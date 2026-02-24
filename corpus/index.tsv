@@ -1,0 +1,4 @@
+# id	module	cfg	tags
+language_safety	corpus/language_coverage/LanguageFeatureMatrix.tla	corpus/language_coverage/LanguageFeatureMatrix.cfg	core,safety,symmetry,constraints
+language_fair	corpus/language_coverage/LanguageFeatureMatrix.tla	corpus/language_coverage/LanguageFeatureMatrixFair.cfg	core,liveness,fairness
+init_next_override	corpus/language_coverage/InitNextTemporalQuant.tla	corpus/language_coverage/InitNextTemporalQuant.cfg	config-init-next,temporal-quantifier-artifact

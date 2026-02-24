@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Git pre-commit hook - runs quick checks before commit
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+cd "$PROJECT_ROOT"
+
+echo "🔍 Running pre-commit checks..."
+echo ""
+
+# Quick format check
+echo "▶ Checking formatting..."
+if ! cargo fmt --all -- --check >/dev/null 2>&1; then
+    echo "❌ Code is not formatted. Run 'cargo fmt' to fix."
+    echo "   Attempting to auto-format..."
+    cargo fmt --all
+    echo "✅ Auto-formatted. Please review changes and commit again."
+    exit 1
+fi
+echo "✅ Formatting OK"
+
+# Quick build check
+echo "▶ Checking build..."
+if ! cargo check --all-targets >/dev/null 2>&1; then
+    echo "❌ Build failed. Fix errors before committing."
+    exit 1
+fi
+echo "✅ Build OK"
+
+# Quick test on core modules
+echo "▶ Running quick tests..."
+if ! cargo test --lib --release -- --test-threads=4 >/dev/null 2>&1; then
+    echo "❌ Tests failed. Fix tests before committing."
+    exit 1
+fi
+echo "✅ Tests OK"
+
+echo ""
+echo "✅ Pre-commit checks passed!"
