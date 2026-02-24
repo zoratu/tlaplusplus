@@ -1,13 +1,13 @@
 use anyhow::{Context, Result, anyhow};
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use crossbeam_queue::SegQueue;
 use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar};
 use std::thread::JoinHandle;
 
 #[derive(Clone, Debug)]
@@ -65,6 +65,12 @@ pub struct DiskBackedQueue<T> {
     writer_handle: Mutex<Option<JoinHandle<()>>>,
     error: Arc<Mutex<Option<String>>>,
     stats: QueueStatsAtomic,
+    // Blocking dequeue support - efficient crossbeam channel notifications
+    notify_tx: Sender<()>,
+    notify_rx: Receiver<()>,
+    finished: AtomicBool,
+    pub num_waiting: AtomicUsize,
+    num_workers: AtomicUsize,
 }
 
 impl<T> DiskBackedQueue<T>
@@ -167,6 +173,8 @@ where
             })
             .context("failed to spawn queue spill writer")?;
 
+        let (notify_tx, notify_rx) = unbounded();
+
         Ok(Self {
             inmem: SegQueue::new(),
             inmem_len: AtomicUsize::new(0),
@@ -179,6 +187,11 @@ where
             writer_handle: Mutex::new(Some(writer_handle)),
             error: writer_error,
             stats: QueueStatsAtomic::default(),
+            notify_tx,
+            notify_rx,
+            finished: AtomicBool::new(false),
+            num_waiting: AtomicUsize::new(0),
+            num_workers: AtomicUsize::new(0),
         })
     }
 
@@ -268,6 +281,8 @@ where
 
         if self.try_reserve_inmem_slot() {
             self.push_inmem_reserved(item);
+            // Wake up one waiting worker - efficient channel notification
+            let _ = self.notify_tx.try_send(());
             return Ok(());
         }
 
@@ -288,6 +303,8 @@ where
             return self.check_error();
         }
 
+        // Wake up one worker after spilling
+        let _ = self.notify_tx.try_send(());
         Ok(())
     }
 
@@ -308,6 +325,55 @@ where
             return Ok(Some(item));
         }
         Ok(None)
+    }
+
+    /// Set the expected number of workers for auto-finish detection
+    pub fn set_worker_count(&self, count: usize) {
+        self.num_workers.store(count, Ordering::Release);
+    }
+
+    /// Blocking pop - waits until an item is available or queue is finished
+    /// Returns None only when queue is finished and empty
+    /// Uses efficient crossbeam channel for worker notifications
+    pub fn pop_blocking(&self) -> Result<Option<T>> {
+        loop {
+            self.check_error()?;
+
+            // Fast path: try to pop without blocking
+            if let Some(item) = self.inmem.pop() {
+                self.inmem_len.fetch_sub(1, Ordering::Release);
+                self.stats.popped.fetch_add(1, Ordering::Relaxed);
+                return Ok(Some(item));
+            }
+
+            // Try loading a segment
+            self.load_one_segment()?;
+
+            // Try again after loading
+            if let Some(item) = self.inmem.pop() {
+                self.inmem_len.fetch_sub(1, Ordering::Release);
+                self.stats.popped.fetch_add(1, Ordering::Relaxed);
+                return Ok(Some(item));
+            }
+
+            // Queue is empty - check if finished
+            if self.finished.load(Ordering::Acquire) {
+                // Final check after seeing finished flag
+                if let Some(item) = self.inmem.pop() {
+                    self.inmem_len.fetch_sub(1, Ordering::Release);
+                    self.stats.popped.fetch_add(1, Ordering::Relaxed);
+                    return Ok(Some(item));
+                }
+                return Ok(None);
+            }
+
+            // Block efficiently on channel - much faster than Condvar
+            self.num_waiting.fetch_add(1, Ordering::Release);
+            let _ = self.notify_rx.recv();
+            self.num_waiting.fetch_sub(1, Ordering::Release);
+
+            // Loop back to try popping again after wake-up
+        }
     }
 
     /// Pop up to `max_items` from the queue in bulk for better cache locality
@@ -439,7 +505,25 @@ where
         }
     }
 
+    /// Check if queue is empty (both in-memory and on-disk)
+    pub fn is_empty(&self) -> bool {
+        self.inmem_len.load(Ordering::Acquire) == 0
+            && self.segments.lock().is_empty()
+            && self.spill_inflight.load(Ordering::Acquire) == 0
+    }
+
+    /// Mark queue as finished - wakes up all blocked workers
+    pub fn finish(&self) {
+        self.finished.store(true, Ordering::Release);
+        // Send many notifications to wake all waiting workers
+        // Unbounded channel means this won't block
+        for _ in 0..1000 {
+            let _ = self.notify_tx.try_send(());
+        }
+    }
+
     pub fn shutdown(&self) -> Result<()> {
+        self.finish(); // Wake up any blocked workers before shutdown
         self.spill_tx.lock().take();
         if let Some(handle) = self.writer_handle.lock().take() {
             let _ = handle.join();
