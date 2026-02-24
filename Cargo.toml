@@ -10,6 +10,7 @@ bloomfilter = "3.0.1"
 clap = { version = "4.5.51", features = ["derive"] }
 crossbeam-channel = "0.5.15"
 crossbeam-queue = "0.3.12"
+dashmap = "6.1.0"
 libc = "0.2.182"
 num_cpus = "1.17.0"
 parking_lot = "0.12.5"
