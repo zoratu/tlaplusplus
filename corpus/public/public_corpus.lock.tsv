@@ -1,0 +1,6 @@
+# id	repo_url	commit_sha	module_path	cfg_path	license	tags
+examples_barrier	https://github.com/tlaplus/Examples.git	aaf4954224762ed584f7b7c7b867c0879ffac50a	specifications/barriers/Barrier.tla	specifications/barriers/Barrier.cfg	NOASSERTION	safety,small,public
+examples_majority	https://github.com/tlaplus/Examples.git	aaf4954224762ed584f7b7c7b867c0879ffac50a	specifications/Majority/MCMajority.tla	specifications/Majority/MCMajority.cfg	NOASSERTION	safety,medium,public
+examples_keyvalue_small	https://github.com/tlaplus/Examples.git	aaf4954224762ed584f7b7c7b867c0879ffac50a	specifications/KeyValueStore/MCKVS.tla	specifications/KeyValueStore/MCKVSSafetySmall.cfg	NOASSERTION	safety,large,public
+fpaxos_twoacc	https://github.com/fpaxos/fpaxos-tlaplus.git	89cab546f62172c8f346673983b09f7315561024	MCFPaxosTwoAcc.tla	MCFPaxos.cfg	NOASSERTION	safety,medium,public
+radix_validation	https://github.com/mitchellh/tlaplus-radix-tree.git	de8be53bca433343c30671886d9b6ca47ebda6ec	RadixTreesValidation.tla	models/RadixTreesValidation/MC.cfg	MIT	structures,small,public

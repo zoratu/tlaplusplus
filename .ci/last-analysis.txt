@@ -1,0 +1,114 @@
+entry_module=corpus/language_coverage/LanguageFeatureMatrix.tla
+parsed_module_name=LanguageFeatureMatrix parsed_constants=3 parsed_variables=7 parsed_definitions=27
+parsed_has_init=true parsed_has_next=true parsed_has_spec=true
+next_top_level_disjuncts=2
+next_max_top_level_conjuncts=1
+next_detected_primed_assignments=0
+next_detected_unchanged_clauses=0
+action_like_definitions=3
+action_conjunct_max=6
+action_detected_primed_assignments=3
+action_detected_unchanged_clauses=1
+action_detected_guard_clauses=5
+probe_init_seeded=7
+probe_init_unresolved=0
+modules_scanned=2
+operators_total=34
+features_total=28
+native_frontend.module_parse=true
+native_frontend.cfg_parse=true
+native_frontend.value_domain=true
+next_branch_probe_total=2
+next_branch_probe_supported=2
+next_branch_probe_generated_successors=1
+next_branch_probe_unsupported=0
+native_frontend.expr_eval=false
+native_frontend.action_eval=true
+native_frontend.unsupported_feature_count=28
+expr_probe_total=8
+expr_probe_ok=7
+expr_probe_failed=1
+--- expr_probe_errors ---
+error_count=1 error=expected field after '.' in expression: step..(step + 1)
+error_example=def=ActionConstraint expr=step' \in step..(step + 1)
+--- modules ---
+module=CoverageHelper path=/Volumes/OWC 1M2/Users/isaiah/src/tlaplusplus/corpus/language_coverage/CoverageHelper.tla operators=5 features=5
+module=LanguageFeatureMatrix path=/Volumes/OWC 1M2/Users/isaiah/src/tlaplusplus/corpus/language_coverage/LanguageFeatureMatrix.tla operators=31 features=28
+--- feature_counts ---
+always=4
+assume=1
+cartesian=3
+case=1
+choose=2
+enabled=1
+eventually=1
+except=2
+if_then_else=5
+instance=1
+intersect=1
+lambda=1
+leads_to=1
+let_in=1
+local=2
+other=1
+prime=11
+quant_exists=2
+quant_forall=2
+record_dot=10
+record_map=3
+set_membership=24
+sf=1
+subseteq=3
+theorem=2
+unchanged=1
+union=1
+wf=1
+--- operators ---
+ActionConstraint
+BoolToNat
+CanVisitWhenNotDone
+Done
+EventualDone
+FairSpec
+HasUnseen
+IdentityNode
+Init
+InvariantsHold
+LOCAL
+NatToBool
+Next
+NodeSeq
+PairSet
+PickUnseenOrPos
+ProgressProperty
+RecomputedSeen
+Rotate
+SafetyProperty
+SeenIntersection
+Spec
+StateConstraint
+Symmetry
+THEOREM
+TableDomain
+TrimToCap
+TypeOK
+Vars
+Visit
+bounded
+cleaned
+grown
+nextPos
+--- config ---
+specification=Spec
+init=none
+next=none
+symmetry=Symmetry
+check_deadlock=false
+constants_count=3
+invariants_count=2
+properties_count=1
+constraints_count=1
+action_constraints_count=1
+constant.Cap=Int(3)
+constant.MaxDepth=Int(5)
+constant.Node=Set([ModelValue("n1"), ModelValue("n2"), ModelValue("n3")])

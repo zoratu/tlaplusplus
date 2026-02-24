@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Git pre-push hook - runs comprehensive checks before push
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+cd "$PROJECT_ROOT"
+
+echo "🚀 Running pre-push checks..."
+echo ""
+
+# Run full CI check
+if ! "$SCRIPT_DIR/check.sh"; then
+    echo ""
+    echo "❌ Pre-push checks failed. Fix issues before pushing."
+    echo "   You can skip this hook with: git push --no-verify"
+    exit 1
+fi
+
+echo ""
+echo "✅ Pre-push checks passed! Safe to push."

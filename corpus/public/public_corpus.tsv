@@ -1,0 +1,7 @@
+# id	repo_url	commit_sha	module_path	cfg_path	license	tags
+# commit_sha may be set to HEAD by scripts/refresh_public_corpus_shas.sh
+examples_barrier	https://github.com/tlaplus/Examples.git	HEAD	specifications/barriers/Barrier.tla	specifications/barriers/Barrier.cfg	NOASSERTION	safety,small,public
+examples_majority	https://github.com/tlaplus/Examples.git	HEAD	specifications/Majority/MCMajority.tla	specifications/Majority/MCMajority.cfg	NOASSERTION	safety,medium,public
+examples_keyvalue_small	https://github.com/tlaplus/Examples.git	HEAD	specifications/KeyValueStore/MCKVS.tla	specifications/KeyValueStore/MCKVSSafetySmall.cfg	NOASSERTION	safety,large,public
+fpaxos_twoacc	https://github.com/fpaxos/fpaxos-tlaplus.git	HEAD	MCFPaxosTwoAcc.tla	MCFPaxos.cfg	NOASSERTION	safety,medium,public
+radix_validation	https://github.com/mitchellh/tlaplus-radix-tree.git	HEAD	RadixTreesValidation.tla	models/RadixTreesValidation/MC.cfg	MIT	structures,small,public
