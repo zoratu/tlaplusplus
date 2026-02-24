@@ -2,6 +2,7 @@ use clap::{Args, Parser, Subcommand};
 use std::collections::BTreeMap;
 use tlaplusplus::models::counter_grid::CounterGridModel;
 use tlaplusplus::models::flurm_job_lifecycle::FlurmJobLifecycleModel;
+use tlaplusplus::models::high_branching::HighBranchingModel;
 use tlaplusplus::models::tla_native::TlaModel;
 use tlaplusplus::system::parse_cpu_list;
 use tlaplusplus::tla::{
@@ -116,6 +117,16 @@ enum Command {
         #[command(flatten)]
         storage: StorageArgs,
     },
+    RunHighBranching {
+        #[arg(long, default_value_t = 8)]
+        max_depth: u32,
+        #[arg(long, default_value_t = 16)]
+        branching_factor: u32,
+        #[command(flatten)]
+        runtime: RuntimeArgs,
+        #[command(flatten)]
+        storage: StorageArgs,
+    },
     AnalyzeTla {
         #[arg(long)]
         module: std::path::PathBuf,
@@ -219,10 +230,7 @@ fn print_stats(model_name: &str, stats: &tlaplusplus::RunStats) {
             .unwrap_or_else(|| "none".to_string())
     );
     println!("resumed_from_checkpoint={}", stats.resumed_from_checkpoint);
-    println!(
-        "fingerprints.disk_lookups={}",
-        stats.fingerprints.disk_lookups
-    );
+    println!("fingerprints.inmem=true",);
     println!(
         "fingerprints.batch_calls={}",
         stats.fingerprints.batch_calls
@@ -271,6 +279,24 @@ fn main() -> anyhow::Result<()> {
             let config = build_engine_config(&runtime, &storage)?;
             let outcome = run_model(model, config)?;
             print_stats("flurm-job-lifecycle", &outcome.stats);
+            if let Some(violation) = outcome.violation {
+                println!("violation=true");
+                println!("violation_message={}", violation.message);
+                println!("violation_state={:?}", violation.state);
+            } else {
+                println!("violation=false");
+            }
+        }
+        Command::RunHighBranching {
+            max_depth,
+            branching_factor,
+            runtime,
+            storage,
+        } => {
+            let model = HighBranchingModel::new(max_depth, branching_factor);
+            let config = build_engine_config(&runtime, &storage)?;
+            let outcome = run_model(model, config)?;
+            print_stats("high-branching", &outcome.stats);
             if let Some(violation) = outcome.violation {
                 println!("violation=true");
                 println!("violation_message={}", violation.message);

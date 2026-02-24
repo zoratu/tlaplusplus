@@ -310,6 +310,52 @@ where
         Ok(None)
     }
 
+    /// Pop up to `max_items` from the queue in bulk for better cache locality
+    pub fn pop_bulk(&self, max_items: usize) -> Result<Vec<T>> {
+        self.check_error()?;
+
+        let mut result = Vec::with_capacity(max_items.min(256));
+
+        // Pop from in-memory queue
+        while result.len() < max_items {
+            if let Some(item) = self.inmem.pop() {
+                self.inmem_len.fetch_sub(1, Ordering::Release);
+                result.push(item);
+            } else {
+                break;
+            }
+        }
+
+        // If we got some items, return them
+        if !result.is_empty() {
+            self.stats
+                .popped
+                .fetch_add(result.len() as u64, Ordering::Relaxed);
+            return Ok(result);
+        }
+
+        // Try loading a segment
+        self.load_one_segment()?;
+
+        // Try popping again after load
+        while result.len() < max_items {
+            if let Some(item) = self.inmem.pop() {
+                self.inmem_len.fetch_sub(1, Ordering::Release);
+                result.push(item);
+            } else {
+                break;
+            }
+        }
+
+        if !result.is_empty() {
+            self.stats
+                .popped
+                .fetch_add(result.len() as u64, Ordering::Relaxed);
+        }
+
+        Ok(result)
+    }
+
     fn load_one_segment(&self) -> Result<()> {
         let Some(_guard) = self.load_lock.try_lock() else {
             return Ok(());
