@@ -481,60 +481,20 @@ where
         );
     }
 
-    let mut fp_store = PageAlignedFingerprintStore::new(
-        PageAlignedConfig {
-            shard_count,
-            expected_items: config.fp_expected_items,
-            shard_size_mb,
-        },
-        &worker_plan.assigned_cpus,
-    )
-    .context("Failed to create page-aligned fingerprint store")?;
+    // Use sled-backed store with bounded memory (prevents OOM)
+    let cache_mb = config
+        .memory_max_bytes
+        .map(|b| (b / (1024 * 1024)) as usize / 2) // Use half of memory limit for fingerprint cache
+        .unwrap_or(2048); // Default 2GB
 
-    // Create async I/O runtime for fingerprint persistence (4 threads, cores 0-1)
-    // Workers use cores 2-127, so I/O threads stay out of their way
-    // IMPORTANT: Must keep this alive for the duration of the run
-    let io_runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .thread_name("tlapp-io")
-        .enable_all()
-        .build()
-        .context("Failed to create async I/O runtime")?;
+    eprintln!("Using sled-backed fingerprint store (bounded memory)");
 
-    // Create persistence channels (one per shard)
-    let persist_channel_capacity = 10_000; // Per shard
-    let (persist_tx, persist_rx) =
-        crate::storage::async_fingerprint_writer::create_persist_channels(
-            shard_count,
-            persist_channel_capacity,
-        );
+    let mut fp_store = crate::storage::hybrid_fingerprint_store::HybridFingerprintStore::new(
+        config.work_dir.clone(),
+        cache_mb,
+    )?;
 
-    // Spawn async writer tasks (one per shard)
-    for (shard_id, rx) in persist_rx.into_iter().enumerate() {
-        let work_dir = config.work_dir.clone();
-        io_runtime.spawn(async move {
-            if let Err(e) = crate::storage::async_fingerprint_writer::fingerprint_writer_task(
-                shard_id, rx, work_dir,
-            )
-            .await
-            {
-                if std::env::var("TLAPP_VERBOSE").is_ok() {
-                    eprintln!("Fingerprint writer {} failed: {}", shard_id, e);
-                }
-            }
-        });
-    }
-
-    if std::env::var("TLAPP_VERBOSE").is_ok() {
-        eprintln!("Async I/O runtime started with {} threads", 4);
-        eprintln!(
-            "  {} fingerprint writers spawned (one per shard)",
-            shard_count
-        );
-    }
-
-    // Enable persistence
-    fp_store.enable_persistence(persist_tx);
+    // Note: Sled handles persistence internally, no need for async I/O runtime
 
     let fp_store = Arc::new(fp_store);
 
@@ -918,7 +878,7 @@ where
     let (states_generated, states_processed, states_distinct, duplicates, enqueued, checkpoints) =
         run_stats.snapshot();
 
-    let outcome = RunOutcome {
+    Ok(RunOutcome {
         stats: RunStats {
             duration: started_at.elapsed(),
             states_generated,
@@ -950,12 +910,7 @@ where
             fingerprints: fp_store.stats(),
         },
         violation,
-    };
-
-    // Explicitly drop io_runtime to shut down async writer tasks gracefully
-    drop(io_runtime);
-
-    Ok(outcome)
+    })
 }
 
 /// Reconstruct trace to a violating state using post-processing
