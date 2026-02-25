@@ -3,6 +3,7 @@ pub mod model;
 pub mod models;
 pub mod runtime;
 pub mod storage;
+pub mod symmetry;
 pub mod system;
 pub mod tla;
 
