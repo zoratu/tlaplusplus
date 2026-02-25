@@ -20,6 +20,7 @@ pub struct TlaModel {
     pub state_constraints: Vec<(String, String)>,
     pub action_constraints: Vec<(String, String)>,
     pub symmetry: Option<SymmetrySpec>,
+    pub view: Option<String>,
     pub initial_state: TlaState,
 }
 
@@ -52,6 +53,7 @@ impl TlaModel {
         let state_constraints = resolve_constraint_exprs(&module, &config);
         let action_constraints = resolve_action_constraint_exprs(&module, &config);
         let symmetry = resolve_symmetry(&module, &config);
+        let view = resolve_view(&module, &config);
 
         Ok(Self {
             module,
@@ -63,6 +65,7 @@ impl TlaModel {
             state_constraints,
             action_constraints,
             symmetry,
+            view,
             initial_state,
         })
     }
@@ -161,6 +164,24 @@ impl Model for TlaModel {
     }
 }
 
+impl TlaModel {
+    /// Evaluate the view function on a state to get the projected state
+    ///
+    /// View functions allow state space reduction by fingerprinting only a
+    /// projection of the state. If no view is defined, returns the full state.
+    pub fn evaluate_view(&self, state: &TlaState) -> Result<TlaValue, String> {
+        if let Some(view_expr) = &self.view {
+            let ctx = EvalContext::with_definitions(state, &self.module.definitions);
+            eval_expr(view_expr, &ctx).map_err(|e| format!("view evaluation failed: {}", e))
+        } else {
+            // No view defined - return full state as a value
+            // Convert state to TlaValue::Record
+            let record: BTreeMap<String, TlaValue> = state.clone();
+            Ok(TlaValue::Record(record))
+        }
+    }
+}
+
 fn resolve_invariant_exprs(module: &TlaModule, cfg: &TlaConfig) -> Vec<(String, String)> {
     cfg.invariants
         .iter()
@@ -253,6 +274,24 @@ fn resolve_symmetry(module: &TlaModule, cfg: &TlaConfig) -> Option<SymmetrySpec>
         }
 
         spec
+    })
+}
+
+fn resolve_view(module: &TlaModule, cfg: &TlaConfig) -> Option<String> {
+    cfg.view.as_ref().map(|view_name| {
+        // Look up the view definition
+        if let Some(def) = module.definitions.get(view_name) {
+            if !def.params.is_empty() {
+                // View function with parameters - not supported yet
+                // Return the name as-is for now
+                return view_name.clone();
+            }
+            // Return the view expression body
+            def.body.clone()
+        } else {
+            // Treat as inline expression
+            view_name.clone()
+        }
     })
 }
 
