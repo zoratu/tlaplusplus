@@ -69,16 +69,6 @@ scripts/tlc_public_corpus.sh
 scripts/refresh_public_corpus_shas.sh
 ```
 
-### Remote Testing
-
-```bash
-# Run on many-core remote host (defaults to ubuntu@98.83.110.220)
-scripts/remote_bench.sh --max-x 20000 --max-y 20000 --max-sum 40000 --workers 96
-
-# Environment overrides
-REMOTE_HOST=user@host REMOTE_KEY=~/.ssh/key scripts/remote_bench.sh
-```
-
 ## Architecture
 
 ### Core Components
@@ -250,13 +240,6 @@ Key parameters for many-core systems:
 - `--fp-batch-size`: Larger batches amortize sync cost (default 512)
 - `--queue-inmem-limit`: Balance memory vs disk I/O (default 5M states)
 - `--memory-max-bytes`: Hard ceiling for automatic budget tuning
-
-### Testing on Remote System
-
-The project includes a remote many-core system for testing:
-- Host: `ubuntu@98.83.110.220`
-- SSH key: `~/.ssh/weka-isaiah-us-east-1_ed25519`
-- Use `scripts/remote_bench.sh` for automated remote execution
 
 ## Code Organization Principles
 
