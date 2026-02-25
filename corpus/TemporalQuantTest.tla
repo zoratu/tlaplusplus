@@ -20,9 +20,14 @@ Inc ==
     /\ x' = x + 1
     /\ y' = y
 
+Stutter ==
+    /\ x = MaxValue
+    /\ x' = x
+    /\ y' = y
+
 Next ==
     \/ Inc
-    \/ (x >= MaxValue /\ x' = x /\ y' = y)
+    \/ Stutter
 
 Spec == Init /\ [][Next]_<<x, y>>
 
