@@ -202,6 +202,19 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
 
     let and_parts = split_top_level_symbol(expr, "/\\");
     if and_parts.len() > 1 {
+        if expr.contains("PriceBandsRespected")
+            || expr.contains("listings")
+            || expr.contains("PositionLimits")
+        {
+            eprintln!(
+                "[DEBUG] Splitting by /\\: got {} parts for expr starting with: {}",
+                and_parts.len(),
+                &expr[..60.min(expr.len())]
+            );
+            for (i, part) in and_parts.iter().enumerate() {
+                eprintln!("[DEBUG]   part[{}]: {}", i, part);
+            }
+        }
         for part in and_parts {
             if !eval_expr_inner(&part, ctx, depth + 1)?.as_bool()? {
                 return Ok(TlaValue::Bool(false));
@@ -1629,6 +1642,13 @@ fn split_top_level_keyword(expr: &str, delim: &str) -> Vec<String> {
 }
 
 fn split_top_level(expr: &str, delim: &str, keyword: bool) -> Vec<String> {
+    if expr.contains("PositionLimits") && delim == "/\\" {
+        eprintln!(
+            "[split_top_level] Called with delim=/\\, expr len={}, expr start: {}",
+            expr.len(),
+            &expr[..60.min(expr.len())]
+        );
+    }
     let mut out = Vec::new();
     let mut start = 0usize;
 
@@ -1637,6 +1657,8 @@ fn split_top_level(expr: &str, delim: &str, keyword: bool) -> Vec<String> {
     let mut bracket = 0usize;
     let mut brace = 0usize;
     let mut angle = 0usize;
+    let mut quantifier_depth = 0usize; // Count of \A or \E seen
+    let mut seen_colon_for_quantifier = 0usize; // Count of : seen to close quantifiers
     let mut in_string = false;
     let mut escaped = false;
 
@@ -1669,17 +1691,104 @@ fn split_top_level(expr: &str, delim: &str, keyword: bool) -> Vec<String> {
             continue;
         }
 
-        let at_top = paren == 0 && bracket == 0 && brace == 0 && angle == 0;
-        if at_top && expr[i..].starts_with(delim) {
+        // Track quantifiers: \A or \E increases depth
+        if ch == '\\'
+            && (expr[i..].starts_with("\\A") || expr[i..].starts_with("\\E"))
+            && paren == 0
+            && bracket == 0
+            && brace == 0
+            && angle == 0
+        {
+            quantifier_depth += 1;
+            if expr.contains("listings") && delim == "/\\" {
+                eprintln!(
+                    "[SPLIT DEBUG] at i={}: saw quantifier, depth now {}",
+                    i, quantifier_depth
+                );
+            }
+        } else if ch == ':'
+            && quantifier_depth > seen_colon_for_quantifier
+            && paren == 0
+            && bracket == 0
+            && brace == 0
+            && angle == 0
+        {
+            // This : starts a quantifier body
+            seen_colon_for_quantifier += 1;
+            if expr.contains("listings") && delim == "/\\" {
+                eprintln!(
+                    "[SPLIT DEBUG] at i={}: saw colon, seen_colon now {}",
+                    i, seen_colon_for_quantifier
+                );
+            }
+        }
+
+        // We're truly at top level if:
+        // 1. No nested parens/brackets
+        // 2. Either no quantifiers, OR we've seen all the colons (we're in the body)
+        // If we're in a quantifier body and see a top-level /\ or \/, that ENDS the quantifier
+        let in_quantifier_body = seen_colon_for_quantifier > 0 && quantifier_depth > 0;
+        let brackets_at_zero = paren == 0 && bracket == 0 && brace == 0 && angle == 0;
+
+        // Check if this is our delimiter at a potential split point
+        if brackets_at_zero && expr[i..].starts_with(delim) {
             let delim_end = i + delim.len();
-            if !keyword || has_word_boundaries(expr, i, delim_end) {
-                let part = expr[start..i].trim();
-                if !part.is_empty() {
-                    out.push(part.to_string());
+            let is_word_ok = !keyword || has_word_boundaries(expr, i, delim_end);
+
+            if is_word_ok {
+                let is_conjunction = delim == "/\\" || delim == "\\/";
+                // Determine if we should split:
+                // 1. If we're before the : in a quantifier (in binders), don't split on /\ or \/
+                // 2. If we're in a quantifier body, check if this /\ is followed by another quantifier
+                //    - If yes: this /\ ENDS the current quantifier - split!
+                //    - If no: this /\ is part of the quantifier body - don't split
+                // 3. Otherwise, split normally
+                let should_split = if quantifier_depth > 0
+                    && quantifier_depth > seen_colon_for_quantifier
+                    && is_conjunction
+                {
+                    // We're in quantifier binders (before :), don't split on conjunctions
+                    false
+                } else if in_quantifier_body && is_conjunction {
+                    // We're in a quantifier body. Check what follows this /\
+                    let after_delim = &expr[delim_end..].trim_start();
+                    let next_is_quantifier =
+                        after_delim.starts_with("\\A") || after_delim.starts_with("\\E");
+                    // Split only if followed by another quantifier (this ends the current quantifier)
+                    next_is_quantifier
+                } else {
+                    // All other cases: split normally
+                    true
+                };
+
+                if should_split {
+                    if expr.contains("listings") && delim == "/\\" {
+                        eprintln!(
+                            "[SPLIT DEBUG] at i={}: SPLITTING (in_quantifier_body={}, quantifier_depth={}, seen_colon={})",
+                            i, in_quantifier_body, quantifier_depth, seen_colon_for_quantifier
+                        );
+                        eprintln!("[SPLIT DEBUG]   part: {}", expr[start..i].trim());
+                    }
+                    let part = expr[start..i].trim();
+                    if !part.is_empty() {
+                        out.push(part.to_string());
+                    }
+                    // Reset quantifier tracking for next part
+                    quantifier_depth = 0;
+                    seen_colon_for_quantifier = 0;
+                    start = delim_end;
+                    i = delim_end;
+                    continue;
+                } else if expr.contains("listings")
+                    && delim == "/\\"
+                    && brackets_at_zero
+                    && is_word_ok
+                {
+                    eprintln!(
+                        "[SPLIT DEBUG] at i={}: NOT SPLITTING (in_quantifier_body={}, quantifier_depth={}, is_conjunction={})",
+                        i, in_quantifier_body, quantifier_depth, is_conjunction
+                    );
                 }
-                start = delim_end;
-                i = delim_end;
-                continue;
             }
         }
 
@@ -1712,11 +1821,24 @@ fn split_top_level(expr: &str, delim: &str, keyword: bool) -> Vec<String> {
         out.push(tail.to_string());
     }
 
-    if out.is_empty() {
+    let result = if out.is_empty() {
         vec![expr.trim().to_string()]
     } else {
         out
+    };
+
+    if expr.contains("PositionLimits") && delim == "/\\" {
+        eprintln!("[split_top_level] Returning {} parts", result.len());
+        for (i, part) in result.iter().enumerate() {
+            eprintln!(
+                "[split_top_level]   part[{}]: {}",
+                i,
+                &part[..60.min(part.len())]
+            );
+        }
     }
+
+    result
 }
 
 fn split_top_level_set_minus(expr: &str) -> Vec<String> {
