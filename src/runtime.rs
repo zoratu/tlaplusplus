@@ -493,7 +493,8 @@ where
 
     // Create async I/O runtime for fingerprint persistence (4 threads, cores 0-1)
     // Workers use cores 2-127, so I/O threads stay out of their way
-    let _io_runtime = tokio::runtime::Builder::new_multi_thread()
+    // IMPORTANT: Must keep this alive for the duration of the run
+    let io_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .thread_name("tlapp-io")
         .enable_all()
@@ -511,7 +512,7 @@ where
     // Spawn async writer tasks (one per shard)
     for (shard_id, rx) in persist_rx.into_iter().enumerate() {
         let work_dir = config.work_dir.clone();
-        _io_runtime.spawn(async move {
+        io_runtime.spawn(async move {
             if let Err(e) = crate::storage::async_fingerprint_writer::fingerprint_writer_task(
                 shard_id, rx, work_dir,
             )
@@ -917,7 +918,7 @@ where
     let (states_generated, states_processed, states_distinct, duplicates, enqueued, checkpoints) =
         run_stats.snapshot();
 
-    Ok(RunOutcome {
+    let outcome = RunOutcome {
         stats: RunStats {
             duration: started_at.elapsed(),
             states_generated,
@@ -949,7 +950,12 @@ where
             fingerprints: fp_store.stats(),
         },
         violation,
-    })
+    };
+
+    // Explicitly drop io_runtime to shut down async writer tasks gracefully
+    drop(io_runtime);
+
+    Ok(outcome)
 }
 
 /// Reconstruct trace to a violating state using post-processing
