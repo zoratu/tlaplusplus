@@ -440,19 +440,6 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
 
     let and_parts = split_top_level_symbol(expr, "/\\");
     if and_parts.len() > 1 {
-        if expr.contains("PriceBandsRespected")
-            || expr.contains("listings")
-            || expr.contains("PositionLimits")
-        {
-            eprintln!(
-                "[DEBUG] Splitting by /\\: got {} parts for expr starting with: {}",
-                and_parts.len(),
-                &expr[..60.min(expr.len())]
-            );
-            for (i, part) in and_parts.iter().enumerate() {
-                eprintln!("[DEBUG]   part[{}]: {}", i, part);
-            }
-        }
         for part in and_parts {
             if !eval_expr_inner(&part, ctx, depth + 1)?.as_bool()? {
                 return Ok(TlaValue::Bool(false));
@@ -2431,12 +2418,6 @@ fn split_top_level(expr: &str, delim: &str, keyword: bool) -> Vec<String> {
             && angle == 0
         {
             quantifier_depth += 1;
-            if expr.contains("listings") && delim == "/\\" {
-                eprintln!(
-                    "[SPLIT DEBUG] at i={}: saw quantifier, depth now {}",
-                    i, quantifier_depth
-                );
-            }
         } else if ch == ':'
             && quantifier_depth > seen_colon_for_quantifier
             && paren == 0
@@ -2446,12 +2427,6 @@ fn split_top_level(expr: &str, delim: &str, keyword: bool) -> Vec<String> {
         {
             // This : starts a quantifier body
             seen_colon_for_quantifier += 1;
-            if expr.contains("listings") && delim == "/\\" {
-                eprintln!(
-                    "[SPLIT DEBUG] at i={}: saw colon, seen_colon now {}",
-                    i, seen_colon_for_quantifier
-                );
-            }
         }
 
         // We're truly at top level if:
@@ -2493,13 +2468,6 @@ fn split_top_level(expr: &str, delim: &str, keyword: bool) -> Vec<String> {
                 };
 
                 if should_split {
-                    if expr.contains("listings") && delim == "/\\" {
-                        eprintln!(
-                            "[SPLIT DEBUG] at i={}: SPLITTING (in_quantifier_body={}, quantifier_depth={}, seen_colon={})",
-                            i, in_quantifier_body, quantifier_depth, seen_colon_for_quantifier
-                        );
-                        eprintln!("[SPLIT DEBUG]   part: {}", expr[start..i].trim());
-                    }
                     let part = expr[start..i].trim();
                     if !part.is_empty() {
                         out.push(part.to_string());
@@ -2510,15 +2478,6 @@ fn split_top_level(expr: &str, delim: &str, keyword: bool) -> Vec<String> {
                     start = delim_end;
                     i = delim_end;
                     continue;
-                } else if expr.contains("listings")
-                    && delim == "/\\"
-                    && brackets_at_zero
-                    && is_word_ok
-                {
-                    eprintln!(
-                        "[SPLIT DEBUG] at i={}: NOT SPLITTING (in_quantifier_body={}, quantifier_depth={}, is_conjunction={})",
-                        i, in_quantifier_body, quantifier_depth, is_conjunction
-                    );
                 }
             }
         }
