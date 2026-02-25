@@ -17,6 +17,7 @@ use anyhow::{Context, Result, anyhow};
 use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -225,14 +226,6 @@ struct CheckpointManifest {
     queue: QueueStats,
     fingerprints: OldFingerprintStats,
 }
-
-#[inline]
-fn fingerprint<T: Hash>(value: &T) -> u64 {
-    let mut hasher = XxHash64::default();
-    value.hash(&mut hasher);
-    hasher.finish()
-}
-
 fn compute_effective_memory_max(config: &EngineConfig) -> Option<u64> {
     let cgroup_limit = if config.enforce_cgroups {
         cgroup_memory_max_bytes()
@@ -483,7 +476,7 @@ where
         let mut dedup = HashSet::with_capacity(initial.len().max(16));
         for state in initial {
             run_stats.states_generated.fetch_add(1, Ordering::Relaxed);
-            let fp = fingerprint(&state);
+            let fp = model.fingerprint(&state);
             if dedup.insert(fp) {
                 initial_fps.push(fp);
                 unique_initial.push(state);
@@ -566,11 +559,20 @@ where
                     .fetch_add(1, Ordering::Relaxed);
 
                 if let Err(message) = worker_model.check_invariants(&state) {
+                    // Reconstruct trace to violation using post-processing
+                    // This re-explores from init states to find the path
+                    let trace = reconstruct_trace_limited(
+                        worker_model.as_ref(),
+                        &state,
+                        100, // Max depth to search
+                    )
+                    .unwrap_or_else(|| vec![state.clone()]);
+
                     let _ = worker_violation_tx.try_send(Violation {
                         message,
                         state,
                         property_type: PropertyType::Safety,
-                        trace: Vec::new(), // TODO: Add trace tracking for better debugging
+                        trace,
                     });
                     if worker_stop_on_violation {
                         worker_stop.store(true, Ordering::Release);
@@ -607,7 +609,7 @@ where
 
                     let mut duplicates_in_batch = 0u64;
                     for candidate in pending_batch.drain(..) {
-                        let fp = fingerprint(&candidate);
+                        let fp = worker_model.fingerprint(&candidate);
                         if !local_fp_dedup.insert(fp) {
                             duplicates_in_batch += 1;
                             continue;
@@ -732,6 +734,115 @@ where
         },
         violation,
     })
+}
+
+/// Reconstruct trace to a violating state using post-processing
+///
+/// This function re-explores the state space from initial states using BFS
+/// to find a path to the target state. This is used when a violation is found
+/// during exploration (where we only store fingerprints, not parent pointers).
+///
+/// Returns a trace from an initial state to the target state, or None if
+/// the target is not reachable.
+pub fn reconstruct_trace<M: Model>(model: &M, target_state: &M::State) -> Option<Vec<M::State>> {
+    // BFS from initial states to target
+    let mut queue: VecDeque<(M::State, Vec<M::State>)> = VecDeque::new();
+    let mut visited = HashSet::new();
+
+    // Start from initial states
+    for init_state in model.initial_states() {
+        let fp = model.fingerprint(&init_state);
+
+        if &init_state == target_state {
+            // Target is an initial state
+            return Some(vec![init_state]);
+        }
+
+        visited.insert(fp);
+        queue.push_back((init_state.clone(), vec![init_state]));
+    }
+
+    // BFS exploration
+    while let Some((state, path)) = queue.pop_front() {
+        let mut successors = Vec::new();
+        model.next_states(&state, &mut successors);
+
+        for next_state in successors {
+            if &next_state == target_state {
+                // Found the target!
+                let mut trace = path.clone();
+                trace.push(next_state);
+                return Some(trace);
+            }
+
+            let fp = model.fingerprint(&next_state);
+            if visited.insert(fp) {
+                // Not visited yet - add to queue
+                let mut next_path = path.clone();
+                next_path.push(next_state.clone());
+                queue.push_back((next_state, next_path));
+            }
+        }
+
+        // Limit search to prevent excessive memory usage
+        if visited.len() > 1_000_000 {
+            // If we haven't found the target after exploring 1M states,
+            // it's likely not reachable or the search is too expensive
+            return None;
+        }
+    }
+
+    // Target not reachable
+    None
+}
+
+/// Reconstruct trace with a maximum depth limit
+///
+/// This is a depth-limited version that stops after exploring up to max_depth
+/// transitions from initial states.
+pub fn reconstruct_trace_limited<M: Model>(
+    model: &M,
+    target_state: &M::State,
+    max_depth: usize,
+) -> Option<Vec<M::State>> {
+    let mut queue: VecDeque<(M::State, Vec<M::State>, usize)> = VecDeque::new();
+    let mut visited = HashSet::new();
+
+    for init_state in model.initial_states() {
+        if &init_state == target_state {
+            return Some(vec![init_state]);
+        }
+
+        let fp = model.fingerprint(&init_state);
+        visited.insert(fp);
+        queue.push_back((init_state.clone(), vec![init_state], 0));
+    }
+
+    while let Some((state, path, depth)) = queue.pop_front() {
+        if depth >= max_depth {
+            continue; // Skip states at max depth
+        }
+
+        let mut successors = Vec::new();
+        model.next_states(&state, &mut successors);
+
+        for next_state in successors {
+            if &next_state == target_state {
+                let mut trace = path.clone();
+                trace.push(next_state);
+                return Some(trace);
+            }
+
+            let fp = model.fingerprint(&next_state);
+            if visited.insert(fp) {
+                let mut next_path = path.clone();
+                next_path.push(next_state.clone());
+                queue.push_back((next_state, next_path, depth + 1));
+            }
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]

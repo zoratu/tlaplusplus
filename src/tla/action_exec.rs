@@ -1,3 +1,4 @@
+use crate::fairness::{ActionLabel, LabeledTransition};
 use crate::tla::{
     EvalContext, TlaDefinition, TlaState, TlaValue, apply_action_ir_with_context,
     compile_action_ir, eval_expr, split_top_level,
@@ -52,6 +53,63 @@ pub fn evaluate_next_states(
         out.extend(successors);
     }
     Ok(out)
+}
+
+/// Evaluate next states with action labels for fairness checking
+///
+/// This version tracks which action (disjunct) generated each successor state,
+/// enabling fairness constraint checking on strongly connected components.
+pub fn evaluate_next_states_labeled(
+    next_body: &str,
+    next_name: &str,
+    definitions: &BTreeMap<String, TlaDefinition>,
+    state: &TlaState,
+) -> Result<Vec<LabeledTransition<TlaState>>> {
+    let disjuncts = split_top_level(next_body, "\\/");
+    let mut out = Vec::new();
+
+    for (disjunct_idx, disj) in disjuncts.iter().enumerate() {
+        let successors = execute_branch(disj.trim(), &BTreeMap::new(), definitions, state)?;
+
+        // Extract action name from disjunct (e.g., "SendMsg(m)" -> "SendMsg")
+        let action_name = extract_action_name(disj.trim()).unwrap_or_else(|| next_name.to_string());
+
+        let label = if disjuncts.len() > 1 {
+            // Multiple disjuncts - label with index
+            ActionLabel::with_disjunct(action_name, disjunct_idx)
+        } else {
+            // Single action
+            ActionLabel::new(action_name)
+        };
+
+        for next_state in successors {
+            out.push(LabeledTransition {
+                from: state.clone(),
+                to: next_state,
+                action: label.clone(),
+            });
+        }
+    }
+
+    Ok(out)
+}
+
+/// Extract action name from a disjunct expression
+fn extract_action_name(expr: &str) -> Option<String> {
+    let trimmed = strip_outer_parens(expr.trim());
+
+    // Handle \E quantifier
+    if trimmed.starts_with("\\E") {
+        // Try to find the action call after the ':'
+        if let Some(colon_idx) = trimmed.find(':') {
+            let body = trimmed[colon_idx + 1..].trim();
+            return extract_action_name(body);
+        }
+        return None;
+    }
+
+    // Try to extract identifier (action name)
+    parse_identifier_prefix(trimmed).map(|(name, _)| name)
 }
 
 fn execute_branch(

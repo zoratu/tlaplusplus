@@ -1,7 +1,8 @@
+use crate::fairness::{FairnessConstraint, LabeledTransition, TarjanSCC, check_fairness_on_scc};
 use crate::tla::{EvalContext, TemporalFormula, TlaValue, eval_expr};
 use anyhow::{Result, anyhow};
 use serde::{Serialize, de::DeserializeOwned};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::hash::Hash;
 
@@ -354,6 +355,185 @@ impl<S: Clone + Eq + Hash> Default for CycleDetector<S> {
     }
 }
 
+/// Büchi automaton checker for fairness constraints
+///
+/// This checker verifies fairness properties on the state graph by:
+/// 1. Building a transition graph with action labels
+/// 2. Finding strongly connected components (SCCs)
+/// 3. Checking fairness constraints on each SCC
+///
+/// A fairness violation occurs when an SCC exists where:
+/// - Weak fairness (WF): action is enabled infinitely often but never occurs
+/// - Strong fairness (SF): action is continuously enabled but never occurs
+pub struct BuchiChecker<S> {
+    /// Fairness constraints to check
+    constraints: Vec<FairnessConstraint>,
+    /// State transition graph
+    _phantom: std::marker::PhantomData<S>,
+}
+
+impl<S: Clone + Eq + Hash + Debug> BuchiChecker<S> {
+    pub fn new(constraints: Vec<FairnessConstraint>) -> Self {
+        Self {
+            constraints,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    /// Check fairness constraints on a labeled transition system
+    ///
+    /// This analyzes the transition graph for fairness violations by:
+    /// 1. Finding all SCCs (cycles) in the graph
+    /// 2. For each SCC, checking that all fairness constraints are satisfied
+    ///
+    /// Returns Ok(()) if all constraints are satisfied, Err otherwise.
+    pub fn check_fairness(&self, states: &[S], transitions: &[LabeledTransition<S>]) -> Result<()> {
+        if self.constraints.is_empty() {
+            return Ok(()); // No fairness constraints to check
+        }
+
+        // Build adjacency information for SCC detection
+        let mut adjacency: HashMap<&S, Vec<&S>> = HashMap::new();
+        for state in states {
+            adjacency.insert(state, Vec::new());
+        }
+        for trans in transitions {
+            adjacency
+                .entry(&trans.from)
+                .or_insert_with(Vec::new)
+                .push(&trans.to);
+        }
+
+        // Find all strongly connected components
+        let get_successors =
+            |state: &&S| -> Vec<&S> { adjacency.get(state).cloned().unwrap_or_default() };
+
+        let mut tarjan = TarjanSCC::new();
+        let sccs = tarjan.find_sccs(&states.iter().collect::<Vec<_>>(), get_successors);
+
+        // Check fairness on each non-trivial SCC (cycles)
+        for scc in sccs {
+            if scc.len() > 1 || self_loop_exists(&scc, transitions) {
+                // This is a cycle - check fairness constraints
+                let scc_states: Vec<S> = scc.iter().map(|&s| s.clone()).collect();
+
+                for constraint in &self.constraints {
+                    check_fairness_on_scc(&scc_states, constraint, transitions)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check fairness with a predicate for action enablement
+    ///
+    /// This is a more precise check that uses a user-provided function
+    /// to determine if an action is enabled in a state.
+    pub fn check_fairness_with_enablement<F>(
+        &self,
+        states: &[S],
+        transitions: &[LabeledTransition<S>],
+        is_enabled: F,
+    ) -> Result<()>
+    where
+        F: Fn(&S, &str) -> bool,
+    {
+        if self.constraints.is_empty() {
+            return Ok(());
+        }
+
+        // Build adjacency information
+        let mut adjacency: HashMap<&S, Vec<&S>> = HashMap::new();
+        for state in states {
+            adjacency.insert(state, Vec::new());
+        }
+        for trans in transitions {
+            adjacency
+                .entry(&trans.from)
+                .or_insert_with(Vec::new)
+                .push(&trans.to);
+        }
+
+        // Find SCCs
+        let get_successors =
+            |state: &&S| -> Vec<&S> { adjacency.get(state).cloned().unwrap_or_default() };
+
+        let mut tarjan = TarjanSCC::new();
+        let sccs = tarjan.find_sccs(&states.iter().collect::<Vec<_>>(), get_successors);
+
+        // Check each non-trivial SCC
+        for scc in sccs {
+            if scc.len() > 1 || self_loop_exists(&scc, transitions) {
+                let scc_states: Vec<S> = scc.iter().map(|&s| s.clone()).collect();
+
+                for constraint in &self.constraints {
+                    self.check_constraint_on_scc(
+                        &scc_states,
+                        constraint,
+                        transitions,
+                        &is_enabled,
+                    )?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check a single fairness constraint on an SCC with enablement checking
+    fn check_constraint_on_scc<F>(
+        &self,
+        scc: &[S],
+        constraint: &FairnessConstraint,
+        transitions: &[LabeledTransition<S>],
+        is_enabled: &F,
+    ) -> Result<()>
+    where
+        F: Fn(&S, &str) -> bool,
+    {
+        let action_name = constraint.action_name();
+
+        // Check if action occurs in this SCC
+        let action_occurs = transitions
+            .iter()
+            .any(|t| scc.contains(&t.from) && scc.contains(&t.to) && t.action.name == action_name);
+
+        // Check if action is enabled in any state of the SCC
+        let action_enabled = scc.iter().any(|state| is_enabled(state, action_name));
+
+        // Fairness violation: enabled but doesn't occur
+        if action_enabled && !action_occurs {
+            return Err(anyhow!(
+                "{} fairness violated: action '{}' is enabled in SCC but never occurs",
+                if constraint.is_weak() {
+                    "Weak"
+                } else {
+                    "Strong"
+                },
+                action_name
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+/// Check if a state has a self-loop in the transition system
+fn self_loop_exists<S: Clone + Eq + Hash>(
+    scc: &[&S],
+    transitions: &[LabeledTransition<S>],
+) -> bool {
+    if scc.len() != 1 {
+        return false;
+    }
+
+    let state = scc[0];
+    transitions
+        .iter()
+        .any(|t| &t.from == state && &t.to == state)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,5 +628,118 @@ mod tests {
         let cycle = detector.find_cycle(&0, get_successors);
         assert!(cycle.is_some());
         assert!(cycle.unwrap().contains(&1));
+    }
+
+    #[test]
+    fn test_buichi_checker_fairness_satisfied() {
+        use crate::fairness::{ActionLabel, FairnessConstraint, LabeledTransition};
+
+        // Create a simple cycle: 0 -> 1 -> 2 -> 0
+        // with action "Next" occurring on all transitions
+        let states = vec![0, 1, 2];
+        let transitions = vec![
+            LabeledTransition {
+                from: 0,
+                to: 1,
+                action: ActionLabel::new("Next"),
+            },
+            LabeledTransition {
+                from: 1,
+                to: 2,
+                action: ActionLabel::new("Next"),
+            },
+            LabeledTransition {
+                from: 2,
+                to: 0,
+                action: ActionLabel::new("Next"),
+            },
+        ];
+
+        let constraint = FairnessConstraint::Weak {
+            vars: vec!["x".to_string()],
+            action: "Next".to_string(),
+        };
+
+        let checker = BuchiChecker::new(vec![constraint]);
+
+        // Should pass: action occurs in the cycle
+        assert!(checker.check_fairness(&states, &transitions).is_ok());
+    }
+
+    #[test]
+    fn test_buichi_checker_fairness_violated() {
+        use crate::fairness::{ActionLabel, FairnessConstraint, LabeledTransition};
+
+        // Create a cycle: 0 -> 1 -> 0
+        // with only "ActionA" occurring, but fairness requires "ActionB"
+        let states = vec![0, 1];
+        let transitions = vec![
+            LabeledTransition {
+                from: 0,
+                to: 1,
+                action: ActionLabel::new("ActionA"),
+            },
+            LabeledTransition {
+                from: 1,
+                to: 0,
+                action: ActionLabel::new("ActionA"),
+            },
+        ];
+
+        let constraint = FairnessConstraint::Weak {
+            vars: vec!["x".to_string()],
+            action: "ActionB".to_string(),
+        };
+
+        let checker = BuchiChecker::new(vec![constraint]);
+
+        // Should fail: ActionB doesn't occur but might be enabled
+        // (conservatively assumes it's enabled)
+        assert!(checker.check_fairness(&states, &transitions).is_err());
+    }
+
+    #[test]
+    fn test_buichi_checker_with_enablement() {
+        use crate::fairness::{ActionLabel, FairnessConstraint, LabeledTransition};
+
+        // Cycle: 0 -> 1 -> 0
+        let states = vec![0, 1];
+        let transitions = vec![
+            LabeledTransition {
+                from: 0,
+                to: 1,
+                action: ActionLabel::new("Inc"),
+            },
+            LabeledTransition {
+                from: 1,
+                to: 0,
+                action: ActionLabel::new("Inc"),
+            },
+        ];
+
+        let wf = FairnessConstraint::Weak {
+            vars: vec!["x".to_string()],
+            action: "Dec".to_string(),
+        };
+
+        let checker = BuchiChecker::new(vec![wf]);
+
+        // Dec is never enabled, so fairness is satisfied
+        let is_enabled = |_state: &i32, action: &str| action != "Dec";
+
+        assert!(
+            checker
+                .check_fairness_with_enablement(&states, &transitions, is_enabled)
+                .is_ok()
+        );
+
+        // Dec is enabled but never occurs - fairness violated
+        let always_enabled = |_state: &i32, _action: &str| true;
+
+        assert!(
+            checker
+                .check_fairness_with_enablement(&states, &transitions, always_enabled)
+                .is_err()
+        );
     }
 }

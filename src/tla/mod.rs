@@ -8,7 +8,9 @@ pub mod scan;
 pub mod temporal;
 pub mod value;
 
-pub use action_exec::{NextBranchProbe, evaluate_next_states, probe_next_disjuncts};
+pub use action_exec::{
+    NextBranchProbe, evaluate_next_states, evaluate_next_states_labeled, probe_next_disjuncts,
+};
 pub use action_ir::{ActionClause, ActionIr, compile_action_ir, looks_like_action};
 pub use cfg::{ConfigValue, TlaConfig, parse_tla_config};
 pub use eval::{
