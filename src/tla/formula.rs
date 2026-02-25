@@ -90,7 +90,7 @@ pub fn classify_clause(clause: &str) -> ClauseKind {
         let rhs = rhs.trim();
         if let Some(var) = lhs.strip_suffix('\'') {
             let var = var.trim();
-            if !is_simple_name(var) {
+            if !is_simple_name(var) || rhs.is_empty() {
                 return ClauseKind::Other;
             }
             return ClauseKind::PrimedAssignment {
@@ -98,7 +98,7 @@ pub fn classify_clause(clause: &str) -> ClauseKind {
                 expr: rhs.to_string(),
             };
         }
-        if is_simple_name(lhs) {
+        if is_simple_name(lhs) && !rhs.is_empty() {
             return ClauseKind::UnprimedEquality {
                 var: lhs.to_string(),
                 expr: rhs.to_string(),
