@@ -118,6 +118,23 @@ impl LivenessChecker {
                 // TODO: Implement when we have transition-level trace
                 Ok(())
             }
+
+            TemporalFormula::TemporalForAll { formula, .. } => {
+                // \AA x: P - Universal quantification
+                // For finite trace checking, we check that P holds for the formula
+                // Note: Full semantic would require iterating over all values in domain,
+                // but that's not feasible without runtime state information
+                // For now, we just check the inner formula
+                self.check_formula_on_trace(formula, trace, eval_predicate)
+            }
+
+            TemporalFormula::TemporalExists { formula, .. } => {
+                // \EE x: P - Existential quantification
+                // For finite trace checking, we check if P holds for the formula
+                // Note: Full semantic would require finding at least one value in domain
+                // For now, we just check the inner formula
+                self.check_formula_on_trace(formula, trace, eval_predicate)
+            }
         }
     }
 

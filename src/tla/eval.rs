@@ -409,17 +409,79 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
 
     if let Some((lhs, op, rhs)) = split_top_level_comparison(expr) {
         let left = eval_expr_inner(lhs, ctx, depth + 1)?;
-        let right = eval_expr_inner(rhs, ctx, depth + 1)?;
+
         return match op {
-            "=" => Ok(TlaValue::Bool(left == right)),
-            "/=" => Ok(TlaValue::Bool(left != right)),
-            "#" => Ok(TlaValue::Bool(left != right)),
-            "<" => Ok(TlaValue::Bool(left.as_int()? < right.as_int()?)),
-            "<=" => Ok(TlaValue::Bool(left.as_int()? <= right.as_int()?)),
-            ">" => Ok(TlaValue::Bool(left.as_int()? > right.as_int()?)),
-            ">=" => Ok(TlaValue::Bool(left.as_int()? >= right.as_int()?)),
-            "\\in" => Ok(TlaValue::Bool(right.contains(&left)?)),
+            "=" => {
+                let right = eval_expr_inner(rhs, ctx, depth + 1)?;
+                Ok(TlaValue::Bool(left == right))
+            }
+            "/=" | "#" => {
+                let right = eval_expr_inner(rhs, ctx, depth + 1)?;
+                Ok(TlaValue::Bool(left != right))
+            }
+            "<" | "<=" | ">" | ">=" => {
+                let right = eval_expr_inner(rhs, ctx, depth + 1)?;
+                let cmp = match op {
+                    "<" => left.as_int()? < right.as_int()?,
+                    "<=" => left.as_int()? <= right.as_int()?,
+                    ">" => left.as_int()? > right.as_int()?,
+                    ">=" => left.as_int()? >= right.as_int()?,
+                    _ => unreachable!(),
+                };
+                Ok(TlaValue::Bool(cmp))
+            }
+            "\\in" => {
+                // Special handling for infinite built-in sets
+                let rhs_trimmed = rhs.trim();
+                match rhs_trimmed {
+                    "Nat" => {
+                        let val = left.as_int()?;
+                        Ok(TlaValue::Bool(val >= 0))
+                    }
+                    "Int" => {
+                        // Any integer is in Int
+                        let _ = left.as_int()?; // Verify it's an integer
+                        Ok(TlaValue::Bool(true))
+                    }
+                    "BOOLEAN" => {
+                        // Check if it's a boolean
+                        match left {
+                            TlaValue::Bool(_) => Ok(TlaValue::Bool(true)),
+                            _ => Ok(TlaValue::Bool(false)),
+                        }
+                    }
+                    _ => {
+                        // Regular set membership
+                        let right = eval_expr_inner(rhs, ctx, depth + 1)?;
+                        Ok(TlaValue::Bool(right.contains(&left)?))
+                    }
+                }
+            }
+            "\\notin" => {
+                // Not in operator - opposite of \in
+                let rhs_trimmed = rhs.trim();
+                match rhs_trimmed {
+                    "Nat" => {
+                        let val = left.as_int()?;
+                        Ok(TlaValue::Bool(val < 0))
+                    }
+                    "Int" => {
+                        // No integer is not in Int
+                        let _ = left.as_int()?;
+                        Ok(TlaValue::Bool(false))
+                    }
+                    "BOOLEAN" => match left {
+                        TlaValue::Bool(_) => Ok(TlaValue::Bool(false)),
+                        _ => Ok(TlaValue::Bool(true)),
+                    },
+                    _ => {
+                        let right = eval_expr_inner(rhs, ctx, depth + 1)?;
+                        Ok(TlaValue::Bool(!right.contains(&left)?))
+                    }
+                }
+            }
             "\\subseteq" => {
+                let right = eval_expr_inner(rhs, ctx, depth + 1)?;
                 let lhs_set = left.as_set()?;
                 let rhs_set = right.as_set()?;
                 Ok(TlaValue::Bool(lhs_set.iter().all(|v| rhs_set.contains(v))))
@@ -735,6 +797,18 @@ fn parse_base<'a>(
     }
 
     if let Some((value, rest)) = parse_int_prefix(s) {
+        // Check for range operator a..b
+        if rest.trim_start().starts_with("..") {
+            let after_dots = rest.trim_start()[2..].trim_start();
+            if let Some((end_value, final_rest)) = parse_int_prefix(after_dots) {
+                // Create a set containing all integers from value to end_value (inclusive)
+                let range_set: BTreeSet<TlaValue> =
+                    (value..=end_value).map(TlaValue::Int).collect();
+                return Ok((TlaValue::Set(range_set), final_rest));
+            } else {
+                return Err(anyhow!("expected integer after '..' in range expression"));
+            }
+        }
         return Ok((TlaValue::Int(value), rest));
     }
 
@@ -2112,7 +2186,18 @@ fn split_top_level_set_minus(expr: &str) -> Vec<String> {
 }
 
 fn split_top_level_comparison(expr: &str) -> Option<(&str, &'static str, &str)> {
-    let patterns = ["\\subseteq", "\\in", "<=", ">=", "/=", "#", "=", "<", ">"];
+    let patterns = [
+        "\\subseteq",
+        "\\notin",
+        "\\in",
+        "<=",
+        ">=",
+        "/=",
+        "#",
+        "=",
+        "<",
+        ">",
+    ];
 
     let mut i = 0usize;
     let mut paren = 0usize;

@@ -1,9 +1,10 @@
+use crate::fairness::{ActionLabel, FairnessConstraint, LabeledTransition};
 use crate::model::Model;
-use crate::symmetry::SymmetrySpec;
+use crate::symmetry::{SymmetrySpec, canonicalize_state};
 use crate::tla::{
     ClauseKind, ConfigValue, EvalContext, TemporalFormula, TlaConfig, TlaModule, TlaState,
     TlaValue, classify_clause, eval_action_constraint, eval_expr, evaluate_next_states,
-    parse_tla_config, parse_tla_module_file, split_top_level,
+    evaluate_next_states_labeled, parse_tla_config, parse_tla_module_file, split_top_level,
 };
 use anyhow::{Context, Result, anyhow};
 use std::collections::{BTreeMap, HashSet};
@@ -17,6 +18,7 @@ pub struct TlaModel {
     pub next_name: String,
     pub invariant_exprs: Vec<(String, String)>,
     pub temporal_properties: Vec<(String, TemporalFormula)>,
+    pub fairness_constraints: Vec<FairnessConstraint>,
     pub state_constraints: Vec<(String, String)>,
     pub action_constraints: Vec<(String, String)>,
     pub symmetry: Option<SymmetrySpec>,
@@ -50,6 +52,7 @@ impl TlaModel {
         let initial_state = evaluate_init_state(&module, &config, &init_name)?;
         let invariant_exprs = resolve_invariant_exprs(&module, &config);
         let temporal_properties = resolve_temporal_properties(&module, &config)?;
+        let fairness_constraints = extract_fairness_constraints(&temporal_properties);
         let state_constraints = resolve_constraint_exprs(&module, &config);
         let action_constraints = resolve_action_constraint_exprs(&module, &config);
         let symmetry = resolve_symmetry(&module, &config);
@@ -62,6 +65,7 @@ impl TlaModel {
             next_name,
             invariant_exprs,
             temporal_properties,
+            fairness_constraints,
             state_constraints,
             action_constraints,
             symmetry,
@@ -178,9 +182,16 @@ impl Model for TlaModel {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::Hasher;
 
+        // Apply symmetry reduction if specified
+        let canonical_state = if let Some(ref symmetry) = self.symmetry {
+            canonicalize_state(state, symmetry)
+        } else {
+            state.clone()
+        };
+
         // If view function is defined, fingerprint only the view
         if self.view.is_some() {
-            match self.evaluate_view(state) {
+            match self.evaluate_view(&canonical_state) {
                 Ok(view_value) => {
                     // Hash the view value
                     if let Ok(bytes) = bincode::serialize(&view_value) {
@@ -197,7 +208,7 @@ impl Model for TlaModel {
 
         // No view or view failed - hash the full state using serialization
         let mut hasher = DefaultHasher::new();
-        if let Ok(bytes) = bincode::serialize(state) {
+        if let Ok(bytes) = bincode::serialize(&canonical_state) {
             hasher.write(&bytes);
         }
         hasher.finish()
@@ -219,6 +230,41 @@ impl TlaModel {
             let record: BTreeMap<String, TlaValue> = state.clone();
             Ok(TlaValue::Record(record))
         }
+    }
+
+    /// Generate next states with action labels for fairness checking
+    ///
+    /// This is used when fairness constraints are present and we need to track
+    /// which action generated each transition for fairness verification.
+    pub fn next_states_labeled(
+        &self,
+        state: &TlaState,
+    ) -> Result<Vec<LabeledTransition<TlaState>>, String> {
+        let next_def = self
+            .module
+            .definitions
+            .get(&self.next_name)
+            .ok_or_else(|| format!("missing Next definition '{}'", self.next_name))?;
+
+        evaluate_next_states_labeled(
+            &next_def.body,
+            &self.next_name,
+            &self.module.definitions,
+            state,
+        )
+        .map_err(|e| format!("labeled next-state evaluation failed: {}", e))
+    }
+
+    /// Check if this model has fairness constraints
+    pub fn has_fairness_constraints(&self) -> bool {
+        !self.fairness_constraints.is_empty()
+    }
+
+    /// Check if this model has liveness properties
+    pub fn has_liveness_properties(&self) -> bool {
+        self.temporal_properties
+            .iter()
+            .any(|(_, formula)| formula.is_liveness_property())
     }
 }
 
@@ -512,6 +558,63 @@ fn config_value_to_tla(value: &ConfigValue) -> Option<TlaValue> {
         ConfigValue::Set(values) => Some(TlaValue::Set(
             values.iter().filter_map(config_value_to_tla).collect(),
         )),
+    }
+}
+
+/// Extract fairness constraints from temporal properties
+///
+/// Fairness constraints (WF and SF) are stored in temporal_properties but need
+/// to be extracted separately for fairness checking on the state graph.
+fn extract_fairness_constraints(
+    temporal_properties: &[(String, TemporalFormula)],
+) -> Vec<FairnessConstraint> {
+    let mut constraints = Vec::new();
+
+    for (_name, formula) in temporal_properties {
+        extract_fairness_from_formula(formula, &mut constraints);
+    }
+
+    constraints
+}
+
+/// Recursively extract fairness constraints from a temporal formula
+fn extract_fairness_from_formula(
+    formula: &TemporalFormula,
+    constraints: &mut Vec<FairnessConstraint>,
+) {
+    match formula {
+        TemporalFormula::WeakFairness { vars, action } => {
+            constraints.push(FairnessConstraint::Weak {
+                vars: vars.clone(),
+                action: action.clone(),
+            });
+        }
+        TemporalFormula::StrongFairness { vars, action } => {
+            constraints.push(FairnessConstraint::Strong {
+                vars: vars.clone(),
+                action: action.clone(),
+            });
+        }
+        TemporalFormula::Always(inner)
+        | TemporalFormula::Eventually(inner)
+        | TemporalFormula::InfinitelyOften(inner)
+        | TemporalFormula::EventuallyAlways(inner)
+        | TemporalFormula::Not(inner) => {
+            extract_fairness_from_formula(inner, constraints);
+        }
+        TemporalFormula::TemporalForAll { formula: inner, .. }
+        | TemporalFormula::TemporalExists { formula: inner, .. } => {
+            extract_fairness_from_formula(inner, constraints);
+        }
+        TemporalFormula::And(left, right)
+        | TemporalFormula::Or(left, right)
+        | TemporalFormula::LeadsTo(left, right) => {
+            extract_fairness_from_formula(left, constraints);
+            extract_fairness_from_formula(right, constraints);
+        }
+        TemporalFormula::StatePredicate(_) => {
+            // No fairness constraints in state predicates
+        }
     }
 }
 
