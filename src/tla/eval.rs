@@ -4,9 +4,20 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_EVAL_DEPTH: usize = 256;
 
+/// Context for evaluating expressions on a single state
 #[derive(Debug, Clone)]
 pub struct EvalContext<'a> {
     pub state: &'a TlaState,
+    pub locals: BTreeMap<String, TlaValue>,
+    pub local_definitions: BTreeMap<String, TlaDefinition>,
+    pub definitions: Option<&'a BTreeMap<String, TlaDefinition>>,
+}
+
+/// Context for evaluating action constraints over two states (current -> next)
+#[derive(Debug, Clone)]
+pub struct TransitionContext<'a> {
+    pub current_state: &'a TlaState,
+    pub next_state: &'a TlaState,
     pub locals: BTreeMap<String, TlaValue>,
     pub local_definitions: BTreeMap<String, TlaDefinition>,
     pub definitions: Option<&'a BTreeMap<String, TlaDefinition>>,
@@ -56,7 +67,7 @@ impl<'a> EvalContext<'a> {
         next
     }
 
-    fn runtime_value(&self, name: &str) -> Option<TlaValue> {
+    pub fn runtime_value(&self, name: &str) -> Option<TlaValue> {
         if let Some(v) = self.locals.get(name) {
             return Some(v.clone());
         }
@@ -85,12 +96,179 @@ impl<'a> EvalContext<'a> {
     }
 }
 
+impl<'a> TransitionContext<'a> {
+    pub fn new(current_state: &'a TlaState, next_state: &'a TlaState) -> Self {
+        Self {
+            current_state,
+            next_state,
+            locals: BTreeMap::new(),
+            local_definitions: BTreeMap::new(),
+            definitions: None,
+        }
+    }
+
+    pub fn with_definitions(
+        current_state: &'a TlaState,
+        next_state: &'a TlaState,
+        definitions: &'a BTreeMap<String, TlaDefinition>,
+    ) -> Self {
+        Self {
+            current_state,
+            next_state,
+            locals: BTreeMap::new(),
+            local_definitions: BTreeMap::new(),
+            definitions: Some(definitions),
+        }
+    }
+
+    /// Resolve a variable name, handling primed (x') and unprimed (x) variables
+    pub fn resolve_variable(&self, name: &str) -> Option<TlaValue> {
+        // Check if it's a primed variable (x')
+        if let Some(unprimed_name) = name.strip_suffix('\'') {
+            // Primed variable - look in next_state
+            return self.next_state.get(unprimed_name).cloned();
+        }
+
+        // Unprimed variable - check locals first, then current_state
+        if let Some(v) = self.locals.get(name) {
+            return Some(v.clone());
+        }
+
+        self.current_state.get(name).cloned()
+    }
+
+    pub fn definition(&self, name: &str) -> Option<TlaDefinition> {
+        if let Some(def) = self.local_definitions.get(name) {
+            return Some(def.clone());
+        }
+        self.definitions.and_then(|defs| defs.get(name).cloned())
+    }
+}
+
 pub fn eval_expr(expr: &str, ctx: &EvalContext<'_>) -> Result<TlaValue> {
     eval_expr_inner(expr, ctx, 0)
 }
 
 pub fn eval_guard(expr: &str, ctx: &EvalContext<'_>) -> Result<bool> {
     eval_expr(expr, ctx)?.as_bool()
+}
+
+/// Evaluate an action constraint over a state transition
+///
+/// Action constraints can reference both current-state variables (x) and
+/// next-state variables (x'). Returns true if the constraint is satisfied.
+pub fn eval_action_constraint(
+    expr: &str,
+    current: &TlaState,
+    next: &TlaState,
+    definitions: Option<&BTreeMap<String, TlaDefinition>>,
+) -> Result<bool> {
+    let ctx = if let Some(defs) = definitions {
+        TransitionContext::with_definitions(current, next, defs)
+    } else {
+        TransitionContext::new(current, next)
+    };
+
+    eval_transition_expr(expr, &ctx, 0)?.as_bool()
+}
+
+/// Evaluate an expression in a transition context (supporting primed variables)
+fn eval_transition_expr(expr: &str, ctx: &TransitionContext<'_>, depth: usize) -> Result<TlaValue> {
+    if depth > MAX_EVAL_DEPTH {
+        return Err(anyhow!("eval depth limit exceeded at {}", MAX_EVAL_DEPTH));
+    }
+
+    let expr = expr.trim();
+
+    // Handle primed and unprimed identifiers
+    if is_identifier(expr) {
+        if let Some(val) = ctx.resolve_variable(expr) {
+            return Ok(val);
+        }
+
+        // Try to resolve as definition
+        if let Some(def) = ctx.definition(expr) {
+            if def.params.is_empty() {
+                // For now, we can't fully evaluate definitions in transition context
+                // This would require a full transition-aware evaluator
+                // Just return a model value
+                return Ok(TlaValue::ModelValue(expr.to_string()));
+            }
+        }
+
+        return Ok(TlaValue::ModelValue(expr.to_string()));
+    }
+
+    // For now, only support simple comparisons
+    // Full implementation would need to recursively handle all expressions
+    // with primed variable support throughout
+
+    // Try simple comparison: x' >= x
+    if let Some((left, op, right)) = parse_simple_comparison(expr) {
+        let left_val = eval_transition_expr(left.trim(), ctx, depth + 1)?;
+        let right_val = eval_transition_expr(right.trim(), ctx, depth + 1)?;
+
+        return Ok(TlaValue::Bool(apply_comparison(&left_val, op, &right_val)?));
+    }
+
+    // TODO: Add support for full expression evaluation with primed variables
+    Err(anyhow!(
+        "complex action constraints not yet fully supported: {}",
+        expr
+    ))
+}
+
+fn is_identifier(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+
+    // Allow primed identifiers (x')
+    let base = s.strip_suffix('\'').unwrap_or(s);
+
+    let mut chars = base.chars();
+    match chars.next() {
+        Some(c) if c.is_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+
+    chars.all(|c| c.is_alphanumeric() || c == '_')
+}
+
+fn parse_simple_comparison(expr: &str) -> Option<(&str, &str, &str)> {
+    for op in [">=", "<=", "=", ">", "<", "/="] {
+        if let Some(idx) = expr.find(op) {
+            let left = &expr[..idx];
+            let right = &expr[idx + op.len()..];
+            return Some((left, op, right));
+        }
+    }
+    None
+}
+
+fn apply_comparison(left: &TlaValue, op: &str, right: &TlaValue) -> Result<bool> {
+    match (left, right) {
+        (TlaValue::Int(a), TlaValue::Int(b)) => Ok(match op {
+            ">=" => a >= b,
+            "<=" => a <= b,
+            "=" => a == b,
+            ">" => a > b,
+            "<" => a < b,
+            "/=" => a != b,
+            _ => return Err(anyhow!("unknown operator: {}", op)),
+        }),
+        (TlaValue::Bool(a), TlaValue::Bool(b)) => Ok(match op {
+            "=" => a == b,
+            "/=" => a != b,
+            _ => return Err(anyhow!("invalid operator for bool: {}", op)),
+        }),
+        _ => Err(anyhow!(
+            "comparison not supported for types: {:?} {} {:?}",
+            left,
+            op,
+            right
+        )),
+    }
 }
 
 pub fn apply_action_ir(action: &ActionIr, current: &TlaState) -> Result<Option<TlaState>> {
