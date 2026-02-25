@@ -5,6 +5,7 @@ pub mod eval;
 pub mod formula;
 pub mod module;
 pub mod scan;
+pub mod temporal;
 pub mod value;
 
 pub use action_exec::{NextBranchProbe, evaluate_next_states, probe_next_disjuncts};
@@ -14,4 +15,5 @@ pub use eval::{EvalContext, apply_action_ir, apply_action_ir_with_context, eval_
 pub use formula::{ClauseKind, classify_clause, split_top_level};
 pub use module::{TlaDefinition, TlaModule, parse_tla_module_file, parse_tla_module_text};
 pub use scan::{ModuleScan, ScanAggregate, scan_module_closure};
+pub use temporal::TemporalFormula;
 pub use value::{TlaState, TlaValue};
