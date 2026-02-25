@@ -173,6 +173,35 @@ impl Model for TlaModel {
 
         Ok(())
     }
+
+    fn fingerprint(&self, state: &Self::State) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::Hasher;
+
+        // If view function is defined, fingerprint only the view
+        if self.view.is_some() {
+            match self.evaluate_view(state) {
+                Ok(view_value) => {
+                    // Hash the view value
+                    if let Ok(bytes) = bincode::serialize(&view_value) {
+                        let mut hasher = DefaultHasher::new();
+                        hasher.write(&bytes);
+                        return hasher.finish();
+                    }
+                }
+                Err(_) => {
+                    // View evaluation failed - fall back to full state fingerprint
+                }
+            }
+        }
+
+        // No view or view failed - hash the full state using serialization
+        let mut hasher = DefaultHasher::new();
+        if let Ok(bytes) = bincode::serialize(state) {
+            hasher.write(&bytes);
+        }
+        hasher.finish()
+    }
 }
 
 impl TlaModel {

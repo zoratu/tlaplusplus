@@ -33,4 +33,21 @@ pub trait Model: Send + Sync + 'static {
         // Default: no constraints, all transitions are valid
         Ok(())
     }
+
+    /// Compute fingerprint of a state
+    ///
+    /// This method allows models to customize how states are fingerprinted,
+    /// which is critical for:
+    /// - View functions: fingerprint only the "view" of the state
+    /// - Symmetry reduction: fingerprint the canonical representative
+    ///
+    /// Default implementation uses standard hashing of the full state.
+    fn fingerprint(&self, state: &Self::State) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::Hasher;
+
+        let mut hasher = DefaultHasher::new();
+        state.hash(&mut hasher);
+        hasher.finish()
+    }
 }
