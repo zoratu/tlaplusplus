@@ -589,6 +589,14 @@ where
                     .states_generated
                     .fetch_add(successors.len() as u64, Ordering::Relaxed);
 
+                // Filter successors by state constraints (prune states that don't satisfy constraints)
+                successors.retain(|next_state| {
+                    worker_model.check_state_constraints(next_state).is_ok()
+                        && worker_model
+                            .check_action_constraints(&state, next_state)
+                            .is_ok()
+                });
+
                 let mut process_batch = |pending_batch: &mut Vec<M::State>| -> Result<()> {
                     if pending_batch.is_empty() {
                         return Ok(());
