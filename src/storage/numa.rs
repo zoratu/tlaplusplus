@@ -27,7 +27,9 @@ impl NumaTopology {
 
         if !node_dir.exists() {
             // NUMA not available - assume single node
-            eprintln!("NUMA topology not available, assuming single node");
+            if std::env::var("TLAPP_VERBOSE").is_ok() {
+                eprintln!("NUMA topology not available, assuming single node");
+            }
             return Ok(Self {
                 node_count: 1,
                 cpu_to_node: HashMap::new(),

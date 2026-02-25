@@ -349,6 +349,73 @@ where
     checkpoint_result
 }
 
+/// Calculate optimal shard count based on system characteristics.
+///
+/// Heuristics:
+/// - 2-4 shards per worker for low contention
+/// - Power of 2 for fast modulo (bitwise AND)
+/// - NUMA-aligned for even distribution across nodes
+/// - Per-shard size between 256MB-2GB for optimal cache behavior
+///
+fn calculate_optimal_shard_count(
+    worker_count: usize,
+    numa_node_count: usize,
+    total_memory_bytes: usize,
+) -> usize {
+    // Start with 2 shards per worker (good balance between contention and overhead)
+    let shards_per_worker = 2;
+    let base_count = worker_count * shards_per_worker;
+
+    // Round up to next power of 2 for fast modulo (hash & (count - 1))
+    let mut candidate = base_count.next_power_of_two();
+
+    // Ensure it's NUMA-aligned (multiple of NUMA node count)
+    if candidate % numa_node_count != 0 {
+        candidate = ((candidate / numa_node_count) + 1) * numa_node_count;
+        // Round back to power of 2 if needed
+        candidate = candidate.next_power_of_two();
+    }
+
+    // Check per-shard size constraints (256MB - 2GB sweet spot)
+    const MIN_SHARD_SIZE: usize = 256 * 1024 * 1024; // 256 MB
+    const MAX_SHARD_SIZE: usize = 2 * 1024 * 1024 * 1024; // 2 GB
+
+    let per_shard_bytes = total_memory_bytes / candidate;
+
+    let adjusted = if per_shard_bytes < MIN_SHARD_SIZE {
+        // Shards too small - reduce count
+        let min_count = (total_memory_bytes / MAX_SHARD_SIZE).max(1);
+        min_count.next_power_of_two()
+    } else if per_shard_bytes > MAX_SHARD_SIZE {
+        // Shards too large - increase count
+        let max_count = (total_memory_bytes / MIN_SHARD_SIZE).max(1);
+        max_count.next_power_of_two()
+    } else {
+        candidate
+    };
+
+    // Clamp to reasonable bounds
+    // Min: at least 2x NUMA nodes for distribution
+    // Max: 4096 shards is plenty (avoid excessive overhead)
+    let min_shards = (numa_node_count * 2).max(64);
+    let max_shards = 4096;
+
+    let final_count = adjusted.clamp(min_shards, max_shards);
+
+    if std::env::var("TLAPP_VERBOSE").is_ok() {
+        eprintln!(
+            "Auto-calculated shard count: {} (base: {}, workers: {}, NUMA nodes: {}, per-shard: {:.1} GB)",
+            final_count,
+            base_count,
+            worker_count,
+            numa_node_count,
+            (total_memory_bytes / final_count) as f64 / (1024.0 * 1024.0 * 1024.0)
+        );
+    }
+
+    final_count
+}
+
 pub fn run_model<M>(model: M, config: EngineConfig) -> Result<RunOutcome<M::State>>
 where
     M: Model,
@@ -388,20 +455,31 @@ where
     let total_bytes_needed =
         (config.fp_expected_items as f64 / load_factor * bytes_per_entry as f64) as usize;
 
-    // Ensure shard_count is power of 2 for fast modulo
-    let shard_count = config.fp_shards.next_power_of_two().max(64);
+    // Auto-calculate optimal shard count if user specified 0 or default
+    let shard_count = if config.fp_shards == 0 {
+        calculate_optimal_shard_count(
+            worker_plan.worker_count,
+            worker_plan.numa_nodes_used.max(1),
+            total_bytes_needed,
+        )
+    } else {
+        // User specified explicit count - round to power of 2 and ensure minimum
+        config.fp_shards.next_power_of_two().max(64)
+    };
     let bytes_per_shard = (total_bytes_needed / shard_count).max(2 * 1024 * 1024); // At least 2MB
     let shard_size_mb = (bytes_per_shard / (1024 * 1024)).max(1); // At least 1MB
 
-    eprintln!("Fingerprint store config:");
-    eprintln!("  Expected items: {}", config.fp_expected_items);
-    eprintln!("  Shard count: {}", shard_count);
-    eprintln!("  Shard size: {} MB", shard_size_mb);
-    eprintln!(
-        "  Total memory: {} MB ({:.1} GB)",
-        shard_count * shard_size_mb,
-        (shard_count * shard_size_mb) as f64 / 1024.0
-    );
+    if std::env::var("TLAPP_VERBOSE").is_ok() {
+        eprintln!("Fingerprint store config:");
+        eprintln!("  Expected items: {}", config.fp_expected_items);
+        eprintln!("  Shard count: {}", shard_count);
+        eprintln!("  Shard size: {} MB", shard_size_mb);
+        eprintln!(
+            "  Total memory: {} MB ({:.1} GB)",
+            shard_count * shard_size_mb,
+            (shard_count * shard_size_mb) as f64 / 1024.0
+        );
+    }
 
     let mut fp_store = PageAlignedFingerprintStore::new(
         PageAlignedConfig {
@@ -439,16 +517,20 @@ where
             )
             .await
             {
-                eprintln!("Fingerprint writer {} failed: {}", shard_id, e);
+                if std::env::var("TLAPP_VERBOSE").is_ok() {
+                    eprintln!("Fingerprint writer {} failed: {}", shard_id, e);
+                }
             }
         });
     }
 
-    eprintln!("Async I/O runtime started with {} threads", 4);
-    eprintln!(
-        "  {} fingerprint writers spawned (one per shard)",
-        shard_count
-    );
+    if std::env::var("TLAPP_VERBOSE").is_ok() {
+        eprintln!("Async I/O runtime started with {} threads", 4);
+        eprintln!(
+            "  {} fingerprint writers spawned (one per shard)",
+            shard_count
+        );
+    }
 
     // Enable persistence
     fp_store.enable_persistence(persist_tx);

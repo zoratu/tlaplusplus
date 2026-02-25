@@ -98,10 +98,12 @@ pub async fn fingerprint_writer_task(
                     write_batch(&mut file, &batch).await?;
                     total_written += batch.len() as u64;
                 }
-                eprintln!(
-                    "Shard {} writer exiting: {} fingerprints written",
-                    shard_id, total_written
-                );
+                if std::env::var("TLAPP_VERBOSE").is_ok() {
+                    eprintln!(
+                        "Shard {} writer exiting: {} fingerprints written",
+                        shard_id, total_written
+                    );
+                }
                 return Err(e);
             }
             Err(_) => {

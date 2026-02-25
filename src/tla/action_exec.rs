@@ -127,34 +127,53 @@ fn execute_branch(
         return execute_exists_branch(after_exists.trim_start(), locals, definitions, state);
     }
 
-    let (name, arg_exprs) = parse_action_call(trimmed)
-        .ok_or_else(|| anyhow!("unsupported branch expression: {trimmed}"))?;
+    // Try to parse as an action call
+    if let Some((name, arg_exprs)) = parse_action_call(trimmed) {
+        let def = definitions
+            .get(&name)
+            .ok_or_else(|| anyhow!("unknown action '{name}'"))?;
+        if def.params.len() != arg_exprs.len() {
+            return Err(anyhow!(
+                "action '{name}' arity mismatch: expected {}, got {}",
+                def.params.len(),
+                arg_exprs.len()
+            ));
+        }
 
-    let def = definitions
-        .get(&name)
-        .ok_or_else(|| anyhow!("unknown action '{name}'"))?;
-    if def.params.len() != arg_exprs.len() {
-        return Err(anyhow!(
-            "action '{name}' arity mismatch: expected {}, got {}",
-            def.params.len(),
-            arg_exprs.len()
-        ));
+        let mut ctx = EvalContext::with_definitions(state, definitions);
+        for (k, v) in locals {
+            ctx.locals.insert(k.clone(), v.clone());
+        }
+
+        let mut args = Vec::with_capacity(arg_exprs.len());
+        for arg_expr in arg_exprs {
+            args.push(eval_expr(&arg_expr, &ctx)?);
+        }
+        for (param, arg) in def.params.iter().zip(args.into_iter()) {
+            ctx.locals.insert(param.clone(), arg);
+        }
+
+        let ir = compile_action_ir(def);
+        let next = apply_action_ir_with_context(&ir, state, &ctx)?;
+        return match next {
+            Some(state) => Ok(vec![state]),
+            None => Ok(Vec::new()),
+        };
     }
+
+    // Not an action call - treat as inline action body (conjunction of constraints)
+    let inline_def = TlaDefinition {
+        name: "<inline>".to_string(),
+        params: Vec::new(),
+        body: trimmed.to_string(),
+    };
 
     let mut ctx = EvalContext::with_definitions(state, definitions);
     for (k, v) in locals {
         ctx.locals.insert(k.clone(), v.clone());
     }
 
-    let mut args = Vec::with_capacity(arg_exprs.len());
-    for arg_expr in arg_exprs {
-        args.push(eval_expr(&arg_expr, &ctx)?);
-    }
-    for (param, arg) in def.params.iter().zip(args.into_iter()) {
-        ctx.locals.insert(param.clone(), arg);
-    }
-
-    let ir = compile_action_ir(def);
+    let ir = compile_action_ir(&inline_def);
     let next = apply_action_ir_with_context(&ir, state, &ctx)?;
     match next {
         Some(state) => Ok(vec![state]),
