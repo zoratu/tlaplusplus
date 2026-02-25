@@ -246,10 +246,12 @@ impl PageAlignedFingerprintStore {
         // Map shards to NUMA nodes
         let shard_to_numa = numa_topology.shard_to_numa_mapping(shard_count, worker_cpus);
 
-        eprintln!(
-            "Creating {} shards with NUMA awareness ({} nodes detected)",
-            shard_count, numa_topology.node_count
-        );
+        if std::env::var("TLAPP_VERBOSE").is_ok() {
+            eprintln!(
+                "Creating {} shards with NUMA awareness ({} nodes detected)",
+                shard_count, numa_topology.node_count
+            );
+        }
 
         // Create shards on their assigned NUMA nodes
         let mut shards = Vec::with_capacity(shard_count);
@@ -259,13 +261,15 @@ impl PageAlignedFingerprintStore {
                 shard_id, numa_node
             ))?;
 
-            eprintln!(
-                "  Shard {:3}: {:.1} GB on NUMA node {} (capacity: {} fingerprints)",
-                shard_id,
-                config.shard_size_mb as f64 / 1024.0,
-                numa_node,
-                shard.capacity
-            );
+            if std::env::var("TLAPP_VERBOSE").is_ok() {
+                eprintln!(
+                    "  Shard {:3}: {:.1} GB on NUMA node {} (capacity: {} fingerprints)",
+                    shard_id,
+                    config.shard_size_mb as f64 / 1024.0,
+                    numa_node,
+                    shard.capacity
+                );
+            }
 
             shards.push(shard);
         }
@@ -273,10 +277,12 @@ impl PageAlignedFingerprintStore {
         let total_capacity: usize = shards.iter().map(|s| s.capacity).sum();
         let total_memory_gb = (shard_count * config.shard_size_mb) as f64 / 1024.0;
 
-        eprintln!(
-            "Total fingerprint capacity: {} entries ({:.1} GB)",
-            total_capacity, total_memory_gb
-        );
+        if std::env::var("TLAPP_VERBOSE").is_ok() {
+            eprintln!(
+                "Total fingerprint capacity: {} entries ({:.1} GB)",
+                total_capacity, total_memory_gb
+            );
+        }
 
         Ok(Self {
             shards,
@@ -426,10 +432,12 @@ unsafe fn allocate_huge_pages(size: usize) -> *mut u8 {
     };
 
     if ptr != MAP_FAILED {
-        eprintln!(
-            "  Allocated {} MB with explicit huge pages",
-            aligned_size / (1024 * 1024)
-        );
+        if std::env::var("TLAPP_VERBOSE").is_ok() {
+            eprintln!(
+                "  Allocated {} MB with explicit huge pages",
+                aligned_size / (1024 * 1024)
+            );
+        }
         return ptr as *mut u8;
     }
 
@@ -451,16 +459,18 @@ unsafe fn allocate_huge_pages(size: usize) -> *mut u8 {
 
     // Advise kernel to use huge pages
     let result = unsafe { madvise(ptr, aligned_size, MADV_HUGEPAGE) };
-    if result == 0 {
-        eprintln!(
-            "  Allocated {} MB with transparent huge pages (THP)",
-            aligned_size / (1024 * 1024)
-        );
-    } else {
-        eprintln!(
-            "  Allocated {} MB (THP advise failed, using regular pages)",
-            aligned_size / (1024 * 1024)
-        );
+    if std::env::var("TLAPP_VERBOSE").is_ok() {
+        if result == 0 {
+            eprintln!(
+                "  Allocated {} MB with transparent huge pages (THP)",
+                aligned_size / (1024 * 1024)
+            );
+        } else {
+            eprintln!(
+                "  Allocated {} MB (THP advise failed, using regular pages)",
+                aligned_size / (1024 * 1024)
+            );
+        }
     }
 
     ptr as *mut u8

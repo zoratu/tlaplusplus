@@ -2,3 +2,4 @@
 /.tlapp*
 /.tlc-out
 /.corpus-cache
+/scripts/remote_*.sh

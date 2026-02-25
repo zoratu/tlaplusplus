@@ -25,9 +25,10 @@ AltInit == Init
 
 Advance ==
     /\ step < MaxDepth
-    /\ step' = step + 1
-    /\ pos' = IF Len(trace) = 0 THEN pos ELSE trace[Len(trace)]
-    /\ trace' = Append(trace, pos')
+    /\ LET newPos == IF Len(trace) = 0 THEN pos ELSE trace[Len(trace)]
+       IN /\ step' = step + 1
+          /\ pos' = newPos
+          /\ trace' = Append(trace, newPos)
 
 Reset ==
     /\ step > 0

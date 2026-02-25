@@ -56,12 +56,16 @@ impl TlaModel {
 
         // Also extract fairness from SPECIFICATION if present
         if let Some(spec_name) = config.specification.as_ref() {
-            eprintln!(
-                "Checking SPECIFICATION '{}' for fairness constraints",
-                spec_name
-            );
+            if std::env::var("TLAPP_VERBOSE").is_ok() {
+                eprintln!(
+                    "Checking SPECIFICATION '{}' for fairness constraints",
+                    spec_name
+                );
+            }
             if let Some(spec_def) = module.definitions.get(spec_name) {
-                eprintln!("  Spec body: {}", spec_def.body);
+                if std::env::var("TLAPP_VERBOSE").is_ok() {
+                    eprintln!("  Spec body: {}", spec_def.body);
+                }
                 match TemporalFormula::parse(&spec_def.body) {
                     Ok(spec_formula) => {
                         extract_fairness_from_formula(&spec_formula, &mut fairness_constraints);
@@ -562,6 +566,16 @@ fn evaluate_init_state(module: &TlaModule, cfg: &TlaConfig, init_name: &str) -> 
         .definitions
         .get(init_name)
         .ok_or_else(|| anyhow!("missing Init definition '{init_name}'"))?;
+
+    // If the init body is just a reference to another definition, resolve it recursively
+    let trimmed_body = init_def.body.trim();
+    if let Some(ref_name) = parse_simple_identifier(trimmed_body) {
+        // Check if this is a reference to another definition (not just a bare identifier)
+        if module.definitions.contains_key(&ref_name) && ref_name != init_name {
+            // Recursively evaluate the referenced init
+            return evaluate_init_state(module, cfg, &ref_name);
+        }
+    }
 
     let mut state = BTreeMap::new();
     for (k, v) in &cfg.constants {
