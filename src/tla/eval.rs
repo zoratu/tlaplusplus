@@ -1,4 +1,6 @@
-use crate::tla::{ActionClause, ActionIr, TlaDefinition, TlaState, TlaValue};
+use crate::tla::{
+    ActionClause, ActionIr, ClauseKind, TlaDefinition, TlaState, TlaValue, classify_clause,
+};
 use anyhow::{Result, anyhow};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -288,6 +290,42 @@ fn apply_comparison(left: &TlaValue, op: &str, right: &TlaValue) -> Result<bool>
     }
 }
 
+/// Evaluate a LET expression that contains primed assignments
+fn eval_let_action(
+    expr: &str,
+    ctx: &EvalContext<'_>,
+    staged: &mut BTreeMap<String, TlaValue>,
+    unchanged_vars: &mut Vec<String>,
+) -> Result<()> {
+    let (defs_text, body_text) =
+        split_outer_let(expr).ok_or_else(|| anyhow!("invalid LET expression in action: {expr}"))?;
+    let defs = parse_let_definitions(defs_text)?;
+    let child_ctx = ctx.with_local_definitions(defs);
+
+    // The body should be a conjunction of primed assignments and guards
+    let conjuncts = split_top_level_symbol(body_text, "/\\");
+    for conjunct in conjuncts {
+        let trimmed = conjunct.trim();
+        match classify_clause(trimmed) {
+            ClauseKind::PrimedAssignment { var, expr: rhs } => {
+                let value = eval_expr(&rhs, &child_ctx)?;
+                staged.insert(var, value);
+            }
+            ClauseKind::Unchanged { vars } => {
+                unchanged_vars.extend(vars);
+            }
+            _ => {
+                // This is a guard - evaluate it
+                if !eval_guard(trimmed, &child_ctx)? {
+                    return Err(anyhow!("LET action guard failed: {}", trimmed));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 pub fn apply_action_ir(action: &ActionIr, current: &TlaState) -> Result<Option<TlaState>> {
     let ctx = EvalContext::new(current);
     apply_action_ir_with_context(action, current, &ctx)
@@ -314,6 +352,11 @@ pub fn apply_action_ir_with_context(
             }
             ActionClause::Unchanged { vars } => {
                 unchanged_vars.extend(vars.iter().cloned());
+            }
+            ActionClause::LetWithPrimes { expr } => {
+                // Evaluate LET expression which should produce assignments
+                // The LET IN body should be a conjunction of primed assignments
+                eval_let_action(expr, ctx, &mut staged, &mut unchanged_vars)?;
             }
         }
     }
@@ -1140,12 +1183,24 @@ fn parse_base<'a>(
             return Ok((value, next_rest));
         }
 
-        // Handle prefix operators like DOMAIN that don't use parentheses
+        // Handle prefix operators like DOMAIN and ENABLED that don't use parentheses
         if matches!(name.as_str(), "DOMAIN") && !has_runtime_value {
             // Parse the argument as the next atom
             let (arg_value, next_rest) = parse_base(rest_after_name.trim_start(), ctx, depth + 1)?;
             let value = eval_operator_call(&name, vec![arg_value], ctx, depth + 1)?;
             return Ok((value, next_rest));
+        }
+
+        // Handle ENABLED operator: ENABLED ActionName
+        if matches!(name.as_str(), "ENABLED") && !has_runtime_value {
+            let action_name_part = rest_after_name.trim_start();
+            // Parse the action name (simple identifier)
+            if let Some((action_name, next_rest)) = parse_identifier_prefix(action_name_part) {
+                let value = eval_enabled(&action_name, ctx, depth + 1)?;
+                return Ok((value, next_rest));
+            } else {
+                return Err(anyhow!("ENABLED expects an action name"));
+            }
         }
 
         let value = ctx.resolve_identifier(&name, depth + 1)?;
@@ -1399,6 +1454,48 @@ fn eval_module_instance_ref(
 
     // Try to evaluate as a nullary operator call
     eval_module_instance_call(alias, name, vec![], ctx, depth)
+}
+
+/// Evaluate ENABLED operator: check if an action is enabled in the current state
+fn eval_enabled(action_name: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<TlaValue> {
+    if depth > MAX_EVAL_DEPTH {
+        return Err(anyhow!("ENABLED recursion depth exceeded at {action_name}"));
+    }
+
+    // Look up the action definition
+    let action_def = ctx
+        .definition(action_name)
+        .ok_or_else(|| anyhow!("action '{}' not found for ENABLED", action_name))?;
+
+    // Check if the action has parameters (should be 0 for actions)
+    if !action_def.params.is_empty() {
+        return Err(anyhow!(
+            "ENABLED expects a nullary action, but '{}' has {} parameters",
+            action_name,
+            action_def.params.len()
+        ));
+    }
+
+    // Compile the action to IR
+    let action_ir = crate::tla::compile_action_ir(&action_def);
+
+    // Try to apply the action to see if it's enabled
+    // An action is enabled if it can produce a successor state
+    match crate::tla::apply_action_ir_with_context(&action_ir, ctx.state, ctx) {
+        Ok(Some(_next_state)) => {
+            // Action produced a successor - it's enabled
+            Ok(TlaValue::Bool(true))
+        }
+        Ok(None) => {
+            // Action did not produce a successor (guard failed) - not enabled
+            Ok(TlaValue::Bool(false))
+        }
+        Err(_) => {
+            // Evaluation error - action is not enabled
+            // (This can happen with complex expressions that aren't fully supported)
+            Ok(TlaValue::Bool(false))
+        }
+    }
 }
 
 fn eval_operator_call(
