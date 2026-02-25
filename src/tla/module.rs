@@ -269,6 +269,13 @@ fn split_definition_line(line: &str) -> Option<(&str, &str)> {
 }
 
 fn parse_def_head(lhs: &str) -> (String, Vec<String>) {
+    // Strip LOCAL prefix if present
+    let lhs = if let Some(rest) = lhs.strip_prefix("LOCAL ") {
+        rest.trim()
+    } else {
+        lhs
+    };
+
     if let Some(open) = lhs.find('(')
         && let Some(close) = lhs.rfind(')')
     {

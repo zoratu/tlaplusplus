@@ -3,9 +3,20 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ActionClause {
-    PrimedAssignment { var: String, expr: String },
-    Unchanged { vars: Vec<String> },
-    Guard { expr: String },
+    PrimedAssignment {
+        var: String,
+        expr: String,
+    },
+    Unchanged {
+        vars: Vec<String>,
+    },
+    Guard {
+        expr: String,
+    },
+    /// LET expression that contains primed assignments in its IN body
+    LetWithPrimes {
+        expr: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,9 +69,19 @@ pub fn compile_action_ir(def: &TlaDefinition) -> ActionIr {
                 ClauseKind::Unchanged { vars } => {
                     clauses.push(ActionClause::Unchanged { vars });
                 }
-                _ => clauses.push(ActionClause::Guard {
-                    expr: part.trim().to_string(),
-                }),
+                _ => {
+                    // Check if this is a LET expression with primed assignments
+                    let trimmed = part.trim();
+                    if trimmed.starts_with("LET") && trimmed.contains('\'') {
+                        clauses.push(ActionClause::LetWithPrimes {
+                            expr: trimmed.to_string(),
+                        });
+                    } else {
+                        clauses.push(ActionClause::Guard {
+                            expr: trimmed.to_string(),
+                        });
+                    }
+                }
             }
         }
     }

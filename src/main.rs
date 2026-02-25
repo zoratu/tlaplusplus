@@ -379,6 +379,7 @@ fn main() -> anyhow::Result<()> {
                         ActionClause::PrimedAssignment { .. } => action_primed_assignments += 1,
                         ActionClause::Unchanged { .. } => action_unchanged_clauses += 1,
                         ActionClause::Guard { .. } => action_guard_clauses += 1,
+                        ActionClause::LetWithPrimes { .. } => action_guard_clauses += 1,
                     }
                 }
             }
@@ -507,7 +508,8 @@ fn main() -> anyhow::Result<()> {
                 for clause in ir.clauses {
                     match clause {
                         ActionClause::Guard { expr }
-                        | ActionClause::PrimedAssignment { expr, .. } => {
+                        | ActionClause::PrimedAssignment { expr, .. }
+                        | ActionClause::LetWithPrimes { expr } => {
                             expr_total += 1;
                             match eval_expr(&expr, &ctx) {
                                 Ok(_) => expr_ok += 1,
