@@ -12,6 +12,48 @@ use tlaplusplus::tla::{
 };
 use tlaplusplus::{EngineConfig, run_model};
 
+/// Parse human-readable byte sizes like "200GB", "10GiB", "512MB"
+fn parse_byte_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+
+    // Try to parse as raw number first
+    if let Ok(n) = s.parse::<u64>() {
+        return Ok(n);
+    }
+
+    // Parse number with unit suffix
+    let (num_part, unit_part) = s
+        .char_indices()
+        .find(|(_, c)| c.is_alphabetic())
+        .map(|(i, _)| s.split_at(i))
+        .ok_or_else(|| format!("Invalid byte size format: {}", s))?;
+
+    let num: f64 = num_part
+        .trim()
+        .parse()
+        .map_err(|_| format!("Invalid number in byte size: {}", num_part))?;
+
+    let multiplier: u64 = match unit_part.to_uppercase().as_str() {
+        "B" => 1,
+        "KB" => 1_000,
+        "KIB" => 1_024,
+        "MB" => 1_000_000,
+        "MIB" => 1_048_576,
+        "GB" => 1_000_000_000,
+        "GIB" => 1_073_741_824,
+        "TB" => 1_000_000_000_000,
+        "TIB" => 1_099_511_627_776,
+        _ => {
+            return Err(format!(
+                "Unknown unit: {}. Supported: B, KB, KiB, MB, MiB, GB, GiB, TB, TiB",
+                unit_part
+            ));
+        }
+    };
+
+    Ok((num * multiplier as f64) as u64)
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "tlaplusplus")]
 #[command(about = "Prototype scalable runtime for TLA+ model checking", long_about = None)]
@@ -39,7 +81,8 @@ struct RuntimeArgs {
     numa_pinning: bool,
     #[arg(
         long,
-        help = "Hard memory ceiling (bytes) used to tune runtime caches/queues"
+        value_parser = parse_byte_size,
+        help = "Hard memory ceiling (supports units: 200GB, 10GiB, 512MB, etc.)"
     )]
     memory_max_bytes: Option<u64>,
     #[arg(
