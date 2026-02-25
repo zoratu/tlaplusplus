@@ -1,4 +1,5 @@
-use crate::model::Model;
+use crate::fairness::{FairnessConstraint, TarjanSCC, check_fairness_on_scc};
+use crate::model::{LabeledTransition, Model};
 use crate::storage::channel_queue::ChannelQueue;
 use crate::storage::fingerprint_store::{
     FingerprintStats as OldFingerprintStats, FingerprintStore,
@@ -14,10 +15,10 @@ use crate::system::{
     pin_current_thread_to_cpu,
 };
 use anyhow::{Context, Result, anyhow};
+use dashmap::DashMap;
 use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -504,6 +505,16 @@ where
     // Work-stealing queues detect completion internally
     // No need for separate monitor thread
 
+    // Check if we need to collect labeled transitions for fairness checking
+    let collect_labeled_transitions = model.has_fairness_constraints();
+    let labeled_transitions: Option<Arc<DashMap<u64, Vec<LabeledTransition<M::State>>>>> =
+        if collect_labeled_transitions {
+            eprintln!("Fairness constraints detected - collecting labeled transitions");
+            Some(Arc::new(DashMap::new()))
+        } else {
+            None
+        };
+
     let mut workers = Vec::with_capacity(worker_plan.worker_count);
     for (worker_id, worker_state) in worker_states.into_iter().enumerate() {
         let worker_model = Arc::clone(&model);
@@ -519,6 +530,7 @@ where
         let worker_stop_on_violation = config.stop_on_violation;
         let worker_fp_batch_size = config.fp_batch_size.max(1);
         let worker_cpu = worker_plan.assigned_cpus.get(worker_id).copied().flatten();
+        let worker_labeled_transitions = labeled_transitions.clone();
 
         workers.push(std::thread::spawn(move || {
             if let Some(cpu) = worker_cpu
@@ -586,7 +598,38 @@ where
                 }
 
                 successors.clear();
-                worker_model.next_states(&state, &mut successors);
+
+                // Use labeled transitions if fairness constraints exist
+                if let Some(ref transitions_map) = worker_labeled_transitions {
+                    if let Some(labeled_transitions_vec) = worker_model.next_states_labeled(&state)
+                    {
+                        // Collect labeled transitions and extract successor states
+                        let state_fp = worker_model.fingerprint(&state);
+
+                        // Store all transitions from this state
+                        let mut transitions_from_state =
+                            Vec::with_capacity(labeled_transitions_vec.len());
+                        for labeled_trans in labeled_transitions_vec {
+                            successors.push(labeled_trans.to.clone());
+                            transitions_from_state.push(labeled_trans);
+                        }
+
+                        // Store transitions in the map (keyed by source state fingerprint)
+                        if !transitions_from_state.is_empty() {
+                            transitions_map
+                                .entry(state_fp)
+                                .or_insert_with(Vec::new)
+                                .extend(transitions_from_state);
+                        }
+                    } else {
+                        // Fallback to unlabeled if model doesn't provide labeled transitions
+                        worker_model.next_states(&state, &mut successors);
+                    }
+                } else {
+                    // No fairness constraints - use regular next_states
+                    worker_model.next_states(&state, &mut successors);
+                }
+
                 worker_stats
                     .states_generated
                     .fetch_add(successors.len() as u64, Ordering::Relaxed);
@@ -697,7 +740,98 @@ where
         return Err(anyhow!(err));
     }
 
-    let violation = violation_rx.try_recv().ok();
+    let mut violation = violation_rx.try_recv().ok();
+
+    // Check fairness constraints if we collected labeled transitions
+    if let Some(transitions_map) = labeled_transitions.as_ref() {
+        eprintln!(
+            "Checking fairness constraints on {} states with transitions...",
+            transitions_map.len()
+        );
+
+        // Flatten all transitions into a single vector
+        let all_transitions: Vec<LabeledTransition<M::State>> = transitions_map
+            .iter()
+            .flat_map(|entry| entry.value().clone())
+            .collect();
+
+        if !all_transitions.is_empty() {
+            eprintln!("  Total transitions collected: {}", all_transitions.len());
+
+            // Collect all unique states from transitions
+            let mut state_set = HashSet::new();
+            for trans in &all_transitions {
+                state_set.insert(model.fingerprint(&trans.from));
+                state_set.insert(model.fingerprint(&trans.to));
+            }
+            let unique_states: Vec<M::State> = all_transitions
+                .iter()
+                .flat_map(|t| vec![t.from.clone(), t.to.clone()])
+                .collect::<Vec<_>>()
+                .into_iter()
+                .filter(|s| {
+                    let fp = model.fingerprint(s);
+                    state_set.remove(&fp)
+                })
+                .collect();
+
+            eprintln!("  Unique states in graph: {}", unique_states.len());
+
+            // Build adjacency map for SCC detection
+            let mut adjacency: HashMap<M::State, Vec<M::State>> = HashMap::new();
+            for trans in &all_transitions {
+                adjacency
+                    .entry(trans.from.clone())
+                    .or_insert_with(Vec::new)
+                    .push(trans.to.clone());
+            }
+
+            // Find strongly connected components using Tarjan's algorithm
+            let mut tarjan = TarjanSCC::new();
+            let sccs = tarjan.find_sccs(&unique_states, |state| {
+                adjacency.get(state).cloned().unwrap_or_default()
+            });
+
+            eprintln!("  Found {} strongly connected components", sccs.len());
+
+            // Check fairness constraints on each non-trivial SCC
+            // (Non-trivial = has more than one state, or has a self-loop)
+            let non_trivial_sccs: Vec<_> = sccs
+                .iter()
+                .filter(|scc| {
+                    scc.len() > 1
+                        || (scc.len() == 1 && {
+                            let state = &scc[0];
+                            adjacency
+                                .get(state)
+                                .map(|succs| succs.contains(state))
+                                .unwrap_or(false)
+                        })
+                })
+                .collect();
+
+            if !non_trivial_sccs.is_empty() {
+                eprintln!(
+                    "  Checking fairness on {} non-trivial SCCs",
+                    non_trivial_sccs.len()
+                );
+
+                // Get fairness constraints from model
+                // Note: We need access to fairness constraints, which requires the model
+                // to expose them. For now, we'll check if the model implements a method
+                // to get fairness constraints. This is model-specific (TlaModel has it).
+
+                // For now, we'll just report that we found cycles
+                eprintln!(
+                    "  Note: Fairness checking on cycles detected but constraint validation not yet wired"
+                );
+                eprintln!("        Models must expose fairness constraints for full checking");
+            } else {
+                eprintln!("  No cycles detected - fairness constraints trivially satisfied");
+            }
+        }
+    }
+
     let (states_generated, states_processed, states_distinct, duplicates, enqueued, checkpoints) =
         run_stats.snapshot();
 

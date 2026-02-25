@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -10,6 +10,22 @@ pub struct TlaDefinition {
     pub body: String,
 }
 
+/// Represents a module instance (INSTANCE declaration)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlaModuleInstance {
+    /// Alias name for this instance (e.g., "Helpers")
+    pub alias: String,
+    /// Module name being instantiated (e.g., "CoverageHelper")
+    pub module_name: String,
+    /// Parameter substitutions: maps parameter name to substitution expression
+    /// e.g., "Node" -> "Node" for "WITH Node <- Node"
+    pub substitutions: BTreeMap<String, String>,
+    /// Whether this instance is LOCAL
+    pub is_local: bool,
+    /// The loaded module (populated after parsing)
+    pub module: Option<Box<TlaModule>>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TlaModule {
     pub name: String,
@@ -18,6 +34,7 @@ pub struct TlaModule {
     pub constants: Vec<String>,
     pub variables: Vec<String>,
     pub definitions: BTreeMap<String, TlaDefinition>,
+    pub instances: BTreeMap<String, TlaModuleInstance>,
 }
 
 pub fn parse_tla_module_file(path: &Path) -> Result<TlaModule> {
@@ -25,7 +42,45 @@ pub fn parse_tla_module_file(path: &Path) -> Result<TlaModule> {
         .with_context(|| format!("failed reading module {}", path.display()))?;
     let mut module = parse_tla_module_text(&raw)?;
     module.path = path.display().to_string();
+
+    // Load module instances
+    load_module_instances(&mut module, path)?;
+
     Ok(module)
+}
+
+/// Load modules referenced by INSTANCE declarations
+fn load_module_instances(module: &mut TlaModule, base_path: &Path) -> Result<()> {
+    let module_dir = base_path.parent().unwrap_or_else(|| Path::new("."));
+
+    for (alias, instance) in module.instances.iter_mut() {
+        // Try to find the module file
+        let instance_path = module_dir.join(format!("{}.tla", instance.module_name));
+
+        if instance_path.exists() {
+            // Load the module
+            let instance_module = parse_tla_module_file(&instance_path).with_context(|| {
+                format!(
+                    "failed to load instance module '{}' for alias '{}'",
+                    instance.module_name, alias
+                )
+            })?;
+
+            instance.module = Some(Box::new(instance_module));
+        } else {
+            // Check if it's a built-in module that we can skip
+            let builtin_modules = ["Naturals", "Integers", "Sequences", "FiniteSets", "TLC"];
+            if !builtin_modules.contains(&instance.module_name.as_str()) {
+                eprintln!(
+                    "Warning: Instance module '{}' not found at {}",
+                    instance.module_name,
+                    instance_path.display()
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
 
 pub fn parse_tla_module_text(input: &str) -> Result<TlaModule> {
@@ -116,6 +171,19 @@ pub fn parse_tla_module_text(input: &str) -> Result<TlaModule> {
             current_def_indent = 0;
             mode = NameListMode::Variables;
             push_names(rest, &mut module.variables);
+            continue;
+        }
+
+        // Parse INSTANCE declarations
+        // Formats:
+        //   Alias == INSTANCE ModuleName
+        //   Alias == INSTANCE ModuleName WITH Param1 <- Value1, Param2 <- Value2
+        //   LOCAL Alias == INSTANCE ModuleName
+        if let Some(instance) = parse_instance_declaration(trimmed) {
+            flush_definition(&mut module, &mut current_def);
+            current_def_indent = 0;
+            mode = NameListMode::None;
+            module.instances.insert(instance.alias.clone(), instance);
             continue;
         }
 
@@ -331,6 +399,95 @@ fn extract_module_name(line: &str) -> Option<String> {
         }
     }
     if name.is_empty() { None } else { Some(name) }
+}
+
+/// Parse an INSTANCE declaration
+/// Formats:
+///   Alias == INSTANCE ModuleName
+///   Alias == INSTANCE ModuleName WITH Param1 <- Value1, Param2 <- Value2
+///   LOCAL Alias == INSTANCE ModuleName WITH...
+fn parse_instance_declaration(line: &str) -> Option<TlaModuleInstance> {
+    let line = line.trim();
+
+    // Check if line contains INSTANCE
+    if !line.contains("INSTANCE") {
+        return None;
+    }
+
+    // Check for LOCAL prefix
+    let (is_local, line) = if let Some(rest) = line.strip_prefix("LOCAL ") {
+        (true, rest.trim())
+    } else {
+        (false, line)
+    };
+
+    // Split on ==
+    let (lhs, rhs) = line.split_once("==")?;
+    let alias = lhs.trim();
+
+    // Check if this is a valid alias (simple identifier)
+    if !alias.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+
+    // Parse RHS: INSTANCE ModuleName [WITH ...]
+    let rhs = rhs.trim();
+    if !rhs.starts_with("INSTANCE") {
+        return None;
+    }
+
+    let after_instance = rhs["INSTANCE".len()..].trim();
+
+    // Check for WITH clause
+    let (module_name, with_clause) = if let Some(idx) = after_instance.find(" WITH ") {
+        (
+            after_instance[..idx].trim(),
+            Some(after_instance[idx + " WITH ".len()..].trim()),
+        )
+    } else {
+        (after_instance, None)
+    };
+
+    // Parse substitutions from WITH clause
+    let mut substitutions = BTreeMap::new();
+    if let Some(with_str) = with_clause {
+        // Split on <- at the top level (not inside brackets)
+        let mut depth = 0;
+        let mut start = 0;
+        let chars: Vec<char> = with_str.chars().collect();
+
+        for i in 0..chars.len() {
+            match chars[i] {
+                '{' | '[' | '(' | '<' => depth += 1,
+                '}' | ']' | ')' | '>' => depth -= 1,
+                ',' if depth == 0 => {
+                    // Found a top-level comma - this separates substitutions
+                    let subst = &with_str[start..i];
+                    if let Some((param, value)) = subst.split_once("<-") {
+                        substitutions.insert(param.trim().to_string(), value.trim().to_string());
+                    }
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+
+        // Handle the last substitution
+        if start < with_str.len() {
+            let subst = &with_str[start..];
+            if let Some((param, value)) = subst.split_once("<-") {
+                substitutions.insert(param.trim().to_string(), value.trim().to_string());
+            }
+        }
+    }
+
+    Some(TlaModuleInstance {
+        alias: alias.to_string(),
+        module_name: module_name.to_string(),
+        substitutions,
+        is_local,
+        module: None,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

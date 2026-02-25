@@ -11,6 +11,7 @@ pub struct EvalContext<'a> {
     pub locals: BTreeMap<String, TlaValue>,
     pub local_definitions: BTreeMap<String, TlaDefinition>,
     pub definitions: Option<&'a BTreeMap<String, TlaDefinition>>,
+    pub instances: Option<&'a BTreeMap<String, crate::tla::module::TlaModuleInstance>>,
 }
 
 /// Context for evaluating action constraints over two states (current -> next)
@@ -30,6 +31,7 @@ impl<'a> EvalContext<'a> {
             locals: BTreeMap::new(),
             local_definitions: BTreeMap::new(),
             definitions: None,
+            instances: None,
         }
     }
 
@@ -42,6 +44,21 @@ impl<'a> EvalContext<'a> {
             locals: BTreeMap::new(),
             local_definitions: BTreeMap::new(),
             definitions: Some(definitions),
+            instances: None,
+        }
+    }
+
+    pub fn with_definitions_and_instances(
+        state: &'a TlaState,
+        definitions: &'a BTreeMap<String, TlaDefinition>,
+        instances: &'a BTreeMap<String, crate::tla::module::TlaModuleInstance>,
+    ) -> Self {
+        Self {
+            state,
+            locals: BTreeMap::new(),
+            local_definitions: BTreeMap::new(),
+            definitions: Some(definitions),
+            instances: Some(instances),
         }
     }
 
@@ -1086,6 +1103,27 @@ fn parse_base<'a>(
         let has_runtime_value = ctx.runtime_value(&name).is_some();
         let has_operator = ctx.definition(&name).is_some();
 
+        // Check for module instance operator: Alias!Operator
+        if rest.trim_start().starts_with('!') {
+            let after_bang = rest.trim_start()[1..].trim_start();
+            if let Some((operator_name, rest_after_op)) = parse_identifier_prefix(after_bang) {
+                let trimmed_rest = rest_after_op.trim_start();
+
+                // Check if this is a function call: Alias!Operator(args)
+                if trimmed_rest.starts_with('(') {
+                    let (args_text, next_rest) = take_bracket_group(trimmed_rest, '(', ')')?;
+                    let args = parse_argument_list(args_text, ctx, depth + 1)?;
+                    let value =
+                        eval_module_instance_call(&name, &operator_name, args, ctx, depth + 1)?;
+                    return Ok((value, next_rest));
+                }
+
+                // Otherwise it's a module instance reference to a constant/definition
+                let value = eval_module_instance_ref(&name, &operator_name, ctx, depth + 1)?;
+                return Ok((value, rest_after_op));
+            }
+        }
+
         if rest.trim_start().starts_with('(') {
             let trimmed_rest = rest.trim_start();
             let (args_text, next_rest) = take_bracket_group(trimmed_rest, '(', ')')?;
@@ -1270,6 +1308,97 @@ fn apply_value(
         }
         _ => Err(anyhow!("Cannot apply non-function value: {func:?}")),
     }
+}
+
+/// Evaluate a module instance operator call: Alias!Operator(args)
+fn eval_module_instance_call(
+    alias: &str,
+    operator_name: &str,
+    args: Vec<TlaValue>,
+    ctx: &EvalContext<'_>,
+    depth: usize,
+) -> Result<TlaValue> {
+    if depth > MAX_EVAL_DEPTH {
+        return Err(anyhow!(
+            "module instance recursion depth exceeded at {alias}!{operator_name}"
+        ));
+    }
+
+    // Get the module instance
+    let instances = ctx
+        .instances
+        .ok_or_else(|| anyhow!("no module instances available in context"))?;
+
+    let instance = instances
+        .get(alias)
+        .ok_or_else(|| anyhow!("module instance '{}' not found", alias))?;
+
+    // Get the module
+    let module = instance.module.as_ref().ok_or_else(|| {
+        anyhow!(
+            "module '{}' not loaded for instance '{}'",
+            instance.module_name,
+            alias
+        )
+    })?;
+
+    // Look up the operator in the instance module
+    let operator_def = module.definitions.get(operator_name).ok_or_else(|| {
+        anyhow!(
+            "operator '{}' not found in module '{}'",
+            operator_name,
+            instance.module_name
+        )
+    })?;
+
+    // Check arity
+    if operator_def.params.len() != args.len() {
+        return Err(anyhow!(
+            "operator '{alias}!{operator_name}' arity mismatch: expected {}, got {}",
+            operator_def.params.len(),
+            args.len()
+        ));
+    }
+
+    // Create a new context with the instance module's definitions and instances
+    let mut instance_ctx = ctx.clone();
+    instance_ctx.definitions = Some(&module.definitions);
+    instance_ctx.instances = Some(&module.instances);
+
+    // Apply substitutions: replace constants in the context
+    for (param, value_expr) in &instance.substitutions {
+        // Evaluate the substitution value in the original context
+        let value = eval_expr(value_expr, ctx)?;
+        instance_ctx.locals.insert(param.clone(), value);
+    }
+
+    // Bind operator parameters
+    let mut bound = Vec::with_capacity(operator_def.params.len());
+    for (param, arg) in operator_def.params.iter().zip(args.into_iter()) {
+        bound.push((param.as_str(), arg));
+    }
+
+    let child_ctx = instance_ctx.with_local_values(&bound);
+
+    // Evaluate the operator body
+    eval_expr_inner(&operator_def.body, &child_ctx, depth + 1)
+}
+
+/// Evaluate a module instance reference: Alias!Constant
+fn eval_module_instance_ref(
+    alias: &str,
+    name: &str,
+    ctx: &EvalContext<'_>,
+    depth: usize,
+) -> Result<TlaValue> {
+    if depth > MAX_EVAL_DEPTH {
+        return Err(anyhow!(
+            "module instance recursion depth exceeded at {alias}!{name}"
+        ));
+    }
+
+    // Try to evaluate as a nullary operator call
+    eval_module_instance_call(alias, name, vec![], ctx, depth)
 }
 
 fn eval_operator_call(
