@@ -16,6 +16,8 @@ pub struct TlaModel {
     pub next_name: String,
     pub invariant_exprs: Vec<(String, String)>,
     pub temporal_properties: Vec<(String, TemporalFormula)>,
+    pub state_constraints: Vec<(String, String)>,
+    pub action_constraints: Vec<(String, String)>,
     pub initial_state: TlaState,
 }
 
@@ -45,6 +47,8 @@ impl TlaModel {
         let initial_state = evaluate_init_state(&module, &config, &init_name)?;
         let invariant_exprs = resolve_invariant_exprs(&module, &config);
         let temporal_properties = resolve_temporal_properties(&module, &config)?;
+        let state_constraints = resolve_constraint_exprs(&module, &config);
+        let action_constraints = resolve_action_constraint_exprs(&module, &config);
 
         Ok(Self {
             module,
@@ -53,6 +57,8 @@ impl TlaModel {
             next_name,
             invariant_exprs,
             temporal_properties,
+            state_constraints,
+            action_constraints,
             initial_state,
         })
     }
@@ -106,6 +112,49 @@ impl Model for TlaModel {
 
         Ok(())
     }
+
+    fn check_state_constraints(&self, state: &Self::State) -> Result<(), String> {
+        if self.state_constraints.is_empty() {
+            return Ok(());
+        }
+
+        let ctx = EvalContext::with_definitions(state, &self.module.definitions);
+        for (name, expr) in &self.state_constraints {
+            match eval_expr(expr, &ctx) {
+                Ok(TlaValue::Bool(true)) => {}
+                Ok(TlaValue::Bool(false)) => {
+                    return Err(format!("state constraint '{name}' violated (state pruned)"));
+                }
+                Ok(other) => {
+                    return Err(format!(
+                        "state constraint '{name}' did not evaluate to BOOLEAN: {other:?}"
+                    ));
+                }
+                Err(err) => {
+                    return Err(format!(
+                        "failed evaluating state constraint '{name}': {err}"
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn check_action_constraints(
+        &self,
+        _current: &Self::State,
+        _next: &Self::State,
+    ) -> Result<(), String> {
+        // Action constraints are not yet implemented in the eval module
+        // They require evaluating predicates over two states (current and next)
+        // TODO: Implement action constraint evaluation
+        if !self.action_constraints.is_empty() {
+            // For now, just accept all transitions
+            // eprintln!("Warning: action constraints defined but not yet implemented");
+        }
+        Ok(())
+    }
 }
 
 fn resolve_invariant_exprs(module: &TlaModule, cfg: &TlaConfig) -> Vec<(String, String)> {
@@ -151,6 +200,34 @@ fn resolve_temporal_properties(
     }
 
     Ok(properties)
+}
+
+fn resolve_constraint_exprs(module: &TlaModule, cfg: &TlaConfig) -> Vec<(String, String)> {
+    cfg.constraints
+        .iter()
+        .map(|constraint| {
+            if let Some(def) = module.definitions.get(constraint)
+                && def.params.is_empty()
+            {
+                return (constraint.clone(), def.body.clone());
+            }
+            (constraint.clone(), constraint.clone())
+        })
+        .collect()
+}
+
+fn resolve_action_constraint_exprs(module: &TlaModule, cfg: &TlaConfig) -> Vec<(String, String)> {
+    cfg.action_constraints
+        .iter()
+        .map(|constraint| {
+            if let Some(def) = module.definitions.get(constraint)
+                && def.params.is_empty()
+            {
+                return (constraint.clone(), def.body.clone());
+            }
+            (constraint.clone(), constraint.clone())
+        })
+        .collect()
 }
 
 fn resolve_init_next_names(
