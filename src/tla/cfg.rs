@@ -19,6 +19,7 @@ pub struct TlaConfig {
     pub init: Option<String>,
     pub next: Option<String>,
     pub symmetry: Option<String>,
+    pub view: Option<String>,
     pub check_deadlock: Option<bool>,
     pub constants: BTreeMap<String, ConfigValue>,
     pub invariants: Vec<String>,
@@ -63,6 +64,11 @@ pub fn parse_tla_config(input: &str) -> Result<TlaConfig> {
         }
         if let Some(value) = line.strip_prefix("SYMMETRY") {
             cfg.symmetry = Some(value.trim().to_string());
+            section = None;
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("VIEW") {
+            cfg.view = Some(value.trim().to_string());
             section = None;
             continue;
         }
