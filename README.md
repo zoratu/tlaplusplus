@@ -166,22 +166,6 @@ To force overflow testing:
   --work-dir ./.tlapp-spill
 ```
 
-## Run on your many-core host
-
-Use `scripts/remote_bench.sh` (defaults to your host/key and `/mnt/weka`):
-
-```bash
-scripts/remote_bench.sh --max-x 20000 --max-y 20000 --max-sum 40000 --workers 96
-```
-
-The remote script defaults to `--core-ids 2-127` for many-core runs.
-
-Environment overrides:
-
-- `REMOTE_HOST` (default: `ubuntu@98.83.110.220`)
-- `REMOTE_KEY` (default: `~/.ssh/weka-isaiah-us-east-1_ed25519`)
-- `REMOTE_DIR` (default: `/mnt/weka/tlaplusplus`)
-
 ## TLA+ compatibility target
 
 Target behavior is direct support for existing TLA+ language/tool semantics without per-model adapters. The current runtime work in this repo is the backend/runtime layer (storage, scheduling, checkpointing, CPU/memory placement).
