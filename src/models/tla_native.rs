@@ -1,11 +1,12 @@
 use crate::model::Model;
+use crate::symmetry::SymmetrySpec;
 use crate::tla::{
     ClauseKind, ConfigValue, EvalContext, TemporalFormula, TlaConfig, TlaModule, TlaState,
     TlaValue, classify_clause, eval_expr, evaluate_next_states, parse_tla_config,
     parse_tla_module_file, split_top_level,
 };
 use anyhow::{Context, Result, anyhow};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 #[derive(Clone, Debug)]
@@ -18,6 +19,7 @@ pub struct TlaModel {
     pub temporal_properties: Vec<(String, TemporalFormula)>,
     pub state_constraints: Vec<(String, String)>,
     pub action_constraints: Vec<(String, String)>,
+    pub symmetry: Option<SymmetrySpec>,
     pub initial_state: TlaState,
 }
 
@@ -49,6 +51,7 @@ impl TlaModel {
         let temporal_properties = resolve_temporal_properties(&module, &config)?;
         let state_constraints = resolve_constraint_exprs(&module, &config);
         let action_constraints = resolve_action_constraint_exprs(&module, &config);
+        let symmetry = resolve_symmetry(&module, &config);
 
         Ok(Self {
             module,
@@ -59,6 +62,7 @@ impl TlaModel {
             temporal_properties,
             state_constraints,
             action_constraints,
+            symmetry,
             initial_state,
         })
     }
@@ -228,6 +232,28 @@ fn resolve_action_constraint_exprs(module: &TlaModule, cfg: &TlaConfig) -> Vec<(
             (constraint.clone(), constraint.clone())
         })
         .collect()
+}
+
+fn resolve_symmetry(module: &TlaModule, cfg: &TlaConfig) -> Option<SymmetrySpec> {
+    cfg.symmetry.as_ref().map(|sym_name| {
+        let mut spec = SymmetrySpec::new(sym_name.clone());
+
+        // Try to extract symmetric values from constants
+        // If the constant is a set of model values, those are the symmetric values
+        if let Some(ConfigValue::Set(values)) = cfg.constants.get(sym_name) {
+            let mut symmetric_values = HashSet::new();
+            for val in values {
+                if let ConfigValue::ModelValue(model_val) = val {
+                    symmetric_values.insert(model_val.clone());
+                }
+            }
+            if !symmetric_values.is_empty() {
+                spec.initialize_from_config(symmetric_values);
+            }
+        }
+
+        spec
+    })
 }
 
 fn resolve_init_next_names(
