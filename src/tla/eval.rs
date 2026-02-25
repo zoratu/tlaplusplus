@@ -2517,17 +2517,6 @@ fn split_top_level(expr: &str, delim: &str, keyword: bool) -> Vec<String> {
         out
     };
 
-    if expr.contains("PositionLimits") && delim == "/\\" {
-        eprintln!("[split_top_level] Returning {} parts", result.len());
-        for (i, part) in result.iter().enumerate() {
-            eprintln!(
-                "[split_top_level]   part[{}]: {}",
-                i,
-                &part[..60.min(part.len())]
-            );
-        }
-    }
-
     result
 }
 
