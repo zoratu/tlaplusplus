@@ -43,6 +43,22 @@ pub enum TemporalFormula {
     /// SF_v(A) - Strong fairness of action A with respect to variables v
     /// If A is enabled infinitely often without being disabled, then A must occur infinitely often
     StrongFairness { vars: Vec<String>, action: String },
+
+    /// \AA x: P - Universal temporal quantification
+    /// For all values x in the domain, temporal formula P holds
+    TemporalForAll {
+        var: String,
+        domain: String,
+        formula: Box<TemporalFormula>,
+    },
+
+    /// \EE x: P - Existential temporal quantification
+    /// There exists a value x in the domain such that temporal formula P holds
+    TemporalExists {
+        var: String,
+        domain: String,
+        formula: Box<TemporalFormula>,
+    },
 }
 
 impl TemporalFormula {
@@ -71,6 +87,8 @@ impl TemporalFormula {
             | TemporalFormula::EventuallyAlways(_)
             | TemporalFormula::WeakFairness { .. }
             | TemporalFormula::StrongFairness { .. } => true,
+            TemporalFormula::TemporalForAll { formula, .. }
+            | TemporalFormula::TemporalExists { formula, .. } => formula.is_liveness_property(),
             TemporalFormula::And(left, right) => {
                 left.is_liveness_property() || right.is_liveness_property()
             }
@@ -85,9 +103,10 @@ impl TemporalFormula {
     /// Parse a temporal formula from TLA+ syntax
     ///
     /// Operator precedence (from lowest to highest):
-    /// 1. /\ and \/ (conjunction/disjunction) - lowest precedence
-    /// 2. ~> (leads-to)
-    /// 3. [], <>, []<>, <>[] (temporal operators) - highest precedence
+    /// 1. \AA, \EE (temporal quantifiers) - bind variables first
+    /// 2. /\ and \/ (conjunction/disjunction)
+    /// 3. ~> (leads-to)
+    /// 4. [], <>, []<>, <>[], WF, SF (temporal operators) - highest precedence
     pub fn parse(expr: &str) -> Result<Self> {
         let trimmed = expr.trim();
 
@@ -99,7 +118,31 @@ impl TemporalFormula {
             }
         }
 
-        // Lowest precedence: Check for conjunction/disjunction first
+        // Highest priority: Check for temporal quantifiers first (they bind variables)
+        // \AA and \EE must be parsed before conjunction because the : separates var from formula
+        if let Some(rest) = trimmed.strip_prefix("\\AA") {
+            if let Some((var, domain, formula_expr)) = parse_temporal_quantifier(rest.trim()) {
+                let formula = Self::parse(&formula_expr)?;
+                return Ok(TemporalFormula::TemporalForAll {
+                    var,
+                    domain,
+                    formula: Box::new(formula),
+                });
+            }
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("\\EE") {
+            if let Some((var, domain, formula_expr)) = parse_temporal_quantifier(rest.trim()) {
+                let formula = Self::parse(&formula_expr)?;
+                return Ok(TemporalFormula::TemporalExists {
+                    var,
+                    domain,
+                    formula: Box::new(formula),
+                });
+            }
+        }
+
+        // Lower precedence: Check for conjunction/disjunction
         if let Some(idx) = find_top_level_operator(trimmed, "/\\") {
             let left = Self::parse(&trimmed[..idx])?;
             let right = Self::parse(&trimmed[idx + 2..])?;
@@ -241,6 +284,67 @@ fn is_balanced(expr: &str) -> bool {
     depth == 0
 }
 
+/// Parse temporal quantifier expression: "var: formula" -> (var, domain, formula)
+///
+/// Examples:
+/// - "\AA n: (n \in Node) /\ <>(n \in Visited)" -> ("n", "Node", "(n \in Node) /\ <>(n \in Visited)")
+/// - "\EE n: (n \in Node) => []P" -> ("n", "Node", "(n \in Node) => []P")
+///
+/// The domain is extracted from the first conjunct if it's a membership test,
+/// otherwise the full formula is kept as-is and domain is set to a placeholder.
+fn parse_temporal_quantifier(input: &str) -> Option<(String, String, String)> {
+    let input = input.trim();
+
+    // Find the colon that separates variable from formula
+    let colon_idx = find_top_level_operator(input, ":")?;
+
+    let var_part = input[..colon_idx].trim();
+    let formula_part = input[colon_idx + 1..].trim();
+
+    // Extract variable name (simple identifier)
+    let var = var_part.to_string();
+
+    // Try to extract domain from the formula
+    // Look for patterns like "(n \in Domain)" at the start
+    let domain =
+        extract_domain_from_formula(&var, formula_part).unwrap_or_else(|| "Any".to_string());
+
+    Some((var, domain, formula_part.to_string()))
+}
+
+/// Extract domain from a formula like "(n \in Node) /\ P" -> Some("Node")
+fn extract_domain_from_formula(var: &str, formula: &str) -> Option<String> {
+    let trimmed = formula.trim();
+
+    // Strip outer parens if present
+    let inner = if trimmed.starts_with('(') {
+        trimmed.trim_start_matches('(').trim_end_matches(')').trim()
+    } else {
+        trimmed
+    };
+
+    // Look for "var \in Domain" at the start (before /\, =>, etc.)
+    let membership_pattern = format!("{} \\in ", var);
+    if let Some(start_idx) = inner.find(&membership_pattern) {
+        if start_idx < 10 {
+            // Should be near the start
+            let after_in = &inner[start_idx + membership_pattern.len()..];
+
+            // Extract domain name (up to next operator or paren)
+            let domain_end = after_in
+                .find(|c: char| matches!(c, ')' | '/' | '\\' | '=' | '~' | '<' | '>' | '['))
+                .unwrap_or(after_in.len());
+
+            let domain = after_in[..domain_end].trim();
+            if !domain.is_empty() {
+                return Some(domain.to_string());
+            }
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,6 +391,52 @@ mod tests {
         let formula = TemporalFormula::parse("[] P /\\ <> Q").unwrap();
         assert!(matches!(formula, TemporalFormula::And(_, _)));
         // Mixed: safety + liveness = liveness
+        assert!(formula.is_liveness_property());
+    }
+
+    #[test]
+    fn test_parse_temporal_forall() {
+        let formula = TemporalFormula::parse("\\AA n: (n \\in Node) => [](n \\in Node)").unwrap();
+        assert!(matches!(formula, TemporalFormula::TemporalForAll { .. }));
+
+        if let TemporalFormula::TemporalForAll {
+            var,
+            domain,
+            formula: inner,
+        } = formula
+        {
+            assert_eq!(var, "n");
+            assert_eq!(domain, "Node");
+            assert!(matches!(*inner, TemporalFormula::StatePredicate(_)));
+        } else {
+            panic!("Expected TemporalForAll");
+        }
+    }
+
+    #[test]
+    fn test_parse_temporal_exists() {
+        let formula = TemporalFormula::parse("\\EE n: (n \\in Node) /\\ <>(visited)").unwrap();
+        assert!(matches!(formula, TemporalFormula::TemporalExists { .. }));
+        assert!(formula.is_liveness_property());
+
+        if let TemporalFormula::TemporalExists {
+            var,
+            domain,
+            formula: inner,
+        } = formula
+        {
+            assert_eq!(var, "n");
+            assert_eq!(domain, "Node");
+            assert!(matches!(*inner, TemporalFormula::And(_, _)));
+        } else {
+            panic!("Expected TemporalExists");
+        }
+    }
+
+    #[test]
+    fn test_parse_temporal_exists_with_eventually() {
+        let formula = TemporalFormula::parse("\\EE n: (n \\in 1..10) /\\ <>(x = n)").unwrap();
+        assert!(matches!(formula, TemporalFormula::TemporalExists { .. }));
         assert!(formula.is_liveness_property());
     }
 }
