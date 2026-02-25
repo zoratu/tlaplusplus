@@ -375,12 +375,43 @@ pub fn apply_action_ir_with_context(
 }
 
 fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<TlaValue> {
+    // DEBUG: Track expression evaluation path when depth is high
+    if std::env::var("TLAPP_TRACE_EVAL").is_ok() && depth >= 3 {
+        let preview_len = if raw_expr.starts_with("LET") {
+            1000
+        } else {
+            100
+        };
+        eprintln!(
+            "TRACE depth={}: expr={:?}",
+            depth,
+            &raw_expr[..preview_len.min(raw_expr.len())]
+        );
+    }
+
     if depth > MAX_EVAL_DEPTH {
         return Err(anyhow!("max expression recursion depth exceeded"));
     }
 
     let mut expr = raw_expr.trim();
     if expr.is_empty() {
+        // Get caller information to debug where empty expressions come from
+        eprintln!("\n=== EMPTY EXPRESSION AT DEPTH {} ===", depth);
+        eprintln!("raw_expr: {:?}", raw_expr);
+        eprintln!("locals: {:?}", ctx.locals.keys().collect::<Vec<_>>());
+
+        // Print a simplified backtrace
+        let bt = std::backtrace::Backtrace::force_capture();
+        let bt_str = format!("{:?}", bt);
+        eprintln!("\nBacktrace (showing tlaplusplus frames):");
+        for line in bt_str
+            .lines()
+            .filter(|l| l.contains("tlaplusplus::tla") && !l.contains("rust_begin_unwind"))
+            .take(15)
+        {
+            eprintln!("  {}", line.trim());
+        }
+
         return Err(anyhow!("empty expression (raw: {raw_expr:?})"));
     }
 
@@ -948,6 +979,20 @@ fn eval_quantifier_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -
         .ok_or_else(|| anyhow!("quantifier is missing ':' in expression: {expr}"))?;
     let binders = after_quant[..colon_idx].trim();
     let body = after_quant[colon_idx + 1..].trim();
+
+    if body.is_empty() {
+        eprintln!("\n=== QUANTIFIER WITH EMPTY BODY ===");
+        eprintln!("is_forall: {}", is_forall);
+        eprintln!("expr (first 500 chars): {:?}", &expr[..500.min(expr.len())]);
+        eprintln!(
+            "after_quant (first 500 chars): {:?}",
+            &after_quant[..500.min(after_quant.len())]
+        );
+        eprintln!("colon_idx: {}", colon_idx);
+        eprintln!("binders: {:?}", binders);
+        eprintln!("body after colon: {:?}", &after_quant[colon_idx + 1..]);
+        eprintln!("body trimmed: {:?}", body);
+    }
 
     let domains = parse_binders(binders, ctx, depth + 1)?;
     let mut assignments = BTreeMap::new();
@@ -2377,6 +2422,7 @@ fn split_top_level(expr: &str, delim: &str, keyword: bool) -> Vec<String> {
     let mut angle = 0usize;
     let mut quantifier_depth = 0usize; // Count of \A or \E seen
     let mut seen_colon_for_quantifier = 0usize; // Count of : seen to close quantifiers
+    let mut let_depth = 0usize; // Count of LET keywords seen (increases on LET, decreases on IN)
     let mut in_string = false;
     let mut escaped = false;
 
@@ -2407,6 +2453,21 @@ fn split_top_level(expr: &str, delim: &str, keyword: bool) -> Vec<String> {
             in_string = true;
             i += ch_len;
             continue;
+        }
+
+        // Track LET depth as we scan through the expression:
+        // - LET increases depth (we're inside a LET expression)
+        // - We DON'T decrement on IN - the LET body continues after IN
+        // - We only reset let_depth when we perform an actual split
+        // This treats the entire "LET defs IN body" as one atomic unit
+        if paren == 0 && bracket == 0 && brace == 0 && angle == 0 {
+            // Check if we're at the start of LET keyword
+            if expr[i..].starts_with("LET") {
+                let after_let = &expr[i + 3..];
+                if after_let.is_empty() || !after_let.chars().next().unwrap().is_alphanumeric() {
+                    let_depth += 1;
+                }
+            }
         }
 
         // Track quantifiers: \A or \E increases depth
@@ -2444,12 +2505,16 @@ fn split_top_level(expr: &str, delim: &str, keyword: bool) -> Vec<String> {
             if is_word_ok {
                 let is_conjunction = delim == "/\\" || delim == "\\/";
                 // Determine if we should split:
-                // 1. If we're before the : in a quantifier (in binders), don't split on /\ or \/
-                // 2. If we're in a quantifier body, check if this /\ is followed by another quantifier
+                // 1. If we're in a LET definition section (between LET and IN), don't split on /\ or \/
+                // 2. If we're before the : in a quantifier (in binders), don't split on /\ or \/
+                // 3. If we're in a quantifier body, check if this /\ is followed by another quantifier
                 //    - If yes: this /\ ENDS the current quantifier - split!
                 //    - If no: this /\ is part of the quantifier body - don't split
-                // 3. Otherwise, split normally
-                let should_split = if quantifier_depth > 0
+                // 4. Otherwise, split normally
+                let should_split = if let_depth > 0 && is_conjunction {
+                    // We're inside a LET expression, don't split on conjunctions
+                    false
+                } else if quantifier_depth > 0
                     && quantifier_depth > seen_colon_for_quantifier
                     && is_conjunction
                 {
@@ -2472,9 +2537,10 @@ fn split_top_level(expr: &str, delim: &str, keyword: bool) -> Vec<String> {
                     if !part.is_empty() {
                         out.push(part.to_string());
                     }
-                    // Reset quantifier tracking for next part
+                    // Reset quantifier and LET tracking for next part
                     quantifier_depth = 0;
                     seen_colon_for_quantifier = 0;
+                    let_depth = 0;
                     start = delim_end;
                     i = delim_end;
                     continue;
