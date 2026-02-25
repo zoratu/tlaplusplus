@@ -81,10 +81,22 @@ impl Default for EngineConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropertyType {
+    /// Safety property - something bad never happens
+    Safety,
+    /// Liveness property - something good eventually happens
+    Liveness,
+}
+
 #[derive(Debug)]
 pub struct Violation<S> {
     pub message: String,
     pub state: S,
+    pub property_type: PropertyType,
+    /// Trace from initial state to violating state (if available)
+    /// Empty for safety violations without trace tracking enabled
+    pub trace: Vec<S>,
 }
 
 #[derive(Debug)]
@@ -554,7 +566,12 @@ where
                     .fetch_add(1, Ordering::Relaxed);
 
                 if let Err(message) = worker_model.check_invariants(&state) {
-                    let _ = worker_violation_tx.try_send(Violation { message, state });
+                    let _ = worker_violation_tx.try_send(Violation {
+                        message,
+                        state,
+                        property_type: PropertyType::Safety,
+                        trace: Vec::new(), // TODO: Add trace tracking for better debugging
+                    });
                     if worker_stop_on_violation {
                         worker_stop.store(true, Ordering::Release);
                     }

@@ -1,8 +1,8 @@
 use crate::model::Model;
 use crate::tla::{
-    ClauseKind, ConfigValue, EvalContext, TlaConfig, TlaModule, TlaState, TlaValue,
-    classify_clause, eval_expr, evaluate_next_states, parse_tla_config, parse_tla_module_file,
-    split_top_level,
+    ClauseKind, ConfigValue, EvalContext, TemporalFormula, TlaConfig, TlaModule, TlaState,
+    TlaValue, classify_clause, eval_expr, evaluate_next_states, parse_tla_config,
+    parse_tla_module_file, split_top_level,
 };
 use anyhow::{Context, Result, anyhow};
 use std::collections::BTreeMap;
@@ -15,6 +15,7 @@ pub struct TlaModel {
     pub init_name: String,
     pub next_name: String,
     pub invariant_exprs: Vec<(String, String)>,
+    pub temporal_properties: Vec<(String, TemporalFormula)>,
     pub initial_state: TlaState,
 }
 
@@ -43,6 +44,7 @@ impl TlaModel {
 
         let initial_state = evaluate_init_state(&module, &config, &init_name)?;
         let invariant_exprs = resolve_invariant_exprs(&module, &config);
+        let temporal_properties = resolve_temporal_properties(&module, &config)?;
 
         Ok(Self {
             module,
@@ -50,6 +52,7 @@ impl TlaModel {
             init_name,
             next_name,
             invariant_exprs,
+            temporal_properties,
             initial_state,
         })
     }
@@ -117,6 +120,37 @@ fn resolve_invariant_exprs(module: &TlaModule, cfg: &TlaConfig) -> Vec<(String, 
             (inv.clone(), inv.clone())
         })
         .collect()
+}
+
+fn resolve_temporal_properties(
+    module: &TlaModule,
+    cfg: &TlaConfig,
+) -> Result<Vec<(String, TemporalFormula)>> {
+    let mut properties = Vec::new();
+
+    for prop_name in &cfg.properties {
+        // Look up definition
+        let expr = if let Some(def) = module.definitions.get(prop_name) {
+            if !def.params.is_empty() {
+                return Err(anyhow!(
+                    "temporal property '{}' must not have parameters",
+                    prop_name
+                ));
+            }
+            &def.body
+        } else {
+            // Treat as inline expression
+            prop_name
+        };
+
+        // Parse temporal formula
+        let formula = TemporalFormula::parse(expr)
+            .with_context(|| format!("failed parsing temporal property '{}'", prop_name))?;
+
+        properties.push((prop_name.clone(), formula));
+    }
+
+    Ok(properties)
 }
 
 fn resolve_init_next_names(
