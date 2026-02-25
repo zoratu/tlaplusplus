@@ -52,7 +52,46 @@ impl TlaModel {
         let initial_state = evaluate_init_state(&module, &config, &init_name)?;
         let invariant_exprs = resolve_invariant_exprs(&module, &config);
         let temporal_properties = resolve_temporal_properties(&module, &config)?;
-        let fairness_constraints = extract_fairness_constraints(&temporal_properties);
+        let mut fairness_constraints = extract_fairness_constraints(&temporal_properties);
+
+        // Also extract fairness from SPECIFICATION if present
+        if let Some(spec_name) = config.specification.as_ref() {
+            eprintln!(
+                "Checking SPECIFICATION '{}' for fairness constraints",
+                spec_name
+            );
+            if let Some(spec_def) = module.definitions.get(spec_name) {
+                eprintln!("  Spec body: {}", spec_def.body);
+                match TemporalFormula::parse(&spec_def.body) {
+                    Ok(spec_formula) => {
+                        extract_fairness_from_formula(&spec_formula, &mut fairness_constraints);
+                    }
+                    Err(e) => {
+                        eprintln!("  Failed to parse Spec as temporal formula: {}", e);
+                    }
+                }
+            } else {
+                eprintln!("  SPECIFICATION '{}' not found in definitions", spec_name);
+            }
+        }
+
+        if !fairness_constraints.is_empty() {
+            eprintln!(
+                "Extracted {} fairness constraints from specification",
+                fairness_constraints.len()
+            );
+            for constraint in &fairness_constraints {
+                match constraint {
+                    FairnessConstraint::Weak { vars, action } => {
+                        eprintln!("  WF_<<{}>>({}) - Weak fairness", vars.join(", "), action);
+                    }
+                    FairnessConstraint::Strong { vars, action } => {
+                        eprintln!("  SF_<<{}>>({}) - Strong fairness", vars.join(", "), action);
+                    }
+                }
+            }
+        }
+
         let state_constraints = resolve_constraint_exprs(&module, &config);
         let action_constraints = resolve_action_constraint_exprs(&module, &config);
         let symmetry = resolve_symmetry(&module, &config);
@@ -103,7 +142,11 @@ impl Model for TlaModel {
             return Ok(());
         }
 
-        let ctx = EvalContext::with_definitions(state, &self.module.definitions);
+        let ctx = EvalContext::with_definitions_and_instances(
+            state,
+            &self.module.definitions,
+            &self.module.instances,
+        );
         for (name, expr) in &self.invariant_exprs {
             match eval_expr(expr, &ctx) {
                 Ok(TlaValue::Bool(true)) => {}
@@ -129,7 +172,11 @@ impl Model for TlaModel {
             return Ok(());
         }
 
-        let ctx = EvalContext::with_definitions(state, &self.module.definitions);
+        let ctx = EvalContext::with_definitions_and_instances(
+            state,
+            &self.module.definitions,
+            &self.module.instances,
+        );
         for (name, expr) in &self.state_constraints {
             match eval_expr(expr, &ctx) {
                 Ok(TlaValue::Bool(true)) => {}
@@ -213,6 +260,45 @@ impl Model for TlaModel {
         }
         hasher.finish()
     }
+
+    fn next_states_labeled(
+        &self,
+        state: &Self::State,
+    ) -> Option<Vec<crate::model::LabeledTransition<Self::State>>> {
+        if !self.has_fairness_constraints() {
+            return None;
+        }
+
+        let next_def = self.module.definitions.get(&self.next_name)?;
+
+        match evaluate_next_states_labeled(
+            &next_def.body,
+            &self.next_name,
+            &self.module.definitions,
+            state,
+        ) {
+            Ok(transitions) => {
+                // Convert from fairness::LabeledTransition to model::LabeledTransition
+                let converted: Vec<crate::model::LabeledTransition<Self::State>> = transitions
+                    .into_iter()
+                    .map(|t| crate::model::LabeledTransition {
+                        from: t.from,
+                        to: t.to,
+                        action: crate::model::ActionLabel {
+                            name: t.action.name,
+                            disjunct_index: t.action.disjunct_index,
+                        },
+                    })
+                    .collect();
+                Some(converted)
+            }
+            Err(_) => None,
+        }
+    }
+
+    fn has_fairness_constraints(&self) -> bool {
+        !self.fairness_constraints.is_empty()
+    }
 }
 
 impl TlaModel {
@@ -222,7 +308,11 @@ impl TlaModel {
     /// projection of the state. If no view is defined, returns the full state.
     pub fn evaluate_view(&self, state: &TlaState) -> Result<TlaValue, String> {
         if let Some(view_expr) = &self.view {
-            let ctx = EvalContext::with_definitions(state, &self.module.definitions);
+            let ctx = EvalContext::with_definitions_and_instances(
+                state,
+                &self.module.definitions,
+                &self.module.instances,
+            );
             eval_expr(view_expr, &ctx).map_err(|e| format!("view evaluation failed: {}", e))
         } else {
             // No view defined - return full state as a value
@@ -501,7 +591,11 @@ fn evaluate_init_state(module: &TlaModule, cfg: &TlaConfig, init_name: &str) -> 
         let mut progress = false;
         let mut next_pending = Vec::new();
         for (var, expr) in pending {
-            let ctx = EvalContext::with_definitions(&state, &module.definitions);
+            let ctx = EvalContext::with_definitions_and_instances(
+                &state,
+                &module.definitions,
+                &module.instances,
+            );
             match eval_expr(&expr, &ctx) {
                 Ok(value) => {
                     state.insert(var, value);
@@ -523,7 +617,8 @@ fn evaluate_init_state(module: &TlaModule, cfg: &TlaConfig, init_name: &str) -> 
         pending = next_pending;
     }
 
-    let ctx = EvalContext::with_definitions(&state, &module.definitions);
+    let ctx =
+        EvalContext::with_definitions_and_instances(&state, &module.definitions, &module.instances);
     for guard in guards {
         if guard.trim().is_empty() {
             continue;

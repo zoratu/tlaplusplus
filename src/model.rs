@@ -3,6 +3,22 @@ use serde::de::DeserializeOwned;
 use std::fmt::Debug;
 use std::hash::Hash;
 
+/// Action label for tracking which actions are taken in transitions
+/// This is optional and only used by models that support fairness checking
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ActionLabel {
+    pub name: String,
+    pub disjunct_index: Option<usize>,
+}
+
+/// Labeled transition - a state transition with an action label
+#[derive(Debug, Clone)]
+pub struct LabeledTransition<S> {
+    pub from: S,
+    pub to: S,
+    pub action: ActionLabel,
+}
+
 pub trait Model: Send + Sync + 'static {
     type State: Clone + Debug + Eq + Hash + Send + Sync + Serialize + DeserializeOwned + 'static;
 
@@ -11,6 +27,27 @@ pub trait Model: Send + Sync + 'static {
     fn initial_states(&self) -> Vec<Self::State>;
 
     fn next_states(&self, state: &Self::State, out: &mut Vec<Self::State>);
+
+    /// Generate labeled next states for fairness checking
+    ///
+    /// This is an optional method that models can implement to support fairness checking.
+    /// If the model has fairness constraints, this method should return a vector of
+    /// labeled transitions (state + action label). Otherwise, it returns None.
+    ///
+    /// Default implementation returns None, meaning the model doesn't support fairness.
+    fn next_states_labeled(
+        &self,
+        _state: &Self::State,
+    ) -> Option<Vec<LabeledTransition<Self::State>>> {
+        None
+    }
+
+    /// Check if this model has fairness constraints that require labeled transitions
+    ///
+    /// Default implementation returns false. Models with fairness should override this.
+    fn has_fairness_constraints(&self) -> bool {
+        false
+    }
 
     fn check_invariants(&self, state: &Self::State) -> Result<(), String>;
 
