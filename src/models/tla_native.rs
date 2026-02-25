@@ -2,8 +2,8 @@ use crate::model::Model;
 use crate::symmetry::SymmetrySpec;
 use crate::tla::{
     ClauseKind, ConfigValue, EvalContext, TemporalFormula, TlaConfig, TlaModule, TlaState,
-    TlaValue, classify_clause, eval_expr, evaluate_next_states, parse_tla_config,
-    parse_tla_module_file, split_top_level,
+    TlaValue, classify_clause, eval_action_constraint, eval_expr, evaluate_next_states,
+    parse_tla_config, parse_tla_module_file, split_top_level,
 };
 use anyhow::{Context, Result, anyhow};
 use std::collections::{BTreeMap, HashSet};
@@ -150,16 +150,27 @@ impl Model for TlaModel {
 
     fn check_action_constraints(
         &self,
-        _current: &Self::State,
-        _next: &Self::State,
+        current: &Self::State,
+        next: &Self::State,
     ) -> Result<(), String> {
-        // Action constraints are not yet implemented in the eval module
-        // They require evaluating predicates over two states (current and next)
-        // TODO: Implement action constraint evaluation
-        if !self.action_constraints.is_empty() {
-            // For now, just accept all transitions
-            // eprintln!("Warning: action constraints defined but not yet implemented");
+        if self.action_constraints.is_empty() {
+            return Ok(());
         }
+
+        for (name, expr) in &self.action_constraints {
+            match eval_action_constraint(expr, current, next, Some(&self.module.definitions)) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(format!("action constraint '{name}' violated"));
+                }
+                Err(err) => {
+                    return Err(format!(
+                        "failed evaluating action constraint '{name}': {err}"
+                    ));
+                }
+            }
+        }
+
         Ok(())
     }
 }
