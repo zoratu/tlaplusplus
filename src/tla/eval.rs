@@ -451,6 +451,131 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
                         }
                     }
                     _ => {
+                        // Check for Seq(S) - sequence membership
+                        if let Some(inner) = rhs_trimmed.strip_prefix("Seq(") {
+                            if let Some(set_expr) = inner.strip_suffix(")") {
+                                // x \in Seq(S) means x is a sequence and all elements are in S
+                                match &left {
+                                    TlaValue::Seq(seq) => {
+                                        let set_val = eval_expr_inner(set_expr, ctx, depth + 1)?;
+                                        let all_in_set = seq
+                                            .iter()
+                                            .all(|elem| set_val.contains(elem).unwrap_or(false));
+                                        return Ok(TlaValue::Bool(all_in_set));
+                                    }
+                                    _ => return Ok(TlaValue::Bool(false)), // Not a sequence
+                                }
+                            }
+                        }
+
+                        // Check for [S -> T] or [field: Type, ...] - function/record set membership
+                        if rhs_trimmed.starts_with('[') && rhs_trimmed.ends_with(']') {
+                            let inner = &rhs_trimmed[1..rhs_trimmed.len() - 1];
+
+                            // Check if it's a function type [S -> T]
+                            if let Some(arrow_idx) = inner.find("->") {
+                                let domain_expr = inner[..arrow_idx].trim();
+                                let codomain_expr = inner[arrow_idx + 2..].trim();
+
+                                // f \in [S -> T] means f is a function, DOMAIN f = S, and all values in T
+                                match &left {
+                                    TlaValue::Function(func) => {
+                                        let domain_set =
+                                            eval_expr_inner(domain_expr, ctx, depth + 1)?;
+                                        let domain_set = domain_set.as_set()?;
+
+                                        // Check that function domain equals the expected domain
+                                        let func_domain: BTreeSet<TlaValue> =
+                                            func.keys().cloned().collect();
+                                        if func_domain != *domain_set {
+                                            return Ok(TlaValue::Bool(false));
+                                        }
+
+                                        // Check all function values are in codomain
+                                        // Handle special case for Nat
+                                        if codomain_expr == "Nat" {
+                                            let all_nat = func
+                                                .values()
+                                                .all(|v| matches!(v.as_int(), Ok(n) if n >= 0));
+                                            return Ok(TlaValue::Bool(all_nat));
+                                        }
+
+                                        let codomain_set =
+                                            eval_expr_inner(codomain_expr, ctx, depth + 1)?;
+                                        let all_in_codomain = func
+                                            .values()
+                                            .all(|v| codomain_set.contains(v).unwrap_or(false));
+                                        return Ok(TlaValue::Bool(all_in_codomain));
+                                    }
+                                    _ => return Ok(TlaValue::Bool(false)), // Not a function
+                                }
+                            }
+
+                            // Check if it's a record type [field: Type, ...]
+                            if inner.contains(':') {
+                                match &left {
+                                    TlaValue::Record(rec) => {
+                                        // Parse field: Type specifications
+                                        let field_specs: Vec<&str> = inner.split(',').collect();
+                                        let mut expected_fields =
+                                            std::collections::HashSet::<String>::new();
+
+                                        for spec in field_specs {
+                                            let parts: Vec<&str> = spec.split(':').collect();
+                                            if parts.len() != 2 {
+                                                continue;
+                                            }
+                                            let field_name = parts[0].trim();
+                                            let field_type = parts[1].trim();
+                                            expected_fields.insert(field_name.to_string());
+
+                                            // Check if record has this field
+                                            if let Some(field_value) = rec.get(field_name) {
+                                                // Check if value matches type
+                                                let matches_type = match field_type {
+                                                    "Nat" => {
+                                                        matches!(field_value.as_int(), Ok(n) if n >= 0)
+                                                    }
+                                                    "Int" => field_value.as_int().is_ok(),
+                                                    "BOOLEAN" => {
+                                                        matches!(field_value, TlaValue::Bool(_))
+                                                    }
+                                                    _ => {
+                                                        // Evaluate type expression and check membership
+                                                        if let Ok(type_val) = eval_expr_inner(
+                                                            field_type,
+                                                            ctx,
+                                                            depth + 1,
+                                                        ) {
+                                                            type_val
+                                                                .contains(field_value)
+                                                                .unwrap_or(false)
+                                                        } else {
+                                                            false
+                                                        }
+                                                    }
+                                                };
+                                                if !matches_type {
+                                                    return Ok(TlaValue::Bool(false));
+                                                }
+                                            } else {
+                                                // Field missing
+                                                return Ok(TlaValue::Bool(false));
+                                            }
+                                        }
+
+                                        // Check that record has no extra fields
+                                        if rec.len() != expected_fields.len() {
+                                            return Ok(TlaValue::Bool(false));
+                                        }
+
+                                        return Ok(TlaValue::Bool(true));
+                                    }
+                                    _ => return Ok(TlaValue::Bool(false)), // Not a record
+                                }
+                            }
+                        }
+
                         // Regular set membership
                         let right = eval_expr_inner(rhs, ctx, depth + 1)?;
                         Ok(TlaValue::Bool(right.contains(&left)?))
@@ -475,6 +600,122 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
                         _ => Ok(TlaValue::Bool(true)),
                     },
                     _ => {
+                        // Check for Seq(S) - sequence membership
+                        if let Some(inner) = rhs_trimmed.strip_prefix("Seq(") {
+                            if let Some(set_expr) = inner.strip_suffix(")") {
+                                // x \notin Seq(S) means x is not a sequence or some element is not in S
+                                match &left {
+                                    TlaValue::Seq(seq) => {
+                                        let set_val = eval_expr_inner(set_expr, ctx, depth + 1)?;
+                                        let all_in_set = seq
+                                            .iter()
+                                            .all(|elem| set_val.contains(elem).unwrap_or(false));
+                                        return Ok(TlaValue::Bool(!all_in_set));
+                                    }
+                                    _ => return Ok(TlaValue::Bool(true)), // Not a sequence
+                                }
+                            }
+                        }
+
+                        // Check for [S -> T] or [field: Type, ...] - function/record set membership
+                        if rhs_trimmed.starts_with('[') && rhs_trimmed.ends_with(']') {
+                            let inner = &rhs_trimmed[1..rhs_trimmed.len() - 1];
+
+                            // Check if it's a function type [S -> T]
+                            if let Some(arrow_idx) = inner.find("->") {
+                                let domain_expr = inner[..arrow_idx].trim();
+                                let codomain_expr = inner[arrow_idx + 2..].trim();
+
+                                // f \notin [S -> T] is the opposite of \in
+                                match &left {
+                                    TlaValue::Function(func) => {
+                                        let domain_set =
+                                            eval_expr_inner(domain_expr, ctx, depth + 1)?;
+                                        let domain_set = domain_set.as_set()?;
+
+                                        let func_domain: BTreeSet<TlaValue> =
+                                            func.keys().cloned().collect();
+                                        if func_domain != *domain_set {
+                                            return Ok(TlaValue::Bool(true));
+                                        }
+
+                                        if codomain_expr == "Nat" {
+                                            let all_nat = func
+                                                .values()
+                                                .all(|v| matches!(v.as_int(), Ok(n) if n >= 0));
+                                            return Ok(TlaValue::Bool(!all_nat));
+                                        }
+
+                                        let codomain_set =
+                                            eval_expr_inner(codomain_expr, ctx, depth + 1)?;
+                                        let all_in_codomain = func
+                                            .values()
+                                            .all(|v| codomain_set.contains(v).unwrap_or(false));
+                                        return Ok(TlaValue::Bool(!all_in_codomain));
+                                    }
+                                    _ => return Ok(TlaValue::Bool(true)), // Not a function
+                                }
+                            }
+
+                            // Check if it's a record type [field: Type, ...]
+                            if inner.contains(':') {
+                                match &left {
+                                    TlaValue::Record(rec) => {
+                                        let field_specs: Vec<&str> = inner.split(',').collect();
+                                        let mut expected_fields =
+                                            std::collections::HashSet::<String>::new();
+
+                                        for spec in field_specs {
+                                            let parts: Vec<&str> = spec.split(':').collect();
+                                            if parts.len() != 2 {
+                                                continue;
+                                            }
+                                            let field_name = parts[0].trim();
+                                            let field_type = parts[1].trim();
+                                            expected_fields.insert(field_name.to_string());
+
+                                            if let Some(field_value) = rec.get(field_name) {
+                                                let matches_type = match field_type {
+                                                    "Nat" => {
+                                                        matches!(field_value.as_int(), Ok(n) if n >= 0)
+                                                    }
+                                                    "Int" => field_value.as_int().is_ok(),
+                                                    "BOOLEAN" => {
+                                                        matches!(field_value, TlaValue::Bool(_))
+                                                    }
+                                                    _ => {
+                                                        if let Ok(type_val) = eval_expr_inner(
+                                                            field_type,
+                                                            ctx,
+                                                            depth + 1,
+                                                        ) {
+                                                            type_val
+                                                                .contains(field_value)
+                                                                .unwrap_or(false)
+                                                        } else {
+                                                            false
+                                                        }
+                                                    }
+                                                };
+                                                if !matches_type {
+                                                    return Ok(TlaValue::Bool(true));
+                                                }
+                                            } else {
+                                                return Ok(TlaValue::Bool(true));
+                                            }
+                                        }
+
+                                        if rec.len() != expected_fields.len() {
+                                            return Ok(TlaValue::Bool(true));
+                                        }
+
+                                        return Ok(TlaValue::Bool(false));
+                                    }
+                                    _ => return Ok(TlaValue::Bool(true)), // Not a record
+                                }
+                            }
+                        }
+
                         let right = eval_expr_inner(rhs, ctx, depth + 1)?;
                         Ok(TlaValue::Bool(!right.contains(&left)?))
                     }
@@ -485,6 +726,14 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
                 let lhs_set = left.as_set()?;
                 let rhs_set = right.as_set()?;
                 Ok(TlaValue::Bool(lhs_set.iter().all(|v| rhs_set.contains(v))))
+            }
+            ".." => {
+                // Range operator: a..b creates set {a, a+1, ..., b}
+                let right = eval_expr_inner(rhs, ctx, depth + 1)?;
+                let start = left.as_int()?;
+                let end = right.as_int()?;
+                let range_set: BTreeSet<TlaValue> = (start..=end).map(TlaValue::Int).collect();
+                Ok(TlaValue::Set(range_set))
             }
             _ => Err(anyhow!("unsupported comparison operator {op}")),
         };
@@ -797,18 +1046,7 @@ fn parse_base<'a>(
     }
 
     if let Some((value, rest)) = parse_int_prefix(s) {
-        // Check for range operator a..b
-        if rest.trim_start().starts_with("..") {
-            let after_dots = rest.trim_start()[2..].trim_start();
-            if let Some((end_value, final_rest)) = parse_int_prefix(after_dots) {
-                // Create a set containing all integers from value to end_value (inclusive)
-                let range_set: BTreeSet<TlaValue> =
-                    (value..=end_value).map(TlaValue::Int).collect();
-                return Ok((TlaValue::Set(range_set), final_rest));
-            } else {
-                return Err(anyhow!("expected integer after '..' in range expression"));
-            }
-        }
+        // Range operator a..b is now handled as a binary operator in comparison section
         return Ok((TlaValue::Int(value), rest));
     }
 
@@ -861,6 +1099,14 @@ fn parse_base<'a>(
             let (args_text, next_rest) = take_bracket_group(trimmed_rest, '[', ']')?;
             let args = parse_argument_list(args_text, ctx, depth + 1)?;
             let value = eval_operator_call(&name, args, ctx, depth + 1)?;
+            return Ok((value, next_rest));
+        }
+
+        // Handle prefix operators like DOMAIN that don't use parentheses
+        if matches!(name.as_str(), "DOMAIN") && !has_runtime_value {
+            // Parse the argument as the next atom
+            let (arg_value, next_rest) = parse_base(rest_after_name.trim_start(), ctx, depth + 1)?;
+            let value = eval_operator_call(&name, vec![arg_value], ctx, depth + 1)?;
             return Ok((value, next_rest));
         }
 
@@ -1180,8 +1426,15 @@ fn eval_operator_call(
                         .collect::<BTreeSet<_>>();
                     return Ok(TlaValue::Set(keys));
                 }
+                TlaValue::Seq(seq) => {
+                    // DOMAIN of a sequence is {1, 2, ..., Len(seq)}
+                    let indices = (1..=seq.len() as i64)
+                        .map(TlaValue::Int)
+                        .collect::<BTreeSet<_>>();
+                    return Ok(TlaValue::Set(indices));
+                }
                 _ => {
-                    return Err(anyhow!("DOMAIN expects a function or record"));
+                    return Err(anyhow!("DOMAIN expects a function, record, or sequence"));
                 }
             }
         }
@@ -2190,6 +2443,7 @@ fn split_top_level_comparison(expr: &str) -> Option<(&str, &'static str, &str)> 
         "\\subseteq",
         "\\notin",
         "\\in",
+        "..",
         "<=",
         ">=",
         "/=",
