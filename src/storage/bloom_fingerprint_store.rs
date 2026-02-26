@@ -123,11 +123,12 @@ impl BloomFingerprintStore {
     }
 
     /// Batch check and insert fingerprints
+    ///
+    /// Optimized: Single write lock per shard instead of lock-per-item
     pub fn contains_or_insert_batch(&self, fps: &[u64], seen: &mut Vec<bool>) -> Result<()> {
         self.batch_calls.fetch_add(1, Ordering::Relaxed);
         self.batch_items
             .fetch_add(fps.len() as u64, Ordering::Relaxed);
-        self.checks.fetch_add(fps.len() as u64, Ordering::Relaxed);
 
         seen.clear();
         seen.resize(fps.len(), false);
@@ -140,40 +141,36 @@ impl BloomFingerprintStore {
             shard_groups[shard_id].push((idx, fp));
         }
 
-        // Process each shard's fingerprints
+        // Track stats locally to reduce atomic operations
+        let mut local_hits = 0u64;
+        let mut local_inserts = 0u64;
+
+        // Process each shard's fingerprints with a SINGLE write lock per shard
         for (shard_id, group) in shard_groups.iter().enumerate() {
             if group.is_empty() {
                 continue;
             }
 
-            let shard = &self.shards[shard_id];
+            // One write lock for entire shard batch - eliminates lock-per-item overhead
+            let mut bloom = self.shards[shard_id].write();
 
             for &(idx, fp) in group {
-                // Check if already present
-                let exists = {
-                    let bloom = shard.read();
-                    bloom.check(&fp)
-                };
-
-                if exists {
+                if bloom.check(&fp) {
                     seen[idx] = true;
-                    self.hits.fetch_add(1, Ordering::Relaxed);
+                    local_hits += 1;
                 } else {
-                    // Insert
-                    let mut bloom = shard.write();
-
-                    // Double-check
-                    if bloom.check(&fp) {
-                        seen[idx] = true;
-                        self.hits.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        bloom.set(&fp);
-                        seen[idx] = false;
-                        self.inserts.fetch_add(1, Ordering::Relaxed);
-                    }
+                    bloom.set(&fp);
+                    seen[idx] = false;
+                    local_inserts += 1;
                 }
             }
+            // Lock released here after processing all items in this shard
         }
+
+        // Single atomic update for stats (instead of per-item)
+        self.checks.fetch_add(fps.len() as u64, Ordering::Relaxed);
+        self.hits.fetch_add(local_hits, Ordering::Relaxed);
+        self.inserts.fetch_add(local_inserts, Ordering::Relaxed);
 
         Ok(())
     }
