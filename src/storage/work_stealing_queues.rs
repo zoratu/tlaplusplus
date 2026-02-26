@@ -240,6 +240,23 @@ impl<T: 'static> WorkStealingQueues<T> {
     {
         self.has_work()
     }
+
+    /// Check if queue is too full and we should apply backpressure
+    /// This prevents unbounded memory growth by pausing state generation
+    /// when we have too many unprocessed states
+    pub fn should_apply_backpressure(&self, max_pending: u64) -> bool {
+        let pushed = self.pushed.load(Ordering::Relaxed);
+        let popped = self.popped.load(Ordering::Relaxed);
+        let pending = pushed.saturating_sub(popped);
+        pending > max_pending
+    }
+
+    /// Get current pending count (pushed - popped)
+    pub fn pending_count(&self) -> u64 {
+        let pushed = self.pushed.load(Ordering::Relaxed);
+        let popped = self.popped.load(Ordering::Relaxed);
+        pushed.saturating_sub(popped)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

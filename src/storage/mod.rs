@@ -1,4 +1,5 @@
 pub mod async_fingerprint_writer;
+pub mod bloom_fingerprint_store;
 pub mod channel_queue;
 pub mod fingerprint_store;
 pub mod hybrid_fingerprint_store;
