@@ -743,9 +743,9 @@ where
 
                 // Apply backpressure: if queue is too full, skip successor generation
                 // This allows workers to process the backlog without deadlock
-                // Target: 30GB total (5.7GB bloom + ~20GB queues)
-                // Combined.tla states are ~56KB each, so 300K states = ~17GB
-                const MAX_PENDING_STATES: u64 = 300_000;
+                // Testing: Increased from 300K to 10M to measure backpressure impact
+                // Java TLC runs with 23M+ states in queue successfully
+                const MAX_PENDING_STATES: u64 = 10_000_000;
                 if worker_queue.should_apply_backpressure(MAX_PENDING_STATES) {
                     // Don't generate successors, just mark worker as idle and continue
                     // This allows us to process the backlog
