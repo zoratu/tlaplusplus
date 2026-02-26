@@ -31,20 +31,30 @@ impl HybridFingerprintStore {
     ///
     /// Parameters:
     /// - work_dir: Directory for sled database
-    /// - cache_size_mb: Sled's in-memory cache size in MB
+    /// - cache_size_mb: Sled's in-memory cache size in MB (KEEP THIS SMALL!)
     pub fn new(work_dir: PathBuf, cache_size_mb: usize) -> Result<Self> {
         let db_path = work_dir.join("fingerprints.sled");
 
-        // Configure sled with bounded cache
+        // CRITICAL: Sled's cache_capacity is just for page cache
+        // Total memory usage can be 3-5x this due to write buffers, compaction, etc.
+        // So we clamp to a conservative max
+        let safe_cache_mb = cache_size_mb.min(5000); // Max 5GB cache
+
+        // Configure sled with VERY conservative settings
         let db = sled::Config::new()
             .path(&db_path)
-            .cache_capacity((cache_size_mb * 1024 * 1024) as u64)
-            .flush_every_ms(Some(5000)) // Flush every 5s
-            .mode(sled::Mode::HighThroughput)
+            .cache_capacity((safe_cache_mb * 1024 * 1024) as u64)
+            .flush_every_ms(Some(1000)) // Flush frequently to avoid buildup
+            .mode(sled::Mode::LowSpace) // Optimize for low memory, not throughput
             .open()?;
 
-        eprintln!("Sled fingerprint store initialized:");
-        eprintln!("  Cache size: {} MB", cache_size_mb);
+        eprintln!("Sled fingerprint store initialized (conservative mode):");
+        eprintln!("  Requested cache: {} MB", cache_size_mb);
+        eprintln!("  Actual cache: {} MB (clamped for safety)", safe_cache_mb);
+        eprintln!(
+            "  Expected peak memory: ~{} MB (3-4x cache)",
+            safe_cache_mb * 4
+        );
         eprintln!("  Database path: {}", db_path.display());
 
         Ok(Self {

@@ -481,13 +481,20 @@ where
         );
     }
 
-    // Use sled-backed store with bounded memory (prevents OOM)
+    // Use sled-backed store with VERY conservative memory limit
+    // Sled's cache_capacity only limits page cache, not total memory usage
+    // Sled also allocates for write buffers, compaction, indexes, etc.
+    // So we use only 5-10% of total memory for sled's cache to be safe
     let cache_mb = config
         .memory_max_bytes
-        .map(|b| (b / (1024 * 1024)) as usize / 2) // Use half of memory limit for fingerprint cache
+        .map(|b| ((b / (1024 * 1024)) as usize / 10).max(1024)) // Use 10% of memory limit, min 1GB
         .unwrap_or(2048); // Default 2GB
 
     eprintln!("Using sled-backed fingerprint store (bounded memory)");
+    eprintln!(
+        "  Sled cache: {} MB (conservative to prevent OOM)",
+        cache_mb
+    );
 
     let mut fp_store = crate::storage::hybrid_fingerprint_store::HybridFingerprintStore::new(
         config.work_dir.clone(),
@@ -547,6 +554,43 @@ where
 
     // Work-stealing queues detect completion internally
     // No need for separate monitor thread
+
+    // Progress reporting thread - prints stats every 10 seconds
+    let progress_run_stats = Arc::clone(&run_stats);
+    let progress_stop = Arc::clone(&stop);
+    let progress_fp_store = Arc::clone(&fp_store);
+    let progress_thread = std::thread::spawn(move || {
+        let mut last_generated = 0u64;
+        let mut last_time = std::time::Instant::now();
+
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+
+            if progress_stop.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let (states_generated, states_processed, states_distinct, _, _, _) =
+                progress_run_stats.snapshot();
+            let fp_stats = progress_fp_store.stats();
+            let now = std::time::Instant::now();
+            let elapsed = now.duration_since(last_time).as_secs_f64();
+            let rate = (states_generated - last_generated) as f64 / elapsed;
+
+            eprintln!(
+                "[Progress] States: {} generated, {} processed, {} distinct | Rate: {:.0} states/sec | FP: {} checks, {} hits",
+                states_generated,
+                states_processed,
+                states_distinct,
+                rate,
+                fp_stats.checks,
+                fp_stats.hits
+            );
+
+            last_generated = states_generated;
+            last_time = now;
+        }
+    });
 
     // Check if we need to collect labeled transitions for fairness checking
     let collect_labeled_transitions = model.has_fairness_constraints();
@@ -762,6 +806,10 @@ where
             return Err(anyhow!("worker thread panicked"));
         }
     }
+
+    // Stop progress reporting
+    stop.store(true, Ordering::Release);
+    let _ = progress_thread.join();
 
     // Cleanup checkpoint thread
     queue.finish(); // Signal completion
