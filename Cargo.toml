@@ -7,6 +7,7 @@ edition = "2024"
 anyhow = "1.0.100"
 bincode = "1.3.3"
 bloomfilter = "3.0.1"
+chrono = "0.4"
 clap = { version = "4.5.51", features = ["derive"] }
 crossbeam-channel = "0.5.15"
 crossbeam-deque = "0.8.6"

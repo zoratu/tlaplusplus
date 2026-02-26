@@ -64,17 +64,18 @@ impl BloomFingerprintStore {
             shards.push(RwLock::new(bloom));
         }
 
-        // Calculate actual memory usage
-        let bits_per_item = -(false_positive_rate.ln()) / (2.0_f64.ln().powi(2));
-        let total_bits = (expected_items as f64 * bits_per_item) as usize;
-        let total_mb = total_bits / 8 / 1024 / 1024;
+        // Calculate actual memory usage (for reference, not printed for TLC compatibility)
+        let _bits_per_item = -(false_positive_rate.ln()) / (2.0_f64.ln().powi(2));
+        let _total_bits = (expected_items as f64 * _bits_per_item) as usize;
+        let _total_mb = _total_bits / 8 / 1024 / 1024;
 
-        eprintln!("Bloom filter fingerprint store initialized:");
-        eprintln!("  Expected items: {}", expected_items);
-        eprintln!("  False positive rate: {}%", false_positive_rate * 100.0);
-        eprintln!("  Shard count: {}", shard_count);
-        eprintln!("  Memory usage: {} MB (FIXED, guaranteed)", total_mb);
-        eprintln!("  Memory per shard: {} MB", total_mb / shard_count);
+        // Removed bloom filter diagnostic output for TLC compatibility
+        // eprintln!("Bloom filter fingerprint store initialized:");
+        // eprintln!("  Expected items: {}", expected_items);
+        // eprintln!("  False positive rate: {}%", false_positive_rate * 100.0);
+        // eprintln!("  Shard count: {}", shard_count);
+        // eprintln!("  Memory usage: {} MB (FIXED, guaranteed)", total_mb);
+        // eprintln!("  Memory per shard: {} MB", total_mb / shard_count);
 
         Ok(Self {
             shards,

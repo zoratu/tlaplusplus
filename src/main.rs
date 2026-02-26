@@ -801,12 +801,10 @@ fn main() -> anyhow::Result<()> {
                         e
                     })?;
 
-            println!("Running TLA+ model: {}", module.display());
-            println!("  Init: {}", model.init_name);
-            println!("  Next: {}", model.next_name);
-            println!("  Variables: {:?}", model.module.variables);
-            println!("  Invariants: {}", model.invariant_exprs.len());
-            println!();
+            // Print TLC-compatible output
+            let start_time = chrono::Local::now();
+            println!("Starting... ({})", start_time.format("%Y-%m-%d %H:%M:%S"));
+            println!("Computing initial states...");
 
             // Clone model for post-processing (liveness checking)
             let model_for_liveness = model.clone();
@@ -818,8 +816,33 @@ fn main() -> anyhow::Result<()> {
                 e
             })?;
 
-            println!();
-            print_stats("tla-native", &outcome.stats);
+            // Print TLC-compatible final output
+            let end_time = chrono::Local::now();
+            let queue_pending = 0; // Queue is empty after completion
+
+            println!(
+                "{} states generated, {} distinct states found, {} states left on queue.",
+                outcome.stats.states_generated, outcome.stats.states_distinct, queue_pending
+            );
+
+            let duration_secs = outcome.stats.duration.as_secs();
+            let duration_str = if duration_secs < 60 {
+                format!("{:02}s", duration_secs)
+            } else if duration_secs < 3600 {
+                format!("{:02}min {:02}s", duration_secs / 60, duration_secs % 60)
+            } else {
+                format!(
+                    "{:02}h {:02}min",
+                    duration_secs / 3600,
+                    (duration_secs % 3600) / 60
+                )
+            };
+
+            println!(
+                "Finished in {} at ({})",
+                duration_str,
+                end_time.format("%Y-%m-%d %H:%M:%S")
+            );
 
             if let Some(violation) = outcome.violation {
                 println!("violation=true");
