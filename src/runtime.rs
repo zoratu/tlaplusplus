@@ -481,27 +481,31 @@ where
         );
     }
 
-    // Use sled-backed store with VERY conservative memory limit
-    // Sled's cache_capacity only limits page cache, not total memory usage
-    // Sled also allocates for write buffers, compaction, indexes, etc.
-    // So we use only 5-10% of total memory for sled's cache to be safe
-    let cache_mb = config
-        .memory_max_bytes
-        .map(|b| ((b / (1024 * 1024)) as usize / 10).max(1024)) // Use 10% of memory limit, min 1GB
-        .unwrap_or(2048); // Default 2GB
+    // Use bloom filter with GUARANTEED bounded memory
+    // Unlike sled or hash tables, bloom filters have fixed memory determined at creation
+    // Memory usage: ~(items * -ln(fpr) / ln(2)^2) bits
+    // Example: 1B items @ 1% FPR = ~1.2GB fixed
+    //
+    // For Combined.tla: expect billions of states, so use generous estimate
+    let expected_states = 5_000_000_000u64; // 5 billion states
+    let fp_rate = 0.01f64; // 1% false positive rate (acceptable for model checking)
 
-    eprintln!("Using sled-backed fingerprint store (bounded memory)");
-    eprintln!(
-        "  Sled cache: {} MB (conservative to prevent OOM)",
-        cache_mb
-    );
+    // Calculate expected memory usage
+    let bits_per_item = -(fp_rate.ln()) / (2.0f64.ln().powi(2));
+    let total_bits = (expected_states as f64 * bits_per_item) as usize;
+    let bloom_memory_mb = total_bits / 8 / 1024 / 1024;
 
-    let mut fp_store = crate::storage::hybrid_fingerprint_store::HybridFingerprintStore::new(
-        config.work_dir.clone(),
-        cache_mb,
+    eprintln!("Using bloom filter fingerprint store (GUARANTEED bounded memory)");
+    eprintln!("  Expected states: {}", expected_states);
+    eprintln!("  False positive rate: {}%", fp_rate * 100.0);
+    eprintln!("  Memory usage: {} MB (FIXED, no growth)", bloom_memory_mb);
+    eprintln!("  Shard count: {}", shard_count);
+
+    let mut fp_store = crate::storage::bloom_fingerprint_store::BloomFingerprintStore::new(
+        expected_states as usize,
+        fp_rate,
+        shard_count,
     )?;
-
-    // Note: Sled handles persistence internally, no need for async I/O runtime
 
     let fp_store = Arc::new(fp_store);
 
@@ -559,6 +563,7 @@ where
     let progress_run_stats = Arc::clone(&run_stats);
     let progress_stop = Arc::clone(&stop);
     let progress_fp_store = Arc::clone(&fp_store);
+    let progress_queue = Arc::clone(&queue);
     let progress_thread = std::thread::spawn(move || {
         let mut last_generated = 0u64;
         let mut last_time = std::time::Instant::now();
@@ -573,15 +578,17 @@ where
             let (states_generated, states_processed, states_distinct, _, _, _) =
                 progress_run_stats.snapshot();
             let fp_stats = progress_fp_store.stats();
+            let queue_pending = progress_queue.pending_count();
             let now = std::time::Instant::now();
             let elapsed = now.duration_since(last_time).as_secs_f64();
             let rate = (states_generated - last_generated) as f64 / elapsed;
 
             eprintln!(
-                "[Progress] States: {} generated, {} processed, {} distinct | Rate: {:.0} states/sec | FP: {} checks, {} hits",
+                "[Progress] States: {} generated, {} processed, {} distinct, {} pending | Rate: {:.0} states/sec | FP: {} checks, {} hits",
                 states_generated,
                 states_processed,
                 states_distinct,
+                queue_pending,
                 rate,
                 fp_stats.checks,
                 fp_stats.hits
@@ -681,6 +688,19 @@ where
                     if worker_stop_on_violation {
                         break;
                     }
+                    continue;
+                }
+
+                // Apply backpressure: if queue is too full, skip successor generation
+                // This allows workers to process the backlog without deadlock
+                // Target: 30GB total (5.7GB bloom + ~20GB queues)
+                // Combined.tla states are ~56KB each, so 300K states = ~17GB
+                const MAX_PENDING_STATES: u64 = 300_000;
+                if worker_queue.should_apply_backpressure(MAX_PENDING_STATES) {
+                    // Don't generate successors, just mark worker as idle and continue
+                    // This allows us to process the backlog
+                    worker_queue.worker_idle();
+                    worker_active.fetch_sub(1, Ordering::AcqRel);
                     continue;
                 }
 
