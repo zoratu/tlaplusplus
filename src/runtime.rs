@@ -493,13 +493,14 @@ where
     // Calculate expected memory usage
     let bits_per_item = -(fp_rate.ln()) / (2.0f64.ln().powi(2));
     let total_bits = (expected_states as f64 * bits_per_item) as usize;
-    let bloom_memory_mb = total_bits / 8 / 1024 / 1024;
+    let _bloom_memory_mb = total_bits / 8 / 1024 / 1024;
 
-    eprintln!("Using bloom filter fingerprint store (GUARANTEED bounded memory)");
-    eprintln!("  Expected states: {}", expected_states);
-    eprintln!("  False positive rate: {}%", fp_rate * 100.0);
-    eprintln!("  Memory usage: {} MB (FIXED, no growth)", bloom_memory_mb);
-    eprintln!("  Shard count: {}", shard_count);
+    // Removed bloom filter diagnostic output for TLC compatibility
+    // eprintln!("Using bloom filter fingerprint store (GUARANTEED bounded memory)");
+    // eprintln!("  Expected states: {}", expected_states);
+    // eprintln!("  False positive rate: {}%", fp_rate * 100.0);
+    // eprintln!("  Memory usage: {} MB (FIXED, no growth)", bloom_memory_mb);
+    // eprintln!("  Shard count: {}", shard_count);
 
     let mut fp_store = crate::storage::bloom_fingerprint_store::BloomFingerprintStore::new(
         expected_states as usize,
@@ -541,6 +542,7 @@ where
         }
         let mut seen_flags = Vec::with_capacity(initial_fps.len());
         fp_store.contains_or_insert_batch(&initial_fps, &mut seen_flags)?;
+        let mut distinct_initial = 0;
         for (idx, state) in unique_initial.into_iter().enumerate() {
             if seen_flags[idx] {
                 run_stats.duplicates.fetch_add(1, Ordering::Relaxed);
@@ -548,8 +550,22 @@ where
                 run_stats.states_distinct.fetch_add(1, Ordering::Relaxed);
                 queue.push_global(state);
                 run_stats.enqueued.fetch_add(1, Ordering::Relaxed);
+                distinct_initial += 1;
             }
         }
+
+        // Print TLC-compatible message
+        let now = chrono::Local::now();
+        let timestamp = now.format("%Y-%m-%d %H:%M:%S");
+        let plural = if distinct_initial == 1 {
+            "state"
+        } else {
+            "states"
+        };
+        eprintln!(
+            "Finished computing initial states: {} distinct {} generated at {}.",
+            distinct_initial, plural, timestamp
+        );
     }
 
     let checkpoint_thread_stop = Arc::new(AtomicBool::new(false));
@@ -565,8 +581,7 @@ where
     let progress_fp_store = Arc::clone(&fp_store);
     let progress_queue = Arc::clone(&queue);
     let progress_thread = std::thread::spawn(move || {
-        let mut last_generated = 0u64;
-        let mut last_time = std::time::Instant::now();
+        let mut progress_counter = 1u64;
 
         loop {
             std::thread::sleep(std::time::Duration::from_secs(10));
@@ -575,27 +590,21 @@ where
                 break;
             }
 
-            let (states_generated, states_processed, states_distinct, _, _, _) =
+            let (states_generated, _states_processed, states_distinct, _, _, _) =
                 progress_run_stats.snapshot();
-            let fp_stats = progress_fp_store.stats();
             let queue_pending = progress_queue.pending_count();
-            let now = std::time::Instant::now();
-            let elapsed = now.duration_since(last_time).as_secs_f64();
-            let rate = (states_generated - last_generated) as f64 / elapsed;
 
+            // Format timestamp in TLC style: YYYY-MM-DD HH:MM:SS
+            let now = chrono::Local::now();
+            let timestamp = now.format("%Y-%m-%d %H:%M:%S");
+
+            // Match TLC format: Progress(N) at YYYY-MM-DD HH:MM:SS: X states generated, Y distinct states found, Z states left on queue.
             eprintln!(
-                "[Progress] States: {} generated, {} processed, {} distinct, {} pending | Rate: {:.0} states/sec | FP: {} checks, {} hits",
-                states_generated,
-                states_processed,
-                states_distinct,
-                queue_pending,
-                rate,
-                fp_stats.checks,
-                fp_stats.hits
+                "Progress({}) at {}: {} states generated, {} distinct states found, {} states left on queue.",
+                progress_counter, timestamp, states_generated, states_distinct, queue_pending
             );
 
-            last_generated = states_generated;
-            last_time = now;
+            progress_counter += 1;
         }
     });
 
