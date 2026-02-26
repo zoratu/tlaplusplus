@@ -820,9 +820,24 @@ fn main() -> anyhow::Result<()> {
             let end_time = chrono::Local::now();
             let queue_pending = 0; // Queue is empty after completion
 
+            // Format numbers with commas (TLC style)
+            fn format_with_commas(n: u64) -> String {
+                let s = n.to_string();
+                let mut result = String::new();
+                for (i, c) in s.chars().rev().enumerate() {
+                    if i > 0 && i % 3 == 0 {
+                        result.push(',');
+                    }
+                    result.push(c);
+                }
+                result.chars().rev().collect()
+            }
+
             println!(
                 "{} states generated, {} distinct states found, {} states left on queue.",
-                outcome.stats.states_generated, outcome.stats.states_distinct, queue_pending
+                format_with_commas(outcome.stats.states_generated),
+                format_with_commas(outcome.stats.states_distinct),
+                queue_pending
             );
 
             let duration_secs = outcome.stats.duration.as_secs();

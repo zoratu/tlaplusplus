@@ -582,6 +582,9 @@ where
     let progress_queue = Arc::clone(&queue);
     let progress_thread = std::thread::spawn(move || {
         let mut progress_counter = 1u64;
+        let mut last_generated = 0u64;
+        let mut last_distinct = 0u64;
+        let mut last_time = std::time::Instant::now();
 
         loop {
             std::thread::sleep(std::time::Duration::from_secs(10));
@@ -594,17 +597,55 @@ where
                 progress_run_stats.snapshot();
             let queue_pending = progress_queue.pending_count();
 
-            // Format timestamp in TLC style: YYYY-MM-DD HH:MM:SS
-            let now = chrono::Local::now();
-            let timestamp = now.format("%Y-%m-%d %H:%M:%S");
+            // Calculate rates per minute
+            let now = std::time::Instant::now();
+            let elapsed_secs = now.duration_since(last_time).as_secs_f64();
+            let elapsed_mins = elapsed_secs / 60.0;
 
-            // Match TLC format: Progress(N) at YYYY-MM-DD HH:MM:SS: X states generated, Y distinct states found, Z states left on queue.
+            let generated_rate = if elapsed_mins > 0.0 {
+                ((states_generated - last_generated) as f64 / elapsed_mins) as u64
+            } else {
+                0
+            };
+
+            let distinct_rate = if elapsed_mins > 0.0 {
+                ((states_distinct - last_distinct) as f64 / elapsed_mins) as u64
+            } else {
+                0
+            };
+
+            // Format timestamp in TLC style: YYYY-MM-DD HH:MM:SS
+            let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+
+            // Format numbers with commas (TLC style)
+            fn format_with_commas(n: u64) -> String {
+                let s = n.to_string();
+                let mut result = String::new();
+                for (i, c) in s.chars().rev().enumerate() {
+                    if i > 0 && i % 3 == 0 {
+                        result.push(',');
+                    }
+                    result.push(c);
+                }
+                result.chars().rev().collect()
+            }
+
+            // Match TLC format exactly
             eprintln!(
-                "Progress({}) at {}: {} states generated, {} distinct states found, {} states left on queue.",
-                progress_counter, timestamp, states_generated, states_distinct, queue_pending
+                "Progress({}) at {}: {} states generated ({} s/min), {} distinct states found ({} ds/min), {} states left on queue.",
+                progress_counter,
+                timestamp,
+                format_with_commas(states_generated),
+                format_with_commas(generated_rate),
+                format_with_commas(states_distinct),
+                format_with_commas(distinct_rate),
+                format_with_commas(queue_pending)
             );
 
             progress_counter += 1;
+            last_generated = states_generated;
+            last_distinct = states_distinct;
+            last_time = now;
         }
     });
 
