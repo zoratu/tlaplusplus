@@ -680,9 +680,12 @@ fn main() -> anyhow::Result<()> {
                 let ir = compile_action_ir(def);
                 let mut ctx =
                     EvalContext::with_definitions(&probe_state, &parsed_module.definitions);
-                for param in &ir.params {
-                    let sample = sample_param_value(param, &probe_state);
-                    ctx.locals.insert(param.clone(), sample);
+                {
+                    let locals_mut = std::rc::Rc::make_mut(&mut ctx.locals);
+                    for param in &ir.params {
+                        let sample = sample_param_value(param, &probe_state);
+                        locals_mut.insert(param.clone(), sample);
+                    }
                 }
                 for clause in ir.clauses {
                     match clause {

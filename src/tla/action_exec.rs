@@ -141,16 +141,22 @@ fn execute_branch(
         }
 
         let mut ctx = EvalContext::with_definitions(state, definitions);
-        for (k, v) in locals {
-            ctx.locals.insert(k.clone(), v.clone());
+        {
+            let locals_mut = std::rc::Rc::make_mut(&mut ctx.locals);
+            for (k, v) in locals {
+                locals_mut.insert(k.clone(), v.clone());
+            }
         }
 
         let mut args = Vec::with_capacity(arg_exprs.len());
         for arg_expr in arg_exprs {
             args.push(eval_expr(&arg_expr, &ctx)?);
         }
-        for (param, arg) in def.params.iter().zip(args.into_iter()) {
-            ctx.locals.insert(param.clone(), arg);
+        {
+            let locals_mut = std::rc::Rc::make_mut(&mut ctx.locals);
+            for (param, arg) in def.params.iter().zip(args.into_iter()) {
+                locals_mut.insert(param.clone(), arg);
+            }
         }
 
         let ir = compile_action_ir(def);
@@ -169,8 +175,11 @@ fn execute_branch(
     };
 
     let mut ctx = EvalContext::with_definitions(state, definitions);
-    for (k, v) in locals {
-        ctx.locals.insert(k.clone(), v.clone());
+    {
+        let locals_mut = std::rc::Rc::make_mut(&mut ctx.locals);
+        for (k, v) in locals {
+            locals_mut.insert(k.clone(), v.clone());
+        }
     }
 
     let ir = compile_action_ir(&inline_def);
@@ -267,8 +276,11 @@ fn parse_binders(
         };
 
         let mut ctx = EvalContext::with_definitions(state, definitions);
-        for (k, v) in locals {
-            ctx.locals.insert(k.clone(), v.clone());
+        {
+            let locals_mut = std::rc::Rc::make_mut(&mut ctx.locals);
+            for (k, v) in locals {
+                locals_mut.insert(k.clone(), v.clone());
+            }
         }
 
         let domain = eval_expr(domain_text.trim(), &ctx)?;

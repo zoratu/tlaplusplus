@@ -3,15 +3,17 @@ use crate::tla::{
 };
 use anyhow::{Result, anyhow};
 use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 
 const MAX_EVAL_DEPTH: usize = 256;
 
 /// Context for evaluating expressions on a single state
+/// Uses Rc for copy-on-write semantics to avoid cloning entire context
 #[derive(Debug, Clone)]
 pub struct EvalContext<'a> {
     pub state: &'a TlaState,
-    pub locals: BTreeMap<String, TlaValue>,
-    pub local_definitions: BTreeMap<String, TlaDefinition>,
+    pub locals: Rc<BTreeMap<String, TlaValue>>,
+    pub local_definitions: Rc<BTreeMap<String, TlaDefinition>>,
     pub definitions: Option<&'a BTreeMap<String, TlaDefinition>>,
     pub instances: Option<&'a BTreeMap<String, crate::tla::module::TlaModuleInstance>>,
 }
@@ -30,8 +32,8 @@ impl<'a> EvalContext<'a> {
     pub fn new(state: &'a TlaState) -> Self {
         Self {
             state,
-            locals: BTreeMap::new(),
-            local_definitions: BTreeMap::new(),
+            locals: Rc::new(BTreeMap::new()),
+            local_definitions: Rc::new(BTreeMap::new()),
             definitions: None,
             instances: None,
         }
@@ -43,8 +45,8 @@ impl<'a> EvalContext<'a> {
     ) -> Self {
         Self {
             state,
-            locals: BTreeMap::new(),
-            local_definitions: BTreeMap::new(),
+            locals: Rc::new(BTreeMap::new()),
+            local_definitions: Rc::new(BTreeMap::new()),
             definitions: Some(definitions),
             instances: None,
         }
@@ -57,33 +59,54 @@ impl<'a> EvalContext<'a> {
     ) -> Self {
         Self {
             state,
-            locals: BTreeMap::new(),
-            local_definitions: BTreeMap::new(),
+            locals: Rc::new(BTreeMap::new()),
+            local_definitions: Rc::new(BTreeMap::new()),
             definitions: Some(definitions),
             instances: Some(instances),
         }
     }
 
     fn with_local_value(&self, name: impl Into<String>, value: TlaValue) -> Self {
-        let mut next = self.clone();
-        next.locals.insert(name.into(), value);
-        next
+        // Copy-on-write: only clone the locals map, reuse the rest
+        let mut new_locals = (*self.locals).clone();
+        new_locals.insert(name.into(), value);
+        Self {
+            state: self.state,
+            locals: Rc::new(new_locals),
+            local_definitions: Rc::clone(&self.local_definitions),
+            definitions: self.definitions,
+            instances: self.instances,
+        }
     }
 
     fn with_local_values(&self, values: &[(&str, TlaValue)]) -> Self {
-        let mut next = self.clone();
+        // Copy-on-write: only clone the locals map, reuse the rest
+        let mut new_locals = (*self.locals).clone();
         for (k, v) in values {
-            next.locals.insert((*k).to_string(), v.clone());
+            new_locals.insert((*k).to_string(), v.clone());
         }
-        next
+        Self {
+            state: self.state,
+            locals: Rc::new(new_locals),
+            local_definitions: Rc::clone(&self.local_definitions),
+            definitions: self.definitions,
+            instances: self.instances,
+        }
     }
 
     fn with_local_definitions(&self, defs: BTreeMap<String, TlaDefinition>) -> Self {
-        let mut next = self.clone();
+        // Copy-on-write: only clone the local_definitions map, reuse the rest
+        let mut new_defs = (*self.local_definitions).clone();
         for (name, def) in defs {
-            next.local_definitions.insert(name, def);
+            new_defs.insert(name, def);
         }
-        next
+        Self {
+            state: self.state,
+            locals: Rc::clone(&self.locals),
+            local_definitions: Rc::new(new_defs),
+            definitions: self.definitions,
+            instances: self.instances,
+        }
     }
 
     pub fn runtime_value(&self, name: &str) -> Option<TlaValue> {
@@ -1054,7 +1077,7 @@ fn eval_lambda_expression(expr: &str, ctx: &EvalContext<'_>, _depth: usize) -> R
     }
 
     // Capture current local context
-    let captured_locals = ctx.locals.clone();
+    let captured_locals = (*ctx.locals).clone();
 
     Ok(TlaValue::Lambda {
         params,
@@ -1375,11 +1398,14 @@ fn apply_value(
 
             // Create a new context with captured locals
             let mut lambda_ctx = ctx.clone();
-            lambda_ctx.locals = captured_locals.clone();
+            lambda_ctx.locals = std::rc::Rc::new(captured_locals.clone());
 
             // Bind arguments to parameters
-            for (param, arg) in params.iter().zip(args.into_iter()) {
-                lambda_ctx.locals.insert(param.clone(), arg);
+            {
+                let locals_mut = std::rc::Rc::make_mut(&mut lambda_ctx.locals);
+                for (param, arg) in params.iter().zip(args.into_iter()) {
+                    locals_mut.insert(param.clone(), arg);
+                }
             }
 
             // Evaluate the lambda body
@@ -1453,10 +1479,13 @@ fn eval_module_instance_call(
     instance_ctx.instances = Some(&module.instances);
 
     // Apply substitutions: replace constants in the context
-    for (param, value_expr) in &instance.substitutions {
-        // Evaluate the substitution value in the original context
-        let value = eval_expr(value_expr, ctx)?;
-        instance_ctx.locals.insert(param.clone(), value);
+    {
+        let locals_mut = std::rc::Rc::make_mut(&mut instance_ctx.locals);
+        for (param, value_expr) in &instance.substitutions {
+            // Evaluate the substitution value in the original context
+            let value = eval_expr(value_expr, ctx)?;
+            locals_mut.insert(param.clone(), value);
+        }
     }
 
     // Bind operator parameters
@@ -1890,8 +1919,11 @@ fn evaluate_exists(
 ) -> Result<bool> {
     if idx >= domains.len() {
         let mut child = ctx.clone();
-        for (k, v) in assignments.iter() {
-            child.locals.insert(k.clone(), v.clone());
+        {
+            let locals_mut = std::rc::Rc::make_mut(&mut child.locals);
+            for (k, v) in assignments.iter() {
+                locals_mut.insert(k.clone(), v.clone());
+            }
         }
         return eval_expr_inner(body, &child, depth + 1)?.as_bool();
     }
@@ -1918,8 +1950,11 @@ fn evaluate_forall(
 ) -> Result<bool> {
     if idx >= domains.len() {
         let mut child = ctx.clone();
-        for (k, v) in assignments.iter() {
-            child.locals.insert(k.clone(), v.clone());
+        {
+            let locals_mut = std::rc::Rc::make_mut(&mut child.locals);
+            for (k, v) in assignments.iter() {
+                locals_mut.insert(k.clone(), v.clone());
+            }
         }
         return eval_expr_inner(body, &child, depth + 1)?.as_bool();
     }
@@ -1947,8 +1982,11 @@ fn collect_function_mapping(
 ) -> Result<()> {
     if idx >= binders.len() {
         let mut child = ctx.clone();
-        for (k, v) in assignments.iter() {
-            child.locals.insert(k.clone(), v.clone());
+        {
+            let locals_mut = std::rc::Rc::make_mut(&mut child.locals);
+            for (k, v) in assignments.iter() {
+                locals_mut.insert(k.clone(), v.clone());
+            }
         }
         let value = eval_expr_inner(body, &child, depth + 1)?;
         let key = binder_key(assignments, binders)?;
@@ -1977,8 +2015,11 @@ fn collect_binder_filter_set(
 ) -> Result<()> {
     if idx >= binders.len() {
         let mut child = ctx.clone();
-        for (k, v) in assignments.iter() {
-            child.locals.insert(k.clone(), v.clone());
+        {
+            let locals_mut = std::rc::Rc::make_mut(&mut child.locals);
+            for (k, v) in assignments.iter() {
+                locals_mut.insert(k.clone(), v.clone());
+            }
         }
 
         if eval_expr_inner(predicate, &child, depth + 1)?.as_bool()? {
@@ -2016,8 +2057,11 @@ fn collect_binder_map_set(
 ) -> Result<()> {
     if idx >= binders.len() {
         let mut child = ctx.clone();
-        for (k, v) in assignments.iter() {
-            child.locals.insert(k.clone(), v.clone());
+        {
+            let locals_mut = std::rc::Rc::make_mut(&mut child.locals);
+            for (k, v) in assignments.iter() {
+                locals_mut.insert(k.clone(), v.clone());
+            }
         }
         out.insert(eval_expr_inner(element_expr, &child, depth + 1)?);
         return Ok(());
