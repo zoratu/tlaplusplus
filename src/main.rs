@@ -1,5 +1,6 @@
 use clap::{Args, Parser, Subcommand};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use tlaplusplus::models::counter_grid::CounterGridModel;
 use tlaplusplus::models::flurm_job_lifecycle::FlurmJobLifecycleModel;
 use tlaplusplus::models::high_branching::HighBranchingModel;
@@ -954,12 +955,12 @@ fn config_value_to_tla(value: &ConfigValue) -> Option<TlaValue> {
         ConfigValue::String(v) => Some(TlaValue::String(v.clone())),
         ConfigValue::ModelValue(v) => Some(TlaValue::ModelValue(v.clone())),
         ConfigValue::OperatorRef(_) => None,
-        ConfigValue::Tuple(values) => Some(TlaValue::Seq(
+        ConfigValue::Tuple(values) => Some(TlaValue::Seq(Arc::new(
             values.iter().filter_map(config_value_to_tla).collect(),
-        )),
-        ConfigValue::Set(values) => Some(TlaValue::Set(
+        ))),
+        ConfigValue::Set(values) => Some(TlaValue::Set(Arc::new(
             values.iter().filter_map(config_value_to_tla).collect(),
-        )),
+        ))),
     }
 }
 

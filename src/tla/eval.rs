@@ -4,6 +4,7 @@ use crate::tla::{
 use anyhow::{Result, anyhow};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
 const MAX_EVAL_DEPTH: usize = 256;
 
@@ -834,7 +835,7 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
                 let start = left.as_int()?;
                 let end = right.as_int()?;
                 let range_set: BTreeSet<TlaValue> = (start..=end).map(TlaValue::Int).collect();
-                Ok(TlaValue::Set(range_set))
+                Ok(TlaValue::Set(Arc::new(range_set)))
             }
             _ => Err(anyhow!("unsupported comparison operator {op}")),
         };
@@ -887,11 +888,11 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
             let mut product = BTreeSet::new();
             for lhs_val in lhs_set {
                 for rhs_val in rhs_set {
-                    let tuple = TlaValue::Seq(vec![lhs_val.clone(), rhs_val.clone()]);
+                    let tuple = TlaValue::Seq(Arc::new(vec![lhs_val.clone(), rhs_val.clone()]));
                     product.insert(tuple);
                 }
             }
-            result = TlaValue::Set(product);
+            result = TlaValue::Set(Arc::new(product));
         }
         return Ok(result);
     }
@@ -919,7 +920,7 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
     if starts_with_keyword(expr, "SUBSET") {
         let rest = expr["SUBSET".len()..].trim();
         let set = eval_expr_inner(rest, ctx, depth + 1)?;
-        return Ok(TlaValue::Set(powerset(set.as_set()?)));
+        return Ok(TlaValue::Set(Arc::new(powerset(set.as_set()?))));
     }
 
     if let Some(rest) = expr.strip_prefix('-')
@@ -1080,9 +1081,9 @@ fn eval_lambda_expression(expr: &str, ctx: &EvalContext<'_>, _depth: usize) -> R
     let captured_locals = (*ctx.locals).clone();
 
     Ok(TlaValue::Lambda {
-        params,
+        params: Arc::new(params),
         body: body.to_string(),
-        captured_locals,
+        captured_locals: Arc::new(captured_locals),
     })
 }
 
@@ -1175,7 +1176,7 @@ fn parse_base<'a>(
             }
             out.push(eval_expr_inner(&part, ctx, depth + 1)?);
         }
-        return Ok((TlaValue::Seq(out), rest));
+        return Ok((TlaValue::Seq(Arc::new(out)), rest));
     }
 
     if s.starts_with('{') {
@@ -1269,7 +1270,7 @@ fn parse_base<'a>(
 fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<TlaValue> {
     let inner = expr.trim();
     if inner.is_empty() {
-        return Ok(TlaValue::Set(BTreeSet::new()));
+        return Ok(TlaValue::Set(Arc::new(BTreeSet::new())));
     }
 
     if let Some(colon_idx) = find_top_level_char(inner, ':') {
@@ -1289,14 +1290,14 @@ fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
                 ctx,
                 depth + 1,
             )?;
-            return Ok(TlaValue::Set(out));
+            return Ok(TlaValue::Set(Arc::new(out)));
         }
 
         let binders = parse_binders(rhs, ctx, depth + 1)?;
         let mut assignments = BTreeMap::new();
         let mut out = BTreeSet::new();
         collect_binder_map_set(0, &binders, lhs, &mut assignments, &mut out, ctx, depth + 1)?;
-        return Ok(TlaValue::Set(out));
+        return Ok(TlaValue::Set(Arc::new(out)));
     }
 
     let mut out = BTreeSet::new();
@@ -1308,7 +1309,7 @@ fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
         out.insert(eval_expr_inner(item, ctx, depth + 1)?);
     }
 
-    Ok(TlaValue::Set(out))
+    Ok(TlaValue::Set(Arc::new(out)))
 }
 
 fn eval_bracket_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<TlaValue> {
@@ -1327,7 +1328,7 @@ fn eval_bracket_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> R
             let mut assignments = BTreeMap::new();
             let mut map = BTreeMap::new();
             collect_function_mapping(0, &binders, rhs, &mut assignments, &mut map, ctx, depth + 1)?;
-            return Ok(TlaValue::Function(map));
+            return Ok(TlaValue::Function(Arc::new(map)));
         }
 
         let mut record = BTreeMap::new();
@@ -1338,7 +1339,7 @@ fn eval_bracket_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> R
             let value = eval_expr_inner(value_text.trim(), ctx, depth + 1)?;
             record.insert(key, value);
         }
-        return Ok(TlaValue::Record(record));
+        return Ok(TlaValue::Record(Arc::new(record)));
     }
 
     Err(anyhow!("unsupported bracket expression: [{expr}]"))
@@ -1398,11 +1399,11 @@ fn apply_value(
 
             // Create a new context with captured locals
             let mut lambda_ctx = ctx.clone();
-            lambda_ctx.locals = std::rc::Rc::new(captured_locals.clone());
+            lambda_ctx.locals = Rc::new((**captured_locals).clone());
 
             // Bind arguments to parameters
             {
-                let locals_mut = std::rc::Rc::make_mut(&mut lambda_ctx.locals);
+                let locals_mut = Rc::make_mut(&mut lambda_ctx.locals);
                 for (param, arg) in params.iter().zip(args.into_iter()) {
                     locals_mut.insert(param.clone(), arg);
                 }
@@ -1612,7 +1613,7 @@ fn eval_operator_call(
             if seq.is_empty() {
                 return Err(anyhow!("Tail of empty sequence"));
             }
-            return Ok(TlaValue::Seq(seq[1..].to_vec()));
+            return Ok(TlaValue::Seq(Arc::new(seq[1..].to_vec())));
         }
         "Append" => {
             if args.len() != 2 {
@@ -1622,9 +1623,9 @@ fn eval_operator_call(
                 TlaValue::Seq(v) => v,
                 _ => return Err(anyhow!("Append expects a sequence, got {:?}", args[0])),
             };
-            let mut new_seq = seq.clone();
+            let mut new_seq = (**seq).clone();
             new_seq.push(args[1].clone());
-            return Ok(TlaValue::Seq(new_seq));
+            return Ok(TlaValue::Seq(Arc::new(new_seq)));
         }
         "SubSeq" => {
             if args.len() != 3 {
@@ -1655,10 +1656,10 @@ fn eval_operator_call(
 
             if start > seq.len() {
                 // If start is beyond the sequence, return empty sequence
-                return Ok(TlaValue::Seq(vec![]));
+                return Ok(TlaValue::Seq(Arc::new(vec![])));
             }
 
-            return Ok(TlaValue::Seq(seq[start..end].to_vec()));
+            return Ok(TlaValue::Seq(Arc::new(seq[start..end].to_vec())));
         }
         "SelectSeq" => {
             if args.len() != 2 {
@@ -1671,7 +1672,7 @@ fn eval_operator_call(
             let test_fn = &args[1];
 
             let mut result = Vec::new();
-            for elem in seq {
+            for elem in seq.iter() {
                 // Apply the test function to each element
                 let test_result = apply_value(test_fn, vec![elem.clone()], ctx, depth + 1)?;
                 let passes = test_result.as_bool()?;
@@ -1679,7 +1680,7 @@ fn eval_operator_call(
                     result.push(elem.clone());
                 }
             }
-            return Ok(TlaValue::Seq(result));
+            return Ok(TlaValue::Seq(Arc::new(result)));
         }
         "Permutations" => {
             if args.len() != 1 {
@@ -1693,9 +1694,9 @@ fn eval_operator_call(
                 for (k, v) in values.iter().cloned().zip(perm.into_iter()) {
                     map.insert(k, v);
                 }
-                out.insert(TlaValue::Function(map));
+                out.insert(TlaValue::Function(Arc::new(map)));
             }
-            return Ok(TlaValue::Set(out));
+            return Ok(TlaValue::Set(Arc::new(out)));
         }
         "DOMAIN" => {
             if args.len() != 1 {
@@ -1704,21 +1705,21 @@ fn eval_operator_call(
             match &args[0] {
                 TlaValue::Function(map) => {
                     let keys = map.keys().cloned().collect::<BTreeSet<_>>();
-                    return Ok(TlaValue::Set(keys));
+                    return Ok(TlaValue::Set(Arc::new(keys)));
                 }
                 TlaValue::Record(map) => {
                     let keys = map
                         .keys()
                         .map(|k| TlaValue::String(k.clone()))
                         .collect::<BTreeSet<_>>();
-                    return Ok(TlaValue::Set(keys));
+                    return Ok(TlaValue::Set(Arc::new(keys)));
                 }
                 TlaValue::Seq(seq) => {
                     // DOMAIN of a sequence is {1, 2, ..., Len(seq)}
                     let indices = (1..=seq.len() as i64)
                         .map(TlaValue::Int)
                         .collect::<BTreeSet<_>>();
-                    return Ok(TlaValue::Set(indices));
+                    return Ok(TlaValue::Set(Arc::new(indices)));
                 }
                 _ => {
                     return Err(anyhow!("DOMAIN expects a function, record, or sequence"));
@@ -2104,7 +2105,7 @@ fn binder_key(
                     .ok_or_else(|| anyhow!("missing binder assignment for {name}"))?,
             );
         }
-        Ok(TlaValue::Seq(items))
+        Ok(TlaValue::Seq(Arc::new(items)))
     }
 }
 
@@ -2195,9 +2196,9 @@ fn set_path_value(base: &TlaValue, path: &[PathSegment], new_value: TlaValue) ->
             TlaValue::Record(map) => {
                 let current = map.get(name).cloned().unwrap_or(TlaValue::Undefined);
                 let updated = set_path_value(&current, &path[1..], new_value)?;
-                let mut next = map.clone();
+                let mut next = (**map).clone();
                 next.insert(name.clone(), updated);
-                Ok(TlaValue::Record(next))
+                Ok(TlaValue::Record(Arc::new(next)))
             }
             _ => Err(anyhow!("field update on non-record value {base:?}")),
         },
@@ -2205,17 +2206,17 @@ fn set_path_value(base: &TlaValue, path: &[PathSegment], new_value: TlaValue) ->
             TlaValue::Function(map) => {
                 let current = map.get(key).cloned().unwrap_or(TlaValue::Undefined);
                 let updated = set_path_value(&current, &path[1..], new_value)?;
-                let mut next = map.clone();
+                let mut next = (**map).clone();
                 next.insert(key.clone(), updated);
-                Ok(TlaValue::Function(next))
+                Ok(TlaValue::Function(Arc::new(next)))
             }
             TlaValue::Record(map) => {
                 let record_key = record_key_from_value(key)?;
                 let current = map.get(&record_key).cloned().unwrap_or(TlaValue::Undefined);
                 let updated = set_path_value(&current, &path[1..], new_value)?;
-                let mut next = map.clone();
+                let mut next = (**map).clone();
                 next.insert(record_key, updated);
-                Ok(TlaValue::Record(next))
+                Ok(TlaValue::Record(Arc::new(next)))
             }
             TlaValue::Seq(values) => {
                 let idx = key.as_int()?;
@@ -2228,9 +2229,9 @@ fn set_path_value(base: &TlaValue, path: &[PathSegment], new_value: TlaValue) ->
                 }
 
                 let updated = set_path_value(&values[zero], &path[1..], new_value)?;
-                let mut next = values.clone();
+                let mut next = (**values).clone();
                 next[zero] = updated;
-                Ok(TlaValue::Seq(next))
+                Ok(TlaValue::Seq(Arc::new(next)))
             }
             _ => Err(anyhow!("index update on unsupported value {base:?}")),
         },
@@ -2260,9 +2261,10 @@ fn seq_or_string_concat(lhs: TlaValue, rhs: TlaValue) -> Result<TlaValue> {
             a.push_str(&b);
             Ok(TlaValue::String(a))
         }
-        (TlaValue::Seq(mut a), TlaValue::Seq(b)) => {
-            a.extend(b);
-            Ok(TlaValue::Seq(a))
+        (TlaValue::Seq(a), TlaValue::Seq(b)) => {
+            let mut result = (*a).clone();
+            result.extend(b.iter().cloned());
+            Ok(TlaValue::Seq(Arc::new(result)))
         }
         (a, b) => Err(anyhow!(
             "\\o expects String or Seq operands, got {a:?} and {b:?}"
@@ -2319,7 +2321,7 @@ fn powerset(input: &BTreeSet<TlaValue>) -> BTreeSet<TlaValue> {
                 subset.insert(value.clone());
             }
         }
-        subsets.insert(TlaValue::Set(subset));
+        subsets.insert(TlaValue::Set(Arc::new(subset)));
     }
 
     subsets
@@ -3753,10 +3755,10 @@ mod tests {
 
         let state = TlaState::from([(
             "actionCount".to_string(),
-            TlaValue::Function(BTreeMap::from([(
+            TlaValue::Function(Arc::new(BTreeMap::from([(
                 TlaValue::ModelValue("bot1".to_string()),
                 TlaValue::Int(1),
-            )])),
+            )]))),
         )]);
 
         let ctx = EvalContext::with_definitions(&state, &defs);
@@ -3771,10 +3773,10 @@ mod tests {
     fn evaluates_except_updates() {
         let state = TlaState::from([(
             "actionCount".to_string(),
-            TlaValue::Function(BTreeMap::from([(
+            TlaValue::Function(Arc::new(BTreeMap::from([(
                 TlaValue::ModelValue("bot1".to_string()),
                 TlaValue::Int(1),
-            )])),
+            )]))),
         )]);
         let ctx = EvalContext::new(&state);
         let updated = eval_expr("[actionCount EXCEPT ![bot1] = @ + 1]", &ctx)
@@ -3793,11 +3795,11 @@ mod tests {
     fn evaluates_quantifier_and_choose() {
         let state = TlaState::from([(
             "S".to_string(),
-            TlaValue::Set(BTreeSet::from([
+            TlaValue::Set(Arc::new(BTreeSet::from([
                 TlaValue::Int(1),
                 TlaValue::Int(2),
                 TlaValue::Int(3),
-            ])),
+            ]))),
         )]);
         let ctx = EvalContext::new(&state);
 
@@ -3832,7 +3834,7 @@ mod tests {
         let lambda = eval_expr(lambda_expr, &ctx).expect("LAMBDA should evaluate");
         match lambda {
             TlaValue::Lambda { params, body, .. } => {
-                assert_eq!(params, vec!["x".to_string()]);
+                assert_eq!(*params, vec!["x".to_string()]);
                 assert_eq!(body, "x + 1");
             }
             _ => panic!("Expected Lambda value"),
@@ -3879,7 +3881,11 @@ mod tests {
 
         assert_eq!(
             result,
-            TlaValue::Seq(vec![TlaValue::Int(3), TlaValue::Int(4), TlaValue::Int(5)])
+            TlaValue::Seq(Arc::new(vec![
+                TlaValue::Int(3),
+                TlaValue::Int(4),
+                TlaValue::Int(5)
+            ]))
         );
 
         // Test SelectSeq with different predicate
@@ -3888,12 +3894,12 @@ mod tests {
 
         assert_eq!(
             result2,
-            TlaValue::Seq(vec![
+            TlaValue::Seq(Arc::new(vec![
                 TlaValue::Int(1),
                 TlaValue::Int(2),
                 TlaValue::Int(4),
                 TlaValue::Int(5)
-            ])
+            ]))
         );
     }
 }

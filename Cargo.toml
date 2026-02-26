@@ -17,7 +17,7 @@ libc = "0.2.182"
 num_cpus = "1.17.0"
 parking_lot = "0.12.5"
 rayon = "1.11.0"
-serde = { version = "1.0.228", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = "1.0.145"
 sled = "0.34.7"
 tokio = { version = "1.41", features = ["rt-multi-thread", "fs", "io-util", "time", "macros"] }
