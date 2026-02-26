@@ -4,7 +4,8 @@ use crate::tla::{
     compile_action_ir, eval_expr, split_top_level,
 };
 use anyhow::{Result, anyhow};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Default)]
 pub struct NextBranchProbe {
@@ -543,7 +544,7 @@ mod tests {
             ("y".to_string(), TlaValue::Int(7)),
             (
                 "S".to_string(),
-                TlaValue::Set(BTreeSet::from([TlaValue::Int(1)])),
+                TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(1)]))),
             ),
         ]);
 

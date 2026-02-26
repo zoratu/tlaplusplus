@@ -9,6 +9,7 @@ use crate::tla::{
 use anyhow::{Context, Result, anyhow};
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub struct TlaModel {
@@ -322,7 +323,7 @@ impl TlaModel {
             // No view defined - return full state as a value
             // Convert state to TlaValue::Record
             let record: BTreeMap<String, TlaValue> = state.clone();
-            Ok(TlaValue::Record(record))
+            Ok(TlaValue::Record(Arc::new(record)))
         }
     }
 
@@ -661,12 +662,12 @@ fn config_value_to_tla(value: &ConfigValue) -> Option<TlaValue> {
         ConfigValue::String(v) => Some(TlaValue::String(v.clone())),
         ConfigValue::ModelValue(v) => Some(TlaValue::ModelValue(v.clone())),
         ConfigValue::OperatorRef(_) => None,
-        ConfigValue::Tuple(values) => Some(TlaValue::Seq(
+        ConfigValue::Tuple(values) => Some(TlaValue::Seq(Arc::new(
             values.iter().filter_map(config_value_to_tla).collect(),
-        )),
-        ConfigValue::Set(values) => Some(TlaValue::Set(
+        ))),
+        ConfigValue::Set(values) => Some(TlaValue::Set(Arc::new(
             values.iter().filter_map(config_value_to_tla).collect(),
-        )),
+        ))),
     }
 }
 
