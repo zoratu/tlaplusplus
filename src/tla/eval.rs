@@ -2744,10 +2744,45 @@ fn split_top_level_comparison(expr: &str) -> Option<(&str, &'static str, &str)> 
     let mut bracket = 0usize;
     let mut brace = 0usize;
     let mut angle = 0usize;
+    let mut let_depth = 0usize;
+    let mut if_depth = 0usize; // Track IF...THEN nesting (protects conditions from split)
     let mut in_string = false;
     let mut escaped = false;
 
     while i < expr.len() {
+        // Check for keywords at word boundaries when at bracket top level
+        if let Some((word, start, word_end)) = next_word(expr, i)
+            && start == i
+            && paren == 0
+            && bracket == 0
+            && brace == 0
+            && angle == 0
+        {
+            match word {
+                "LET" => {
+                    let_depth += 1;
+                    i = word_end;
+                    continue;
+                }
+                "IN" if let_depth > 0 => {
+                    let_depth -= 1;
+                    i = word_end;
+                    continue;
+                }
+                "IF" => {
+                    if_depth += 1;
+                    i = word_end;
+                    continue;
+                }
+                "THEN" if if_depth > 0 => {
+                    if_depth -= 1;
+                    i = word_end;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
         let ch = expr[i..].chars().next().expect("char at byte index");
         let ch_len = ch.len_utf8();
         let next = expr[i + ch_len..].chars().next();
@@ -2797,7 +2832,12 @@ fn split_top_level_comparison(expr: &str) -> Option<(&str, &'static str, &str)> 
             _ => {}
         }
 
-        let at_top = paren == 0 && bracket == 0 && brace == 0 && angle == 0;
+        let at_top = paren == 0
+            && bracket == 0
+            && brace == 0
+            && angle == 0
+            && let_depth == 0
+            && if_depth == 0;
         if at_top {
             for pattern in patterns {
                 if !expr[i..].starts_with(pattern) {
@@ -3900,6 +3940,103 @@ mod tests {
                 TlaValue::Int(4),
                 TlaValue::Int(5)
             ]))
+        );
+    }
+
+    #[test]
+    fn if_with_equality_in_condition() {
+        let state =
+            TlaState::from([("opts".to_string(), TlaValue::Set(Arc::new(BTreeSet::new())))]);
+        let ctx = EvalContext::new(&state);
+
+        // IF expression with equality in condition should not be split at =
+        let expr = "IF opts = {} THEN 0 ELSE 1";
+        let result = eval_expr(expr, &ctx).expect("IF expression should evaluate");
+        assert_eq!(
+            result,
+            TlaValue::Int(0),
+            "opts is empty set, so should return 0"
+        );
+
+        // Same test with non-empty set
+        let state2 = TlaState::from([(
+            "opts".to_string(),
+            TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(1)]))),
+        )]);
+        let ctx2 = EvalContext::new(&state2);
+        let result2 = eval_expr(expr, &ctx2).expect("IF expression should evaluate");
+        assert_eq!(
+            result2,
+            TlaValue::Int(1),
+            "opts is non-empty, so should return 1"
+        );
+    }
+
+    #[test]
+    fn if_with_nested_let_in_else() {
+        let state = TlaState::from([("S".to_string(), TlaValue::Set(Arc::new(BTreeSet::new())))]);
+        let ctx = EvalContext::new(&state);
+
+        // IF with nested LET in ELSE branch
+        let expr = "IF S = {} THEN 0 ELSE LET x == 1 IN x + 2";
+        let result = eval_expr(expr, &ctx).expect("IF with nested LET should evaluate");
+        assert_eq!(
+            result,
+            TlaValue::Int(0),
+            "S is empty set, so should return 0"
+        );
+
+        // Same test with non-empty set to exercise the ELSE branch
+        let state2 = TlaState::from([(
+            "S".to_string(),
+            TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(1)]))),
+        )]);
+        let ctx2 = EvalContext::new(&state2);
+        let result2 = eval_expr(expr, &ctx2).expect("IF with nested LET should evaluate");
+        assert_eq!(
+            result2,
+            TlaValue::Int(3),
+            "S is non-empty, so should evaluate LET and return 3"
+        );
+    }
+
+    #[test]
+    fn split_top_level_comparison_respects_if_then() {
+        // split_top_level_comparison should NOT split inside IF...THEN
+        let result = split_top_level_comparison("IF x = 5 THEN y ELSE z");
+        assert!(
+            result.is_none(),
+            "split_top_level_comparison should not split inside IF condition: {:?}",
+            result
+        );
+
+        // After THEN, it should be able to split
+        let result = split_top_level_comparison("IF x THEN a = b ELSE c");
+        assert!(
+            result.is_some(),
+            "split_top_level_comparison should split after THEN"
+        );
+        let (left, op, right) = result.unwrap();
+        assert_eq!(left, "IF x THEN a");
+        assert_eq!(op, "=");
+        assert_eq!(right, "b ELSE c");
+    }
+
+    #[test]
+    fn split_top_level_comparison_respects_let_in() {
+        // split_top_level_comparison should NOT split inside LET...IN
+        let result = split_top_level_comparison("LET x = 5 IN y");
+        assert!(
+            result.is_none(),
+            "split_top_level_comparison should not split inside LET: {:?}",
+            result
+        );
+
+        // After IN, it should be able to split
+        let result = split_top_level_comparison("LET x IN a = b");
+        assert!(
+            result.is_some(),
+            "split_top_level_comparison should split after IN"
         );
     }
 }

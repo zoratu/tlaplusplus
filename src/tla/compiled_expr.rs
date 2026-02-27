@@ -764,14 +764,19 @@ fn matches_keyword_at(chars: &[char], i: usize, keyword: &str) -> bool {
 }
 
 fn split_binary_op<'a>(expr: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
-    let mut depth = 0;
+    let mut bracket_depth = 0i32;
+    let mut let_depth = 0usize;
+    let mut if_depth = 0usize; // Track IF...THEN nesting (protects conditions from split)
     let mut in_string = false;
-    let bytes = expr.as_bytes();
-    let op_bytes = op.as_bytes();
+    let chars: Vec<char> = expr.chars().collect();
+    let op_chars: Vec<char> = op.chars().collect();
     let mut i = 0;
 
-    while i < bytes.len() {
-        if bytes[i] == b'"' && (i == 0 || bytes[i - 1] != b'\\') {
+    while i < chars.len() {
+        let c = chars[i];
+
+        // Handle strings
+        if c == '"' && (i == 0 || chars[i - 1] != '\\') {
             in_string = !in_string;
             i += 1;
             continue;
@@ -782,28 +787,68 @@ fn split_binary_op<'a>(expr: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
         }
 
         // Handle << and >> for sequence literals
-        if i + 1 < bytes.len() {
-            if bytes[i] == b'<' && bytes[i + 1] == b'<' {
-                depth += 1;
+        if i + 1 < chars.len() {
+            if c == '<' && chars[i + 1] == '<' {
+                bracket_depth += 1;
                 i += 2;
                 continue;
             }
-            if bytes[i] == b'>' && bytes[i + 1] == b'>' {
-                depth -= 1;
+            if c == '>' && chars[i + 1] == '>' {
+                bracket_depth -= 1;
                 i += 2;
                 continue;
             }
         }
 
-        match bytes[i] {
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => depth -= 1,
+        match c {
+            '(' | '[' | '{' => bracket_depth += 1,
+            ')' | ']' | '}' => bracket_depth -= 1,
             _ => {}
         }
 
-        if depth == 0 && i + op_bytes.len() <= bytes.len() {
-            if &bytes[i..i + op_bytes.len()] == op_bytes {
-                return Some((&expr[..i], &expr[i + op_bytes.len()..]));
+        // At bracket top level, check for LET, IN, IF, THEN keywords
+        if bracket_depth == 0 {
+            if matches_keyword_at(&chars, i, "LET") {
+                let_depth += 1;
+                i += 3;
+                continue;
+            }
+            if matches_keyword_at(&chars, i, "IN") && let_depth > 0 {
+                let_depth -= 1;
+                i += 2;
+                continue;
+            }
+            if matches_keyword_at(&chars, i, "IF") {
+                if_depth += 1;
+                i += 2;
+                continue;
+            }
+            if matches_keyword_at(&chars, i, "THEN") && if_depth > 0 {
+                if_depth -= 1;
+                i += 4;
+                continue;
+            }
+        }
+
+        // Only split when at top level of all constructs
+        let at_top = bracket_depth == 0 && let_depth == 0 && if_depth == 0;
+        if at_top && i + op_chars.len() <= chars.len() {
+            // Check if operator matches
+            let mut matches = true;
+            for (j, &oc) in op_chars.iter().enumerate() {
+                if chars[i + j] != oc {
+                    matches = false;
+                    break;
+                }
+            }
+            if matches {
+                // Calculate byte offsets
+                let left_byte_end: usize = chars[..i].iter().map(|c| c.len_utf8()).sum();
+                let right_byte_start: usize = chars[..i + op_chars.len()]
+                    .iter()
+                    .map(|c| c.len_utf8())
+                    .sum();
+                return Some((&expr[..left_byte_end], &expr[right_byte_start..]));
             }
         }
         i += 1;
@@ -1842,5 +1887,112 @@ mod tests {
         } else {
             panic!("Expected CompiledLetWithPrimes");
         }
+    }
+
+    #[test]
+    fn test_compile_if_with_equality_in_condition() {
+        // IF with equality operator in condition should not be split at =
+        let expr = compile_expr("IF opts = {} THEN 0 ELSE 1");
+        assert!(
+            matches!(expr, CompiledExpr::If { .. }),
+            "IF expression with equality should be parsed as If, got: {:?}",
+            expr
+        );
+
+        // IF with more complex condition containing =
+        let expr = compile_expr("IF x = 5 THEN x + 1 ELSE x - 1");
+        if let CompiledExpr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } = expr
+        {
+            // Condition should be an equality check, not Unparsed
+            assert!(
+                matches!(*cond, CompiledExpr::Eq(_, _)),
+                "Condition should be Eq, got: {:?}",
+                cond
+            );
+            // Branches should be compiled
+            assert!(
+                matches!(*then_branch, CompiledExpr::Add(_, _)),
+                "Then branch should be Add, got: {:?}",
+                then_branch
+            );
+            assert!(
+                matches!(*else_branch, CompiledExpr::Sub(_, _)),
+                "Else branch should be Sub, got: {:?}",
+                else_branch
+            );
+        } else {
+            panic!("Expected If expression");
+        }
+    }
+
+    #[test]
+    fn test_compile_if_with_nested_let_in_else() {
+        // IF with nested LET in ELSE branch
+        let expr = compile_expr("IF S = {} THEN 0 ELSE LET x == 1 IN x + 2");
+        if let CompiledExpr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } = expr
+        {
+            // Condition should be equality check
+            assert!(
+                matches!(*cond, CompiledExpr::Eq(_, _)),
+                "Condition should be Eq, got: {:?}",
+                cond
+            );
+            // Then branch should be integer
+            assert!(
+                matches!(*then_branch, CompiledExpr::Int(0)),
+                "Then branch should be Int(0), got: {:?}",
+                then_branch
+            );
+            // Else branch should be LET
+            assert!(
+                matches!(*else_branch, CompiledExpr::Let { .. }),
+                "Else branch should be Let, got: {:?}",
+                else_branch
+            );
+        } else {
+            panic!("Expected If expression");
+        }
+    }
+
+    #[test]
+    fn test_split_binary_op_respects_if_then() {
+        // split_binary_op should NOT split inside IF...THEN
+        // The = inside "IF x = 5 THEN" should not be found
+        let result = split_binary_op("IF x = 5 THEN y ELSE z", "=");
+        assert!(
+            result.is_none(),
+            "split_binary_op should not split inside IF condition: {:?}",
+            result
+        );
+
+        // But after THEN, it should be able to split
+        let result = split_binary_op("IF x THEN a = b ELSE c", "=");
+        assert!(result.is_some(), "split_binary_op should split after THEN");
+        let (left, right) = result.unwrap();
+        assert_eq!(left.trim(), "IF x THEN a");
+        assert_eq!(right.trim(), "b ELSE c");
+    }
+
+    #[test]
+    fn test_split_binary_op_respects_let_in() {
+        // split_binary_op should NOT split inside LET...IN
+        let result = split_binary_op("LET x = 5 IN y", "=");
+        assert!(
+            result.is_none(),
+            "split_binary_op should not split inside LET: {:?}",
+            result
+        );
+
+        // After IN, it should be able to split
+        let result = split_binary_op("LET x IN a = b", "=");
+        assert!(result.is_some(), "split_binary_op should split after IN");
     }
 }
