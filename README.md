@@ -11,8 +11,9 @@ GC runs more frequently, and even with parallel GC there can be long pauses.
 These pauses cause workers to stall, which shows up as reduced CPU utilization.
 Lastlyk, TLC uses memory-mapped files for the fingerprint store, and as working
 set exceeds RAM, page faults trigger blocking I/O. The combination creates a
-negative feedback loop: GC pauses → workers stall → I/O queue builds up → more
-iowait → less throughput → more memory pressure → more GC.
+negative feedback loop: GC pauses, so workers stall, which makes I/O queue
+builds up, which creates more iowait, which makes less throughput, which makes
+more memory pressure, which creates more GC.
 
 TLA++ avoids this by using lock-free, in-memory fingerprint store (no disk I/O
 on hot path), work-stealing to keep all cores busy even if some workers are
@@ -26,12 +27,6 @@ Benchmarked on 128-core AMD EPYC (c6a.metal, 256GB RAM):
 | States/minute | 10.5M | 980K | **10.7x** |
 | CPU utilization | 95%+ | ~60% | - |
 | Memory efficiency | Lock-free | GC pauses | - |
-
-Key optimizations:
-- **NUMA-aware work-stealing queues** - hierarchical stealing prefers same-NUMA-node workers
-- **Lock-free fingerprint store** - atomic CAS operations eliminate lock contention
-- **Zero-copy state handling** - Arc-wrapped collections avoid clone overhead
-- **Batch fingerprint checking** - amortizes synchronization across 512+ states
 
 ## Features
 
