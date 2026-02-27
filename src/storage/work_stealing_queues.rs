@@ -21,7 +21,9 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 const MAX_LOCAL_STEAL_ATTEMPTS: usize = 8;
 
 /// Maximum workers to try stealing from per remote NUMA node
-const MAX_REMOTE_STEAL_ATTEMPTS: usize = 4;
+/// Keep low because cross-NUMA stealing is expensive (memory access latency)
+/// NUMA distances can be 2-3x higher for remote nodes
+const MAX_REMOTE_STEAL_ATTEMPTS: usize = 1;
 
 /// Work-stealing queue system for parallel state exploration
 /// Each worker has a local queue and can steal from others when idle
