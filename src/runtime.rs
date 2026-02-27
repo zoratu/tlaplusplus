@@ -9,8 +9,10 @@ use crate::storage::page_aligned_fingerprint_store::{
 };
 use crate::storage::queue::{DiskBackedQueue, DiskQueueConfig, QueueStats};
 use crate::storage::simple_blocking_queue::SimpleBlockingQueue;
-use crate::storage::spillable_work_stealing::{SpillableConfig, SpillableWorkStealingQueues};
-use crate::storage::work_stealing_queues::{WorkStealingQueues, WorkerState};
+use crate::storage::spillable_work_stealing::{
+    SpillableConfig, SpillableWorkStealingQueues, SpillableWorkerState,
+};
+use crate::storage::work_stealing_queues::WorkStealingQueues;
 use crate::system::{
     WorkerPlan, WorkerPlanRequest, build_worker_plan, cgroup_memory_max_bytes,
     pin_current_thread_to_cpu,
@@ -533,6 +535,9 @@ where
         spill_dir: config.work_dir.join("queue-spill"),
         spill_batch: config.queue_spill_batch,
         load_existing: config.resume_from_checkpoint,
+        // Per-worker spill buffer settings for lock-free spilling
+        worker_spill_buffer_size: 4096, // Each worker buffers 4K items locally
+        worker_channel_bound: 16,       // 16 batches in flight per worker
     };
     let (queue, worker_states) = SpillableWorkStealingQueues::new(
         worker_plan.worker_count,
@@ -784,8 +789,8 @@ where
 
             loop {
                 // Chaos: check if this worker should crash
-                if crate::chaos::should_crash_worker(worker_state.id) {
-                    panic!("chaos: simulated worker {} crash", worker_state.id);
+                if crate::chaos::should_crash_worker(worker_state.id()) {
+                    panic!("chaos: simulated worker {} crash", worker_state.id());
                 }
 
                 // Chaos: failpoint for worker panic
@@ -810,7 +815,7 @@ where
                 };
 
                 // Mark worker as active (cache-line padded, no contention with other workers)
-                worker_queue.worker_start(worker_state.id);
+                worker_queue.worker_start(worker_state.id());
                 local_states_processed += 1;
 
                 // Periodically flush local stats to reduce atomic contention
@@ -844,7 +849,7 @@ where
                     if worker_stop_on_violation {
                         worker_stop.store(true, Ordering::Release);
                     }
-                    worker_queue.worker_idle(worker_state.id);
+                    worker_queue.worker_idle(worker_state.id());
                     if worker_stop_on_violation {
                         break;
                     }
@@ -858,7 +863,7 @@ where
                 if worker_queue.should_apply_backpressure(MAX_PENDING_STATES) {
                     // Don't generate successors, just mark worker as idle and continue
                     // This allows us to process the backlog
-                    worker_queue.worker_idle(worker_state.id);
+                    worker_queue.worker_idle(worker_state.id());
                     continue;
                 }
 
@@ -983,7 +988,7 @@ where
                 }
 
                 // Mark worker as idle (done with this state)
-                worker_queue.worker_idle(worker_state.id);
+                worker_queue.worker_idle(worker_state.id());
             }
 
             // Flush any remaining local stats before exiting

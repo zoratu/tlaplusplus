@@ -61,6 +61,15 @@ pub struct WorkerState<T> {
     flush_threshold: u64,
 }
 
+impl<T> WorkerState<T> {
+    /// Push an item to this worker's local queue
+    #[inline]
+    pub fn push(&mut self, item: T) {
+        self.worker.push(item);
+        self.local_pushed += 1;
+    }
+}
+
 impl<T: 'static> WorkStealingQueues<T> {
     /// Create a new NUMA-aware work-stealing queue system
     /// worker_numa_nodes: for each worker_id, which NUMA node it belongs to
