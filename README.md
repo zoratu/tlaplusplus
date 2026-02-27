@@ -1,8 +1,23 @@
-# tlaplusplus
+# TLA++
 
-A Rust implementation of TLA+ model checking, achieving **10.7x faster** state exploration than Java TLC on many-core systems.
+A Rust implementation of TLA+ model checking, achieving **10.7x faster** state exploration than Java TLC on many-core systems for large models.
 
 ## Performance
+
+When running complex models on large systems, I noticed a gradual reduction in
+CPU efficiency. TLC writes fingerprints to disk files that grow continuously.
+As files get larger, I/O latency increases. As the heap fills with state data,
+GC runs more frequently, and even with parallel GC there can be long pauses.
+These pauses cause workers to stall, which shows up as reduced CPU utilization.
+Lastlyk, TLC uses memory-mapped files for the fingerprint store, and as working
+set exceeds RAM, page faults trigger blocking I/O. The combination creates a
+negative feedback loop: GC pauses → workers stall → I/O queue builds up → more
+iowait → less throughput → more memory pressure → more GC.
+
+TLA++ avoids this by using lock-free, in-memory fingerprint store (no disk I/O
+on hot path), work-stealing to keep all cores busy even if some workers are
+slow, no GC pauses (because Rust), and batch operations to amortize any
+synchronization cost.
 
 Benchmarked on 128-core AMD EPYC (c6a.metal, 256GB RAM):
 
