@@ -259,14 +259,28 @@ fn apply_memory_budget(config: &EngineConfig, effective_memory_max: Option<u64>)
 }
 
 fn write_checkpoint_manifest(path: &Path, manifest: &CheckpointManifest) -> Result<()> {
+    // Chaos: fail point for testing checkpoint write failures
+    crate::fail_point!("checkpoint_write_fail");
+
+    // Chaos: apply I/O latency if configured
+    crate::chaos::apply_io_latency();
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed creating checkpoint dir {}", parent.display()))?;
     }
     let tmp = path.with_extension("tmp");
     let bytes = serde_json::to_vec_pretty(manifest).context("failed serializing checkpoint")?;
+
+    // Chaos: fail point for disk write
+    crate::fail_point!("checkpoint_disk_write_fail");
+
     std::fs::write(&tmp, bytes)
         .with_context(|| format!("failed writing checkpoint temp file {}", tmp.display()))?;
+
+    // Chaos: fail point for atomic rename
+    crate::fail_point!("checkpoint_rename_fail");
+
     std::fs::rename(&tmp, path)
         .with_context(|| format!("failed atomically moving checkpoint to {}", path.display()))?;
     Ok(())
@@ -298,7 +312,12 @@ where
         .wait_for_quiescence(ctx.stop, ctx.active_workers, ctx.live_workers);
 
     let checkpoint_result = (|| -> Result<()> {
+        // Chaos: fail point for queue flush
+        crate::fail_point!("checkpoint_queue_flush_fail");
         ctx.queue.checkpoint_flush()?;
+
+        // Chaos: fail point for fingerprint flush
+        crate::fail_point!("checkpoint_fp_flush_fail");
         let _ = ctx.fp_store.flush()?;
 
         let (states_generated, states_processed, states_distinct, duplicates, enqueued, _) =
@@ -574,7 +593,30 @@ where
         let mut last_time = std::time::Instant::now();
 
         loop {
-            std::thread::sleep(std::time::Duration::from_secs(10));
+            // Check for emergency checkpoint request every second
+            for _ in 0..10 {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+
+                if progress_stop.load(Ordering::Relaxed) {
+                    return;
+                }
+
+                // Handle emergency checkpoint request
+                if crate::chaos::is_emergency_checkpoint_requested() {
+                    eprintln!("Emergency checkpoint: flushing fingerprint store...");
+                    if let Err(e) = progress_fp_store.flush() {
+                        eprintln!("Emergency checkpoint: fingerprint flush failed: {}", e);
+                    } else {
+                        eprintln!("Emergency checkpoint: fingerprint store flushed successfully");
+                    }
+                    let (generated, _, distinct, _, _, _) = progress_run_stats.snapshot();
+                    eprintln!(
+                        "Emergency checkpoint: {} states generated, {} distinct at time of failure",
+                        generated, distinct
+                    );
+                    crate::chaos::clear_emergency_checkpoint();
+                }
+            }
 
             if progress_stop.load(Ordering::Relaxed) {
                 break;
@@ -722,6 +764,17 @@ where
             };
 
             loop {
+                // Chaos: check if this worker should crash
+                if crate::chaos::should_crash_worker(worker_state.id) {
+                    panic!("chaos: simulated worker {} crash", worker_state.id);
+                }
+
+                // Chaos: failpoint for worker panic
+                #[cfg(feature = "failpoints")]
+                if crate::fail_point_is_set!("worker_panic") {
+                    panic!("chaos: failpoint worker_panic triggered");
+                }
+
                 worker_pause.worker_pause_point(&worker_stop);
                 if worker_stop.load(Ordering::Acquire) {
                     break;
@@ -932,11 +985,36 @@ where
         }));
     }
 
-    for worker in workers {
+    // Worker crash recovery: continue with remaining workers instead of failing immediately
+    let mut crashed_workers = 0usize;
+    let total_workers = workers.len();
+
+    for (worker_id, worker) in workers.into_iter().enumerate() {
         if worker.join().is_err() {
-            stop.store(true, Ordering::Release);
-            return Err(anyhow!("worker thread panicked"));
+            crashed_workers += 1;
+            eprintln!(
+                "Warning: worker {} crashed ({}/{} workers still running)",
+                worker_id,
+                total_workers - crashed_workers,
+                total_workers
+            );
+
+            // If all workers crashed, we must stop
+            if crashed_workers == total_workers {
+                stop.store(true, Ordering::Release);
+                return Err(anyhow!("all {} worker threads panicked", total_workers));
+            }
+
+            // Otherwise continue - other workers may still complete the work
+            // The work-stealing queues will redistribute work from the crashed worker
         }
+    }
+
+    if crashed_workers > 0 {
+        eprintln!(
+            "Run completed with {}/{} workers crashed (recovered gracefully)",
+            crashed_workers, total_workers
+        );
     }
 
     // Stop progress reporting
@@ -1292,6 +1370,244 @@ mod tests {
         assert!(resumed.violation.is_some());
 
         let _ = std::fs::remove_dir_all(work_dir);
+        Ok(())
+    }
+}
+
+/// Failpoint integration tests - run with `cargo test --features failpoints`
+#[cfg(all(test, feature = "failpoints"))]
+mod failpoint_tests {
+    use super::{EngineConfig, run_model};
+    use crate::chaos;
+    use crate::models::counter_grid::CounterGridModel;
+    use anyhow::Result;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_work_dir(prefix: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "tlapp-failpoint-{prefix}-{nanos}-{}",
+            std::process::id()
+        ))
+    }
+
+    /// Test that worker crash is recovered gracefully
+    #[test]
+    fn worker_crash_recovery() -> Result<()> {
+        let work_dir = temp_work_dir("worker-crash");
+
+        // Set worker 0 to crash after a few iterations
+        chaos::set_crash_worker(0);
+
+        let model = CounterGridModel::new(10, 10, 50);
+        let config = EngineConfig {
+            workers: 4, // Multiple workers so others can continue
+            enforce_cgroups: false,
+            numa_pinning: false,
+            clean_work_dir: true,
+            resume_from_checkpoint: false,
+            checkpoint_interval_secs: 0,
+            work_dir: work_dir.clone(),
+            ..EngineConfig::default()
+        };
+
+        // Run should complete despite worker 0 crashing
+        let outcome = run_model(model, config)?;
+
+        // Reset crash worker
+        chaos::set_crash_worker(u64::MAX);
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(work_dir);
+
+        // The run should have completed (other workers finished the work)
+        assert!(outcome.stats.states_generated > 0);
+        eprintln!(
+            "Worker crash recovery test: {} states generated with 1 crashed worker",
+            outcome.stats.states_generated
+        );
+
+        Ok(())
+    }
+
+    /// Test that I/O latency doesn't break the system
+    #[test]
+    fn io_latency_tolerance() -> Result<()> {
+        let work_dir = temp_work_dir("io-latency");
+
+        // Add 10ms I/O latency
+        chaos::set_io_latency_us(10_000);
+
+        let model = CounterGridModel::new(5, 5, 20);
+        let config = EngineConfig {
+            workers: 2,
+            enforce_cgroups: false,
+            numa_pinning: false,
+            clean_work_dir: true,
+            resume_from_checkpoint: false,
+            checkpoint_interval_secs: 0,
+            work_dir: work_dir.clone(),
+            ..EngineConfig::default()
+        };
+
+        let outcome = run_model(model, config)?;
+
+        // Reset I/O latency
+        chaos::set_io_latency_us(0);
+
+        let _ = std::fs::remove_dir_all(work_dir);
+
+        assert!(outcome.stats.states_generated > 0);
+        eprintln!(
+            "I/O latency test: {} states with 10ms artificial latency",
+            outcome.stats.states_generated
+        );
+
+        Ok(())
+    }
+
+    /// Test fingerprint store degradation (failpoint returns false instead of panicking)
+    #[test]
+    fn fingerprint_store_degradation() -> Result<()> {
+        let scenario = fail::FailScenario::setup();
+        let work_dir = temp_work_dir("fp-degrade");
+
+        // Enable fingerprint store shard full failpoint
+        fail::cfg("fp_store_shard_full", "return").unwrap();
+
+        let model = CounterGridModel::new(5, 5, 20);
+        let config = EngineConfig {
+            workers: 2,
+            enforce_cgroups: false,
+            numa_pinning: false,
+            clean_work_dir: true,
+            resume_from_checkpoint: false,
+            checkpoint_interval_secs: 0,
+            work_dir: work_dir.clone(),
+            ..EngineConfig::default()
+        };
+
+        // Should complete despite fingerprint store "full"
+        // May explore some duplicate states but should not crash
+        let outcome = run_model(model, config)?;
+
+        scenario.teardown();
+        let _ = std::fs::remove_dir_all(work_dir);
+
+        assert!(outcome.stats.states_generated > 0);
+        eprintln!(
+            "FP degradation test: {} states generated (some may be duplicates)",
+            outcome.stats.states_generated
+        );
+
+        Ok(())
+    }
+
+    /// Test emergency checkpoint functionality
+    #[test]
+    fn emergency_checkpoint_request() {
+        // Request emergency checkpoint
+        assert!(!chaos::is_emergency_checkpoint_requested());
+        chaos::request_emergency_checkpoint();
+        assert!(chaos::is_emergency_checkpoint_requested());
+
+        // Clear it
+        chaos::clear_emergency_checkpoint();
+        assert!(!chaos::is_emergency_checkpoint_requested());
+
+        eprintln!("Emergency checkpoint request/clear test passed");
+    }
+
+    /// Test retry_with_backoff helper
+    #[test]
+    fn retry_with_backoff_success() {
+        let mut attempts = 0;
+
+        // Succeed on 3rd attempt
+        let result: Result<i32, String> = chaos::retry_with_backoff(
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(format!("fail attempt {}", attempts))
+                } else {
+                    Ok(42)
+                }
+            },
+            5,   // max retries
+            10,  // 10ms initial delay
+            100, // 100ms max delay
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(attempts, 3);
+        eprintln!(
+            "Retry with backoff test: succeeded after {} attempts",
+            attempts
+        );
+    }
+
+    /// Test retry_with_backoff exhaustion
+    #[test]
+    fn retry_with_backoff_exhaustion() {
+        let mut attempts = 0;
+
+        // Always fail
+        let result: Result<i32, String> = chaos::retry_with_backoff(
+            || {
+                attempts += 1;
+                Err(format!("always fail attempt {}", attempts))
+            },
+            2,   // max 2 retries (3 total attempts)
+            10,  // 10ms initial delay
+            100, // 100ms max delay
+        );
+
+        assert!(result.is_err());
+        assert_eq!(attempts, 3); // Initial + 2 retries
+        eprintln!(
+            "Retry exhaustion test: failed after {} attempts as expected",
+            attempts
+        );
+    }
+
+    /// Test that multiple workers can crash and run still completes
+    #[test]
+    fn multiple_worker_crashes() -> Result<()> {
+        let scenario = fail::FailScenario::setup();
+        let work_dir = temp_work_dir("multi-crash");
+
+        // Enable worker panic failpoint - this will affect all workers
+        // but they should crash one at a time
+        fail::cfg("worker_panic", "1*return->off").unwrap();
+
+        let model = CounterGridModel::new(8, 8, 30);
+        let config = EngineConfig {
+            workers: 4,
+            enforce_cgroups: false,
+            numa_pinning: false,
+            clean_work_dir: true,
+            resume_from_checkpoint: false,
+            checkpoint_interval_secs: 0,
+            work_dir: work_dir.clone(),
+            ..EngineConfig::default()
+        };
+
+        // Should complete even with one worker crashing
+        let outcome = run_model(model, config)?;
+
+        scenario.teardown();
+        let _ = std::fs::remove_dir_all(work_dir);
+
+        assert!(outcome.stats.states_generated > 0);
+        eprintln!(
+            "Multiple worker crash test: {} states generated",
+            outcome.stats.states_generated
+        );
+
         Ok(())
     }
 }

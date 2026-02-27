@@ -1,4 +1,5 @@
 pub mod canon;
+pub mod chaos;
 pub mod fairness;
 pub mod liveness;
 pub mod model;
