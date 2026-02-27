@@ -649,6 +649,7 @@ fn split_top_level(expr: &str, delim: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
     let mut depth = 0;
+    let mut let_depth: usize = 0; // Track LET...IN nesting
     let mut in_string = false;
     let chars: Vec<char> = expr.chars().collect();
     let delim_chars: Vec<char> = delim.chars().collect();
@@ -694,7 +695,23 @@ fn split_top_level(expr: &str, delim: &str) -> Vec<String> {
             _ => {}
         }
 
-        if depth == 0 {
+        // Check for LET keyword at word boundary when at bracket top level
+        if depth == 0 && matches_keyword_at(&chars, i, "LET") {
+            let_depth += 1;
+            current.push_str("LET");
+            i += 3;
+            continue;
+        }
+
+        // Check for IN keyword at word boundary when inside a LET
+        if depth == 0 && let_depth > 0 && matches_keyword_at(&chars, i, "IN") {
+            let_depth = let_depth.saturating_sub(1);
+            current.push_str("IN");
+            i += 2;
+            continue;
+        }
+
+        if depth == 0 && let_depth == 0 {
             // Check for delimiter
             let remaining: String = chars[i..].iter().collect();
             if remaining.starts_with(delim) {
@@ -716,6 +733,34 @@ fn split_top_level(expr: &str, delim: &str) -> Vec<String> {
     }
 
     parts
+}
+
+/// Check if a keyword appears at position i with word boundaries
+fn matches_keyword_at(chars: &[char], i: usize, keyword: &str) -> bool {
+    let kw_chars: Vec<char> = keyword.chars().collect();
+
+    // Check if keyword matches
+    if i + kw_chars.len() > chars.len() {
+        return false;
+    }
+    for (j, kc) in kw_chars.iter().enumerate() {
+        if chars[i + j] != *kc {
+            return false;
+        }
+    }
+
+    // Check word boundary before (must be start or non-alphanumeric)
+    if i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_') {
+        return false;
+    }
+
+    // Check word boundary after (must be end or non-alphanumeric)
+    let after = i + kw_chars.len();
+    if after < chars.len() && (chars[after].is_alphanumeric() || chars[after] == '_') {
+        return false;
+    }
+
+    true
 }
 
 fn split_binary_op<'a>(expr: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
@@ -1165,7 +1210,13 @@ fn try_parse_if(expr: &str) -> Option<CompiledExpr> {
 
 fn try_parse_let(expr: &str) -> Option<CompiledExpr> {
     // LET defs IN body
-    let rest = expr.strip_prefix("LET ")?.trim();
+    // Handle "LET " or "LET\n" or "LET\t" etc.
+    let rest = expr.strip_prefix("LET")?;
+    // Must be followed by whitespace
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let rest = rest.trim_start();
 
     let in_idx = find_keyword(rest, "IN")?;
     let defs_str = rest[..in_idx].trim();
