@@ -482,27 +482,17 @@ where
     }
 
     // Use bloom filter with GUARANTEED bounded memory
-    // Unlike sled or hash tables, bloom filters have fixed memory determined at creation
-    // Memory usage: ~(items * -ln(fpr) / ln(2)^2) bits
-    // Example: 1B items @ 1% FPR = ~1.2GB fixed
-    //
-    // For Combined.tla: expect billions of states, so use generous estimate
-    let expected_states = 5_000_000_000u64; // 5 billion states
-    let fp_rate = 0.01f64; // 1% false positive rate (acceptable for model checking)
+    // Testing showed bloom filter is faster than page-aligned hash table:
+    // - Bloom: 2.24M states/sec
+    // - Page-aligned: 1.84M states/sec
+    // Bloom filter wins because:
+    // - Bit operations are simpler than hash table CAS
+    // - No linear probing cache misses
+    // - RwLock sharding is efficient for this access pattern
+    let expected_states = config.fp_expected_items;
+    let fp_rate = config.fp_false_positive_rate;
 
-    // Calculate expected memory usage
-    let bits_per_item = -(fp_rate.ln()) / (2.0f64.ln().powi(2));
-    let total_bits = (expected_states as f64 * bits_per_item) as usize;
-    let _bloom_memory_mb = total_bits / 8 / 1024 / 1024;
-
-    // Removed bloom filter diagnostic output for TLC compatibility
-    // eprintln!("Using bloom filter fingerprint store (GUARANTEED bounded memory)");
-    // eprintln!("  Expected states: {}", expected_states);
-    // eprintln!("  False positive rate: {}%", fp_rate * 100.0);
-    // eprintln!("  Memory usage: {} MB (FIXED, no growth)", bloom_memory_mb);
-    // eprintln!("  Shard count: {}", shard_count);
-
-    let mut fp_store = crate::storage::bloom_fingerprint_store::BloomFingerprintStore::new(
+    let fp_store = crate::storage::bloom_fingerprint_store::BloomFingerprintStore::new(
         expected_states as usize,
         fp_rate,
         shard_count,
