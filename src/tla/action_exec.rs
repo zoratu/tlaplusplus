@@ -1,11 +1,59 @@
 use crate::fairness::{ActionLabel, LabeledTransition};
 use crate::tla::{
-    EvalContext, TlaDefinition, TlaState, TlaValue, apply_action_ir_with_context,
+    CompiledActionIr, EvalContext, TlaDefinition, TlaState, TlaValue, apply_compiled_action_ir,
     compile_action_ir, eval_expr, split_top_level,
 };
 use anyhow::{Result, anyhow};
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use dashmap::DashMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Arc, LazyLock};
+
+// Global cache for pre-warmed compiled action IRs (populated at model load time)
+// This is read-only during model checking, so no contention
+static PREWARMED_ACTION_CACHE: LazyLock<DashMap<String, Arc<CompiledActionIr>>> =
+    LazyLock::new(DashMap::new);
+
+// Thread-local cache for runtime-compiled action IRs
+// Using thread-local storage eliminates cross-thread contention entirely
+thread_local! {
+    static THREAD_LOCAL_ACTION_CACHE: RefCell<HashMap<String, Arc<CompiledActionIr>>> =
+        RefCell::new(HashMap::with_capacity(64));
+}
+
+/// Get or compile an action IR with compiled expressions (thread-local, zero contention)
+fn get_or_compile_action(def: &TlaDefinition) -> Arc<CompiledActionIr> {
+    // Use body as cache key (name could have duplicates with different bodies)
+    let cache_key = format!("{}:{}", def.name, def.body);
+
+    // Check pre-warmed global cache first (read-only, no contention)
+    if let Some(cached) = PREWARMED_ACTION_CACHE.get(&cache_key) {
+        return Arc::clone(&cached);
+    }
+
+    // Check thread-local cache
+    THREAD_LOCAL_ACTION_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(cached) = cache.get(&cache_key) {
+            return Arc::clone(cached);
+        }
+
+        // Compile and cache in thread-local storage
+        let ir = compile_action_ir(def);
+        let compiled = Arc::new(CompiledActionIr::from_ir(&ir));
+        cache.insert(cache_key, Arc::clone(&compiled));
+        compiled
+    })
+}
+
+/// Insert a pre-compiled action into the global pre-warmed cache
+///
+/// This is used to warm up the cache at model load time with actions
+/// that have already been compiled. The global cache is read-only during
+/// model checking, so there's no contention.
+pub fn insert_compiled_action(cache_key: String, compiled: Arc<CompiledActionIr>) {
+    PREWARMED_ACTION_CACHE.insert(cache_key, compiled);
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct NextBranchProbe {
@@ -160,8 +208,9 @@ fn execute_branch(
             }
         }
 
-        let ir = compile_action_ir(def);
-        let next = apply_action_ir_with_context(&ir, state, &ctx)?;
+        // Use compiled action IR for faster evaluation
+        let compiled_ir = get_or_compile_action(def);
+        let next = apply_compiled_action_ir(&compiled_ir, state, &ctx)?;
         return match next {
             Some(state) => Ok(vec![state]),
             None => Ok(Vec::new()),
@@ -183,8 +232,9 @@ fn execute_branch(
         }
     }
 
-    let ir = compile_action_ir(&inline_def);
-    let next = apply_action_ir_with_context(&ir, state, &ctx)?;
+    // Use compiled action IR for inline actions too
+    let compiled_ir = get_or_compile_action(&inline_def);
+    let next = apply_compiled_action_ir(&compiled_ir, state, &ctx)?;
     match next {
         Some(state) => Ok(vec![state]),
         None => Ok(Vec::new()),

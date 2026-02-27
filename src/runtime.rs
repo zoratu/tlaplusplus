@@ -481,29 +481,26 @@ where
         );
     }
 
-    // Use bloom filter with GUARANTEED bounded memory
-    // Testing showed bloom filter is faster than page-aligned hash table:
-    // - Bloom: 2.24M states/sec
-    // - Page-aligned: 1.84M states/sec
-    // Bloom filter wins because:
-    // - Bit operations are simpler than hash table CAS
-    // - No linear probing cache misses
-    // - RwLock sharding is efficient for this access pattern
-    let expected_states = config.fp_expected_items;
-    let fp_rate = config.fp_false_positive_rate;
-
-    let fp_store = crate::storage::bloom_fingerprint_store::BloomFingerprintStore::new(
-        expected_states as usize,
-        fp_rate,
+    // Use lock-free page-aligned fingerprint store for high concurrency
+    // At 126 workers, RwLock sharding causes severe contention (~97% throughput loss)
+    // Atomic CAS operations eliminate lock contention entirely
+    let fp_config = PageAlignedConfig {
         shard_count,
-    )?;
+        expected_items: config.fp_expected_items,
+        shard_size_mb: shard_size_mb,
+    };
+
+    let fp_store = PageAlignedFingerprintStore::new(fp_config, &worker_plan.assigned_cpus)?;
 
     let fp_store = Arc::new(fp_store);
 
-    // Use work-stealing queues - state of the art for CPU-bound parallel workloads
+    // Use NUMA-aware work-stealing queues
     // Each worker has its own queue, steals from others when idle
-    // Zero contention on the common path (local push/pop)
-    let (queue, worker_states) = WorkStealingQueues::new(worker_plan.worker_count);
+    // Hierarchical stealing: prefer same-NUMA node first, then remote
+    let (queue, worker_states) = WorkStealingQueues::new(
+        worker_plan.worker_count,
+        worker_plan.worker_numa_nodes.clone(),
+    );
 
     let run_stats = Arc::new(AtomicRunStats::default());
     let stop = Arc::new(AtomicBool::new(false));
@@ -650,7 +647,7 @@ where
         };
 
     let mut workers = Vec::with_capacity(worker_plan.worker_count);
-    for (worker_id, worker_state) in worker_states.into_iter().enumerate() {
+    for (worker_id, mut worker_state) in worker_states.into_iter().enumerate() {
         let worker_model = Arc::clone(&model);
         let worker_fp_store = Arc::clone(&fp_store);
         let worker_queue = Arc::clone(&queue);
@@ -681,6 +678,49 @@ where
             let mut batch_seen: Vec<bool> = Vec::with_capacity(worker_fp_batch_size);
             let mut local_fp_dedup: HashSet<u64> = HashSet::with_capacity(worker_fp_batch_size * 2);
 
+            // Per-worker stats counters to reduce atomic contention
+            // Flushed periodically instead of every state
+            let mut local_states_processed = 0u64;
+            let mut local_states_generated = 0u64;
+            let mut local_duplicates = 0u64;
+            let mut local_states_distinct = 0u64;
+            let mut local_enqueued = 0u64;
+            const STATS_FLUSH_INTERVAL: u64 = 256; // Flush every 256 states
+
+            let flush_local_stats = |processed: &mut u64,
+                                     generated: &mut u64,
+                                     duplicates: &mut u64,
+                                     distinct: &mut u64,
+                                     enqueued: &mut u64,
+                                     stats: &AtomicRunStats| {
+                if *processed > 0 {
+                    stats
+                        .states_processed
+                        .fetch_add(*processed, Ordering::Relaxed);
+                    *processed = 0;
+                }
+                if *generated > 0 {
+                    stats
+                        .states_generated
+                        .fetch_add(*generated, Ordering::Relaxed);
+                    *generated = 0;
+                }
+                if *duplicates > 0 {
+                    stats.duplicates.fetch_add(*duplicates, Ordering::Relaxed);
+                    *duplicates = 0;
+                }
+                if *distinct > 0 {
+                    stats
+                        .states_distinct
+                        .fetch_add(*distinct, Ordering::Relaxed);
+                    *distinct = 0;
+                }
+                if *enqueued > 0 {
+                    stats.enqueued.fetch_add(*enqueued, Ordering::Relaxed);
+                    *enqueued = 0;
+                }
+            };
+
             loop {
                 worker_pause.worker_pause_point(&worker_stop);
                 if worker_stop.load(Ordering::Acquire) {
@@ -689,7 +729,7 @@ where
 
                 // Work-stealing: try local queue first, then steal from others
                 // This has zero contention on the common path
-                let state = match worker_queue.pop_for_worker(&worker_state) {
+                let state = match worker_queue.pop_for_worker(&mut worker_state) {
                     Some(state) => state,
                     None => {
                         // No work available and exploration complete
@@ -697,12 +737,21 @@ where
                     }
                 };
 
-                // Mark worker as active (doing actual work)
-                worker_queue.worker_start();
-                worker_active.fetch_add(1, Ordering::AcqRel);
-                worker_stats
-                    .states_processed
-                    .fetch_add(1, Ordering::Relaxed);
+                // Mark worker as active (cache-line padded, no contention with other workers)
+                worker_queue.worker_start(worker_state.id);
+                local_states_processed += 1;
+
+                // Periodically flush local stats to reduce atomic contention
+                if local_states_processed % STATS_FLUSH_INTERVAL == 0 {
+                    flush_local_stats(
+                        &mut local_states_processed,
+                        &mut local_states_generated,
+                        &mut local_duplicates,
+                        &mut local_states_distinct,
+                        &mut local_enqueued,
+                        &worker_stats,
+                    );
+                }
 
                 if let Err(message) = worker_model.check_invariants(&state) {
                     // Reconstruct trace to violation using post-processing
@@ -723,8 +772,7 @@ where
                     if worker_stop_on_violation {
                         worker_stop.store(true, Ordering::Release);
                     }
-                    worker_queue.worker_idle();
-                    worker_active.fetch_sub(1, Ordering::AcqRel);
+                    worker_queue.worker_idle(worker_state.id);
                     if worker_stop_on_violation {
                         break;
                     }
@@ -733,14 +781,12 @@ where
 
                 // Apply backpressure: if queue is too full, skip successor generation
                 // This allows workers to process the backlog without deadlock
-                // Testing: Increased from 300K to 10M to measure backpressure impact
-                // Java TLC runs with 23M+ states in queue successfully
-                const MAX_PENDING_STATES: u64 = 10_000_000;
+                // Testing: Increased to 1B to allow full state space exploration
+                const MAX_PENDING_STATES: u64 = 1_000_000_000;
                 if worker_queue.should_apply_backpressure(MAX_PENDING_STATES) {
                     // Don't generate successors, just mark worker as idle and continue
                     // This allows us to process the backlog
-                    worker_queue.worker_idle();
-                    worker_active.fetch_sub(1, Ordering::AcqRel);
+                    worker_queue.worker_idle(worker_state.id);
                     continue;
                 }
 
@@ -777,9 +823,7 @@ where
                     worker_model.next_states(&state, &mut successors);
                 }
 
-                worker_stats
-                    .states_generated
-                    .fetch_add(successors.len() as u64, Ordering::Relaxed);
+                local_states_generated += successors.len() as u64;
 
                 // Filter successors by state constraints (prune states that don't satisfy constraints)
                 successors.retain(|next_state| {
@@ -789,13 +833,19 @@ where
                             .is_ok()
                 });
 
-                let mut process_batch = |pending_batch: &mut Vec<M::State>| -> Result<()> {
+                let mut states_to_enqueue: Vec<M::State> = Vec::with_capacity(worker_fp_batch_size);
+                let mut process_batch = |pending_batch: &mut Vec<M::State>,
+                                         local_duplicates: &mut u64,
+                                         local_states_distinct: &mut u64,
+                                         local_enqueued: &mut u64|
+                 -> Result<()> {
                     if pending_batch.is_empty() {
                         return Ok(());
                     }
                     unique_states.clear();
                     unique_fps.clear();
                     local_fp_dedup.clear();
+                    states_to_enqueue.clear();
 
                     let mut duplicates_in_batch = 0u64;
                     for candidate in pending_batch.drain(..) {
@@ -813,20 +863,20 @@ where
 
                         for (idx, next_state) in unique_states.drain(..).enumerate() {
                             if batch_seen[idx] {
-                                worker_stats.duplicates.fetch_add(1, Ordering::Relaxed);
+                                *local_duplicates += 1;
                             } else {
-                                worker_stats.states_distinct.fetch_add(1, Ordering::Relaxed);
-                                worker_queue.push_local(&worker_state, next_state);
-                                worker_stats.enqueued.fetch_add(1, Ordering::Relaxed);
+                                *local_states_distinct += 1;
+                                states_to_enqueue.push(next_state);
                             }
                         }
+
+                        // Batch push all new states at once
+                        let pushed = worker_queue
+                            .push_local_batch(&mut worker_state, states_to_enqueue.drain(..));
+                        *local_enqueued += pushed as u64;
                     }
 
-                    if duplicates_in_batch > 0 {
-                        worker_stats
-                            .duplicates
-                            .fetch_add(duplicates_in_batch, Ordering::Relaxed);
-                    }
+                    *local_duplicates += duplicates_in_batch;
                     Ok(())
                 };
 
@@ -836,7 +886,12 @@ where
                     }
                     pending_batch.push(next);
                     if pending_batch.len() >= worker_fp_batch_size
-                        && let Err(err) = process_batch(&mut pending_batch)
+                        && let Err(err) = process_batch(
+                            &mut pending_batch,
+                            &mut local_duplicates,
+                            &mut local_states_distinct,
+                            &mut local_enqueued,
+                        )
                     {
                         let _ = worker_error_tx.send(err.to_string());
                         worker_stop.store(true, Ordering::Release);
@@ -844,16 +899,33 @@ where
                     }
                 }
                 if !worker_stop.load(Ordering::Acquire)
-                    && let Err(err) = process_batch(&mut pending_batch)
+                    && let Err(err) = process_batch(
+                        &mut pending_batch,
+                        &mut local_duplicates,
+                        &mut local_states_distinct,
+                        &mut local_enqueued,
+                    )
                 {
                     let _ = worker_error_tx.send(err.to_string());
                     worker_stop.store(true, Ordering::Release);
                 }
 
                 // Mark worker as idle (done with this state)
-                worker_queue.worker_idle();
-                worker_active.fetch_sub(1, Ordering::AcqRel);
+                worker_queue.worker_idle(worker_state.id);
             }
+
+            // Flush any remaining local stats before exiting
+            flush_local_stats(
+                &mut local_states_processed,
+                &mut local_states_generated,
+                &mut local_duplicates,
+                &mut local_states_distinct,
+                &mut local_enqueued,
+                &worker_stats,
+            );
+
+            // Flush queue counters
+            worker_queue.flush_worker_counters(&mut worker_state);
 
             worker_live.fetch_sub(1, Ordering::AcqRel);
             worker_pause.wait_cv.notify_all();

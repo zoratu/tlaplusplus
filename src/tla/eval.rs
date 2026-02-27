@@ -67,7 +67,7 @@ impl<'a> EvalContext<'a> {
         }
     }
 
-    fn with_local_value(&self, name: impl Into<String>, value: TlaValue) -> Self {
+    pub(crate) fn with_local_value(&self, name: impl Into<String>, value: TlaValue) -> Self {
         // Copy-on-write: only clone the locals map, reuse the rest
         let mut new_locals = (*self.locals).clone();
         new_locals.insert(name.into(), value);
@@ -124,7 +124,7 @@ impl<'a> EvalContext<'a> {
         self.definitions.and_then(|defs| defs.get(name).cloned())
     }
 
-    fn resolve_identifier(&self, name: &str, depth: usize) -> Result<TlaValue> {
+    pub(crate) fn resolve_identifier(&self, name: &str, depth: usize) -> Result<TlaValue> {
         if let Some(v) = self.runtime_value(name) {
             return Ok(v);
         }
@@ -315,7 +315,7 @@ fn apply_comparison(left: &TlaValue, op: &str, right: &TlaValue) -> Result<bool>
 }
 
 /// Evaluate a LET expression that contains primed assignments
-fn eval_let_action(
+pub(crate) fn eval_let_action(
     expr: &str,
     ctx: &EvalContext<'_>,
     staged: &mut BTreeMap<String, TlaValue>,

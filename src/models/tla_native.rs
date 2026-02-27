@@ -2,9 +2,11 @@ use crate::fairness::{ActionLabel, FairnessConstraint, LabeledTransition};
 use crate::model::Model;
 use crate::symmetry::{SymmetrySpec, canonicalize_state};
 use crate::tla::{
-    ClauseKind, ConfigValue, EvalContext, TemporalFormula, TlaConfig, TlaModule, TlaState,
-    TlaValue, classify_clause, eval_action_constraint, eval_expr, evaluate_next_states,
-    evaluate_next_states_labeled, parse_tla_config, parse_tla_module_file, split_top_level,
+    ClauseKind, CompiledActionIr, CompiledExpr, ConfigValue, EvalContext, TemporalFormula,
+    TlaConfig, TlaDefinition, TlaModule, TlaState, TlaValue, classify_clause, compile_action_ir,
+    compile_expr, eval_action_constraint, eval_compiled, eval_expr, evaluate_next_states,
+    evaluate_next_states_labeled, insert_compiled_action, looks_like_action, parse_tla_config,
+    parse_tla_module_file, split_top_level,
 };
 use anyhow::{Context, Result, anyhow};
 use std::collections::{BTreeMap, HashSet};
@@ -25,6 +27,12 @@ pub struct TlaModel {
     pub symmetry: Option<SymmetrySpec>,
     pub view: Option<String>,
     pub initial_state: TlaState,
+    /// Pre-compiled action definitions for fast execution
+    pub compiled_actions: BTreeMap<String, Arc<CompiledActionIr>>,
+    /// Pre-compiled invariant expressions (name, compiled expr)
+    pub compiled_invariants: Vec<(String, Arc<CompiledExpr>)>,
+    /// Pre-compiled state constraint expressions (name, compiled expr)
+    pub compiled_state_constraints: Vec<(String, Arc<CompiledExpr>)>,
 }
 
 impl TlaModel {
@@ -34,7 +42,7 @@ impl TlaModel {
         init_override: Option<&str>,
         next_override: Option<&str>,
     ) -> Result<Self> {
-        let module = parse_tla_module_file(module_path)?;
+        let mut module = parse_tla_module_file(module_path)?;
         let config = if let Some(path) = cfg_path {
             let raw = std::fs::read_to_string(path)
                 .with_context(|| format!("failed reading cfg {}", path.display()))?;
@@ -42,6 +50,10 @@ impl TlaModel {
         } else {
             TlaConfig::default()
         };
+
+        // Inject constants from config into module definitions
+        // This makes constants available during action evaluation
+        inject_constants_into_definitions(&mut module, &config);
 
         let (init_name, next_name) = resolve_init_next_names(
             &module,
@@ -102,6 +114,18 @@ impl TlaModel {
         let symmetry = resolve_symmetry(&module, &config);
         let view = resolve_view(&module, &config);
 
+        // Pre-compile all action definitions
+        let compiled_actions = precompile_actions(&module.definitions);
+
+        // Pre-compile invariant expressions
+        let compiled_invariants = precompile_expressions(&invariant_exprs);
+
+        // Pre-compile state constraint expressions
+        let compiled_state_constraints = precompile_expressions(&state_constraints);
+
+        // Warm up the global action cache with our pre-compiled actions
+        warm_up_action_cache(&compiled_actions, &module.definitions);
+
         Ok(Self {
             module,
             config,
@@ -115,6 +139,9 @@ impl TlaModel {
             symmetry,
             view,
             initial_state,
+            compiled_actions,
+            compiled_invariants,
+            compiled_state_constraints,
         })
     }
 }
@@ -143,7 +170,7 @@ impl Model for TlaModel {
     }
 
     fn check_invariants(&self, state: &Self::State) -> Result<(), String> {
-        if self.invariant_exprs.is_empty() {
+        if self.compiled_invariants.is_empty() {
             return Ok(());
         }
 
@@ -152,8 +179,8 @@ impl Model for TlaModel {
             &self.module.definitions,
             &self.module.instances,
         );
-        for (name, expr) in &self.invariant_exprs {
-            match eval_expr(expr, &ctx) {
+        for (name, compiled_expr) in &self.compiled_invariants {
+            match eval_compiled(compiled_expr, &ctx) {
                 Ok(TlaValue::Bool(true)) => {}
                 Ok(TlaValue::Bool(false)) => {
                     return Err(format!("invariant '{name}' violated"));
@@ -173,7 +200,7 @@ impl Model for TlaModel {
     }
 
     fn check_state_constraints(&self, state: &Self::State) -> Result<(), String> {
-        if self.state_constraints.is_empty() {
+        if self.compiled_state_constraints.is_empty() {
             return Ok(());
         }
 
@@ -182,8 +209,8 @@ impl Model for TlaModel {
             &self.module.definitions,
             &self.module.instances,
         );
-        for (name, expr) in &self.state_constraints {
-            match eval_expr(expr, &ctx) {
+        for (name, compiled_expr) in &self.compiled_state_constraints {
+            match eval_compiled(compiled_expr, &ctx) {
                 Ok(TlaValue::Bool(true)) => {}
                 Ok(TlaValue::Bool(false)) => {
                     return Err(format!("state constraint '{name}' violated (state pruned)"));
@@ -724,6 +751,101 @@ fn extract_fairness_from_formula(
         }
         TemporalFormula::StatePredicate(_) => {
             // No fairness constraints in state predicates
+        }
+    }
+}
+
+/// Inject constants from config into module definitions
+///
+/// This makes constants available during action evaluation by creating
+/// zero-parameter operator definitions for each constant.
+fn inject_constants_into_definitions(module: &mut TlaModule, config: &TlaConfig) {
+    for (name, value) in &config.constants {
+        // Convert ConfigValue to a TLA+ expression string
+        let body = config_value_to_expr(value);
+
+        // Add as a zero-parameter definition
+        module.definitions.insert(
+            name.clone(),
+            TlaDefinition {
+                name: name.clone(),
+                params: vec![],
+                body,
+            },
+        );
+    }
+}
+
+/// Convert a ConfigValue to a TLA+ expression string
+fn config_value_to_expr(value: &ConfigValue) -> String {
+    match value {
+        ConfigValue::Int(n) => n.to_string(),
+        ConfigValue::String(s) => format!("\"{}\"", s),
+        ConfigValue::ModelValue(s) => s.clone(),
+        ConfigValue::Bool(b) => {
+            if *b {
+                "TRUE".to_string()
+            } else {
+                "FALSE".to_string()
+            }
+        }
+        ConfigValue::Set(values) => {
+            let items: Vec<String> = values.iter().map(config_value_to_expr).collect();
+            format!("{{{}}}", items.join(", "))
+        }
+        ConfigValue::Tuple(values) => {
+            let items: Vec<String> = values.iter().map(config_value_to_expr).collect();
+            format!("<<{}>>", items.join(", "))
+        }
+        ConfigValue::OperatorRef(name) => name.clone(),
+    }
+}
+
+/// Pre-compile all action definitions in the module
+///
+/// This compiles actions at model load time instead of lazily during execution,
+/// improving runtime performance by avoiding repeated compilation.
+fn precompile_actions(
+    definitions: &BTreeMap<String, TlaDefinition>,
+) -> BTreeMap<String, Arc<CompiledActionIr>> {
+    let mut compiled = BTreeMap::new();
+
+    for (name, def) in definitions {
+        // Only compile definitions that look like actions (contain primed variables or UNCHANGED)
+        if looks_like_action(def) {
+            let ir = compile_action_ir(def);
+            let compiled_ir = Arc::new(CompiledActionIr::from_ir(&ir));
+            compiled.insert(name.clone(), compiled_ir);
+        }
+    }
+
+    compiled
+}
+
+/// Pre-compile a list of (name, expression) pairs into compiled expressions
+fn precompile_expressions(exprs: &[(String, String)]) -> Vec<(String, Arc<CompiledExpr>)> {
+    exprs
+        .iter()
+        .map(|(name, expr)| {
+            let compiled = Arc::new(compile_expr(expr));
+            (name.clone(), compiled)
+        })
+        .collect()
+}
+
+/// Warm up the global COMPILED_ACTION_CACHE with pre-compiled actions
+///
+/// This ensures that when actions are looked up during execution, they're
+/// already in the cache and don't need to be compiled.
+fn warm_up_action_cache(
+    compiled_actions: &BTreeMap<String, Arc<CompiledActionIr>>,
+    definitions: &BTreeMap<String, TlaDefinition>,
+) {
+    for (name, compiled_ir) in compiled_actions {
+        if let Some(def) = definitions.get(name) {
+            // Use the same cache key format as get_or_compile_action
+            let cache_key = format!("{}:{}", def.name, def.body);
+            insert_compiled_action(cache_key, Arc::clone(compiled_ir));
         }
     }
 }
