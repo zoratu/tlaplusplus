@@ -8,3 +8,4 @@
 /corpus/*_TTrace_*.tla
 /corpus/*_TTrace_*.bin
 /corpus/states/
+/DEPLOY.md
