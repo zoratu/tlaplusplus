@@ -9,7 +9,8 @@ use crate::storage::page_aligned_fingerprint_store::{
 };
 use crate::storage::queue::{DiskBackedQueue, DiskQueueConfig, QueueStats};
 use crate::storage::simple_blocking_queue::SimpleBlockingQueue;
-use crate::storage::work_stealing_queues::WorkStealingQueues;
+use crate::storage::spillable_work_stealing::{SpillableConfig, SpillableWorkStealingQueues};
+use crate::storage::work_stealing_queues::{WorkStealingQueues, WorkerState};
 use crate::system::{
     WorkerPlan, WorkerPlanRequest, build_worker_plan, cgroup_memory_max_bytes,
     pin_current_thread_to_cpu,
@@ -51,6 +52,10 @@ pub struct EngineConfig {
     pub queue_inmem_limit: usize,
     pub queue_spill_batch: usize,
     pub queue_spill_channel_bound: usize,
+    /// Enable disk spilling for work-stealing queues (prevents memory exhaustion)
+    pub enable_queue_spilling: bool,
+    /// Max items in memory before spilling (when enable_queue_spilling is true)
+    pub queue_max_inmem_items: u64,
 }
 
 impl Default for EngineConfig {
@@ -79,6 +84,8 @@ impl Default for EngineConfig {
             queue_inmem_limit: 5_000_000,
             queue_spill_batch: 50_000,
             queue_spill_channel_bound: 128,
+            enable_queue_spilling: false,
+            queue_max_inmem_items: 50_000_000, // 50M items before spilling
         }
     }
 }
@@ -513,13 +520,25 @@ where
 
     let fp_store = Arc::new(fp_store);
 
-    // Use NUMA-aware work-stealing queues
+    // Use NUMA-aware work-stealing queues with optional disk spilling
     // Each worker has its own queue, steals from others when idle
     // Hierarchical stealing: prefer same-NUMA node first, then remote
-    let (queue, worker_states) = WorkStealingQueues::new(
+    // When spilling enabled, overflow goes to disk to prevent memory exhaustion
+    let spill_config = SpillableConfig {
+        max_inmem_items: if config.enable_queue_spilling {
+            config.queue_max_inmem_items
+        } else {
+            u64::MAX // Effectively disable spilling
+        },
+        spill_dir: config.work_dir.join("queue-spill"),
+        spill_batch: config.queue_spill_batch,
+        load_existing: config.resume_from_checkpoint,
+    };
+    let (queue, worker_states) = SpillableWorkStealingQueues::new(
         worker_plan.worker_count,
         worker_plan.worker_numa_nodes.clone(),
-    );
+        spill_config,
+    )?;
 
     let run_stats = Arc::new(AtomicRunStats::default());
     let stop = Arc::new(AtomicBool::new(false));
