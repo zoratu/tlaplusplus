@@ -208,3 +208,145 @@ mod tests {
         );
     }
 }
+
+/// Property-based tests using proptest
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Generate arbitrary TlaValue for property testing
+    fn arb_tla_value() -> impl Strategy<Value = TlaValue> {
+        prop_oneof![
+            // Primitive values
+            any::<bool>().prop_map(TlaValue::Bool),
+            (-1000i64..1000).prop_map(TlaValue::Int),
+            "[a-z]{0,5}".prop_map(TlaValue::String),
+            "[A-Z]{1,3}".prop_map(TlaValue::ModelValue),
+        ]
+    }
+
+    /// Generate a set of TlaValues
+    fn arb_tla_set() -> impl Strategy<Value = TlaValue> {
+        prop::collection::btree_set(arb_tla_value(), 0..10).prop_map(|s| TlaValue::Set(Arc::new(s)))
+    }
+
+    /// Generate a sequence of TlaValues
+    fn arb_tla_seq() -> impl Strategy<Value = TlaValue> {
+        prop::collection::vec(arb_tla_value(), 0..10).prop_map(|v| TlaValue::Seq(Arc::new(v)))
+    }
+
+    proptest! {
+        /// Set union is commutative: A ∪ B = B ∪ A
+        #[test]
+        fn set_union_commutative(a in arb_tla_set(), b in arb_tla_set()) {
+            let ab = a.set_union(&b).unwrap();
+            let ba = b.set_union(&a).unwrap();
+            prop_assert_eq!(ab, ba);
+        }
+
+        /// Set union is associative: (A ∪ B) ∪ C = A ∪ (B ∪ C)
+        #[test]
+        fn set_union_associative(a in arb_tla_set(), b in arb_tla_set(), c in arb_tla_set()) {
+            let ab_c = a.set_union(&b).unwrap().set_union(&c).unwrap();
+            let a_bc = a.set_union(&b.set_union(&c).unwrap()).unwrap();
+            prop_assert_eq!(ab_c, a_bc);
+        }
+
+        /// Set intersection is commutative: A ∩ B = B ∩ A
+        #[test]
+        fn set_intersection_commutative(a in arb_tla_set(), b in arb_tla_set()) {
+            let ab = a.set_intersection(&b).unwrap();
+            let ba = b.set_intersection(&a).unwrap();
+            prop_assert_eq!(ab, ba);
+        }
+
+        /// Set intersection is associative: (A ∩ B) ∩ C = A ∩ (B ∩ C)
+        #[test]
+        fn set_intersection_associative(a in arb_tla_set(), b in arb_tla_set(), c in arb_tla_set()) {
+            let ab_c = a.set_intersection(&b).unwrap().set_intersection(&c).unwrap();
+            let a_bc = a.set_intersection(&b.set_intersection(&c).unwrap()).unwrap();
+            prop_assert_eq!(ab_c, a_bc);
+        }
+
+        /// Set difference: |A \ B| <= |A|
+        #[test]
+        fn set_minus_shrinks(a in arb_tla_set(), b in arb_tla_set()) {
+            let diff = a.set_minus(&b).unwrap();
+            prop_assert!(diff.len().unwrap() <= a.len().unwrap());
+        }
+
+        /// Union contains both operands: A ⊆ (A ∪ B) and B ⊆ (A ∪ B)
+        #[test]
+        fn set_union_contains_operands(a in arb_tla_set(), b in arb_tla_set()) {
+            let union = a.set_union(&b).unwrap();
+            for elem in a.as_set().unwrap() {
+                prop_assert!(union.contains(elem).unwrap());
+            }
+            for elem in b.as_set().unwrap() {
+                prop_assert!(union.contains(elem).unwrap());
+            }
+        }
+
+        /// Intersection is subset of both: (A ∩ B) ⊆ A and (A ∩ B) ⊆ B
+        #[test]
+        fn set_intersection_is_subset(a in arb_tla_set(), b in arb_tla_set()) {
+            let inter = a.set_intersection(&b).unwrap();
+            for elem in inter.as_set().unwrap() {
+                prop_assert!(a.contains(elem).unwrap());
+                prop_assert!(b.contains(elem).unwrap());
+            }
+        }
+
+        /// Difference has no elements from B: (A \ B) ∩ B = ∅
+        #[test]
+        fn set_minus_disjoint(a in arb_tla_set(), b in arb_tla_set()) {
+            let diff = a.set_minus(&b).unwrap();
+            let inter = diff.set_intersection(&b).unwrap();
+            prop_assert!(inter.is_empty().unwrap());
+        }
+
+        /// De Morgan: A \ (B ∪ C) = (A \ B) ∩ (A \ C)
+        #[test]
+        fn set_demorgan(a in arb_tla_set(), b in arb_tla_set(), c in arb_tla_set()) {
+            let bc = b.set_union(&c).unwrap();
+            let lhs = a.set_minus(&bc).unwrap();
+            let ab = a.set_minus(&b).unwrap();
+            let ac = a.set_minus(&c).unwrap();
+            let rhs = ab.set_intersection(&ac).unwrap();
+            prop_assert_eq!(lhs, rhs);
+        }
+
+        /// Sequence length matches vec length
+        #[test]
+        fn seq_length_correct(items in prop::collection::vec(arb_tla_value(), 0..20)) {
+            let seq = TlaValue::Seq(Arc::new(items.clone()));
+            prop_assert_eq!(seq.len().unwrap(), items.len());
+        }
+
+        /// Sequence indexing (1-based)
+        #[test]
+        fn seq_indexing_works(items in prop::collection::vec(arb_tla_value(), 1..10)) {
+            let seq = TlaValue::Seq(Arc::new(items.clone()));
+            for (i, expected) in items.iter().enumerate() {
+                let idx = TlaValue::Int((i + 1) as i64); // 1-based indexing
+                let actual = seq.apply(&idx).unwrap();
+                prop_assert_eq!(actual, expected);
+            }
+        }
+
+        /// Bool roundtrip
+        #[test]
+        fn bool_roundtrip(b in any::<bool>()) {
+            let val = TlaValue::Bool(b);
+            prop_assert_eq!(val.as_bool().unwrap(), b);
+        }
+
+        /// Int roundtrip
+        #[test]
+        fn int_roundtrip(i in any::<i64>()) {
+            let val = TlaValue::Int(i);
+            prop_assert_eq!(val.as_int().unwrap(), i);
+        }
+    }
+}

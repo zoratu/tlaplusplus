@@ -368,6 +368,19 @@ impl PageAlignedFingerprintStore {
 
     /// Check if fingerprint exists or insert it
     pub fn contains_or_insert(&self, fp: u64) -> bool {
+        // Chaos: simulate shard full - degrade gracefully by treating as "not seen"
+        // This may cause duplicate exploration but won't crash the system
+        #[cfg(feature = "failpoints")]
+        if crate::fail_point_is_set!("fp_store_shard_full") {
+            // Log once per ~1000 calls to avoid spam
+            static WARN_COUNTER: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            if WARN_COUNTER.fetch_add(1, Ordering::Relaxed) % 1000 == 0 {
+                eprintln!("Warning: fingerprint store shard full (chaos), degrading gracefully");
+            }
+            return false; // Treat as new - may cause duplicate work but won't crash
+        }
+
         self.stats.checks.fetch_add(1, Ordering::Relaxed);
         let shard_id = (fp as usize) & self.shard_mask;
         let shard = &self.shards[shard_id];

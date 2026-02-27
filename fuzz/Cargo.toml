@@ -1,0 +1,36 @@
+[package]
+name = "tlaplusplus-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1.3", features = ["derive"] }
+
+[dependencies.tlaplusplus]
+path = ".."
+
+[[bin]]
+name = "fuzz_tla_module"
+path = "fuzz_targets/fuzz_tla_module.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_tla_config"
+path = "fuzz_targets/fuzz_tla_config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_tla_value_ops"
+path = "fuzz_targets/fuzz_tla_value_ops.rs"
+test = false
+doc = false
+bench = false
