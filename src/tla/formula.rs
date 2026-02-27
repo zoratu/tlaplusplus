@@ -20,6 +20,7 @@ pub fn split_top_level(expr: &str, delimiter: &str) -> Vec<String> {
     let mut bracket = 0usize;
     let mut brace = 0usize;
     let mut angle = 0usize;
+    let mut let_depth = 0usize; // Track LET...IN nesting
 
     while i < chars.len() {
         let c = chars[i];
@@ -54,7 +55,26 @@ pub fn split_top_level(expr: &str, delimiter: &str) -> Vec<String> {
             _ => {}
         }
 
-        let at_top = paren == 0 && bracket == 0 && brace == 0 && angle == 0;
+        // Check for LET keyword (at word boundary)
+        let at_bracket_top = paren == 0 && bracket == 0 && brace == 0 && angle == 0;
+        if at_bracket_top && matches_keyword_at(&chars, i, "LET") {
+            let_depth += 1;
+            // Push "LET" and advance
+            current.push_str("LET");
+            i += 3;
+            continue;
+        }
+
+        // Check for IN keyword (at word boundary) - only decrements if we're inside a LET
+        if at_bracket_top && let_depth > 0 && matches_keyword_at(&chars, i, "IN") {
+            let_depth = let_depth.saturating_sub(1);
+            // Push "IN" and advance
+            current.push_str("IN");
+            i += 2;
+            continue;
+        }
+
+        let at_top = at_bracket_top && let_depth == 0;
         if at_top && matches_at(&chars, i, &delim_chars) {
             let piece = current.trim();
             if !piece.is_empty() {
@@ -75,6 +95,34 @@ pub fn split_top_level(expr: &str, delimiter: &str) -> Vec<String> {
     }
 
     out
+}
+
+/// Check if a keyword appears at position i with word boundaries
+fn matches_keyword_at(chars: &[char], i: usize, keyword: &str) -> bool {
+    let kw_chars: Vec<char> = keyword.chars().collect();
+
+    // Check if keyword matches
+    if i + kw_chars.len() > chars.len() {
+        return false;
+    }
+    for (j, kc) in kw_chars.iter().enumerate() {
+        if chars[i + j] != *kc {
+            return false;
+        }
+    }
+
+    // Check word boundary before (must be start or non-alphanumeric)
+    if i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_') {
+        return false;
+    }
+
+    // Check word boundary after (must be end or non-alphanumeric)
+    let after = i + kw_chars.len();
+    if after < chars.len() && (chars[after].is_alphanumeric() || chars[after] == '_') {
+        return false;
+    }
+
+    true
 }
 
 pub fn classify_clause(clause: &str) -> ClauseKind {
