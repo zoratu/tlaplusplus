@@ -1366,29 +1366,54 @@ fn try_parse_choose(expr: &str) -> Option<CompiledExpr> {
 }
 
 fn find_keyword(expr: &str, keyword: &str) -> Option<usize> {
-    let mut depth = 0;
-    let bytes = expr.as_bytes();
-    let keyword_bytes = keyword.as_bytes();
+    let mut bracket_depth = 0i32;
+    let mut let_depth = 0usize; // Track LET...IN nesting
+    let chars: Vec<char> = expr.chars().collect();
+    let keyword_chars: Vec<char> = keyword.chars().collect();
+    let mut i = 0;
 
-    for i in 0..bytes.len() {
-        match bytes[i] {
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => depth -= 1,
-            _ if depth == 0 => {
-                if i + keyword_bytes.len() <= bytes.len()
-                    && &bytes[i..i + keyword_bytes.len()] == keyword_bytes
-                {
-                    // Check it's a word boundary
-                    let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
-                    let after_ok = i + keyword_bytes.len() >= bytes.len()
-                        || !bytes[i + keyword_bytes.len()].is_ascii_alphanumeric();
-                    if before_ok && after_ok {
-                        return Some(i);
-                    }
-                }
+    while i < chars.len() {
+        let c = chars[i];
+
+        // Track bracket depth
+        match c {
+            '(' | '[' | '{' => bracket_depth += 1,
+            ')' | ']' | '}' => bracket_depth -= 1,
+            '<' if i + 1 < chars.len() && chars[i + 1] == '<' => {
+                bracket_depth += 1;
+                i += 2;
+                continue;
+            }
+            '>' if i + 1 < chars.len() && chars[i + 1] == '>' => {
+                bracket_depth -= 1;
+                i += 2;
+                continue;
             }
             _ => {}
         }
+
+        // At bracket top level, check for LET and IN keywords to track nesting
+        if bracket_depth == 0 {
+            if matches_keyword_at(&chars, i, "LET") {
+                let_depth += 1;
+                i += 3;
+                continue;
+            }
+            if matches_keyword_at(&chars, i, "IN") && let_depth > 0 {
+                let_depth -= 1;
+                i += 2;
+                continue;
+            }
+        }
+
+        // Check if we found the keyword at top level (brackets and LET both at 0)
+        if bracket_depth == 0 && let_depth == 0 && matches_keyword_at(&chars, i, keyword) {
+            // Return byte offset, not char index
+            let byte_offset: usize = chars[..i].iter().map(|c| c.len_utf8()).sum();
+            return Some(byte_offset);
+        }
+
+        i += 1;
     }
     None
 }
