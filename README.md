@@ -1,6 +1,6 @@
 # tlaplusplus
 
-A high-performance Rust implementation of TLA+ model checking, achieving **10.7x faster** state exploration than Java TLC on many-core systems.
+A Rust implementation of TLA+ model checking, achieving **10.7x faster** state exploration than Java TLC on many-core systems.
 
 ## Performance
 
@@ -126,7 +126,7 @@ Native TLA+ parsing and evaluation (in progress):
 
 ## Chaos Testing
 
-The project includes comprehensive fault injection for reliability testing:
+The project includes fault injection for reliability testing:
 
 ```rust
 // Available failpoints (enable with --features failpoints)
@@ -169,12 +169,12 @@ Key parameters for many-core systems:
 
 ## Current Status
 
-**Production-ready**:
+**Working**:
 - Parallel runtime with work-stealing
 - Lock-free fingerprint storage
 - NUMA-aware resource management
-- Comprehensive test coverage
-- Chaos/fault injection testing
+- 103 tests, property tests, fuzzing
+- Fault injection testing
 
 **In progress**:
 - Native TLA+ frontend (direct `.tla` execution)

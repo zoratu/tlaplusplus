@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-`tlaplusplus` is a high-performance Rust implementation of TLA+ model checking, achieving **10.7x faster** state exploration than Java TLC on many-core systems (benchmarked on 128-core AMD EPYC).
+`tlaplusplus` is a Rust implementation of TLA+ model checking, achieving **10.7x faster** state exploration than Java TLC on many-core systems (benchmarked on 128-core AMD EPYC).
 
 Key performance features:
 - **NUMA-aware work-stealing queues** - hierarchical stealing prefers same-NUMA-node workers
@@ -170,7 +170,7 @@ Optimized termination without per-state atomic updates:
 
 ## Testing
 
-The project includes comprehensive testing:
+The project includes:
 
 - **103 unit tests** covering runtime, storage, and TLA+ evaluation
 - **Property-based tests** (proptest) verifying set algebra laws
@@ -207,11 +207,11 @@ Key parameters for many-core systems:
 
 ## Current Status
 
-**Production-ready**:
+**Working**:
 - Parallel runtime with NUMA-aware work-stealing
 - Lock-free fingerprint storage with atomic CAS
-- Comprehensive test coverage (103 tests)
-- Chaos/fault injection testing
+- 103 tests, property tests, fuzzing
+- Fault injection testing
 - 10.7x speedup over Java TLC on 128-core systems
 
 **In progress**:
