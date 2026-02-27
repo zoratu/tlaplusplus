@@ -856,7 +856,6 @@ mod tests {
     use std::fs;
 
     #[test]
-    #[ignore] // TODO: Support inline conjunctive expressions in Next branches
     fn builds_and_steps_simple_tla_model() {
         let tmp = std::env::temp_dir().join("tlapp-native-model-test");
         let _ = fs::remove_dir_all(&tmp);
