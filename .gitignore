@@ -1,5 +1,10 @@
 /target
+/fuzz/target
+/fuzz/Cargo.lock
 /.tlapp*
 /.tlc-out
 /.corpus-cache
 /scripts/remote_*.sh
+/corpus/*_TTrace_*.tla
+/corpus/*_TTrace_*.bin
+/corpus/states/
