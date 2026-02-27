@@ -205,6 +205,65 @@ impl FingerprintShard {
         }
     }
 
+    /// Check if fingerprint exists or insert it (lock-free, no stats)
+    ///
+    /// Returns true if fingerprint already existed, false if newly inserted
+    /// This version skips stats updates for maximum performance
+    fn contains_or_insert_no_stats(&self, fp: u64) -> bool {
+        // Never store 0 (reserved for empty slots)
+        let fp = if fp == 0 { 1 } else { fp };
+
+        let mut index = (fp as usize) % self.capacity;
+        let table = unsafe { std::slice::from_raw_parts_mut(self.table, self.capacity) };
+        let mut probes = 0;
+
+        loop {
+            let entry = &table[index];
+            let stored_fp = entry.fp.load(Ordering::Acquire);
+
+            if stored_fp == fp {
+                // Found existing fingerprint
+                return true;
+            }
+
+            if stored_fp == 0 {
+                // Empty slot - try to claim it
+                match entry
+                    .fp
+                    .compare_exchange(0, fp, Ordering::AcqRel, Ordering::Acquire)
+                {
+                    Ok(_) => {
+                        // Successfully inserted
+                        entry.state.store(1, Ordering::Release);
+                        self.count.fetch_add(1, Ordering::Relaxed);
+                        return false;
+                    }
+                    Err(actual) if actual == fp => {
+                        // Concurrent insert of same fingerprint
+                        return true;
+                    }
+                    Err(_) => {
+                        // Someone else claimed this slot, continue probing
+                    }
+                }
+            }
+
+            // Linear probe to next slot
+            index = (index + 1) % self.capacity;
+            probes += 1;
+
+            // Safety: prevent infinite loop if table is full
+            if probes >= self.capacity as u64 {
+                panic!(
+                    "Fingerprint shard {} is full! capacity={}, count={}",
+                    self.numa_node,
+                    self.capacity,
+                    self.count.load(Ordering::Relaxed)
+                );
+            }
+        }
+    }
+
     /// Get current count of fingerprints
     fn len(&self) -> u64 {
         self.count.load(Ordering::Relaxed)
@@ -332,10 +391,8 @@ impl PageAlignedFingerprintStore {
 
     /// Batch check and insert fingerprints
     pub fn contains_or_insert_batch(&self, fps: &[u64], seen: &mut Vec<bool>) -> Result<()> {
-        self.stats.batch_calls.fetch_add(1, Ordering::Relaxed);
-        self.stats
-            .batch_items
-            .fetch_add(fps.len() as u64, Ordering::Relaxed);
+        // NOTE: Stats updates removed from hot path to reduce atomic contention
+        // Stats are now estimated from queue counters instead
 
         seen.clear();
         seen.resize(fps.len(), false);
@@ -357,14 +414,10 @@ impl PageAlignedFingerprintStore {
             let shard = &self.shards[shard_id];
 
             for &(idx, fp) in group {
-                let existed = shard.contains_or_insert(fp, &self.stats);
+                let existed = shard.contains_or_insert_no_stats(fp);
                 seen[idx] = existed;
 
-                if existed {
-                    self.stats.hits.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    self.stats.inserts.fetch_add(1, Ordering::Relaxed);
-
+                if !existed {
                     // If persistence enabled, try to send (non-blocking)
                     if let Some(ref persist_tx) = self.persist_tx {
                         let _ = persist_tx[shard_id].try_send(FingerprintPersistMsg { fp });
@@ -372,10 +425,6 @@ impl PageAlignedFingerprintStore {
                 }
             }
         }
-
-        self.stats
-            .checks
-            .fetch_add(fps.len() as u64, Ordering::Relaxed);
 
         Ok(())
     }

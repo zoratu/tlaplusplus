@@ -793,17 +793,31 @@ fn main() -> anyhow::Result<()> {
             runtime,
             storage,
         } => {
-            let model =
-                TlaModel::from_files(&module, config.as_deref(), init.as_deref(), next.as_deref())
-                    .map_err(|e| {
-                        eprintln!("Error building TLA+ model:");
-                        eprintln!("  Module: {}", module.display());
-                        if let Some(cfg) = &config {
-                            eprintln!("  Config: {}", cfg.display());
-                        }
-                        eprintln!("  Error: {}", e);
-                        e
-                    })?;
+            // Auto-detect config file if not specified
+            let config_path = config.or_else(|| {
+                let cfg_path = module.with_extension("cfg");
+                if cfg_path.exists() {
+                    Some(cfg_path)
+                } else {
+                    None
+                }
+            });
+
+            let model = TlaModel::from_files(
+                &module,
+                config_path.as_deref(),
+                init.as_deref(),
+                next.as_deref(),
+            )
+            .map_err(|e| {
+                eprintln!("Error building TLA+ model:");
+                eprintln!("  Module: {}", module.display());
+                if let Some(cfg) = &config_path {
+                    eprintln!("  Config: {}", cfg.display());
+                }
+                eprintln!("  Error: {}", e);
+                e
+            })?;
 
             // Print TLC-compatible output
             let start_time = chrono::Local::now();

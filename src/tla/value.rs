@@ -47,6 +47,27 @@ impl TlaValue {
         }
     }
 
+    pub fn as_seq(&self) -> Result<&Vec<TlaValue>> {
+        match self {
+            Self::Seq(v) => Ok(v.as_ref()),
+            _ => Err(anyhow!("expected Seq, got {self:?}")),
+        }
+    }
+
+    pub fn as_record(&self) -> Result<&BTreeMap<String, TlaValue>> {
+        match self {
+            Self::Record(v) => Ok(v.as_ref()),
+            _ => Err(anyhow!("expected Record, got {self:?}")),
+        }
+    }
+
+    pub fn as_function(&self) -> Result<&BTreeMap<TlaValue, TlaValue>> {
+        match self {
+            Self::Function(v) => Ok(v.as_ref()),
+            _ => Err(anyhow!("expected Function, got {self:?}")),
+        }
+    }
+
     pub fn set_union(&self, other: &Self) -> Result<Self> {
         let mut out = self.as_set()?.clone();
         for value in other.as_set()? {

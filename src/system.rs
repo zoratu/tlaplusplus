@@ -6,10 +6,14 @@ use std::path::{Path, PathBuf};
 pub struct WorkerPlan {
     pub worker_count: usize,
     pub assigned_cpus: Vec<Option<usize>>,
+    /// NUMA node assignment for each worker (index = worker_id, value = numa_node)
+    pub worker_numa_nodes: Vec<usize>,
     pub allowed_cpus: Vec<usize>,
     pub cgroup_cpuset_cores: Option<usize>,
     pub cgroup_quota_cores: Option<usize>,
     pub numa_nodes_used: usize,
+    /// Number of workers per NUMA node
+    pub workers_per_numa: Vec<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -255,38 +259,44 @@ pub fn build_worker_plan(req: WorkerPlanRequest) -> WorkerPlan {
     };
     let worker_count = requested_workers.min(allowed_cpus.len().max(1)).max(1);
 
-    let assigned_cpus = if req.enable_numa_pinning && !allowed_cpus.is_empty() {
-        let raw_nodes = discover_numa_nodes();
-        let mut nodes = Vec::new();
-        for node_cpus in raw_nodes {
-            let mut node_allowed = intersect_sorted(&allowed_cpus, &node_cpus);
-            if !node_allowed.is_empty() {
-                node_allowed.sort_unstable();
-                node_allowed.dedup();
-                nodes.push(node_allowed);
-            }
+    // Build NUMA-aware worker assignments
+    let raw_nodes = discover_numa_nodes();
+    let mut numa_nodes: Vec<Vec<usize>> = Vec::new();
+    for node_cpus in &raw_nodes {
+        let mut node_allowed = intersect_sorted(&allowed_cpus, node_cpus);
+        if !node_allowed.is_empty() {
+            node_allowed.sort_unstable();
+            node_allowed.dedup();
+            numa_nodes.push(node_allowed);
         }
-        if nodes.is_empty() {
-            allowed_cpus
-                .iter()
-                .cycle()
-                .take(worker_count)
-                .map(|cpu| Some(*cpu))
-                .collect()
-        } else {
-            let mut out = Vec::with_capacity(worker_count);
-            for idx in 0..worker_count {
-                let node_idx = idx % nodes.len();
-                let node_round = idx / nodes.len();
-                let node = &nodes[node_idx];
-                let cpu = node[node_round % node.len()];
-                out.push(Some(cpu));
-            }
-            out
+    }
+
+    let (assigned_cpus, worker_numa_nodes) = if req.enable_numa_pinning && !numa_nodes.is_empty() {
+        let mut cpus = Vec::with_capacity(worker_count);
+        let mut numa_assignments = Vec::with_capacity(worker_count);
+
+        for idx in 0..worker_count {
+            let node_idx = idx % numa_nodes.len();
+            let node_round = idx / numa_nodes.len();
+            let node = &numa_nodes[node_idx];
+            let cpu = node[node_round % node.len()];
+            cpus.push(Some(cpu));
+            numa_assignments.push(node_idx);
         }
+        (cpus, numa_assignments)
     } else {
-        vec![None; worker_count]
+        // No NUMA pinning - all workers on "node 0"
+        (vec![None; worker_count], vec![0; worker_count])
     };
+
+    // Count workers per NUMA node
+    let num_numa_nodes = numa_nodes.len().max(1);
+    let mut workers_per_numa = vec![0usize; num_numa_nodes];
+    for &node in &worker_numa_nodes {
+        if node < workers_per_numa.len() {
+            workers_per_numa[node] += 1;
+        }
+    }
 
     let numa_nodes_used = if req.enable_numa_pinning {
         let mut set = BTreeSet::new();
@@ -296,7 +306,7 @@ pub fn build_worker_plan(req: WorkerPlanRequest) -> WorkerPlan {
         if set.is_empty() {
             0
         } else {
-            discover_numa_nodes()
+            raw_nodes
                 .into_iter()
                 .filter(|node| node.iter().any(|cpu| set.contains(cpu)))
                 .count()
@@ -308,10 +318,12 @@ pub fn build_worker_plan(req: WorkerPlanRequest) -> WorkerPlan {
     WorkerPlan {
         worker_count,
         assigned_cpus,
+        worker_numa_nodes,
         allowed_cpus,
         cgroup_cpuset_cores: cpuset_limit,
         cgroup_quota_cores: quota_limit,
         numa_nodes_used,
+        workers_per_numa,
     }
 }
 
