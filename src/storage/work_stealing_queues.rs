@@ -101,20 +101,33 @@ impl<T: 'static> WorkStealingQueues<T> {
             return Some(item);
         }
 
-        // Try to get work using work-stealing algorithm
+        // Slow path: try global and stealing with exponential backoff
+        let mut spin_count = 0u32;
+        const MAX_SPINS: u32 = 16; // Spin up to 16 times before yielding
+
         loop {
-            // Try global queue first
+            // Try global queue
             match self.global.steal() {
                 Steal::Success(item) => {
                     self.popped.fetch_add(1, Ordering::Relaxed);
                     return Some(item);
                 }
+                Steal::Retry => {
+                    // Contention on global - spin briefly
+                    std::hint::spin_loop();
+                    continue;
+                }
                 Steal::Empty => {}
-                Steal::Retry => continue, // Contention, retry
             }
 
             // Try stealing from other workers
             if let Some(item) = self.try_steal_from_others(worker_state.id) {
+                return Some(item);
+            }
+
+            // Check local queue again (another worker might have pushed)
+            if let Some(item) = worker_state.worker.pop() {
+                self.popped.fetch_add(1, Ordering::Relaxed);
                 return Some(item);
             }
 
@@ -123,29 +136,19 @@ impl<T: 'static> WorkStealingQueues<T> {
                 return None;
             }
 
-            // Brief yield to avoid spinning
-            std::thread::yield_now();
-
-            // Try one more time before giving up
-            if let Some(item) = worker_state.worker.pop() {
-                self.popped.fetch_add(1, Ordering::Relaxed);
-                return Some(item);
-            }
-
-            match self.global.steal() {
-                Steal::Success(item) => {
-                    self.popped.fetch_add(1, Ordering::Relaxed);
-                    return Some(item);
+            // Exponential backoff to reduce contention
+            spin_count += 1;
+            if spin_count < MAX_SPINS {
+                // Spin briefly - much cheaper than thread yield
+                for _ in 0..(1 << spin_count.min(6)) {
+                    std::hint::spin_loop();
                 }
-                _ => {}
+            } else {
+                // After max spins, yield to OS scheduler
+                // Reset spin count for next round
+                spin_count = 0;
+                std::thread::yield_now();
             }
-
-            if self.should_finish() {
-                return None;
-            }
-
-            // Small sleep to avoid busy-waiting
-            std::thread::sleep(Duration::from_micros(10));
         }
     }
 
