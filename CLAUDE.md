@@ -40,9 +40,7 @@ cargo +nightly fuzz run fuzz_tla_module
 ```bash
 # Run synthetic counter-grid model (stress testing)
 ./target/release/tlaplusplus run-counter-grid \
-  --max-x 10000 --max-y 10000 --max-sum 20000 \
-  --workers 0 --core-ids 2-127 \
-  --numa-pinning=true
+  --max-x 10000 --max-y 10000 --max-sum 20000
 
 # Analyze a TLA+ spec
 cargo run -- analyze-tla \
@@ -67,28 +65,33 @@ scripts/tlc_public_corpus.sh
 
 ### Core Components
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Model Trait Layer                         │
-│  (CounterGrid, TlaModel, custom models implement Model)     │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    Runtime Engine                            │
-│  - Work-stealing scheduler (NUMA-aware)                     │
-│  - Worker crash recovery (continues with N-1 workers)       │
-│  - Checkpoint coordination                                   │
-└─────────────────────────────────────────────────────────────┘
-                              │
-              ┌───────────────┴───────────────┐
-              ▼                               ▼
-┌─────────────────────────┐     ┌─────────────────────────────┐
-│  Fingerprint Store      │     │  Work-Stealing Queues       │
-│  - Lock-free CAS ops    │     │  - Per-worker local deques  │
-│  - Page-aligned memory  │     │  - NUMA-aware stealing      │
-│  - NUMA shard placement │     │  - Global injector queue    │
-└─────────────────────────┘     └─────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph Model["Model Trait Layer"]
+        M["CounterGrid, TlaModel, custom models implement Model"]
+    end
+
+    subgraph Runtime["Runtime Engine"]
+        R1["Work-stealing scheduler (NUMA-aware)"]
+        R2["Worker crash recovery (N-1 workers)"]
+        R3["Checkpoint coordination"]
+    end
+
+    subgraph FP["Fingerprint Store"]
+        F1["Lock-free CAS ops"]
+        F2["Page-aligned memory"]
+        F3["NUMA shard placement"]
+    end
+
+    subgraph WS["Work-Stealing Queues"]
+        W1["Per-worker local deques"]
+        W2["NUMA-aware stealing"]
+        W3["Global injector queue"]
+    end
+
+    Model --> Runtime
+    Runtime --> FP
+    Runtime --> WS
 ```
 
 **1. Model Trait (`src/model.rs`)**
@@ -197,7 +200,7 @@ Key parameters for many-core systems:
 |-----------|---------|-------------|
 | `--workers` | auto | Worker count (0 = auto from cgroup) |
 | `--core-ids` | all | CPU list (e.g., "2-127") |
-| `--numa-pinning` | false | Enable NUMA-aware CPU binding |
+| `--numa-pinning` | true | Enable NUMA-aware CPU binding |
 | `--fp-shards` | 64 | Fingerprint store shard count |
 | `--fp-batch-size` | 512 | States per fingerprint batch |
 | `--checkpoint-interval-secs` | 0 | Checkpoint frequency (0 = disabled) |
