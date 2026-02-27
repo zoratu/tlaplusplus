@@ -7,6 +7,7 @@
 // 4. Local queue operations are completely contention-free
 // 5. NUMA-aware hierarchical stealing (prefer same-NUMA workers)
 
+use crate::storage::queue::QueueStats;
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use crossbeam_utils::CachePadded;
 use std::sync::Arc;
@@ -325,7 +326,19 @@ impl<T: 'static> WorkStealingQueues<T> {
         self.global.is_empty() && self.stealers.iter().all(|s| s.is_empty())
     }
 
-    pub fn stats(&self) -> WorkStealingStats {
+    pub fn stats(&self) -> QueueStats {
+        QueueStats {
+            pushed: self.global_pushed.load(Ordering::Relaxed),
+            popped: self.global_popped.load(Ordering::Relaxed),
+            spilled_items: 0, // Work-stealing queues don't spill
+            spill_batches: 0,
+            loaded_segments: 0,
+            loaded_items: 0,
+            max_inmem_len: 0, // Not tracked for work-stealing
+        }
+    }
+
+    pub fn work_stealing_stats(&self) -> WorkStealingStats {
         let mut active_count = 0;
         for active in self.worker_active.iter() {
             let val: u8 = active.load(Ordering::Relaxed);

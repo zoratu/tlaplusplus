@@ -1032,7 +1032,56 @@ where
         return Err(anyhow!("checkpoint thread panicked"));
     }
 
-    // Checkpointing disabled with SimpleBlockingQueue
+    // Write checkpoint manifest on exit if requested
+    if config.checkpoint_on_exit {
+        let checkpoint_path = config.work_dir.join("checkpoints").join("latest.json");
+        let (
+            states_generated,
+            states_processed,
+            states_distinct,
+            duplicates,
+            enqueued,
+            checkpoints,
+        ) = run_stats.snapshot();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let manifest = CheckpointManifest {
+            version: 1,
+            model: std::any::type_name::<M>().to_string(),
+            created_unix_secs: now,
+            duration_millis: started_at.elapsed().as_millis() as u64,
+            states_generated,
+            states_processed,
+            states_distinct,
+            duplicates,
+            enqueued,
+            checkpoints,
+            configured_workers: config.workers,
+            actual_workers: worker_plan.worker_count,
+            allowed_cpu_count: worker_plan.allowed_cpus.len(),
+            cgroup_cpuset_cores: worker_plan.cgroup_cpuset_cores,
+            cgroup_quota_cores: worker_plan.cgroup_quota_cores,
+            numa_nodes_used: worker_plan.numa_nodes_used,
+            effective_memory_max_bytes: effective_memory_max,
+            resumed_from_checkpoint,
+            queue: queue.stats(),
+            fingerprints: {
+                let stats = fp_store.stats();
+                OldFingerprintStats {
+                    checks: stats.checks,
+                    hits: stats.hits,
+                    inserts: stats.inserts,
+                    batch_calls: stats.batch_calls,
+                    batch_items: stats.batch_items,
+                }
+            },
+        };
+        if let Err(e) = write_checkpoint_manifest(&checkpoint_path, &manifest) {
+            eprintln!("Warning: failed to write checkpoint manifest: {}", e);
+        }
+    }
 
     // Queue cleanup happens automatically
     let _ = fp_store.flush();
@@ -1299,7 +1348,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: Implement checkpointing for work-stealing queues
     fn writes_checkpoint_manifest_on_exit() -> Result<()> {
         let work_dir = temp_work_dir("manifest");
         let model = CounterGridModel::new(64, 64, 300);
@@ -1328,7 +1376,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: Bulk dequeue changes queue fill behavior - need to adjust test
+    #[ignore] // Work-stealing queues don't persist state to disk; checkpoint/resume requires DiskBackedQueue
     fn resumes_from_disk_queue_checkpoint() -> Result<()> {
         let work_dir = temp_work_dir("resume");
 
