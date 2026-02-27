@@ -4,6 +4,7 @@ use crate::storage::channel_queue::ChannelQueue;
 use crate::storage::fingerprint_store::{
     FingerprintStats as OldFingerprintStats, FingerprintStore,
 };
+use crate::storage::numa::set_preferred_node;
 use crate::storage::page_aligned_fingerprint_store::{
     FingerprintStats, FingerprintStoreConfig as PageAlignedConfig, PageAlignedFingerprintStore,
 };
@@ -740,15 +741,25 @@ where
         let worker_stop_on_violation = config.stop_on_violation;
         let worker_fp_batch_size = config.fp_batch_size.max(1);
         let worker_cpu = worker_plan.assigned_cpus.get(worker_id).copied().flatten();
+        let worker_numa_node = worker_plan
+            .worker_numa_nodes
+            .get(worker_id)
+            .copied()
+            .unwrap_or(0);
         let worker_labeled_transitions = labeled_transitions.clone();
 
         workers.push(std::thread::spawn(move || {
+            // Pin thread to CPU for cache locality
             if let Some(cpu) = worker_cpu
                 && let Err(err) = pin_current_thread_to_cpu(cpu)
             {
                 let _ = worker_error_tx.send(format!("cpu pinning failed on core {cpu}: {err}"));
                 worker_stop.store(true, Ordering::Release);
             }
+
+            // Set NUMA memory policy - all allocations on this thread will prefer the local node
+            // This reduces cross-NUMA memory access which causes high kernel time
+            let _ = set_preferred_node(worker_numa_node);
 
             let mut successors: Vec<M::State> = Vec::with_capacity(64);
             let mut pending_batch: Vec<M::State> = Vec::with_capacity(worker_fp_batch_size);

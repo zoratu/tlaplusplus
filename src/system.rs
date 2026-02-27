@@ -1,3 +1,4 @@
+use crate::storage::numa::NumaTopology;
 use anyhow::{Context, Result};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -252,18 +253,65 @@ pub fn build_worker_plan(req: WorkerPlanRequest) -> WorkerPlan {
         allowed_cpus.truncate(quota.max(1));
     }
 
+    // Calculate optimal worker count based on NUMA topology when auto mode (workers = 0)
+    let (optimal_workers, recommended_nodes) =
+        if req.requested_workers == 0 && req.enable_numa_pinning {
+            // Use NUMA-aware optimization: limit to nodes with low inter-node latency
+            match NumaTopology::detect() {
+                Ok(topology) => {
+                    let (optimal, nodes) = topology.optimal_worker_count(&allowed_cpus);
+                    eprintln!(
+                        "NUMA-optimized worker count: {} workers across {} nodes (of {} available)",
+                        optimal,
+                        nodes.len(),
+                        topology.node_count
+                    );
+                    (optimal, Some(nodes))
+                }
+                Err(_) => (allowed_cpus.len(), None),
+            }
+        } else {
+            (allowed_cpus.len(), None)
+        };
+
     let requested_workers = if req.requested_workers == 0 {
-        allowed_cpus.len().max(1)
+        optimal_workers.max(1)
     } else {
         req.requested_workers
     };
-    let worker_count = requested_workers.min(allowed_cpus.len().max(1)).max(1);
 
-    // Build NUMA-aware worker assignments
+    // Filter allowed_cpus to recommended NUMA nodes if auto mode selected them
+    let effective_allowed_cpus = if let Some(ref nodes) = recommended_nodes {
+        // Only use CPUs from recommended NUMA nodes
+        let topology = NumaTopology::detect().unwrap_or_else(|_| NumaTopology {
+            node_count: 1,
+            cpu_to_node: std::collections::HashMap::new(),
+            distances: vec![vec![10]],
+            cpus_per_node: vec![],
+        });
+        allowed_cpus
+            .iter()
+            .copied()
+            .filter(|cpu| {
+                let node = topology.cpu_to_node.get(cpu).copied().unwrap_or(0);
+                nodes.contains(&node)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        allowed_cpus.clone()
+    };
+
+    let worker_count = requested_workers
+        .min(effective_allowed_cpus.len().max(1))
+        .max(1);
+
+    // Build NUMA-aware worker assignments using effective CPUs (filtered by NUMA optimization)
     let raw_nodes = discover_numa_nodes();
     let mut numa_nodes: Vec<Vec<usize>> = Vec::new();
+    let mut effective_sorted = effective_allowed_cpus.clone();
+    effective_sorted.sort_unstable();
     for node_cpus in &raw_nodes {
-        let mut node_allowed = intersect_sorted(&allowed_cpus, node_cpus);
+        let mut node_allowed = intersect_sorted(&effective_sorted, node_cpus);
         if !node_allowed.is_empty() {
             node_allowed.sort_unstable();
             node_allowed.dedup();
