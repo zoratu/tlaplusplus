@@ -6,12 +6,22 @@
 // 3. Termination detection without per-state atomic updates
 // 4. Local queue operations are completely contention-free
 // 5. NUMA-aware hierarchical stealing (prefer same-NUMA workers)
+// 6. Adaptive steal limits for many-core scalability (380+ workers)
+// 7. Per-NUMA idle counters for O(NUMA_nodes) termination check
+// 8. Batch stealing to reduce steal overhead
 
 use crate::storage::queue::QueueStats;
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use crossbeam_utils::CachePadded;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+
+/// Maximum workers to try stealing from within same NUMA node
+/// Prevents O(n) steal attempts when n is large (e.g., 64 workers/node)
+const MAX_LOCAL_STEAL_ATTEMPTS: usize = 8;
+
+/// Maximum workers to try stealing from per remote NUMA node
+const MAX_REMOTE_STEAL_ATTEMPTS: usize = 4;
 
 /// Work-stealing queue system for parallel state exploration
 /// Each worker has a local queue and can steal from others when idle
@@ -33,10 +43,15 @@ pub struct WorkStealingQueues<T> {
     num_workers: usize,
 
     /// NUMA node for each worker (worker_id -> numa_node)
+    #[allow(dead_code)]
     worker_numa_nodes: Vec<usize>,
 
     /// Workers grouped by NUMA node (numa_node -> [worker_ids])
     numa_worker_groups: Vec<Vec<usize>>,
+
+    /// Per-NUMA active worker count (cache-line padded)
+    /// Allows O(NUMA_nodes) termination check instead of O(workers)
+    numa_active_counts: Vec<CachePadded<AtomicUsize>>,
 
     /// Global pushed counter (only updated in batches from workers)
     global_pushed: AtomicU64,
@@ -102,6 +117,11 @@ impl<T: 'static> WorkStealingQueues<T> {
             });
         }
 
+        // Initialize per-NUMA active counters
+        let numa_active_counts: Vec<CachePadded<AtomicUsize>> = (0..num_numa_nodes)
+            .map(|_| CachePadded::new(AtomicUsize::new(0)))
+            .collect();
+
         let shared = Arc::new(Self {
             global: Injector::new(),
             stealers,
@@ -110,6 +130,7 @@ impl<T: 'static> WorkStealingQueues<T> {
             num_workers,
             worker_numa_nodes,
             numa_worker_groups,
+            numa_active_counts,
             global_pushed: AtomicU64::new(0),
             global_popped: AtomicU64::new(0),
         });
@@ -220,20 +241,27 @@ impl<T: 'static> WorkStealingQueues<T> {
     /// Try to steal work from other workers using hierarchical NUMA-aware stealing
     /// 1. First try stealing from workers on the same NUMA node (low latency)
     /// 2. Then try stealing from workers on remote NUMA nodes
+    ///
+    /// Optimized for many-core systems (380+ workers):
+    /// - Limits steal attempts to avoid O(n) scanning
+    /// - Uses batch stealing to reduce overhead
     fn try_steal_from_others(&self, worker_state: &mut WorkerState<T>) -> Option<T> {
         let my_numa = worker_state.numa_node;
 
         // Phase 1: Try to steal from same NUMA node first (low latency)
+        // Limit attempts to avoid scanning all 64+ workers per NUMA node
         if let Some(local_workers) = self.numa_worker_groups.get(my_numa) {
             let start = (worker_state.id * 7) % local_workers.len().max(1);
-            for i in 0..local_workers.len() {
+            let max_attempts = local_workers.len().min(MAX_LOCAL_STEAL_ATTEMPTS);
+            for i in 0..max_attempts {
                 let idx = (start + i) % local_workers.len();
                 let target = local_workers[idx];
                 if target == worker_state.id {
                     continue;
                 }
 
-                match self.stealers[target].steal() {
+                // Try batch steal first - steal half the items into our local queue
+                match self.stealers[target].steal_batch_and_pop(&worker_state.worker) {
                     Steal::Success(item) => {
                         worker_state.local_popped += 1;
                         return Some(item);
@@ -252,12 +280,13 @@ impl<T: 'static> WorkStealingQueues<T> {
 
             // Try a few workers from this remote node
             let start = (worker_state.id * 7) % remote_workers.len();
-            for i in 0..remote_workers.len().min(4) {
-                // Limit remote steals
+            let max_attempts = remote_workers.len().min(MAX_REMOTE_STEAL_ATTEMPTS);
+            for i in 0..max_attempts {
                 let idx = (start + i) % remote_workers.len();
                 let target = remote_workers[idx];
 
-                match self.stealers[target].steal() {
+                // For remote NUMA, also use batch stealing
+                match self.stealers[target].steal_batch_and_pop(&worker_state.worker) {
                     Steal::Success(item) => {
                         worker_state.local_popped += 1;
                         return Some(item);
@@ -271,28 +300,31 @@ impl<T: 'static> WorkStealingQueues<T> {
         None
     }
 
-    /// Optimized termination detection
+    /// Optimized termination detection using per-NUMA idle counters
     /// Returns true if all workers are idle and no work exists anywhere
+    ///
+    /// Optimized for many-core systems:
+    /// - O(NUMA_nodes) check instead of O(workers) for idle detection
+    /// - Only falls back to O(workers) stealer check if all NUMA nodes are idle
     fn should_terminate(&self, _worker_id: usize) -> bool {
         if self.finished.load(Ordering::Acquire) {
             return true;
         }
 
-        // Check if any worker is active
-        for active in self.worker_active.iter() {
-            let val: u8 = active.load(Ordering::Acquire);
-            if val != 0 {
+        // Fast path: Check per-NUMA active counters (O(NUMA_nodes) instead of O(workers))
+        for numa_active in &self.numa_active_counts {
+            if numa_active.load(Ordering::Acquire) > 0 {
                 return false;
             }
         }
 
-        // All workers idle - double-check that global queue is empty
-        // and no steals are possible
+        // All NUMA nodes report idle - check global queue
         if !self.global.is_empty() {
             return false;
         }
 
-        // Check all stealers
+        // Check all stealers (only reached when all workers idle)
+        // This is O(workers) but only happens at termination
         for stealer in &self.stealers {
             if !stealer.is_empty() {
                 return false;
@@ -302,14 +334,24 @@ impl<T: 'static> WorkStealingQueues<T> {
         true
     }
 
-    /// Mark worker as active (cache-line padded, no contention with other workers)
+    /// Mark worker as active using per-NUMA counter
+    /// Cache-line padded to prevent false sharing between NUMA nodes
+    #[inline]
     pub fn worker_start(&self, worker_id: usize) {
+        // Track per-worker state for debugging
         self.worker_active[worker_id].store(1, Ordering::Release);
+        // Increment per-NUMA counter for fast termination detection (O(1) lookup)
+        let numa_node = self.worker_numa_nodes.get(worker_id).copied().unwrap_or(0);
+        self.numa_active_counts[numa_node].fetch_add(1, Ordering::AcqRel);
     }
 
-    /// Mark worker as idle
+    /// Mark worker as idle and decrement per-NUMA counter
+    #[inline]
     pub fn worker_idle(&self, worker_id: usize) {
         self.worker_active[worker_id].store(0, Ordering::Release);
+        // Decrement per-NUMA counter (O(1) lookup)
+        let numa_node = self.worker_numa_nodes.get(worker_id).copied().unwrap_or(0);
+        self.numa_active_counts[numa_node].fetch_sub(1, Ordering::AcqRel);
     }
 
     /// Flush worker's local counters to global (call before worker exits)
