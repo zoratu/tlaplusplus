@@ -1043,23 +1043,56 @@ impl PageAlignedFingerprintStore {
     }
 
     /// Batch check and insert fingerprints
+    ///
+    /// Note: For better scalability at high worker counts, use
+    /// `contains_or_insert_batch_with_affinity` which processes shards
+    /// in a worker-specific order to reduce contention.
     pub fn contains_or_insert_batch(&self, fps: &[u64], seen: &mut Vec<bool>) -> Result<()> {
+        self.contains_or_insert_batch_with_affinity(fps, seen, 0)
+    }
+
+    /// Batch check and insert fingerprints with worker affinity
+    ///
+    /// Each worker processes shards starting from a different offset (based on worker_id).
+    /// This spreads contention across shards when many workers process similar fingerprints.
+    ///
+    /// Example with 4 shards and 4 workers:
+    /// - Worker 0 processes shards: 0, 1, 2, 3
+    /// - Worker 1 processes shards: 1, 2, 3, 0
+    /// - Worker 2 processes shards: 2, 3, 0, 1
+    /// - Worker 3 processes shards: 3, 0, 1, 2
+    ///
+    /// This reduces the probability of multiple workers hitting the same shard simultaneously.
+    pub fn contains_or_insert_batch_with_affinity(
+        &self,
+        fps: &[u64],
+        seen: &mut Vec<bool>,
+        worker_id: usize,
+    ) -> Result<()> {
         // NOTE: Stats updates removed from hot path to reduce atomic contention
         // Stats are now estimated from queue counters instead
 
         seen.clear();
         seen.resize(fps.len(), false);
 
+        let num_shards = self.shards.len();
+
         // Group by shard for cache locality
-        let mut shard_groups: Vec<Vec<(usize, u64)>> = vec![Vec::new(); self.shards.len()];
+        let mut shard_groups: Vec<Vec<(usize, u64)>> = vec![Vec::new(); num_shards];
 
         for (idx, &fp) in fps.iter().enumerate() {
             let shard_id = self.shard_id_for(fp);
             shard_groups[shard_id].push((idx, fp));
         }
 
-        // Process each shard's fingerprints
-        for (shard_id, group) in shard_groups.iter().enumerate() {
+        // Process shards in worker-specific order to reduce contention
+        // Worker N starts at shard (N % num_shards) and wraps around
+        let start_shard = worker_id % num_shards;
+
+        for offset in 0..num_shards {
+            let shard_id = (start_shard + offset) % num_shards;
+            let group = &shard_groups[shard_id];
+
             if group.is_empty() {
                 continue;
             }
