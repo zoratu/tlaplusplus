@@ -42,7 +42,7 @@ The NUMA-aware auto-configuration achieves 2-4x better throughput by avoiding cr
 - **Automatic NUMA optimization** - detects NUMA topology and distances, auto-selects optimal worker count using only close NUMA nodes (distance ≤20)
 - **NUMA-local memory allocation** - workers bind memory to their NUMA node via `set_mempolicy()`, achieving 99%+ user CPU
 - **Parallel state exploration** with N worker threads (auto-detected from NUMA topology)
-- **Lock-free fingerprint store** with page-aligned memory and NUMA-aware shard placement
+- **Lock-free fingerprint store** with page-aligned memory, NUMA-aware shard placement, and dynamic resize
 - **Work-stealing queues** with batch stealing and per-NUMA idle counters for O(NUMA_nodes) termination detection
 - **NUMA-aware CPU pinning** via `sched_setaffinity`
 - **Cgroup-aware resource limits** - respects cpuset and CPU quota
@@ -71,7 +71,7 @@ cargo run -- analyze-tla \
 ## Testing
 
 ```bash
-# Run all tests (103 tests)
+# Run all tests (116 tests)
 cargo test
 
 # Run with chaos/failpoint testing
@@ -129,6 +129,7 @@ flowchart TB
 - Open-addressed hash table with atomic CAS operations
 - 2MB page-aligned memory allocation for TLB efficiency
 - NUMA-aware shard placement based on worker CPU affinity
+- **Dynamic resize** at 85% load factor using seqlock coordination
 - Graceful degradation under memory pressure
 
 **Work-Stealing Queues** (`work_stealing_queues.rs`):
@@ -185,7 +186,7 @@ Key parameters for many-core systems:
 | `--core-ids` | all | CPU list (e.g., "2-127") |
 | `--numa-pinning` | true | Enable NUMA-aware CPU binding |
 | `--fp-shards` | auto | Fingerprint store shard count (0 = auto) |
-| `--fp-expected-items` | 100M | Expected distinct states (increase for large models) |
+| `--fp-expected-items` | 100M | Initial capacity hint (shards auto-resize at 85% load) |
 | `--fp-batch-size` | 512 | States per fingerprint batch |
 | `--checkpoint-interval-secs` | 0 | Checkpoint frequency (0 = disabled) |
 
@@ -205,7 +206,7 @@ This eliminates cross-NUMA memory access, which causes 20-38% kernel time on man
 - Parallel runtime with work-stealing
 - Lock-free fingerprint storage
 - NUMA-aware resource management
-- 103 tests, property tests, fuzzing
+- 116 tests, property tests, fuzzing
 - Fault injection testing
 
 **In progress**:
