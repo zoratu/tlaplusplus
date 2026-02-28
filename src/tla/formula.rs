@@ -21,6 +21,8 @@ pub fn split_top_level(expr: &str, delimiter: &str) -> Vec<String> {
     let mut brace = 0usize;
     let mut angle = 0usize;
     let mut let_depth = 0usize; // Track LET...IN nesting
+    let mut if_depth = 0usize; // Track IF...ELSE nesting
+    let mut case_depth = 0usize; // Track CASE expression nesting
 
     while i < chars.len() {
         let c = chars[i];
@@ -55,32 +57,63 @@ pub fn split_top_level(expr: &str, delimiter: &str) -> Vec<String> {
             _ => {}
         }
 
-        // Check for LET keyword (at word boundary)
+        // Check for keywords at word boundary when at bracket top level
         let at_bracket_top = paren == 0 && bracket == 0 && brace == 0 && angle == 0;
-        if at_bracket_top && matches_keyword_at(&chars, i, "LET") {
-            let_depth += 1;
-            // Push "LET" and advance
-            current.push_str("LET");
-            i += 3;
-            continue;
+
+        if at_bracket_top {
+            // Track LET...IN nesting
+            // NOTE: We increment let_depth on LET but DO NOT decrement on IN.
+            // This is because in TLA+ actions, the pattern:
+            //   /\ LET x == ... IN /\ expr1 /\ expr2
+            // should treat "expr1 /\ expr2" as the body of the LET, not as
+            // top-level conjuncts. The LET expression extends to the end of the
+            // current grouping, and we only want to split at conjunctions that
+            // are truly at the top level (outside any LET).
+            if matches_keyword_at(&chars, i, "LET") {
+                let_depth += 1;
+                current.push_str("LET");
+                i += 3;
+                continue;
+            }
+            // Just push IN without decrementing - the LET body extends to the end
+            if let_depth > 0 && matches_keyword_at(&chars, i, "IN") {
+                current.push_str("IN");
+                i += 2;
+                continue;
+            }
+
+            // Track IF...ELSE nesting - don't split inside IF-THEN-ELSE
+            if matches_keyword_at(&chars, i, "IF") {
+                if_depth += 1;
+                current.push_str("IF");
+                i += 2;
+                continue;
+            }
+            if if_depth > 0 && matches_keyword_at(&chars, i, "ELSE") {
+                if_depth = if_depth.saturating_sub(1);
+                current.push_str("ELSE");
+                i += 4;
+                continue;
+            }
+
+            // Track CASE expressions - don't split inside CASE
+            if matches_keyword_at(&chars, i, "CASE") {
+                case_depth += 1;
+                current.push_str("CASE");
+                i += 4;
+                continue;
+            }
         }
 
-        // Check for IN keyword (at word boundary) - only decrements if we're inside a LET
-        if at_bracket_top && let_depth > 0 && matches_keyword_at(&chars, i, "IN") {
-            let_depth = let_depth.saturating_sub(1);
-            // Push "IN" and advance
-            current.push_str("IN");
-            i += 2;
-            continue;
-        }
-
-        let at_top = at_bracket_top && let_depth == 0;
+        let at_top = at_bracket_top && let_depth == 0 && if_depth == 0 && case_depth == 0;
         if at_top && matches_at(&chars, i, &delim_chars) {
             let piece = current.trim();
             if !piece.is_empty() {
                 out.push(piece.to_string());
             }
             current.clear();
+            // Reset case depth when we split (CASE expressions don't span conjuncts)
+            case_depth = 0;
             i += delim_chars.len();
             continue;
         }
