@@ -4,10 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-`tlaplusplus` is a Rust implementation of TLA+ model checking, achieving **10.7x faster** state exploration than Java TLC on many-core systems (benchmarked on 128-core AMD EPYC).
+`tlaplusplus` is a Rust implementation of TLA+ model checking, achieving **10.7x faster** state exploration than Java TLC on many-core systems (benchmarked on 128-core AMD EPYC, validated on 384-core systems with 6 NUMA nodes).
 
 Key performance features:
-- **NUMA-aware work-stealing queues** - hierarchical stealing prefers same-NUMA-node workers
+- **Automatic NUMA-aware worker scaling** - detects NUMA topology and distances, auto-selects optimal worker count using only close NUMA nodes (distance ≤20)
+- **NUMA-local memory allocation** - workers bind memory to their NUMA node via `set_mempolicy()`, achieving 99%+ user CPU (vs 60-70% without)
+- **NUMA-aware work-stealing queues** - hierarchical stealing prefers same-NUMA-node workers, batch stealing reduces overhead
 - **Lock-free fingerprint store** - atomic CAS operations eliminate lock contention
 - **Zero-copy state handling** - Arc-wrapped collections avoid clone overhead
 - **Batch fingerprint checking** - amortizes synchronization across 512+ states
@@ -117,15 +119,21 @@ flowchart TB
 **Work-Stealing Queues** (`work_stealing_queues.rs`):
 - Per-worker lock-free deques (crossbeam-deque)
 - Hierarchical NUMA-aware stealing:
-  1. First try workers on same NUMA node (low latency)
-  2. Then try remote NUMA nodes
+  1. First try workers on same NUMA node (low latency, max 8 attempts)
+  2. Then try remote NUMA nodes (max 1 attempt per node to minimize cross-NUMA traffic)
+- Batch stealing via `steal_batch_and_pop()` reduces steal overhead
+- Per-NUMA idle counters for O(NUMA_nodes) termination detection (vs O(workers))
 - Cache-line padded counters to prevent false sharing
-- Automatic termination detection
 - Batch API: `push_local_batch()` for amortizing synchronization
 
-**4. System Layer (`src/system.rs`)**
+**4. System Layer (`src/system.rs`, `src/storage/numa.rs`)**
 - Cgroup-aware worker planning: reads `/sys/fs/cgroup` for cpuset and CPU quota
-- NUMA node discovery and CPU pinning via `sched_setaffinity`
+- NUMA topology detection from `/sys/devices/system/node`:
+  - Discovers node count, CPU-to-node mappings, and inter-node distances
+  - Auto-calculates optimal worker count based on NUMA distances (threshold ≤20)
+  - On 6-NUMA-node systems, typically selects 3 close nodes for 2-4x better throughput
+- NUMA-local memory binding via `set_mempolicy(MPOL_PREFERRED)` syscall
+- CPU pinning via `sched_setaffinity`
 - CPU list parsing (supports "2-127" or "2-63,96-127")
 - Memory budget calculation from cgroup limits
 
@@ -198,12 +206,28 @@ Key parameters for many-core systems:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--workers` | auto | Worker count (0 = auto from cgroup) |
+| `--workers` | auto | Worker count (0 = auto from NUMA topology) |
 | `--core-ids` | all | CPU list (e.g., "2-127") |
 | `--numa-pinning` | true | Enable NUMA-aware CPU binding |
-| `--fp-shards` | 64 | Fingerprint store shard count |
+| `--fp-shards` | auto | Fingerprint store shard count (0 = auto) |
+| `--fp-expected-items` | 100M | Expected distinct states (increase for large models) |
 | `--fp-batch-size` | 512 | States per fingerprint batch |
 | `--checkpoint-interval-secs` | 0 | Checkpoint frequency (0 = disabled) |
+
+### NUMA Optimization (Many-Core Systems)
+
+On systems with multiple NUMA nodes (e.g., 384-core with 6 NUMA nodes):
+
+- **`--workers 0`** (default): Auto-detects NUMA topology and selects workers only from close NUMA nodes (distance ≤20). On a 6-node system, typically uses 3 nodes = 192 workers instead of 384.
+- This achieves **99%+ user CPU** vs 60-70% when using all NUMA nodes
+- Cross-NUMA memory access causes 20-38% kernel time; NUMA-local allocation eliminates this
+
+Example NUMA distances (from `numactl --hardware`):
+```
+node   0   1   2   3   4   5
+  0:  10  15  17  21  28  26   <- nodes 0,1,2 are "close" (≤20)
+  3:  21  28  26  10  15  17   <- nodes 3,4,5 are "close" to each other
+```
 
 ## Current Status
 

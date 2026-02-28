@@ -1,6 +1,6 @@
 # TLA++
 
-A Rust implementation of TLA+ model checking, achieving **10.7x faster** state exploration than Java TLC on many-core systems for large models.
+A Rust implementation of TLA+ model checking, achieving **10.7x faster** state exploration than Java TLC on many-core systems for large models. Validated on 384-core systems with 6 NUMA nodes.
 
 ## Performance
 
@@ -28,11 +28,22 @@ Benchmarked on 128-core AMD EPYC (c6a.metal, 256GB RAM):
 | CPU utilization | 95%+ | ~60% | - |
 | Memory efficiency | Lock-free | GC pauses | - |
 
+Validated on 384-core systems (6 NUMA nodes, 760GB RAM):
+
+| Configuration | %usr | %sys | States/min |
+|--------------|------|------|------------|
+| 380 workers (all NUMA) | 60-70% | 20-38% | 5-9M |
+| 192 workers (auto, 3 NUMA) | **99%+** | **<1%** | **10-22M** |
+
+The NUMA-aware auto-configuration achieves 2-4x better throughput by avoiding cross-NUMA memory access.
+
 ## Features
 
-- **Parallel state exploration** with N worker threads (auto-detected from cgroup/NUMA topology)
+- **Automatic NUMA optimization** - detects NUMA topology and distances, auto-selects optimal worker count using only close NUMA nodes (distance ≤20)
+- **NUMA-local memory allocation** - workers bind memory to their NUMA node via `set_mempolicy()`, achieving 99%+ user CPU
+- **Parallel state exploration** with N worker threads (auto-detected from NUMA topology)
 - **Lock-free fingerprint store** with page-aligned memory and NUMA-aware shard placement
-- **Work-stealing queues** for dynamic load balancing across workers
+- **Work-stealing queues** with batch stealing and per-NUMA idle counters for O(NUMA_nodes) termination detection
 - **NUMA-aware CPU pinning** via `sched_setaffinity`
 - **Cgroup-aware resource limits** - respects cpuset and CPU quota
 - **Checkpoint/resume** for long-running model checks
@@ -170,12 +181,23 @@ Key parameters for many-core systems:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--workers` | auto | Worker count (0 = auto from cgroup) |
+| `--workers` | auto | Worker count (0 = auto from NUMA topology) |
 | `--core-ids` | all | CPU list (e.g., "2-127") |
 | `--numa-pinning` | true | Enable NUMA-aware CPU binding |
-| `--fp-shards` | 64 | Fingerprint store shard count |
+| `--fp-shards` | auto | Fingerprint store shard count (0 = auto) |
+| `--fp-expected-items` | 100M | Expected distinct states (increase for large models) |
 | `--fp-batch-size` | 512 | States per fingerprint batch |
 | `--checkpoint-interval-secs` | 0 | Checkpoint frequency (0 = disabled) |
+
+### NUMA Auto-Optimization
+
+With `--workers 0` (default), tlaplusplus automatically:
+1. Detects NUMA topology from `/sys/devices/system/node`
+2. Reads inter-node distances (local=10, remote=15-28 typically)
+3. Selects workers only from NUMA nodes with distance ≤20 to each other
+4. Binds each worker's memory allocations to its local NUMA node
+
+This eliminates cross-NUMA memory access, which causes 20-38% kernel time on many-core systems.
 
 ## Current Status
 
