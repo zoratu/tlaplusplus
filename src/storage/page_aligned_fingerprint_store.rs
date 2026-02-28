@@ -42,6 +42,10 @@ const RESIZE_CHECK_INTERVAL: u64 = 1_000;
 const MAX_SPIN_BEFORE_YIELD: u32 = 64;
 /// Maximum yields before sleeping
 const MAX_YIELDS_BEFORE_SLEEP: u32 = 16;
+/// Maximum retry iterations in fingerprint operations before warning
+const MAX_RETRIES_BEFORE_WARN: u32 = 10_000;
+/// Maximum retry iterations before panic (something is very wrong)
+const MAX_RETRIES_BEFORE_PANIC: u32 = 1_000_000;
 
 #[derive(Clone, Debug)]
 pub struct FingerprintStoreConfig {
@@ -361,7 +365,24 @@ impl FingerprintShard {
         // Never store 0 (reserved for empty slots)
         let fp = if fp == 0 { 1 } else { fp };
 
+        let mut retries = 0u32;
         loop {
+            retries += 1;
+            if retries == MAX_RETRIES_BEFORE_WARN {
+                eprintln!(
+                    "Warning: fingerprint {:#x} (stats) exceeded {} retries in shard {}",
+                    fp, MAX_RETRIES_BEFORE_WARN, self.numa_node
+                );
+            }
+            if retries > MAX_RETRIES_BEFORE_PANIC {
+                panic!(
+                    "Fingerprint {:#x} (stats) stuck after {} retries in shard {}",
+                    fp, MAX_RETRIES_BEFORE_PANIC, self.numa_node
+                );
+            }
+            if retries > 0 && retries % 1000 == 0 {
+                std::thread::yield_now();
+            }
             let seq_before = self.seq.load(Ordering::Acquire);
             if seq_before % 2 == 1 {
                 // RESIZE IN PROGRESS - use lock-free path through old+new tables
@@ -432,10 +453,28 @@ impl FingerprintShard {
                         probes += 1;
                     }
 
+                    // New table full during resize
+                    if retries % 1000 == 0 {
+                        eprintln!(
+                            "Warning: fp {:#x} (stats) retry {} - new table full during resize",
+                            fp, retries
+                        );
+                    }
                     std::hint::spin_loop();
                     continue;
                 }
 
+                // Check if resize completed
+                let seq_recheck = self.seq.load(Ordering::Acquire);
+                if seq_recheck % 2 == 0 {
+                    continue;
+                }
+                if retries % 1000 == 0 {
+                    eprintln!(
+                        "Warning: fp {:#x} (stats) retry {} - waiting for new_table",
+                        fp, retries
+                    );
+                }
                 std::hint::spin_loop();
                 continue;
             }
@@ -503,11 +542,27 @@ impl FingerprintShard {
             }
 
             // Table is full - trigger resize and retry
-            {
-                let _guard = self.resize_lock.lock();
+            // Use try_lock to avoid blocking all workers
+            if let Some(_guard) = self.resize_lock.try_lock() {
                 if self.load_factor() >= 0.80 {
+                    if retries > 1 {
+                        eprintln!(
+                            "Triggering resize (stats) after {} retries (load={:.1}%)",
+                            retries,
+                            self.load_factor() * 100.0
+                        );
+                    }
                     self.resize();
                 }
+            } else {
+                // Someone else is resizing - yield and retry
+                if retries % 1000 == 0 {
+                    eprintln!(
+                        "Warning: fp {:#x} (stats) retry {} - waiting for resize",
+                        fp, retries
+                    );
+                }
+                std::thread::yield_now();
             }
         }
     }
@@ -524,7 +579,35 @@ impl FingerprintShard {
         // Never store 0 (reserved for empty slots)
         let fp = if fp == 0 { 1 } else { fp };
 
+        let mut retries = 0u32;
         loop {
+            retries += 1;
+            if retries == MAX_RETRIES_BEFORE_WARN {
+                eprintln!(
+                    "Warning: fingerprint {:#x} exceeded {} retries in shard {} (seq={}, load={:.1}%)",
+                    fp,
+                    MAX_RETRIES_BEFORE_WARN,
+                    self.numa_node,
+                    self.seq.load(Ordering::Relaxed),
+                    self.load_factor() * 100.0
+                );
+            }
+            if retries > MAX_RETRIES_BEFORE_PANIC {
+                panic!(
+                    "Fingerprint {:#x} stuck in infinite loop after {} retries in shard {} (seq={}, capacity={}, count={}, load={:.1}%)",
+                    fp,
+                    MAX_RETRIES_BEFORE_PANIC,
+                    self.numa_node,
+                    self.seq.load(Ordering::Relaxed),
+                    self.get_capacity(),
+                    self.len(),
+                    self.load_factor() * 100.0
+                );
+            }
+            // Yield periodically to avoid starving other threads
+            if retries > 0 && retries % 1000 == 0 {
+                std::thread::yield_now();
+            }
             // Read seqlock - if odd, resize in progress
             let seq_before = self.seq.load(Ordering::Acquire);
             if seq_before % 2 == 1 {
@@ -600,12 +683,36 @@ impl FingerprintShard {
                     }
 
                     // New table is getting full during resize - very rare
-                    // Spin briefly and retry (resize should complete soon)
+                    // This can happen if:
+                    // 1. Many workers inserting concurrently fill the table
+                    // 2. The resize thread is slow to complete
+                    if retries % 1000 == 0 {
+                        eprintln!(
+                            "Warning: fp {:#x} retry {} - new table full during resize (cap={}, seq={})",
+                            fp,
+                            retries,
+                            new_cap,
+                            self.seq.load(Ordering::Relaxed)
+                        );
+                    }
                     std::hint::spin_loop();
                     continue;
                 }
 
-                // new_table not yet set up - spin briefly and retry
+                // new_table not yet set up OR resize just completed and cleared it
+                // Re-read seq to check if resize completed
+                let seq_recheck = self.seq.load(Ordering::Acquire);
+                if seq_recheck % 2 == 0 {
+                    // Resize completed! Take normal path on next iteration
+                    continue;
+                }
+                // Still resizing but new_table not ready - very brief window
+                if retries % 1000 == 0 {
+                    eprintln!(
+                        "Warning: fp {:#x} retry {} - waiting for new_table (seq={} -> {})",
+                        fp, retries, seq_before, seq_recheck
+                    );
+                }
                 std::hint::spin_loop();
                 continue;
             }
@@ -671,11 +778,30 @@ impl FingerprintShard {
             }
 
             // Table is full - trigger resize and retry
-            {
-                let _guard = self.resize_lock.lock();
+            // Use try_lock to avoid blocking all workers
+            if let Some(_guard) = self.resize_lock.try_lock() {
                 if self.load_factor() >= 0.80 {
+                    if retries > 1 {
+                        eprintln!(
+                            "Triggering resize after {} retries (cap={}, count={}, load={:.1}%)",
+                            retries,
+                            capacity,
+                            self.len(),
+                            self.load_factor() * 100.0
+                        );
+                    }
                     self.resize();
                 }
+            } else {
+                // Someone else is resizing - yield and retry
+                // The resize path above will handle insertion into new table
+                if retries % 1000 == 0 {
+                    eprintln!(
+                        "Warning: fp {:#x} retry {} - waiting for resize to complete",
+                        fp, retries
+                    );
+                }
+                std::thread::yield_now();
             }
         }
     }
