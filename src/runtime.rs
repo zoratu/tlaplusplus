@@ -1,3 +1,4 @@
+use crate::autotune::{AutoTuneConfig, AutoTuner, WorkerThrottle};
 use crate::fairness::{FairnessConstraint, TarjanSCC, check_fairness_on_scc};
 use crate::model::{LabeledTransition, Model};
 use crate::storage::channel_queue::ChannelQueue;
@@ -59,6 +60,8 @@ pub struct EngineConfig {
     pub enable_queue_spilling: bool,
     /// Max items in memory before spilling (when enable_queue_spilling is true)
     pub queue_max_inmem_items: u64,
+    /// Enable auto-tuning of worker count based on CPU utilization
+    pub auto_tune: bool,
 }
 
 impl Default for EngineConfig {
@@ -89,6 +92,7 @@ impl Default for EngineConfig {
             queue_spill_channel_bound: 128,
             enable_queue_spilling: true,
             queue_max_inmem_items: 50_000_000, // 50M items before spilling
+            auto_tune: false,
         }
     }
 }
@@ -570,6 +574,10 @@ where
     let (violation_tx, violation_rx) = crossbeam_channel::bounded(1);
     let (error_tx, error_rx) = crossbeam_channel::bounded::<String>(1);
 
+    // Auto-tuning: create throttle for dynamic worker count adjustment
+    let throttle = Arc::new(WorkerThrottle::new(worker_plan.worker_count));
+    let auto_tune_enabled = config.auto_tune;
+
     let started_at = Instant::now();
     let resumed_from_checkpoint = config.resume_from_checkpoint && queue.has_pending_work();
     if !resumed_from_checkpoint {
@@ -729,6 +737,24 @@ where
             None
         };
 
+    // Start auto-tuner if enabled (reads run_stats for throughput)
+    let mut auto_tuner = if auto_tune_enabled {
+        let tune_config = AutoTuneConfig {
+            max_workers: worker_plan.worker_count,
+            min_workers: worker_plan.worker_count / 8, // Floor at 1/8 of workers
+            target_sys_pct: 20.0,
+            adjustment_step: (worker_plan.worker_count / 16).max(4), // ~6% at a time
+            verbose: true,
+            ..Default::default()
+        };
+        let mut tuner = AutoTuner::new(tune_config, Arc::clone(&throttle), Arc::clone(&stop));
+        let stats_for_tuner = Arc::clone(&run_stats);
+        tuner.start(move || stats_for_tuner.states_generated.load(Ordering::Relaxed));
+        Some(tuner)
+    } else {
+        None
+    };
+
     let mut workers = Vec::with_capacity(worker_plan.worker_count);
     for (worker_id, mut worker_state) in worker_states.into_iter().enumerate() {
         let worker_model = Arc::clone(&model);
@@ -739,6 +765,7 @@ where
         let worker_active = Arc::clone(&active_workers);
         let worker_live = Arc::clone(&live_workers);
         let worker_pause = Arc::clone(&pause);
+        let worker_throttle = Arc::clone(&throttle);
         let worker_violation_tx = violation_tx.clone();
         let worker_error_tx = error_tx.clone();
         let worker_stop_on_violation = config.stop_on_violation;
@@ -830,6 +857,9 @@ where
                 if worker_stop.load(Ordering::Acquire) {
                     break;
                 }
+
+                // Auto-tune throttle: workers over the limit yield briefly
+                worker_throttle.worker_throttle_point(worker_id);
 
                 // Work-stealing: try local queue first, then steal from others
                 // This has zero contention on the common path
@@ -1075,6 +1105,11 @@ where
     // Stop progress reporting
     stop.store(true, Ordering::Release);
     let _ = progress_thread.join();
+
+    // Stop auto-tuner if running
+    if let Some(tuner) = auto_tuner.take() {
+        tuner.join();
+    }
 
     // Cleanup checkpoint thread
     queue.finish(); // Signal completion

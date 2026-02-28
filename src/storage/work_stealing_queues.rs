@@ -204,18 +204,12 @@ impl<T: 'static> WorkStealingQueues<T> {
         &self,
         worker_state: &mut WorkerState<T>,
         item: T,
-        home_numa: usize,
+        _home_numa: usize,
     ) {
-        if home_numa == worker_state.numa_node {
-            // Same NUMA - push to local queue (best cache locality)
-            worker_state.worker.push(item);
-            worker_state.local_pushed += 1;
-        } else {
-            // Cross-NUMA - push to home NUMA's injector
-            let numa_idx = home_numa.min(self.num_numa_nodes.saturating_sub(1));
-            self.numa_injectors[numa_idx].push(item);
-            self.global_pushed.fetch_add(1, Ordering::Relaxed);
-        }
+        // SCALABILITY FIX: Always push to local queue to avoid injector contention.
+        // See push_batch_to_numa for details.
+        worker_state.worker.push(item);
+        worker_state.local_pushed += 1;
 
         // Periodically flush local counter
         if worker_state.local_pushed >= worker_state.flush_threshold {
@@ -234,24 +228,15 @@ impl<T: 'static> WorkStealingQueues<T> {
         items: impl Iterator<Item = (T, usize)>,
     ) -> usize {
         let mut count = 0;
-        let mut remote_count = 0u64;
 
-        for (item, home_numa) in items {
-            if home_numa == worker_state.numa_node {
-                worker_state.worker.push(item);
-                worker_state.local_pushed += 1;
-            } else {
-                let numa_idx = home_numa.min(self.num_numa_nodes.saturating_sub(1));
-                self.numa_injectors[numa_idx].push(item);
-                remote_count += 1;
-            }
+        // SCALABILITY FIX: Always push to local queue to avoid NUMA injector contention.
+        // With 384 workers and 6 NUMA nodes, ~64 workers contend on each injector lock.
+        // Local queues are lock-free (crossbeam Worker::push is single-threaded).
+        // NUMA-aware stealing will still provide locality benefits when workers steal.
+        for (item, _home_numa) in items {
+            worker_state.worker.push(item);
+            worker_state.local_pushed += 1;
             count += 1;
-        }
-
-        // Update global counter for remote pushes
-        if remote_count > 0 {
-            self.global_pushed
-                .fetch_add(remote_count, Ordering::Relaxed);
         }
 
         // Periodically flush local counter

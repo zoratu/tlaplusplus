@@ -111,6 +111,9 @@ struct RuntimeArgs {
     poll_sleep_ms: u64,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     stop_on_violation: bool,
+    /// Enable auto-tuning of worker count based on CPU utilization
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    auto_tune: bool,
 }
 
 #[derive(Args, Clone, Debug)]
@@ -259,6 +262,7 @@ fn build_engine_config(
         queue_spill_channel_bound: storage.queue_spill_channel_bound,
         enable_queue_spilling: !storage.disable_queue_spilling,
         queue_max_inmem_items: storage.queue_max_inmem_items,
+        auto_tune: runtime.auto_tune,
     })
 }
 
