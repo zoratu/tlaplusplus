@@ -126,6 +126,11 @@ struct FingerprintShard {
     old_table: AtomicPtr<HashTableEntry>,
     /// Old table capacity during resize
     old_capacity: AtomicUsize,
+    /// New table pointer during resize (for lock-free inserts)
+    /// Workers can insert here during resize instead of waiting
+    new_table: AtomicPtr<HashTableEntry>,
+    /// New table capacity during resize
+    new_capacity: AtomicUsize,
     /// Old memory regions waiting to be freed (after readers drain)
     #[allow(clippy::type_complexity)]
     old_memory: Mutex<Vec<(*mut u8, usize)>>,
@@ -170,6 +175,8 @@ impl FingerprintShard {
             resize_lock: Mutex::new(()),
             old_table: AtomicPtr::new(std::ptr::null_mut()),
             old_capacity: AtomicUsize::new(0),
+            new_table: AtomicPtr::new(std::ptr::null_mut()),
+            new_capacity: AtomicUsize::new(0),
             old_memory: Mutex::new(Vec::new()),
         })
     }
@@ -247,11 +254,17 @@ impl FingerprintShard {
         self.old_table.store(old_table, Ordering::Release);
         self.old_capacity.store(old_capacity, Ordering::Release);
 
+        // Store new table for lock-free inserts during resize
+        // Workers can insert here instead of waiting for resize to complete
+        self.new_table.store(new_table, Ordering::Release);
+        self.new_capacity.store(new_capacity, Ordering::Release);
+
         // Mark resize in progress (odd seq number)
-        // After this, readers will check old_table first
+        // After this, workers will check old_table then insert into new_table
         self.seq.fetch_add(1, Ordering::AcqRel);
 
         // Rehash all entries from old to new table
+        // Note: workers may also be inserting into new table concurrently
         let old_slice = unsafe { std::slice::from_raw_parts(old_table, old_capacity) };
         let new_slice = unsafe { std::slice::from_raw_parts_mut(new_table, new_capacity) };
 
@@ -259,15 +272,38 @@ impl FingerprintShard {
         for entry in old_slice {
             let fp = entry.fp.load(Ordering::Acquire);
             if fp != 0 {
-                // Insert into new table
+                // Insert into new table using CAS (workers may have already inserted)
                 let mut index = (fp as usize) % new_capacity;
                 loop {
                     let new_entry = &new_slice[index];
-                    if new_entry.fp.load(Ordering::Relaxed) == 0 {
-                        new_entry.fp.store(fp, Ordering::Release);
-                        new_entry.state.store(1, Ordering::Release);
+                    let stored = new_entry.fp.load(Ordering::Acquire);
+                    if stored == fp {
+                        // Already inserted by a worker
                         rehashed += 1;
                         break;
+                    }
+                    if stored == 0 {
+                        // Try to insert
+                        match new_entry.fp.compare_exchange(
+                            0,
+                            fp,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        ) {
+                            Ok(_) => {
+                                new_entry.state.store(1, Ordering::Release);
+                                rehashed += 1;
+                                break;
+                            }
+                            Err(actual) if actual == fp => {
+                                // Concurrent insert of same fingerprint
+                                rehashed += 1;
+                                break;
+                            }
+                            Err(_) => {
+                                // Slot taken by different fp, continue probing
+                            }
+                        }
                     }
                     index = (index + 1) % new_capacity;
                 }
@@ -283,10 +319,13 @@ impl FingerprintShard {
         // Mark resize complete (even seq number)
         self.seq.fetch_add(1, Ordering::AcqRel);
 
-        // Clear old table pointers (readers will now use new table)
+        // Clear old/new table pointers (readers will now use main table)
         self.old_table
             .store(std::ptr::null_mut(), Ordering::Release);
         self.old_capacity.store(0, Ordering::Release);
+        self.new_table
+            .store(std::ptr::null_mut(), Ordering::Release);
+        self.new_capacity.store(0, Ordering::Release);
 
         // Queue old memory for later cleanup (can't free immediately - readers may still use it)
         self.old_memory.lock().push((old_memory, old_memory_size));
@@ -317,19 +356,91 @@ impl FingerprintShard {
     /// Check if fingerprint exists or insert it (lock-free with resize support)
     ///
     /// Returns true if fingerprint already existed, false if newly inserted
+    /// This is completely non-blocking during resize.
     fn contains_or_insert(&self, fp: u64, stats: &FingerprintStatsAtomic) -> bool {
         // Never store 0 (reserved for empty slots)
         let fp = if fp == 0 { 1 } else { fp };
 
         loop {
-            // Read seqlock - if odd, resize in progress, spin
             let seq_before = self.seq.load(Ordering::Acquire);
             if seq_before % 2 == 1 {
+                // RESIZE IN PROGRESS - use lock-free path through old+new tables
+
+                // Step 1: Check old table (RCU read)
+                let old_table_ptr = self.old_table.load(Ordering::Acquire);
+                let old_cap = self.old_capacity.load(Ordering::Acquire);
+
+                if !old_table_ptr.is_null() && old_cap > 0 {
+                    let old_table = unsafe { std::slice::from_raw_parts(old_table_ptr, old_cap) };
+                    let mut index = (fp as usize) % old_cap;
+                    let mut probes = 0u64;
+
+                    while probes < old_cap as u64 {
+                        let stored_fp = old_table[index].fp.load(Ordering::Acquire);
+                        if stored_fp == fp {
+                            return true;
+                        }
+                        if stored_fp == 0 {
+                            break;
+                        }
+                        index = (index + 1) % old_cap;
+                        probes += 1;
+                    }
+                }
+
+                // Step 2: Check/insert into new table (non-blocking!)
+                let new_table_ptr = self.new_table.load(Ordering::Acquire);
+                let new_cap = self.new_capacity.load(Ordering::Acquire);
+
+                if !new_table_ptr.is_null() && new_cap > 0 {
+                    let new_table =
+                        unsafe { std::slice::from_raw_parts_mut(new_table_ptr, new_cap) };
+                    let mut index = (fp as usize) % new_cap;
+                    let mut probes = 0u64;
+
+                    while probes < new_cap as u64 {
+                        let entry = &new_table[index];
+                        let stored_fp = entry.fp.load(Ordering::Acquire);
+
+                        if stored_fp == fp {
+                            return true;
+                        }
+
+                        if stored_fp == 0 {
+                            match entry.fp.compare_exchange(
+                                0,
+                                fp,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            ) {
+                                Ok(_) => {
+                                    entry.state.store(1, Ordering::Release);
+                                    self.count.fetch_add(1, Ordering::Relaxed);
+                                    if probes > 0 {
+                                        stats.collisions.fetch_add(probes, Ordering::Relaxed);
+                                    }
+                                    return false;
+                                }
+                                Err(actual) if actual == fp => {
+                                    return true;
+                                }
+                                Err(_) => {}
+                            }
+                        }
+
+                        index = (index + 1) % new_cap;
+                        probes += 1;
+                    }
+
+                    std::hint::spin_loop();
+                    continue;
+                }
+
                 std::hint::spin_loop();
                 continue;
             }
 
-            // Get current table and capacity
+            // NORMAL PATH - no resize in progress
             let capacity = self.get_capacity();
             let table_ptr = self.get_table();
             let table = unsafe { std::slice::from_raw_parts_mut(table_ptr, capacity) };
@@ -343,19 +454,22 @@ impl FingerprintShard {
                 let stored_fp = entry.fp.load(Ordering::Acquire);
 
                 if stored_fp == fp {
-                    // Found existing fingerprint
                     result = Some(true);
                     break;
                 }
 
                 if stored_fp == 0 {
-                    // Empty slot - try to claim it
+                    // Check seq BEFORE CAS to avoid inserting while resize may have started
+                    let seq_check = self.seq.load(Ordering::Acquire);
+                    if seq_check != seq_before {
+                        break; // Resize started, retry
+                    }
+
                     match entry
                         .fp
                         .compare_exchange(0, fp, Ordering::AcqRel, Ordering::Acquire)
                     {
                         Ok(_) => {
-                            // Successfully inserted
                             entry.state.store(1, Ordering::Release);
                             self.count.fetch_add(1, Ordering::Relaxed);
                             if probes > 0 {
@@ -365,51 +479,36 @@ impl FingerprintShard {
                             break;
                         }
                         Err(actual) if actual == fp => {
-                            // Concurrent insert of same fingerprint
                             result = Some(true);
                             break;
                         }
-                        Err(_) => {
-                            // Someone else claimed this slot, continue probing
-                        }
+                        Err(_) => {}
                     }
                 }
 
-                // Linear probe to next slot
                 index = (index + 1) % capacity;
                 probes += 1;
             }
 
-            // Check if resize happened during our operation
             let seq_after = self.seq.load(Ordering::Acquire);
             if seq_before != seq_after {
-                // Resize happened, retry from scratch
                 continue;
             }
 
-            // If we completed the operation, check if resize is needed
             if let Some(existed) = result {
                 if !existed {
-                    // We inserted - maybe trigger resize
                     self.maybe_resize();
                 }
                 return existed;
             }
 
             // Table is full - trigger resize and retry
-            eprintln!(
-                "Shard {} probed {} times without finding slot, triggering resize",
-                self.numa_node, probes
-            );
-
-            // Force resize by acquiring lock
             {
                 let _guard = self.resize_lock.lock();
                 if self.load_factor() >= 0.80 {
                     self.resize();
                 }
             }
-            // Retry after resize
         }
     }
 
@@ -417,24 +516,26 @@ impl FingerprintShard {
     ///
     /// Returns true if fingerprint already existed, false if newly inserted
     /// This version skips stats updates for maximum performance
+    ///
+    /// IMPORTANT: This is completely non-blocking during resize:
+    /// - Check old table for existing fingerprints
+    /// - Check/insert into new table (no waiting!)
     fn contains_or_insert_no_stats(&self, fp: u64) -> bool {
         // Never store 0 (reserved for empty slots)
         let fp = if fp == 0 { 1 } else { fp };
-
-        let mut resize_wait_spins = 0u32;
-        let mut resize_wait_yields = 0u32;
 
         loop {
             // Read seqlock - if odd, resize in progress
             let seq_before = self.seq.load(Ordering::Acquire);
             if seq_before % 2 == 1 {
-                // RCU-style read: check old table first during resize
-                // If fingerprint exists in old table, we can return immediately
+                // RESIZE IN PROGRESS - use lock-free path through old+new tables
+                // This is completely non-blocking!
+
+                // Step 1: Check old table (RCU read)
                 let old_table_ptr = self.old_table.load(Ordering::Acquire);
                 let old_cap = self.old_capacity.load(Ordering::Acquire);
 
                 if !old_table_ptr.is_null() && old_cap > 0 {
-                    // Safe to read old table - it's still valid during resize
                     let old_table = unsafe { std::slice::from_raw_parts(old_table_ptr, old_cap) };
                     let mut index = (fp as usize) % old_cap;
                     let mut probes = 0u64;
@@ -442,11 +543,10 @@ impl FingerprintShard {
                     while probes < old_cap as u64 {
                         let stored_fp = old_table[index].fp.load(Ordering::Acquire);
                         if stored_fp == fp {
-                            // Found in old table - definitely already seen
+                            // Found in old table - already seen
                             return true;
                         }
                         if stored_fp == 0 {
-                            // Empty slot - not in old table
                             break;
                         }
                         index = (index + 1) % old_cap;
@@ -454,29 +554,63 @@ impl FingerprintShard {
                     }
                 }
 
-                // Not found in old table - need to wait for resize to insert
-                // Exponential backoff to reduce contention
-                if resize_wait_spins < MAX_SPIN_BEFORE_YIELD {
-                    // Spin phase: quick spins for short resizes
-                    for _ in 0..(1 << resize_wait_spins.min(6)) {
-                        std::hint::spin_loop();
+                // Step 2: Check/insert into new table (non-blocking!)
+                let new_table_ptr = self.new_table.load(Ordering::Acquire);
+                let new_cap = self.new_capacity.load(Ordering::Acquire);
+
+                if !new_table_ptr.is_null() && new_cap > 0 {
+                    let new_table =
+                        unsafe { std::slice::from_raw_parts_mut(new_table_ptr, new_cap) };
+                    let mut index = (fp as usize) % new_cap;
+                    let mut probes = 0u64;
+
+                    while probes < new_cap as u64 {
+                        let entry = &new_table[index];
+                        let stored_fp = entry.fp.load(Ordering::Acquire);
+
+                        if stored_fp == fp {
+                            // Found in new table
+                            return true;
+                        }
+
+                        if stored_fp == 0 {
+                            // Try to insert
+                            match entry.fp.compare_exchange(
+                                0,
+                                fp,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            ) {
+                                Ok(_) => {
+                                    entry.state.store(1, Ordering::Release);
+                                    self.count.fetch_add(1, Ordering::Relaxed);
+                                    return false; // New fingerprint
+                                }
+                                Err(actual) if actual == fp => {
+                                    return true; // Concurrent insert
+                                }
+                                Err(_) => {
+                                    // Slot taken, continue probing
+                                }
+                            }
+                        }
+
+                        index = (index + 1) % new_cap;
+                        probes += 1;
                     }
-                    resize_wait_spins += 1;
-                } else if resize_wait_yields < MAX_YIELDS_BEFORE_SLEEP {
-                    // Yield phase: let other threads run
-                    std::thread::yield_now();
-                    resize_wait_yields += 1;
-                } else {
-                    // Sleep phase: resize is taking long, sleep briefly
-                    std::thread::sleep(std::time::Duration::from_micros(100));
+
+                    // New table is getting full during resize - very rare
+                    // Spin briefly and retry (resize should complete soon)
+                    std::hint::spin_loop();
+                    continue;
                 }
+
+                // new_table not yet set up - spin briefly and retry
+                std::hint::spin_loop();
                 continue;
             }
-            // Reset backoff counters when resize completes
-            resize_wait_spins = 0;
-            resize_wait_yields = 0;
 
-            // Get current table and capacity
+            // NORMAL PATH - no resize in progress
             let capacity = self.get_capacity();
             let table_ptr = self.get_table();
             let table = unsafe { std::slice::from_raw_parts_mut(table_ptr, capacity) };
@@ -490,36 +624,35 @@ impl FingerprintShard {
                 let stored_fp = entry.fp.load(Ordering::Acquire);
 
                 if stored_fp == fp {
-                    // Found existing fingerprint
                     result = Some(true);
                     break;
                 }
 
                 if stored_fp == 0 {
-                    // Empty slot - try to claim it
+                    // Check seq BEFORE CAS to avoid inserting while resize may have started
+                    let seq_check = self.seq.load(Ordering::Acquire);
+                    if seq_check != seq_before {
+                        break; // Resize started, retry
+                    }
+
                     match entry
                         .fp
                         .compare_exchange(0, fp, Ordering::AcqRel, Ordering::Acquire)
                     {
                         Ok(_) => {
-                            // Successfully inserted
                             entry.state.store(1, Ordering::Release);
                             self.count.fetch_add(1, Ordering::Relaxed);
                             result = Some(false);
                             break;
                         }
                         Err(actual) if actual == fp => {
-                            // Concurrent insert of same fingerprint
                             result = Some(true);
                             break;
                         }
-                        Err(_) => {
-                            // Someone else claimed this slot, continue probing
-                        }
+                        Err(_) => {}
                     }
                 }
 
-                // Linear probe to next slot
                 index = (index + 1) % capacity;
                 probes += 1;
             }
@@ -527,14 +660,11 @@ impl FingerprintShard {
             // Check if resize happened during our operation
             let seq_after = self.seq.load(Ordering::Acquire);
             if seq_before != seq_after {
-                // Resize happened, retry from scratch
                 continue;
             }
 
-            // If we completed the operation, check if resize is needed
             if let Some(existed) = result {
                 if !existed {
-                    // We inserted - maybe trigger resize
                     self.maybe_resize();
                 }
                 return existed;
@@ -547,7 +677,6 @@ impl FingerprintShard {
                     self.resize();
                 }
             }
-            // Retry after resize
         }
     }
 
@@ -623,24 +752,32 @@ impl PageAlignedFingerprintStore {
             );
         }
 
-        // Create shards with deterministic NUMA placement
+        // Create shards with deterministic NUMA placement and staggered sizes
+        // Staggering prevents thundering herd when all shards hit resize threshold together
         let mut shards = Vec::with_capacity(shard_count);
         for shard_id in 0..shard_count {
             // Deterministic: shard N belongs to NUMA (N / shards_per_numa)
             let numa_node = (shard_id / shards_per_numa).min(num_numa_nodes - 1);
 
-            let shard = FingerprintShard::new(config.shard_size_mb, numa_node).context(format!(
+            // Stagger sizes: vary by ±25% based on shard_id to spread out resizes
+            // Using prime multipliers to ensure good distribution
+            let stagger_factor = 1.0 + 0.25 * ((shard_id * 7 % 11) as f64 / 10.0 - 0.5);
+            let staggered_size_mb =
+                ((config.shard_size_mb as f64 * stagger_factor) as usize).max(64);
+
+            let shard = FingerprintShard::new(staggered_size_mb, numa_node).context(format!(
                 "Failed to create shard {} on NUMA node {}",
                 shard_id, numa_node
             ))?;
 
             if std::env::var("TLAPP_VERBOSE").is_ok() {
                 eprintln!(
-                    "  Shard {:3}: {:.1} GB on NUMA node {} (capacity: {} fingerprints)",
+                    "  Shard {:3}: {:.1} GB on NUMA node {} (capacity: {} fingerprints, stagger: {:.0}%)",
                     shard_id,
-                    config.shard_size_mb as f64 / 1024.0,
+                    staggered_size_mb as f64 / 1024.0,
                     numa_node,
-                    shard.get_capacity()
+                    shard.get_capacity(),
+                    stagger_factor * 100.0
                 );
             }
 
