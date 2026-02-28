@@ -613,7 +613,15 @@ impl FingerprintShard {
                     seq_mismatch_count
                 );
             }
-            // Yield periodically to avoid starving other threads
+            // Exponential backoff to reduce contention at high worker counts
+            // This helps prevent livelock when many workers are competing
+            if retries > 100 {
+                // After 100 retries, use exponential backoff with jitter
+                let backoff_spins = 1u32 << ((retries.min(10_000) / 100).min(10));
+                for _ in 0..backoff_spins {
+                    std::hint::spin_loop();
+                }
+            }
             if retries > 0 && retries % 1000 == 0 {
                 std::thread::yield_now();
             }
@@ -621,6 +629,13 @@ impl FingerprintShard {
             let seq_before = self.seq.load(Ordering::Acquire);
             if seq_before % 2 == 1 {
                 resize_path_count += 1;
+
+                // If we've been stuck in resize path for many retries, yield aggressively
+                // This helps the resize thread get CPU time to complete
+                if resize_path_count > 100 && resize_path_count % 10 == 0 {
+                    std::thread::yield_now();
+                }
+
                 // RESIZE IN PROGRESS - use lock-free path through old+new tables
                 // This is completely non-blocking!
 
