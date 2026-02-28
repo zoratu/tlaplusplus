@@ -213,6 +213,7 @@ Key parameters for many-core systems:
 | `--workers` | auto | Worker count (0 = auto from NUMA topology) |
 | `--core-ids` | all | CPU list (e.g., "2-127") |
 | `--numa-pinning` | true | Enable NUMA-aware CPU binding |
+| `--auto-tune` | true | Dynamically adjust active workers based on CPU sys% |
 | `--fp-shards` | auto | Fingerprint store shard count (0 = auto) |
 | `--fp-expected-items` | 100M | Expected distinct states (increase for large models) |
 | `--fp-batch-size` | 512 | States per fingerprint batch |
@@ -232,6 +233,38 @@ node   0   1   2   3   4   5
   0:  10  15  17  21  28  26   <- nodes 0,1,2 are "close" (≤20)
   3:  21  28  26  10  15  17   <- nodes 3,4,5 are "close" to each other
 ```
+
+### Auto-Tuning (Enabled by Default)
+
+The auto-tuner (`--auto-tune=true`) monitors `/proc/stat` and dynamically adjusts active worker count:
+
+- **Target**: Keep kernel (sys%) time below 20%
+- **High sys%** indicates lock/atomic contention → reduces active workers
+- **Low sys%** → tries adding workers back
+- Uses hysteresis (±5%) to prevent oscillation
+- Workers over the target yield briefly (100µs) rather than spin
+
+On a 384-core system:
+- Without auto-tune: 48% usr, 51% sys (severe contention)
+- With auto-tune: 81% usr, 18% sys (auto-selects ~360 workers)
+
+### Remaining Scalability Bottlenecks
+
+Current bottlenecks preventing 100% user CPU utilization:
+
+1. **Atomic counter contention** - Shared `AtomicU64` counters (`states_generated`, `states_processed`) cause cache-line bouncing across NUMA nodes
+
+2. **Fingerprint CAS contention** - 384 workers hitting the same shards cause compare-exchange retry loops (exponential backoff helps but doesn't eliminate)
+
+3. **Fingerprint resize blocking** - When shards resize at 75% load, other workers must spin/yield until complete
+
+4. **Memory allocator pressure** - Per-state allocations (even with jemalloc) cause kernel time for page table management
+
+**Potential fixes** (not yet implemented):
+- Per-worker local counters with periodic flush (eliminate shared atomics)
+- Sharded fingerprint stores with worker affinity (reduce CAS contention)
+- Pre-allocated state pools (eliminate allocator overhead)
+- Huge pages for state memory (reduce TLB misses)
 
 ## Current Status
 
