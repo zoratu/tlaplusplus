@@ -523,29 +523,43 @@ pub struct PageAlignedFingerprintStore {
     stats: FingerprintStatsAtomic,
     /// Optional persistence channels (one per shard)
     persist_tx: Option<Vec<Sender<FingerprintPersistMsg>>>,
+    /// Number of NUMA nodes
+    num_numa_nodes: usize,
+    /// Shards per NUMA node (for deterministic routing)
+    shards_per_numa: usize,
 }
 
 impl PageAlignedFingerprintStore {
-    /// Create new fingerprint store with NUMA-aware shard placement
+    /// Create new fingerprint store with NUMA-local shard placement
+    ///
+    /// Shards are deterministically assigned to NUMA nodes:
+    /// - Shards 0..K on NUMA 0, K..2K on NUMA 1, etc.
+    /// - Fingerprints are routed to their home NUMA via `home_numa(fp)`
+    /// - This ensures fingerprint checks are local when states are routed correctly
     pub fn new(config: FingerprintStoreConfig, worker_cpus: &[Option<usize>]) -> Result<Self> {
         let shard_count = config.shard_count.max(1).next_power_of_two();
 
         // Detect NUMA topology
         let numa_topology = crate::storage::numa::NumaTopology::detect()?;
+        let num_numa_nodes = numa_topology.node_count.max(1);
 
-        // Map shards to NUMA nodes
-        let shard_to_numa = numa_topology.shard_to_numa_mapping(shard_count, worker_cpus);
+        // Deterministic NUMA assignment: shards are evenly distributed across NUMA nodes
+        // Shards 0..K on NUMA 0, K..2K on NUMA 1, etc.
+        let shards_per_numa = (shard_count + num_numa_nodes - 1) / num_numa_nodes;
 
         if std::env::var("TLAPP_VERBOSE").is_ok() {
             eprintln!(
-                "Creating {} shards with NUMA awareness ({} nodes detected)",
-                shard_count, numa_topology.node_count
+                "Creating {} shards with NUMA-local routing ({} nodes, {} shards/node)",
+                shard_count, num_numa_nodes, shards_per_numa
             );
         }
 
-        // Create shards on their assigned NUMA nodes
+        // Create shards with deterministic NUMA placement
         let mut shards = Vec::with_capacity(shard_count);
-        for (shard_id, &numa_node) in shard_to_numa.iter().enumerate() {
+        for shard_id in 0..shard_count {
+            // Deterministic: shard N belongs to NUMA (N / shards_per_numa)
+            let numa_node = (shard_id / shards_per_numa).min(num_numa_nodes - 1);
+
             let shard = FingerprintShard::new(config.shard_size_mb, numa_node).context(format!(
                 "Failed to create shard {} on NUMA node {}",
                 shard_id, numa_node
@@ -579,7 +593,26 @@ impl PageAlignedFingerprintStore {
             shard_mask: shard_count - 1,
             stats: FingerprintStatsAtomic::default(),
             persist_tx: None,
+            num_numa_nodes,
+            shards_per_numa,
         })
+    }
+
+    /// Get the home NUMA node for a fingerprint
+    ///
+    /// This determines which NUMA node "owns" this fingerprint.
+    /// States should be routed to their fingerprint's home NUMA for local checking.
+    #[inline]
+    pub fn home_numa(&self, fp: u64) -> usize {
+        // Mix bits to reduce correlation between NUMA routing and shard selection
+        let mixed = (fp >> 32) ^ (fp >> 16) ^ fp;
+        (mixed as usize) % self.num_numa_nodes
+    }
+
+    /// Get number of NUMA nodes
+    #[inline]
+    pub fn num_numa_nodes(&self) -> usize {
+        self.num_numa_nodes
     }
 
     /// Enable persistence by providing senders for each shard
@@ -592,9 +625,26 @@ impl PageAlignedFingerprintStore {
         self.persist_tx = Some(persist_tx);
     }
 
+    /// Get the shard for a fingerprint using NUMA-local routing
+    ///
+    /// The fingerprint is routed to a shard on its home NUMA node:
+    /// 1. Compute home NUMA from fingerprint
+    /// 2. Select shard within that NUMA's range
     #[inline]
     fn shard_for(&self, fp: u64) -> &FingerprintShard {
-        &self.shards[(fp as usize) & self.shard_mask]
+        let numa = self.home_numa(fp);
+        // Select shard within this NUMA's range
+        let shard_within_numa = (fp as usize) % self.shards_per_numa;
+        let shard_id = (numa * self.shards_per_numa + shard_within_numa).min(self.shards.len() - 1);
+        &self.shards[shard_id]
+    }
+
+    /// Get shard ID for a fingerprint (for external use)
+    #[inline]
+    pub fn shard_id_for(&self, fp: u64) -> usize {
+        let numa = self.home_numa(fp);
+        let shard_within_numa = (fp as usize) % self.shards_per_numa;
+        (numa * self.shards_per_numa + shard_within_numa).min(self.shards.len() - 1)
     }
 
     /// Check if fingerprint exists or insert it
@@ -613,7 +663,7 @@ impl PageAlignedFingerprintStore {
         }
 
         self.stats.checks.fetch_add(1, Ordering::Relaxed);
-        let shard_id = (fp as usize) & self.shard_mask;
+        let shard_id = self.shard_id_for(fp);
         let shard = &self.shards[shard_id];
 
         let existed = shard.contains_or_insert(fp, &self.stats);
@@ -645,7 +695,7 @@ impl PageAlignedFingerprintStore {
         let mut shard_groups: Vec<Vec<(usize, u64)>> = vec![Vec::new(); self.shards.len()];
 
         for (idx, &fp) in fps.iter().enumerate() {
-            let shard_id = (fp as usize) & self.shard_mask;
+            let shard_id = self.shard_id_for(fp);
             shard_groups[shard_id].push((idx, fp));
         }
 

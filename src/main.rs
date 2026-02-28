@@ -136,9 +136,9 @@ struct StorageArgs {
     queue_spill_batch: usize,
     #[arg(long, default_value_t = 128)]
     queue_spill_channel_bound: usize,
-    /// Enable disk spilling for work-stealing queues (prevents memory exhaustion)
+    /// Disable disk spilling for work-stealing queues (spilling is enabled by default)
     #[arg(long, default_value_t = false)]
-    enable_queue_spilling: bool,
+    disable_queue_spilling: bool,
     /// Max items in memory before spilling to disk (when enable_queue_spilling is true)
     #[arg(long, default_value_t = 50_000_000)]
     queue_max_inmem_items: u64,
@@ -257,7 +257,7 @@ fn build_engine_config(
         queue_inmem_limit: storage.queue_inmem_limit,
         queue_spill_batch: storage.queue_spill_batch,
         queue_spill_channel_bound: storage.queue_spill_channel_bound,
-        enable_queue_spilling: storage.enable_queue_spilling,
+        enable_queue_spilling: !storage.disable_queue_spilling,
         queue_max_inmem_items: storage.queue_max_inmem_items,
     })
 }
