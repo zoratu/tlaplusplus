@@ -34,10 +34,14 @@ use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024; // 2MB
 const MADV_HUGEPAGE: i32 = 14; // From linux/mman.h
 
-/// Load factor threshold for triggering resize (85%)
-const RESIZE_LOAD_THRESHOLD: f64 = 0.85;
+/// Load factor threshold for triggering resize (75% - earlier to reduce contention)
+const RESIZE_LOAD_THRESHOLD: f64 = 0.75;
 /// How often to check load factor (every N inserts)
-const RESIZE_CHECK_INTERVAL: u64 = 10_000;
+const RESIZE_CHECK_INTERVAL: u64 = 1_000;
+/// Maximum spin iterations before yielding during resize wait
+const MAX_SPIN_BEFORE_YIELD: u32 = 64;
+/// Maximum yields before sleeping
+const MAX_YIELDS_BEFORE_SLEEP: u32 = 16;
 
 #[derive(Clone, Debug)]
 pub struct FingerprintStoreConfig {
@@ -117,6 +121,11 @@ struct FingerprintShard {
     check_counter: AtomicU64,
     /// Mutex for resize coordination (only one thread can resize)
     resize_lock: Mutex<()>,
+    /// Old table pointer during resize (for RCU-style reads)
+    /// Readers can check this table during resize to find existing fingerprints
+    old_table: AtomicPtr<HashTableEntry>,
+    /// Old table capacity during resize
+    old_capacity: AtomicUsize,
     /// Old memory regions waiting to be freed (after readers drain)
     #[allow(clippy::type_complexity)]
     old_memory: Mutex<Vec<(*mut u8, usize)>>,
@@ -159,6 +168,8 @@ impl FingerprintShard {
             seq: AtomicU64::new(0),
             check_counter: AtomicU64::new(0),
             resize_lock: Mutex::new(()),
+            old_table: AtomicPtr::new(std::ptr::null_mut()),
+            old_capacity: AtomicUsize::new(0),
             old_memory: Mutex::new(Vec::new()),
         })
     }
@@ -226,13 +237,19 @@ impl FingerprintShard {
             std::ptr::write_bytes(new_table, 0, new_capacity);
         }
 
-        // Mark resize in progress (odd seq number)
-        self.seq.fetch_add(1, Ordering::AcqRel);
-
-        // Get old table info
+        // Get old table info BEFORE marking resize in progress
         let old_table = self.get_table();
         let old_memory = self.memory.load(Ordering::Acquire);
         let old_memory_size = self.memory_size.load(Ordering::Acquire);
+
+        // Store old table for RCU-style reads during resize
+        // Readers can check this table while resize is in progress
+        self.old_table.store(old_table, Ordering::Release);
+        self.old_capacity.store(old_capacity, Ordering::Release);
+
+        // Mark resize in progress (odd seq number)
+        // After this, readers will check old_table first
+        self.seq.fetch_add(1, Ordering::AcqRel);
 
         // Rehash all entries from old to new table
         let old_slice = unsafe { std::slice::from_raw_parts(old_table, old_capacity) };
@@ -265,6 +282,11 @@ impl FingerprintShard {
 
         // Mark resize complete (even seq number)
         self.seq.fetch_add(1, Ordering::AcqRel);
+
+        // Clear old table pointers (readers will now use new table)
+        self.old_table
+            .store(std::ptr::null_mut(), Ordering::Release);
+        self.old_capacity.store(0, Ordering::Release);
 
         // Queue old memory for later cleanup (can't free immediately - readers may still use it)
         self.old_memory.lock().push((old_memory, old_memory_size));
@@ -399,13 +421,60 @@ impl FingerprintShard {
         // Never store 0 (reserved for empty slots)
         let fp = if fp == 0 { 1 } else { fp };
 
+        let mut resize_wait_spins = 0u32;
+        let mut resize_wait_yields = 0u32;
+
         loop {
-            // Read seqlock - if odd, resize in progress, spin
+            // Read seqlock - if odd, resize in progress
             let seq_before = self.seq.load(Ordering::Acquire);
             if seq_before % 2 == 1 {
-                std::hint::spin_loop();
+                // RCU-style read: check old table first during resize
+                // If fingerprint exists in old table, we can return immediately
+                let old_table_ptr = self.old_table.load(Ordering::Acquire);
+                let old_cap = self.old_capacity.load(Ordering::Acquire);
+
+                if !old_table_ptr.is_null() && old_cap > 0 {
+                    // Safe to read old table - it's still valid during resize
+                    let old_table = unsafe { std::slice::from_raw_parts(old_table_ptr, old_cap) };
+                    let mut index = (fp as usize) % old_cap;
+                    let mut probes = 0u64;
+
+                    while probes < old_cap as u64 {
+                        let stored_fp = old_table[index].fp.load(Ordering::Acquire);
+                        if stored_fp == fp {
+                            // Found in old table - definitely already seen
+                            return true;
+                        }
+                        if stored_fp == 0 {
+                            // Empty slot - not in old table
+                            break;
+                        }
+                        index = (index + 1) % old_cap;
+                        probes += 1;
+                    }
+                }
+
+                // Not found in old table - need to wait for resize to insert
+                // Exponential backoff to reduce contention
+                if resize_wait_spins < MAX_SPIN_BEFORE_YIELD {
+                    // Spin phase: quick spins for short resizes
+                    for _ in 0..(1 << resize_wait_spins.min(6)) {
+                        std::hint::spin_loop();
+                    }
+                    resize_wait_spins += 1;
+                } else if resize_wait_yields < MAX_YIELDS_BEFORE_SLEEP {
+                    // Yield phase: let other threads run
+                    std::thread::yield_now();
+                    resize_wait_yields += 1;
+                } else {
+                    // Sleep phase: resize is taking long, sleep briefly
+                    std::thread::sleep(std::time::Duration::from_micros(100));
+                }
                 continue;
             }
+            // Reset backoff counters when resize completes
+            resize_wait_spins = 0;
+            resize_wait_yields = 0;
 
             // Get current table and capacity
             let capacity = self.get_capacity();
