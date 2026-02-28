@@ -10,7 +10,7 @@ Key performance features:
 - **Automatic NUMA-aware worker scaling** - detects NUMA topology and distances, auto-selects optimal worker count using only close NUMA nodes (distance ≤20)
 - **NUMA-local memory allocation** - workers bind memory to their NUMA node via `set_mempolicy()`, achieving 99%+ user CPU (vs 60-70% without)
 - **NUMA-aware work-stealing queues** - hierarchical stealing prefers same-NUMA-node workers, batch stealing reduces overhead
-- **Lock-free fingerprint store** - atomic CAS operations eliminate lock contention
+- **Lock-free fingerprint store** - atomic CAS operations, dynamic resize at 85% load
 - **Zero-copy state handling** - Arc-wrapped collections avoid clone overhead
 - **Batch fingerprint checking** - amortizes synchronization across 512+ states
 - No GC pauses (native Rust memory management)
@@ -24,7 +24,7 @@ Key performance features:
 # Build release binary
 cargo build --release
 
-# Run all tests (103 tests)
+# Run all tests (116 tests)
 cargo test
 
 # Run with chaos/failpoint testing
@@ -113,7 +113,11 @@ flowchart TB
 - Open-addressed hash table with atomic CAS operations
 - 2MB page-aligned memory allocation for TLB efficiency
 - NUMA-aware shard placement based on worker CPU affinity
-- Bloom filter pre-check to reduce CAS operations
+- **Dynamic resize** at 85% load factor:
+  - Seqlock coordination (odd = resizing, even = stable)
+  - Atomic pointer swapping for lock-free table replacement
+  - Readers spin-wait during resize, then retry
+  - Tested at 192 workers, 20M states/sec throughput maintained during resize
 - Graceful degradation under memory pressure
 
 **Work-Stealing Queues** (`work_stealing_queues.rs`):
@@ -234,7 +238,7 @@ node   0   1   2   3   4   5
 **Working**:
 - Parallel runtime with NUMA-aware work-stealing
 - Lock-free fingerprint storage with atomic CAS
-- 103 tests, property tests, fuzzing
+- 116 tests, property tests, fuzzing
 - Fault injection testing
 - 10.7x speedup over Java TLC on 128-core systems
 
