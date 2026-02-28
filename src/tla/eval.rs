@@ -1781,6 +1781,7 @@ fn split_outer_let(expr: &str) -> Option<(&str, &str)> {
 
 fn parse_let_definitions(defs_text: &str) -> Result<BTreeMap<String, TlaDefinition>> {
     let eq_positions = find_top_level_definition_eqs(defs_text);
+
     if eq_positions.is_empty() {
         return Err(anyhow!("LET block has no definitions"));
     }
@@ -2469,6 +2470,8 @@ fn split_top_level(expr: &str, delim: &str, keyword: bool) -> Vec<String> {
     let mut quantifier_depth = 0usize; // Count of \A or \E seen
     let mut seen_colon_for_quantifier = 0usize; // Count of : seen to close quantifiers
     let mut let_depth = 0usize; // Count of LET keywords seen (increases on LET, decreases on IN)
+    let mut if_depth = 0usize; // Count of IF keywords seen (increases on IF, decreases on ELSE)
+    let mut case_depth = 0usize; // Count of CASE keywords seen
     let mut in_string = false;
     let mut escaped = false;
 
@@ -2516,6 +2519,45 @@ fn split_top_level(expr: &str, delim: &str, keyword: bool) -> Vec<String> {
             }
         }
 
+        // Track IF-THEN-ELSE: IF increases depth, ELSE decreases it
+        // This ensures we don't split inside an IF-THEN-ELSE expression
+        if paren == 0 && bracket == 0 && brace == 0 && angle == 0 {
+            if expr[i..].starts_with("IF") {
+                let after_if = &expr[i + 2..];
+                if after_if.is_empty()
+                    || after_if
+                        .chars()
+                        .next()
+                        .map_or(true, |c| !c.is_alphanumeric())
+                {
+                    if_depth += 1;
+                }
+            } else if expr[i..].starts_with("ELSE") {
+                let after_else = &expr[i + 4..];
+                if after_else.is_empty()
+                    || after_else
+                        .chars()
+                        .next()
+                        .map_or(true, |c| !c.is_alphanumeric())
+                {
+                    if_depth = if_depth.saturating_sub(1);
+                }
+            }
+
+            // Track CASE expressions - don't split inside CASE
+            if expr[i..].starts_with("CASE") {
+                let after_case = &expr[i + 4..];
+                if after_case.is_empty()
+                    || after_case
+                        .chars()
+                        .next()
+                        .map_or(true, |c| !c.is_alphanumeric())
+                {
+                    case_depth += 1;
+                }
+            }
+        }
+
         // Track quantifiers: \A or \E increases depth
         if ch == '\\'
             && (expr[i..].starts_with("\\A") || expr[i..].starts_with("\\E"))
@@ -2556,9 +2598,16 @@ fn split_top_level(expr: &str, delim: &str, keyword: bool) -> Vec<String> {
                 // 3. If we're in a quantifier body, check if this /\ is followed by another quantifier
                 //    - If yes: this /\ ENDS the current quantifier - split!
                 //    - If no: this /\ is part of the quantifier body - don't split
-                // 4. Otherwise, split normally
+                // 4. If we're inside IF-THEN (before ELSE), don't split on /\ or \/
+                // 5. Otherwise, split normally
                 let should_split = if let_depth > 0 && is_conjunction {
                     // We're inside a LET expression, don't split on conjunctions
+                    false
+                } else if if_depth > 0 && is_conjunction {
+                    // We're inside IF-THEN (before ELSE), don't split on conjunctions
+                    false
+                } else if case_depth > 0 && is_conjunction {
+                    // We're inside a CASE expression, don't split on conjunctions
                     false
                 } else if quantifier_depth > 0
                     && quantifier_depth > seen_colon_for_quantifier
@@ -2583,10 +2632,12 @@ fn split_top_level(expr: &str, delim: &str, keyword: bool) -> Vec<String> {
                     if !part.is_empty() {
                         out.push(part.to_string());
                     }
-                    // Reset quantifier and LET tracking for next part
+                    // Reset quantifier, LET, IF, and CASE tracking for next part
                     quantifier_depth = 0;
                     seen_colon_for_quantifier = 0;
                     let_depth = 0;
+                    if_depth = 0;
+                    case_depth = 0;
                     start = delim_end;
                     i = delim_end;
                     continue;

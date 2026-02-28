@@ -483,6 +483,10 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
             Box::new(compile_expr(right)),
         );
     }
+    // Handle \o (concatenation) BEFORE \ (set minus) since \ would match \o
+    if let Some((left, right)) = split_binary_op(expr, "\\o") {
+        return CompiledExpr::Concat(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
+    }
     if let Some((left, right)) = split_binary_op(expr, "\\") {
         return CompiledExpr::SetMinus(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
     }
@@ -650,6 +654,9 @@ fn split_top_level(expr: &str, delim: &str) -> Vec<String> {
     let mut current = String::new();
     let mut depth = 0;
     let mut let_depth: usize = 0; // Track LET...IN nesting
+    let mut if_depth: usize = 0; // Track IF...ELSE nesting
+    let mut case_depth: usize = 0; // Track CASE expression nesting
+    let mut in_quantifier_body = false; // Track if we're in a quantifier body
     let mut in_string = false;
     let chars: Vec<char> = expr.chars().collect();
     let delim_chars: Vec<char> = delim.chars().collect();
@@ -695,32 +702,129 @@ fn split_top_level(expr: &str, delim: &str) -> Vec<String> {
             _ => {}
         }
 
-        // Check for LET keyword at word boundary when at bracket top level
-        if depth == 0 && matches_keyword_at(&chars, i, "LET") {
-            let_depth += 1;
-            current.push_str("LET");
-            i += 3;
-            continue;
+        // Check for keywords at word boundary when at bracket top level
+        if depth == 0 {
+            // Track LET...IN nesting
+            // NOTE: We increment let_depth on LET but DO NOT decrement on IN.
+            // This is because in TLA+ actions, the pattern:
+            //   /\ LET x == ... IN /\ expr1 /\ expr2
+            // should treat "expr1 /\ expr2" as the body of the LET, not as
+            // top-level conjuncts. The LET expression extends to the end of the
+            // current grouping, and we only want to split at conjunctions that
+            // are truly at the top level (outside any LET).
+            if matches_keyword_at(&chars, i, "LET") {
+                let_depth += 1;
+                current.push_str("LET");
+                i += 3;
+                continue;
+            }
+            // Just push IN without decrementing - the LET body extends to the end
+            if let_depth > 0 && matches_keyword_at(&chars, i, "IN") {
+                current.push_str("IN");
+                i += 2;
+                continue;
+            }
+
+            // Track IF...ELSE nesting - don't split inside IF-THEN-ELSE
+            if matches_keyword_at(&chars, i, "IF") {
+                if_depth += 1;
+                current.push_str("IF");
+                i += 2;
+                continue;
+            }
+            if if_depth > 0 && matches_keyword_at(&chars, i, "ELSE") {
+                if_depth = if_depth.saturating_sub(1);
+                current.push_str("ELSE");
+                i += 4;
+                continue;
+            }
+
+            // Track CASE expressions - don't split inside CASE
+            if matches_keyword_at(&chars, i, "CASE") {
+                case_depth += 1;
+                current.push_str("CASE");
+                i += 4;
+                continue;
+            }
         }
 
-        // Check for IN keyword at word boundary when inside a LET
-        if depth == 0 && let_depth > 0 && matches_keyword_at(&chars, i, "IN") {
-            let_depth = let_depth.saturating_sub(1);
-            current.push_str("IN");
-            i += 2;
-            continue;
+        // Check for quantifier start: \A or \E followed by space
+        // These bind loosely - everything after : is part of the quantifier body
+        if depth == 0 && c == '\\' && i + 2 < chars.len() {
+            let next = chars[i + 1];
+            let after = chars[i + 2];
+            if (next == 'A' || next == 'E') && (after.is_whitespace() || after == '(') {
+                // Found quantifier start - look for the : that ends the binding part
+                // and starts the body
+                let mut j = i + 2;
+                let mut inner_depth = 0;
+                while j < chars.len() {
+                    match chars[j] {
+                        '(' | '[' | '{' => inner_depth += 1,
+                        ')' | ']' | '}' => inner_depth -= 1,
+                        ':' if inner_depth == 0 => {
+                            // Found the colon - everything after this is quantifier body
+                            in_quantifier_body = true;
+                            // Push everything up to and including the colon
+                            for k in i..=j {
+                                current.push(chars[k]);
+                            }
+                            i = j + 1;
+                            break;
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                if j < chars.len() {
+                    continue;
+                }
+            }
         }
 
-        if depth == 0 && let_depth == 0 {
+        let at_top = depth == 0 && let_depth == 0 && if_depth == 0 && case_depth == 0;
+        if at_top {
             // Check for delimiter
             let remaining: String = chars[i..].iter().collect();
             if remaining.starts_with(delim) {
-                if !current.trim().is_empty() {
-                    parts.push(current.trim().to_string());
+                // If we're in a quantifier body, check if what follows is a new quantifier
+                // If so, we should split here (the quantifier body ends)
+                // If not, we should NOT split (still inside quantifier body)
+                if in_quantifier_body {
+                    // Look ahead past the delimiter and whitespace
+                    let after_delim = &remaining[delim.len()..].trim_start();
+                    // If what follows is \A or \E, this is a new top-level conjunct
+                    let starts_new_quantifier = after_delim.starts_with("\\A ")
+                        || after_delim.starts_with("\\A(")
+                        || after_delim.starts_with("\\E ")
+                        || after_delim.starts_with("\\E(");
+                    if starts_new_quantifier {
+                        // End current quantifier body, split here
+                        in_quantifier_body = false;
+                        if !current.trim().is_empty() {
+                            parts.push(current.trim().to_string());
+                        }
+                        current = String::new();
+                        // Reset case depth when we split
+                        case_depth = 0;
+                        i += delim_chars.len();
+                        continue;
+                    }
+                    // Otherwise, don't split - we're still in the quantifier body
+                    current.push(c);
+                    i += 1;
+                    continue;
+                } else {
+                    // Not in a quantifier body, split normally
+                    if !current.trim().is_empty() {
+                        parts.push(current.trim().to_string());
+                    }
+                    current = String::new();
+                    // Reset case depth when we split
+                    case_depth = 0;
+                    i += delim_chars.len();
+                    continue;
                 }
-                current = String::new();
-                i += delim_chars.len();
-                continue;
             }
         }
 
@@ -767,6 +871,7 @@ fn split_binary_op<'a>(expr: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
     let mut bracket_depth = 0i32;
     let mut let_depth = 0usize;
     let mut if_depth = 0usize; // Track IF...THEN nesting (protects conditions from split)
+    let mut case_depth = 0usize; // Track CASE...[] nesting (arms contain = and ->)
     let mut in_string = false;
     let chars: Vec<char> = expr.chars().collect();
     let op_chars: Vec<char> = op.chars().collect();
@@ -806,7 +911,7 @@ fn split_binary_op<'a>(expr: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
             _ => {}
         }
 
-        // At bracket top level, check for LET, IN, IF, THEN keywords
+        // At bracket top level, check for LET, IN, IF, THEN, CASE keywords
         if bracket_depth == 0 {
             if matches_keyword_at(&chars, i, "LET") {
                 let_depth += 1;
@@ -828,10 +933,19 @@ fn split_binary_op<'a>(expr: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
                 i += 4;
                 continue;
             }
+            // Track CASE expressions - they contain = and -> in their arms
+            if matches_keyword_at(&chars, i, "CASE") {
+                case_depth += 1;
+                i += 4;
+                continue;
+            }
+            // CASE expressions end at the end of the expression or when we hit
+            // a conjunction/disjunction at the same bracket level (but we don't
+            // track that here - just don't split inside CASE at all)
         }
 
         // Only split when at top level of all constructs
-        let at_top = bracket_depth == 0 && let_depth == 0 && if_depth == 0;
+        let at_top = bracket_depth == 0 && let_depth == 0 && if_depth == 0 && case_depth == 0;
         if at_top && i + op_chars.len() <= chars.len() {
             // Check if operator matches
             let mut matches = true;
@@ -893,6 +1007,19 @@ fn find_record_access_dot(expr: &str) -> Option<usize> {
 }
 
 fn parse_func_apply(expr: &str) -> Option<(&str, Vec<String>)> {
+    // CASE expressions use [] as arm separator, not function application
+    // Skip them entirely to avoid confusing [] with f[x] syntax
+    let trimmed = expr.trim_start();
+    if trimmed.starts_with("CASE")
+        && (trimmed.len() == 4
+            || !trimmed
+                .as_bytes()
+                .get(4)
+                .map_or(false, |c| c.is_ascii_alphanumeric()))
+    {
+        return None;
+    }
+
     // Find the last [ at depth 0
     let mut depth = 0;
     let bytes = expr.as_bytes();
@@ -1043,37 +1170,62 @@ fn parse_except_updates(s: &str) -> Option<Vec<(Vec<CompiledExpr>, CompiledExpr)
     }
 }
 
-/// Parse EXCEPT path: [k1][k2][k3]... -> vec![k1, k2, k3]
+/// Parse EXCEPT path: [k1][k2][k3]... or .field.field2... -> vec![k1, k2, k3] or vec!["field", "field2"]
 fn parse_except_path(s: &str) -> Option<Vec<CompiledExpr>> {
     let mut path = Vec::new();
     let mut remaining = s.trim();
 
     while !remaining.is_empty() {
-        if !remaining.starts_with('[') {
-            break;
-        }
-
-        // Find matching ]
-        let mut depth = 0;
-        let mut end_idx = None;
-        for (i, c) in remaining.char_indices() {
-            match c {
-                '[' => depth += 1,
-                ']' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end_idx = Some(i);
-                        break;
+        // Handle bracket notation: [key]
+        if remaining.starts_with('[') {
+            // Find matching ]
+            let mut depth = 0;
+            let mut end_idx = None;
+            for (i, c) in remaining.char_indices() {
+                match c {
+                    '[' => depth += 1,
+                    ']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end_idx = Some(i);
+                            break;
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
+
+            let end = end_idx?;
+            let key_expr = &remaining[1..end].trim();
+            path.push(compile_expr(key_expr));
+            remaining = &remaining[end + 1..];
+            continue;
         }
 
-        let end = end_idx?;
-        let key_expr = &remaining[1..end].trim();
-        path.push(compile_expr(key_expr));
-        remaining = &remaining[end + 1..];
+        // Handle dot notation: .field
+        if remaining.starts_with('.') {
+            remaining = &remaining[1..];
+            // Parse field name (identifier)
+            let mut end_idx = 0;
+            for (i, c) in remaining.char_indices() {
+                if c.is_alphanumeric() || c == '_' {
+                    end_idx = i + c.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            if end_idx == 0 {
+                // No valid field name after dot
+                break;
+            }
+            let field_name = &remaining[..end_idx];
+            path.push(CompiledExpr::String(field_name.to_string()));
+            remaining = &remaining[end_idx..];
+            continue;
+        }
+
+        // Neither bracket nor dot - done with path
+        break;
     }
 
     if path.is_empty() { None } else { Some(path) }
@@ -1267,20 +1419,55 @@ fn try_parse_let(expr: &str) -> Option<CompiledExpr> {
     let defs_str = rest[..in_idx].trim();
     let body_str = rest[in_idx + 2..].trim();
 
-    // Parse definitions (simplified: name == expr)
+    // Parse definitions properly handling multiline definitions
+    // Find all == positions at top level (not inside brackets or nested LET)
+    let eq_positions = find_definition_equals(defs_str);
+    if eq_positions.is_empty() {
+        return None;
+    }
+
     let mut bindings = Vec::new();
-    for def in split_top_level(defs_str, "\n") {
-        let def = def.trim();
-        if def.is_empty() {
+    for (idx, eq_pos) in eq_positions.iter().enumerate() {
+        // Find the start of this definition (name part)
+        let name_start = if idx == 0 {
+            0
+        } else {
+            // Start after the previous definition's body
+            // Find the line start before this ==
+            find_line_start_before(defs_str, *eq_pos)
+        };
+
+        // Find the end of this definition's body
+        let body_end = if idx + 1 < eq_positions.len() {
+            find_line_start_before(defs_str, eq_positions[idx + 1])
+        } else {
+            defs_str.len()
+        };
+
+        let name = defs_str[name_start..*eq_pos].trim();
+        let value = defs_str[*eq_pos + 2..body_end].trim();
+
+        // Skip comments (lines starting with \*)
+        let name = name.lines().last().unwrap_or("").trim();
+
+        // Name should be a simple identifier (possibly with params in brackets)
+        if let Some(bracket_idx) = name.find('[') {
+            // Has parameters like sumF[S \in SUBSET opts] - skip these recursive defs
             continue;
         }
-        if let Some(eq_idx) = def.find("==") {
-            let name = def[..eq_idx].trim();
-            let value = def[eq_idx + 2..].trim();
-            if is_identifier(name) {
-                bindings.push((name.to_string(), compile_expr(value)));
-            }
+        if !name.is_empty() && is_identifier(name) {
+            bindings.push((name.to_string(), compile_expr(value)));
         }
+    }
+
+    if bindings.is_empty() {
+        // We successfully parsed the LET...IN structure but couldn't handle the definitions
+        // (likely recursive function definitions like sumF[S \in SUBSET opts]).
+        // Return Unparsed so eval.rs can handle it with string-based evaluation,
+        // rather than returning None which would cause the expression to fall through
+        // to other parsers (like split_comparison) that might incorrectly split on
+        // operators inside the LET body.
+        return Some(CompiledExpr::Unparsed(expr.to_string()));
     }
 
     Some(CompiledExpr::Let {
@@ -1413,6 +1600,7 @@ fn try_parse_choose(expr: &str) -> Option<CompiledExpr> {
 fn find_keyword(expr: &str, keyword: &str) -> Option<usize> {
     let mut bracket_depth = 0i32;
     let mut let_depth = 0usize; // Track LET...IN nesting
+    let mut if_depth = 0usize; // Track IF...ELSE nesting
     let chars: Vec<char> = expr.chars().collect();
     let keyword_chars: Vec<char> = keyword.chars().collect();
     let mut i = 0;
@@ -1437,7 +1625,7 @@ fn find_keyword(expr: &str, keyword: &str) -> Option<usize> {
             _ => {}
         }
 
-        // At bracket top level, check for LET and IN keywords to track nesting
+        // At bracket top level, check for LET, IN, IF, ELSE keywords to track nesting
         if bracket_depth == 0 {
             if matches_keyword_at(&chars, i, "LET") {
                 let_depth += 1;
@@ -1449,10 +1637,25 @@ fn find_keyword(expr: &str, keyword: &str) -> Option<usize> {
                 i += 2;
                 continue;
             }
+            // Track IF...ELSE nesting to avoid finding keywords inside IF conditions
+            if matches_keyword_at(&chars, i, "IF") {
+                if_depth += 1;
+                i += 2;
+                continue;
+            }
+            if matches_keyword_at(&chars, i, "ELSE") && if_depth > 0 {
+                if_depth -= 1;
+                i += 4;
+                continue;
+            }
         }
 
-        // Check if we found the keyword at top level (brackets and LET both at 0)
-        if bracket_depth == 0 && let_depth == 0 && matches_keyword_at(&chars, i, keyword) {
+        // Check if we found the keyword at top level (brackets, LET, and IF all at 0)
+        if bracket_depth == 0
+            && let_depth == 0
+            && if_depth == 0
+            && matches_keyword_at(&chars, i, keyword)
+        {
             // Return byte offset, not char index
             let byte_offset: usize = chars[..i].iter().map(|c| c.len_utf8()).sum();
             return Some(byte_offset);
@@ -1705,33 +1908,53 @@ fn parse_let_bindings(defs_text: &str) -> Option<Vec<(String, String)>> {
     }
 }
 
-/// Find all == positions at top level (not inside brackets/parens)
+/// Find all == positions at top level (not inside brackets/parens or nested LET)
 fn find_definition_equals(text: &str) -> Vec<usize> {
     let mut positions = Vec::new();
-    let bytes = text.as_bytes();
-    let mut depth: usize = 0;
+    let chars: Vec<char> = text.chars().collect();
+    let mut depth: usize = 0; // Bracket depth
+    let mut let_depth: usize = 0; // LET...IN nesting depth
     let mut i = 0;
 
-    while i + 1 < bytes.len() {
-        match bytes[i] {
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
-            b'<' if i + 1 < bytes.len() && bytes[i + 1] == b'<' => {
+    while i + 1 < chars.len() {
+        let c = chars[i];
+
+        // Track bracket depth
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            '<' if i + 1 < chars.len() && chars[i + 1] == '<' => {
                 depth += 1;
                 i += 1;
             }
-            b'>' if i + 1 < bytes.len() && bytes[i + 1] == b'>' => {
+            '>' if i + 1 < chars.len() && chars[i + 1] == '>' => {
                 depth = depth.saturating_sub(1);
                 i += 1;
             }
-            b'=' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b'=' => {
-                // Found == at top level
-                // Make sure it's not inside a string
-                positions.push(i);
-                i += 1; // Skip the second =
-            }
             _ => {}
         }
+
+        // Track LET...IN nesting (only at bracket top level)
+        if depth == 0 && matches_keyword_at(&chars, i, "LET") {
+            let_depth += 1;
+            i += 3;
+            continue;
+        }
+        if depth == 0 && let_depth > 0 && matches_keyword_at(&chars, i, "IN") {
+            let_depth = let_depth.saturating_sub(1);
+            i += 2;
+            continue;
+        }
+
+        // Check for == at true top level (no brackets, no nested LET)
+        if c == '=' && i + 1 < chars.len() && chars[i + 1] == '=' && depth == 0 && let_depth == 0 {
+            // Found == at top level
+            // Calculate byte offset
+            let byte_pos: usize = chars[..i].iter().map(|c| c.len_utf8()).sum();
+            positions.push(byte_pos);
+            i += 1; // Skip the second =
+        }
+
         i += 1;
     }
 
@@ -1994,5 +2217,89 @@ mod tests {
         // After IN, it should be able to split
         let result = split_binary_op("LET x IN a = b", "=");
         assert!(result.is_some(), "split_binary_op should split after IN");
+    }
+}
+
+#[test]
+fn test_forall_with_record_access() {
+    // This tests the exact pattern from PriceBandsRespected
+    let expr = compile_expr("\\A l \\in listings : l.price >= MinPrice");
+    println!("Compiled expression: {:?}", expr);
+
+    match &expr {
+        CompiledExpr::Forall { var, domain, body } => {
+            println!("Forall var: {}", var);
+            println!("Forall domain: {:?}", domain);
+            println!("Forall body: {:?}", body);
+            assert_eq!(var, "l");
+            // Check that body has RecordAccess
+            match body.as_ref() {
+                CompiledExpr::Ge(left, _) => {
+                    println!("Left side of Ge: {:?}", left);
+                    match left.as_ref() {
+                        CompiledExpr::RecordAccess(base, field) => {
+                            println!("RecordAccess base: {:?}, field: {}", base, field);
+                            assert_eq!(field, "price");
+                            match base.as_ref() {
+                                CompiledExpr::Var(v) => {
+                                    println!("Var name: {}", v);
+                                    assert_eq!(v, "l");
+                                }
+                                _ => panic!("Expected Var for base, got: {:?}", base),
+                            }
+                        }
+                        _ => panic!("Expected RecordAccess, got: {:?}", left),
+                    }
+                }
+                _ => panic!("Expected Ge in body, got: {:?}", body),
+            }
+        }
+        _ => panic!("Expected Forall, got: {:?}", expr),
+    }
+}
+
+#[test]
+fn test_multiple_quantifiers_in_conjunction() {
+    // This tests the exact pattern from PriceBandsRespected
+    let expr_str = r#"/\ \A l \in listings : l.price >= MinPrice /\ l.price <= MaxPrice
+/\ \A o \in options : o.strike >= MinPrice"#;
+
+    let expr = compile_expr(expr_str);
+    println!("Multi-quantifier compiled: {:?}", expr);
+
+    // Should be And([Forall{...}, Forall{...}])
+    match &expr {
+        CompiledExpr::And(parts) => {
+            println!("And with {} parts:", parts.len());
+            for (i, part) in parts.iter().enumerate() {
+                println!("Part {}: {:?}", i, part);
+                // Each part should be a Forall
+                match part {
+                    CompiledExpr::Forall { var, body, .. } => {
+                        println!("  Forall var: {}", var);
+                        // Make sure the body contains the full conjunction
+                        match body.as_ref() {
+                            CompiledExpr::And(body_parts) => {
+                                println!("  Body has {} And parts", body_parts.len());
+                                assert!(body_parts.len() >= 1, "Body should have at least 1 part");
+                            }
+                            CompiledExpr::Ge(_, _) => {
+                                // This is fine for the second quantifier
+                                println!("  Body is Ge (single condition)");
+                            }
+                            _ => {
+                                // For first quantifier, body should be And
+                                if i == 0 {
+                                    panic!("First quantifier body should be And, got: {:?}", body);
+                                }
+                            }
+                        }
+                    }
+                    _ => panic!("Part {} should be Forall, got: {:?}", i, part),
+                }
+            }
+            assert_eq!(parts.len(), 2, "Should have exactly 2 quantifiers");
+        }
+        _ => panic!("Expected And, got: {:?}", expr),
     }
 }

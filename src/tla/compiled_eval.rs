@@ -332,11 +332,25 @@ fn eval_compiled_inner(
             Ok(TlaValue::Seq(Arc::new(seq)))
         }
         CompiledExpr::Concat(a, b) => {
-            let seq1 = eval_compiled_inner(a, ctx, depth + 1)?;
-            let seq2 = eval_compiled_inner(b, ctx, depth + 1)?;
-            let mut result = seq1.as_seq()?.to_vec();
-            result.extend(seq2.as_seq()?.iter().cloned());
-            Ok(TlaValue::Seq(Arc::new(result)))
+            let lhs = eval_compiled_inner(a, ctx, depth + 1)?;
+            let rhs = eval_compiled_inner(b, ctx, depth + 1)?;
+            // Handle both string and sequence concatenation
+            match (lhs, rhs) {
+                (TlaValue::String(mut a), TlaValue::String(b)) => {
+                    a.push_str(&b);
+                    Ok(TlaValue::String(a))
+                }
+                (TlaValue::Seq(a), TlaValue::Seq(b)) => {
+                    let mut result = (*a).clone();
+                    result.extend(b.iter().cloned());
+                    Ok(TlaValue::Seq(Arc::new(result)))
+                }
+                (a, b) => Err(anyhow!(
+                    "\\o expects String or Seq operands, got {:?} and {:?}",
+                    a,
+                    b
+                )),
+            }
         }
         CompiledExpr::Len(e) => {
             let seq = eval_compiled_inner(e, ctx, depth + 1)?;
@@ -595,12 +609,7 @@ fn eval_compiled_inner(
         }
 
         // Fallback: use string-based evaluation
-        CompiledExpr::Unparsed(s) => {
-            if std::env::var("TLAPP_TRACE_UNPARSED").is_ok() {
-                eprintln!("EVAL_UNPARSED: {:?}", s);
-            }
-            eval_expr(s, ctx)
-        }
+        CompiledExpr::Unparsed(s) => eval_expr(s, ctx),
     }
 }
 
@@ -1269,4 +1278,109 @@ mod tests {
         // y should be unchanged
         assert_eq!(next_state.get("y"), Some(&TlaValue::Int(10)));
     }
+}
+
+#[cfg(test)]
+mod forall_tests {
+    use super::*;
+    use crate::tla::TlaState;
+    use crate::tla::compiled_expr::compile_expr;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_forall_with_record_access_evaluation() {
+        // Create a state with 'listings' as a set of records
+        let mut state = TlaState::new();
+
+        // Create a set of record values
+        let mut rec1 = BTreeMap::new();
+        rec1.insert("price".to_string(), TlaValue::Int(10));
+        rec1.insert("id".to_string(), TlaValue::Int(1));
+
+        let mut rec2 = BTreeMap::new();
+        rec2.insert("price".to_string(), TlaValue::Int(15));
+        rec2.insert("id".to_string(), TlaValue::Int(2));
+
+        let listings_set: BTreeSet<TlaValue> = [
+            TlaValue::Record(Arc::new(rec1)),
+            TlaValue::Record(Arc::new(rec2)),
+        ]
+        .into_iter()
+        .collect();
+
+        state.insert(
+            "listings".to_string(),
+            TlaValue::Set(Arc::new(listings_set)),
+        );
+        state.insert("MinPrice".to_string(), TlaValue::Int(5));
+
+        // Create context
+        let ctx = EvalContext::new(&state);
+
+        // Compile and evaluate
+        let expr = compile_expr("\\A l \\in listings : l.price >= MinPrice");
+        println!("Evaluating: {:?}", expr);
+
+        let result = eval_compiled(&expr, &ctx);
+        println!("Result: {:?}", result);
+
+        assert!(result.is_ok(), "Evaluation failed: {:?}", result);
+        assert_eq!(result.unwrap(), TlaValue::Bool(true));
+    }
+}
+
+#[test]
+fn test_full_price_bands_invariant() {
+    // Replicate the full PriceBandsRespected invariant
+    let expr_str = r#"\A l \in listings : l.price >= MinPrice /\ l.price <= MaxPrice"#;
+
+    let expr = compile_expr(expr_str);
+    println!("Full invariant compiled: {:?}", expr);
+
+    // Make sure it's a Forall with And body
+    match &expr {
+        CompiledExpr::Forall { var, domain, body } => {
+            println!("var: {}, domain: {:?}", var, domain);
+            println!("body: {:?}", body);
+
+            // Check body is And with two Ge/Le
+            match body.as_ref() {
+                CompiledExpr::And(parts) => {
+                    println!("And with {} parts", parts.len());
+                    for (i, part) in parts.iter().enumerate() {
+                        println!("Part {}: {:?}", i, part);
+                    }
+                }
+                _ => {
+                    println!("Body is not And: {:?}", body);
+                }
+            }
+        }
+        _ => {
+            panic!("Expected Forall, got: {:?}", expr);
+        }
+    }
+
+    // Now test evaluation
+    let mut state = TlaState::new();
+
+    // Create a set of record values
+    let mut rec1 = BTreeMap::new();
+    rec1.insert("price".to_string(), TlaValue::Int(10));
+
+    let listings_set: BTreeSet<TlaValue> = [TlaValue::Record(Arc::new(rec1))].into_iter().collect();
+
+    state.insert(
+        "listings".to_string(),
+        TlaValue::Set(Arc::new(listings_set)),
+    );
+    state.insert("MinPrice".to_string(), TlaValue::Int(5));
+    state.insert("MaxPrice".to_string(), TlaValue::Int(20));
+
+    let ctx = EvalContext::new(&state);
+
+    let result = eval_compiled(&expr, &ctx);
+    println!("Result: {:?}", result);
+    assert!(result.is_ok(), "Evaluation failed: {:?}", result);
+    assert_eq!(result.unwrap(), TlaValue::Bool(true));
 }
