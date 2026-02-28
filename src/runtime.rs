@@ -508,8 +508,11 @@ where
         // User specified explicit count - round to power of 2 and ensure minimum
         config.fp_shards.next_power_of_two().max(64)
     };
-    let bytes_per_shard = (total_bytes_needed / shard_count).max(2 * 1024 * 1024); // At least 2MB
-    let shard_size_mb = (bytes_per_shard / (1024 * 1024)).max(1); // At least 1MB
+    // Minimum 64MB per shard to avoid frequent resizes with many workers
+    // Resize is expensive with 380 workers due to seqlock contention
+    let min_shard_bytes = 64 * 1024 * 1024; // 64MB minimum
+    let bytes_per_shard = (total_bytes_needed / shard_count).max(min_shard_bytes);
+    let shard_size_mb = (bytes_per_shard / (1024 * 1024)).max(64); // At least 64MB
 
     if std::env::var("TLAPP_VERBOSE").is_ok() {
         eprintln!("Fingerprint store config:");
