@@ -111,8 +111,8 @@ struct RuntimeArgs {
     poll_sleep_ms: u64,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     stop_on_violation: bool,
-    /// Enable auto-tuning of worker count based on CPU utilization
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    /// Auto-tune worker count based on CPU utilization (reduces workers when sys% is high)
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     auto_tune: bool,
 }
 
