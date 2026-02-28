@@ -27,8 +27,17 @@ const MAX_REMOTE_STEAL_ATTEMPTS: usize = 1;
 
 /// Work-stealing queue system for parallel state exploration
 /// Each worker has a local queue and can steal from others when idle
+///
+/// NUMA-aware design:
+/// - Per-NUMA injector queues for fingerprint-based routing
+/// - States are routed to their fingerprint's home NUMA
+/// - Workers prefer their local NUMA injector over remote
 pub struct WorkStealingQueues<T> {
-    /// Global injector for initial work and external submissions
+    /// Per-NUMA injector queues for fingerprint-based state routing
+    /// States are pushed to their fingerprint's home NUMA's injector
+    numa_injectors: Vec<Injector<T>>,
+
+    /// Legacy global injector (for initial states, will be deprecated)
     global: Injector<T>,
 
     /// Stealers for all workers (used by other workers to steal)
@@ -43,6 +52,9 @@ pub struct WorkStealingQueues<T> {
 
     /// Total workers
     num_workers: usize,
+
+    /// Number of NUMA nodes
+    num_numa_nodes: usize,
 
     /// NUMA node for each worker (worker_id -> numa_node)
     #[allow(dead_code)]
@@ -124,12 +136,18 @@ impl<T: 'static> WorkStealingQueues<T> {
             .map(|_| CachePadded::new(AtomicUsize::new(0)))
             .collect();
 
+        // Initialize per-NUMA injector queues for fingerprint-based routing
+        let numa_injectors: Vec<Injector<T>> =
+            (0..num_numa_nodes).map(|_| Injector::new()).collect();
+
         let shared = Arc::new(Self {
+            numa_injectors,
             global: Injector::new(),
             stealers,
             finished: AtomicBool::new(false),
             worker_active,
             num_workers,
+            num_numa_nodes,
             worker_numa_nodes,
             numa_worker_groups,
             numa_active_counts,
@@ -175,6 +193,77 @@ impl<T: 'static> WorkStealingQueues<T> {
         count
     }
 
+    /// Push a state to its fingerprint's home NUMA injector
+    /// This ensures the state is processed by a worker on the NUMA node
+    /// where its fingerprint shard lives, making fingerprint checks local.
+    ///
+    /// If the home NUMA is the same as the worker's NUMA, pushes to local queue
+    /// for better cache locality.
+    #[inline]
+    pub fn push_to_numa_injector(
+        &self,
+        worker_state: &mut WorkerState<T>,
+        item: T,
+        home_numa: usize,
+    ) {
+        if home_numa == worker_state.numa_node {
+            // Same NUMA - push to local queue (best cache locality)
+            worker_state.worker.push(item);
+            worker_state.local_pushed += 1;
+        } else {
+            // Cross-NUMA - push to home NUMA's injector
+            let numa_idx = home_numa.min(self.num_numa_nodes.saturating_sub(1));
+            self.numa_injectors[numa_idx].push(item);
+            self.global_pushed.fetch_add(1, Ordering::Relaxed);
+        }
+
+        // Periodically flush local counter
+        if worker_state.local_pushed >= worker_state.flush_threshold {
+            self.global_pushed
+                .fetch_add(worker_state.local_pushed, Ordering::Relaxed);
+            worker_state.local_pushed = 0;
+        }
+    }
+
+    /// Push multiple states to their fingerprint home NUMAs
+    /// Takes an iterator of (state, home_numa) pairs
+    #[inline]
+    pub fn push_batch_to_numa(
+        &self,
+        worker_state: &mut WorkerState<T>,
+        items: impl Iterator<Item = (T, usize)>,
+    ) -> usize {
+        let mut count = 0;
+        let mut remote_count = 0u64;
+
+        for (item, home_numa) in items {
+            if home_numa == worker_state.numa_node {
+                worker_state.worker.push(item);
+                worker_state.local_pushed += 1;
+            } else {
+                let numa_idx = home_numa.min(self.num_numa_nodes.saturating_sub(1));
+                self.numa_injectors[numa_idx].push(item);
+                remote_count += 1;
+            }
+            count += 1;
+        }
+
+        // Update global counter for remote pushes
+        if remote_count > 0 {
+            self.global_pushed
+                .fetch_add(remote_count, Ordering::Relaxed);
+        }
+
+        // Periodically flush local counter
+        if worker_state.local_pushed >= worker_state.flush_threshold {
+            self.global_pushed
+                .fetch_add(worker_state.local_pushed, Ordering::Relaxed);
+            worker_state.local_pushed = 0;
+        }
+
+        count
+    }
+
     /// Pop work for a specific worker
     /// Uses optimized termination detection without per-state atomic updates
     pub fn pop_for_worker(&self, worker_state: &mut WorkerState<T>) -> Option<T> {
@@ -196,9 +285,25 @@ impl<T: 'static> WorkStealingQueues<T> {
     fn pop_slow_path(&self, worker_state: &mut WorkerState<T>) -> Option<T> {
         let mut spin_count = 0u32;
         const MAX_SPINS: u32 = 32;
+        let my_numa = worker_state.numa_node;
 
         loop {
-            // Try global queue
+            // 1. Try local NUMA's injector first (states homed here for fingerprint locality)
+            if my_numa < self.numa_injectors.len() {
+                match self.numa_injectors[my_numa].steal() {
+                    Steal::Success(item) => {
+                        worker_state.local_popped += 1;
+                        return Some(item);
+                    }
+                    Steal::Retry => {
+                        std::hint::spin_loop();
+                        continue;
+                    }
+                    Steal::Empty => {}
+                }
+            }
+
+            // 2. Try global queue (for initial states)
             match self.global.steal() {
                 Steal::Success(item) => {
                     worker_state.local_popped += 1;
@@ -211,8 +316,18 @@ impl<T: 'static> WorkStealingQueues<T> {
                 Steal::Empty => {}
             }
 
-            // Try stealing from other workers
-            if let Some(item) = self.try_steal_from_others(worker_state) {
+            // 3. Try stealing from same-NUMA workers
+            if let Some(item) = self.try_steal_local_numa(worker_state) {
+                return Some(item);
+            }
+
+            // 4. Try remote NUMA injectors (load balancing when local is idle)
+            if let Some(item) = self.try_steal_remote_numa_injectors(worker_state) {
+                return Some(item);
+            }
+
+            // 5. Try stealing from remote NUMA workers (last resort)
+            if let Some(item) = self.try_steal_remote_numa_workers(worker_state) {
                 return Some(item);
             }
 
@@ -240,20 +355,16 @@ impl<T: 'static> WorkStealingQueues<T> {
         }
     }
 
-    /// Try to steal work from other workers using hierarchical NUMA-aware stealing
-    /// 1. First try stealing from workers on the same NUMA node (low latency)
-    /// 2. Then try stealing from workers on remote NUMA nodes
-    ///
-    /// Optimized for many-core systems (380+ workers):
-    /// - Limits steal attempts to avoid O(n) scanning
-    /// - Uses batch stealing to reduce overhead
-    fn try_steal_from_others(&self, worker_state: &mut WorkerState<T>) -> Option<T> {
+    /// Try to steal work from same-NUMA workers (low latency)
+    /// Limits attempts to avoid O(n) scanning on large NUMA nodes
+    fn try_steal_local_numa(&self, worker_state: &mut WorkerState<T>) -> Option<T> {
         let my_numa = worker_state.numa_node;
 
-        // Phase 1: Try to steal from same NUMA node first (low latency)
-        // Limit attempts to avoid scanning all 64+ workers per NUMA node
         if let Some(local_workers) = self.numa_worker_groups.get(my_numa) {
-            let start = (worker_state.id * 7) % local_workers.len().max(1);
+            if local_workers.is_empty() {
+                return None;
+            }
+            let start = (worker_state.id * 7) % local_workers.len();
             let max_attempts = local_workers.len().min(MAX_LOCAL_STEAL_ATTEMPTS);
             for i in 0..max_attempts {
                 let idx = (start + i) % local_workers.len();
@@ -262,7 +373,7 @@ impl<T: 'static> WorkStealingQueues<T> {
                     continue;
                 }
 
-                // Try batch steal first - steal half the items into our local queue
+                // Try batch steal - steal half the items into our local queue
                 match self.stealers[target].steal_batch_and_pop(&worker_state.worker) {
                     Steal::Success(item) => {
                         worker_state.local_popped += 1;
@@ -274,7 +385,36 @@ impl<T: 'static> WorkStealingQueues<T> {
             }
         }
 
-        // Phase 2: Try to steal from remote NUMA nodes
+        None
+    }
+
+    /// Try to steal from remote NUMA injector queues (load balancing)
+    fn try_steal_remote_numa_injectors(&self, worker_state: &mut WorkerState<T>) -> Option<T> {
+        let my_numa = worker_state.numa_node;
+
+        for (node_idx, injector) in self.numa_injectors.iter().enumerate() {
+            if node_idx == my_numa {
+                continue;
+            }
+
+            match injector.steal() {
+                Steal::Success(item) => {
+                    worker_state.local_popped += 1;
+                    return Some(item);
+                }
+                Steal::Empty => continue,
+                Steal::Retry => continue,
+            }
+        }
+
+        None
+    }
+
+    /// Try to steal from remote NUMA workers (last resort)
+    /// Keep attempts low because cross-NUMA stealing is expensive
+    fn try_steal_remote_numa_workers(&self, worker_state: &mut WorkerState<T>) -> Option<T> {
+        let my_numa = worker_state.numa_node;
+
         for (node_idx, remote_workers) in self.numa_worker_groups.iter().enumerate() {
             if node_idx == my_numa || remote_workers.is_empty() {
                 continue;
@@ -320,7 +460,14 @@ impl<T: 'static> WorkStealingQueues<T> {
             }
         }
 
-        // All NUMA nodes report idle - check global queue
+        // Check per-NUMA injector queues
+        for injector in &self.numa_injectors {
+            if !injector.is_empty() {
+                return false;
+            }
+        }
+
+        // Check global queue (for initial states)
         if !self.global.is_empty() {
             return false;
         }
@@ -376,6 +523,13 @@ impl<T: 'static> WorkStealingQueues<T> {
     }
 
     pub fn is_empty(&self) -> bool {
+        // Check all NUMA injectors
+        for injector in &self.numa_injectors {
+            if !injector.is_empty() {
+                return false;
+            }
+        }
+        // Check global and all stealers
         self.global.is_empty() && self.stealers.iter().all(|s| s.is_empty())
     }
 

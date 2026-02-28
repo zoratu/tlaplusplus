@@ -326,6 +326,40 @@ where
         }
     }
 
+    /// Push batch with NUMA-aware routing based on fingerprint home NUMA
+    /// Each item is routed to its fingerprint's home NUMA node's injector
+    /// This ensures fingerprint checks happen on local memory (no cross-NUMA access)
+    pub fn push_batch_to_numa(
+        &self,
+        worker_state: &mut SpillableWorkerState<T>,
+        items: impl Iterator<Item = (T, usize)>,
+    ) -> usize {
+        let pending = self.hot.pending_count();
+        let should_spill = pending >= self.max_inmem_items;
+
+        if !should_spill {
+            // Fast path: push to in-memory work-stealing queue with NUMA routing
+            self.hot.push_batch_to_numa(&mut worker_state.inner, items)
+        } else {
+            // Spill path: accumulate in worker's local buffer (ignoring NUMA routing)
+            // When loaded back from disk, items will be pushed to global queue
+            // This is a tradeoff: spilled items may not be NUMA-local on reload
+            let mut count = 0;
+            for (item, _home_numa) in items {
+                worker_state.spill_buffer.push(item);
+                count += 1;
+
+                // When buffer is full, try to send to coordinator
+                if worker_state.spill_buffer.len() >= worker_state.spill_buffer_threshold {
+                    self.flush_worker_spill_buffer(worker_state);
+                }
+            }
+            self.spill_redirects
+                .fetch_add(count as u64, Ordering::Relaxed);
+            count
+        }
+    }
+
     /// Flush a worker's spill buffer to the coordinator (NON-BLOCKING)
     fn flush_worker_spill_buffer(&self, worker_state: &mut SpillableWorkerState<T>) {
         if worker_state.spill_buffer.is_empty() {

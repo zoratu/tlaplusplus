@@ -87,7 +87,7 @@ impl Default for EngineConfig {
             queue_inmem_limit: 5_000_000,
             queue_spill_batch: 50_000,
             queue_spill_channel_bound: 128,
-            enable_queue_spilling: false,
+            enable_queue_spilling: true,
             queue_max_inmem_items: 50_000_000, // 50M items before spilling
         }
     }
@@ -934,7 +934,9 @@ where
                             .is_ok()
                 });
 
-                let mut states_to_enqueue: Vec<M::State> = Vec::with_capacity(worker_fp_batch_size);
+                // Pair states with their fingerprint's home NUMA for routing
+                let mut states_with_home_numa: Vec<(M::State, usize)> =
+                    Vec::with_capacity(worker_fp_batch_size);
                 let mut process_batch = |pending_batch: &mut Vec<M::State>,
                                          local_duplicates: &mut u64,
                                          local_states_distinct: &mut u64,
@@ -946,7 +948,7 @@ where
                     unique_states.clear();
                     unique_fps.clear();
                     local_fp_dedup.clear();
-                    states_to_enqueue.clear();
+                    states_with_home_numa.clear();
 
                     let mut duplicates_in_batch = 0u64;
                     for candidate in pending_batch.drain(..) {
@@ -967,13 +969,15 @@ where
                                 *local_duplicates += 1;
                             } else {
                                 *local_states_distinct += 1;
-                                states_to_enqueue.push(next_state);
+                                // Get the fingerprint's home NUMA for routing
+                                let home_numa = worker_fp_store.home_numa(unique_fps[idx]);
+                                states_with_home_numa.push((next_state, home_numa));
                             }
                         }
 
-                        // Batch push all new states at once
+                        // Batch push with NUMA-aware routing
                         let pushed = worker_queue
-                            .push_local_batch(&mut worker_state, states_to_enqueue.drain(..));
+                            .push_batch_to_numa(&mut worker_state, states_with_home_numa.drain(..));
                         *local_enqueued += pushed as u64;
                     }
 
