@@ -812,7 +812,10 @@ where
             let mut local_duplicates = 0u64;
             let mut local_states_distinct = 0u64;
             let mut local_enqueued = 0u64;
-            const STATS_FLUSH_INTERVAL: u64 = 2048; // Flush every 2048 states (was 256)
+            // Adaptive flush: every 512 states OR every ~1 second (whichever comes first)
+            // This balances atomic contention reduction vs stats freshness
+            const STATS_FLUSH_INTERVAL: u64 = 512;
+            let mut last_stats_flush = Instant::now();
 
             let flush_local_stats = |processed: &mut u64,
                                      generated: &mut u64,
@@ -883,7 +886,10 @@ where
                 local_states_processed += 1;
 
                 // Periodically flush local stats to reduce atomic contention
-                if local_states_processed % STATS_FLUSH_INTERVAL == 0 {
+                // Flush either by count OR by time (every ~1 second) for accurate reporting
+                let should_flush = local_states_processed % STATS_FLUSH_INTERVAL == 0
+                    || last_stats_flush.elapsed() >= Duration::from_secs(1);
+                if should_flush {
                     flush_local_stats(
                         &mut local_states_processed,
                         &mut local_states_generated,
@@ -892,6 +898,7 @@ where
                         &mut local_enqueued,
                         &worker_stats,
                     );
+                    last_stats_flush = Instant::now();
                 }
 
                 if let Err(message) = worker_model.check_invariants(&state) {
