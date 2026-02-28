@@ -1,3 +1,4 @@
+pub mod autotune;
 pub mod canon;
 pub mod chaos;
 pub mod fairness;
