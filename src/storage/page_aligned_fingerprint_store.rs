@@ -580,28 +580,37 @@ impl FingerprintShard {
         let fp = if fp == 0 { 1 } else { fp };
 
         let mut retries = 0u32;
+        let mut resize_path_count = 0u32;
+        let mut normal_path_count = 0u32;
+        let mut seq_mismatch_count = 0u32;
         loop {
             retries += 1;
             if retries == MAX_RETRIES_BEFORE_WARN {
                 eprintln!(
-                    "Warning: fingerprint {:#x} exceeded {} retries in shard {} (seq={}, load={:.1}%)",
+                    "Warning: fingerprint {:#x} exceeded {} retries in shard {} (seq={}, load={:.1}%, resize_path={}, normal_path={}, seq_mismatch={})",
                     fp,
                     MAX_RETRIES_BEFORE_WARN,
                     self.numa_node,
                     self.seq.load(Ordering::Relaxed),
-                    self.load_factor() * 100.0
+                    self.load_factor() * 100.0,
+                    resize_path_count,
+                    normal_path_count,
+                    seq_mismatch_count
                 );
             }
             if retries > MAX_RETRIES_BEFORE_PANIC {
                 panic!(
-                    "Fingerprint {:#x} stuck in infinite loop after {} retries in shard {} (seq={}, capacity={}, count={}, load={:.1}%)",
+                    "Fingerprint {:#x} stuck in infinite loop after {} retries in shard {} (seq={}, capacity={}, count={}, load={:.1}%, resize_path={}, normal_path={}, seq_mismatch={})",
                     fp,
                     MAX_RETRIES_BEFORE_PANIC,
                     self.numa_node,
                     self.seq.load(Ordering::Relaxed),
                     self.get_capacity(),
                     self.len(),
-                    self.load_factor() * 100.0
+                    self.load_factor() * 100.0,
+                    resize_path_count,
+                    normal_path_count,
+                    seq_mismatch_count
                 );
             }
             // Yield periodically to avoid starving other threads
@@ -611,6 +620,7 @@ impl FingerprintShard {
             // Read seqlock - if odd, resize in progress
             let seq_before = self.seq.load(Ordering::Acquire);
             if seq_before % 2 == 1 {
+                resize_path_count += 1;
                 // RESIZE IN PROGRESS - use lock-free path through old+new tables
                 // This is completely non-blocking!
 
@@ -718,6 +728,7 @@ impl FingerprintShard {
             }
 
             // NORMAL PATH - no resize in progress
+            normal_path_count += 1;
             let capacity = self.get_capacity();
             let table_ptr = self.get_table();
             let table = unsafe { std::slice::from_raw_parts_mut(table_ptr, capacity) };
@@ -767,6 +778,7 @@ impl FingerprintShard {
             // Check if resize happened during our operation
             let seq_after = self.seq.load(Ordering::Acquire);
             if seq_before != seq_after {
+                seq_mismatch_count += 1;
                 continue;
             }
 
