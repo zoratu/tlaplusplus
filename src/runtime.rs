@@ -798,6 +798,13 @@ where
             let mut batch_seen: Vec<bool> = Vec::with_capacity(worker_fp_batch_size);
             let mut local_fp_dedup: HashSet<u64> = HashSet::with_capacity(worker_fp_batch_size * 2);
 
+            // Per-worker persistent fingerprint cache to reduce global store CAS contention
+            // This catches duplicates locally before hitting shared atomics
+            // Size: 64K entries = ~512KB per worker, catches most duplicates locally
+            const LOCAL_FP_CACHE_SIZE: usize = 65536;
+            let mut local_fp_cache: HashSet<u64> = HashSet::with_capacity(LOCAL_FP_CACHE_SIZE);
+            let mut local_fp_cache_hits = 0u64;
+
             // Per-worker stats counters to reduce atomic contention
             // Flushed periodically instead of every state
             let mut local_states_processed = 0u64;
@@ -805,7 +812,7 @@ where
             let mut local_duplicates = 0u64;
             let mut local_states_distinct = 0u64;
             let mut local_enqueued = 0u64;
-            const STATS_FLUSH_INTERVAL: u64 = 256; // Flush every 256 states
+            const STATS_FLUSH_INTERVAL: u64 = 2048; // Flush every 2048 states (was 256)
 
             let flush_local_stats = |processed: &mut u64,
                                      generated: &mut u64,
@@ -970,10 +977,16 @@ where
                 // Pair states with their fingerprint's home NUMA for routing
                 let mut states_with_home_numa: Vec<(M::State, usize)> =
                     Vec::with_capacity(worker_fp_batch_size);
+                // Fingerprints that need global store check (not in local cache)
+                let mut fps_to_check: Vec<u64> = Vec::with_capacity(worker_fp_batch_size);
+                let mut states_to_check: Vec<M::State> = Vec::with_capacity(worker_fp_batch_size);
+
                 let mut process_batch = |pending_batch: &mut Vec<M::State>,
                                          local_duplicates: &mut u64,
                                          local_states_distinct: &mut u64,
-                                         local_enqueued: &mut u64|
+                                         local_enqueued: &mut u64,
+                                         fp_cache: &mut HashSet<u64>,
+                                         fp_cache_hits: &mut u64|
                  -> Result<()> {
                     if pending_batch.is_empty() {
                         return Ok(());
@@ -982,28 +995,53 @@ where
                     unique_fps.clear();
                     local_fp_dedup.clear();
                     states_with_home_numa.clear();
+                    fps_to_check.clear();
+                    states_to_check.clear();
 
                     let mut duplicates_in_batch = 0u64;
                     for candidate in pending_batch.drain(..) {
                         let fp = worker_model.fingerprint(&candidate);
+                        // Dedup within this batch first
                         if !local_fp_dedup.insert(fp) {
                             duplicates_in_batch += 1;
                             continue;
                         }
-                        unique_fps.push(fp);
-                        unique_states.push(candidate);
+                        // Check persistent local cache - catches duplicates without CAS
+                        if fp_cache.contains(&fp) {
+                            *fp_cache_hits += 1;
+                            duplicates_in_batch += 1;
+                            continue;
+                        }
+                        // Need to check global store
+                        fps_to_check.push(fp);
+                        states_to_check.push(candidate);
                     }
 
-                    if !unique_fps.is_empty() {
-                        worker_fp_store.contains_or_insert_batch(&unique_fps, &mut batch_seen)?;
+                    if !fps_to_check.is_empty() {
+                        // Use worker-affinity batch to reduce CAS contention
+                        // Each worker processes shards in a different order
+                        worker_fp_store.contains_or_insert_batch_with_affinity(
+                            &fps_to_check,
+                            &mut batch_seen,
+                            worker_id,
+                        )?;
 
-                        for (idx, next_state) in unique_states.drain(..).enumerate() {
+                        for (idx, next_state) in states_to_check.drain(..).enumerate() {
+                            let fp = fps_to_check[idx];
                             if batch_seen[idx] {
                                 *local_duplicates += 1;
+                                // Add to local cache to catch future duplicates
+                                if fp_cache.len() < LOCAL_FP_CACHE_SIZE {
+                                    fp_cache.insert(fp);
+                                }
                             } else {
                                 *local_states_distinct += 1;
+                                // Add new fingerprint to local cache
+                                if fp_cache.len() < LOCAL_FP_CACHE_SIZE {
+                                    fp_cache.insert(fp);
+                                }
                                 // Get the fingerprint's home NUMA for routing
-                                let home_numa = worker_fp_store.home_numa(unique_fps[idx]);
+                                let home_numa = worker_fp_store.home_numa(fp);
                                 states_with_home_numa.push((next_state, home_numa));
                             }
                         }
@@ -1015,6 +1053,12 @@ where
                     }
 
                     *local_duplicates += duplicates_in_batch;
+
+                    // Clear cache if it gets too large (prevents unbounded memory)
+                    if fp_cache.len() >= LOCAL_FP_CACHE_SIZE {
+                        fp_cache.clear();
+                    }
+
                     Ok(())
                 };
 
@@ -1029,6 +1073,8 @@ where
                             &mut local_duplicates,
                             &mut local_states_distinct,
                             &mut local_enqueued,
+                            &mut local_fp_cache,
+                            &mut local_fp_cache_hits,
                         )
                     {
                         let _ = worker_error_tx.send(err.to_string());
@@ -1042,6 +1088,8 @@ where
                         &mut local_duplicates,
                         &mut local_states_distinct,
                         &mut local_enqueued,
+                        &mut local_fp_cache,
+                        &mut local_fp_cache_hits,
                     )
                 {
                     let _ = worker_error_tx.send(err.to_string());
