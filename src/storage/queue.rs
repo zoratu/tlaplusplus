@@ -60,6 +60,9 @@ pub struct DiskBackedQueue<T> {
     spill_batch: usize,
     spill_tx: Mutex<Option<Sender<Vec<T>>>>,
     segments: Arc<Mutex<VecDeque<PathBuf>>>,
+    /// Segments that have been loaded but not yet deleted (for crash recovery)
+    /// These are only deleted during checkpoint_flush to ensure resume can reload them
+    consumed_segments: Arc<Mutex<Vec<PathBuf>>>,
     spill_inflight: Arc<AtomicUsize>,
     load_lock: Mutex<()>,
     writer_handle: Mutex<Option<JoinHandle<()>>>,
@@ -201,6 +204,7 @@ where
             spill_batch: config.spill_batch.max(16),
             spill_tx: Mutex::new(Some(spill_tx)),
             segments,
+            consumed_segments: Arc::new(Mutex::new(Vec::new())),
             spill_inflight,
             load_lock: Mutex::new(()),
             writer_handle: Mutex::new(Some(writer_handle)),
@@ -483,26 +487,41 @@ where
             self.force_push_inmem(item);
         }
 
-        // Retry segment removal (non-critical, log warning on failure)
-        if let Err(err) = crate::chaos::retry_with_backoff(
-            || std::fs::remove_file(&path).map_err(|e| anyhow::anyhow!("{}", e)),
-            2,   // 2 retries
-            50,  // 50ms
-            500, // max 500ms
-        ) {
-            eprintln!(
-                "Warning: failed to remove queue segment {} after retries: {}",
-                path.display(),
-                err
-            );
-            // Don't fail the whole operation - segment removal is cleanup, not critical
-        }
+        // DON'T delete segment immediately - add to consumed list for later cleanup
+        // This ensures that if the process crashes before checkpoint, the segment
+        // can be reloaded on resume. Segments are only deleted during checkpoint_flush.
+        self.consumed_segments.lock().push(path);
 
         self.stats.loaded_segments.fetch_add(1, Ordering::Relaxed);
         self.stats
             .loaded_items
             .fetch_add(loaded_len, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Delete all consumed segments (called during checkpoint to free disk space)
+    /// Only deletes segments that have been fully loaded into memory
+    fn delete_consumed_segments(&self) {
+        let segments_to_delete: Vec<PathBuf> = {
+            let mut consumed = self.consumed_segments.lock();
+            std::mem::take(&mut *consumed)
+        };
+
+        for path in segments_to_delete {
+            if let Err(err) = crate::chaos::retry_with_backoff(
+                || std::fs::remove_file(&path).map_err(|e| anyhow::anyhow!("{}", e)),
+                2,   // 2 retries
+                50,  // 50ms
+                500, // max 500ms
+            ) {
+                eprintln!(
+                    "Warning: failed to remove consumed segment {} after retries: {}",
+                    path.display(),
+                    err
+                );
+                // Don't fail - segment removal is cleanup, not critical
+            }
+        }
     }
 
     pub fn is_drained(&self) -> bool {
@@ -539,6 +558,12 @@ where
             self.check_error()?;
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+
+        // Now that everything is safely on disk, delete consumed segments
+        // This is safe because: if we crash after this point, the queue state
+        // is now in the newly-spilled segments, not the consumed ones
+        self.delete_consumed_segments();
+
         self.check_error()
     }
 
@@ -577,6 +602,8 @@ where
         if let Some(handle) = self.writer_handle.lock().take() {
             let _ = handle.join();
         }
+        // Clean up consumed segments on graceful shutdown
+        self.delete_consumed_segments();
         self.check_error()
     }
 
