@@ -1,6 +1,9 @@
 use crate::autotune::{AutoTuneConfig, AutoTuner, WorkerThrottle};
 use crate::fairness::{FairnessConstraint, TarjanSCC, check_fairness_on_scc};
 use crate::model::{LabeledTransition, Model};
+use crate::storage::async_fingerprint_writer::{
+    create_persist_channels, fingerprint_writer_task, load_fingerprints_from_disk,
+};
 use crate::storage::channel_queue::ChannelQueue;
 use crate::storage::fingerprint_store::{
     FingerprintStats as OldFingerprintStats, FingerprintStore,
@@ -16,8 +19,8 @@ use crate::storage::spillable_work_stealing::{
 };
 use crate::storage::work_stealing_queues::WorkStealingQueues;
 use crate::system::{
-    WorkerPlan, WorkerPlanRequest, build_worker_plan, cgroup_memory_max_bytes,
-    pin_current_thread_to_cpu,
+    MemoryMonitor, MemoryStatus, WorkerPlan, WorkerPlanRequest, build_worker_plan,
+    cgroup_memory_max_bytes, get_memory_stats, pin_current_thread_to_cpu,
 };
 use anyhow::{Context, Result, anyhow};
 use dashmap::DashMap;
@@ -62,6 +65,8 @@ pub struct EngineConfig {
     pub queue_max_inmem_items: u64,
     /// Enable auto-tuning of worker count based on CPU utilization
     pub auto_tune: bool,
+    /// Enable fingerprint persistence to disk (required for resume)
+    pub enable_fp_persistence: bool,
 }
 
 impl Default for EngineConfig {
@@ -93,6 +98,7 @@ impl Default for EngineConfig {
             enable_queue_spilling: true,
             queue_max_inmem_items: 50_000_000, // 50M items before spilling
             auto_tune: false,
+            enable_fp_persistence: true, // Enable by default for resume support
         }
     }
 }
@@ -539,7 +545,94 @@ where
         shard_size_mb: shard_size_mb,
     };
 
-    let fp_store = PageAlignedFingerprintStore::new(fp_config, &worker_plan.assigned_cpus)?;
+    let mut fp_store = PageAlignedFingerprintStore::new(fp_config, &worker_plan.assigned_cpus)?;
+
+    // Set up fingerprint persistence for resume support
+    let fp_persist_runtime = if config.enable_fp_persistence {
+        // Create persist channels (one per shard)
+        let (persist_tx, persist_rx) = create_persist_channels(shard_count, 10_000);
+        fp_store.enable_persistence(persist_tx);
+
+        // Create tokio runtime for async I/O
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2) // Just 2 threads for I/O
+            .thread_name("tlapp-fp-io")
+            .enable_all()
+            .build()
+            .context("Failed to create fingerprint I/O runtime")?;
+
+        // Spawn writer tasks for each shard
+        let work_dir = config.work_dir.clone();
+        for (shard_id, rx) in persist_rx.into_iter().enumerate() {
+            let wd = work_dir.clone();
+            runtime.spawn(async move {
+                if let Err(e) = fingerprint_writer_task(shard_id, rx, wd).await {
+                    // Channel disconnected is expected on shutdown
+                    if !e.to_string().contains("disconnected") {
+                        eprintln!("Fingerprint writer shard {} error: {}", shard_id, e);
+                    }
+                }
+            });
+        }
+
+        Some(runtime)
+    } else {
+        None
+    };
+
+    // Load fingerprints from disk if resuming
+    if config.resume_from_checkpoint {
+        let fp_dir = config.work_dir.join("fingerprints");
+        if fp_dir.exists() {
+            eprintln!("Loading fingerprints from disk for resume...");
+            let load_start = Instant::now();
+
+            // Use a blocking load since we need this before workers start
+            let loaded = std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(shard_count);
+                for shard_id in 0..shard_count {
+                    let fp_path = fp_dir
+                        .join(format!("shard-{:03}", shard_id))
+                        .join("segment.bin");
+                    handles.push(s.spawn(move || -> Vec<u64> {
+                        if !fp_path.exists() {
+                            return Vec::new();
+                        }
+                        match std::fs::read(&fp_path) {
+                            Ok(bytes) => bytes
+                                .chunks_exact(8)
+                                .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+                                .collect(),
+                            Err(e) => {
+                                eprintln!("Warning: failed to load shard {}: {}", shard_id, e);
+                                Vec::new()
+                            }
+                        }
+                    }));
+                }
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+
+            // Insert loaded fingerprints into store
+            let mut total_loaded = 0usize;
+            for (shard_id, fps) in loaded.into_iter().enumerate() {
+                total_loaded += fps.len();
+                for fp in fps {
+                    let _ = fp_store.contains_or_insert(fp);
+                }
+            }
+
+            let load_elapsed = load_start.elapsed();
+            eprintln!(
+                "Loaded {} fingerprints from disk in {:.1}s",
+                total_loaded,
+                load_elapsed.as_secs_f64()
+            );
+        }
+    }
 
     let fp_store = Arc::new(fp_store);
 
@@ -635,12 +728,19 @@ where
     let progress_stop = Arc::clone(&stop);
     let progress_fp_store = Arc::clone(&fp_store);
     let progress_queue = Arc::clone(&queue);
+    let progress_throttle = Arc::clone(&throttle);
+    let progress_worker_count = worker_plan.worker_count;
     let progress_thread = std::thread::spawn(move || {
         let mut progress_counter = 1u64;
         let mut last_generated = 0u64;
         let mut last_distinct = 0u64;
         let mut last_queue_pending = 0u64;
         let mut last_time = std::time::Instant::now();
+
+        // Memory monitor - check periodically and throttle if needed
+        let memory_monitor = MemoryMonitor::default();
+        let mut memory_warned = false;
+        let mut memory_throttled = false;
 
         loop {
             // Check for emergency checkpoint request every second
@@ -649,6 +749,64 @@ where
 
                 if progress_stop.load(Ordering::Relaxed) {
                     return;
+                }
+
+                // Check memory pressure and throttle workers if needed
+                let mem_status = memory_monitor.check();
+                match mem_status {
+                    MemoryStatus::Critical {
+                        rss_bytes,
+                        limit_bytes,
+                        ratio,
+                    } => {
+                        if !memory_throttled {
+                            let rss_gb = rss_bytes as f64 / 1024.0 / 1024.0 / 1024.0;
+                            let limit_gb = limit_bytes as f64 / 1024.0 / 1024.0 / 1024.0;
+                            eprintln!(
+                                "MEMORY CRITICAL: {:.1}GB / {:.1}GB ({:.0}%) - throttling to 25% workers",
+                                rss_gb,
+                                limit_gb,
+                                ratio * 100.0
+                            );
+                            // Throttle to 25% of workers
+                            let reduced = (progress_worker_count / 4).max(1);
+                            progress_throttle.set_active_target(reduced);
+                            memory_throttled = true;
+                            memory_warned = true;
+                        }
+                    }
+                    MemoryStatus::Warning {
+                        rss_bytes,
+                        limit_bytes,
+                        ratio,
+                    } => {
+                        if !memory_warned {
+                            let rss_gb = rss_bytes as f64 / 1024.0 / 1024.0 / 1024.0;
+                            let limit_gb = limit_bytes as f64 / 1024.0 / 1024.0 / 1024.0;
+                            eprintln!(
+                                "MEMORY WARNING: {:.1}GB / {:.1}GB ({:.0}%) - consider reducing workers",
+                                rss_gb,
+                                limit_gb,
+                                ratio * 100.0
+                            );
+                            // Throttle to 50% of workers
+                            let reduced = (progress_worker_count / 2).max(1);
+                            progress_throttle.set_active_target(reduced);
+                            memory_warned = true;
+                        }
+                    }
+                    MemoryStatus::Ok { ratio, .. } => {
+                        // If we were throttled and now OK, gradually restore
+                        if memory_throttled && ratio < 0.60 {
+                            eprintln!(
+                                "Memory pressure relieved ({:.0}%) - restoring workers",
+                                ratio * 100.0
+                            );
+                            progress_throttle.set_active_target(progress_worker_count);
+                            memory_throttled = false;
+                            memory_warned = false;
+                        }
+                    }
                 }
 
                 // Handle emergency checkpoint request

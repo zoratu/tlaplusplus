@@ -400,6 +400,236 @@ pub fn pin_current_thread_to_cpu(_cpu: usize) -> Result<()> {
     Ok(())
 }
 
+/// Memory usage statistics
+#[derive(Debug, Clone, Default)]
+pub struct MemoryStats {
+    /// Resident set size in bytes
+    pub rss_bytes: u64,
+    /// Virtual memory size in bytes
+    pub vms_bytes: u64,
+    /// Available system memory in bytes
+    pub available_bytes: u64,
+    /// Total system memory in bytes
+    pub total_bytes: u64,
+}
+
+impl MemoryStats {
+    /// Memory pressure as percentage (0.0 - 1.0)
+    pub fn pressure(&self) -> f64 {
+        if self.total_bytes == 0 {
+            return 0.0;
+        }
+        self.rss_bytes as f64 / self.total_bytes as f64
+    }
+
+    /// Check if under memory pressure (>80% of total)
+    pub fn is_under_pressure(&self) -> bool {
+        self.pressure() > 0.80
+    }
+
+    /// Check if critical memory (>90% of total)
+    pub fn is_critical(&self) -> bool {
+        self.pressure() > 0.90
+    }
+}
+
+/// Get current process memory usage
+pub fn get_memory_stats() -> MemoryStats {
+    let mut stats = MemoryStats::default();
+
+    // Read /proc/self/status for process memory
+    if let Ok(content) = std::fs::read_to_string("/proc/self/status") {
+        for line in content.lines() {
+            if line.starts_with("VmRSS:") {
+                if let Some(kb) = parse_proc_kb(line) {
+                    stats.rss_bytes = kb * 1024;
+                }
+            } else if line.starts_with("VmSize:") {
+                if let Some(kb) = parse_proc_kb(line) {
+                    stats.vms_bytes = kb * 1024;
+                }
+            }
+        }
+    }
+
+    // Read /proc/meminfo for system memory
+    if let Ok(content) = std::fs::read_to_string("/proc/meminfo") {
+        for line in content.lines() {
+            if line.starts_with("MemTotal:") {
+                if let Some(kb) = parse_proc_kb(line) {
+                    stats.total_bytes = kb * 1024;
+                }
+            } else if line.starts_with("MemAvailable:") {
+                if let Some(kb) = parse_proc_kb(line) {
+                    stats.available_bytes = kb * 1024;
+                }
+            }
+        }
+    }
+
+    // Also check cgroup memory limit
+    if let Some(limit) = cgroup_memory_limit() {
+        // Use cgroup limit as effective total if lower than system total
+        if limit < stats.total_bytes && limit > 0 {
+            stats.total_bytes = limit;
+        }
+    }
+
+    stats
+}
+
+fn parse_proc_kb(line: &str) -> Option<u64> {
+    // Format: "VmRSS:     12345 kB"
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() >= 2 {
+        parts[1].parse().ok()
+    } else {
+        None
+    }
+}
+
+/// Get cgroup memory limit (if any)
+pub fn cgroup_memory_limit() -> Option<u64> {
+    // Try cgroup v2 first
+    let v2_paths = [
+        PathBuf::from("/sys/fs/cgroup/memory.max"),
+        // Also try with the relative path
+    ];
+
+    for path in &v2_paths {
+        if let Some(content) = read_trimmed(path) {
+            if content != "max" {
+                if let Ok(limit) = content.parse::<u64>() {
+                    return Some(limit);
+                }
+            }
+        }
+    }
+
+    // Try cgroup v1
+    let v1_path = PathBuf::from("/sys/fs/cgroup/memory/memory.limit_in_bytes");
+    if let Some(content) = read_trimmed(&v1_path) {
+        if let Ok(limit) = content.parse::<u64>() {
+            // Ignore very large limits (essentially unlimited)
+            if limit < u64::MAX / 2 {
+                return Some(limit);
+            }
+        }
+    }
+
+    None
+}
+
+/// Memory monitor that can be polled periodically
+pub struct MemoryMonitor {
+    /// Memory limit in bytes (process will apply backpressure above this)
+    pub limit_bytes: u64,
+    /// Warning threshold (start applying backpressure)
+    pub warn_threshold: f64,
+    /// Critical threshold (emergency measures)
+    pub critical_threshold: f64,
+}
+
+impl Default for MemoryMonitor {
+    fn default() -> Self {
+        // Get system/cgroup memory and set limit to 85%
+        let stats = get_memory_stats();
+        let effective_total = if stats.total_bytes > 0 {
+            stats.total_bytes
+        } else {
+            // Fallback: assume 64GB
+            64 * 1024 * 1024 * 1024
+        };
+
+        Self {
+            limit_bytes: (effective_total as f64 * 0.85) as u64,
+            warn_threshold: 0.75,
+            critical_threshold: 0.90,
+        }
+    }
+}
+
+impl MemoryMonitor {
+    pub fn new(limit_bytes: u64) -> Self {
+        Self {
+            limit_bytes,
+            warn_threshold: 0.75,
+            critical_threshold: 0.90,
+        }
+    }
+
+    /// Check current memory status
+    pub fn check(&self) -> MemoryStatus {
+        let stats = get_memory_stats();
+        let usage_ratio = if self.limit_bytes > 0 {
+            stats.rss_bytes as f64 / self.limit_bytes as f64
+        } else {
+            stats.pressure()
+        };
+
+        if usage_ratio >= self.critical_threshold {
+            MemoryStatus::Critical {
+                rss_bytes: stats.rss_bytes,
+                limit_bytes: self.limit_bytes,
+                ratio: usage_ratio,
+            }
+        } else if usage_ratio >= self.warn_threshold {
+            MemoryStatus::Warning {
+                rss_bytes: stats.rss_bytes,
+                limit_bytes: self.limit_bytes,
+                ratio: usage_ratio,
+            }
+        } else {
+            MemoryStatus::Ok {
+                rss_bytes: stats.rss_bytes,
+                limit_bytes: self.limit_bytes,
+                ratio: usage_ratio,
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum MemoryStatus {
+    Ok {
+        rss_bytes: u64,
+        limit_bytes: u64,
+        ratio: f64,
+    },
+    Warning {
+        rss_bytes: u64,
+        limit_bytes: u64,
+        ratio: f64,
+    },
+    Critical {
+        rss_bytes: u64,
+        limit_bytes: u64,
+        ratio: f64,
+    },
+}
+
+impl MemoryStatus {
+    pub fn is_ok(&self) -> bool {
+        matches!(self, MemoryStatus::Ok { .. })
+    }
+
+    pub fn is_warning(&self) -> bool {
+        matches!(self, MemoryStatus::Warning { .. })
+    }
+
+    pub fn is_critical(&self) -> bool {
+        matches!(self, MemoryStatus::Critical { .. })
+    }
+
+    pub fn ratio(&self) -> f64 {
+        match self {
+            MemoryStatus::Ok { ratio, .. } => *ratio,
+            MemoryStatus::Warning { ratio, .. } => *ratio,
+            MemoryStatus::Critical { ratio, .. } => *ratio,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_cpu_list;
