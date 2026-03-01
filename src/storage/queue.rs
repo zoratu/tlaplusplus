@@ -538,6 +538,11 @@ where
         !self.is_drained()
     }
 
+    /// Get count of segments waiting to be loaded from disk
+    pub fn segment_count(&self) -> usize {
+        self.segments.lock().len()
+    }
+
     pub fn checkpoint_flush(&self) -> Result<()> {
         self.check_error()?;
 

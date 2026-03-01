@@ -661,9 +661,11 @@ where
 
     // On resume, proactively load spilled queue segments into memory
     // This ensures workers have access to the spilled states immediately
+    // Only load up to queue_max_inmem_items to avoid OOM - rest loaded on-demand
     if config.resume_from_checkpoint {
         eprintln!("Loading spilled queue segments for resume...");
-        let loaded = queue.load_spilled_segments()?;
+        let max_load = config.queue_max_inmem_items;
+        let loaded = queue.load_spilled_segments(max_load)?;
         if loaded > 0 {
             eprintln!("Loaded {} states from spilled queue segments", loaded);
         }
