@@ -639,6 +639,7 @@ where
         let mut progress_counter = 1u64;
         let mut last_generated = 0u64;
         let mut last_distinct = 0u64;
+        let mut last_queue_pending = 0u64;
         let mut last_time = std::time::Instant::now();
 
         loop {
@@ -708,21 +709,51 @@ where
                 result.chars().rev().collect()
             }
 
-            // Match TLC format exactly
+            // Calculate ETA based on queue drain rate
+            let eta_str = if progress_counter > 1 && elapsed_secs > 0.0 {
+                let queue_delta = last_queue_pending as i64 - queue_pending as i64;
+                let drain_rate = queue_delta as f64 / elapsed_secs; // states/sec
+
+                if drain_rate > 10.0 {
+                    // Queue is draining - estimate completion time
+                    let eta_secs = queue_pending as f64 / drain_rate;
+                    if eta_secs < 60.0 {
+                        format!(" ETA: {:.0}s", eta_secs)
+                    } else if eta_secs < 3600.0 {
+                        format!(" ETA: {:.1}m", eta_secs / 60.0)
+                    } else if eta_secs < 86400.0 {
+                        format!(" ETA: {:.1}h", eta_secs / 3600.0)
+                    } else {
+                        format!(" ETA: {:.1}d", eta_secs / 86400.0)
+                    }
+                } else if drain_rate < -10.0 {
+                    // Queue is growing
+                    " ETA: queue growing".to_string()
+                } else {
+                    // Queue is stable
+                    " ETA: stabilizing".to_string()
+                }
+            } else {
+                String::new()
+            };
+
+            // Match TLC format with ETA
             eprintln!(
-                "Progress({}) at {}: {} states generated ({} s/min), {} distinct states found ({} ds/min), {} states left on queue.",
+                "Progress({}) at {}: {} states generated ({} s/min), {} distinct states found ({} ds/min), {} states left on queue.{}",
                 progress_counter,
                 timestamp,
                 format_with_commas(states_generated),
                 format_with_commas(generated_rate),
                 format_with_commas(states_distinct),
                 format_with_commas(distinct_rate),
-                format_with_commas(queue_pending)
+                format_with_commas(queue_pending),
+                eta_str
             );
 
             progress_counter += 1;
             last_generated = states_generated;
             last_distinct = states_distinct;
+            last_queue_pending = queue_pending;
             last_time = now;
         }
     });
