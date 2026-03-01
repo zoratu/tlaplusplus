@@ -544,16 +544,28 @@ where
         self.overflow.checkpoint_flush()
     }
 
-    /// Load all spilled segments from disk into the hot queue (for resume)
+    /// Load spilled segments from disk into the hot queue (for resume)
     /// This should be called BEFORE starting workers to ensure spilled states
     /// are available for processing immediately.
+    /// Only loads up to max_items to avoid OOM - remaining segments are loaded
+    /// on-demand by the background loader thread.
     /// Returns the number of items loaded.
-    pub fn load_spilled_segments(&self) -> Result<u64> {
+    pub fn load_spilled_segments(&self, max_items: u64) -> Result<u64> {
         let mut total_loaded = 0u64;
         let start = std::time::Instant::now();
 
         loop {
-            // Keep loading until overflow queue is empty
+            // Stop if we've loaded enough to get workers started
+            if total_loaded >= max_items {
+                eprintln!(
+                    "Loaded {} items from disk (limit reached, {} segments remain for background loading)",
+                    total_loaded,
+                    self.overflow.segment_count()
+                );
+                break;
+            }
+
+            // Load a batch from disk
             match self.overflow.pop_bulk(50_000) {
                 Ok(items) if !items.is_empty() => {
                     let count = items.len();
