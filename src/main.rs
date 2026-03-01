@@ -145,6 +145,9 @@ struct StorageArgs {
     /// Max items in memory before spilling to disk (when enable_queue_spilling is true)
     #[arg(long, default_value_t = 50_000_000)]
     queue_max_inmem_items: u64,
+    /// Disable fingerprint persistence (persistence is enabled by default for resume support)
+    #[arg(long, default_value_t = false)]
+    disable_fp_persistence: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -263,6 +266,7 @@ fn build_engine_config(
         enable_queue_spilling: !storage.disable_queue_spilling,
         queue_max_inmem_items: storage.queue_max_inmem_items,
         auto_tune: runtime.auto_tune,
+        enable_fp_persistence: runtime.resume || !storage.disable_fp_persistence,
     })
 }
 
