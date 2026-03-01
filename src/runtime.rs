@@ -659,6 +659,16 @@ where
         spill_config,
     )?;
 
+    // On resume, proactively load spilled queue segments into memory
+    // This ensures workers have access to the spilled states immediately
+    if config.resume_from_checkpoint {
+        eprintln!("Loading spilled queue segments for resume...");
+        let loaded = queue.load_spilled_segments()?;
+        if loaded > 0 {
+            eprintln!("Loaded {} states from spilled queue segments", loaded);
+        }
+    }
+
     let run_stats = Arc::new(AtomicRunStats::default());
     let stop = Arc::new(AtomicBool::new(false));
     let active_workers = Arc::new(AtomicUsize::new(0));
