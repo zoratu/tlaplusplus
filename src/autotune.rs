@@ -250,19 +250,6 @@ impl AutoTuner {
             let time_since_adjustment = last_adjustment.elapsed();
             let can_adjust = time_since_adjustment >= config.adjustment_cooldown;
 
-            if config.verbose {
-                eprintln!(
-                    "AutoTune: workers={}/{} usr={:.1}% sys={:.1}% throughput={:.0}/s best={:.0}/s@{}",
-                    current_target,
-                    config.max_workers,
-                    usr_pct,
-                    sys_pct,
-                    throughput_rate,
-                    best_throughput_rate,
-                    best_workers
-                );
-            }
-
             if can_adjust {
                 // Don't reduce workers if throughput has dropped significantly from best
                 let throughput_ok = throughput_rate > best_throughput_rate * 0.85;
