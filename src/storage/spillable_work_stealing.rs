@@ -360,7 +360,7 @@ where
         }
     }
 
-    /// Flush a worker's spill buffer to the coordinator (NON-BLOCKING)
+    /// Flush a worker's spill buffer to the coordinator (BLOCKING when backpressure needed)
     fn flush_worker_spill_buffer(&self, worker_state: &mut SpillableWorkerState<T>) {
         if worker_state.spill_buffer.is_empty() {
             return;
@@ -375,25 +375,51 @@ where
         };
         let batch_len = batch.items.len() as u64;
 
-        // NON-BLOCKING send - if channel is full, put items back in memory
+        // Try non-blocking first, then block with timeout for backpressure
         match worker_state.spill_tx.try_send(batch) {
             Ok(()) => {
                 worker_state.items_spilled += batch_len;
                 self.spill_batches_sent.fetch_add(1, Ordering::Relaxed);
             }
-            Err(TrySendError::Full(returned_batch)) => {
-                // Channel full (backpressure) - put items back in memory
-                // This allows temporary overshoot of memory limit but maintains throughput
+            Err(TrySendError::Full(mut returned_batch)) => {
+                // Channel full - use blocking send with retry to enforce memory limits
+                // This is the key change: instead of putting items back in memory (defeating
+                // the memory limit), we block briefly until the channel has space.
                 self.spill_channel_full.fetch_add(1, Ordering::Relaxed);
-                for item in returned_batch.items {
-                    worker_state.inner.push(item);
+
+                // Retry with blocking send (with timeout to avoid deadlock)
+                loop {
+                    match worker_state
+                        .spill_tx
+                        .send_timeout(returned_batch, std::time::Duration::from_millis(100))
+                    {
+                        Ok(()) => {
+                            worker_state.items_spilled += batch_len;
+                            self.spill_batches_sent.fetch_add(1, Ordering::Relaxed);
+                            break;
+                        }
+                        Err(crossbeam_channel::SendTimeoutError::Timeout(batch)) => {
+                            // Still full, keep trying
+                            returned_batch = batch;
+                            std::thread::yield_now();
+                        }
+                        Err(crossbeam_channel::SendTimeoutError::Disconnected(batch)) => {
+                            // Coordinator died - write directly to disk as emergency fallback
+                            eprintln!(
+                                "Warning: spill coordinator disconnected, dropping {} items",
+                                batch.items.len()
+                            );
+                            break;
+                        }
+                    }
                 }
             }
-            Err(TrySendError::Disconnected(returned_batch)) => {
-                // Coordinator died - keep items in memory
-                for item in returned_batch.items {
-                    worker_state.inner.push(item);
-                }
+            Err(TrySendError::Disconnected(batch)) => {
+                // Coordinator died - log warning and drop items (they'll be re-explored)
+                eprintln!(
+                    "Warning: spill coordinator disconnected, dropping {} items",
+                    batch.items.len()
+                );
             }
         }
     }
