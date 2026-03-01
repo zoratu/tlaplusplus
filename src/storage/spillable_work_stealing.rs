@@ -482,6 +482,19 @@ where
         self.hot.pending_count()
     }
 
+    /// Get total pending count including spilled items on disk
+    pub fn total_pending_count(&self) -> u64 {
+        let inmem = self.hot.pending_count();
+        let spilled = self.spill_redirects.load(Ordering::Relaxed);
+        let loaded = self.disk_loads.load(Ordering::Relaxed);
+        // Also check overflow queue's spilled items
+        let overflow_stats = self.overflow.stats();
+        let overflow_spilled = overflow_stats.spilled_items;
+        let overflow_loaded = overflow_stats.loaded_items;
+
+        inmem + (spilled + overflow_spilled).saturating_sub(loaded + overflow_loaded)
+    }
+
     /// Check if queue is too full (for backpressure)
     pub fn should_apply_backpressure(&self, max_pending: u64) -> bool {
         self.hot.should_apply_backpressure(max_pending)

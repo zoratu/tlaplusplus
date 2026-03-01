@@ -674,7 +674,8 @@ where
 
             let (states_generated, _states_processed, states_distinct, _, _, _) =
                 progress_run_stats.snapshot();
-            let queue_pending = progress_queue.pending_count();
+            // Use total_pending_count to include spilled items on disk
+            let queue_pending = progress_queue.total_pending_count();
 
             // Calculate rates per minute
             let now = std::time::Instant::now();
