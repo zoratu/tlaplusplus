@@ -544,6 +544,54 @@ where
         self.overflow.checkpoint_flush()
     }
 
+    /// Load all spilled segments from disk into the hot queue (for resume)
+    /// This should be called BEFORE starting workers to ensure spilled states
+    /// are available for processing immediately.
+    /// Returns the number of items loaded.
+    pub fn load_spilled_segments(&self) -> Result<u64> {
+        let mut total_loaded = 0u64;
+        let start = std::time::Instant::now();
+
+        loop {
+            // Keep loading until overflow queue is empty
+            match self.overflow.pop_bulk(50_000) {
+                Ok(items) if !items.is_empty() => {
+                    let count = items.len();
+                    total_loaded += count as u64;
+                    self.disk_loads.fetch_add(count as u64, Ordering::Relaxed);
+                    for item in items {
+                        self.hot.push_global(item);
+                    }
+                    // Print progress every 1M items
+                    if total_loaded % 1_000_000 < 50_000 {
+                        eprintln!(
+                            "Loaded {} items from disk segments ({:.1}s)...",
+                            total_loaded,
+                            start.elapsed().as_secs_f64()
+                        );
+                    }
+                }
+                Ok(_) => {
+                    // No more items to load
+                    break;
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        }
+
+        if total_loaded > 0 {
+            eprintln!(
+                "Finished loading {} items from disk in {:.1}s",
+                total_loaded,
+                start.elapsed().as_secs_f64()
+            );
+        }
+
+        Ok(total_loaded)
+    }
+
     /// Get reference to underlying hot queues (for worker pop operations)
     pub fn hot(&self) -> &Arc<WorkStealingQueues<T>> {
         &self.hot
