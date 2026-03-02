@@ -75,6 +75,8 @@ pub struct WorkStealingQueues<T> {
     has_started: AtomicBool,
     /// Flag to prevent termination during checkpoint (queues may be temporarily empty)
     checkpoint_in_progress: AtomicBool,
+    /// Flag to indicate pause is requested - workers should exit pop_slow_path
+    pause_requested: AtomicBool,
 }
 
 /// Per-worker state that each worker thread owns
@@ -159,6 +161,7 @@ impl<T: 'static> WorkStealingQueues<T> {
             global_popped: AtomicU64::new(0),
             has_started: AtomicBool::new(false),
             checkpoint_in_progress: AtomicBool::new(false),
+            pause_requested: AtomicBool::new(false),
         });
 
         (shared, worker_states)
@@ -337,6 +340,13 @@ impl<T: 'static> WorkStealingQueues<T> {
 
             // Check termination: are all workers idle and no work exists?
             if self.should_terminate(worker_state.id) {
+                return None;
+            }
+
+            // Check if pause requested - exit to allow worker to reach pause point
+            // This is needed because checkpoint sets checkpoint_in_progress which
+            // prevents termination, but workers still need to pause for checkpoint
+            if self.pause_requested.load(Ordering::Acquire) {
                 return None;
             }
 
@@ -541,6 +551,12 @@ impl<T: 'static> WorkStealingQueues<T> {
     pub fn set_checkpoint_in_progress(&self, in_progress: bool) {
         self.checkpoint_in_progress
             .store(in_progress, Ordering::Release);
+    }
+
+    /// Set pause requested flag
+    /// When true, workers will exit pop_slow_path to allow pause to take effect
+    pub fn set_pause_requested(&self, requested: bool) {
+        self.pause_requested.store(requested, Ordering::Release);
     }
 
     pub fn is_empty(&self) -> bool {
