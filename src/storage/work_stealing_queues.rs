@@ -71,6 +71,8 @@ pub struct WorkStealingQueues<T> {
     global_pushed: AtomicU64,
     /// Global popped counter (only updated in batches from workers)
     global_popped: AtomicU64,
+    /// Flag set when first work is taken - prevents premature termination during startup
+    has_started: AtomicBool,
 }
 
 /// Per-worker state that each worker thread owns
@@ -153,6 +155,7 @@ impl<T: 'static> WorkStealingQueues<T> {
             numa_active_counts,
             global_pushed: AtomicU64::new(0),
             global_popped: AtomicU64::new(0),
+            has_started: AtomicBool::new(false),
         });
 
         (shared, worker_states)
@@ -259,11 +262,18 @@ impl<T: 'static> WorkStealingQueues<T> {
         // Fast path: pop from local queue (completely contention-free)
         if let Some(item) = worker_state.worker.pop() {
             worker_state.local_popped += 1;
+            // Mark that exploration has started (prevents premature termination)
+            self.has_started.store(true, Ordering::Release);
             return Some(item);
         }
 
         // Slow path: try global and stealing
-        self.pop_slow_path(worker_state)
+        let result = self.pop_slow_path(worker_state);
+        if result.is_some() {
+            // Mark that exploration has started (prevents premature termination)
+            self.has_started.store(true, Ordering::Release);
+        }
+        result
     }
 
     #[cold]
@@ -436,6 +446,15 @@ impl<T: 'static> WorkStealingQueues<T> {
     fn should_terminate(&self, _worker_id: usize) -> bool {
         if self.finished.load(Ordering::Acquire) {
             return true;
+        }
+
+        // CRITICAL: Don't terminate until at least one state has been popped.
+        // This prevents a race condition during startup where all workers start
+        // simultaneously, one gets the initial state, and others see empty queues
+        // with 0 active workers (the winner hasn't called worker_start yet) and
+        // incorrectly terminate.
+        if !self.has_started.load(Ordering::Acquire) {
+            return false;
         }
 
         // Fast path: Check per-NUMA active counters (O(NUMA_nodes) instead of O(workers))
