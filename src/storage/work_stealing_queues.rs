@@ -73,6 +73,8 @@ pub struct WorkStealingQueues<T> {
     global_popped: AtomicU64,
     /// Flag set when first work is taken - prevents premature termination during startup
     has_started: AtomicBool,
+    /// Flag to prevent termination during checkpoint (queues may be temporarily empty)
+    checkpoint_in_progress: AtomicBool,
 }
 
 /// Per-worker state that each worker thread owns
@@ -156,6 +158,7 @@ impl<T: 'static> WorkStealingQueues<T> {
             global_pushed: AtomicU64::new(0),
             global_popped: AtomicU64::new(0),
             has_started: AtomicBool::new(false),
+            checkpoint_in_progress: AtomicBool::new(false),
         });
 
         (shared, worker_states)
@@ -448,6 +451,12 @@ impl<T: 'static> WorkStealingQueues<T> {
             return true;
         }
 
+        // CRITICAL: Don't terminate during checkpoint - queues may be temporarily empty
+        // while checkpoint is draining and reloading items.
+        if self.checkpoint_in_progress.load(Ordering::Acquire) {
+            return false;
+        }
+
         // CRITICAL: Don't terminate until at least one state has been popped.
         // This prevents a race condition during startup where all workers start
         // simultaneously, one gets the initial state, and others see empty queues
@@ -524,6 +533,14 @@ impl<T: 'static> WorkStealingQueues<T> {
     /// Mark as finished
     pub fn finish(&self) {
         self.finished.store(true, Ordering::Release);
+    }
+
+    /// Set checkpoint in progress flag
+    /// When true, workers will not terminate even if queues appear empty
+    /// (queues may be temporarily drained during checkpoint)
+    pub fn set_checkpoint_in_progress(&self, in_progress: bool) {
+        self.checkpoint_in_progress
+            .store(in_progress, Ordering::Release);
     }
 
     pub fn is_empty(&self) -> bool {
