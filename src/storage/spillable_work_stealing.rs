@@ -631,9 +631,10 @@ where
         self.overflow.checkpoint_flush()?;
 
         if drained > 0 {
+            let segment_count = self.overflow.segment_count();
             eprintln!(
-                "Checkpoint: flushed {} queue items to disk, reloading...",
-                drained
+                "Checkpoint: flushed {} queue items to disk ({} segments), reloading...",
+                drained, segment_count
             );
 
             // Reload the drained items back into memory so workers can continue
@@ -654,11 +655,29 @@ where
                         for item in items {
                             self.hot.push_global(item);
                         }
+                        // Print progress
+                        if reloaded % 1_000_000 < 50_000 {
+                            eprintln!(
+                                "Checkpoint: reloaded {} of {} items ({} segments remain)...",
+                                reloaded,
+                                drained,
+                                self.overflow.segment_count()
+                            );
+                        }
                     }
                     Ok(_) => {
                         // Queue appears empty - might be racing with loader or segments not ready
                         // Wait briefly and retry
                         empty_attempts += 1;
+                        if reloaded < drained && empty_attempts % 10 == 0 {
+                            eprintln!(
+                                "Checkpoint: reload stalled at {} of {} (empty_attempts={}, segments={})",
+                                reloaded,
+                                drained,
+                                empty_attempts,
+                                self.overflow.segment_count()
+                            );
+                        }
                         if reloaded < drained {
                             std::thread::sleep(std::time::Duration::from_millis(10));
                         }
