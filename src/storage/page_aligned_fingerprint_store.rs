@@ -1143,6 +1143,11 @@ impl PageAlignedFingerprintStore {
         sum / self.shards.len() as f64
     }
 
+    /// Get the number of shards
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
     /// Flush (no-op for in-memory store)
     pub fn flush(&self) -> Result<usize> {
         Ok(0)

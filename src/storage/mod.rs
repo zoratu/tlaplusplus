@@ -8,4 +8,5 @@ pub mod page_aligned_fingerprint_store;
 pub mod queue;
 pub mod simple_blocking_queue;
 pub mod spillable_work_stealing;
+pub mod unified_fingerprint_store;
 pub mod work_stealing_queues;
