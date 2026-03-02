@@ -6,6 +6,8 @@ pub mod hybrid_fingerprint_store;
 pub mod numa;
 pub mod page_aligned_fingerprint_store;
 pub mod queue;
+#[cfg(feature = "s3")]
+pub mod s3_persistence;
 pub mod simple_blocking_queue;
 pub mod spillable_work_stealing;
 pub mod unified_fingerprint_store;
