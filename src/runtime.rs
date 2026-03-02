@@ -9,13 +9,14 @@ use crate::storage::fingerprint_store::{
     FingerprintStats as OldFingerprintStats, FingerprintStore,
 };
 use crate::storage::numa::set_preferred_node;
-use crate::storage::page_aligned_fingerprint_store::{
-    FingerprintStats, FingerprintStoreConfig as PageAlignedConfig, PageAlignedFingerprintStore,
-};
+use crate::storage::page_aligned_fingerprint_store::FingerprintStats;
 use crate::storage::queue::{DiskBackedQueue, DiskQueueConfig, QueueStats};
 use crate::storage::simple_blocking_queue::SimpleBlockingQueue;
 use crate::storage::spillable_work_stealing::{
     SpillableConfig, SpillableWorkStealingQueues, SpillableWorkerState,
+};
+use crate::storage::unified_fingerprint_store::{
+    UnifiedFingerprintConfig, UnifiedFingerprintStore,
 };
 use crate::storage::work_stealing_queues::WorkStealingQueues;
 use crate::system::{
@@ -67,6 +68,8 @@ pub struct EngineConfig {
     pub auto_tune: bool,
     /// Enable fingerprint persistence to disk (required for resume)
     pub enable_fp_persistence: bool,
+    /// Use bloom filter for fingerprints (bounded memory, ~1% false positive rate)
+    pub use_bloom_fingerprints: bool,
 }
 
 impl Default for EngineConfig {
@@ -99,6 +102,7 @@ impl Default for EngineConfig {
             queue_max_inmem_items: 50_000_000, // 50M items before spilling
             auto_tune: false,
             enable_fp_persistence: true, // Enable by default for resume support
+            use_bloom_fingerprints: false, // Use page-aligned by default (faster)
         }
     }
 }
@@ -497,8 +501,15 @@ where
     let fp_path = config.work_dir.join("fingerprints");
     let queue_path = config.work_dir.join("queue");
 
-    // Use page-aligned, NUMA-aware fingerprint store for 95%+ CPU utilization
-    // This eliminates TLB thrashing: 48M pages → 98K pages (500x reduction)
+    // Configure fingerprint store based on mode (bloom filter vs page-aligned)
+    //
+    // Page-aligned mode: In-memory hash table with huge pages
+    //   - Fastest, eliminates TLB thrashing
+    //   - Memory usage grows with unique states (unbounded)
+    //
+    // Bloom filter mode: Fixed memory bloom filter
+    //   - Bounded memory (~120MB for 100M items at 1% FPR)
+    //   - Small false positive rate (~1%) may cause re-exploration of some states
 
     // Calculate memory per shard based on expected items
     // Each entry is 16 bytes (8-byte fp + 8-byte padding), plus 10% headroom for open addressing
@@ -518,34 +529,50 @@ where
         // User specified explicit count - round to power of 2 and ensure minimum
         config.fp_shards.next_power_of_two().max(64)
     };
-    // Minimum 64MB per shard to avoid frequent resizes with many workers
-    // Resize is expensive with 380 workers due to seqlock contention
-    let min_shard_bytes = 64 * 1024 * 1024; // 64MB minimum
-    let bytes_per_shard = (total_bytes_needed / shard_count).max(min_shard_bytes);
-    let shard_size_mb = (bytes_per_shard / (1024 * 1024)).max(64); // At least 64MB
+
+    // Only calculate shard_size_mb for page-aligned mode
+    let shard_size_mb = if !config.use_bloom_fingerprints {
+        // Minimum 64MB per shard to avoid frequent resizes with many workers
+        let min_shard_bytes = 64 * 1024 * 1024; // 64MB minimum
+        let bytes_per_shard = (total_bytes_needed / shard_count).max(min_shard_bytes);
+        (bytes_per_shard / (1024 * 1024)).max(64) // At least 64MB
+    } else {
+        0 // Not used in bloom mode
+    };
 
     if std::env::var("TLAPP_VERBOSE").is_ok() {
         eprintln!("Fingerprint store config:");
+        eprintln!(
+            "  Mode: {}",
+            if config.use_bloom_fingerprints {
+                "bloom"
+            } else {
+                "page-aligned"
+            }
+        );
         eprintln!("  Expected items: {}", config.fp_expected_items);
         eprintln!("  Shard count: {}", shard_count);
-        eprintln!("  Shard size: {} MB", shard_size_mb);
-        eprintln!(
-            "  Total memory: {} MB ({:.1} GB)",
-            shard_count * shard_size_mb,
-            (shard_count * shard_size_mb) as f64 / 1024.0
-        );
+        if !config.use_bloom_fingerprints {
+            eprintln!("  Shard size: {} MB", shard_size_mb);
+            eprintln!(
+                "  Total memory: {} MB ({:.1} GB)",
+                shard_count * shard_size_mb,
+                (shard_count * shard_size_mb) as f64 / 1024.0
+            );
+        }
     }
 
-    // Use lock-free page-aligned fingerprint store for high concurrency
-    // At 126 workers, RwLock sharding causes severe contention (~97% throughput loss)
-    // Atomic CAS operations eliminate lock contention entirely
-    let fp_config = PageAlignedConfig {
+    // Create unified fingerprint store (either page-aligned or bloom filter)
+    let fp_config = UnifiedFingerprintConfig {
+        use_bloom: config.use_bloom_fingerprints,
         shard_count,
         expected_items: config.fp_expected_items,
-        shard_size_mb: shard_size_mb,
+        false_positive_rate: config.fp_false_positive_rate,
+        shard_size_mb,
+        num_numa_nodes: worker_plan.numa_nodes_used.max(1),
     };
 
-    let mut fp_store = PageAlignedFingerprintStore::new(fp_config, &worker_plan.assigned_cpus)?;
+    let mut fp_store = UnifiedFingerprintStore::new(fp_config, &worker_plan.assigned_cpus)?;
 
     // Set up fingerprint persistence for resume support
     let fp_persist_runtime = if config.enable_fp_persistence {

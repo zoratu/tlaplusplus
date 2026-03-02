@@ -148,6 +148,10 @@ struct StorageArgs {
     /// Disable fingerprint persistence (persistence is enabled by default for resume support)
     #[arg(long, default_value_t = false)]
     disable_fp_persistence: bool,
+    /// Use bloom filter for fingerprints (bounded memory, ~1% false positive rate)
+    /// This drastically reduces memory usage at the cost of possibly re-exploring ~1% of states
+    #[arg(long, default_value_t = false)]
+    use_bloom_fingerprints: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -267,6 +271,7 @@ fn build_engine_config(
         queue_max_inmem_items: storage.queue_max_inmem_items,
         auto_tune: runtime.auto_tune,
         enable_fp_persistence: runtime.resume || !storage.disable_fp_persistence,
+        use_bloom_fingerprints: storage.use_bloom_fingerprints,
     })
 }
 
