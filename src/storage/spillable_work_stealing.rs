@@ -566,8 +566,96 @@ where
     }
 
     /// Checkpoint - flush all in-memory state to disk
+    /// This drains items from the hot queue (injectors), writes them to disk,
+    /// then reloads them back into memory so workers can continue.
+    /// Call this when workers are paused to ensure all frontier states are persisted.
     pub fn checkpoint_flush(&self) -> Result<()> {
-        self.overflow.checkpoint_flush()
+        // First, drain all items from the hot queue's injectors to the overflow queue
+        // This captures the current frontier that workers haven't processed yet
+        let drained = self.drain_injectors_to_disk()?;
+
+        // Flush the overflow queue to ensure all segments are written to disk
+        self.overflow.checkpoint_flush()?;
+
+        if drained > 0 {
+            eprintln!(
+                "Checkpoint: flushed {} queue items to disk, reloading...",
+                drained
+            );
+
+            // Reload the drained items back into memory so workers can continue
+            // This ensures checkpoint is durable while workers can still process
+            let mut reloaded = 0u64;
+            loop {
+                match self.overflow.pop_bulk(50_000) {
+                    Ok(items) if !items.is_empty() => {
+                        let count = items.len();
+                        reloaded += count as u64;
+                        for item in items {
+                            self.hot.push_global(item);
+                        }
+                    }
+                    Ok(_) => break, // No more items
+                    Err(e) => {
+                        eprintln!("Checkpoint: warning: failed to reload items: {}", e);
+                        break;
+                    }
+                }
+            }
+            eprintln!("Checkpoint: reloaded {} items to memory", reloaded);
+        }
+
+        Ok(())
+    }
+
+    /// Drain all items from injector queues to disk for checkpointing
+    /// Returns the number of items drained
+    fn drain_injectors_to_disk(&self) -> Result<u64> {
+        use crossbeam_deque::Steal;
+
+        let mut total_drained = 0u64;
+
+        // Drain global injector
+        loop {
+            match self.hot.global.steal() {
+                Steal::Success(item) => {
+                    self.overflow.push(item)?;
+                    total_drained += 1;
+                }
+                Steal::Empty => break,
+                Steal::Retry => continue,
+            }
+        }
+
+        // Drain per-NUMA injectors
+        for injector in &self.hot.numa_injectors {
+            loop {
+                match injector.steal() {
+                    Steal::Success(item) => {
+                        self.overflow.push(item)?;
+                        total_drained += 1;
+                    }
+                    Steal::Empty => break,
+                    Steal::Retry => continue,
+                }
+            }
+        }
+
+        // Drain worker stealers (workers should be paused at this point)
+        for stealer in &self.hot.stealers {
+            loop {
+                match stealer.steal() {
+                    Steal::Success(item) => {
+                        self.overflow.push(item)?;
+                        total_drained += 1;
+                    }
+                    Steal::Empty => break,
+                    Steal::Retry => continue,
+                }
+            }
+        }
+
+        Ok(total_drained)
     }
 
     /// Load spilled segments from disk into the hot queue (for resume)
