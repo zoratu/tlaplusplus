@@ -504,6 +504,13 @@ where
         self.hot.set_checkpoint_in_progress(in_progress);
     }
 
+    /// Set pause requested flag
+    /// Call this when requesting worker pause - causes workers to exit
+    /// pop_slow_path so they can reach the worker_pause_point.
+    pub fn set_pause_requested(&self, requested: bool) {
+        self.hot.set_pause_requested(requested);
+    }
+
     /// Mark worker as active
     pub fn worker_start(&self, worker_id: usize) {
         self.hot.worker_start(worker_id);
