@@ -495,6 +495,15 @@ where
         self.checkpoint_in_progress.load(Ordering::Acquire)
     }
 
+    /// Set checkpoint in progress flag
+    /// Call this BEFORE requesting worker pause to prevent workers from
+    /// terminating when they see empty queues during the pause wait.
+    pub fn set_checkpoint_in_progress(&self, in_progress: bool) {
+        self.checkpoint_in_progress
+            .store(in_progress, Ordering::Release);
+        self.hot.set_checkpoint_in_progress(in_progress);
+    }
+
     /// Mark worker as active
     pub fn worker_start(&self, worker_id: usize) {
         self.hot.worker_start(worker_id);
@@ -593,27 +602,16 @@ where
     /// Checkpoint - flush all in-memory state to disk
     /// This drains items from the hot queue (injectors), writes them to disk,
     /// then reloads them back into memory so workers can continue.
-    /// Call this when workers are paused to ensure all frontier states are persisted.
+    ///
+    /// IMPORTANT: Caller must call set_checkpoint_in_progress(true) BEFORE
+    /// requesting worker pause, and set_checkpoint_in_progress(false) AFTER
+    /// resume. This prevents workers from terminating when they see empty
+    /// queues during the pause/checkpoint/resume cycle.
     pub fn checkpoint_flush(&self) -> Result<()> {
-        // Signal to background loader to pause - prevents race condition where
-        // loader consumes disk segments before we can reload them
-        self.checkpoint_in_progress.store(true, Ordering::Release);
-
-        // CRITICAL: Also set the flag on the underlying WorkStealingQueues!
-        // Workers check hot.should_terminate() in pop_slow_path, which won't see
-        // our checkpoint_in_progress flag unless we propagate it to the hot queues.
-        // This prevents workers from terminating when queues appear empty during
-        // checkpoint drain/reload.
-        self.hot.set_checkpoint_in_progress(true);
-
-        // Use a closure to ensure we always clear the flag, even on error
-        let result = self.checkpoint_flush_inner();
-
-        // Re-enable worker termination and background loader (always, even on error)
-        self.hot.set_checkpoint_in_progress(false);
-        self.checkpoint_in_progress.store(false, Ordering::Release);
-
-        result
+        // NOTE: checkpoint_in_progress should already be set by caller before
+        // requesting pause. We don't set/clear it here to avoid race conditions
+        // with worker termination detection.
+        self.checkpoint_flush_inner()
     }
 
     /// Inner checkpoint implementation
