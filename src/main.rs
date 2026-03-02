@@ -154,6 +154,22 @@ struct StorageArgs {
     use_bloom_fingerprints: bool,
 }
 
+#[derive(Args, Clone, Debug, Default)]
+struct S3Args {
+    /// S3 bucket for checkpoint persistence (enables S3 sync)
+    #[arg(long)]
+    s3_bucket: Option<String>,
+    /// S3 prefix/path for this run (e.g., "runs/my-run-123")
+    #[arg(long, default_value = "")]
+    s3_prefix: String,
+    /// S3 region (e.g., "us-east-1"). If not specified, uses instance/env region
+    #[arg(long)]
+    s3_region: Option<String>,
+    /// S3 upload interval in seconds (default: 10)
+    #[arg(long, default_value_t = 10)]
+    s3_upload_interval_secs: u64,
+}
+
 #[derive(Subcommand, Debug)]
 enum Command {
     RunCounterGrid {
@@ -167,6 +183,8 @@ enum Command {
         runtime: RuntimeArgs,
         #[command(flatten)]
         storage: StorageArgs,
+        #[command(flatten)]
+        s3: S3Args,
     },
     RunFlurmLifecycle {
         #[arg(long, default_value_t = 3)]
@@ -177,6 +195,8 @@ enum Command {
         runtime: RuntimeArgs,
         #[command(flatten)]
         storage: StorageArgs,
+        #[command(flatten)]
+        s3: S3Args,
     },
     RunHighBranching {
         #[arg(long, default_value_t = 8)]
@@ -187,6 +207,8 @@ enum Command {
         runtime: RuntimeArgs,
         #[command(flatten)]
         storage: StorageArgs,
+        #[command(flatten)]
+        s3: S3Args,
     },
     RunAdaptiveBranching {
         #[arg(long, default_value_t = 5)]
@@ -205,6 +227,8 @@ enum Command {
         runtime: RuntimeArgs,
         #[command(flatten)]
         storage: StorageArgs,
+        #[command(flatten)]
+        s3: S3Args,
     },
     AnalyzeTla {
         #[arg(long)]
@@ -225,6 +249,8 @@ enum Command {
         runtime: RuntimeArgs,
         #[command(flatten)]
         storage: StorageArgs,
+        #[command(flatten)]
+        s3: S3Args,
     },
 }
 
@@ -330,6 +356,190 @@ fn print_stats(model_name: &str, stats: &tlaplusplus::RunStats) {
     println!("queue.max_inmem_len={}", stats.queue.max_inmem_len);
 }
 
+/// Run a model with optional S3 persistence
+/// If s3.s3_bucket is Some, enables continuous S3 upload and download on resume
+fn run_model_with_s3<M>(
+    model: M,
+    config: EngineConfig,
+    s3: &S3Args,
+) -> anyhow::Result<tlaplusplus::RunOutcome<M::State>>
+where
+    M: tlaplusplus::Model + Send + Sync + 'static,
+    M::State: Clone
+        + std::fmt::Debug
+        + Eq
+        + std::hash::Hash
+        + Send
+        + Sync
+        + serde::Serialize
+        + serde::de::DeserializeOwned,
+{
+    // If S3 is not configured, just run the model directly
+    #[cfg(not(feature = "s3"))]
+    {
+        let _ = s3; // Suppress unused warning
+        return run_model(model, config);
+    }
+
+    #[cfg(feature = "s3")]
+    {
+        use tlaplusplus::storage::s3_persistence::S3Persistence;
+
+        if s3.s3_bucket.is_none() {
+            // No S3 bucket configured, run directly
+            return run_model(model, config);
+        }
+
+        let bucket = s3.s3_bucket.as_ref().unwrap();
+        let prefix = if s3.s3_prefix.is_empty() {
+            // Generate a prefix based on timestamp
+            format!("runs/{}", chrono::Local::now().format("%Y%m%d-%H%M%S"))
+        } else {
+            s3.s3_prefix.clone()
+        };
+
+        eprintln!("S3: Enabled persistence to s3://{}/{}", bucket, prefix);
+
+        // Create tokio runtime for S3 operations
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("s3-io")
+            .enable_all()
+            .build()?;
+
+        // Initialize S3 persistence
+        let mut s3_persist = rt.block_on(async {
+            S3Persistence::new(bucket, &prefix, &config.work_dir, s3.s3_region.as_deref())
+                .await
+                .map(|p| p.with_upload_interval(s3.s3_upload_interval_secs))
+        })?;
+
+        // Download existing state if resuming
+        if config.resume_from_checkpoint {
+            eprintln!("S3: Checking for existing state to resume...");
+            match rt.block_on(s3_persist.download_state()) {
+                Ok(tlaplusplus::storage::s3_persistence::DownloadResult::Resumed {
+                    manifest,
+                    ..
+                }) => {
+                    eprintln!("S3: Resuming from checkpoint in run {}", manifest.run_id);
+                }
+                Ok(tlaplusplus::storage::s3_persistence::DownloadResult::NoExistingState) => {
+                    eprintln!("S3: No existing state found, starting fresh");
+                }
+                Err(e) => {
+                    eprintln!("S3: Warning: failed to download state: {}", e);
+                }
+            }
+        }
+
+        // Start background upload
+        s3_persist.start_background_upload(rt.handle());
+
+        // Set up SIGTERM handler for graceful shutdown
+        let s3_persist = std::sync::Arc::new(std::sync::Mutex::new(Some(s3_persist)));
+        let s3_persist_for_signal = s3_persist.clone();
+        let _rt_handle = rt.handle().clone();
+
+        // Spawn signal handler
+        rt.spawn(async move {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{SignalKind, signal};
+                let mut sigterm =
+                    signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
+                let mut sigint =
+                    signal(SignalKind::interrupt()).expect("Failed to register SIGINT handler");
+
+                tokio::select! {
+                    _ = sigterm.recv() => {
+                        eprintln!("\nS3: Received SIGTERM, performing emergency flush...");
+                    }
+                    _ = sigint.recv() => {
+                        eprintln!("\nS3: Received SIGINT, performing emergency flush...");
+                    }
+                }
+
+                // Take the persist handle out of the mutex before any await
+                let persist_opt = s3_persist_for_signal.lock().unwrap().take();
+
+                // Emergency flush
+                if let Some(mut persist) = persist_opt {
+                    if let Err(e) = persist.emergency_flush().await {
+                        eprintln!("S3: Emergency flush failed: {}", e);
+                    }
+                    if let Err(e) = persist.stop().await {
+                        eprintln!("S3: Stop failed: {}", e);
+                    }
+                }
+
+                std::process::exit(0);
+            }
+
+            #[cfg(not(unix))]
+            {
+                // On non-Unix, just use ctrl-c
+                let _ = tokio::signal::ctrl_c().await;
+                eprintln!("\nS3: Received Ctrl+C, performing emergency flush...");
+
+                // Take the persist handle out of the mutex before any await
+                let persist_opt = s3_persist_for_signal.lock().unwrap().take();
+
+                if let Some(mut persist) = persist_opt {
+                    if let Err(e) = persist.emergency_flush().await {
+                        eprintln!("S3: Emergency flush failed: {}", e);
+                    }
+                    if let Err(e) = persist.stop().await {
+                        eprintln!("S3: Stop failed: {}", e);
+                    }
+                }
+
+                std::process::exit(0);
+            }
+        });
+
+        // Run the model
+        let outcome = run_model(model, config)?;
+
+        // Final flush to S3
+        if let Some(mut persist) = s3_persist.lock().unwrap().take() {
+            eprintln!("S3: Performing final flush...");
+
+            // Add checkpoint state
+            let checkpoint = tlaplusplus::storage::s3_persistence::CheckpointState {
+                id: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+                states_generated: outcome.stats.states_generated,
+                states_distinct: outcome.stats.states_distinct,
+                queue_pending: 0, // Completed
+            };
+
+            rt.block_on(async {
+                if let Err(e) = persist.emergency_flush().await {
+                    eprintln!("S3: Final flush error: {}", e);
+                }
+                if let Err(e) = persist.upload_manifest(Some(checkpoint)).await {
+                    eprintln!("S3: Manifest upload error: {}", e);
+                }
+                if let Err(e) = persist.stop().await {
+                    eprintln!("S3: Stop error: {}", e);
+                }
+            });
+
+            let stats = persist.stats();
+            eprintln!(
+                "S3: Total uploaded: {} files, {:.2} MB",
+                stats.files_uploaded,
+                stats.bytes_uploaded as f64 / 1_048_576.0
+            );
+        }
+
+        Ok(outcome)
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -340,10 +550,11 @@ fn main() -> anyhow::Result<()> {
             max_sum,
             runtime,
             storage,
+            s3,
         } => {
             let model = CounterGridModel::new(max_x, max_y, max_sum);
             let config = build_engine_config(&runtime, &storage)?;
-            let outcome = run_model(model, config)?;
+            let outcome = run_model_with_s3(model, config, &s3)?;
             print_stats("counter-grid", &outcome.stats);
             if let Some(violation) = outcome.violation {
                 println!("violation=true");
@@ -358,10 +569,11 @@ fn main() -> anyhow::Result<()> {
             max_time_limit,
             runtime,
             storage,
+            s3,
         } => {
             let model = FlurmJobLifecycleModel::new(max_jobs, max_time_limit);
             let config = build_engine_config(&runtime, &storage)?;
-            let outcome = run_model(model, config)?;
+            let outcome = run_model_with_s3(model, config, &s3)?;
             print_stats("flurm-job-lifecycle", &outcome.stats);
             if let Some(violation) = outcome.violation {
                 println!("violation=true");
@@ -376,10 +588,11 @@ fn main() -> anyhow::Result<()> {
             branching_factor,
             runtime,
             storage,
+            s3,
         } => {
             let model = HighBranchingModel::new(max_depth, branching_factor);
             let config = build_engine_config(&runtime, &storage)?;
-            let outcome = run_model(model, config)?;
+            let outcome = run_model_with_s3(model, config, &s3)?;
             print_stats("high-branching", &outcome.stats);
             if let Some(violation) = outcome.violation {
                 println!("violation=true");
@@ -397,6 +610,7 @@ fn main() -> anyhow::Result<()> {
             adjustment_interval_secs,
             runtime,
             storage,
+            s3: _, // S3 not yet integrated with adaptive branching
         } => {
             use std::sync::Arc;
             use std::sync::atomic::{AtomicBool, Ordering};
@@ -813,6 +1027,7 @@ fn main() -> anyhow::Result<()> {
             next,
             runtime,
             storage,
+            s3,
         } => {
             // Auto-detect config file if not specified
             let config_path = config.or_else(|| {
@@ -849,7 +1064,7 @@ fn main() -> anyhow::Result<()> {
             let model_for_liveness = model.clone();
 
             let config = build_engine_config(&runtime, &storage)?;
-            let outcome = run_model(model, config).map_err(|e| {
+            let outcome = run_model_with_s3(model, config, &s3).map_err(|e| {
                 eprintln!("Error running model:");
                 eprintln!("  {}", e);
                 e
