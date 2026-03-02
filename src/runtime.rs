@@ -806,6 +806,13 @@ where
                     eprintln!("Checkpoint: starting periodic checkpoint...");
                     let ckpt_start = Instant::now();
 
+                    // CRITICAL: Set checkpoint flag BEFORE requesting pause!
+                    // This prevents workers from terminating when they see empty
+                    // queues while waiting for pause. Without this, workers in
+                    // pop_slow_path check should_terminate(), see empty queues,
+                    // and exit before checkpoint can drain/reload items.
+                    ckpt_queue.set_checkpoint_in_progress(true);
+
                     // Request pause and wait for workers to quiesce
                     ckpt_pause.request_pause();
                     ckpt_pause.wait_for_quiescence(
@@ -818,6 +825,7 @@ where
                     if let Err(e) = ckpt_queue.checkpoint_flush() {
                         eprintln!("Checkpoint: queue flush failed: {}", e);
                         ckpt_pause.resume();
+                        ckpt_queue.set_checkpoint_in_progress(false);
                         continue;
                     }
 
@@ -825,6 +833,7 @@ where
                     if let Err(e) = ckpt_fp_store.flush() {
                         eprintln!("Checkpoint: fingerprint flush failed: {}", e);
                         ckpt_pause.resume();
+                        ckpt_queue.set_checkpoint_in_progress(false);
                         continue;
                     }
 
@@ -885,8 +894,9 @@ where
                         );
                     }
 
-                    // Resume workers
+                    // Resume workers and allow termination again
                     ckpt_pause.resume();
+                    ckpt_queue.set_checkpoint_in_progress(false);
                     last_checkpoint = Instant::now();
                 }
             }))
