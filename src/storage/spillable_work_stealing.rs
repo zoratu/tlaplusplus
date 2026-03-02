@@ -473,7 +473,14 @@ where
     }
 
     /// Check termination - must check both hot and disk
+    /// Also prevents termination during checkpoint to avoid race condition
     pub fn should_terminate(&self) -> bool {
+        // CRITICAL: Don't terminate during checkpoint!
+        // Checkpoint drains queues to disk, so queues may appear empty.
+        // Workers must wait for checkpoint to finish and reload items.
+        if self.checkpoint_in_progress.load(Ordering::Acquire) {
+            return false;
+        }
         if self.hot.has_pending_work() {
             return false;
         }
@@ -481,6 +488,11 @@ where
             return false;
         }
         true
+    }
+
+    /// Check if a checkpoint is currently in progress
+    pub fn is_checkpoint_in_progress(&self) -> bool {
+        self.checkpoint_in_progress.load(Ordering::Acquire)
     }
 
     /// Mark worker as active
@@ -587,10 +599,18 @@ where
         // loader consumes disk segments before we can reload them
         self.checkpoint_in_progress.store(true, Ordering::Release);
 
+        // CRITICAL: Also set the flag on the underlying WorkStealingQueues!
+        // Workers check hot.should_terminate() in pop_slow_path, which won't see
+        // our checkpoint_in_progress flag unless we propagate it to the hot queues.
+        // This prevents workers from terminating when queues appear empty during
+        // checkpoint drain/reload.
+        self.hot.set_checkpoint_in_progress(true);
+
         // Use a closure to ensure we always clear the flag, even on error
         let result = self.checkpoint_flush_inner();
 
-        // Re-enable background loader (always, even on error)
+        // Re-enable worker termination and background loader (always, even on error)
+        self.hot.set_checkpoint_in_progress(false);
         self.checkpoint_in_progress.store(false, Ordering::Release);
 
         result
