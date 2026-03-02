@@ -756,8 +756,143 @@ where
     }
 
     let checkpoint_thread_stop = Arc::new(AtomicBool::new(false));
-    // Checkpointing disabled for work-stealing queues
-    let checkpoint_thread: Option<std::thread::JoinHandle<()>> = None;
+
+    // Checkpoint thread - periodically flushes queue and fingerprints to disk
+    let checkpoint_thread: Option<std::thread::JoinHandle<()>> =
+        if config.checkpoint_interval_secs > 0 {
+            let ckpt_stop = Arc::clone(&checkpoint_thread_stop);
+            let ckpt_pause = Arc::clone(&pause);
+            let ckpt_queue = Arc::clone(&queue);
+            let ckpt_fp_store = Arc::clone(&fp_store);
+            let ckpt_run_stats = Arc::clone(&run_stats);
+            let ckpt_active_workers = Arc::clone(&active_workers);
+            let ckpt_live_workers = Arc::clone(&live_workers);
+            let ckpt_exploration_stop = Arc::clone(&stop);
+            let ckpt_interval = Duration::from_secs(config.checkpoint_interval_secs);
+            let ckpt_work_dir = config.work_dir.clone();
+            let ckpt_model_name = std::any::type_name::<M>().to_string();
+            let ckpt_worker_count = worker_plan.worker_count;
+            let ckpt_allowed_cpus = worker_plan.allowed_cpus.len();
+            let ckpt_cgroup_cpuset_cores = worker_plan.cgroup_cpuset_cores;
+            let ckpt_cgroup_quota_cores = worker_plan.cgroup_quota_cores;
+            let ckpt_numa_nodes_used = worker_plan.numa_nodes_used;
+            let ckpt_effective_memory_max = effective_memory_max;
+            let ckpt_resumed = resumed_from_checkpoint;
+            let ckpt_started_at = started_at;
+            let ckpt_configured_workers = config.workers;
+
+            Some(std::thread::spawn(move || {
+                let checkpoint_path = ckpt_work_dir.join("checkpoints").join("latest.json");
+                let mut last_checkpoint = Instant::now();
+
+                loop {
+                    // Sleep in small increments to check stop flag
+                    std::thread::sleep(Duration::from_secs(1));
+
+                    if ckpt_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+
+                    // Check if it's time for a checkpoint
+                    if last_checkpoint.elapsed() < ckpt_interval {
+                        continue;
+                    }
+
+                    // Don't checkpoint if exploration has stopped
+                    if ckpt_exploration_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+
+                    eprintln!("Checkpoint: starting periodic checkpoint...");
+                    let ckpt_start = Instant::now();
+
+                    // Request pause and wait for workers to quiesce
+                    ckpt_pause.request_pause();
+                    ckpt_pause.wait_for_quiescence(
+                        &ckpt_exploration_stop,
+                        &ckpt_active_workers,
+                        &ckpt_live_workers,
+                    );
+
+                    // Flush queue state to disk
+                    if let Err(e) = ckpt_queue.checkpoint_flush() {
+                        eprintln!("Checkpoint: queue flush failed: {}", e);
+                        ckpt_pause.resume();
+                        continue;
+                    }
+
+                    // Flush fingerprints to disk
+                    if let Err(e) = ckpt_fp_store.flush() {
+                        eprintln!("Checkpoint: fingerprint flush failed: {}", e);
+                        ckpt_pause.resume();
+                        continue;
+                    }
+
+                    // Write checkpoint manifest
+                    let (
+                        states_generated,
+                        states_processed,
+                        states_distinct,
+                        duplicates,
+                        enqueued,
+                        checkpoints,
+                    ) = ckpt_run_stats.snapshot();
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let manifest = CheckpointManifest {
+                        version: 1,
+                        model: ckpt_model_name.clone(),
+                        created_unix_secs: now,
+                        duration_millis: ckpt_started_at.elapsed().as_millis() as u64,
+                        states_generated,
+                        states_processed,
+                        states_distinct,
+                        duplicates,
+                        enqueued,
+                        checkpoints,
+                        configured_workers: ckpt_configured_workers,
+                        actual_workers: ckpt_worker_count,
+                        allowed_cpu_count: ckpt_allowed_cpus,
+                        cgroup_cpuset_cores: ckpt_cgroup_cpuset_cores,
+                        cgroup_quota_cores: ckpt_cgroup_quota_cores,
+                        numa_nodes_used: ckpt_numa_nodes_used,
+                        effective_memory_max_bytes: ckpt_effective_memory_max,
+                        resumed_from_checkpoint: ckpt_resumed,
+                        queue: ckpt_queue.stats(),
+                        fingerprints: {
+                            let stats = ckpt_fp_store.stats();
+                            OldFingerprintStats {
+                                checks: stats.checks,
+                                hits: stats.hits,
+                                inserts: stats.inserts,
+                                batch_calls: stats.batch_calls,
+                                batch_items: stats.batch_items,
+                            }
+                        },
+                    };
+
+                    if let Err(e) = write_checkpoint_manifest(&checkpoint_path, &manifest) {
+                        eprintln!("Checkpoint: failed to write manifest: {}", e);
+                    } else {
+                        ckpt_run_stats.checkpoints.fetch_add(1, Ordering::Relaxed);
+                        eprintln!(
+                            "Checkpoint: completed in {:.1}s (states: {}, distinct: {})",
+                            ckpt_start.elapsed().as_secs_f64(),
+                            states_generated,
+                            states_distinct
+                        );
+                    }
+
+                    // Resume workers
+                    ckpt_pause.resume();
+                    last_checkpoint = Instant::now();
+                }
+            }))
+        } else {
+            None
+        };
 
     // Work-stealing queues detect completion internally
     // No need for separate monitor thread

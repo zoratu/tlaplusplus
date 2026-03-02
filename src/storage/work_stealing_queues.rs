@@ -35,13 +35,13 @@ const MAX_REMOTE_STEAL_ATTEMPTS: usize = 1;
 pub struct WorkStealingQueues<T> {
     /// Per-NUMA injector queues for fingerprint-based state routing
     /// States are pushed to their fingerprint's home NUMA's injector
-    numa_injectors: Vec<Injector<T>>,
+    pub(crate) numa_injectors: Vec<Injector<T>>,
 
     /// Legacy global injector (for initial states, will be deprecated)
-    global: Injector<T>,
+    pub(crate) global: Injector<T>,
 
     /// Stealers for all workers (used by other workers to steal)
-    stealers: Vec<Stealer<T>>,
+    pub(crate) stealers: Vec<Stealer<T>>,
 
     /// Completion flag
     finished: AtomicBool,
