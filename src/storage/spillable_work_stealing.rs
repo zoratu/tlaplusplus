@@ -105,8 +105,12 @@ pub struct SpillableWorkStealingQueues<T> {
     /// Signal to stop background threads
     stop_signal: Arc<AtomicBool>,
 
-    /// Flag to pause loader during checkpoint (prevents race condition)
+    /// Flag to prevent worker termination during checkpoint
     checkpoint_in_progress: Arc<AtomicBool>,
+
+    /// Flag to pause loader during checkpoint drain (prevents race with drain)
+    /// Only set during the actual drain operation, not the whole checkpoint
+    checkpoint_draining: Arc<AtomicBool>,
 
     /// Stats
     spill_redirects: AtomicU64,
@@ -170,14 +174,15 @@ where
 
         // Start background loader thread
         let checkpoint_in_progress = Arc::new(AtomicBool::new(false));
+        let checkpoint_draining = Arc::new(AtomicBool::new(false));
         let loader_hot = Arc::clone(&hot);
         let loader_overflow = Arc::clone(&overflow);
         let loader_stop = Arc::clone(&stop_signal);
-        let loader_checkpoint = Arc::clone(&checkpoint_in_progress);
+        let loader_draining = Arc::clone(&checkpoint_draining);
         let loader_handle = std::thread::Builder::new()
             .name("tlapp-queue-loader".to_string())
             .spawn(move || {
-                Self::loader_thread(loader_hot, loader_overflow, loader_stop, loader_checkpoint);
+                Self::loader_thread(loader_hot, loader_overflow, loader_stop, loader_draining);
             })?;
 
         let queues = Arc::new(Self {
@@ -188,6 +193,7 @@ where
             loader_handle: Some(loader_handle),
             stop_signal,
             checkpoint_in_progress,
+            checkpoint_draining,
             spill_redirects: AtomicU64::new(0),
             disk_loads: AtomicU64::new(0),
             spill_batches_sent: AtomicU64::new(0),
@@ -267,7 +273,7 @@ where
         hot: Arc<WorkStealingQueues<T>>,
         overflow: Arc<DiskBackedQueue<T>>,
         stop: Arc<AtomicBool>,
-        checkpoint_in_progress: Arc<AtomicBool>,
+        checkpoint_draining: Arc<AtomicBool>,
     ) {
         while !stop.load(Ordering::Acquire) {
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -276,9 +282,9 @@ where
                 break;
             }
 
-            // Skip loading during checkpoint - checkpoint_flush will reload items itself
-            // This prevents a race where loader consumes segments before checkpoint can reload them
-            if checkpoint_in_progress.load(Ordering::Acquire) {
+            // Skip loading only during checkpoint drain - prevents race with drain_injectors_to_disk
+            // Once drain completes, we can start loading items back from disk
+            if checkpoint_draining.load(Ordering::Acquire) {
                 continue;
             }
 
@@ -623,6 +629,9 @@ where
 
     /// Inner checkpoint implementation
     fn checkpoint_flush_inner(&self) -> Result<()> {
+        // Block the background loader during drain to prevent race condition
+        self.checkpoint_draining.store(true, Ordering::Release);
+
         // First, drain all items from the hot queue's injectors to the overflow queue
         // This captures the current frontier that workers haven't processed yet
         let drained = self.drain_injectors_to_disk()?;
@@ -630,73 +639,21 @@ where
         // Flush the overflow queue to ensure all segments are written to disk
         self.overflow.checkpoint_flush()?;
 
+        // Unblock the background loader - it can start reloading items now
+        // This happens BEFORE S3 upload, so reload progresses during upload
+        self.checkpoint_draining.store(false, Ordering::Release);
+
         if drained > 0 {
             let segment_count = self.overflow.segment_count();
             eprintln!(
-                "Checkpoint: flushed {} queue items to disk ({} segments), reloading...",
+                "Checkpoint: flushed {} queue items to disk ({} segments)",
                 drained, segment_count
             );
-
-            // Reload the drained items back into memory so workers can continue
-            // This ensures checkpoint is durable while workers can still process
-            // CRITICAL: We must reload at least `drained` items before returning,
-            // otherwise workers may wake up, find empty queues, and terminate.
-            // The background loader thread might race with us, so we retry with backoff.
-            let mut reloaded = 0u64;
-            let mut empty_attempts = 0;
-            const MAX_EMPTY_ATTEMPTS: u32 = 50; // 50 * 10ms = 500ms max wait
-
-            while reloaded < drained && empty_attempts < MAX_EMPTY_ATTEMPTS {
-                match self.overflow.pop_bulk(50_000) {
-                    Ok(items) if !items.is_empty() => {
-                        let count = items.len();
-                        reloaded += count as u64;
-                        empty_attempts = 0; // Reset on success
-                        for item in items {
-                            self.hot.push_global(item);
-                        }
-                        // Print progress
-                        if reloaded % 1_000_000 < 50_000 {
-                            eprintln!(
-                                "Checkpoint: reloaded {} of {} items ({} segments remain)...",
-                                reloaded,
-                                drained,
-                                self.overflow.segment_count()
-                            );
-                        }
-                    }
-                    Ok(_) => {
-                        // Queue appears empty - might be racing with loader or segments not ready
-                        // Wait briefly and retry
-                        empty_attempts += 1;
-                        if reloaded < drained && empty_attempts % 10 == 0 {
-                            eprintln!(
-                                "Checkpoint: reload stalled at {} of {} (empty_attempts={}, segments={})",
-                                reloaded,
-                                drained,
-                                empty_attempts,
-                                self.overflow.segment_count()
-                            );
-                        }
-                        if reloaded < drained {
-                            std::thread::sleep(std::time::Duration::from_millis(10));
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Checkpoint: warning: failed to reload items: {}", e);
-                        empty_attempts += 1;
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                }
-            }
-
-            if reloaded < drained {
-                eprintln!(
-                    "Checkpoint: warning: only reloaded {} of {} items (background loader may have consumed the rest)",
-                    reloaded, drained
-                );
-            }
-            eprintln!("Checkpoint: reloaded {} items to memory", reloaded);
+            // NOTE: We no longer reload synchronously here to avoid memory spike.
+            // The background loader will reload items gradually after checkpoint
+            // completes and workers resume. Workers won't terminate during this
+            // period because checkpoint_in_progress flag prevents termination.
+            // The runtime waits for queue to refill before clearing the flag.
         }
 
         Ok(())
