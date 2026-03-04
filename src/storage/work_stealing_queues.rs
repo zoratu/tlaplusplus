@@ -625,6 +625,15 @@ impl<T: 'static> WorkStealingQueues<T> {
         let popped = self.global_popped.load(Ordering::Relaxed);
         pushed.saturating_sub(popped)
     }
+
+    /// Adjust counters after draining items (e.g., during checkpoint)
+    /// This treats drained items as if they were popped, so pending_count() stays accurate
+    pub fn adjust_counters_after_drain(&self, drained_count: u64) {
+        // Increment popped counter to reflect items that were drained to disk
+        // This ensures pending_count() returns an accurate value after checkpoint
+        self.global_popped
+            .fetch_add(drained_count, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

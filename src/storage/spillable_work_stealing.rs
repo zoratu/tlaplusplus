@@ -268,41 +268,108 @@ where
         }
     }
 
-    /// Background thread that loads from disk when hot queues are empty
+    /// Background thread that loads from disk when hot queues need refilling
     fn loader_thread(
         hot: Arc<WorkStealingQueues<T>>,
         overflow: Arc<DiskBackedQueue<T>>,
         stop: Arc<AtomicBool>,
         checkpoint_draining: Arc<AtomicBool>,
     ) {
-        while !stop.load(Ordering::Acquire) {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+        // Threshold: start loading when queue drops below this
+        // Must be high enough to keep 64+ workers busy while loading more
+        const LOW_WATER_MARK: u64 = 500_000;
+        // Stop loading when queue reaches this level (avoid OOM)
+        const HIGH_WATER_MARK: u64 = 10_000_000;
+        // Load larger batches for efficiency
+        const LOAD_BATCH_SIZE: usize = 100_000;
 
+        while !stop.load(Ordering::Acquire) {
             if stop.load(Ordering::Acquire) {
                 break;
             }
 
             // Skip loading only during checkpoint drain - prevents race with drain_injectors_to_disk
-            // Once drain completes, we can start loading items back from disk
             if checkpoint_draining.load(Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
                 continue;
             }
 
             // Check if hot queues need refilling
-            if !hot.is_empty() {
+            // - Below LOW_WATER_MARK: load aggressively (no sleep between batches)
+            // - Between LOW and HIGH: keep loading (with brief pauses)
+            // - Above HIGH_WATER_MARK: pause loading to avoid OOM
+            let pending = hot.pending_count();
+            let should_load_aggressively = pending < LOW_WATER_MARK;
+
+            if pending >= HIGH_WATER_MARK {
+                // Queue is full enough, pause to avoid OOM
+                std::thread::sleep(std::time::Duration::from_millis(50));
                 continue;
             }
 
-            // Try to load a batch from disk
-            match overflow.pop_bulk(10_000) {
+            // Queue is low or empty - check if disk has items
+            let has_work = overflow.has_pending_work();
+            let segment_count = overflow.segment_count();
+
+            // Log state every 10 seconds (to track loader behavior)
+            static LAST_DEBUG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let last = LAST_DEBUG.load(std::sync::atomic::Ordering::Relaxed);
+            if now_secs >= last + 10 {
+                if LAST_DEBUG
+                    .compare_exchange(
+                        last,
+                        now_secs,
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    eprintln!(
+                        "Loader debug: pending={}, has_work={}, segments={}, aggressive={}",
+                        pending, has_work, segment_count, should_load_aggressively
+                    );
+                }
+            }
+
+            if !has_work {
+                // No disk items, sleep before checking again
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            }
+
+            // Aggressively load from disk - no sleep between loads when disk has work
+            match overflow.pop_bulk(LOAD_BATCH_SIZE) {
                 Ok(items) if !items.is_empty() => {
+                    let count = items.len();
                     for item in items {
                         hot.push_global(item);
                     }
+                    // Log first few loads to confirm loader is working
+                    static LOAD_LOG_COUNT: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let log_num = LOAD_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if log_num < 10 || log_num % 100 == 0 {
+                        eprintln!(
+                            "Loader: loaded {} items from disk (pending was {}, segments left: {})",
+                            count,
+                            pending,
+                            overflow.segment_count()
+                        );
+                    }
+                    // No sleep between batches - keep loading until HIGH_WATER_MARK
+                    // Workers need items faster than the 5ms sleep allows
                 }
-                Ok(_) => {}
+                Ok(_) => {
+                    // Empty batch, brief pause
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
                 Err(e) => {
                     eprintln!("Warning: disk queue load error: {}", e);
+                    std::thread::sleep(std::time::Duration::from_millis(100));
                 }
             }
         }
@@ -635,6 +702,13 @@ where
         // First, drain all items from the hot queue's injectors to the overflow queue
         // This captures the current frontier that workers haven't processed yet
         let drained = self.drain_injectors_to_disk()?;
+
+        // CRITICAL: Adjust the hot queue's counters so pending_count() reflects reality
+        // Without this, the loader thread sees pending_count() >> LOW_WATER_MARK
+        // and doesn't reload items from disk, causing worker starvation!
+        if drained > 0 {
+            self.hot.adjust_counters_after_drain(drained);
+        }
 
         // Flush the overflow queue to ensure all segments are written to disk
         self.overflow.checkpoint_flush()?;

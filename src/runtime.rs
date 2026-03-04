@@ -1280,6 +1280,20 @@ where
                 let state = match worker_queue.pop_for_worker(&mut worker_state) {
                     Some(state) => state,
                     None => {
+                        // During checkpoint, pop_for_worker returns None because pause_requested
+                        // is set. Workers should NOT terminate - they need to continue the loop
+                        // to hit the pause_point, wait for resume, and then re-enter pop_for_worker.
+                        if worker_queue.is_checkpoint_in_progress() {
+                            continue;
+                        }
+                        // After checkpoint, the loader thread may still be loading items from disk.
+                        // Workers should not terminate while there's pending disk work - the loader
+                        // will push items to the global queue that workers can steal.
+                        if worker_queue.has_pending_work() {
+                            // Give the loader thread time to load more items
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            continue;
+                        }
                         // No work available and exploration complete
                         break;
                     }
@@ -1375,6 +1389,7 @@ where
                     worker_model.next_states(&state, &mut successors);
                 }
 
+                let successors_before_filter = successors.len();
                 local_states_generated += successors.len() as u64;
 
                 // Filter successors by state constraints (prune states that don't satisfy constraints)
@@ -1384,6 +1399,19 @@ where
                             .check_action_constraints(&state, next_state)
                             .is_ok()
                 });
+
+                // Debug: track constraint filtering
+                static DEBUG_STATES_SAMPLED: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let sample_count = DEBUG_STATES_SAMPLED.fetch_add(1, Ordering::Relaxed);
+                if sample_count < 10 {
+                    eprintln!(
+                        "DEBUG [state {}]: {} successors generated, {} after constraint filter",
+                        sample_count,
+                        successors_before_filter,
+                        successors.len()
+                    );
+                }
 
                 // Pair states with their fingerprint's home NUMA for routing
                 let mut states_with_home_numa: Vec<(M::State, usize)> =
