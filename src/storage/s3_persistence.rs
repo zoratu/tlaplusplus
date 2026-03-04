@@ -113,13 +113,27 @@ impl S3Persistence {
 
         let client = Client::new(&config);
 
-        // Verify bucket access
-        client
-            .head_bucket()
+        // Try a lightweight check - list with max 1 key to verify access
+        // head_bucket requires additional permissions that may not be granted
+        match client
+            .list_objects_v2()
             .bucket(bucket)
+            .prefix(prefix)
+            .max_keys(1)
             .send()
             .await
-            .context(format!("Cannot access S3 bucket: {}", bucket))?;
+        {
+            Ok(_) => {}
+            Err(e) => {
+                // Log the full error for debugging
+                eprintln!("S3: Bucket access check failed: {:?}", e);
+                return Err(anyhow::anyhow!(
+                    "Cannot access S3 bucket: {} - {}",
+                    bucket,
+                    e
+                ));
+            }
+        }
 
         Ok(Self {
             client,
