@@ -1,9 +1,9 @@
-use crate::canon::{ColoredGraph, canonicalize};
-use anyhow::{Result, anyhow};
+use crate::tla::{TlaState, TlaValue};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Debug;
 use std::hash::Hash;
+use std::sync::Arc;
 
 /// Symmetry specification for state space reduction
 ///
@@ -11,11 +11,19 @@ use std::hash::Hash;
 /// under permutations of certain values. For example, if a system has
 /// multiple identical processes, states that differ only by process IDs
 /// are equivalent and only one representative needs to be explored.
+///
+/// IMPORTANT: Values can only be permuted within their own symmetry group.
+/// For example, if Bots = {b1, b2} and Nodes = {n1, n2}, then b1 can be
+/// swapped with b2, and n1 can be swapped with n2, but b1 CANNOT be
+/// swapped with n1 - they are different types of model values.
 #[derive(Debug, Clone)]
 pub struct SymmetrySpec {
-    /// The set of values that can be permuted (e.g., process IDs, node names)
+    /// The name of the symmetry set (e.g., "Symmetry")
     pub symmetric_set: String,
-    /// Cached set of symmetric values (model values)
+    /// Groups of symmetric values - values within each group can be permuted
+    /// but values from different groups cannot be interchanged
+    pub symmetry_groups: Option<Vec<HashSet<String>>>,
+    /// Flat set of all symmetric values (for quick membership check)
     pub symmetric_values: Option<HashSet<String>>,
 }
 
@@ -23,16 +31,27 @@ impl SymmetrySpec {
     pub fn new(symmetric_set: String) -> Self {
         Self {
             symmetric_set,
+            symmetry_groups: None,
             symmetric_values: None,
         }
     }
 
-    /// Initialize the symmetric values from a TLA+ state
+    /// Initialize with separate symmetry groups
+    /// Each group contains values that can be permuted among themselves
+    pub fn initialize_with_groups(&mut self, groups: Vec<HashSet<String>>) {
+        let all_values: HashSet<String> = groups.iter().flat_map(|g| g.iter().cloned()).collect();
+        self.symmetric_values = Some(all_values);
+        self.symmetry_groups = Some(groups);
+    }
+
+    /// Initialize the symmetric values from a TLA+ state (legacy single-group)
     ///
     /// This should be called once during model initialization to determine
     /// which values are in the symmetric set.
     pub fn initialize_from_config(&mut self, values: HashSet<String>) {
-        self.symmetric_values = Some(values);
+        self.symmetric_values = Some(values.clone());
+        // Single group for backwards compatibility
+        self.symmetry_groups = Some(vec![values]);
     }
 
     /// Check if a value is in the symmetric set
@@ -42,6 +61,13 @@ impl SymmetrySpec {
             .map(|vals| vals.contains(value))
             .unwrap_or(false)
     }
+
+    /// Get the symmetry group that contains a given value
+    pub fn get_group_for_value(&self, value: &str) -> Option<&HashSet<String>> {
+        self.symmetry_groups
+            .as_ref()
+            .and_then(|groups| groups.iter().find(|group| group.contains(value)))
+    }
 }
 
 /// Computes a canonical representative of a state's symmetry class
@@ -50,57 +76,162 @@ impl SymmetrySpec {
 /// symmetric values in the state. This ensures that all symmetric states
 /// map to the same canonical representative.
 ///
-/// This implementation uses graph canonicalization to compute the
-/// canonical permutation efficiently.
+/// IMPORTANT: Permutations are applied independently to each symmetry group.
+/// Values from different groups are never interchanged.
 pub fn canonicalize_state<S>(state: &S, symmetry: &SymmetrySpec) -> S
 where
     S: Clone + Debug + Serialize + for<'de> Deserialize<'de>,
 {
-    // For TLA+ states, we serialize to JSON, apply permutation, and deserialize
-    // This is a simple but general approach that works for any serializable state
+    // For generic types, we can't directly manipulate the structure
+    // Fall back to identity for non-TlaState types
+    state.clone()
+}
 
-    if symmetry.symmetric_values.is_none() {
-        // No symmetric values - return state unchanged
-        return state.clone();
-    }
-
-    // Serialize state to JSON
-    let json_str = match serde_json::to_string(state) {
-        Ok(s) => s,
-        Err(_) => return state.clone(), // Fallback: return unchanged
+/// Specialized canonicalization for TlaState that directly manipulates the structure
+pub fn canonicalize_tla_state(state: &TlaState, symmetry: &SymmetrySpec) -> TlaState {
+    let groups = match &symmetry.symmetry_groups {
+        Some(g) if !g.is_empty() => g,
+        _ => return state.clone(),
     };
 
-    // Extract all occurrences of symmetric values
-    let symmetric_values = symmetry.symmetric_values.as_ref().unwrap();
-    let mut found_values = Vec::new();
+    // First, find all symmetric values that appear in the state
+    let mut found_values: Vec<HashSet<String>> = groups.iter().map(|_| HashSet::new()).collect();
+    collect_model_values_in_state(state, groups, &mut found_values);
 
-    for sym_val in symmetric_values {
-        if json_str.contains(sym_val) {
-            found_values.push(sym_val.clone());
+    // For each group, compute the canonical permutation based on found values
+    let mut full_permutation: HashMap<String, String> = HashMap::new();
+    for (group_idx, (group, found)) in groups.iter().zip(found_values.iter()).enumerate() {
+        if found.is_empty() {
+            continue;
         }
+
+        let found_vec: Vec<String> = found.iter().cloned().collect();
+        let group_permutation = compute_canonical_permutation(&found_vec, group);
+
+        // Debug: print first permutation
+        static DEBUG_PERM: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !DEBUG_PERM.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("DEBUG group {}: found values {:?}", group_idx, found);
+            eprintln!(
+                "DEBUG group {}: permutation {:?}",
+                group_idx, group_permutation
+            );
+        }
+
+        full_permutation.extend(group_permutation);
     }
 
-    if found_values.is_empty() {
-        // No symmetric values in state - return unchanged
+    if full_permutation.is_empty() || full_permutation.iter().all(|(k, v)| k == v) {
         return state.clone();
     }
 
-    // Compute canonical permutation using graph canonicalization
-    let permutation = compute_canonical_permutation(&found_values, symmetric_values);
+    // Apply the permutation to the state
+    apply_permutation_to_state(state, &full_permutation)
+}
 
-    // Apply permutation to state by replacing values in JSON
-    let mut canonical_json = json_str;
-    for (from, to) in permutation {
-        // Replace all occurrences (careful to avoid partial matches)
-        // This is a simple string replacement - a more robust implementation
-        // would parse the JSON structure
-        canonical_json = canonical_json.replace(&format!("\"{}\"", from), &format!("\"{}\"", to));
+/// Recursively collect all ModelValue strings that appear in a state
+fn collect_model_values_in_state(
+    state: &TlaState,
+    groups: &[HashSet<String>],
+    found: &mut [HashSet<String>],
+) {
+    for value in state.values() {
+        collect_model_values_in_value(value, groups, found);
     }
+}
 
-    // Deserialize back to state
-    match serde_json::from_str(&canonical_json) {
-        Ok(canonical_state) => canonical_state,
-        Err(_) => state.clone(), // Fallback on error
+fn collect_model_values_in_value(
+    value: &TlaValue,
+    groups: &[HashSet<String>],
+    found: &mut [HashSet<String>],
+) {
+    match value {
+        TlaValue::ModelValue(s) => {
+            // Check which group this value belongs to
+            for (group_idx, group) in groups.iter().enumerate() {
+                if group.contains(s) {
+                    found[group_idx].insert(s.clone());
+                    break;
+                }
+            }
+        }
+        TlaValue::Set(items) => {
+            for item in items.iter() {
+                collect_model_values_in_value(item, groups, found);
+            }
+        }
+        TlaValue::Seq(items) => {
+            for item in items.iter() {
+                collect_model_values_in_value(item, groups, found);
+            }
+        }
+        TlaValue::Record(fields) => {
+            for val in fields.values() {
+                collect_model_values_in_value(val, groups, found);
+            }
+        }
+        TlaValue::Function(map) => {
+            for (k, v) in map.iter() {
+                collect_model_values_in_value(k, groups, found);
+                collect_model_values_in_value(v, groups, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Apply a permutation to all ModelValue instances in a state
+fn apply_permutation_to_state(state: &TlaState, permutation: &HashMap<String, String>) -> TlaState {
+    state
+        .iter()
+        .map(|(k, v)| (k.clone(), apply_permutation_to_value(v, permutation)))
+        .collect()
+}
+
+fn apply_permutation_to_value(value: &TlaValue, permutation: &HashMap<String, String>) -> TlaValue {
+    match value {
+        TlaValue::ModelValue(s) => {
+            if let Some(replacement) = permutation.get(s) {
+                TlaValue::ModelValue(replacement.clone())
+            } else {
+                value.clone()
+            }
+        }
+        TlaValue::Set(items) => {
+            let new_items: BTreeSet<TlaValue> = items
+                .iter()
+                .map(|item| apply_permutation_to_value(item, permutation))
+                .collect();
+            TlaValue::Set(Arc::new(new_items))
+        }
+        TlaValue::Seq(items) => {
+            let new_items: Vec<TlaValue> = items
+                .iter()
+                .map(|item| apply_permutation_to_value(item, permutation))
+                .collect();
+            TlaValue::Seq(Arc::new(new_items))
+        }
+        TlaValue::Record(fields) => {
+            let new_fields: BTreeMap<String, TlaValue> = fields
+                .iter()
+                .map(|(k, v)| (k.clone(), apply_permutation_to_value(v, permutation)))
+                .collect();
+            TlaValue::Record(Arc::new(new_fields))
+        }
+        TlaValue::Function(map) => {
+            let new_map: BTreeMap<TlaValue, TlaValue> = map
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        apply_permutation_to_value(k, permutation),
+                        apply_permutation_to_value(v, permutation),
+                    )
+                })
+                .collect();
+            TlaValue::Function(Arc::new(new_map))
+        }
+        _ => value.clone(),
     }
 }
 
@@ -138,53 +269,41 @@ where
     }
 }
 
-/// Permutation-based canonicalization for TLA+ states
+/// Compute canonical permutation for a symmetry group
 ///
-/// Uses graph canonicalization (Nauty-like algorithm) to find the
-/// canonical permutation of symmetric values.
+/// Maps the found values to canonical representatives. For example, if the
+/// group is {bot1, bot2, bot3} and the state contains {bot3, bot1}, then
+/// we map bot1 → bot1, bot3 → bot2 (using the first N sorted canonical values).
+///
+/// This ensures that ALL states using any 2 bots will canonicalize to use
+/// bot1 and bot2, regardless of which specific bots they originally used.
 pub fn compute_canonical_permutation(
-    state_values: &[String],
-    symmetric_values: &HashSet<String>,
+    found_values: &[String],
+    group: &HashSet<String>,
 ) -> HashMap<String, String> {
-    // Extract symmetric values that appear in the state
-    let mut appearing_symmetric: Vec<String> = state_values
-        .iter()
-        .filter(|v| symmetric_values.contains(*v))
-        .cloned()
-        .collect();
-
-    if appearing_symmetric.is_empty() {
+    if found_values.is_empty() {
         return HashMap::new();
     }
 
-    // Remove duplicates and sort for determinism
-    appearing_symmetric.sort();
-    appearing_symmetric.dedup();
+    // Sort the found values
+    let mut sorted_found: Vec<String> = found_values.to_vec();
+    sorted_found.sort();
+    sorted_found.dedup();
 
-    // Build a colored graph for canonicalization
-    // For simple model values, we create a graph where:
-    // - Each value is a vertex
-    // - All values have the same color (they're symmetric)
-    // - Edges represent relationships (for now, no edges - just vertex ordering)
-    let mut graph = ColoredGraph::new();
+    // Sort the full group to get canonical labels
+    let mut canonical_labels: Vec<String> = group.iter().cloned().collect();
+    canonical_labels.sort();
 
-    for value in &appearing_symmetric {
-        graph.add_vertex(value.clone(), 0); // All same color
+    // Map each found value to its canonical counterpart
+    // found[i] → canonical[i]
+    let mut permutation = HashMap::new();
+    for (i, found_val) in sorted_found.iter().enumerate() {
+        if i < canonical_labels.len() {
+            permutation.insert(found_val.clone(), canonical_labels[i].clone());
+        }
     }
 
-    // Canonicalize the graph
-    let labeling = canonicalize(&graph);
-
-    // Extract the permutation from the canonical labeling
-    labeling.permutation
-}
-
-/// Apply a permutation to a value (recursively through state structure)
-pub fn apply_permutation_to_value(value: &str, permutation: &HashMap<String, String>) -> String {
     permutation
-        .get(value)
-        .cloned()
-        .unwrap_or_else(|| value.to_string())
 }
 
 #[cfg(test)]
@@ -234,12 +353,18 @@ mod tests {
         permutation.insert("old_value".to_string(), "new_value".to_string());
 
         assert_eq!(
-            apply_permutation_to_value("old_value", &permutation),
-            "new_value"
+            apply_permutation_to_value(
+                &TlaValue::ModelValue("old_value".to_string()),
+                &permutation
+            ),
+            TlaValue::ModelValue("new_value".to_string())
         );
         assert_eq!(
-            apply_permutation_to_value("other_value", &permutation),
-            "other_value"
+            apply_permutation_to_value(
+                &TlaValue::ModelValue("other_value".to_string()),
+                &permutation
+            ),
+            TlaValue::ModelValue("other_value".to_string())
         );
     }
 }
