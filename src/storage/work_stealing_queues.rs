@@ -77,6 +77,9 @@ pub struct WorkStealingQueues<T> {
     checkpoint_in_progress: AtomicBool,
     /// Flag to indicate pause is requested - workers should exit pop_slow_path
     pause_requested: AtomicBool,
+    /// Flag set by spillable wrapper when disk overflow has pending work
+    /// Prevents termination when hot queues are empty but disk has items
+    disk_has_pending_work: AtomicBool,
 }
 
 /// Per-worker state that each worker thread owns
@@ -162,6 +165,7 @@ impl<T: 'static> WorkStealingQueues<T> {
             has_started: AtomicBool::new(false),
             checkpoint_in_progress: AtomicBool::new(false),
             pause_requested: AtomicBool::new(false),
+            disk_has_pending_work: AtomicBool::new(false),
         });
 
         (shared, worker_states)
@@ -467,6 +471,14 @@ impl<T: 'static> WorkStealingQueues<T> {
             return false;
         }
 
+        // CRITICAL: Don't terminate if disk overflow has pending work.
+        // The loader thread will push items from disk to our global queue.
+        // Without this check, workers would terminate when hot queues are empty
+        // but millions of items exist on disk waiting to be loaded.
+        if self.disk_has_pending_work.load(Ordering::Acquire) {
+            return false;
+        }
+
         // CRITICAL: Don't terminate until at least one state has been popped.
         // This prevents a race condition during startup where all workers start
         // simultaneously, one gets the initial state, and others see empty queues
@@ -557,6 +569,13 @@ impl<T: 'static> WorkStealingQueues<T> {
     /// When true, workers will exit pop_slow_path to allow pause to take effect
     pub fn set_pause_requested(&self, requested: bool) {
         self.pause_requested.store(requested, Ordering::Release);
+    }
+
+    /// Set flag indicating disk overflow has pending work
+    /// Called by spillable wrapper to prevent termination when disk has items
+    pub fn set_disk_has_pending_work(&self, has_work: bool) {
+        self.disk_has_pending_work
+            .store(has_work, Ordering::Release);
     }
 
     pub fn is_empty(&self) -> bool {
