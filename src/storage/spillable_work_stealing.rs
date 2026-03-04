@@ -301,20 +301,21 @@ where
             let pending = hot.pending_count();
             let should_load_aggressively = pending < LOW_WATER_MARK;
 
+            // Queue is low or empty - check if disk has items
+            let has_work = overflow.has_pending_work();
+            let segment_count = overflow.segment_count();
+
+            // CRITICAL: Update hot queue's disk_has_pending_work flag BEFORE any continue.
+            // This prevents workers from terminating when hot queues are empty
+            // but disk has millions of items waiting to be loaded.
+            // Must happen every iteration, even when pending >= HIGH_WATER_MARK.
+            hot.set_disk_has_pending_work(has_work);
+
             if pending >= HIGH_WATER_MARK {
                 // Queue is full enough, pause to avoid OOM
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 continue;
             }
-
-            // Queue is low or empty - check if disk has items
-            let has_work = overflow.has_pending_work();
-            let segment_count = overflow.segment_count();
-
-            // CRITICAL: Update hot queue's disk_has_pending_work flag
-            // This prevents workers from terminating when hot queues are empty
-            // but disk has millions of items waiting to be loaded.
-            hot.set_disk_has_pending_work(has_work);
 
             // Log state every 10 seconds (to track loader behavior)
             static LAST_DEBUG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
