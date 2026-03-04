@@ -58,6 +58,7 @@ pub struct DiskBackedQueue<T> {
     inmem_len: AtomicUsize,
     inmem_limit: usize,
     spill_batch: usize,
+    spill_dir_path: PathBuf,
     spill_tx: Mutex<Option<Sender<Vec<T>>>>,
     segments: Arc<Mutex<VecDeque<PathBuf>>>,
     /// Segments that have been loaded but not yet deleted (for crash recovery)
@@ -74,6 +75,7 @@ pub struct DiskBackedQueue<T> {
     finished: AtomicBool,
     pub num_waiting: AtomicUsize,
     num_workers: AtomicUsize,
+    next_segment_id: Arc<AtomicU64>,
 }
 
 impl<T> DiskBackedQueue<T>
@@ -135,17 +137,19 @@ where
         let writer_inflight = Arc::clone(&spill_inflight);
         let writer_error_ref = Arc::clone(&writer_error);
         let writer_dir = config.spill_dir.clone();
-        let mut next_segment_id = 0u64;
+        let spill_dir_path = config.spill_dir.clone();
+        let mut initial_segment_id = 0u64;
         if let Some((id, _)) = existing_segments.last() {
-            next_segment_id = id.saturating_add(1);
+            initial_segment_id = id.saturating_add(1);
         }
+        let next_segment_id = Arc::new(AtomicU64::new(initial_segment_id));
+        let writer_segment_id = Arc::clone(&next_segment_id);
         let writer_handle = std::thread::Builder::new()
             .name("tlapp-queue-spill".to_string())
             .spawn(move || {
-                let mut segment_id = next_segment_id;
                 while let Ok(batch) = spill_rx.recv() {
+                    let segment_id = writer_segment_id.fetch_add(1, Ordering::Relaxed);
                     let segment_path = writer_dir.join(format!("segment-{segment_id:016}.bin"));
-                    segment_id += 1;
 
                     let serialized = bincode::serialize(&batch);
                     match serialized {
@@ -202,6 +206,7 @@ where
             inmem_len: AtomicUsize::new(0),
             inmem_limit: config.inmem_limit.max(100),
             spill_batch: config.spill_batch.max(16),
+            spill_dir_path,
             spill_tx: Mutex::new(Some(spill_tx)),
             segments,
             consumed_segments: Arc::new(Mutex::new(Vec::new())),
@@ -215,6 +220,7 @@ where
             finished: AtomicBool::new(false),
             num_waiting: AtomicUsize::new(0),
             num_workers: AtomicUsize::new(0),
+            next_segment_id,
         })
     }
 
@@ -543,6 +549,21 @@ where
         self.segments.lock().len()
     }
 
+    /// Register a segment that was written externally (for parallel checkpoint)
+    pub fn register_segment(&self, path: PathBuf) {
+        self.segments.lock().push_back(path);
+    }
+
+    /// Allocate the next segment ID atomically (for parallel checkpoint)
+    pub fn allocate_segment_id(&self) -> u64 {
+        self.next_segment_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Get the spill directory path
+    pub fn get_spill_dir(&self) -> &std::path::Path {
+        &self.spill_dir_path
+    }
+
     pub fn checkpoint_flush(&self) -> Result<()> {
         eprintln!("DiskBackedQueue: checkpoint_flush starting");
         self.check_error()?;
@@ -587,6 +608,137 @@ where
         // is now in the newly-spilled segments, not the consumed ones
         self.delete_consumed_segments();
         eprintln!("DiskBackedQueue: checkpoint_flush completed");
+
+        self.check_error()
+    }
+
+    /// Parallel checkpoint flush - writes batches using multiple threads
+    /// This is faster than checkpoint_flush because it bypasses the async channel
+    /// and writes directly to disk in parallel.
+    pub fn parallel_checkpoint_flush(&self, num_threads: usize) -> Result<()> {
+        eprintln!(
+            "DiskBackedQueue: parallel_checkpoint_flush starting with {} threads",
+            num_threads
+        );
+        self.check_error()?;
+
+        // First, wait for any in-flight async writes to complete
+        while self.spill_inflight.load(Ordering::Acquire) != 0 {
+            self.check_error()?;
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        // Collect all items into batches
+        let mut batches: Vec<Vec<T>> = Vec::new();
+        let mut current_batch = Vec::with_capacity(self.spill_batch);
+
+        while let Some(item) = self.inmem.pop() {
+            self.inmem_len.fetch_sub(1, Ordering::Release);
+            current_batch.push(item);
+
+            if current_batch.len() >= self.spill_batch {
+                batches.push(std::mem::take(&mut current_batch));
+                current_batch = Vec::with_capacity(self.spill_batch);
+            }
+        }
+
+        if !current_batch.is_empty() {
+            batches.push(current_batch);
+        }
+
+        let total_batches = batches.len();
+        if total_batches == 0 {
+            eprintln!("DiskBackedQueue: parallel_checkpoint_flush - nothing to flush");
+            self.delete_consumed_segments();
+            return Ok(());
+        }
+
+        eprintln!(
+            "DiskBackedQueue: parallel_checkpoint_flush - writing {} batches",
+            total_batches
+        );
+
+        // Write batches in parallel using thread scope
+        let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let segments_written: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+        let items_written = AtomicU64::new(0);
+        let batch_queue: Mutex<Vec<Vec<T>>> = Mutex::new(batches);
+
+        std::thread::scope(|s| {
+            for thread_id in 0..num_threads.min(total_batches) {
+                let batch_queue = &batch_queue;
+                let errors = &errors;
+                let segments_written = &segments_written;
+                let items_written = &items_written;
+                let next_segment_id = &self.next_segment_id;
+                let spill_dir = &self.spill_dir_path;
+                let segments = &self.segments;
+
+                s.spawn(move || {
+                    loop {
+                        // Get next batch
+                        let batch = {
+                            let mut guard = batch_queue.lock();
+                            guard.pop()
+                        };
+
+                        let batch = match batch {
+                            Some(b) => b,
+                            None => break,
+                        };
+
+                        let batch_len = batch.len();
+
+                        // Get unique segment ID
+                        let segment_id = next_segment_id.fetch_add(1, Ordering::Relaxed);
+                        let segment_path = spill_dir.join(format!("segment-{segment_id:016}.bin"));
+
+                        // Serialize and write
+                        match bincode::serialize(&batch) {
+                            Ok(bytes) => match std::fs::write(&segment_path, &bytes) {
+                                Ok(()) => {
+                                    segments.lock().push_back(segment_path.clone());
+                                    segments_written.lock().push(segment_path);
+                                    items_written.fetch_add(batch_len as u64, Ordering::Relaxed);
+                                }
+                                Err(e) => {
+                                    errors
+                                        .lock()
+                                        .push(format!("thread {} write error: {}", thread_id, e));
+                                }
+                            },
+                            Err(e) => {
+                                errors
+                                    .lock()
+                                    .push(format!("thread {} serialize error: {}", thread_id, e));
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        // Check for errors
+        let errs = errors.into_inner();
+        if !errs.is_empty() {
+            return Err(anyhow!("parallel checkpoint errors: {:?}", errs));
+        }
+
+        let written = items_written.load(Ordering::Relaxed);
+        self.stats
+            .spilled_items
+            .fetch_add(written, Ordering::Relaxed);
+        self.stats
+            .spill_batches
+            .fetch_add(total_batches as u64, Ordering::Relaxed);
+
+        eprintln!(
+            "DiskBackedQueue: parallel_checkpoint_flush completed - {} items in {} batches",
+            written, total_batches
+        );
+
+        // Delete consumed segments
+        self.delete_consumed_segments();
 
         self.check_error()
     }
