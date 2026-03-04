@@ -1,6 +1,6 @@
 use crate::fairness::{ActionLabel, FairnessConstraint, LabeledTransition};
 use crate::model::Model;
-use crate::symmetry::{SymmetrySpec, canonicalize_state};
+use crate::symmetry::{SymmetrySpec, canonicalize_tla_state};
 use crate::tla::{
     ClauseKind, CompiledActionIr, CompiledExpr, ConfigValue, EvalContext, TemporalFormula,
     TlaConfig, TlaDefinition, TlaModule, TlaState, TlaValue, classify_clause, compile_action_ir,
@@ -263,7 +263,40 @@ impl Model for TlaModel {
 
         // Apply symmetry reduction if specified
         let canonical_state = if let Some(ref symmetry) = self.symmetry {
-            canonicalize_state(state, symmetry)
+            let canonical = canonicalize_tla_state(state, symmetry);
+            // Debug: track canonicalization statistics
+            static FP_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            static FP_CHANGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            static DEBUG_PRINTED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+
+            let total = FP_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if state != &canonical {
+                FP_CHANGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+
+            // Print first state and periodic summary
+            if total == 0 {
+                eprintln!(
+                    "DEBUG fingerprint: symmetry.symmetric_values = {:?}",
+                    symmetry.symmetric_values
+                );
+                if state != &canonical {
+                    eprintln!("DEBUG fingerprint: state WAS canonicalized (states differ)");
+                } else {
+                    eprintln!("DEBUG fingerprint: state unchanged by canonicalization");
+                }
+            }
+            if total > 0 && total % 500_000 == 0 {
+                let changed = FP_CHANGED.load(std::sync::atomic::Ordering::Relaxed);
+                eprintln!(
+                    "DEBUG symmetry: {} total fingerprints, {} ({:.1}%) had canonicalization changes",
+                    total,
+                    changed,
+                    (changed as f64 / total as f64) * 100.0
+                );
+            }
+            canonical
         } else {
             state.clone()
         };
@@ -466,23 +499,108 @@ fn resolve_action_constraint_exprs(module: &TlaModule, cfg: &TlaConfig) -> Vec<(
 fn resolve_symmetry(module: &TlaModule, cfg: &TlaConfig) -> Option<SymmetrySpec> {
     cfg.symmetry.as_ref().map(|sym_name| {
         let mut spec = SymmetrySpec::new(sym_name.clone());
+        let mut symmetry_groups: Vec<HashSet<String>> = Vec::new();
 
-        // Try to extract symmetric values from constants
-        // If the constant is a set of model values, those are the symmetric values
+        // Try to extract symmetric values from constants first (single group)
         if let Some(ConfigValue::Set(values)) = cfg.constants.get(sym_name) {
-            let mut symmetric_values = HashSet::new();
+            let mut group = HashSet::new();
             for val in values {
                 if let ConfigValue::ModelValue(model_val) = val {
-                    symmetric_values.insert(model_val.clone());
+                    group.insert(model_val.clone());
                 }
             }
-            if !symmetric_values.is_empty() {
-                spec.initialize_from_config(symmetric_values);
+            if !group.is_empty() {
+                symmetry_groups.push(group);
             }
+        }
+
+        // If not found in constants, look up in module definitions
+        // This handles cases like: Symmetry == Permutations(Bots) \union Permutations(Sellers)
+        // IMPORTANT: Each Permutations(SetName) creates a SEPARATE symmetry group!
+        if symmetry_groups.is_empty() {
+            if let Some(def) = module.definitions.get(sym_name) {
+                // Extract Permutations(SetName) calls from the definition
+                let set_names = extract_permutation_sets(&def.body, &module.definitions);
+                for set_name in &set_names {
+                    // Each set becomes its own symmetry group
+                    if let Some(ConfigValue::Set(values)) = cfg.constants.get(set_name) {
+                        let mut group = HashSet::new();
+                        for val in values {
+                            if let ConfigValue::ModelValue(model_val) = val {
+                                group.insert(model_val.clone());
+                            }
+                        }
+                        if !group.is_empty() {
+                            symmetry_groups.push(group);
+                        }
+                    }
+                }
+                if !symmetry_groups.is_empty() {
+                    let total_values: usize = symmetry_groups.iter().map(|g| g.len()).sum();
+                    eprintln!("Symmetry '{}' initialized from module definition: {} groups, {} total values",
+                        sym_name, symmetry_groups.len(), total_values);
+                    for (i, group) in symmetry_groups.iter().enumerate() {
+                        eprintln!("  Group {}: {} values ({:?})", i, group.len(),
+                            group.iter().take(5).cloned().collect::<Vec<_>>());
+                    }
+                }
+            }
+        }
+
+        if !symmetry_groups.is_empty() {
+            spec.initialize_with_groups(symmetry_groups);
+        } else {
+            eprintln!("Warning: Symmetry '{}' specified but no symmetric values found", sym_name);
         }
 
         spec
     })
+}
+
+/// Extract set names from Permutations(...) calls in an expression
+/// Handles expressions like: Permutations(Bots) \union Permutations(Sellers)
+/// Also follows definition references like: BotSymmetry \union SellerSymmetry
+fn extract_permutation_sets(
+    expr: &str,
+    definitions: &BTreeMap<String, TlaDefinition>,
+) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut visited = HashSet::new();
+    extract_permutation_sets_recursive(expr, definitions, &mut result, &mut visited);
+    result
+}
+
+fn extract_permutation_sets_recursive(
+    expr: &str,
+    definitions: &BTreeMap<String, TlaDefinition>,
+    result: &mut Vec<String>,
+    visited: &mut HashSet<String>,
+) {
+    // Find Permutations(SetName) calls using regex-like matching
+    let mut pos = 0;
+    while let Some(perm_start) = expr[pos..].find("Permutations(") {
+        let abs_start = pos + perm_start + "Permutations(".len();
+        // Find the matching closing paren
+        let rest = &expr[abs_start..];
+        if let Some(paren_end) = rest.find(')') {
+            let set_name = rest[..paren_end].trim().to_string();
+            if !set_name.is_empty() && !result.contains(&set_name) {
+                result.push(set_name);
+            }
+        }
+        pos = abs_start;
+    }
+
+    // Also look for references to other definitions that might contain Permutations
+    // Handle expressions like: BotSymmetry \union SellerSymmetry
+    for (def_name, def) in definitions {
+        // Check if this definition name appears in the expression
+        if expr.contains(def_name) && !visited.contains(def_name) {
+            visited.insert(def_name.clone());
+            // Recursively extract from this definition
+            extract_permutation_sets_recursive(&def.body, definitions, result, visited);
+        }
+    }
 }
 
 fn resolve_view(module: &TlaModule, cfg: &TlaConfig) -> Option<String> {
