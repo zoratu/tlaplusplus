@@ -315,6 +315,26 @@ When memory fills up, the system gracefully degrades:
    - On memory pressure signals, triggers checkpoint to persist state
    - Allows resumption after restart with more memory
 
+### Checkpoint and Recovery
+
+Periodic checkpoints (`--checkpoint-interval-secs`) persist state for crash recovery:
+
+**Checkpoint process:**
+1. Workers pause at designated pause points
+2. In-memory queue items drain to disk (creates segment files)
+3. Fingerprint store flushes to disk
+4. Manifest written with state counts and metadata
+5. Workers resume, loader thread reloads items from disk
+
+**Post-checkpoint throughput recovery:**
+- Loader thread refills queue from disk segments (100K items/batch)
+- Workers wait for pending disk work before terminating
+- Maintains ~6M states/min throughput after checkpoint (vs ~500K without fixes)
+- Key mechanisms:
+  - `adjust_counters_after_drain()` keeps `pending_count()` accurate
+  - Workers check `has_pending_work()` before breaking from main loop
+  - Aggressive loading (no sleep between batches) when queue < 500K items
+
 ## Current Status
 
 **Working**:
@@ -329,9 +349,11 @@ When memory fills up, the system gracefully degrades:
 - Native TLA+ frontend (direct `.tla` execution)
 - Full TLA+ language coverage
 
+**Partially implemented**:
+- Symmetry reduction (multi-group support, needs more testing)
+
 **Not yet implemented**:
 - Temporal/liveness checking
-- Symmetry reduction
 
 ## Key Implementation Notes
 
