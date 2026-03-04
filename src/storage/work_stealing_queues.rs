@@ -293,6 +293,12 @@ impl<T: 'static> WorkStealingQueues<T> {
         let my_numa = worker_state.numa_node;
 
         loop {
+            // CRITICAL: Check pause_requested early in the loop.
+            // This ensures workers can exit even if Steal::Retry keeps looping.
+            if self.pause_requested.load(Ordering::Acquire) {
+                return None;
+            }
+
             // 1. Try local NUMA's injector first (states homed here for fingerprint locality)
             if my_numa < self.numa_injectors.len() {
                 match self.numa_injectors[my_numa].steal() {
@@ -569,6 +575,11 @@ impl<T: 'static> WorkStealingQueues<T> {
     /// When true, workers will exit pop_slow_path to allow pause to take effect
     pub fn set_pause_requested(&self, requested: bool) {
         self.pause_requested.store(requested, Ordering::Release);
+    }
+
+    /// Check if pause is requested
+    pub fn is_pause_requested(&self) -> bool {
+        self.pause_requested.load(Ordering::Acquire)
     }
 
     /// Set flag indicating disk overflow has pending work

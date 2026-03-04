@@ -212,10 +212,12 @@ impl PauseController {
         active_workers: &AtomicUsize,
         live_workers: &AtomicUsize,
     ) {
+        eprintln!("Checkpoint: entering wait_for_quiescence");
         let mut iterations = 0u64;
         let start = Instant::now();
         loop {
             if stop.load(Ordering::Acquire) {
+                eprintln!("Checkpoint: wait_for_quiescence breaking due to stop");
                 break;
             }
             let paused = self.paused_workers.load(Ordering::Acquire);
@@ -235,6 +237,13 @@ impl PauseController {
             }
 
             if paused >= live && active == 0 {
+                eprintln!(
+                    "Checkpoint: quiescence achieved: paused={}/{}, active={}, elapsed={:.1}s",
+                    paused,
+                    live,
+                    active,
+                    start.elapsed().as_secs_f64()
+                );
                 break;
             }
             std::thread::sleep(Duration::from_millis(1));

@@ -544,30 +544,49 @@ where
     }
 
     pub fn checkpoint_flush(&self) -> Result<()> {
+        eprintln!("DiskBackedQueue: checkpoint_flush starting");
         self.check_error()?;
 
         let mut spill = Vec::with_capacity(self.spill_batch);
+        let mut spill_count = 0usize;
         while let Some(item) = self.inmem.pop() {
             self.inmem_len.fetch_sub(1, Ordering::Release);
             spill.push(item);
             if spill.len() >= self.spill_batch {
                 let batch = std::mem::take(&mut spill);
                 self.spill_batch_now(batch)?;
+                spill_count += 1;
+                if spill_count % 10 == 0 {
+                    eprintln!("DiskBackedQueue: spilled {} batches", spill_count);
+                }
             }
         }
         if !spill.is_empty() {
             self.spill_batch_now(spill)?;
+            spill_count += 1;
         }
+        eprintln!("DiskBackedQueue: finished spilling {} batches", spill_count);
 
+        let mut wait_iterations = 0u64;
         while self.spill_inflight.load(Ordering::Acquire) != 0 {
             self.check_error()?;
+            wait_iterations += 1;
+            if wait_iterations % 5000 == 0 {
+                eprintln!(
+                    "DiskBackedQueue: waiting for spill_inflight={} to become 0, waited {}s",
+                    self.spill_inflight.load(Ordering::Acquire),
+                    wait_iterations / 1000
+                );
+            }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+        eprintln!("DiskBackedQueue: spill_inflight is now 0");
 
         // Now that everything is safely on disk, delete consumed segments
         // This is safe because: if we crash after this point, the queue state
         // is now in the newly-spilled segments, not the consumed ones
         self.delete_consumed_segments();
+        eprintln!("DiskBackedQueue: checkpoint_flush completed");
 
         self.check_error()
     }

@@ -518,13 +518,29 @@ where
 
     /// Pop work for a worker
     pub fn pop_for_worker(&self, worker_state: &mut SpillableWorkerState<T>) -> Option<T> {
+        // CRITICAL: Check pause_requested early to avoid blocking on disk I/O.
+        // During checkpoint, we need workers to reach pause_point quickly.
+        if self.hot.is_pause_requested() {
+            return None;
+        }
+
         // Try hot queues first
         if let Some(item) = self.hot.pop_for_worker(&mut worker_state.inner) {
             return Some(item);
         }
 
+        // Check pause again before potentially blocking disk I/O
+        if self.hot.is_pause_requested() {
+            return None;
+        }
+
         // Hot queues empty - try loading directly from overflow
         self.try_load_from_disk();
+
+        // Check pause AGAIN after disk I/O
+        if self.hot.is_pause_requested() {
+            return None;
+        }
 
         // Try hot again after loading
         self.hot.pop_for_worker(&mut worker_state.inner)
@@ -702,22 +718,33 @@ where
 
     /// Inner checkpoint implementation
     fn checkpoint_flush_inner(&self) -> Result<()> {
+        eprintln!("Checkpoint: checkpoint_flush_inner starting");
+
         // Block the background loader during drain to prevent race condition
         self.checkpoint_draining.store(true, Ordering::Release);
+        eprintln!("Checkpoint: checkpoint_draining set to true");
 
         // First, drain all items from the hot queue's injectors to the overflow queue
         // This captures the current frontier that workers haven't processed yet
+        eprintln!("Checkpoint: starting drain_injectors_to_disk");
         let drained = self.drain_injectors_to_disk()?;
+        eprintln!(
+            "Checkpoint: drain_injectors_to_disk returned {} items",
+            drained
+        );
 
         // CRITICAL: Adjust the hot queue's counters so pending_count() reflects reality
         // Without this, the loader thread sees pending_count() >> LOW_WATER_MARK
         // and doesn't reload items from disk, causing worker starvation!
         if drained > 0 {
             self.hot.adjust_counters_after_drain(drained);
+            eprintln!("Checkpoint: adjusted counters after drain");
         }
 
         // Flush the overflow queue to ensure all segments are written to disk
+        eprintln!("Checkpoint: calling overflow.checkpoint_flush");
         self.overflow.checkpoint_flush()?;
+        eprintln!("Checkpoint: overflow.checkpoint_flush completed");
 
         // Unblock the background loader - it can start reloading items now
         // This happens BEFORE S3 upload, so reload progresses during upload
@@ -745,43 +772,77 @@ where
         use crossbeam_deque::Steal;
 
         let mut total_drained = 0u64;
+        const MAX_RETRIES_PER_QUEUE: u32 = 1000;
 
         // Drain global injector
+        let mut retries = 0u32;
         loop {
             match self.hot.global.steal() {
                 Steal::Success(item) => {
                     self.overflow.push(item)?;
                     total_drained += 1;
+                    retries = 0;
                 }
                 Steal::Empty => break,
-                Steal::Retry => continue,
+                Steal::Retry => {
+                    retries += 1;
+                    if retries > MAX_RETRIES_PER_QUEUE {
+                        eprintln!("Warning: drain global injector hit retry limit, breaking");
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
             }
         }
 
         // Drain per-NUMA injectors
-        for injector in &self.hot.numa_injectors {
+        for (node_idx, injector) in self.hot.numa_injectors.iter().enumerate() {
+            retries = 0;
             loop {
                 match injector.steal() {
                     Steal::Success(item) => {
                         self.overflow.push(item)?;
                         total_drained += 1;
+                        retries = 0;
                     }
                     Steal::Empty => break,
-                    Steal::Retry => continue,
+                    Steal::Retry => {
+                        retries += 1;
+                        if retries > MAX_RETRIES_PER_QUEUE {
+                            eprintln!(
+                                "Warning: drain NUMA injector {} hit retry limit, breaking",
+                                node_idx
+                            );
+                            break;
+                        }
+                        std::hint::spin_loop();
+                    }
                 }
             }
         }
 
         // Drain worker stealers (workers should be paused at this point)
-        for stealer in &self.hot.stealers {
+        for (worker_idx, stealer) in self.hot.stealers.iter().enumerate() {
+            retries = 0;
             loop {
                 match stealer.steal() {
                     Steal::Success(item) => {
                         self.overflow.push(item)?;
                         total_drained += 1;
+                        retries = 0;
                     }
                     Steal::Empty => break,
-                    Steal::Retry => continue,
+                    Steal::Retry => {
+                        retries += 1;
+                        if retries > MAX_RETRIES_PER_QUEUE {
+                            eprintln!(
+                                "Warning: drain worker {} stealer hit retry limit, breaking",
+                                worker_idx
+                            );
+                            break;
+                        }
+                        std::hint::spin_loop();
+                    }
                 }
             }
         }
