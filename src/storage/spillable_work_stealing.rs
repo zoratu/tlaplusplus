@@ -742,9 +742,18 @@ where
         }
 
         // Flush the overflow queue to ensure all segments are written to disk
-        eprintln!("Checkpoint: calling overflow.checkpoint_flush");
-        self.overflow.checkpoint_flush()?;
-        eprintln!("Checkpoint: overflow.checkpoint_flush completed");
+        // Use parallel checkpoint with multiple threads for faster I/O
+        let num_checkpoint_threads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4)
+            .min(32); // Cap at 32 threads for I/O
+        eprintln!(
+            "Checkpoint: calling overflow.parallel_checkpoint_flush with {} threads",
+            num_checkpoint_threads
+        );
+        self.overflow
+            .parallel_checkpoint_flush(num_checkpoint_threads)?;
+        eprintln!("Checkpoint: overflow.parallel_checkpoint_flush completed");
 
         // Unblock the background loader - it can start reloading items now
         // This happens BEFORE S3 upload, so reload progresses during upload
@@ -768,7 +777,191 @@ where
 
     /// Drain all items from injector queues to disk for checkpointing
     /// Returns the number of items drained
+    /// This uses the legacy async channel approach
     fn drain_injectors_to_disk(&self) -> Result<u64> {
+        self.drain_injectors_parallel()
+    }
+
+    /// Drain injectors using parallel direct writes (bypasses async channel)
+    fn drain_injectors_parallel(&self) -> Result<u64> {
+        use crossbeam_deque::Steal;
+        use parking_lot::Mutex;
+
+        const BATCH_SIZE: usize = 50_000;
+        const MAX_RETRIES: u32 = 1000;
+
+        // Get number of parallel threads
+        let num_threads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4)
+            .min(32);
+
+        // First, collect all items into batches
+        let mut batches: Vec<Vec<T>> = Vec::new();
+        let mut current_batch = Vec::with_capacity(BATCH_SIZE);
+        let mut total_drained = 0u64;
+
+        // Helper to drain an injector
+        let drain_one = |injector: &crossbeam_deque::Injector<T>,
+                         current_batch: &mut Vec<T>,
+                         batches: &mut Vec<Vec<T>>,
+                         total: &mut u64| {
+            let mut retries = 0u32;
+            loop {
+                match injector.steal() {
+                    Steal::Success(item) => {
+                        current_batch.push(item);
+                        *total += 1;
+                        retries = 0;
+
+                        if current_batch.len() >= BATCH_SIZE {
+                            batches.push(std::mem::take(current_batch));
+                            *current_batch = Vec::with_capacity(BATCH_SIZE);
+                        }
+                    }
+                    Steal::Empty => break,
+                    Steal::Retry => {
+                        retries += 1;
+                        if retries > MAX_RETRIES {
+                            break;
+                        }
+                        std::hint::spin_loop();
+                    }
+                }
+            }
+        };
+
+        // Drain global injector
+        drain_one(
+            &self.hot.global,
+            &mut current_batch,
+            &mut batches,
+            &mut total_drained,
+        );
+
+        // Drain per-NUMA injectors
+        for injector in self.hot.numa_injectors.iter() {
+            drain_one(
+                injector,
+                &mut current_batch,
+                &mut batches,
+                &mut total_drained,
+            );
+        }
+
+        // Drain worker stealers
+        for stealer in self.hot.stealers.iter() {
+            let mut retries = 0u32;
+            loop {
+                match stealer.steal() {
+                    Steal::Success(item) => {
+                        current_batch.push(item);
+                        total_drained += 1;
+                        retries = 0;
+
+                        if current_batch.len() >= BATCH_SIZE {
+                            batches.push(std::mem::take(&mut current_batch));
+                            current_batch = Vec::with_capacity(BATCH_SIZE);
+                        }
+                    }
+                    Steal::Empty => break,
+                    Steal::Retry => {
+                        retries += 1;
+                        if retries > MAX_RETRIES {
+                            break;
+                        }
+                        std::hint::spin_loop();
+                    }
+                }
+            }
+        }
+
+        // Don't forget the last partial batch
+        if !current_batch.is_empty() {
+            batches.push(current_batch);
+        }
+
+        if batches.is_empty() {
+            return Ok(0);
+        }
+
+        eprintln!(
+            "Checkpoint: drain_injectors_parallel - writing {} batches ({} items) with {} threads",
+            batches.len(),
+            total_drained,
+            num_threads
+        );
+
+        // Write batches in parallel
+        let spill_dir = self.overflow.get_spill_dir().to_path_buf();
+        std::fs::create_dir_all(&spill_dir)?;
+
+        // Allocate segment IDs atomically for all batches
+        let segment_ids: Vec<u64> = (0..batches.len())
+            .map(|_| self.overflow.allocate_segment_id())
+            .collect();
+
+        let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let segments_written: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
+        let batch_queue: Mutex<Vec<(u64, Vec<T>)>> =
+            Mutex::new(segment_ids.into_iter().zip(batches.into_iter()).collect());
+
+        std::thread::scope(|s| {
+            for _ in 0..num_threads {
+                let batch_queue = &batch_queue;
+                let errors = &errors;
+                let segments_written = &segments_written;
+                let spill_dir = &spill_dir;
+                let overflow = &self.overflow;
+
+                s.spawn(move || {
+                    loop {
+                        let (segment_id, batch) = {
+                            let mut guard = batch_queue.lock();
+                            match guard.pop() {
+                                Some(item) => item,
+                                None => break,
+                            }
+                        };
+
+                        let segment_path = spill_dir.join(format!("segment-{segment_id:016}.bin"));
+
+                        match bincode::serialize(&batch) {
+                            Ok(bytes) => match std::fs::write(&segment_path, &bytes) {
+                                Ok(()) => {
+                                    // Register segment with overflow queue
+                                    overflow.register_segment(segment_path.clone());
+                                    segments_written.lock().push(segment_path);
+                                }
+                                Err(e) => {
+                                    errors.lock().push(format!("write error: {}", e));
+                                }
+                            },
+                            Err(e) => {
+                                errors.lock().push(format!("serialize error: {}", e));
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        let errs = errors.into_inner();
+        if !errs.is_empty() {
+            return Err(anyhow::anyhow!("parallel drain errors: {:?}", errs));
+        }
+
+        eprintln!(
+            "Checkpoint: drain_injectors_parallel completed - {} segments written",
+            segments_written.lock().len()
+        );
+
+        Ok(total_drained)
+    }
+
+    /// Legacy drain function for fallback
+    #[allow(dead_code)]
+    fn drain_injectors_to_disk_legacy(&self) -> Result<u64> {
         use crossbeam_deque::Steal;
 
         let mut total_drained = 0u64;
