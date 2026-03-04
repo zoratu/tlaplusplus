@@ -188,7 +188,11 @@ impl PauseController {
         if !self.requested.load(Ordering::Acquire) {
             return;
         }
-        self.paused_workers.fetch_add(1, Ordering::AcqRel);
+        let paused_count = self.paused_workers.fetch_add(1, Ordering::AcqRel) + 1;
+        // Log when first few workers pause and periodically after
+        if paused_count <= 5 || paused_count % 10 == 0 {
+            eprintln!("Worker pausing: {} workers now paused", paused_count);
+        }
         let mut guard = self.wait_lock.lock();
         while self.requested.load(Ordering::Acquire) && !stop.load(Ordering::Acquire) {
             self.wait_cv.wait_for(&mut guard, Duration::from_millis(10));
@@ -208,6 +212,8 @@ impl PauseController {
         active_workers: &AtomicUsize,
         live_workers: &AtomicUsize,
     ) {
+        let mut iterations = 0u64;
+        let start = Instant::now();
         loop {
             if stop.load(Ordering::Acquire) {
                 break;
@@ -215,6 +221,19 @@ impl PauseController {
             let paused = self.paused_workers.load(Ordering::Acquire);
             let live = live_workers.load(Ordering::Acquire);
             let active = active_workers.load(Ordering::Acquire);
+
+            // Debug: log progress every 5 seconds
+            iterations += 1;
+            if iterations % 5000 == 0 {
+                eprintln!(
+                    "Checkpoint: waiting for quiescence: paused={}/{}, active={}, elapsed={:.1}s",
+                    paused,
+                    live,
+                    active,
+                    start.elapsed().as_secs_f64()
+                );
+            }
+
             if paused >= live && active == 0 {
                 break;
             }
@@ -919,9 +938,13 @@ where
                         "Checkpoint: warning: queue still empty after 30s wait, model may have completed"
                     );
                 } else {
+                    let pending = ckpt_queue.pending_count();
+                    let total_pending = ckpt_queue.total_pending_count();
                     eprintln!(
-                        "Checkpoint: queue refilled in {:.1}s, resuming workers",
-                        wait_start.elapsed().as_secs_f64()
+                        "Checkpoint: queue refilled in {:.1}s (inmem: {}, total: {}), resuming workers",
+                        wait_start.elapsed().as_secs_f64(),
+                        pending,
+                        total_pending
                     );
                 }
 
