@@ -441,7 +441,8 @@ where
         let s3_persist_for_signal = s3_persist.clone();
         let _rt_handle = rt.handle().clone();
 
-        // Spawn signal handler
+        // Spawn signal handler for graceful shutdown (spot instance preemption)
+        eprintln!("Signal handler: Setting up SIGTERM/SIGINT handlers...");
         rt.spawn(async move {
             #[cfg(unix)]
             {
@@ -451,28 +452,67 @@ where
                 let mut sigint =
                     signal(SignalKind::interrupt()).expect("Failed to register SIGINT handler");
 
-                tokio::select! {
+                eprintln!("Signal handler: Waiting for signals...");
+
+                let is_spot_preemption = tokio::select! {
                     _ = sigterm.recv() => {
-                        eprintln!("\nS3: Received SIGTERM, performing emergency flush...");
+                        use std::io::Write;
+                        let _ = std::io::stderr().flush();
+                        eprintln!("\n🛑 SIGTERM received - spot instance preemption detected!");
+                        eprintln!("   AWS gives us ~2 minutes to checkpoint and flush to S3...");
+                        let _ = std::io::stderr().flush();
+                        true
                     }
                     _ = sigint.recv() => {
-                        eprintln!("\nS3: Received SIGINT, performing emergency flush...");
+                        use std::io::Write;
+                        let _ = std::io::stderr().flush();
+                        eprintln!("\n🛑 SIGINT received - graceful shutdown requested...");
+                        let _ = std::io::stderr().flush();
+                        false
                     }
+                };
+
+                // Request emergency checkpoint from the checkpoint thread
+                eprintln!("   Step 1/3: Requesting emergency checkpoint...");
+                tlaplusplus::chaos::request_emergency_checkpoint();
+
+                // Wait for checkpoint to complete (max 90 seconds for spot, 30 for SIGINT)
+                let timeout_secs = if is_spot_preemption { 90 } else { 30 };
+                let checkpoint_ok = tokio::task::spawn_blocking(move || {
+                    tlaplusplus::chaos::wait_for_emergency_checkpoint(timeout_secs)
+                })
+                .await
+                .unwrap_or(false);
+
+                if checkpoint_ok {
+                    eprintln!("   Step 2/3: Emergency checkpoint complete!");
+                } else {
+                    eprintln!(
+                        "   Step 2/3: Checkpoint timed out after {}s (continuing with S3 flush)",
+                        timeout_secs
+                    );
                 }
 
                 // Take the persist handle out of the mutex before any await
                 let persist_opt = s3_persist_for_signal.lock().unwrap().take();
 
-                // Emergency flush
+                // S3 flush
+                eprintln!("   Step 3/3: Flushing to S3...");
                 if let Some(mut persist) = persist_opt {
                     if let Err(e) = persist.emergency_flush().await {
-                        eprintln!("S3: Emergency flush failed: {}", e);
+                        eprintln!("   S3 emergency flush failed: {}", e);
+                    } else {
+                        eprintln!("   S3 emergency flush complete!");
                     }
                     if let Err(e) = persist.stop().await {
-                        eprintln!("S3: Stop failed: {}", e);
+                        eprintln!("   S3 stop failed: {}", e);
                     }
                 }
 
+                eprintln!("✅ Graceful shutdown complete. State preserved for resume.");
+                use std::io::Write;
+                let _ = std::io::stderr().flush();
+                let _ = std::io::stdout().flush();
                 std::process::exit(0);
             }
 
@@ -480,20 +520,44 @@ where
             {
                 // On non-Unix, just use ctrl-c
                 let _ = tokio::signal::ctrl_c().await;
-                eprintln!("\nS3: Received Ctrl+C, performing emergency flush...");
+                eprintln!("\n🛑 Ctrl+C received - graceful shutdown requested...");
+
+                // Request emergency checkpoint
+                eprintln!("   Step 1/3: Requesting emergency checkpoint...");
+                tlaplusplus::chaos::request_emergency_checkpoint();
+
+                // Wait for checkpoint (max 30 seconds)
+                let checkpoint_ok = tokio::task::spawn_blocking(|| {
+                    tlaplusplus::chaos::wait_for_emergency_checkpoint(30)
+                })
+                .await
+                .unwrap_or(false);
+
+                if checkpoint_ok {
+                    eprintln!("   Step 2/3: Emergency checkpoint complete!");
+                } else {
+                    eprintln!("   Step 2/3: Checkpoint timed out (continuing with S3 flush)");
+                }
 
                 // Take the persist handle out of the mutex before any await
                 let persist_opt = s3_persist_for_signal.lock().unwrap().take();
 
+                eprintln!("   Step 3/3: Flushing to S3...");
                 if let Some(mut persist) = persist_opt {
                     if let Err(e) = persist.emergency_flush().await {
-                        eprintln!("S3: Emergency flush failed: {}", e);
+                        eprintln!("   S3 emergency flush failed: {}", e);
+                    } else {
+                        eprintln!("   S3 emergency flush complete!");
                     }
                     if let Err(e) = persist.stop().await {
-                        eprintln!("S3: Stop failed: {}", e);
+                        eprintln!("   S3 stop failed: {}", e);
                     }
                 }
 
+                eprintln!("✅ Graceful shutdown complete. State preserved for resume.");
+                use std::io::Write;
+                let _ = std::io::stderr().flush();
+                let _ = std::io::stdout().flush();
                 std::process::exit(0);
             }
         });
