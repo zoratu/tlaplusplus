@@ -10,7 +10,7 @@
 // - Spill coordinator batches items from all workers sequentially
 // - Workers NEVER block on disk I/O
 
-use crate::storage::queue::{DiskBackedQueue, DiskQueueConfig, QueueStats};
+use crate::storage::queue::{DiskBackedQueue, DiskQueueConfig, QueueStats, serialize_compressed};
 use crate::storage::work_stealing_queues::{WorkStealingQueues, WorkStealingStats, WorkerState};
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, TrySendError};
@@ -940,7 +940,8 @@ where
 
                         let segment_path = spill_dir.join(format!("segment-{segment_id:016}.bin"));
 
-                        match bincode::serialize(&batch) {
+                        // Use zstd compression for 5-10x space savings
+                        match serialize_compressed(&batch) {
                             Ok(bytes) => match std::fs::write(&segment_path, &bytes) {
                                 Ok(()) => {
                                     // Register segment with overflow queue

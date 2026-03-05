@@ -10,6 +10,37 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar};
 use std::thread::JoinHandle;
 
+/// Compression level for zstd (1-22, higher = better compression but slower)
+/// Level 3 is a good balance for real-time compression
+const ZSTD_COMPRESSION_LEVEL: i32 = 3;
+
+/// Serialize data with zstd compression for space efficiency.
+/// TLA+ states are highly repetitive (same variable names, model values),
+/// so compression achieves 5-10x space savings.
+pub fn serialize_compressed<T: Serialize>(data: &T) -> Result<Vec<u8>> {
+    let uncompressed =
+        bincode::serialize(data).map_err(|e| anyhow!("bincode serialize failed: {}", e))?;
+    let compressed = zstd::encode_all(uncompressed.as_slice(), ZSTD_COMPRESSION_LEVEL)
+        .map_err(|e| anyhow!("zstd compress failed: {}", e))?;
+    Ok(compressed)
+}
+
+/// Deserialize zstd-compressed data.
+/// Falls back to uncompressed bincode for backwards compatibility with
+/// existing segment files written before compression was added.
+pub fn deserialize_compressed<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    // Try zstd decompression first
+    match zstd::decode_all(bytes) {
+        Ok(decompressed) => bincode::deserialize(&decompressed)
+            .map_err(|e| anyhow!("bincode deserialize after decompress failed: {}", e)),
+        Err(_) => {
+            // Fall back to raw bincode for uncompressed legacy segments
+            bincode::deserialize(bytes)
+                .map_err(|e| anyhow!("bincode deserialize (uncompressed fallback) failed: {}", e))
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DiskQueueConfig {
     pub spill_dir: PathBuf,
@@ -151,7 +182,8 @@ where
                     let segment_id = writer_segment_id.fetch_add(1, Ordering::Relaxed);
                     let segment_path = writer_dir.join(format!("segment-{segment_id:016}.bin"));
 
-                    let serialized = bincode::serialize(&batch);
+                    // Use zstd compression for 5-10x space savings
+                    let serialized = serialize_compressed(&batch);
                     match serialized {
                         Ok(bytes) => {
                             // Retry file write with exponential backoff
@@ -486,7 +518,8 @@ where
             2000, // max 2 second delay
         )?;
 
-        let batch: Vec<T> = bincode::deserialize(&bytes)
+        // Decompress and deserialize (with fallback for legacy uncompressed segments)
+        let batch: Vec<T> = deserialize_compressed(&bytes)
             .with_context(|| format!("failed deserializing queue segment {}", path.display()))?;
         let loaded_len = batch.len() as u64;
         for item in batch {
@@ -693,8 +726,8 @@ where
                         let segment_id = next_segment_id.fetch_add(1, Ordering::Relaxed);
                         let segment_path = spill_dir.join(format!("segment-{segment_id:016}.bin"));
 
-                        // Serialize and write
-                        match bincode::serialize(&batch) {
+                        // Serialize with compression and write
+                        match serialize_compressed(&batch) {
                             Ok(bytes) => match std::fs::write(&segment_path, &bytes) {
                                 Ok(()) => {
                                     segments.lock().push_back(segment_path.clone());
