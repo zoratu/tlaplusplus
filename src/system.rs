@@ -716,6 +716,122 @@ pub fn check_disk_space(path: &Path) -> Result<DiskStats> {
     Ok(stats)
 }
 
+/// Statistics from pruning old segment files
+#[derive(Debug, Default)]
+pub struct PruneStats {
+    pub files_removed: usize,
+    pub bytes_freed: u64,
+}
+
+/// Prune old segment files in a directory, keeping only the most recent `keep_count` files.
+/// Files are sorted by modification time (or name if mtime unavailable).
+/// Only removes files matching the given extension (e.g., ".bin").
+///
+/// Returns statistics about what was removed.
+pub fn prune_old_segments(
+    dir: &Path,
+    extension: &str,
+    keep_count: usize,
+) -> std::io::Result<PruneStats> {
+    if !dir.exists() {
+        return Ok(PruneStats::default());
+    }
+
+    // Collect all matching files with their modification times
+    let mut files: Vec<(PathBuf, std::time::SystemTime, u64)> = std::fs::read_dir(dir)?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().map(|e| e == extension).unwrap_or(false) {
+                let metadata = entry.metadata().ok()?;
+                let mtime = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+                let size = metadata.len();
+                Some((path, mtime, size))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Sort by modification time, newest first
+    files.sort_by(|a, b| b.1.cmp(&a.1));
+
+    // Remove oldest files if we have more than keep_count
+    let mut stats = PruneStats::default();
+    if files.len() > keep_count {
+        for (path, _, size) in files.into_iter().skip(keep_count) {
+            if std::fs::remove_file(&path).is_ok() {
+                stats.files_removed += 1;
+                stats.bytes_freed += size;
+            }
+        }
+    }
+
+    Ok(stats)
+}
+
+/// Prune old segments in the .tlapp directory structure.
+/// This includes queue-spill and fingerprints directories.
+/// Keeps the most recent `keep_count` segment files in each subdirectory.
+pub fn prune_work_dir_segments(work_dir: &Path, keep_count: usize) -> std::io::Result<PruneStats> {
+    let mut total_stats = PruneStats::default();
+
+    // Prune queue-spill directory
+    let queue_spill_dir = work_dir.join("queue-spill");
+    if queue_spill_dir.exists() {
+        let stats = prune_old_segments(&queue_spill_dir, "bin", keep_count)?;
+        if stats.files_removed > 0 {
+            eprintln!(
+                "Retention: pruned {} queue-spill files ({:.1} MB)",
+                stats.files_removed,
+                stats.bytes_freed as f64 / 1_048_576.0
+            );
+        }
+        total_stats.files_removed += stats.files_removed;
+        total_stats.bytes_freed += stats.bytes_freed;
+    }
+
+    // Prune fingerprints directory (handle shard subdirectories)
+    let fp_dir = work_dir.join("fingerprints");
+    if fp_dir.exists() {
+        // Fingerprints may be in shard subdirectories
+        for entry in std::fs::read_dir(&fp_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                // Shard directory (e.g., shard-000)
+                let stats = prune_old_segments(&path, "bin", keep_count)?;
+                if stats.files_removed > 0 {
+                    eprintln!(
+                        "Retention: pruned {} fingerprint files in {} ({:.1} MB)",
+                        stats.files_removed,
+                        path.file_name().unwrap_or_default().to_string_lossy(),
+                        stats.bytes_freed as f64 / 1_048_576.0
+                    );
+                }
+                total_stats.files_removed += stats.files_removed;
+                total_stats.bytes_freed += stats.bytes_freed;
+            } else if path.extension().map(|e| e == "bin").unwrap_or(false) {
+                // Direct fingerprint files (non-sharded)
+                let stats = prune_old_segments(&fp_dir, "bin", keep_count)?;
+                total_stats.files_removed += stats.files_removed;
+                total_stats.bytes_freed += stats.bytes_freed;
+                break; // Only need to do this once
+            }
+        }
+    }
+
+    if total_stats.files_removed > 0 {
+        eprintln!(
+            "Retention: total pruned {} files, freed {:.1} MB",
+            total_stats.files_removed,
+            total_stats.bytes_freed as f64 / 1_048_576.0
+        );
+    }
+
+    Ok(total_stats)
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_cpu_list;

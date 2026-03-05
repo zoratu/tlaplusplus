@@ -16,7 +16,7 @@ use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
@@ -1115,6 +1115,23 @@ where
             self.spill_channel_full.load(Ordering::Relaxed),
             self.disk_loads.load(Ordering::Relaxed),
         )
+    }
+
+    /// Get the spill directory path
+    pub fn spill_dir_path(&self) -> &Path {
+        self.overflow.spill_dir_path()
+    }
+
+    /// Get paths of all current segments (for S3 upload tracking)
+    pub fn segment_paths(&self) -> Vec<PathBuf> {
+        self.overflow.segment_paths()
+    }
+
+    /// Clean up all segment files in the spill directory
+    /// Call this after confirming segments have been uploaded to S3
+    /// CAUTION: Only call if you're sure the segments are safely backed up elsewhere!
+    pub fn cleanup_spill_dir(&self) -> std::io::Result<u64> {
+        self.overflow.cleanup_spill_dir()
     }
 }
 
