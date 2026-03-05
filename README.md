@@ -219,4 +219,4 @@ This eliminates cross-NUMA memory access, which causes 20-38% kernel time on man
 
 ## License
 
-MIT
+GNU GPLv3
