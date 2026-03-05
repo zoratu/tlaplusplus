@@ -252,6 +252,11 @@ impl S3Persistence {
 
         let handle = runtime.spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+            let mut iteration_count = 0u64;
+            // Prune every 6 iterations (~60s with 10s interval)
+            const PRUNE_INTERVAL: u64 = 6;
+            // Keep last 5 checkpoints
+            const KEEP_CHECKPOINTS: usize = 5;
 
             loop {
                 tokio::select! {
@@ -278,6 +283,23 @@ impl S3Persistence {
                 .await
                 {
                     eprintln!("S3: Background upload error: {}", e);
+                }
+
+                // Periodically prune S3 files that no longer exist locally
+                iteration_count += 1;
+                if iteration_count % PRUNE_INTERVAL == 0 {
+                    if let Err(e) = prune_deleted_files(
+                        &client,
+                        &bucket,
+                        &prefix,
+                        &local_dir,
+                        &uploaded_offsets,
+                        KEEP_CHECKPOINTS,
+                    )
+                    .await
+                    {
+                        eprintln!("S3: Background prune error: {}", e);
+                    }
                 }
             }
         });
@@ -413,6 +435,170 @@ impl S3Persistence {
     pub fn is_running(&self) -> bool {
         self.upload_handle.is_some() && !self.stop.load(Ordering::Acquire)
     }
+
+    /// Prune old checkpoints from S3, keeping only the most recent `keep_count`.
+    /// Also removes queue-spill segments that are no longer present locally.
+    /// This should be called after local pruning to keep S3 in sync.
+    pub async fn prune_old_checkpoints(&self, keep_count: usize) -> Result<PruneResult> {
+        let mut checkpoints_deleted = 0u64;
+        let mut segments_deleted = 0u64;
+
+        // List all checkpoint files on S3
+        let checkpoint_prefix = format!("{}/checkpoints/checkpoint-", self.prefix);
+        let mut checkpoint_keys: Vec<String> = Vec::new();
+
+        let mut continuation_token: Option<String> = None;
+        loop {
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&checkpoint_prefix);
+
+            if let Some(token) = continuation_token {
+                request = request.continuation_token(token);
+            }
+
+            let response = request.send().await?;
+
+            for obj in response.contents() {
+                if let Some(key) = obj.key() {
+                    // Only match checkpoint-*.json, not latest.json
+                    if key.ends_with(".json") && key.contains("checkpoint-") {
+                        checkpoint_keys.push(key.to_string());
+                    }
+                }
+            }
+
+            if response.is_truncated() == Some(true) {
+                continuation_token = response.next_continuation_token().map(|s| s.to_string());
+            } else {
+                break;
+            }
+        }
+
+        // Sort by key (contains timestamp, so lexicographic = chronological)
+        checkpoint_keys.sort();
+
+        // Delete oldest checkpoints if we have more than keep_count
+        if checkpoint_keys.len() > keep_count {
+            let to_delete = checkpoint_keys.len() - keep_count;
+            for key in checkpoint_keys.into_iter().take(to_delete) {
+                match self
+                    .client
+                    .delete_object()
+                    .bucket(&self.bucket)
+                    .key(&key)
+                    .send()
+                    .await
+                {
+                    Ok(_) => {
+                        checkpoints_deleted += 1;
+                        eprintln!("S3: Pruned old checkpoint {}", key);
+                    }
+                    Err(e) => {
+                        eprintln!("S3: Warning: failed to delete {}: {}", key, e);
+                    }
+                }
+            }
+        }
+
+        // Prune queue-spill segments that no longer exist locally
+        let queue_prefix = format!("{}/queue-spill/", self.prefix);
+        let local_queue_dir = self.local_dir.join("queue-spill");
+
+        let mut s3_segments: Vec<String> = Vec::new();
+        continuation_token = None;
+
+        loop {
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&queue_prefix);
+
+            if let Some(token) = continuation_token {
+                request = request.continuation_token(token);
+            }
+
+            let response = request.send().await?;
+
+            for obj in response.contents() {
+                if let Some(key) = obj.key() {
+                    s3_segments.push(key.to_string());
+                }
+            }
+
+            if response.is_truncated() == Some(true) {
+                continuation_token = response.next_continuation_token().map(|s| s.to_string());
+            } else {
+                break;
+            }
+        }
+
+        // Check each S3 segment against local existence
+        for key in s3_segments {
+            // Extract filename from S3 key
+            let filename = key.split('/').last().unwrap_or(&key);
+            let local_path = local_queue_dir.join(filename);
+
+            // If local file doesn't exist, delete from S3
+            if !local_path.exists() {
+                match self
+                    .client
+                    .delete_object()
+                    .bucket(&self.bucket)
+                    .key(&key)
+                    .send()
+                    .await
+                {
+                    Ok(_) => {
+                        segments_deleted += 1;
+                        // Remove from tracked offsets
+                        let rel_path = format!("queue-spill/{}", filename);
+                        self.uploaded_offsets.remove(&rel_path);
+                    }
+                    Err(e) => {
+                        eprintln!("S3: Warning: failed to delete segment {}: {}", key, e);
+                    }
+                }
+            }
+        }
+
+        if checkpoints_deleted > 0 || segments_deleted > 0 {
+            eprintln!(
+                "S3: Pruned {} checkpoints, {} segments",
+                checkpoints_deleted, segments_deleted
+            );
+        }
+
+        Ok(PruneResult {
+            checkpoints_deleted,
+            segments_deleted,
+        })
+    }
+
+    /// Get the S3 client for external use (e.g., runtime pruning)
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+
+    /// Get the bucket name
+    pub fn bucket(&self) -> &str {
+        &self.bucket
+    }
+
+    /// Get the prefix
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+}
+
+/// Result of S3 pruning operation
+#[derive(Debug)]
+pub struct PruneResult {
+    pub checkpoints_deleted: u64,
+    pub segments_deleted: u64,
 }
 
 /// Result of downloading state from S3
@@ -582,6 +768,147 @@ async fn collect_files(dir: &Path) -> Result<Vec<PathBuf>> {
     }
 
     Ok(files)
+}
+
+/// Prune S3 files that no longer exist locally.
+/// This keeps S3 in sync with local pruning (checkpoints, consumed queue segments).
+async fn prune_deleted_files(
+    client: &Client,
+    bucket: &str,
+    prefix: &str,
+    local_dir: &Path,
+    uploaded_offsets: &DashMap<String, u64>,
+    keep_checkpoints: usize,
+) -> Result<()> {
+    let mut checkpoints_deleted = 0u64;
+    let mut segments_deleted = 0u64;
+
+    // 1. Prune old checkpoint files (keep last N)
+    let checkpoint_prefix = format!("{}/checkpoints/checkpoint-", prefix);
+    let mut checkpoint_keys: Vec<String> = Vec::new();
+
+    let mut continuation_token: Option<String> = None;
+    loop {
+        let mut request = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(&checkpoint_prefix);
+
+        if let Some(token) = continuation_token {
+            request = request.continuation_token(token);
+        }
+
+        let response = match request.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("S3: Warning: failed to list checkpoints for pruning: {}", e);
+                return Ok(());
+            }
+        };
+
+        for obj in response.contents() {
+            if let Some(key) = obj.key() {
+                if key.ends_with(".json") && key.contains("checkpoint-") {
+                    checkpoint_keys.push(key.to_string());
+                }
+            }
+        }
+
+        if response.is_truncated() == Some(true) {
+            continuation_token = response.next_continuation_token().map(|s| s.to_string());
+        } else {
+            break;
+        }
+    }
+
+    // Sort by key (timestamp-based, oldest first)
+    checkpoint_keys.sort();
+
+    // Delete oldest checkpoints if we have more than keep_checkpoints
+    if checkpoint_keys.len() > keep_checkpoints {
+        let to_delete = checkpoint_keys.len() - keep_checkpoints;
+        for key in checkpoint_keys.into_iter().take(to_delete) {
+            match client.delete_object().bucket(bucket).key(&key).send().await {
+                Ok(_) => {
+                    checkpoints_deleted += 1;
+                }
+                Err(e) => {
+                    eprintln!("S3: Warning: failed to delete checkpoint {}: {}", key, e);
+                }
+            }
+        }
+    }
+
+    // 2. Prune queue-spill segments that no longer exist locally
+    let queue_prefix = format!("{}/queue-spill/", prefix);
+    let local_queue_dir = local_dir.join("queue-spill");
+
+    let mut s3_segments: Vec<String> = Vec::new();
+    continuation_token = None;
+
+    loop {
+        let mut request = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(&queue_prefix);
+
+        if let Some(token) = continuation_token {
+            request = request.continuation_token(token);
+        }
+
+        let response = match request.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!(
+                    "S3: Warning: failed to list queue segments for pruning: {}",
+                    e
+                );
+                return Ok(());
+            }
+        };
+
+        for obj in response.contents() {
+            if let Some(key) = obj.key() {
+                s3_segments.push(key.to_string());
+            }
+        }
+
+        if response.is_truncated() == Some(true) {
+            continuation_token = response.next_continuation_token().map(|s| s.to_string());
+        } else {
+            break;
+        }
+    }
+
+    // Check each S3 segment against local existence
+    for key in s3_segments {
+        let filename = key.split('/').last().unwrap_or(&key);
+        let local_path = local_queue_dir.join(filename);
+
+        // If local file doesn't exist, delete from S3
+        if !local_path.exists() {
+            match client.delete_object().bucket(bucket).key(&key).send().await {
+                Ok(_) => {
+                    segments_deleted += 1;
+                    // Remove from tracked offsets
+                    let rel_path = format!("queue-spill/{}", filename);
+                    uploaded_offsets.remove(&rel_path);
+                }
+                Err(e) => {
+                    eprintln!("S3: Warning: failed to delete segment {}: {}", key, e);
+                }
+            }
+        }
+    }
+
+    if checkpoints_deleted > 0 || segments_deleted > 0 {
+        eprintln!(
+            "S3: Pruned {} checkpoints, {} queue segments from S3",
+            checkpoints_deleted, segments_deleted
+        );
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
