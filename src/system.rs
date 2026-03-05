@@ -771,25 +771,16 @@ pub fn prune_old_segments(
 }
 
 /// Prune old segments in the .tlapp directory structure.
-/// This includes queue-spill and fingerprints directories.
-/// Keeps the most recent `keep_count` segment files in each subdirectory.
+/// Only prunes fingerprint directories - queue-spill segments are managed
+/// separately by DiskBackedQueue::delete_consumed_segments() which only
+/// deletes segments after they've been loaded.
+/// Keeps the most recent `keep_count` segment files in each fingerprint shard.
 pub fn prune_work_dir_segments(work_dir: &Path, keep_count: usize) -> std::io::Result<PruneStats> {
     let mut total_stats = PruneStats::default();
 
-    // Prune queue-spill directory
-    let queue_spill_dir = work_dir.join("queue-spill");
-    if queue_spill_dir.exists() {
-        let stats = prune_old_segments(&queue_spill_dir, "bin", keep_count)?;
-        if stats.files_removed > 0 {
-            eprintln!(
-                "Retention: pruned {} queue-spill files ({:.1} MB)",
-                stats.files_removed,
-                stats.bytes_freed as f64 / 1_048_576.0
-            );
-        }
-        total_stats.files_removed += stats.files_removed;
-        total_stats.bytes_freed += stats.bytes_freed;
-    }
+    // NOTE: We do NOT prune queue-spill here! Queue segments are consumed
+    // in order by the loader thread and are deleted via delete_consumed_segments()
+    // after being loaded. Pruning them here would cause data loss.
 
     // Prune fingerprints directory (handle shard subdirectories)
     let fp_dir = work_dir.join("fingerprints");
