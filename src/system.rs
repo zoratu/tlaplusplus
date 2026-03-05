@@ -630,6 +630,92 @@ impl MemoryStatus {
     }
 }
 
+/// Disk space statistics for a path
+#[derive(Debug, Clone, Default)]
+pub struct DiskStats {
+    /// Total disk space in bytes
+    pub total_bytes: u64,
+    /// Available disk space in bytes
+    pub available_bytes: u64,
+    /// Used disk space in bytes
+    pub used_bytes: u64,
+}
+
+impl DiskStats {
+    /// Check if disk is under pressure (>80% used)
+    pub fn is_under_pressure(&self) -> bool {
+        if self.total_bytes == 0 {
+            return false;
+        }
+        self.used_bytes as f64 / self.total_bytes as f64 > 0.80
+    }
+
+    /// Check if disk is critical (>95% used or <1GB available)
+    pub fn is_critical(&self) -> bool {
+        if self.total_bytes == 0 {
+            return false;
+        }
+        let used_ratio = self.used_bytes as f64 / self.total_bytes as f64;
+        used_ratio > 0.95 || self.available_bytes < 1024 * 1024 * 1024 // <1GB
+    }
+
+    /// Get available space in human-readable format
+    pub fn available_human(&self) -> String {
+        let gb = self.available_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        format!("{:.1} GB", gb)
+    }
+}
+
+/// Get disk space statistics for a given path
+pub fn get_disk_stats(path: &Path) -> DiskStats {
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::mem::MaybeUninit;
+
+        let path_cstr = match CString::new(path.to_string_lossy().as_bytes()) {
+            Ok(s) => s,
+            Err(_) => return DiskStats::default(),
+        };
+
+        let mut statvfs = MaybeUninit::<libc::statvfs>::uninit();
+        let result = unsafe { libc::statvfs(path_cstr.as_ptr(), statvfs.as_mut_ptr()) };
+
+        if result == 0 {
+            let statvfs = unsafe { statvfs.assume_init() };
+            let block_size = statvfs.f_frsize as u64;
+            DiskStats {
+                total_bytes: statvfs.f_blocks as u64 * block_size,
+                available_bytes: statvfs.f_bavail as u64 * block_size,
+                used_bytes: (statvfs.f_blocks - statvfs.f_bfree) as u64 * block_size,
+            }
+        } else {
+            DiskStats::default()
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        DiskStats::default()
+    }
+}
+
+/// Check disk space and return an error if critical
+pub fn check_disk_space(path: &Path) -> Result<DiskStats> {
+    let stats = get_disk_stats(path);
+    if stats.is_critical() {
+        anyhow::bail!(
+            "CRITICAL: Disk space critically low at {}: {} available ({}% used). \
+             Free up disk space or reduce checkpoint/spill data.",
+            path.display(),
+            stats.available_human(),
+            (stats.used_bytes as f64 / stats.total_bytes as f64 * 100.0) as u32
+        );
+    }
+    Ok(stats)
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_cpu_list;
