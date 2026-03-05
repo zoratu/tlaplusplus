@@ -755,6 +755,20 @@ where
             .parallel_checkpoint_flush(num_checkpoint_threads)?;
         eprintln!("Checkpoint: overflow.parallel_checkpoint_flush completed");
 
+        // CRITICAL: Set disk_has_pending_work BEFORE resuming workers/loader.
+        // After draining items to disk, we KNOW there's pending work on disk.
+        // Workers check this flag in should_terminate() - if false, they might
+        // terminate prematurely before the loader has a chance to reload items.
+        // This fixes a race where:
+        // 1. Checkpoint drains items to disk
+        // 2. Workers resume but hot queues are empty
+        // 3. disk_has_pending_work is stale (false from before checkpoint)
+        // 4. Workers see empty queues + disk_has_pending_work=false and terminate
+        if self.overflow.has_pending_work() {
+            self.hot.set_disk_has_pending_work(true);
+            eprintln!("Checkpoint: set disk_has_pending_work=true (segments on disk)");
+        }
+
         // Unblock the background loader - it can start reloading items now
         // This happens BEFORE S3 upload, so reload progresses during upload
         self.checkpoint_draining.store(false, Ordering::Release);
