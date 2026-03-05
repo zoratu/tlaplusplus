@@ -822,17 +822,26 @@ where
                     break;
                 }
 
-                // Check if it's time for a checkpoint
-                if last_checkpoint.elapsed() < ckpt_interval {
+                // Check for emergency checkpoint (spot instance preemption)
+                let is_emergency = crate::chaos::is_emergency_checkpoint_requested();
+
+                // Check if it's time for a checkpoint (or emergency requested)
+                if !is_emergency && last_checkpoint.elapsed() < ckpt_interval {
                     continue;
                 }
 
-                // Don't checkpoint if exploration has stopped
-                if ckpt_exploration_stop.load(Ordering::Acquire) {
+                // Don't checkpoint if exploration has stopped (unless emergency)
+                if !is_emergency && ckpt_exploration_stop.load(Ordering::Acquire) {
                     break;
                 }
 
-                eprintln!("Checkpoint: starting periodic checkpoint...");
+                if is_emergency {
+                    eprintln!(
+                        "Checkpoint: EMERGENCY checkpoint requested (spot instance preemption)..."
+                    );
+                } else {
+                    eprintln!("Checkpoint: starting periodic checkpoint...");
+                }
                 let ckpt_start = Instant::now();
 
                 // CRITICAL: Set checkpoint flag BEFORE requesting pause!
@@ -930,7 +939,24 @@ where
                     );
                 }
 
-                // Resume workers
+                // For emergency checkpoint (spot preemption), signal completion and don't resume
+                if is_emergency {
+                    eprintln!(
+                        "Checkpoint: EMERGENCY checkpoint complete, signaling for S3 flush..."
+                    );
+                    crate::chaos::clear_emergency_checkpoint();
+                    crate::chaos::set_emergency_checkpoint_complete();
+                    // Don't resume workers - signal handler will exit process after S3 flush
+                    // But we need to clear flags so signal handler can proceed
+                    ckpt_queue.set_pause_requested(false);
+                    ckpt_queue.set_checkpoint_in_progress(false);
+                    // Wait here until process exits (signal handler will call exit())
+                    loop {
+                        std::thread::sleep(Duration::from_secs(60));
+                    }
+                }
+
+                // Resume workers (normal checkpoint path)
                 ckpt_pause.resume();
                 ckpt_queue.set_pause_requested(false);
 
@@ -1941,6 +1967,7 @@ pub fn reconstruct_trace_limited<M: Model>(
 #[cfg(test)]
 mod tests {
     use super::{EngineConfig, run_model};
+    use crate::chaos;
     use crate::models::counter_grid::CounterGridModel;
     use anyhow::Result;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2175,7 +2202,16 @@ mod failpoint_tests {
         chaos::clear_emergency_checkpoint();
         assert!(!chaos::is_emergency_checkpoint_requested());
 
-        eprintln!("Emergency checkpoint request/clear test passed");
+        // Test completion flag
+        assert!(!chaos::is_emergency_checkpoint_complete());
+        chaos::set_emergency_checkpoint_complete();
+        assert!(chaos::is_emergency_checkpoint_complete());
+
+        // Reset for other tests
+        crate::chaos::EMERGENCY_CHECKPOINT_COMPLETE
+            .store(false, std::sync::atomic::Ordering::Release);
+
+        eprintln!("Emergency checkpoint request/clear/complete test passed");
     }
 
     /// Test retry_with_backoff helper

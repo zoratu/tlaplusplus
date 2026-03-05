@@ -57,6 +57,9 @@ pub static CHAOS_ENABLED: AtomicBool = AtomicBool::new(false);
 /// Flag to request emergency checkpoint before failure
 pub static EMERGENCY_CHECKPOINT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// Flag indicating emergency checkpoint has completed
+pub static EMERGENCY_CHECKPOINT_COMPLETE: AtomicBool = AtomicBool::new(false);
+
 /// Worker ID to crash (usize::MAX = none)
 pub static CHAOS_CRASH_WORKER: AtomicU64 = AtomicU64::new(u64::MAX);
 
@@ -97,6 +100,31 @@ pub fn is_emergency_checkpoint_requested() -> bool {
 /// Clear emergency checkpoint flag (after checkpoint completes)
 pub fn clear_emergency_checkpoint() {
     EMERGENCY_CHECKPOINT_REQUESTED.store(false, Ordering::Release);
+}
+
+/// Signal that emergency checkpoint has completed
+pub fn set_emergency_checkpoint_complete() {
+    EMERGENCY_CHECKPOINT_COMPLETE.store(true, Ordering::Release);
+}
+
+/// Check if emergency checkpoint has completed
+pub fn is_emergency_checkpoint_complete() -> bool {
+    EMERGENCY_CHECKPOINT_COMPLETE.load(Ordering::Acquire)
+}
+
+/// Wait for emergency checkpoint to complete (with timeout)
+/// Returns true if completed, false if timed out
+pub fn wait_for_emergency_checkpoint(timeout_secs: u64) -> bool {
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(timeout_secs);
+
+    while !is_emergency_checkpoint_complete() {
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    true
 }
 
 /// Set which worker should crash (u64::MAX = none)
