@@ -295,11 +295,13 @@ where
             }
 
             // Check if hot queues need refilling
-            // - Below LOW_WATER_MARK: load aggressively (no sleep between batches)
-            // - Between LOW and HIGH: keep loading (with brief pauses)
-            // - Above HIGH_WATER_MARK: pause loading to avoid OOM
+            // CRITICAL: Use actual queue emptiness, not pending_count()!
+            // After checkpoint drains items to disk, pending_count() still includes them
+            // even though they're not in memory. This caused workers to spin with 0 throughput
+            // because loader thought queue was full when it was actually empty.
+            let hot_queues_empty = hot.is_empty();
             let pending = hot.pending_count();
-            let should_load_aggressively = pending < LOW_WATER_MARK;
+            let should_load_aggressively = hot_queues_empty || pending < LOW_WATER_MARK;
 
             // Queue is low or empty - check if disk has items
             let has_work = overflow.has_pending_work();
@@ -311,8 +313,11 @@ where
             // Must happen every iteration, even when pending >= HIGH_WATER_MARK.
             hot.set_disk_has_pending_work(has_work);
 
-            if pending >= HIGH_WATER_MARK {
-                // Queue is full enough, pause to avoid OOM
+            // Only pause loading if hot queues actually have enough items
+            // AND there's no work on disk. The pending_count() can be misleading
+            // after checkpoint drain, so we also check actual queue state.
+            if pending >= HIGH_WATER_MARK && !hot_queues_empty && !has_work {
+                // Queue is full enough and no disk work, pause to avoid OOM
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 continue;
             }
@@ -335,8 +340,12 @@ where
                     .is_ok()
                 {
                     eprintln!(
-                        "Loader debug: pending={}, has_work={}, segments={}, aggressive={}",
-                        pending, has_work, segment_count, should_load_aggressively
+                        "Loader debug: pending={}, hot_empty={}, has_work={}, segments={}, aggressive={}",
+                        pending,
+                        hot_queues_empty,
+                        has_work,
+                        segment_count,
+                        should_load_aggressively
                     );
                 }
             }
