@@ -21,7 +21,8 @@ use crate::storage::unified_fingerprint_store::{
 use crate::storage::work_stealing_queues::WorkStealingQueues;
 use crate::system::{
     MemoryMonitor, MemoryStatus, WorkerPlan, WorkerPlanRequest, build_worker_plan,
-    cgroup_memory_max_bytes, get_memory_stats, pin_current_thread_to_cpu,
+    cgroup_memory_max_bytes, check_disk_space, get_disk_stats, get_memory_stats,
+    pin_current_thread_to_cpu,
 };
 use anyhow::{Context, Result, anyhow};
 use dashmap::DashMap;
@@ -635,6 +636,17 @@ where
     std::fs::create_dir_all(&config.work_dir)
         .with_context(|| format!("failed creating work dir {}", config.work_dir.display()))?;
 
+    // Check disk space before starting - fail early if insufficient
+    let disk_stats = check_disk_space(&config.work_dir)?;
+    if disk_stats.is_under_pressure() {
+        eprintln!(
+            "WARNING: Disk space is under pressure ({} available, {}% used). \
+             Consider freeing space to avoid checkpoint failures.",
+            disk_stats.available_human(),
+            (disk_stats.used_bytes as f64 / disk_stats.total_bytes as f64 * 100.0) as u32
+        );
+    }
+
     let effective_memory_max = compute_effective_memory_max(&config);
     let (fp_cache_capacity_bytes, queue_inmem_limit) =
         apply_memory_budget(&config, effective_memory_max);
@@ -953,6 +965,25 @@ where
                 // Don't checkpoint if exploration has stopped (unless emergency)
                 if !is_emergency && ckpt_exploration_stop.load(Ordering::Acquire) {
                     break;
+                }
+
+                // Check disk space before checkpoint
+                let disk_stats = get_disk_stats(&ckpt_work_dir);
+                if disk_stats.is_critical() {
+                    eprintln!(
+                        "Checkpoint: CRITICAL - Disk space low ({} available, {}% used). \
+                         Skipping checkpoint to prevent corruption. Free up disk space!",
+                        disk_stats.available_human(),
+                        (disk_stats.used_bytes as f64 / disk_stats.total_bytes as f64 * 100.0)
+                            as u32
+                    );
+                    if !is_emergency {
+                        continue;
+                    }
+                    // For emergency checkpoint, try anyway but warn loudly
+                    eprintln!(
+                        "Checkpoint: Attempting emergency checkpoint despite low disk space..."
+                    );
                 }
 
                 if is_emergency {
