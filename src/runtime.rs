@@ -164,6 +164,25 @@ struct AtomicRunStats {
 }
 
 impl AtomicRunStats {
+    /// Create stats initialized from checkpoint values (for resume)
+    fn from_checkpoint(
+        states_generated: u64,
+        states_processed: u64,
+        states_distinct: u64,
+        duplicates: u64,
+        enqueued: u64,
+        checkpoints: u64,
+    ) -> Self {
+        Self {
+            states_generated: AtomicU64::new(states_generated),
+            states_processed: AtomicU64::new(states_processed),
+            states_distinct: AtomicU64::new(states_distinct),
+            duplicates: AtomicU64::new(duplicates),
+            enqueued: AtomicU64::new(enqueued),
+            checkpoints: AtomicU64::new(checkpoints),
+        }
+    }
+
     fn snapshot(&self) -> (u64, u64, u64, u64, u64, u64) {
         (
             self.states_generated.load(Ordering::Relaxed),
@@ -337,6 +356,18 @@ fn write_checkpoint_manifest(path: &Path, manifest: &CheckpointManifest) -> Resu
     std::fs::rename(&tmp, path)
         .with_context(|| format!("failed atomically moving checkpoint to {}", path.display()))?;
     Ok(())
+}
+
+/// Load checkpoint manifest from disk (for resume)
+fn load_checkpoint_manifest(path: &Path) -> Result<Option<CheckpointManifest>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed reading checkpoint {}", path.display()))?;
+    let manifest: CheckpointManifest = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed parsing checkpoint {}", path.display()))?;
+    Ok(Some(manifest))
 }
 
 /// Maximum number of checkpoint files to retain (rolling window)
@@ -858,7 +889,39 @@ where
         }
     }
 
-    let run_stats = Arc::new(AtomicRunStats::default());
+    // Initialize run stats - from checkpoint if resuming, otherwise from zero
+    let run_stats = if config.resume_from_checkpoint {
+        let checkpoint_path = config.work_dir.join("checkpoints").join("latest.json");
+        match load_checkpoint_manifest(&checkpoint_path) {
+            Ok(Some(manifest)) => {
+                eprintln!(
+                    "Resuming counters from checkpoint: {} generated, {} distinct, {} duplicates",
+                    manifest.states_generated, manifest.states_distinct, manifest.duplicates
+                );
+                Arc::new(AtomicRunStats::from_checkpoint(
+                    manifest.states_generated,
+                    manifest.states_processed,
+                    manifest.states_distinct,
+                    manifest.duplicates,
+                    manifest.enqueued,
+                    manifest.checkpoints,
+                ))
+            }
+            Ok(None) => {
+                eprintln!("No checkpoint manifest found, starting counters from 0");
+                Arc::new(AtomicRunStats::default())
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: failed to load checkpoint manifest: {}, starting counters from 0",
+                    e
+                );
+                Arc::new(AtomicRunStats::default())
+            }
+        }
+    } else {
+        Arc::new(AtomicRunStats::default())
+    };
     let stop = Arc::new(AtomicBool::new(false));
     let active_workers = Arc::new(AtomicUsize::new(0));
     let live_workers = Arc::new(AtomicUsize::new(worker_plan.worker_count));
