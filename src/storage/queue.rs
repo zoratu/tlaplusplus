@@ -790,6 +790,53 @@ where
             None => None,
         }
     }
+
+    /// Get paths of all current segments (for S3 upload tracking)
+    pub fn segment_paths(&self) -> Vec<PathBuf> {
+        self.segments.lock().iter().cloned().collect()
+    }
+
+    /// Get the spill directory path
+    pub fn spill_dir_path(&self) -> &Path {
+        &self.spill_dir_path
+    }
+
+    /// Clean up all segment files in the spill directory
+    /// Call this after confirming segments have been uploaded to S3
+    /// CAUTION: Only call if you're sure the segments are safely backed up elsewhere!
+    pub fn cleanup_spill_dir(&self) -> std::io::Result<u64> {
+        let dir = &self.spill_dir_path;
+
+        if !dir.exists() {
+            return Ok(0);
+        }
+
+        let mut cleaned_bytes = 0u64;
+        let mut cleaned_count = 0u64;
+
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().map(|e| e == "bin").unwrap_or(false) {
+                if let Ok(metadata) = entry.metadata() {
+                    cleaned_bytes += metadata.len();
+                }
+                if std::fs::remove_file(&path).is_ok() {
+                    cleaned_count += 1;
+                }
+            }
+        }
+
+        if cleaned_count > 0 {
+            eprintln!(
+                "Queue: cleaned up {} segment files ({:.1} MB)",
+                cleaned_count,
+                cleaned_bytes as f64 / 1_048_576.0
+            );
+        }
+
+        Ok(cleaned_bytes)
+    }
 }
 
 #[cfg(test)]

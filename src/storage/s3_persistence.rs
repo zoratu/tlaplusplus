@@ -323,6 +323,13 @@ impl S3Persistence {
             result.files_uploaded,
             result.bytes_uploaded as f64 / 1_048_576.0
         );
+        if result.queue_files_uploaded > 0 {
+            eprintln!(
+                "S3:   Including {} queue-spill files ({:.2} MB)",
+                result.queue_files_uploaded,
+                result.queue_bytes_uploaded as f64 / 1_048_576.0
+            );
+        }
 
         Ok(FlushResult {
             duration,
@@ -441,6 +448,8 @@ pub struct S3Stats {
 struct UploadScanResult {
     files_uploaded: u64,
     bytes_uploaded: u64,
+    queue_files_uploaded: u64,
+    queue_bytes_uploaded: u64,
 }
 
 /// Scan local directory and upload changed files
@@ -455,6 +464,8 @@ async fn upload_changed_files(
 ) -> Result<UploadScanResult> {
     let mut files_uploaded = 0u64;
     let mut bytes_uploaded = 0u64;
+    let mut queue_files_uploaded = 0u64;
+    let mut queue_bytes_uploaded = 0u64;
 
     // Recursively scan local directory
     let entries = collect_files(local_dir).await?;
@@ -524,6 +535,13 @@ async fn upload_changed_files(
                 .context(format!("Failed to upload {}", s3_key))?;
         }
 
+        // Track queue-spill files separately
+        let is_queue_spill = rel_path.contains("queue-spill") || rel_path.contains("queue/");
+        if is_queue_spill {
+            queue_files_uploaded += 1;
+            queue_bytes_uploaded += bytes_to_upload;
+        }
+
         // Update tracking
         uploaded_offsets.insert(rel_path, current_size);
         bytes_uploaded += bytes_to_upload;
@@ -535,6 +553,8 @@ async fn upload_changed_files(
     Ok(UploadScanResult {
         files_uploaded,
         bytes_uploaded,
+        queue_files_uploaded,
+        queue_bytes_uploaded,
     })
 }
 

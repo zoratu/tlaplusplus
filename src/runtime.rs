@@ -22,7 +22,7 @@ use crate::storage::work_stealing_queues::WorkStealingQueues;
 use crate::system::{
     MemoryMonitor, MemoryStatus, WorkerPlan, WorkerPlanRequest, build_worker_plan,
     cgroup_memory_max_bytes, check_disk_space, get_disk_stats, get_memory_stats,
-    pin_current_thread_to_cpu,
+    pin_current_thread_to_cpu, prune_work_dir_segments,
 };
 use anyhow::{Context, Result, anyhow};
 use dashmap::DashMap;
@@ -1089,6 +1089,17 @@ where
                         states_distinct,
                         MAX_CHECKPOINT_FILES,
                     );
+
+                    // Prune old segment files to prevent unbounded growth
+                    // Only do this for normal checkpoints, not emergency ones
+                    // (emergency checkpoints need files intact for S3 upload)
+                    if !is_emergency {
+                        if let Err(e) =
+                            prune_work_dir_segments(&ckpt_work_dir, MAX_CHECKPOINT_FILES)
+                        {
+                            eprintln!("Checkpoint: warning: failed to prune old segments: {}", e);
+                        }
+                    }
                 }
 
                 // For emergency checkpoint (spot preemption), signal completion and don't resume
