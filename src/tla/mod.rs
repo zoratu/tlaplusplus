@@ -16,7 +16,9 @@ pub use action_exec::{
 };
 pub use action_ir::{ActionClause, ActionIr, compile_action_ir, looks_like_action};
 pub use cfg::{ConfigValue, TlaConfig, parse_tla_config};
-pub use compiled_eval::{apply_compiled_action_ir, eval_compiled, eval_compiled_guard};
+pub use compiled_eval::{
+    apply_compiled_action_ir, apply_compiled_action_ir_multi, eval_compiled, eval_compiled_guard,
+};
 pub use compiled_expr::{CompiledActionClause, CompiledActionIr, CompiledExpr, compile_expr};
 pub use eval::{
     EvalContext, TransitionContext, apply_action_ir, apply_action_ir_with_context,

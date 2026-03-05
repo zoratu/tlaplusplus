@@ -185,13 +185,21 @@ fn eval_compiled_inner(
         // Set membership
         CompiledExpr::In(elem, set) => {
             let elem_val = eval_compiled_inner(elem, ctx, depth + 1)?;
-            let set_val = eval_compiled_inner(set, ctx, depth + 1)?;
-            Ok(TlaValue::Bool(set_val.contains(&elem_val)?))
+            Ok(TlaValue::Bool(compiled_membership_contains(
+                &elem_val,
+                set,
+                ctx,
+                depth + 1,
+            )?))
         }
         CompiledExpr::NotIn(elem, set) => {
             let elem_val = eval_compiled_inner(elem, ctx, depth + 1)?;
-            let set_val = eval_compiled_inner(set, ctx, depth + 1)?;
-            Ok(TlaValue::Bool(!set_val.contains(&elem_val)?))
+            Ok(TlaValue::Bool(!compiled_membership_contains(
+                &elem_val,
+                set,
+                ctx,
+                depth + 1,
+            )?))
         }
 
         // Arithmetic
@@ -467,6 +475,32 @@ fn eval_compiled_inner(
             eval_except(&base_val, updates, ctx, depth)
         }
 
+        // TLC module: Function pair constructor (a :> b creates {a -> b})
+        CompiledExpr::FuncPair(key_expr, val_expr) => {
+            let key = eval_compiled_inner(key_expr, ctx, depth + 1)?;
+            let val = eval_compiled_inner(val_expr, ctx, depth + 1)?;
+            let mut func = BTreeMap::new();
+            func.insert(key, val);
+            Ok(TlaValue::Function(Arc::new(func)))
+        }
+
+        // TLC module: Function override (f @@ g merges functions, g takes precedence)
+        CompiledExpr::FuncOverride(left, right) => {
+            let left_val = eval_compiled_inner(left, ctx, depth + 1)?;
+            let right_val = eval_compiled_inner(right, ctx, depth + 1)?;
+
+            // Both operands must be functions
+            let left_func = left_val.as_function()?;
+            let right_func = right_val.as_function()?;
+
+            // Merge: start with left, override with right
+            let mut result = left_func.clone();
+            for (k, v) in right_func.iter() {
+                result.insert(k.clone(), v.clone());
+            }
+            Ok(TlaValue::Function(Arc::new(result)))
+        }
+
         // Self-reference (@ in EXCEPT) - should only be evaluated within EXCEPT context
         CompiledExpr::SelfRef => {
             // This should be handled specially by eval_except
@@ -610,6 +644,132 @@ fn eval_compiled_inner(
 
         // Fallback: use string-based evaluation
         CompiledExpr::Unparsed(s) => eval_expr(s, ctx),
+    }
+}
+
+fn compiled_membership_contains(
+    value: &TlaValue,
+    set_expr: &CompiledExpr,
+    ctx: &EvalContext<'_>,
+    depth: usize,
+) -> Result<bool> {
+    match set_expr {
+        CompiledExpr::NatSet => Ok(matches!(value.as_int(), Ok(n) if n >= 0)),
+        CompiledExpr::IntSet => Ok(value.as_int().is_ok()),
+        CompiledExpr::BooleanSet => Ok(matches!(value, TlaValue::Bool(_))),
+        CompiledExpr::Var(name) => {
+            if let Some(def) = ctx.definition(name)
+                && def.params.is_empty()
+            {
+                return membership_matches_text(value, &def.body, ctx, depth + 1);
+            }
+            let set_val = eval_compiled_inner(set_expr, ctx, depth + 1)?;
+            set_val.contains(value)
+        }
+        CompiledExpr::Unparsed(text) => membership_matches_text(value, text, ctx, depth + 1),
+        _ => {
+            let set_val = eval_compiled_inner(set_expr, ctx, depth + 1)?;
+            set_val.contains(value)
+        }
+    }
+}
+
+fn membership_matches_text(
+    value: &TlaValue,
+    expr: &str,
+    ctx: &EvalContext<'_>,
+    depth: usize,
+) -> Result<bool> {
+    let rhs_trimmed = expr.trim();
+    match rhs_trimmed {
+        "Nat" => Ok(matches!(value.as_int(), Ok(n) if n >= 0)),
+        "Int" => Ok(value.as_int().is_ok()),
+        "BOOLEAN" => Ok(matches!(value, TlaValue::Bool(_))),
+        _ => {
+            if let Some(def) = ctx.definition(rhs_trimmed)
+                && def.params.is_empty()
+            {
+                return membership_matches_text(value, &def.body, ctx, depth + 1);
+            }
+
+            if let Some(inner) = rhs_trimmed.strip_prefix("Seq(") {
+                if let Some(set_expr) = inner.strip_suffix(")") {
+                    return match value {
+                        TlaValue::Seq(seq) => {
+                            let mut all_in_set = true;
+                            for elem in seq.iter() {
+                                if !membership_matches_text(elem, set_expr, ctx, depth + 1)? {
+                                    all_in_set = false;
+                                    break;
+                                }
+                            }
+                            Ok(all_in_set)
+                        }
+                        _ => Ok(false),
+                    };
+                }
+            }
+
+            if rhs_trimmed.starts_with('[') && rhs_trimmed.ends_with(']') {
+                let inner = &rhs_trimmed[1..rhs_trimmed.len() - 1];
+
+                if let Some(arrow_idx) = inner.find("->") {
+                    let domain_expr = inner[..arrow_idx].trim();
+                    let codomain_expr = inner[arrow_idx + 2..].trim();
+                    return match value {
+                        TlaValue::Function(func) => {
+                            let domain_val = crate::tla::eval::eval_expr(domain_expr, ctx)?;
+                            let domain_set = match domain_val.as_set() {
+                                Ok(set) => set,
+                                Err(_) => return Ok(false),
+                            };
+                            let func_domain: std::collections::BTreeSet<TlaValue> =
+                                func.keys().cloned().collect();
+                            if func_domain != *domain_set {
+                                return Ok(false);
+                            }
+                            for item in func.values() {
+                                if !membership_matches_text(item, codomain_expr, ctx, depth + 1)? {
+                                    return Ok(false);
+                                }
+                            }
+                            Ok(true)
+                        }
+                        _ => Ok(false),
+                    };
+                }
+
+                if inner.contains(':') {
+                    return match value {
+                        TlaValue::Record(rec) => {
+                            let field_specs: Vec<&str> = inner.split(',').collect();
+                            let mut expected_fields = std::collections::HashSet::<String>::new();
+                            for spec in field_specs {
+                                let parts: Vec<&str> = spec.split(':').collect();
+                                if parts.len() != 2 {
+                                    continue;
+                                }
+                                let field_name = parts[0].trim();
+                                let field_type = parts[1].trim();
+                                expected_fields.insert(field_name.to_string());
+                                let Some(field_value) = rec.get(field_name) else {
+                                    return Ok(false);
+                                };
+                                if !membership_matches_text(field_value, field_type, ctx, depth + 1)?
+                                {
+                                    return Ok(false);
+                                }
+                            }
+                            Ok(rec.len() == expected_fields.len())
+                        }
+                        _ => Ok(false),
+                    };
+                }
+            }
+
+            let set_val = crate::tla::eval::eval_expr(rhs_trimmed, ctx)?;
+            set_val.contains(value)
+        }
     }
 }
 
@@ -962,86 +1122,226 @@ fn lookup_definition(name: &str, ctx: &EvalContext<'_>) -> Option<crate::tla::Tl
 
 use crate::tla::TlaState;
 use crate::tla::compiled_expr::{CompiledActionClause, CompiledActionIr};
-use crate::tla::eval::eval_let_action;
+use crate::tla::eval::{eval_let_action_multi, parse_action_binder_specs};
 
 /// Evaluate a guard expression using compiled evaluation, falling back to bool
 pub fn eval_compiled_guard(expr: &CompiledExpr, ctx: &EvalContext<'_>) -> Result<bool> {
     eval_compiled(expr, ctx)?.as_bool()
 }
 
-/// Apply a compiled action IR to the current state
+#[derive(Debug, Clone)]
+struct CompiledActionBranch<'a> {
+    ctx: EvalContext<'a>,
+    staged: BTreeMap<String, TlaValue>,
+    unchanged_vars: Vec<String>,
+}
+
+/// Apply a compiled action IR to the current state.
+///
+/// This wrapper preserves the older single-successor shape for legacy callers.
 pub fn apply_compiled_action_ir(
     action: &CompiledActionIr,
     current: &TlaState,
     ctx: &EvalContext<'_>,
 ) -> Result<Option<TlaState>> {
-    let mut staged: BTreeMap<String, TlaValue> = BTreeMap::new();
-    let mut unchanged_vars: Vec<String> = Vec::new();
-
-    for clause in &action.clauses {
-        if !eval_compiled_clause(clause, ctx, &mut staged, &mut unchanged_vars)? {
-            return Ok(None); // Guard failed
-        }
-    }
-
-    let mut next = current.clone();
-    for var in unchanged_vars {
-        if let Some(old) = current.get(&var) {
-            next.insert(var, old.clone());
-        }
-    }
-    for (var, value) in staged {
-        next.insert(var, value);
-    }
-
-    Ok(Some(next))
+    Ok(apply_compiled_action_ir_multi(action, current, ctx)?
+        .into_iter()
+        .next())
 }
 
-/// Evaluate a single compiled action clause recursively
-/// Returns Ok(true) to continue, Ok(false) if a guard failed
-fn eval_compiled_clause(
-    clause: &CompiledActionClause,
+pub fn apply_compiled_action_ir_multi(
+    action: &CompiledActionIr,
+    current: &TlaState,
     ctx: &EvalContext<'_>,
-    staged: &mut BTreeMap<String, TlaValue>,
-    unchanged_vars: &mut Vec<String>,
-) -> Result<bool> {
-    match clause {
-        CompiledActionClause::Guard { expr } => {
-            if !eval_compiled_guard(expr, ctx)? {
-                return Ok(false);
+) -> Result<Vec<TlaState>> {
+    let branches = eval_compiled_clause_sequence(
+        &action.clauses,
+        vec![CompiledActionBranch {
+            ctx: ctx.clone(),
+            staged: BTreeMap::new(),
+            unchanged_vars: Vec::new(),
+        }],
+    )?;
+    let mut out = Vec::with_capacity(branches.len());
+    for branch in branches {
+        let mut next = current.clone();
+        for var in branch.unchanged_vars {
+            if let Some(old) = current.get(&var) {
+                next.insert(var, old.clone());
             }
         }
+        for (var, value) in branch.staged {
+            next.insert(var, value);
+        }
+        out.push(next);
+    }
+    Ok(out)
+}
+
+fn eval_compiled_clause_sequence<'a>(
+    clauses: &[CompiledActionClause],
+    branches: Vec<CompiledActionBranch<'a>>,
+) -> Result<Vec<CompiledActionBranch<'a>>> {
+    let mut branches = branches;
+    for clause in clauses {
+        let mut next_branches = Vec::new();
+        for branch in branches {
+            next_branches.extend(eval_compiled_clause_to_branch(clause, branch)?);
+        }
+        branches = next_branches;
+        if branches.is_empty() {
+            break;
+        }
+    }
+    Ok(branches)
+}
+
+fn eval_compiled_clause_to_branch<'a>(
+    clause: &CompiledActionClause,
+    branch: CompiledActionBranch<'a>,
+) -> Result<Vec<CompiledActionBranch<'a>>> {
+    let eval_ctx = ctx_with_staged_primes(&branch.ctx, &branch.staged);
+    match clause {
+        CompiledActionClause::Guard { expr } => {
+            if eval_compiled_guard(expr, &eval_ctx)? {
+                Ok(vec![branch])
+            } else {
+                Ok(Vec::new())
+            }
+        }
+        CompiledActionClause::Exists {
+            binders,
+            body_clauses,
+        } => {
+            let binder_specs = parse_action_binder_specs(binders)?;
+            let outer_ctx = branch.ctx.clone();
+            let branches = expand_compiled_exists_branches(
+                &binder_specs,
+                0,
+                &branch.ctx,
+                &branch.staged,
+                &branch.unchanged_vars,
+                body_clauses,
+            )?;
+            Ok(branches
+                .into_iter()
+                .map(|inner| CompiledActionBranch {
+                    ctx: outer_ctx.clone(),
+                    staged: inner.staged,
+                    unchanged_vars: inner.unchanged_vars,
+                })
+                .collect())
+        }
+        CompiledActionClause::Conditional {
+            condition,
+            then_clauses,
+            else_clauses,
+        } => {
+            let selected = if eval_compiled_guard(condition, &eval_ctx)? {
+                then_clauses
+            } else {
+                else_clauses
+            };
+            eval_compiled_clause_sequence(selected, vec![branch])
+        }
         CompiledActionClause::PrimedAssignment { var, expr } => {
-            let value = eval_compiled(expr, ctx)?;
-            staged.insert(var.clone(), value);
+            let mut branch = branch;
+            let value = eval_compiled(expr, &eval_ctx)?;
+            branch.staged.insert(var.clone(), value);
+            Ok(vec![branch])
         }
         CompiledActionClause::Unchanged { vars } => {
-            unchanged_vars.extend(vars.iter().cloned());
+            let mut branch = branch;
+            branch.unchanged_vars.extend(vars.iter().cloned());
+            Ok(vec![branch])
         }
         CompiledActionClause::CompiledLetWithPrimes {
             bindings,
             body_clauses,
         } => {
-            // Evaluate bindings and create a new context with them
-            let mut inner_ctx = ctx.clone();
+            let mut inner_ctx = eval_ctx.clone();
             for (name, expr) in bindings {
                 let value = eval_compiled(expr, &inner_ctx)?;
                 inner_ctx = inner_ctx.with_local_value(name, value);
             }
-
-            // Recursively evaluate body clauses with the extended context
-            for body_clause in body_clauses {
-                if !eval_compiled_clause(body_clause, &inner_ctx, staged, unchanged_vars)? {
-                    return Ok(false); // Guard failed
-                }
-            }
+            let outer_ctx = branch.ctx.clone();
+            let branches = eval_compiled_clause_sequence(
+                body_clauses,
+                vec![CompiledActionBranch {
+                    ctx: inner_ctx,
+                    staged: branch.staged,
+                    unchanged_vars: branch.unchanged_vars,
+                }],
+            )?;
+            Ok(branches
+                .into_iter()
+                .map(|inner| CompiledActionBranch {
+                    ctx: outer_ctx.clone(),
+                    staged: inner.staged,
+                    unchanged_vars: inner.unchanged_vars,
+                })
+                .collect())
         }
         CompiledActionClause::LetWithPrimes { expr } => {
-            // Fall back to string evaluation for LET expressions we couldn't compile
-            eval_let_action(expr, ctx, staged, unchanged_vars)?;
+            Ok(eval_let_action_multi(expr, &eval_ctx, &branch.staged, &branch.unchanged_vars)?
+                .into_iter()
+                .map(|(staged, unchanged_vars)| CompiledActionBranch {
+                    ctx: branch.ctx.clone(),
+                    staged,
+                    unchanged_vars,
+                })
+                .collect())
         }
     }
-    Ok(true)
+}
+
+fn expand_compiled_exists_branches<'a>(
+    binder_specs: &[(String, String)],
+    idx: usize,
+    ctx: &EvalContext<'a>,
+    staged: &BTreeMap<String, TlaValue>,
+    unchanged_vars: &[String],
+    body_clauses: &[CompiledActionClause],
+) -> Result<Vec<CompiledActionBranch<'a>>> {
+    if idx >= binder_specs.len() {
+        return eval_compiled_clause_sequence(
+            body_clauses,
+            vec![CompiledActionBranch {
+                ctx: ctx.clone(),
+                staged: staged.clone(),
+                unchanged_vars: unchanged_vars.to_vec(),
+            }],
+        );
+    }
+
+    let (name, domain_text) = &binder_specs[idx];
+    let eval_ctx = ctx_with_staged_primes(ctx, staged);
+    let domain = eval_expr(domain_text, &eval_ctx)?;
+    let values = domain.as_set()?.iter().cloned().collect::<Vec<_>>();
+    let mut out = Vec::new();
+    for value in values {
+        let child_ctx = ctx.with_local_value(name.clone(), value);
+        out.extend(expand_compiled_exists_branches(
+            binder_specs,
+            idx + 1,
+            &child_ctx,
+            staged,
+            unchanged_vars,
+            body_clauses,
+        )?);
+    }
+    Ok(out)
+}
+
+fn ctx_with_staged_primes<'a>(
+    ctx: &EvalContext<'a>,
+    staged: &BTreeMap<String, TlaValue>,
+) -> EvalContext<'a> {
+    let mut out = ctx.clone();
+    for (var, value) in staged {
+        out = out.with_local_value(&format!("{}'", var), value.clone());
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1277,6 +1577,66 @@ mod tests {
         assert_eq!(next_state.get("x"), Some(&TlaValue::Int(6)));
         // y should be unchanged
         assert_eq!(next_state.get("y"), Some(&TlaValue::Int(10)));
+    }
+
+    #[test]
+    fn test_compiled_conditional_action() {
+        use crate::tla::compiled_expr::CompiledActionIr;
+        use crate::tla::{ActionClause, ActionIr};
+
+        let state = TlaState::from([
+            ("flag".to_string(), TlaValue::Bool(false)),
+            ("x".to_string(), TlaValue::Int(7)),
+            ("y".to_string(), TlaValue::Int(9)),
+        ]);
+        let ctx = EvalContext::new(&state);
+
+        let action_ir = ActionIr {
+            name: "Conditional".to_string(),
+            params: vec![],
+            clauses: vec![ActionClause::Guard {
+                expr: "IF flag THEN /\\ x' = x + 1 /\\ UNCHANGED y ELSE /\\ UNCHANGED x /\\ y' = y + 1"
+                    .to_string(),
+            }],
+        };
+
+        let compiled = CompiledActionIr::from_ir(&action_ir);
+        let result = apply_compiled_action_ir(&compiled, &state, &ctx).unwrap();
+        let next_state = result.expect("conditional branch should succeed");
+        assert_eq!(next_state.get("x"), Some(&TlaValue::Int(7)));
+        assert_eq!(next_state.get("y"), Some(&TlaValue::Int(10)));
+    }
+
+    #[test]
+    fn test_compiled_quantified_let_action_generates_multiple_successors() {
+        use crate::tla::compiled_expr::CompiledActionIr;
+        use crate::tla::{ActionClause, ActionIr};
+
+        let state = TlaState::from([
+            ("x".to_string(), TlaValue::Int(0)),
+            ("y".to_string(), TlaValue::Int(9)),
+        ]);
+        let ctx = EvalContext::new(&state);
+
+        let action_ir = ActionIr {
+            name: "Pick".to_string(),
+            params: vec![],
+            clauses: vec![ActionClause::LetWithPrimes {
+                expr: "LET choices == {1, 2} IN /\\ \\E pick \\in choices : /\\ x' = pick /\\ UNCHANGED <<y>>".to_string(),
+            }],
+        };
+
+        let compiled = CompiledActionIr::from_ir(&action_ir);
+        let next_states = apply_compiled_action_ir_multi(&compiled, &state, &ctx).unwrap();
+        assert_eq!(next_states.len(), 2);
+        let next_xs: std::collections::BTreeSet<i64> = next_states
+            .iter()
+            .map(|next| next.get("x").unwrap().as_int().unwrap())
+            .collect();
+        assert_eq!(next_xs, std::collections::BTreeSet::from([1, 2]));
+        for next in next_states {
+            assert_eq!(next.get("y"), Some(&TlaValue::Int(9)));
+        }
     }
 }
 

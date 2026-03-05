@@ -1,6 +1,7 @@
 use crate::tla::{
     ActionClause, ActionIr, ClauseKind, TlaDefinition, TlaState, TlaValue, classify_clause,
 };
+use crate::tla::action_ir::{parse_action_exists, parse_action_if, split_action_body_clauses};
 use anyhow::{Result, anyhow};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
@@ -117,7 +118,7 @@ impl<'a> EvalContext<'a> {
         self.state.get(name).cloned()
     }
 
-    fn definition(&self, name: &str) -> Option<TlaDefinition> {
+    pub(crate) fn definition(&self, name: &str) -> Option<TlaDefinition> {
         if let Some(def) = self.local_definitions.get(name) {
             return Some(def.clone());
         }
@@ -314,45 +315,88 @@ fn apply_comparison(left: &TlaValue, op: &str, right: &TlaValue) -> Result<bool>
     }
 }
 
-/// Evaluate a LET expression that contains primed assignments
+#[derive(Debug, Clone, Default)]
+struct ActionEvalBranch {
+    staged: BTreeMap<String, TlaValue>,
+    unchanged_vars: Vec<String>,
+}
+
+/// Evaluate a LET expression that contains primed assignments.
+///
+/// This wrapper preserves the previous single-successor shape for legacy callers.
 pub(crate) fn eval_let_action(
     expr: &str,
     ctx: &EvalContext<'_>,
     staged: &mut BTreeMap<String, TlaValue>,
     unchanged_vars: &mut Vec<String>,
 ) -> Result<()> {
+    let mut branches = eval_let_action_multi(expr, ctx, staged, unchanged_vars)?.into_iter();
+    let Some((next_staged, next_unchanged)) = branches.next() else {
+        return Err(anyhow!("LET action produced no successor branches"));
+    };
+    if branches.next().is_some() {
+        return Err(anyhow!("LET action produced multiple successor branches"));
+    }
+    *staged = next_staged;
+    *unchanged_vars = next_unchanged;
+    Ok(())
+}
+
+pub(crate) fn eval_let_action_multi(
+    expr: &str,
+    ctx: &EvalContext<'_>,
+    staged: &BTreeMap<String, TlaValue>,
+    unchanged_vars: &[String],
+) -> Result<Vec<(BTreeMap<String, TlaValue>, Vec<String>)>> {
+    let initial = ActionEvalBranch {
+        staged: staged.clone(),
+        unchanged_vars: unchanged_vars.to_vec(),
+    };
+    Ok(eval_let_action_multi_branch(expr, ctx, initial)?
+        .into_iter()
+        .map(|branch| (branch.staged, branch.unchanged_vars))
+        .collect())
+}
+
+fn eval_let_action_multi_branch(
+    expr: &str,
+    ctx: &EvalContext<'_>,
+    branch: ActionEvalBranch,
+) -> Result<Vec<ActionEvalBranch>> {
     let (defs_text, body_text) =
         split_outer_let(expr).ok_or_else(|| anyhow!("invalid LET expression in action: {expr}"))?;
     let defs = parse_let_definitions(defs_text)?;
     let child_ctx = ctx.with_local_definitions(defs);
-
-    // The body should be a conjunction of primed assignments and guards
-    let conjuncts = split_top_level_symbol(body_text, "/\\");
-    for conjunct in conjuncts {
-        let trimmed = conjunct.trim();
-        match classify_clause(trimmed) {
-            ClauseKind::PrimedAssignment { var, expr: rhs } => {
-                let value = eval_expr(&rhs, &child_ctx)?;
-                staged.insert(var, value);
-            }
-            ClauseKind::Unchanged { vars } => {
-                unchanged_vars.extend(vars);
-            }
-            _ => {
-                // This is a guard - evaluate it
-                if !eval_guard(trimmed, &child_ctx)? {
-                    return Err(anyhow!("LET action guard failed: {}", trimmed));
-                }
-            }
-        }
-    }
-
-    Ok(())
+    eval_action_body_text_multi(body_text, &child_ctx, branch)
 }
 
 pub fn apply_action_ir(action: &ActionIr, current: &TlaState) -> Result<Option<TlaState>> {
     let ctx = EvalContext::new(current);
-    apply_action_ir_with_context(action, current, &ctx)
+    Ok(apply_action_ir_with_context_multi(action, current, &ctx)?
+        .into_iter()
+        .next())
+}
+
+pub(crate) fn apply_action_ir_with_context_multi(
+    action: &ActionIr,
+    current: &TlaState,
+    ctx: &EvalContext<'_>,
+) -> Result<Vec<TlaState>> {
+    let branches = eval_action_clauses_multi(&action.clauses, ctx, vec![ActionEvalBranch::default()])?;
+    let mut out = Vec::with_capacity(branches.len());
+    for branch in branches {
+        let mut next = current.clone();
+        for var in branch.unchanged_vars {
+            if let Some(old) = current.get(&var) {
+                next.insert(var, old.clone());
+            }
+        }
+        for (var, value) in branch.staged {
+            next.insert(var, value);
+        }
+        out.push(next);
+    }
+    Ok(out)
 }
 
 pub fn apply_action_ir_with_context(
@@ -360,42 +404,307 @@ pub fn apply_action_ir_with_context(
     current: &TlaState,
     ctx: &EvalContext<'_>,
 ) -> Result<Option<TlaState>> {
-    let mut staged: BTreeMap<String, TlaValue> = BTreeMap::new();
-    let mut unchanged_vars: Vec<String> = Vec::new();
+    Ok(apply_action_ir_with_context_multi(action, current, ctx)?
+        .into_iter()
+        .next())
+}
 
-    for clause in &action.clauses {
-        match clause {
-            ActionClause::Guard { expr } => {
-                if !eval_guard(expr, ctx)? {
-                    return Ok(None);
+fn eval_action_clauses_multi(
+    clauses: &[ActionClause],
+    ctx: &EvalContext<'_>,
+    branches: Vec<ActionEvalBranch>,
+) -> Result<Vec<ActionEvalBranch>> {
+    let mut branches = branches;
+    for clause in clauses {
+        let mut next_branches = Vec::new();
+        for branch in branches {
+            next_branches.extend(eval_action_clause_to_branch(clause, ctx, branch)?);
+        }
+        branches = next_branches;
+        if branches.is_empty() {
+            break;
+        }
+    }
+    Ok(branches)
+}
+
+fn eval_action_clause_to_branch(
+    clause: &ActionClause,
+    ctx: &EvalContext<'_>,
+    branch: ActionEvalBranch,
+) -> Result<Vec<ActionEvalBranch>> {
+    let eval_ctx = ctx_with_staged_primes(ctx, &branch.staged);
+    match clause {
+        ActionClause::Guard { expr } => eval_action_clause_text_multi(expr, ctx, branch),
+        ActionClause::PrimedAssignment { var, expr } => {
+            let mut branch = branch;
+            branch.staged.insert(var.clone(), eval_expr(expr, &eval_ctx)?);
+            Ok(vec![branch])
+        }
+        ActionClause::Unchanged { vars } => {
+            let mut branch = branch;
+            branch.unchanged_vars.extend(vars.iter().cloned());
+            Ok(vec![branch])
+        }
+        ActionClause::Exists { binders, body } => eval_exists_action_multi(binders, body, ctx, branch),
+        ActionClause::LetWithPrimes { expr } => eval_let_action_multi_branch(expr, ctx, branch),
+    }
+}
+
+fn eval_action_body_text_multi(
+    body: &str,
+    ctx: &EvalContext<'_>,
+    branch: ActionEvalBranch,
+) -> Result<Vec<ActionEvalBranch>> {
+    let mut branches = vec![branch];
+    for clause in split_action_body_clauses(body) {
+        let mut next_branches = Vec::new();
+        for branch in branches {
+            next_branches.extend(eval_action_clause_text_multi(&clause, ctx, branch)?);
+        }
+        branches = next_branches;
+        if branches.is_empty() {
+            break;
+        }
+    }
+    Ok(branches)
+}
+
+fn eval_action_clause_text_multi(
+    expr: &str,
+    ctx: &EvalContext<'_>,
+    branch: ActionEvalBranch,
+) -> Result<Vec<ActionEvalBranch>> {
+    let trimmed = expr.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("empty action clause"));
+    }
+
+    let eval_ctx = ctx_with_staged_primes(ctx, &branch.staged);
+    if let Some((condition, then_branch, else_branch)) = parse_action_if(trimmed) {
+        let branch_body = if eval_guard(condition, &eval_ctx)? {
+            then_branch
+        } else {
+            else_branch
+        };
+        return eval_action_body_text_multi(branch_body, ctx, branch);
+    }
+    if let Some((binders, body)) = parse_action_exists(trimmed) {
+        return eval_exists_action_multi(binders, body, ctx, branch);
+    }
+
+    match classify_clause(trimmed) {
+        ClauseKind::PrimedAssignment { var, expr: rhs } => {
+            let mut branch = branch;
+            branch.staged.insert(var, eval_expr(&rhs, &eval_ctx)?);
+            Ok(vec![branch])
+        }
+        ClauseKind::Unchanged { vars } => {
+            let mut branch = branch;
+            branch.unchanged_vars.extend(vars);
+            Ok(vec![branch])
+        }
+        ClauseKind::UnprimedEquality { .. } | ClauseKind::Other => {
+            if trimmed.starts_with("LET") && trimmed.contains('\'') {
+                eval_let_action_multi_branch(trimmed, ctx, branch)
+            } else if eval_guard(trimmed, &eval_ctx)? {
+                Ok(vec![branch])
+            } else {
+                Ok(Vec::new())
+            }
+        }
+    }
+}
+
+fn eval_exists_action_multi(
+    binders: &str,
+    body: &str,
+    ctx: &EvalContext<'_>,
+    branch: ActionEvalBranch,
+) -> Result<Vec<ActionEvalBranch>> {
+    let binder_specs = parse_action_binder_specs(binders)?;
+    expand_action_exists_branches(&binder_specs, 0, ctx, body, branch)
+}
+
+fn expand_action_exists_branches(
+    binder_specs: &[(String, String)],
+    idx: usize,
+    ctx: &EvalContext<'_>,
+    body: &str,
+    branch: ActionEvalBranch,
+) -> Result<Vec<ActionEvalBranch>> {
+    if idx >= binder_specs.len() {
+        return eval_action_body_text_multi(body, ctx, branch);
+    }
+
+    let (name, domain_text) = &binder_specs[idx];
+    let eval_ctx = ctx_with_staged_primes(ctx, &branch.staged);
+    let domain = eval_expr(domain_text, &eval_ctx)?;
+    let values = domain.as_set()?.iter().cloned().collect::<Vec<_>>();
+    let mut out = Vec::new();
+    for value in values {
+        let child_ctx = ctx.with_local_value(name.clone(), value);
+        out.extend(expand_action_exists_branches(
+            binder_specs,
+            idx + 1,
+            &child_ctx,
+            body,
+            branch.clone(),
+        )?);
+    }
+    Ok(out)
+}
+
+fn ctx_with_staged_primes<'a>(
+    ctx: &EvalContext<'a>,
+    staged: &BTreeMap<String, TlaValue>,
+) -> EvalContext<'a> {
+    let mut out = ctx.clone();
+    for (var, value) in staged {
+        out = out.with_local_value(&format!("{}'", var), value.clone());
+    }
+    out
+}
+
+pub(crate) fn parse_action_binder_specs(expr: &str) -> Result<Vec<(String, String)>> {
+    let mut binders = Vec::new();
+    let mut rest = expr.trim();
+
+    while !rest.is_empty() {
+        let in_idx = find_top_level_keyword_index(rest, "\\in")
+            .ok_or_else(|| anyhow!("binder segment missing \\in: {rest}"))?;
+
+        let vars_text = rest[..in_idx].trim();
+        let after_in = rest[in_idx + "\\in".len()..].trim_start();
+
+        let mut split_idx = None;
+        let mut search_from = 0usize;
+        while let Some(comma_idx) = find_top_level_char_from(after_in, ',', search_from) {
+            let tail = after_in[comma_idx + 1..].trim_start();
+            if find_top_level_keyword_index(tail, "\\in").is_some() {
+                split_idx = Some(comma_idx);
+                break;
+            }
+            search_from = comma_idx + 1;
+        }
+
+        let (domain_text, next_rest) = match split_idx {
+            Some(idx) => (&after_in[..idx], &after_in[idx + 1..]),
+            None => (after_in, ""),
+        };
+
+        for var in crate::tla::split_top_level(vars_text, ",") {
+            let name = var.trim();
+            if !name.is_empty() {
+                binders.push((name.to_string(), domain_text.trim().to_string()));
+            }
+        }
+
+        rest = next_rest.trim_start();
+    }
+
+    if binders.is_empty() {
+        return Err(anyhow!("exists binder list is empty: {expr}"));
+    }
+
+    Ok(binders)
+}
+
+fn matches_membership_expr(
+    value: &TlaValue,
+    expr: &str,
+    ctx: &EvalContext<'_>,
+    depth: usize,
+) -> Result<bool> {
+    let rhs_trimmed = expr.trim();
+    match rhs_trimmed {
+        "Nat" => Ok(matches!(value.as_int(), Ok(n) if n >= 0)),
+        "Int" => Ok(value.as_int().is_ok()),
+        "BOOLEAN" => Ok(matches!(value, TlaValue::Bool(_))),
+        _ => {
+            if let Some(def) = ctx.definition(rhs_trimmed)
+                && def.params.is_empty()
+            {
+                return matches_membership_expr(value, &def.body, ctx, depth + 1);
+            }
+
+            if let Some(inner) = rhs_trimmed.strip_prefix("Seq(") {
+                if let Some(set_expr) = inner.strip_suffix(")") {
+                    return match value {
+                        TlaValue::Seq(seq) => {
+                            for elem in seq.iter() {
+                                if !matches_membership_expr(elem, set_expr, ctx, depth + 1)? {
+                                    return Ok(false);
+                                }
+                            }
+                            Ok(true)
+                        }
+                        _ => Ok(false),
+                    };
                 }
             }
-            ActionClause::PrimedAssignment { var, expr } => {
-                let value = eval_expr(expr, ctx)?;
-                staged.insert(var.clone(), value);
+
+            if rhs_trimmed.starts_with('[') && rhs_trimmed.ends_with(']') {
+                let inner = &rhs_trimmed[1..rhs_trimmed.len() - 1];
+
+                if let Some(arrow_idx) = inner.find("->") {
+                    let domain_expr = inner[..arrow_idx].trim();
+                    let codomain_expr = inner[arrow_idx + 2..].trim();
+                    return match value {
+                        TlaValue::Function(func) => {
+                            let domain_val = eval_expr_inner(domain_expr, ctx, depth + 1)?;
+                            let domain_set = match domain_val.as_set() {
+                                Ok(set) => set,
+                                Err(_) => return Ok(false),
+                            };
+                            let func_domain: BTreeSet<TlaValue> =
+                                func.keys().cloned().collect();
+                            if func_domain != *domain_set {
+                                return Ok(false);
+                            }
+                            for item in func.values() {
+                                if !matches_membership_expr(item, codomain_expr, ctx, depth + 1)? {
+                                    return Ok(false);
+                                }
+                            }
+                            Ok(true)
+                        }
+                        _ => Ok(false),
+                    };
+                }
+
+                if inner.contains(':') {
+                    return match value {
+                        TlaValue::Record(rec) => {
+                            let field_specs: Vec<&str> = inner.split(',').collect();
+                            let mut expected_fields = std::collections::HashSet::<String>::new();
+                            for spec in field_specs {
+                                let parts: Vec<&str> = spec.split(':').collect();
+                                if parts.len() != 2 {
+                                    continue;
+                                }
+                                let field_name = parts[0].trim();
+                                let field_type = parts[1].trim();
+                                expected_fields.insert(field_name.to_string());
+                                let Some(field_value) = rec.get(field_name) else {
+                                    return Ok(false);
+                                };
+                                if !matches_membership_expr(field_value, field_type, ctx, depth + 1)?
+                                {
+                                    return Ok(false);
+                                }
+                            }
+                            Ok(rec.len() == expected_fields.len())
+                        }
+                        _ => Ok(false),
+                    };
+                }
             }
-            ActionClause::Unchanged { vars } => {
-                unchanged_vars.extend(vars.iter().cloned());
-            }
-            ActionClause::LetWithPrimes { expr } => {
-                // Evaluate LET expression which should produce assignments
-                // The LET IN body should be a conjunction of primed assignments
-                eval_let_action(expr, ctx, &mut staged, &mut unchanged_vars)?;
-            }
+
+            let set_val = eval_expr_inner(rhs_trimmed, ctx, depth + 1)?;
+            set_val.contains(value)
         }
     }
-
-    let mut next = current.clone();
-    for var in unchanged_vars {
-        if let Some(old) = current.get(&var) {
-            next.insert(var, old.clone());
-        }
-    }
-    for (var, value) in staged {
-        next.insert(var, value);
-    }
-
-    Ok(Some(next))
 }
 
 fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<TlaValue> {
@@ -533,295 +842,22 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
                 Ok(TlaValue::Bool(cmp))
             }
             "\\in" => {
-                // Special handling for infinite built-in sets
                 let rhs_trimmed = rhs.trim();
-                match rhs_trimmed {
-                    "Nat" => {
-                        let val = left.as_int()?;
-                        Ok(TlaValue::Bool(val >= 0))
-                    }
-                    "Int" => {
-                        // Any integer is in Int
-                        let _ = left.as_int()?; // Verify it's an integer
-                        Ok(TlaValue::Bool(true))
-                    }
-                    "BOOLEAN" => {
-                        // Check if it's a boolean
-                        match left {
-                            TlaValue::Bool(_) => Ok(TlaValue::Bool(true)),
-                            _ => Ok(TlaValue::Bool(false)),
-                        }
-                    }
-                    _ => {
-                        // Check for Seq(S) - sequence membership
-                        if let Some(inner) = rhs_trimmed.strip_prefix("Seq(") {
-                            if let Some(set_expr) = inner.strip_suffix(")") {
-                                // x \in Seq(S) means x is a sequence and all elements are in S
-                                match &left {
-                                    TlaValue::Seq(seq) => {
-                                        let set_val = eval_expr_inner(set_expr, ctx, depth + 1)?;
-                                        let all_in_set = seq
-                                            .iter()
-                                            .all(|elem| set_val.contains(elem).unwrap_or(false));
-                                        return Ok(TlaValue::Bool(all_in_set));
-                                    }
-                                    _ => return Ok(TlaValue::Bool(false)), // Not a sequence
-                                }
-                            }
-                        }
-
-                        // Check for [S -> T] or [field: Type, ...] - function/record set membership
-                        if rhs_trimmed.starts_with('[') && rhs_trimmed.ends_with(']') {
-                            let inner = &rhs_trimmed[1..rhs_trimmed.len() - 1];
-
-                            // Check if it's a function type [S -> T]
-                            if let Some(arrow_idx) = inner.find("->") {
-                                let domain_expr = inner[..arrow_idx].trim();
-                                let codomain_expr = inner[arrow_idx + 2..].trim();
-
-                                // f \in [S -> T] means f is a function, DOMAIN f = S, and all values in T
-                                match &left {
-                                    TlaValue::Function(func) => {
-                                        let domain_set =
-                                            eval_expr_inner(domain_expr, ctx, depth + 1)?;
-                                        let domain_set = domain_set.as_set()?;
-
-                                        // Check that function domain equals the expected domain
-                                        let func_domain: BTreeSet<TlaValue> =
-                                            func.keys().cloned().collect();
-                                        if func_domain != *domain_set {
-                                            return Ok(TlaValue::Bool(false));
-                                        }
-
-                                        // Check all function values are in codomain
-                                        // Handle special case for Nat
-                                        if codomain_expr == "Nat" {
-                                            let all_nat = func
-                                                .values()
-                                                .all(|v| matches!(v.as_int(), Ok(n) if n >= 0));
-                                            return Ok(TlaValue::Bool(all_nat));
-                                        }
-
-                                        let codomain_set =
-                                            eval_expr_inner(codomain_expr, ctx, depth + 1)?;
-                                        let all_in_codomain = func
-                                            .values()
-                                            .all(|v| codomain_set.contains(v).unwrap_or(false));
-                                        return Ok(TlaValue::Bool(all_in_codomain));
-                                    }
-                                    _ => return Ok(TlaValue::Bool(false)), // Not a function
-                                }
-                            }
-
-                            // Check if it's a record type [field: Type, ...]
-                            if inner.contains(':') {
-                                match &left {
-                                    TlaValue::Record(rec) => {
-                                        // Parse field: Type specifications
-                                        let field_specs: Vec<&str> = inner.split(',').collect();
-                                        let mut expected_fields =
-                                            std::collections::HashSet::<String>::new();
-
-                                        for spec in field_specs {
-                                            let parts: Vec<&str> = spec.split(':').collect();
-                                            if parts.len() != 2 {
-                                                continue;
-                                            }
-                                            let field_name = parts[0].trim();
-                                            let field_type = parts[1].trim();
-                                            expected_fields.insert(field_name.to_string());
-
-                                            // Check if record has this field
-                                            if let Some(field_value) = rec.get(field_name) {
-                                                // Check if value matches type
-                                                let matches_type = match field_type {
-                                                    "Nat" => {
-                                                        matches!(field_value.as_int(), Ok(n) if n >= 0)
-                                                    }
-                                                    "Int" => field_value.as_int().is_ok(),
-                                                    "BOOLEAN" => {
-                                                        matches!(field_value, TlaValue::Bool(_))
-                                                    }
-                                                    _ => {
-                                                        // Evaluate type expression and check membership
-                                                        if let Ok(type_val) = eval_expr_inner(
-                                                            field_type,
-                                                            ctx,
-                                                            depth + 1,
-                                                        ) {
-                                                            type_val
-                                                                .contains(field_value)
-                                                                .unwrap_or(false)
-                                                        } else {
-                                                            false
-                                                        }
-                                                    }
-                                                };
-                                                if !matches_type {
-                                                    return Ok(TlaValue::Bool(false));
-                                                }
-                                            } else {
-                                                // Field missing
-                                                return Ok(TlaValue::Bool(false));
-                                            }
-                                        }
-
-                                        // Check that record has no extra fields
-                                        if rec.len() != expected_fields.len() {
-                                            return Ok(TlaValue::Bool(false));
-                                        }
-
-                                        return Ok(TlaValue::Bool(true));
-                                    }
-                                    _ => return Ok(TlaValue::Bool(false)), // Not a record
-                                }
-                            }
-                        }
-
-                        // Regular set membership
-                        let right = eval_expr_inner(rhs, ctx, depth + 1)?;
-                        Ok(TlaValue::Bool(right.contains(&left)?))
-                    }
-                }
+                Ok(TlaValue::Bool(matches_membership_expr(
+                    &left,
+                    rhs_trimmed,
+                    ctx,
+                    depth + 1,
+                )?))
             }
             "\\notin" => {
-                // Not in operator - opposite of \in
                 let rhs_trimmed = rhs.trim();
-                match rhs_trimmed {
-                    "Nat" => {
-                        let val = left.as_int()?;
-                        Ok(TlaValue::Bool(val < 0))
-                    }
-                    "Int" => {
-                        // No integer is not in Int
-                        let _ = left.as_int()?;
-                        Ok(TlaValue::Bool(false))
-                    }
-                    "BOOLEAN" => match left {
-                        TlaValue::Bool(_) => Ok(TlaValue::Bool(false)),
-                        _ => Ok(TlaValue::Bool(true)),
-                    },
-                    _ => {
-                        // Check for Seq(S) - sequence membership
-                        if let Some(inner) = rhs_trimmed.strip_prefix("Seq(") {
-                            if let Some(set_expr) = inner.strip_suffix(")") {
-                                // x \notin Seq(S) means x is not a sequence or some element is not in S
-                                match &left {
-                                    TlaValue::Seq(seq) => {
-                                        let set_val = eval_expr_inner(set_expr, ctx, depth + 1)?;
-                                        let all_in_set = seq
-                                            .iter()
-                                            .all(|elem| set_val.contains(elem).unwrap_or(false));
-                                        return Ok(TlaValue::Bool(!all_in_set));
-                                    }
-                                    _ => return Ok(TlaValue::Bool(true)), // Not a sequence
-                                }
-                            }
-                        }
-
-                        // Check for [S -> T] or [field: Type, ...] - function/record set membership
-                        if rhs_trimmed.starts_with('[') && rhs_trimmed.ends_with(']') {
-                            let inner = &rhs_trimmed[1..rhs_trimmed.len() - 1];
-
-                            // Check if it's a function type [S -> T]
-                            if let Some(arrow_idx) = inner.find("->") {
-                                let domain_expr = inner[..arrow_idx].trim();
-                                let codomain_expr = inner[arrow_idx + 2..].trim();
-
-                                // f \notin [S -> T] is the opposite of \in
-                                match &left {
-                                    TlaValue::Function(func) => {
-                                        let domain_set =
-                                            eval_expr_inner(domain_expr, ctx, depth + 1)?;
-                                        let domain_set = domain_set.as_set()?;
-
-                                        let func_domain: BTreeSet<TlaValue> =
-                                            func.keys().cloned().collect();
-                                        if func_domain != *domain_set {
-                                            return Ok(TlaValue::Bool(true));
-                                        }
-
-                                        if codomain_expr == "Nat" {
-                                            let all_nat = func
-                                                .values()
-                                                .all(|v| matches!(v.as_int(), Ok(n) if n >= 0));
-                                            return Ok(TlaValue::Bool(!all_nat));
-                                        }
-
-                                        let codomain_set =
-                                            eval_expr_inner(codomain_expr, ctx, depth + 1)?;
-                                        let all_in_codomain = func
-                                            .values()
-                                            .all(|v| codomain_set.contains(v).unwrap_or(false));
-                                        return Ok(TlaValue::Bool(!all_in_codomain));
-                                    }
-                                    _ => return Ok(TlaValue::Bool(true)), // Not a function
-                                }
-                            }
-
-                            // Check if it's a record type [field: Type, ...]
-                            if inner.contains(':') {
-                                match &left {
-                                    TlaValue::Record(rec) => {
-                                        let field_specs: Vec<&str> = inner.split(',').collect();
-                                        let mut expected_fields =
-                                            std::collections::HashSet::<String>::new();
-
-                                        for spec in field_specs {
-                                            let parts: Vec<&str> = spec.split(':').collect();
-                                            if parts.len() != 2 {
-                                                continue;
-                                            }
-                                            let field_name = parts[0].trim();
-                                            let field_type = parts[1].trim();
-                                            expected_fields.insert(field_name.to_string());
-
-                                            if let Some(field_value) = rec.get(field_name) {
-                                                let matches_type = match field_type {
-                                                    "Nat" => {
-                                                        matches!(field_value.as_int(), Ok(n) if n >= 0)
-                                                    }
-                                                    "Int" => field_value.as_int().is_ok(),
-                                                    "BOOLEAN" => {
-                                                        matches!(field_value, TlaValue::Bool(_))
-                                                    }
-                                                    _ => {
-                                                        if let Ok(type_val) = eval_expr_inner(
-                                                            field_type,
-                                                            ctx,
-                                                            depth + 1,
-                                                        ) {
-                                                            type_val
-                                                                .contains(field_value)
-                                                                .unwrap_or(false)
-                                                        } else {
-                                                            false
-                                                        }
-                                                    }
-                                                };
-                                                if !matches_type {
-                                                    return Ok(TlaValue::Bool(true));
-                                                }
-                                            } else {
-                                                return Ok(TlaValue::Bool(true));
-                                            }
-                                        }
-
-                                        if rec.len() != expected_fields.len() {
-                                            return Ok(TlaValue::Bool(true));
-                                        }
-
-                                        return Ok(TlaValue::Bool(false));
-                                    }
-                                    _ => return Ok(TlaValue::Bool(true)), // Not a record
-                                }
-                            }
-                        }
-
-                        let right = eval_expr_inner(rhs, ctx, depth + 1)?;
-                        Ok(TlaValue::Bool(!right.contains(&left)?))
-                    }
-                }
+                Ok(TlaValue::Bool(!matches_membership_expr(
+                    &left,
+                    rhs_trimmed,
+                    ctx,
+                    depth + 1,
+                )?))
             }
             "\\subseteq" => {
                 let right = eval_expr_inner(rhs, ctx, depth + 1)?;
@@ -849,8 +885,24 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
         }
         return Ok(out);
     }
+    let union_parts = split_top_level_keyword(expr, "\\cup");
+    if union_parts.len() > 1 {
+        let mut out = eval_expr_inner(&union_parts[0], ctx, depth + 1)?;
+        for part in &union_parts[1..] {
+            out = out.set_union(&eval_expr_inner(part, ctx, depth + 1)?)?;
+        }
+        return Ok(out);
+    }
 
     let intersect_parts = split_top_level_keyword(expr, "\\intersect");
+    if intersect_parts.len() > 1 {
+        let mut out = eval_expr_inner(&intersect_parts[0], ctx, depth + 1)?;
+        for part in &intersect_parts[1..] {
+            out = out.set_intersection(&eval_expr_inner(part, ctx, depth + 1)?)?;
+        }
+        return Ok(out);
+    }
+    let intersect_parts = split_top_level_keyword(expr, "\\cap");
     if intersect_parts.len() > 1 {
         let mut out = eval_expr_inner(&intersect_parts[0], ctx, depth + 1)?;
         for part in &intersect_parts[1..] {
@@ -895,6 +947,34 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
             result = TlaValue::Set(Arc::new(product));
         }
         return Ok(result);
+    }
+
+    // TLC module: Function override operator @@
+    // f @@ g merges two functions, with g taking precedence on overlapping keys
+    let func_override_parts = split_top_level_symbol(expr, "@@");
+    if func_override_parts.len() > 1 {
+        let mut out = eval_expr_inner(&func_override_parts[0], ctx, depth + 1)?;
+        for part in &func_override_parts[1..] {
+            let rhs = eval_expr_inner(part, ctx, depth + 1)?;
+            let left_func = out.as_function()?;
+            let right_func = rhs.as_function()?;
+            let mut result = left_func.clone();
+            for (k, v) in right_func.iter() {
+                result.insert(k.clone(), v.clone());
+            }
+            out = TlaValue::Function(Arc::new(result));
+        }
+        return Ok(out);
+    }
+
+    // TLC module: Function pair constructor :>
+    // a :> b creates a function mapping a to b (single mapping {a -> b})
+    if let Some((lhs, rhs)) = split_once_top_level(expr, ":>") {
+        let key = eval_expr_inner(lhs.trim(), ctx, depth + 1)?;
+        let val = eval_expr_inner(rhs.trim(), ctx, depth + 1)?;
+        let mut func = BTreeMap::new();
+        func.insert(key, val);
+        return Ok(TlaValue::Function(Arc::new(func)));
     }
 
     if let Some((lhs, op, rhs)) = split_top_level_additive(expr) {
@@ -1543,15 +1623,8 @@ fn eval_enabled(action_name: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
 
     // Try to apply the action to see if it's enabled
     // An action is enabled if it can produce a successor state
-    match crate::tla::apply_action_ir_with_context(&action_ir, ctx.state, ctx) {
-        Ok(Some(_next_state)) => {
-            // Action produced a successor - it's enabled
-            Ok(TlaValue::Bool(true))
-        }
-        Ok(None) => {
-            // Action did not produce a successor (guard failed) - not enabled
-            Ok(TlaValue::Bool(false))
-        }
+    match apply_action_ir_with_context_multi(&action_ir, ctx.state, ctx) {
+        Ok(next_states) => Ok(TlaValue::Bool(!next_states.is_empty())),
         Err(_) => {
             // Evaluation error - action is not enabled
             // (This can happen with complex expressions that aren't fully supported)
@@ -2920,8 +2993,14 @@ fn split_top_level_comparison(expr: &str) -> Option<(&str, &'static str, &str)> 
                 }
 
                 if pattern == ">" {
+                    let prev_char = expr[..i].chars().next_back();
                     let next_char = expr[end..].chars().next();
+                    // Skip >= and >> operators
                     if next_char == Some('=') || next_char == Some('>') {
+                        continue;
+                    }
+                    // Skip :> (TLC function pair operator)
+                    if prev_char == Some(':') {
                         continue;
                     }
                 }
@@ -3355,6 +3434,11 @@ fn find_top_level_char_from(expr: &str, target: char, start_at: usize) -> Option
         }
 
         if paren == 0 && bracket == 0 && brace == 0 && angle == 0 && ch == target {
+            // When searching for ':', skip ':>' (TLC function pair operator)
+            if ch == ':' && next == Some('>') {
+                i += ch_len;
+                continue;
+            }
             return Some(i);
         }
 
@@ -3761,6 +3845,7 @@ fn skip_leading_ws(input: &str, mut idx: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn evals_arithmetic_and_boolean() {
@@ -3821,6 +3906,57 @@ mod tests {
         };
         let out = apply_action_ir(&action, &state).expect("evaluation should succeed");
         assert!(out.is_none());
+    }
+
+    #[test]
+    fn applies_action_ir_with_conditional_branches() {
+        let state = TlaState::from([
+            ("flag".to_string(), TlaValue::Bool(false)),
+            ("x".to_string(), TlaValue::Int(7)),
+            ("y".to_string(), TlaValue::Int(9)),
+        ]);
+        let action = ActionIr {
+            name: "Conditional".to_string(),
+            params: vec![],
+            clauses: vec![ActionClause::Guard {
+                expr: "IF flag THEN /\\ x' = x + 1 /\\ UNCHANGED y ELSE /\\ UNCHANGED x /\\ y' = y + 1"
+                    .to_string(),
+            }],
+        };
+
+        let next = apply_action_ir(&action, &state)
+            .expect("conditional action should evaluate")
+            .expect("branch should succeed");
+        assert_eq!(next.get("x"), Some(&TlaValue::Int(7)));
+        assert_eq!(next.get("y"), Some(&TlaValue::Int(10)));
+    }
+
+    #[test]
+    fn quantified_let_action_generates_multiple_successors() {
+        let state = TlaState::from([
+            ("x".to_string(), TlaValue::Int(0)),
+            ("y".to_string(), TlaValue::Int(9)),
+        ]);
+        let ctx = EvalContext::new(&state);
+        let action = ActionIr {
+            name: "Pick".to_string(),
+            params: vec![],
+            clauses: vec![ActionClause::LetWithPrimes {
+                expr: "LET choices == {1, 2} IN /\\ \\E pick \\in choices : /\\ x' = pick /\\ UNCHANGED <<y>>".to_string(),
+            }],
+        };
+
+        let next_states =
+            apply_action_ir_with_context_multi(&action, &state, &ctx).expect("action should branch");
+        assert_eq!(next_states.len(), 2);
+        let next_xs: BTreeSet<i64> = next_states
+            .iter()
+            .map(|next| next.get("x").unwrap().as_int().unwrap())
+            .collect();
+        assert_eq!(next_xs, BTreeSet::from([1, 2]));
+        for next in next_states {
+            assert_eq!(next.get("y"), Some(&TlaValue::Int(9)));
+        }
     }
 
     #[test]
@@ -4089,5 +4225,19 @@ mod tests {
             result.is_some(),
             "split_top_level_comparison should split after IN"
         );
+    }
+
+    #[test]
+    fn evaluates_cup_alias() {
+        let state = TlaState::new();
+        let ctx = EvalContext::new(&state);
+
+        let result = eval_expr("{1, 2} \\cup {2, 3}", &ctx).expect("\\cup should evaluate");
+        let expected = TlaValue::Set(Arc::new(BTreeSet::from([
+            TlaValue::Int(1),
+            TlaValue::Int(2),
+            TlaValue::Int(3),
+        ])));
+        assert_eq!(result, expected);
     }
 }
