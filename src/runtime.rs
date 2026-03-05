@@ -338,6 +338,126 @@ fn write_checkpoint_manifest(path: &Path, manifest: &CheckpointManifest) -> Resu
     Ok(())
 }
 
+/// Maximum number of checkpoint files to retain (rolling window)
+const MAX_CHECKPOINT_FILES: usize = 5;
+
+/// Write a checkpoint with validation and rolling retention.
+///
+/// This function:
+/// 1. Writes checkpoint to a timestamped file (e.g., checkpoint-1709612345.json)
+/// 2. Reads it back and validates the JSON parses correctly and key fields match
+/// 3. Only if valid: updates latest.json to point to the new checkpoint
+/// 4. Prunes old checkpoints keeping only the last MAX_CHECKPOINT_FILES
+///
+/// The `latest_path` should be the path to latest.json (e.g., work_dir/checkpoints/latest.json)
+fn write_validated_rolling_checkpoint(
+    latest_path: &Path,
+    manifest: &CheckpointManifest,
+) -> Result<()> {
+    // Get the checkpoints directory
+    let checkpoint_dir = latest_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("checkpoint path has no parent directory"))?;
+
+    std::fs::create_dir_all(checkpoint_dir).with_context(|| {
+        format!(
+            "failed creating checkpoint dir {}",
+            checkpoint_dir.display()
+        )
+    })?;
+
+    // Create timestamped checkpoint filename
+    let timestamp = manifest.created_unix_secs;
+    let timestamped_name = format!("checkpoint-{}.json", timestamp);
+    let timestamped_path = checkpoint_dir.join(&timestamped_name);
+
+    // Step 1: Write checkpoint to timestamped file
+    write_checkpoint_manifest(&timestamped_path, manifest).with_context(|| {
+        format!(
+            "failed writing checkpoint to {}",
+            timestamped_path.display()
+        )
+    })?;
+
+    // Step 2: Read back and validate
+    let readback_bytes = std::fs::read(&timestamped_path).with_context(|| {
+        format!(
+            "failed reading back checkpoint from {}",
+            timestamped_path.display()
+        )
+    })?;
+
+    let readback_manifest: CheckpointManifest = serde_json::from_slice(&readback_bytes)
+        .with_context(|| {
+            format!(
+                "failed parsing checkpoint JSON from {}",
+                timestamped_path.display()
+            )
+        })?;
+
+    // Validate key fields match what we wrote
+    if readback_manifest.version != manifest.version
+        || readback_manifest.model != manifest.model
+        || readback_manifest.created_unix_secs != manifest.created_unix_secs
+        || readback_manifest.states_generated != manifest.states_generated
+        || readback_manifest.states_distinct != manifest.states_distinct
+    {
+        // Validation failed - remove the corrupt checkpoint and return error
+        let _ = std::fs::remove_file(&timestamped_path);
+        return Err(anyhow::anyhow!(
+            "checkpoint validation failed: read-back data does not match written data"
+        ));
+    }
+
+    // Step 3: Update latest.json to be a copy of the validated checkpoint
+    // We copy rather than symlink for S3 compatibility
+    std::fs::copy(&timestamped_path, latest_path)
+        .with_context(|| format!("failed copying checkpoint to {}", latest_path.display()))?;
+
+    // Step 4: Prune old checkpoints (keep last MAX_CHECKPOINT_FILES)
+    prune_old_checkpoints(checkpoint_dir, MAX_CHECKPOINT_FILES)?;
+
+    Ok(())
+}
+
+/// Prune old checkpoint files, keeping only the most recent `keep_count` files.
+/// Only removes files matching the pattern "checkpoint-*.json".
+fn prune_old_checkpoints(checkpoint_dir: &Path, keep_count: usize) -> Result<()> {
+    let mut checkpoint_files: Vec<_> = std::fs::read_dir(checkpoint_dir)
+        .with_context(|| format!("failed reading checkpoint dir {}", checkpoint_dir.display()))?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            // Match checkpoint-{timestamp}.json but NOT latest.json
+            name_str.starts_with("checkpoint-") && name_str.ends_with(".json")
+        })
+        .collect();
+
+    // Sort by filename (which contains timestamp, so oldest first)
+    checkpoint_files.sort_by_key(|e| e.file_name());
+
+    // Remove oldest files if we have more than keep_count
+    if checkpoint_files.len() > keep_count {
+        let to_remove = checkpoint_files.len() - keep_count;
+        for entry in checkpoint_files.into_iter().take(to_remove) {
+            let path = entry.path();
+            if let Err(e) = std::fs::remove_file(&path) {
+                // Log but don't fail - pruning is best-effort
+                eprintln!(
+                    "Checkpoint: warning: failed to prune old checkpoint {}: {}",
+                    path.display(),
+                    e
+                );
+            } else {
+                eprintln!("Checkpoint: pruned old checkpoint {}", path.display());
+            }
+        }
+    }
+
+    Ok(())
+}
+
 struct CheckpointContext<'a, T> {
     checkpoint_path: &'a Path,
     model_name: &'a str,
@@ -411,7 +531,7 @@ where
                 }
             },
         };
-        write_checkpoint_manifest(ctx.checkpoint_path, &manifest)?;
+        write_validated_rolling_checkpoint(ctx.checkpoint_path, &manifest)?;
         ctx.run_stats.checkpoints.fetch_add(1, Ordering::Relaxed);
         Ok(())
     })();
@@ -927,15 +1047,16 @@ where
                     },
                 };
 
-                if let Err(e) = write_checkpoint_manifest(&checkpoint_path, &manifest) {
-                    eprintln!("Checkpoint: failed to write manifest: {}", e);
+                if let Err(e) = write_validated_rolling_checkpoint(&checkpoint_path, &manifest) {
+                    eprintln!("Checkpoint: failed to write/validate manifest: {}", e);
                 } else {
                     ckpt_run_stats.checkpoints.fetch_add(1, Ordering::Relaxed);
                     eprintln!(
-                        "Checkpoint: completed in {:.1}s (states: {}, distinct: {})",
+                        "Checkpoint: completed in {:.1}s (states: {}, distinct: {}) [validated, keeping last {}]",
                         ckpt_start.elapsed().as_secs_f64(),
                         states_generated,
-                        states_distinct
+                        states_distinct,
+                        MAX_CHECKPOINT_FILES,
                     );
                 }
 
@@ -1713,8 +1834,16 @@ where
                 }
             },
         };
-        if let Err(e) = write_checkpoint_manifest(&checkpoint_path, &manifest) {
-            eprintln!("Warning: failed to write checkpoint manifest: {}", e);
+        if let Err(e) = write_validated_rolling_checkpoint(&checkpoint_path, &manifest) {
+            eprintln!(
+                "Warning: failed to write/validate checkpoint manifest: {}",
+                e
+            );
+        } else {
+            eprintln!(
+                "Exit checkpoint written and validated [keeping last {}]",
+                MAX_CHECKPOINT_FILES
+            );
         }
     }
 
