@@ -1,0 +1,6 @@
+# Generated trace files
+*_TTrace_*.tla
+*_TTrace_*.bin
+
+# Working directories
+.tlc-out/
