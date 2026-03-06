@@ -858,6 +858,7 @@ fn main() -> anyhow::Result<()> {
                         ActionClause::PrimedAssignment { .. } => action_primed_assignments += 1,
                         ActionClause::Unchanged { .. } => action_unchanged_clauses += 1,
                         ActionClause::Guard { .. } => action_guard_clauses += 1,
+                        ActionClause::Exists { .. } => action_guard_clauses += 1,
                         ActionClause::LetWithPrimes { .. } => action_guard_clauses += 1,
                     }
                 }
@@ -1010,6 +1011,7 @@ fn main() -> anyhow::Result<()> {
                                 }
                             }
                         }
+                        ActionClause::Exists { .. } => {}
                         ActionClause::Unchanged { .. } => {}
                     }
                 }
