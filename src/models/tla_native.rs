@@ -1017,4 +1017,50 @@ INVARIANT Inv
         assert!(!next.is_empty());
         assert!(model.check_invariants(&init[0]).is_ok());
     }
+
+    #[test]
+    fn function_set_membership_invariant_does_not_trigger_empty_expression() {
+        let tmp = std::env::temp_dir().join("tlapp-native-function-set-invariant");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should be created");
+
+        let module = tmp.join("FunctionSetInvariant.tla");
+        fs::write(
+            &module,
+            r#"
+---- MODULE FunctionSetInvariant ----
+EXTENDS Naturals
+CONSTANTS S
+VARIABLES f
+Init == /\ f = [x \in S |-> 0]
+Next == /\ UNCHANGED <<f>>
+TypeOK == f \in [S -> 0..1]
+Spec == Init /\ [][Next]_<<f>>
+====
+"#,
+        )
+        .expect("module should be written");
+
+        let cfg = tmp.join("FunctionSetInvariant.cfg");
+        fs::write(
+            &cfg,
+            r#"
+SPECIFICATION Spec
+CONSTANTS
+    S = {a, b}
+INVARIANT TypeOK
+"#,
+        )
+        .expect("cfg should be written");
+
+        let model =
+            TlaModel::from_files(&module, Some(&cfg), None, None).expect("model should build");
+        let init = model.initial_states();
+        assert_eq!(init.len(), 1);
+        let invariant_result = model.check_invariants(&init[0]);
+        assert!(
+            invariant_result.is_ok(),
+            "unexpected invariant result: {invariant_result:?}"
+        );
+    }
 }
