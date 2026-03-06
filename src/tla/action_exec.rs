@@ -1,7 +1,7 @@
 use crate::fairness::{ActionLabel, LabeledTransition};
 use crate::tla::{
-    CompiledActionIr, EvalContext, TlaDefinition, TlaState, TlaValue, apply_compiled_action_ir,
-    compile_action_ir, eval_expr, split_top_level,
+    CompiledActionIr, EvalContext, TlaDefinition, TlaState, TlaValue,
+    apply_compiled_action_ir_multi, compile_action_ir, eval_expr, split_top_level,
 };
 use anyhow::{Result, anyhow};
 use dashmap::DashMap;
@@ -210,11 +210,7 @@ fn execute_branch(
 
         // Use compiled action IR for faster evaluation
         let compiled_ir = get_or_compile_action(def);
-        let next = apply_compiled_action_ir(&compiled_ir, state, &ctx)?;
-        return match next {
-            Some(state) => Ok(vec![state]),
-            None => Ok(Vec::new()),
-        };
+        return apply_compiled_action_ir_multi(&compiled_ir, state, &ctx);
     }
 
     // Not an action call - treat as inline action body (conjunction of constraints)
@@ -234,11 +230,7 @@ fn execute_branch(
 
     // Use compiled action IR for inline actions too
     let compiled_ir = get_or_compile_action(&inline_def);
-    let next = apply_compiled_action_ir(&compiled_ir, state, &ctx)?;
-    match next {
-        Some(state) => Ok(vec![state]),
-        None => Ok(Vec::new()),
-    }
+    apply_compiled_action_ir_multi(&compiled_ir, state, &ctx)
 }
 
 fn execute_exists_branch(
@@ -540,6 +532,11 @@ fn find_top_level_char_from(expr: &str, target: char, start_at: usize) -> Option
         }
 
         if paren == 0 && bracket == 0 && brace == 0 && angle == 0 && ch == target {
+            // When searching for ':', skip ':>' (TLC function pair operator)
+            if ch == ':' && next == Some('>') {
+                i += len;
+                continue;
+            }
             return Some(i);
         }
 

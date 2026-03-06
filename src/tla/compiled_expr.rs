@@ -86,6 +86,10 @@ pub enum CompiledExpr {
     FuncApply(Box<CompiledExpr>, Vec<CompiledExpr>),
     FuncExcept(Box<CompiledExpr>, Vec<(Vec<CompiledExpr>, CompiledExpr)>),
     Domain(Box<CompiledExpr>),
+    /// TLC module: Function pair constructor (a :> b creates {a -> b})
+    FuncPair(Box<CompiledExpr>, Box<CompiledExpr>),
+    /// TLC module: Function override (f @@ g merges functions, g takes precedence)
+    FuncOverride(Box<CompiledExpr>, Box<CompiledExpr>),
 
     // Control flow
     If {
@@ -184,7 +188,9 @@ impl CompiledExpr {
             | CompiledExpr::Subset(a, b)
             | CompiledExpr::SetRange(a, b)
             | CompiledExpr::Append(a, b)
-            | CompiledExpr::Concat(a, b) => a.is_fully_compiled() && b.is_fully_compiled(),
+            | CompiledExpr::Concat(a, b)
+            | CompiledExpr::FuncPair(a, b)
+            | CompiledExpr::FuncOverride(a, b) => a.is_fully_compiled() && b.is_fully_compiled(),
             CompiledExpr::If {
                 cond,
                 then_branch,
@@ -464,6 +470,16 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
         return CompiledExpr::Mod(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
     }
 
+    // TLC module: Function override operator @@
+    // f @@ g merges two functions, with g taking precedence on overlapping keys
+    // Lower precedence than :> so parse it first
+    if let Some((left, right)) = split_binary_op(expr, "@@") {
+        return CompiledExpr::FuncOverride(
+            Box::new(compile_expr(left)),
+            Box::new(compile_expr(right)),
+        );
+    }
+
     // Set operations
     if let Some((left, right)) = split_binary_op(expr, "\\union") {
         return CompiledExpr::Union(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
@@ -489,6 +505,16 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
     }
     if let Some((left, right)) = split_binary_op(expr, "\\") {
         return CompiledExpr::SetMinus(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
+    }
+
+    // TLC module: Function pair constructor :>
+    // a :> b creates a function mapping a to b (single mapping {a -> b})
+    // Higher precedence than @@, so parse it after set operations
+    if let Some((left, right)) = split_binary_op(expr, ":>") {
+        return CompiledExpr::FuncPair(
+            Box::new(compile_expr(left)),
+            Box::new(compile_expr(right)),
+        );
     }
 
     // Set/sequence range: a..b
@@ -956,6 +982,10 @@ fn split_binary_op<'a>(expr: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
                 }
             }
             if matches {
+                if op == ">" && i > 0 && chars[i - 1] == ':' {
+                    i += 1;
+                    continue;
+                }
                 // Calculate byte offsets
                 let left_byte_end: usize = chars[..i].iter().map(|c| c.len_utf8()).sum();
                 let right_byte_start: usize = chars[..i + op_chars.len()]
@@ -1032,6 +1062,9 @@ fn parse_func_apply(expr: &str) -> Option<(&str, Vec<String>)> {
             b'[' if depth == 1 => {
                 // Found the opening bracket
                 let func = &expr[..i];
+                if func.trim().is_empty() {
+                    return None;
+                }
                 let args_str = &expr[i + 1..expr.len() - 1];
                 let args = split_top_level(args_str, ",");
                 return Some((func, args));
@@ -1379,7 +1412,13 @@ fn find_top_level_colon(expr: &str) -> Option<usize> {
         match bytes[i] {
             b'(' | b'[' | b'{' => depth += 1,
             b')' | b']' | b'}' => depth -= 1,
-            b':' if depth == 0 => return Some(i),
+            b':' if depth == 0 => {
+                // Skip :> (TLC function pair operator) - only match standalone :
+                if i + 1 < bytes.len() && bytes[i + 1] == b'>' {
+                    continue;
+                }
+                return Some(i);
+            }
             _ => {}
         }
     }
@@ -1671,6 +1710,7 @@ fn find_keyword(expr: &str, keyword: &str) -> Option<usize> {
 // ============================================================================
 
 use crate::tla::{ActionClause, ClauseKind, classify_clause};
+use crate::tla::action_ir::{parse_action_exists, parse_action_if, split_action_body_clauses};
 
 /// A compiled version of ActionClause that stores pre-parsed expressions
 #[derive(Debug, Clone)]
@@ -1684,6 +1724,15 @@ pub enum CompiledActionClause {
     },
     Guard {
         expr: CompiledExpr,
+    },
+    Exists {
+        binders: String,
+        body_clauses: Vec<CompiledActionClause>,
+    },
+    Conditional {
+        condition: CompiledExpr,
+        then_clauses: Vec<CompiledActionClause>,
+        else_clauses: Vec<CompiledActionClause>,
     },
     /// Compiled LET expression with primed assignments in the body
     /// The bindings are evaluated first to create local definitions,
@@ -1711,36 +1760,79 @@ pub struct CompiledActionIr {
 impl CompiledActionIr {
     /// Compile an ActionIr into a CompiledActionIr with pre-parsed expressions
     pub fn from_ir(ir: &crate::tla::ActionIr) -> Self {
-        let clauses = ir
-            .clauses
-            .iter()
-            .map(|clause| match clause {
-                ActionClause::PrimedAssignment { var, expr } => {
-                    CompiledActionClause::PrimedAssignment {
-                        var: var.clone(),
-                        expr: compile_expr(expr),
-                    }
-                }
-                ActionClause::Unchanged { vars } => {
-                    CompiledActionClause::Unchanged { vars: vars.clone() }
-                }
-                ActionClause::Guard { expr } => CompiledActionClause::Guard {
-                    expr: compile_expr(expr),
-                },
-                ActionClause::LetWithPrimes { expr } => {
-                    // Try to compile the LET expression
-                    match compile_let_with_primes(expr) {
-                        Some(compiled) => compiled,
-                        None => CompiledActionClause::LetWithPrimes { expr: expr.clone() },
-                    }
-                }
-            })
-            .collect();
+        let clauses = ir.clauses.iter().map(compile_action_clause).collect();
 
         CompiledActionIr {
             name: ir.name.clone(),
             params: ir.params.clone(),
             clauses,
+        }
+    }
+}
+
+fn compile_action_clause(clause: &ActionClause) -> CompiledActionClause {
+    match clause {
+        ActionClause::PrimedAssignment { var, expr } => CompiledActionClause::PrimedAssignment {
+            var: var.clone(),
+            expr: compile_expr(expr),
+        },
+        ActionClause::Unchanged { vars } => CompiledActionClause::Unchanged { vars: vars.clone() },
+        ActionClause::Guard { expr } => compile_action_clause_text(expr),
+        ActionClause::Exists { binders, body } => CompiledActionClause::Exists {
+            binders: binders.clone(),
+            body_clauses: compile_action_body_clauses(body),
+        },
+        ActionClause::LetWithPrimes { expr } => match compile_let_with_primes(expr) {
+            Some(compiled) => compiled,
+            None => CompiledActionClause::LetWithPrimes { expr: expr.clone() },
+        },
+    }
+}
+
+fn compile_action_body_clauses(body: &str) -> Vec<CompiledActionClause> {
+    split_action_body_clauses(body)
+        .into_iter()
+        .map(|clause| compile_action_clause_text(&clause))
+        .collect()
+}
+
+fn compile_action_clause_text(expr: &str) -> CompiledActionClause {
+    let trimmed = expr.trim();
+    if let Some((condition, then_branch, else_branch)) = parse_action_if(trimmed) {
+        let then_clauses = compile_action_body_clauses(then_branch);
+        let else_clauses = compile_action_body_clauses(else_branch);
+        return CompiledActionClause::Conditional {
+            condition: compile_expr(condition),
+            then_clauses,
+            else_clauses,
+        };
+    }
+    if let Some((binders, body)) = parse_action_exists(trimmed) {
+        return CompiledActionClause::Exists {
+            binders: binders.to_string(),
+            body_clauses: compile_action_body_clauses(body),
+        };
+    }
+
+    match classify_clause(trimmed) {
+        ClauseKind::PrimedAssignment { var, expr } => CompiledActionClause::PrimedAssignment {
+            var,
+            expr: compile_expr(&expr),
+        },
+        ClauseKind::Unchanged { vars } => CompiledActionClause::Unchanged { vars },
+        ClauseKind::UnprimedEquality { .. } | ClauseKind::Other => {
+            if trimmed.starts_with("LET") && trimmed.contains('\'') {
+                match compile_let_with_primes(trimmed) {
+                    Some(compiled) => compiled,
+                    None => CompiledActionClause::LetWithPrimes {
+                        expr: trimmed.to_string(),
+                    },
+                }
+            } else {
+                CompiledActionClause::Guard {
+                    expr: compile_expr(trimmed),
+                }
+            }
         }
     }
 }
@@ -1761,42 +1853,13 @@ fn compile_let_with_primes(expr: &str) -> Option<CompiledActionClause> {
         .collect();
 
     // Parse body as conjunction of clauses
-    let body_conjuncts = split_top_level(body_text, "/\\");
+    let body_conjuncts = split_action_body_clauses(body_text);
 
     // Compile each clause in the body
-    let mut body_clauses = Vec::new();
-    for conjunct in body_conjuncts {
-        let trimmed = conjunct.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        match classify_clause(trimmed) {
-            ClauseKind::PrimedAssignment { var, expr } => {
-                body_clauses.push(CompiledActionClause::PrimedAssignment {
-                    var,
-                    expr: compile_expr(&expr),
-                });
-            }
-            ClauseKind::Unchanged { vars } => {
-                body_clauses.push(CompiledActionClause::Unchanged { vars });
-            }
-            ClauseKind::UnprimedEquality { .. } | ClauseKind::Other => {
-                // Check for nested LET with primes
-                if trimmed.starts_with("LET") && trimmed.contains('\'') {
-                    match compile_let_with_primes(trimmed) {
-                        Some(compiled) => body_clauses.push(compiled),
-                        None => return None, // Can't compile nested LET, fall back
-                    }
-                } else {
-                    // Treat as guard
-                    body_clauses.push(CompiledActionClause::Guard {
-                        expr: compile_expr(trimmed),
-                    });
-                }
-            }
-        }
-    }
+    let body_clauses = body_conjuncts
+        .into_iter()
+        .map(|conjunct| compile_action_clause_text(&conjunct))
+        .collect();
 
     Some(CompiledActionClause::CompiledLetWithPrimes {
         bindings: compiled_bindings,
@@ -2006,6 +2069,16 @@ mod tests {
 
         let expr = compile_expr("n < 10");
         assert!(matches!(expr, CompiledExpr::Lt(_, _)));
+    }
+
+    #[test]
+    fn test_compile_function_pair() {
+        let expr = compile_expr("mid :> [x |-> 1]");
+        assert!(
+            matches!(expr, CompiledExpr::FuncPair(_, _)),
+            "function pair should not be parsed as comparison: {:?}",
+            expr
+        );
     }
 
     #[test]

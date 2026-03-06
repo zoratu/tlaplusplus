@@ -23,6 +23,7 @@ pub fn split_top_level(expr: &str, delimiter: &str) -> Vec<String> {
     let mut let_depth = 0usize; // Track LET...IN nesting
     let mut if_depth = 0usize; // Track IF...ELSE nesting
     let mut case_depth = 0usize; // Track CASE expression nesting
+    let mut in_quantifier_body = false;
 
     while i < chars.len() {
         let c = chars[i];
@@ -103,10 +104,60 @@ pub fn split_top_level(expr: &str, delimiter: &str) -> Vec<String> {
                 i += 4;
                 continue;
             }
+
+            if c == '\\' && i + 2 < chars.len() {
+                let quant = chars[i + 1];
+                let after = chars[i + 2];
+                if (quant == 'A' || quant == 'E') && (after.is_whitespace() || after == '(') {
+                    let mut j = i + 2;
+                    let mut inner_depth = 0usize;
+                    while j < chars.len() {
+                        match chars[j] {
+                            '(' | '[' | '{' => inner_depth += 1,
+                            ')' | ']' | '}' => inner_depth = inner_depth.saturating_sub(1),
+                            '<' if j + 1 < chars.len() && chars[j + 1] == '<' => {
+                                inner_depth += 1;
+                                j += 1;
+                            }
+                            '>' if j + 1 < chars.len() && chars[j + 1] == '>' => {
+                                inner_depth = inner_depth.saturating_sub(1);
+                                j += 1;
+                            }
+                            ':' if inner_depth == 0 => {
+                                in_quantifier_body = true;
+                                for ch in &chars[i..=j] {
+                                    current.push(*ch);
+                                }
+                                i = j + 1;
+                                break;
+                            }
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    if j < chars.len() {
+                        continue;
+                    }
+                }
+            }
         }
 
         let at_top = at_bracket_top && let_depth == 0 && if_depth == 0 && case_depth == 0;
         if at_top && matches_at(&chars, i, &delim_chars) {
+            if in_quantifier_body && delimiter == "/\\" {
+                let after_delim: String = chars[i + delim_chars.len()..].iter().collect();
+                let after_delim = after_delim.trim_start();
+                let starts_new_quantifier = after_delim.starts_with("\\A ")
+                    || after_delim.starts_with("\\A(")
+                    || after_delim.starts_with("\\E ")
+                    || after_delim.starts_with("\\E(");
+                if !starts_new_quantifier {
+                    current.push(c);
+                    i += 1;
+                    continue;
+                }
+                in_quantifier_body = false;
+            }
             let piece = current.trim();
             if !piece.is_empty() {
                 out.push(piece.to_string());
@@ -240,6 +291,17 @@ mod tests {
     fn splits_top_level_disjunction() {
         let parts = split_top_level("\\/ A /\\ B \\/ \\E x \\in S: (C \\/ D) \\/ E", "\\/");
         assert_eq!(parts.len(), 3);
+    }
+
+    #[test]
+    fn does_not_split_quantified_action_body() {
+        let parts = split_top_level(
+            "/\\ Cardinality(staleSlots) >= needSlots /\\ \\E targets \\in SUBSET staleSlots : /\\ Cardinality(targets) = needSlots /\\ pendingWrite' = bestGen /\\ writeTargets' = targets",
+            "/\\",
+        );
+        assert_eq!(parts.len(), 2);
+        assert!(parts[1].starts_with("\\E targets \\in SUBSET staleSlots :"));
+        assert!(parts[1].contains("writeTargets' = targets"));
     }
 
     #[test]
