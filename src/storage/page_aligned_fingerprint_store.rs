@@ -887,7 +887,7 @@ impl PageAlignedFingerprintStore {
     /// - Shards 0..K on NUMA 0, K..2K on NUMA 1, etc.
     /// - Fingerprints are routed to their home NUMA via `home_numa(fp)`
     /// - This ensures fingerprint checks are local when states are routed correctly
-    pub fn new(config: FingerprintStoreConfig, worker_cpus: &[Option<usize>]) -> Result<Self> {
+    pub fn new(config: FingerprintStoreConfig, _worker_cpus: &[Option<usize>]) -> Result<Self> {
         let shard_count = config.shard_count.max(1).next_power_of_two();
 
         // Detect NUMA topology

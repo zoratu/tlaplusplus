@@ -163,6 +163,73 @@ Recovery behaviors:
 - **I/O failures**: Exponential backoff retry (3 attempts, 100ms-2s delays)
 - **Memory pressure**: Graceful degradation, emergency checkpoints
 
+## S3 Persistence for Spot Instances
+
+TLA++ includes built-in S3 support for running on AWS spot instances. When enabled, it automatically:
+- Uploads checkpoints and queue segments to S3 in the background
+- Downloads existing state on resume for seamless spot instance recovery
+- Handles SIGTERM gracefully with emergency checkpoint+flush (spot preemption warning)
+- Prunes old checkpoints to control S3 storage costs
+
+### Basic Usage
+
+```bash
+# Run with S3 persistence (auto-generates run ID)
+./target/release/tlaplusplus run-tla \
+  --module /path/to/Spec.tla \
+  --config /path/to/Spec.cfg \
+  --s3-bucket my-bucket \
+  --s3-region us-west-2
+
+# Resume a specific run after spot termination
+./target/release/tlaplusplus run-tla \
+  --module /path/to/Spec.tla \
+  --config /path/to/Spec.cfg \
+  --s3-bucket my-bucket \
+  --s3-region us-west-2 \
+  --s3-prefix runs/my-run-123 \
+  --resume true
+```
+
+### S3 Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--s3-bucket` | none | S3 bucket name (enables S3 sync when set) |
+| `--s3-region` | auto | AWS region (auto-detects from instance/env if not set) |
+| `--s3-prefix` | auto | Path prefix in bucket (auto-generates timestamp if not set) |
+| `--s3-upload-interval-secs` | 10 | Background upload frequency |
+| `--checkpoint-interval-secs` | 600* | Checkpoint frequency (*defaults to 10 min when S3 enabled) |
+
+### AWS Credentials
+
+S3 access requires standard AWS credentials. Options:
+- Instance profile (recommended for EC2)
+- Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
+- AWS credentials file (`~/.aws/credentials`)
+
+### Spot Instance Workflow
+
+1. Launch spot instance with your model
+2. Model runs, checkpointing to S3 every 10 minutes by default
+3. If spot preempted (SIGTERM), emergency checkpoint + S3 flush (~2 min)
+4. Launch new spot instance, resume with `--resume true --s3-prefix runs/previous-run`
+5. Model continues from last checkpoint with counters preserved
+
+### S3 Storage Structure
+
+```
+s3://bucket/prefix/
+├── manifest.json           # Run metadata and latest checkpoint
+├── checkpoints/
+│   ├── latest.json         # Current checkpoint
+│   └── checkpoint-*.json   # Rolling checkpoint history
+├── fingerprints/           # Seen state hashes (for resume)
+│   └── shard-*.bin
+└── queue-spill/            # Pending states (zstd compressed)
+    └── segment-*.bin
+```
+
 ## TLC Corpus Validation
 
 ```bash

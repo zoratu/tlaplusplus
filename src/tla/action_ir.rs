@@ -219,11 +219,7 @@ fn find_action_keyword(expr: &str, keyword: &str) -> Option<usize> {
             }
         }
 
-        if at_top
-            && let_depth == 0
-            && if_depth == 0
-            && matches_keyword_at(&chars, i, keyword)
-        {
+        if at_top && let_depth == 0 && if_depth == 0 && matches_keyword_at(&chars, i, keyword) {
             let byte_offset: usize = chars[..i].iter().map(|c| c.len_utf8()).sum();
             return Some(byte_offset);
         }

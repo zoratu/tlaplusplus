@@ -8,9 +8,6 @@
 //!
 //! Benchmarks show this can provide 3-5x speedup on expression-heavy workloads.
 
-use crate::tla::{TlaDefinition, TlaValue};
-use anyhow::{Result, anyhow};
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// Compiled TLA+ expression - parsed once, evaluated many times
@@ -515,10 +512,7 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
     // a :> b creates a function mapping a to b (single mapping {a -> b})
     // Higher precedence than @@, so parse it after set operations
     if let Some((left, right)) = split_binary_op(expr, ":>") {
-        return CompiledExpr::FuncPair(
-            Box::new(compile_expr(left)),
-            Box::new(compile_expr(right)),
-        );
+        return CompiledExpr::FuncPair(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
     }
 
     // Set/sequence range: a..b
@@ -1508,7 +1502,7 @@ fn try_parse_let(expr: &str) -> Option<CompiledExpr> {
         let name = name.lines().last().unwrap_or("").trim();
 
         // Name should be a simple identifier (possibly with params in brackets)
-        if let Some(bracket_idx) = name.find('[') {
+        if let Some(_bracket_idx) = name.find('[') {
             // Has parameters like sumF[S \in SUBSET opts] - skip these recursive defs
             continue;
         }
@@ -1659,7 +1653,7 @@ fn find_keyword(expr: &str, keyword: &str) -> Option<usize> {
     let mut let_depth = 0usize; // Track LET...IN nesting
     let mut if_depth = 0usize; // Track IF...ELSE nesting
     let chars: Vec<char> = expr.chars().collect();
-    let keyword_chars: Vec<char> = keyword.chars().collect();
+    let _keyword_chars: Vec<char> = keyword.chars().collect();
     let mut i = 0;
 
     while i < chars.len() {
@@ -1727,8 +1721,8 @@ fn find_keyword(expr: &str, keyword: &str) -> Option<usize> {
 // Compiled Action IR - pre-compiled action clauses for fast execution
 // ============================================================================
 
-use crate::tla::{ActionClause, ClauseKind, classify_clause};
 use crate::tla::action_ir::{parse_action_exists, parse_action_if, split_action_body_clauses};
+use crate::tla::{ActionClause, ClauseKind, classify_clause};
 
 /// A compiled version of ActionClause that stores pre-parsed expressions
 #[derive(Debug, Clone)]
@@ -1969,7 +1963,7 @@ fn parse_let_bindings(defs_text: &str) -> Option<Vec<(String, String)>> {
         let body = defs_text[*eq_pos + 2..body_end].trim();
 
         // Name should be a simple identifier (possibly with params, but we ignore those for now)
-        let name = if let Some(paren) = name.find('(') {
+        let name = if let Some(_paren) = name.find('(') {
             // Has parameters - for simplicity, we don't support parameterized local defs yet
             // Return None to fall back to string eval
             return None;

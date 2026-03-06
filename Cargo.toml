@@ -7,8 +7,6 @@ edition = "2024"
 default = []
 # Enable fail points for chaos/fault injection testing
 failpoints = ["fail/failpoints"]
-# Enable S3 persistence for checkpoint/resume across spot instances
-s3 = ["aws-sdk-s3", "aws-config"]
 
 [dependencies]
 # Chaos testing - only active with failpoints feature
@@ -34,9 +32,9 @@ tokio = { version = "1.41", features = ["rt-multi-thread", "fs", "io-util", "tim
 twox-hash = "2.1.2"
 zstd = "0.13"
 
-# AWS SDK for S3 persistence (optional, enabled with s3 feature)
-aws-sdk-s3 = { version = "1.65", optional = true }
-aws-config = { version = "1.5", optional = true }
+# AWS SDK for S3 persistence (built-in for spot instance checkpoint/resume)
+aws-sdk-s3 = "1.65"
+aws-config = "1.5"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 procfs = "0.17"

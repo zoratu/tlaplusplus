@@ -1,9 +1,7 @@
 // In-memory lock-free fingerprint store - NO DISK I/O!
 // This eliminates the disk I/O bottleneck for 100+ core scaling
 
-use bloomfilter::Bloom;
 use dashmap::DashMap;
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 

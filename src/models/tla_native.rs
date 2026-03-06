@@ -1,4 +1,4 @@
-use crate::fairness::{ActionLabel, FairnessConstraint, LabeledTransition};
+use crate::fairness::{FairnessConstraint, LabeledTransition};
 use crate::model::Model;
 use crate::symmetry::{SymmetrySpec, canonicalize_tla_state};
 use crate::tla::{
@@ -264,37 +264,40 @@ impl Model for TlaModel {
         // Apply symmetry reduction if specified
         let canonical_state = if let Some(ref symmetry) = self.symmetry {
             let canonical = canonicalize_tla_state(state, symmetry);
-            // Debug: track canonicalization statistics
-            static FP_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            static FP_CHANGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            static DEBUG_PRINTED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
+            // Debug: track canonicalization statistics (only in debug builds)
+            #[cfg(debug_assertions)]
+            {
+                static FP_TOTAL: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                static FP_CHANGED: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
 
-            let total = FP_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if state != &canonical {
-                FP_CHANGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-
-            // Print first state and periodic summary
-            if total == 0 {
-                eprintln!(
-                    "DEBUG fingerprint: symmetry.symmetric_values = {:?}",
-                    symmetry.symmetric_values
-                );
+                let total = FP_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if state != &canonical {
-                    eprintln!("DEBUG fingerprint: state WAS canonicalized (states differ)");
-                } else {
-                    eprintln!("DEBUG fingerprint: state unchanged by canonicalization");
+                    FP_CHANGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-            }
-            if total > 0 && total % 500_000 == 0 {
-                let changed = FP_CHANGED.load(std::sync::atomic::Ordering::Relaxed);
-                eprintln!(
-                    "DEBUG symmetry: {} total fingerprints, {} ({:.1}%) had canonicalization changes",
-                    total,
-                    changed,
-                    (changed as f64 / total as f64) * 100.0
-                );
+
+                // Print first state and periodic summary
+                if total == 0 {
+                    eprintln!(
+                        "DEBUG fingerprint: symmetry.symmetric_values = {:?}",
+                        symmetry.symmetric_values
+                    );
+                    if state != &canonical {
+                        eprintln!("DEBUG fingerprint: state WAS canonicalized (states differ)");
+                    } else {
+                        eprintln!("DEBUG fingerprint: state unchanged by canonicalization");
+                    }
+                }
+                if total > 0 && total % 500_000 == 0 {
+                    let changed = FP_CHANGED.load(std::sync::atomic::Ordering::Relaxed);
+                    eprintln!(
+                        "DEBUG symmetry: {} total fingerprints, {} ({:.1}%) had canonicalization changes",
+                        total,
+                        changed,
+                        (changed as f64 / total as f64) * 100.0
+                    );
+                }
             }
             canonical
         } else {

@@ -233,7 +233,7 @@ impl AutoTuner {
             let throughput_rate = (current_throughput - prev_throughput) as f64
                 / config.sample_interval.as_secs_f64();
 
-            let (usr_pct, sys_pct) = if let Some(ref prev) = prev_sample {
+            let (_usr_pct, sys_pct) = if let Some(ref prev) = prev_sample {
                 current_sample.diff(prev)
             } else {
                 (0.0, 0.0)

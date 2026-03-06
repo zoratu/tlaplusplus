@@ -6,7 +6,7 @@ use crate::tla::{
 use anyhow::{Result, anyhow};
 use dashmap::DashMap;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock};
 
 // Global cache for pre-warmed compiled action IRs (populated at model load time)

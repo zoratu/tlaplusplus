@@ -1,40 +1,32 @@
 use crate::autotune::{AutoTuneConfig, AutoTuner, WorkerThrottle};
-use crate::fairness::{FairnessConstraint, TarjanSCC, check_fairness_on_scc};
+use crate::fairness::TarjanSCC;
 use crate::model::{LabeledTransition, Model};
-use crate::storage::async_fingerprint_writer::{
-    create_persist_channels, fingerprint_writer_task, load_fingerprints_from_disk,
-};
-use crate::storage::channel_queue::ChannelQueue;
+use crate::storage::async_fingerprint_writer::{create_persist_channels, fingerprint_writer_task};
 use crate::storage::fingerprint_store::{
     FingerprintStats as OldFingerprintStats, FingerprintStore,
 };
 use crate::storage::numa::set_preferred_node;
 use crate::storage::page_aligned_fingerprint_store::FingerprintStats;
-use crate::storage::queue::{DiskBackedQueue, DiskQueueConfig, QueueStats};
-use crate::storage::simple_blocking_queue::SimpleBlockingQueue;
-use crate::storage::spillable_work_stealing::{
-    SpillableConfig, SpillableWorkStealingQueues, SpillableWorkerState,
-};
+use crate::storage::queue::{DiskBackedQueue, QueueStats};
+use crate::storage::spillable_work_stealing::{SpillableConfig, SpillableWorkStealingQueues};
 use crate::storage::unified_fingerprint_store::{
     UnifiedFingerprintConfig, UnifiedFingerprintStore,
 };
-use crate::storage::work_stealing_queues::WorkStealingQueues;
 use crate::system::{
     MemoryMonitor, MemoryStatus, WorkerPlan, WorkerPlanRequest, build_worker_plan,
-    cgroup_memory_max_bytes, check_disk_space, get_disk_stats, get_memory_stats,
-    pin_current_thread_to_cpu, prune_work_dir_segments,
+    cgroup_memory_max_bytes, check_disk_space, get_disk_stats, pin_current_thread_to_cpu,
+    prune_work_dir_segments,
 };
 use anyhow::{Context, Result, anyhow};
 use dashmap::DashMap;
 use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::hash::{Hash, Hasher};
+use std::hash::Hasher;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use twox_hash::XxHash64;
 
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
@@ -657,7 +649,7 @@ where
     M: Model,
 {
     let model = Arc::new(model);
-    let checkpoint_path = config.work_dir.join("checkpoints").join("latest.json");
+    let _checkpoint_path = config.work_dir.join("checkpoints").join("latest.json");
 
     if config.clean_work_dir && !config.resume_from_checkpoint && config.work_dir.exists() {
         std::fs::remove_dir_all(&config.work_dir).with_context(|| {
@@ -679,7 +671,7 @@ where
     }
 
     let effective_memory_max = compute_effective_memory_max(&config);
-    let (fp_cache_capacity_bytes, queue_inmem_limit) =
+    let (_fp_cache_capacity_bytes, _queue_inmem_limit) =
         apply_memory_budget(&config, effective_memory_max);
 
     let worker_plan = build_worker_plan(WorkerPlanRequest {
@@ -689,8 +681,8 @@ where
         requested_core_ids: config.core_ids.clone(),
     });
 
-    let fp_path = config.work_dir.join("fingerprints");
-    let queue_path = config.work_dir.join("queue");
+    let _fp_path = config.work_dir.join("fingerprints");
+    let _queue_path = config.work_dir.join("queue");
 
     // Configure fingerprint store based on mode (bloom filter vs page-aligned)
     //
@@ -766,7 +758,7 @@ where
     let mut fp_store = UnifiedFingerprintStore::new(fp_config, &worker_plan.assigned_cpus)?;
 
     // Set up fingerprint persistence for resume support
-    let fp_persist_runtime = if config.enable_fp_persistence {
+    let _fp_persist_runtime = if config.enable_fp_persistence {
         // Create persist channels (one per shard)
         let (persist_tx, persist_rx) = create_persist_channels(shard_count, 10_000);
         fp_store.enable_persistence(persist_tx);
@@ -836,7 +828,7 @@ where
 
             // Insert loaded fingerprints into store
             let mut total_loaded = 0usize;
-            for (shard_id, fps) in loaded.into_iter().enumerate() {
+            for (_shard_id, fps) in loaded.into_iter().enumerate() {
                 total_loaded += fps.len();
                 for fp in fps {
                     let _ = fp_store.contains_or_insert(fp);
@@ -1450,7 +1442,7 @@ where
         let worker_queue = Arc::clone(&queue);
         let worker_stats = Arc::clone(&run_stats);
         let worker_stop = Arc::clone(&stop);
-        let worker_active = Arc::clone(&active_workers);
+        let _worker_active = Arc::clone(&active_workers);
         let worker_live = Arc::clone(&live_workers);
         let worker_pause = Arc::clone(&pause);
         let worker_throttle = Arc::clone(&throttle);
@@ -1684,17 +1676,20 @@ where
                             .is_ok()
                 });
 
-                // Debug: track constraint filtering
-                static DEBUG_STATES_SAMPLED: std::sync::atomic::AtomicU64 =
-                    std::sync::atomic::AtomicU64::new(0);
-                let sample_count = DEBUG_STATES_SAMPLED.fetch_add(1, Ordering::Relaxed);
-                if sample_count < 10 {
-                    eprintln!(
-                        "DEBUG [state {}]: {} successors generated, {} after constraint filter",
-                        sample_count,
-                        successors_before_filter,
-                        successors.len()
-                    );
+                // Debug: track constraint filtering (only in debug builds)
+                #[cfg(debug_assertions)]
+                {
+                    static DEBUG_STATES_SAMPLED: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let sample_count = DEBUG_STATES_SAMPLED.fetch_add(1, Ordering::Relaxed);
+                    if sample_count < 10 {
+                        eprintln!(
+                            "DEBUG [state {}]: {} successors generated, {} after constraint filter",
+                            sample_count,
+                            successors_before_filter,
+                            successors.len()
+                        );
+                    }
                 }
 
                 // Pair states with their fingerprint's home NUMA for routing
@@ -1959,7 +1954,7 @@ where
         return Err(anyhow!(err));
     }
 
-    let mut violation = violation_rx.try_recv().ok();
+    let violation = violation_rx.try_recv().ok();
 
     // Check fairness constraints if we collected labeled transitions
     if let Some(transitions_map) = labeled_transitions.as_ref() {
