@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DEFAULT_MODULE="${ROOT_DIR}/corpus/language_coverage/LanguageFeatureMatrix.tla"
-DEFAULT_CFG="${ROOT_DIR}/corpus/language_coverage/LanguageFeatureMatrix.cfg"
+DEFAULT_MODULE="${ROOT_DIR}/corpus/examples/SimpleCounter.tla"
+DEFAULT_CFG="${ROOT_DIR}/corpus/examples/SimpleCounter.cfg"
 MODULE_PATH="${1:-${DEFAULT_MODULE}}"
 CFG_PATH="${2:-${DEFAULT_CFG}}"
 OUT_DIR="${3:-${ROOT_DIR}/.tlc-out/language_coverage}"

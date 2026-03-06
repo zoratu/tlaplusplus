@@ -7,87 +7,83 @@ Test specifications for validating tlaplusplus against TLC.
 ```bash
 # Run a single spec
 ./target/release/tlaplusplus run-tla \
-  --module corpus/SimpleCounter.tla \
-  --config corpus/SimpleCounter.cfg
+  --module corpus/examples/SimpleCounter.tla \
+  --config corpus/examples/SimpleCounter.cfg
 
-# Run full corpus validation
-scripts/tlc_check.sh
+# Run full corpus validation against TLC
+scripts/tlc_corpus.sh
 ```
 
-## Specifications
+## Directory Structure
 
-### Basic Models
+### [`examples/`](examples/)
+Basic models for getting started.
 
-| Spec | Config | Description |
-|------|--------|-------------|
-| [SimpleCounter.tla](SimpleCounter.tla) | [.cfg](SimpleCounter.cfg) | Minimal counter model (~100 states) |
-| [SimpleCounterViolation.tla](SimpleCounterViolation.tla) | [.cfg](SimpleCounterViolation.cfg) | Counter with intentional invariant violation |
-| [SimpleCounterNoConfig.tla](SimpleCounterNoConfig.tla) | - | Counter without separate config file |
+| Spec | Description |
+|------|-------------|
+| [SimpleCounter](examples/SimpleCounter.tla) | Minimal counter model (~100 states) |
+| [SimpleCounterViolation](examples/SimpleCounterViolation.tla) | Counter with intentional invariant violation |
+| [SimpleCounterNoConfig](examples/SimpleCounterNoConfig.tla) | Counter without separate config file |
 
-### Language Features
+### [`language/`](language/)
+Individual TLA+ language feature tests.
 
-| Spec | Config | Features Tested |
-|------|--------|-----------------|
-| [SetOperatorsTest.tla](SetOperatorsTest.tla) | [.cfg](SetOperatorsTest.cfg) | Set operations: union, intersection, subset |
-| [StringTest.tla](StringTest.tla) | [.cfg](StringTest.cfg) | String values and operations |
-| [NegativeIntTest.tla](NegativeIntTest.tla) | [.cfg](NegativeIntTest.cfg) | Negative integer handling |
-| [NestedExceptTest.tla](NestedExceptTest.tla) | [.cfg](NestedExceptTest.cfg) | Nested EXCEPT expressions |
-| [MultiVarQuantifierTest.tla](MultiVarQuantifierTest.tla) | [.cfg](MultiVarQuantifierTest.cfg) | Multi-variable quantifiers |
-| [RecursiveTest.tla](RecursiveTest.tla) | [.cfg](RecursiveTest.cfg) | RECURSIVE operator definitions |
-| [ViewTest.tla](ViewTest.tla) | [.cfg](ViewTest.cfg) | VIEW for state symmetry |
-| [OperatorSubstitutionTest.tla](OperatorSubstitutionTest.tla) | [.cfg](OperatorSubstitutionTest.cfg) | Operator argument substitution |
+| Spec | Features Tested |
+|------|-----------------|
+| [SetOperatorsTest](language/SetOperatorsTest.tla) | Set operations: union, intersection, subset |
+| [StringTest](language/StringTest.tla) | String values and operations |
+| [NegativeIntTest](language/NegativeIntTest.tla) | Negative integer handling |
+| [NestedExceptTest](language/NestedExceptTest.tla) | Nested EXCEPT expressions |
+| [MultiVarQuantifierTest](language/MultiVarQuantifierTest.tla) | Multi-variable quantifiers |
+| [RecursiveTest](language/RecursiveTest.tla) | RECURSIVE operator definitions |
+| [ViewTest](language/ViewTest.tla) | VIEW for state symmetry |
+| [OperatorSubstitutionTest](language/OperatorSubstitutionTest.tla) | Operator argument substitution |
+| [InstanceTest](language/InstanceTest.tla) | INSTANCE with substitution |
+| [InstanceTestSimple](language/InstanceTestSimple.tla) | Basic INSTANCE usage |
+| [MultipleExtendsTest](language/MultipleExtendsTest.tla) | Multiple EXTENDS clauses |
 
-### Module System
+### [`temporal/`](temporal/)
+Temporal property and fairness tests.
 
-| Spec | Config | Features Tested |
-|------|--------|-----------------|
-| [InstanceTest.tla](InstanceTest.tla) | [.cfg](InstanceTest.cfg) | INSTANCE with substitution |
-| [InstanceTestSimple.tla](InstanceTestSimple.tla) | [.cfg](InstanceTestSimple.cfg) | Basic INSTANCE usage |
-| [MultipleExtendsTest.tla](MultipleExtendsTest.tla) | [.cfg](MultipleExtendsTest.cfg) | Multiple EXTENDS clauses |
-| [CoverageHelper.tla](CoverageHelper.tla) | - | Helper module for other tests |
+| Spec | Features Tested |
+|------|-----------------|
+| [LivenessTest](temporal/LivenessTest.tla) | Eventually, Always, leads-to |
+| [FairnessTest](temporal/FairnessTest.tla) | Weak/strong fairness |
+| [TemporalQuantTest](temporal/TemporalQuantTest.tla) | Temporal quantifiers (\E x: <>P) |
+| [EnabledTest](temporal/EnabledTest.tla) | ENABLED operator |
 
-### Temporal Properties
+### [`integration/`](integration/)
+Complex multi-feature models.
 
-| Spec | Config | Features Tested |
-|------|--------|-----------------|
-| [LivenessTest.tla](LivenessTest.tla) | [.cfg](LivenessTest.cfg) | Eventually, Always, leads-to |
-| [FairnessTest.tla](FairnessTest.tla) | [.cfg](FairnessTest.cfg) | Weak/strong fairness |
-| [TemporalQuantTest.tla](TemporalQuantTest.tla) | [.cfg](TemporalQuantTest.cfg) | Temporal quantifiers (\E x: <>P) |
-| [EnabledTest.tla](EnabledTest.tla) | [.cfg](EnabledTest.cfg) | ENABLED operator |
+| Spec | Description |
+|------|-------------|
+| [Combined](integration/Combined.tla) | Multi-module production-style spec |
+| [CombinedSimple](integration/CombinedSimple.tla) | Simplified version of Combined |
 
-### Complex Models
+### [`internals/`](internals/)
+TLA+ specifications modeling tlaplusplus's own internal algorithms.
 
-| Spec | Config | Description |
-|------|--------|-------------|
-| [Combined.tla](Combined.tla) | [.cfg](Combined.cfg) | Multi-module production-style spec |
-| [CombinedSimple.tla](CombinedSimple.tla) | [.cfg](CombinedSimple.cfg) | Simplified version of Combined |
+| Spec | Description |
+|------|-------------|
+| [WorkQueue](internals/WorkQueue.tla) | Work-stealing queue with checkpoint/drain protocol |
+| [FingerprintResize](internals/FingerprintResize.tla) | Lock-free fingerprint store resize using seqlock |
 
-### tlaplusplus Internal Models
-
-TLA+ specifications modeling tlaplusplus's own internal algorithms:
-
-| Spec | Config | Description |
-|------|--------|-------------|
-| [WorkQueue.tla](WorkQueue.tla) | [.cfg](WorkQueue.cfg) | Work-stealing queue with checkpoint/drain protocol |
-| [FingerprintResize.tla](FingerprintResize.tla) | [.cfg](FingerprintResize.cfg) | Lock-free fingerprint store resize using seqlock |
-
-## Language Coverage
-
-The `language_coverage/` directory contains systematic tests for TLA+ language features:
+### [`language_coverage/`](language_coverage/)
+Systematic language feature coverage suite.
 
 | Spec | Config | Description |
 |------|--------|-------------|
-| [LanguageFeatureMatrix.tla](language_coverage/LanguageFeatureMatrix.tla) | [.cfg](language_coverage/LanguageFeatureMatrix.cfg) | Comprehensive language feature coverage |
-| [LanguageFeatureMatrix.tla](language_coverage/LanguageFeatureMatrix.tla) | [Fair.cfg](language_coverage/LanguageFeatureMatrixFair.cfg) | Same spec with fairness properties |
-| [LanguageFeatureMatrix.tla](language_coverage/LanguageFeatureMatrix.tla) | [NoEnabled.cfg](language_coverage/LanguageFeatureMatrix_NoEnabled.cfg) | Same spec without ENABLED |
-| [InitNextTemporalQuant.tla](language_coverage/InitNextTemporalQuant.tla) | [.cfg](language_coverage/InitNextTemporalQuant.cfg) | Init/Next override with temporal quantifiers |
+| [LanguageFeatureMatrix](language_coverage/LanguageFeatureMatrix.tla) | [default](language_coverage/LanguageFeatureMatrix.cfg) | Comprehensive feature coverage |
+| | [fairness](language_coverage/LanguageFeatureMatrixFair.cfg) | With fairness properties |
+| | [no-enabled](language_coverage/LanguageFeatureMatrix_NoEnabled.cfg) | Without ENABLED |
+| [InitNextTemporalQuant](language_coverage/InitNextTemporalQuant.tla) | [cfg](language_coverage/InitNextTemporalQuant.cfg) | Init/Next override with temporal quantifiers |
 
 ## Running Validation
 
 ```bash
-# Compare tlaplusplus output against TLC for all specs
-scripts/tlc_check.sh
-
-# Run just the language coverage tests
+# Run all corpus specs through TLC
 scripts/tlc_corpus.sh
+
+# Run a specific spec through TLC
+scripts/tlc_check.sh corpus/examples/SimpleCounter.tla corpus/examples/SimpleCounter.cfg
 ```
