@@ -258,8 +258,8 @@ where
         let mut new_partition = partition.clone();
 
         // Split the cell: singleton for chosen vertex, rest
-        let mut singleton = vec![vertex_idx];
-        let mut rest: Vec<usize> = cell
+        let singleton = vec![vertex_idx];
+        let rest: Vec<usize> = cell
             .iter()
             .filter(|&&idx| idx != vertex_idx)
             .copied()

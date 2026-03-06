@@ -1,7 +1,7 @@
+use crate::tla::action_ir::{parse_action_exists, parse_action_if, split_action_body_clauses};
 use crate::tla::{
     ActionClause, ActionIr, ClauseKind, TlaDefinition, TlaState, TlaValue, classify_clause,
 };
-use crate::tla::action_ir::{parse_action_exists, parse_action_if, split_action_body_clauses};
 use anyhow::{Result, anyhow};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
@@ -382,7 +382,8 @@ pub(crate) fn apply_action_ir_with_context_multi(
     current: &TlaState,
     ctx: &EvalContext<'_>,
 ) -> Result<Vec<TlaState>> {
-    let branches = eval_action_clauses_multi(&action.clauses, ctx, vec![ActionEvalBranch::default()])?;
+    let branches =
+        eval_action_clauses_multi(&action.clauses, ctx, vec![ActionEvalBranch::default()])?;
     let mut out = Vec::with_capacity(branches.len());
     for branch in branches {
         let mut next = current.clone();
@@ -438,7 +439,9 @@ fn eval_action_clause_to_branch(
         ActionClause::Guard { expr } => eval_action_clause_text_multi(expr, ctx, branch),
         ActionClause::PrimedAssignment { var, expr } => {
             let mut branch = branch;
-            branch.staged.insert(var.clone(), eval_expr(expr, &eval_ctx)?);
+            branch
+                .staged
+                .insert(var.clone(), eval_expr(expr, &eval_ctx)?);
             Ok(vec![branch])
         }
         ActionClause::Unchanged { vars } => {
@@ -446,7 +449,9 @@ fn eval_action_clause_to_branch(
             branch.unchanged_vars.extend(vars.iter().cloned());
             Ok(vec![branch])
         }
-        ActionClause::Exists { binders, body } => eval_exists_action_multi(binders, body, ctx, branch),
+        ActionClause::Exists { binders, body } => {
+            eval_exists_action_multi(binders, body, ctx, branch)
+        }
         ActionClause::LetWithPrimes { expr } => eval_let_action_multi_branch(expr, ctx, branch),
     }
 }
@@ -657,8 +662,7 @@ fn matches_membership_expr(
                                 Ok(set) => set,
                                 Err(_) => return Ok(false),
                             };
-                            let func_domain: BTreeSet<TlaValue> =
-                                func.keys().cloned().collect();
+                            let func_domain: BTreeSet<TlaValue> = func.keys().cloned().collect();
                             if func_domain != *domain_set {
                                 return Ok(false);
                             }
@@ -689,8 +693,12 @@ fn matches_membership_expr(
                                 let Some(field_value) = rec.get(field_name) else {
                                     return Ok(false);
                                 };
-                                if !matches_membership_expr(field_value, field_type, ctx, depth + 1)?
-                                {
+                                if !matches_membership_expr(
+                                    field_value,
+                                    field_type,
+                                    ctx,
+                                    depth + 1,
+                                )? {
                                     return Ok(false);
                                 }
                             }
@@ -3981,8 +3989,8 @@ mod tests {
             }],
         };
 
-        let next_states =
-            apply_action_ir_with_context_multi(&action, &state, &ctx).expect("action should branch");
+        let next_states = apply_action_ir_with_context_multi(&action, &state, &ctx)
+            .expect("action should branch");
         assert_eq!(next_states.len(), 2);
         let next_xs: BTreeSet<i64> = next_states
             .iter()

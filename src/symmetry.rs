@@ -78,7 +78,7 @@ impl SymmetrySpec {
 ///
 /// IMPORTANT: Permutations are applied independently to each symmetry group.
 /// Values from different groups are never interchanged.
-pub fn canonicalize_state<S>(state: &S, symmetry: &SymmetrySpec) -> S
+pub fn canonicalize_state<S>(state: &S, _symmetry: &SymmetrySpec) -> S
 where
     S: Clone + Debug + Serialize + for<'de> Deserialize<'de>,
 {
@@ -108,15 +108,18 @@ pub fn canonicalize_tla_state(state: &TlaState, symmetry: &SymmetrySpec) -> TlaS
         let found_vec: Vec<String> = found.iter().cloned().collect();
         let group_permutation = compute_canonical_permutation(&found_vec, group);
 
-        // Debug: print first permutation
-        static DEBUG_PERM: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        if !DEBUG_PERM.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            eprintln!("DEBUG group {}: found values {:?}", group_idx, found);
-            eprintln!(
-                "DEBUG group {}: permutation {:?}",
-                group_idx, group_permutation
-            );
+        // Debug: print first permutation (only in debug builds)
+        #[cfg(debug_assertions)]
+        {
+            static DEBUG_PERM: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !DEBUG_PERM.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("DEBUG group {}: found values {:?}", group_idx, found);
+                eprintln!(
+                    "DEBUG group {}: permutation {:?}",
+                    group_idx, group_permutation
+                );
+            }
         }
 
         full_permutation.extend(group_permutation);

@@ -103,7 +103,8 @@ struct RuntimeArgs {
         help = "Resume from existing checkpoint/work dir"
     )]
     resume: bool,
-    #[arg(long, default_value_t = 30)]
+    /// Checkpoint interval in seconds (0 = disabled, default: 600 with S3, 0 without)
+    #[arg(long, default_value_t = 0)]
     checkpoint_interval_secs: u64,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     checkpoint_on_exit: bool,
@@ -358,9 +359,10 @@ fn print_stats(model_name: &str, stats: &tlaplusplus::RunStats) {
 
 /// Run a model with optional S3 persistence
 /// If s3.s3_bucket is Some, enables continuous S3 upload and download on resume
+/// When S3 is enabled, defaults checkpoint interval to 10 minutes if not explicitly set
 fn run_model_with_s3<M>(
     model: M,
-    config: EngineConfig,
+    mut config: EngineConfig,
     s3: &S3Args,
 ) -> anyhow::Result<tlaplusplus::RunOutcome<M::State>>
 where
@@ -374,234 +376,230 @@ where
         + serde::Serialize
         + serde::de::DeserializeOwned,
 {
-    // If S3 is not configured, just run the model directly
-    #[cfg(not(feature = "s3"))]
-    {
-        let _ = s3; // Suppress unused warning
+    use tlaplusplus::storage::s3_persistence::S3Persistence;
+
+    if s3.s3_bucket.is_none() {
+        // No S3 bucket configured, run directly
         return run_model(model, config);
     }
 
-    #[cfg(feature = "s3")]
-    {
-        use tlaplusplus::storage::s3_persistence::S3Persistence;
+    // When S3 is enabled, default to 10-minute checkpoint interval for spot instance safety
+    // Only apply default if checkpoint interval was left at CLI default (0 = disabled)
+    if config.checkpoint_interval_secs == 0 {
+        config.checkpoint_interval_secs = 600; // 10 minutes
+        eprintln!("S3: Using default checkpoint interval of 10 minutes for spot instance safety");
+    }
 
-        if s3.s3_bucket.is_none() {
-            // No S3 bucket configured, run directly
-            return run_model(model, config);
+    let bucket = s3.s3_bucket.as_ref().unwrap();
+    let prefix = if s3.s3_prefix.is_empty() {
+        // Generate a prefix based on timestamp
+        format!("runs/{}", chrono::Local::now().format("%Y%m%d-%H%M%S"))
+    } else {
+        s3.s3_prefix.clone()
+    };
+
+    eprintln!("S3: Enabled persistence to s3://{}/{}", bucket, prefix);
+
+    // Create tokio runtime for S3 operations
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("s3-io")
+        .enable_all()
+        .build()?;
+
+    // Initialize S3 persistence
+    let mut s3_persist = rt.block_on(async {
+        S3Persistence::new(bucket, &prefix, &config.work_dir, s3.s3_region.as_deref())
+            .await
+            .map(|p| p.with_upload_interval(s3.s3_upload_interval_secs))
+    })?;
+
+    // Download existing state if resuming
+    if config.resume_from_checkpoint {
+        eprintln!("S3: Checking for existing state to resume...");
+        match rt.block_on(s3_persist.download_state()) {
+            Ok(tlaplusplus::storage::s3_persistence::DownloadResult::Resumed {
+                manifest, ..
+            }) => {
+                eprintln!("S3: Resuming from checkpoint in run {}", manifest.run_id);
+            }
+            Ok(tlaplusplus::storage::s3_persistence::DownloadResult::NoExistingState) => {
+                eprintln!("S3: No existing state found, starting fresh");
+            }
+            Err(e) => {
+                eprintln!("S3: Warning: failed to download state: {}", e);
+            }
+        }
+    }
+
+    // Start background upload
+    s3_persist.start_background_upload(rt.handle());
+
+    // Set up SIGTERM handler for graceful shutdown
+    let s3_persist = std::sync::Arc::new(std::sync::Mutex::new(Some(s3_persist)));
+    let s3_persist_for_signal = s3_persist.clone();
+    let _rt_handle = rt.handle().clone();
+
+    // Spawn signal handler for graceful shutdown (spot instance preemption)
+    eprintln!("Signal handler: Setting up SIGTERM/SIGINT handlers...");
+    rt.spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut sigterm =
+                signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
+            let mut sigint =
+                signal(SignalKind::interrupt()).expect("Failed to register SIGINT handler");
+
+            eprintln!("Signal handler: Waiting for signals...");
+
+            let is_spot_preemption = tokio::select! {
+                _ = sigterm.recv() => {
+                    use std::io::Write;
+                    let _ = std::io::stderr().flush();
+                    eprintln!("\n🛑 SIGTERM received - spot instance preemption detected!");
+                    eprintln!("   AWS gives us ~2 minutes to checkpoint and flush to S3...");
+                    let _ = std::io::stderr().flush();
+                    true
+                }
+                _ = sigint.recv() => {
+                    use std::io::Write;
+                    let _ = std::io::stderr().flush();
+                    eprintln!("\n🛑 SIGINT received - graceful shutdown requested...");
+                    let _ = std::io::stderr().flush();
+                    false
+                }
+            };
+
+            // Request emergency checkpoint from the checkpoint thread
+            eprintln!("   Step 1/3: Requesting emergency checkpoint...");
+            tlaplusplus::chaos::request_emergency_checkpoint();
+
+            // Wait for checkpoint to complete (max 90 seconds for spot, 30 for SIGINT)
+            let timeout_secs = if is_spot_preemption { 90 } else { 30 };
+            let checkpoint_ok = tokio::task::spawn_blocking(move || {
+                tlaplusplus::chaos::wait_for_emergency_checkpoint(timeout_secs)
+            })
+            .await
+            .unwrap_or(false);
+
+            if checkpoint_ok {
+                eprintln!("   Step 2/3: Emergency checkpoint complete!");
+            } else {
+                eprintln!(
+                    "   Step 2/3: Checkpoint timed out after {}s (continuing with S3 flush)",
+                    timeout_secs
+                );
+            }
+
+            // Take the persist handle out of the mutex before any await
+            let persist_opt = s3_persist_for_signal.lock().unwrap().take();
+
+            // S3 flush
+            eprintln!("   Step 3/3: Flushing to S3...");
+            if let Some(mut persist) = persist_opt {
+                if let Err(e) = persist.emergency_flush().await {
+                    eprintln!("   S3 emergency flush failed: {}", e);
+                } else {
+                    eprintln!("   S3 emergency flush complete!");
+                }
+                if let Err(e) = persist.stop().await {
+                    eprintln!("   S3 stop failed: {}", e);
+                }
+            }
+
+            eprintln!("✅ Graceful shutdown complete. State preserved for resume.");
+            use std::io::Write;
+            let _ = std::io::stderr().flush();
+            let _ = std::io::stdout().flush();
+            std::process::exit(0);
         }
 
-        let bucket = s3.s3_bucket.as_ref().unwrap();
-        let prefix = if s3.s3_prefix.is_empty() {
-            // Generate a prefix based on timestamp
-            format!("runs/{}", chrono::Local::now().format("%Y%m%d-%H%M%S"))
-        } else {
-            s3.s3_prefix.clone()
+        #[cfg(not(unix))]
+        {
+            // On non-Unix, just use ctrl-c
+            let _ = tokio::signal::ctrl_c().await;
+            eprintln!("\n🛑 Ctrl+C received - graceful shutdown requested...");
+
+            // Request emergency checkpoint
+            eprintln!("   Step 1/3: Requesting emergency checkpoint...");
+            tlaplusplus::chaos::request_emergency_checkpoint();
+
+            // Wait for checkpoint (max 30 seconds)
+            let checkpoint_ok = tokio::task::spawn_blocking(|| {
+                tlaplusplus::chaos::wait_for_emergency_checkpoint(30)
+            })
+            .await
+            .unwrap_or(false);
+
+            if checkpoint_ok {
+                eprintln!("   Step 2/3: Emergency checkpoint complete!");
+            } else {
+                eprintln!("   Step 2/3: Checkpoint timed out (continuing with S3 flush)");
+            }
+
+            // Take the persist handle out of the mutex before any await
+            let persist_opt = s3_persist_for_signal.lock().unwrap().take();
+
+            eprintln!("   Step 3/3: Flushing to S3...");
+            if let Some(mut persist) = persist_opt {
+                if let Err(e) = persist.emergency_flush().await {
+                    eprintln!("   S3 emergency flush failed: {}", e);
+                } else {
+                    eprintln!("   S3 emergency flush complete!");
+                }
+                if let Err(e) = persist.stop().await {
+                    eprintln!("   S3 stop failed: {}", e);
+                }
+            }
+
+            eprintln!("✅ Graceful shutdown complete. State preserved for resume.");
+            use std::io::Write;
+            let _ = std::io::stderr().flush();
+            let _ = std::io::stdout().flush();
+            std::process::exit(0);
+        }
+    });
+
+    // Run the model
+    let outcome = run_model(model, config)?;
+
+    // Final flush to S3
+    if let Some(mut persist) = s3_persist.lock().unwrap().take() {
+        eprintln!("S3: Performing final flush...");
+
+        // Add checkpoint state
+        let checkpoint = tlaplusplus::storage::s3_persistence::CheckpointState {
+            id: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            states_generated: outcome.stats.states_generated,
+            states_distinct: outcome.stats.states_distinct,
+            queue_pending: 0, // Completed
         };
 
-        eprintln!("S3: Enabled persistence to s3://{}/{}", bucket, prefix);
-
-        // Create tokio runtime for S3 operations
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .thread_name("s3-io")
-            .enable_all()
-            .build()?;
-
-        // Initialize S3 persistence
-        let mut s3_persist = rt.block_on(async {
-            S3Persistence::new(bucket, &prefix, &config.work_dir, s3.s3_region.as_deref())
-                .await
-                .map(|p| p.with_upload_interval(s3.s3_upload_interval_secs))
-        })?;
-
-        // Download existing state if resuming
-        if config.resume_from_checkpoint {
-            eprintln!("S3: Checking for existing state to resume...");
-            match rt.block_on(s3_persist.download_state()) {
-                Ok(tlaplusplus::storage::s3_persistence::DownloadResult::Resumed {
-                    manifest,
-                    ..
-                }) => {
-                    eprintln!("S3: Resuming from checkpoint in run {}", manifest.run_id);
-                }
-                Ok(tlaplusplus::storage::s3_persistence::DownloadResult::NoExistingState) => {
-                    eprintln!("S3: No existing state found, starting fresh");
-                }
-                Err(e) => {
-                    eprintln!("S3: Warning: failed to download state: {}", e);
-                }
+        rt.block_on(async {
+            if let Err(e) = persist.emergency_flush().await {
+                eprintln!("S3: Final flush error: {}", e);
             }
-        }
-
-        // Start background upload
-        s3_persist.start_background_upload(rt.handle());
-
-        // Set up SIGTERM handler for graceful shutdown
-        let s3_persist = std::sync::Arc::new(std::sync::Mutex::new(Some(s3_persist)));
-        let s3_persist_for_signal = s3_persist.clone();
-        let _rt_handle = rt.handle().clone();
-
-        // Spawn signal handler for graceful shutdown (spot instance preemption)
-        eprintln!("Signal handler: Setting up SIGTERM/SIGINT handlers...");
-        rt.spawn(async move {
-            #[cfg(unix)]
-            {
-                use tokio::signal::unix::{SignalKind, signal};
-                let mut sigterm =
-                    signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
-                let mut sigint =
-                    signal(SignalKind::interrupt()).expect("Failed to register SIGINT handler");
-
-                eprintln!("Signal handler: Waiting for signals...");
-
-                let is_spot_preemption = tokio::select! {
-                    _ = sigterm.recv() => {
-                        use std::io::Write;
-                        let _ = std::io::stderr().flush();
-                        eprintln!("\n🛑 SIGTERM received - spot instance preemption detected!");
-                        eprintln!("   AWS gives us ~2 minutes to checkpoint and flush to S3...");
-                        let _ = std::io::stderr().flush();
-                        true
-                    }
-                    _ = sigint.recv() => {
-                        use std::io::Write;
-                        let _ = std::io::stderr().flush();
-                        eprintln!("\n🛑 SIGINT received - graceful shutdown requested...");
-                        let _ = std::io::stderr().flush();
-                        false
-                    }
-                };
-
-                // Request emergency checkpoint from the checkpoint thread
-                eprintln!("   Step 1/3: Requesting emergency checkpoint...");
-                tlaplusplus::chaos::request_emergency_checkpoint();
-
-                // Wait for checkpoint to complete (max 90 seconds for spot, 30 for SIGINT)
-                let timeout_secs = if is_spot_preemption { 90 } else { 30 };
-                let checkpoint_ok = tokio::task::spawn_blocking(move || {
-                    tlaplusplus::chaos::wait_for_emergency_checkpoint(timeout_secs)
-                })
-                .await
-                .unwrap_or(false);
-
-                if checkpoint_ok {
-                    eprintln!("   Step 2/3: Emergency checkpoint complete!");
-                } else {
-                    eprintln!(
-                        "   Step 2/3: Checkpoint timed out after {}s (continuing with S3 flush)",
-                        timeout_secs
-                    );
-                }
-
-                // Take the persist handle out of the mutex before any await
-                let persist_opt = s3_persist_for_signal.lock().unwrap().take();
-
-                // S3 flush
-                eprintln!("   Step 3/3: Flushing to S3...");
-                if let Some(mut persist) = persist_opt {
-                    if let Err(e) = persist.emergency_flush().await {
-                        eprintln!("   S3 emergency flush failed: {}", e);
-                    } else {
-                        eprintln!("   S3 emergency flush complete!");
-                    }
-                    if let Err(e) = persist.stop().await {
-                        eprintln!("   S3 stop failed: {}", e);
-                    }
-                }
-
-                eprintln!("✅ Graceful shutdown complete. State preserved for resume.");
-                use std::io::Write;
-                let _ = std::io::stderr().flush();
-                let _ = std::io::stdout().flush();
-                std::process::exit(0);
+            if let Err(e) = persist.upload_manifest(Some(checkpoint)).await {
+                eprintln!("S3: Manifest upload error: {}", e);
             }
-
-            #[cfg(not(unix))]
-            {
-                // On non-Unix, just use ctrl-c
-                let _ = tokio::signal::ctrl_c().await;
-                eprintln!("\n🛑 Ctrl+C received - graceful shutdown requested...");
-
-                // Request emergency checkpoint
-                eprintln!("   Step 1/3: Requesting emergency checkpoint...");
-                tlaplusplus::chaos::request_emergency_checkpoint();
-
-                // Wait for checkpoint (max 30 seconds)
-                let checkpoint_ok = tokio::task::spawn_blocking(|| {
-                    tlaplusplus::chaos::wait_for_emergency_checkpoint(30)
-                })
-                .await
-                .unwrap_or(false);
-
-                if checkpoint_ok {
-                    eprintln!("   Step 2/3: Emergency checkpoint complete!");
-                } else {
-                    eprintln!("   Step 2/3: Checkpoint timed out (continuing with S3 flush)");
-                }
-
-                // Take the persist handle out of the mutex before any await
-                let persist_opt = s3_persist_for_signal.lock().unwrap().take();
-
-                eprintln!("   Step 3/3: Flushing to S3...");
-                if let Some(mut persist) = persist_opt {
-                    if let Err(e) = persist.emergency_flush().await {
-                        eprintln!("   S3 emergency flush failed: {}", e);
-                    } else {
-                        eprintln!("   S3 emergency flush complete!");
-                    }
-                    if let Err(e) = persist.stop().await {
-                        eprintln!("   S3 stop failed: {}", e);
-                    }
-                }
-
-                eprintln!("✅ Graceful shutdown complete. State preserved for resume.");
-                use std::io::Write;
-                let _ = std::io::stderr().flush();
-                let _ = std::io::stdout().flush();
-                std::process::exit(0);
+            if let Err(e) = persist.stop().await {
+                eprintln!("S3: Stop error: {}", e);
             }
         });
 
-        // Run the model
-        let outcome = run_model(model, config)?;
-
-        // Final flush to S3
-        if let Some(mut persist) = s3_persist.lock().unwrap().take() {
-            eprintln!("S3: Performing final flush...");
-
-            // Add checkpoint state
-            let checkpoint = tlaplusplus::storage::s3_persistence::CheckpointState {
-                id: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-                states_generated: outcome.stats.states_generated,
-                states_distinct: outcome.stats.states_distinct,
-                queue_pending: 0, // Completed
-            };
-
-            rt.block_on(async {
-                if let Err(e) = persist.emergency_flush().await {
-                    eprintln!("S3: Final flush error: {}", e);
-                }
-                if let Err(e) = persist.upload_manifest(Some(checkpoint)).await {
-                    eprintln!("S3: Manifest upload error: {}", e);
-                }
-                if let Err(e) = persist.stop().await {
-                    eprintln!("S3: Stop error: {}", e);
-                }
-            });
-
-            let stats = persist.stats();
-            eprintln!(
-                "S3: Total uploaded: {} files, {:.2} MB",
-                stats.files_uploaded,
-                stats.bytes_uploaded as f64 / 1_048_576.0
-            );
-        }
-
-        Ok(outcome)
+        let stats = persist.stats();
+        eprintln!(
+            "S3: Total uploaded: {} files, {:.2} MB",
+            stats.files_uploaded,
+            stats.bytes_uploaded as f64 / 1_048_576.0
+        );
     }
+
+    Ok(outcome)
 }
 
 fn main() -> anyhow::Result<()> {

@@ -6,7 +6,7 @@
 // - If channel full, fingerprint stays in memory (safe, just slower recovery)
 
 use anyhow::{Context, Result};
-use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
+use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::fs::{OpenOptions, create_dir_all};

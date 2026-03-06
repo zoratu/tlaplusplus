@@ -216,7 +216,7 @@ where
         // Use select! to receive from any worker without polling
         let mut sel = crossbeam_channel::Select::new();
         let mut recv_indices: Vec<usize> = Vec::with_capacity(receivers.len());
-        for (i, rx) in receivers.iter().enumerate() {
+        for (_i, rx) in receivers.iter().enumerate() {
             let idx = sel.recv(rx);
             recv_indices.push(idx);
         }
@@ -322,31 +322,35 @@ where
                 continue;
             }
 
-            // Log state every 10 seconds (to track loader behavior)
-            static LAST_DEBUG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let now_secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let last = LAST_DEBUG.load(std::sync::atomic::Ordering::Relaxed);
-            if now_secs >= last + 10 {
-                if LAST_DEBUG
-                    .compare_exchange(
-                        last,
-                        now_secs,
-                        std::sync::atomic::Ordering::Relaxed,
-                        std::sync::atomic::Ordering::Relaxed,
-                    )
-                    .is_ok()
-                {
-                    eprintln!(
-                        "Loader debug: pending={}, hot_empty={}, has_work={}, segments={}, aggressive={}",
-                        pending,
-                        hot_queues_empty,
-                        has_work,
-                        segment_count,
-                        should_load_aggressively
-                    );
+            // Log state every 10 seconds (only in debug builds)
+            #[cfg(debug_assertions)]
+            {
+                static LAST_DEBUG: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let last = LAST_DEBUG.load(std::sync::atomic::Ordering::Relaxed);
+                if now_secs >= last + 10 {
+                    if LAST_DEBUG
+                        .compare_exchange(
+                            last,
+                            now_secs,
+                            std::sync::atomic::Ordering::Relaxed,
+                            std::sync::atomic::Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
+                        eprintln!(
+                            "Loader debug: pending={}, hot_empty={}, has_work={}, segments={}, aggressive={}",
+                            pending,
+                            hot_queues_empty,
+                            has_work,
+                            segment_count,
+                            should_load_aggressively
+                        );
+                    }
                 }
             }
 
@@ -363,17 +367,21 @@ where
                     for item in items {
                         hot.push_global(item);
                     }
-                    // Log first few loads to confirm loader is working
-                    static LOAD_LOG_COUNT: std::sync::atomic::AtomicU64 =
-                        std::sync::atomic::AtomicU64::new(0);
-                    let log_num = LOAD_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if log_num < 10 || log_num % 100 == 0 {
-                        eprintln!(
-                            "Loader: loaded {} items from disk (pending was {}, segments left: {})",
-                            count,
-                            pending,
-                            overflow.segment_count()
-                        );
+                    // Log first few loads (only in debug builds)
+                    #[cfg(debug_assertions)]
+                    {
+                        static LOAD_LOG_COUNT: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        let log_num =
+                            LOAD_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if log_num < 10 || log_num % 100 == 0 {
+                            eprintln!(
+                                "Loader: loaded {} items from disk (pending was {}, segments left: {})",
+                                count,
+                                pending,
+                                overflow.segment_count()
+                            );
+                        }
                     }
                     // No sleep between batches - keep loading until HIGH_WATER_MARK
                     // Workers need items faster than the 5ms sleep allows

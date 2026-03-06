@@ -7,7 +7,6 @@ use crate::tla::compiled_expr::{CompiledExpr, compile_expr};
 use crate::tla::eval::{EvalContext, eval_expr};
 use crate::tla::value::TlaValue;
 use anyhow::{Result, anyhow};
-use dashmap::DashMap;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
@@ -755,8 +754,12 @@ fn membership_matches_text(
                                 let Some(field_value) = rec.get(field_name) else {
                                     return Ok(false);
                                 };
-                                if !membership_matches_text(field_value, field_type, ctx, depth + 1)?
-                                {
+                                if !membership_matches_text(
+                                    field_value,
+                                    field_type,
+                                    ctx,
+                                    depth + 1,
+                                )? {
                                     return Ok(false);
                                 }
                             }
@@ -1283,14 +1286,16 @@ fn eval_compiled_clause_to_branch<'a>(
                 .collect())
         }
         CompiledActionClause::LetWithPrimes { expr } => {
-            Ok(eval_let_action_multi(expr, &eval_ctx, &branch.staged, &branch.unchanged_vars)?
-                .into_iter()
-                .map(|(staged, unchanged_vars)| CompiledActionBranch {
-                    ctx: branch.ctx.clone(),
-                    staged,
-                    unchanged_vars,
-                })
-                .collect())
+            Ok(
+                eval_let_action_multi(expr, &eval_ctx, &branch.staged, &branch.unchanged_vars)?
+                    .into_iter()
+                    .map(|(staged, unchanged_vars)| CompiledActionBranch {
+                        ctx: branch.ctx.clone(),
+                        staged,
+                        unchanged_vars,
+                    })
+                    .collect(),
+            )
         }
     }
 }

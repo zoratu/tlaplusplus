@@ -1,7 +1,6 @@
 use crate::fairness::{FairnessConstraint, LabeledTransition, TarjanSCC, check_fairness_on_scc};
-use crate::tla::{EvalContext, TemporalFormula, TlaValue, eval_expr};
+use crate::tla::TemporalFormula;
 use anyhow::{Result, anyhow};
-use serde::{Serialize, de::DeserializeOwned};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::hash::Hash;
