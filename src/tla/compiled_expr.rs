@@ -434,6 +434,10 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
 
     // Comparison operators
     if let Some((left, op, right)) = split_comparison(expr) {
+        if matches!(op, "\\in" | "\\notin") && is_bracket_type_expr(right) {
+            return CompiledExpr::Unparsed(expr.to_string());
+        }
+
         let left_expr = Box::new(compile_expr(left));
         let right_expr = Box::new(compile_expr(right));
         return match op {
@@ -1074,6 +1078,20 @@ fn parse_func_apply(expr: &str) -> Option<(&str, Vec<String>)> {
         }
     }
     None
+}
+
+fn is_bracket_type_expr(expr: &str) -> bool {
+    let trimmed = expr.trim();
+    if !trimmed.starts_with('[') || !trimmed.ends_with(']') {
+        return false;
+    }
+
+    let inner = &trimmed[1..trimmed.len() - 1];
+    if inner.contains("|->") || inner.contains(" EXCEPT ") {
+        return false;
+    }
+
+    inner.contains("->") || inner.contains(':')
 }
 
 fn parse_op_call(expr: &str) -> Option<(&str, Vec<String>)> {
@@ -2104,6 +2122,17 @@ mod tests {
 
         let expr = compile_expr("\\A x \\in S : x >= 0");
         assert!(matches!(expr, CompiledExpr::Forall { .. }));
+    }
+
+    #[test]
+    fn test_bracketed_function_set_is_not_misparsed_as_function_application() {
+        let expr = compile_expr("[S -> T]");
+        match expr {
+            CompiledExpr::Unparsed(raw) => assert_eq!(raw, "[S -> T]"),
+            other => {
+                panic!("expected bracketed function-set type to stay unparsed, got: {other:?}")
+            }
+        }
     }
 
     #[test]
