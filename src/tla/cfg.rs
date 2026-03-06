@@ -35,6 +35,13 @@ enum Section {
     Properties,
     Constraints,
     ActionConstraints,
+    // Single-value sections (value on next line)
+    Specification,
+    Init,
+    Next,
+    Symmetry,
+    View,
+    CheckDeadlock,
 }
 
 pub fn parse_tla_config(input: &str) -> Result<TlaConfig> {
@@ -47,32 +54,59 @@ pub fn parse_tla_config(input: &str) -> Result<TlaConfig> {
             continue;
         }
 
-        if let Some(value) = line.strip_prefix("SPECIFICATION") {
+        // Handle SPECIFICATION, INIT, NEXT, SYMMETRY, VIEW
+        // These can be either "KEYWORD value" on one line, or "KEYWORD" then value on next line
+        if line == "SPECIFICATION" {
+            section = Some(Section::Specification);
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("SPECIFICATION ") {
             cfg.specification = Some(value.trim().to_string());
             section = None;
             continue;
         }
-        if let Some(value) = line.strip_prefix("INIT") {
+        if line == "INIT" {
+            section = Some(Section::Init);
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("INIT ") {
             cfg.init = Some(value.trim().to_string());
             section = None;
             continue;
         }
-        if let Some(value) = line.strip_prefix("NEXT") {
+        if line == "NEXT" {
+            section = Some(Section::Next);
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("NEXT ") {
             cfg.next = Some(value.trim().to_string());
             section = None;
             continue;
         }
-        if let Some(value) = line.strip_prefix("SYMMETRY") {
+        if line == "SYMMETRY" {
+            section = Some(Section::Symmetry);
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("SYMMETRY ") {
             cfg.symmetry = Some(value.trim().to_string());
             section = None;
             continue;
         }
-        if let Some(value) = line.strip_prefix("VIEW") {
+        if line == "VIEW" {
+            section = Some(Section::View);
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("VIEW ") {
             cfg.view = Some(value.trim().to_string());
             section = None;
             continue;
         }
-        if let Some(value) = line.strip_prefix("CHECK_DEADLOCK") {
+        // CHECK_DEADLOCK can be on same line or next line
+        if line == "CHECK_DEADLOCK" {
+            section = Some(Section::CheckDeadlock);
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("CHECK_DEADLOCK ") {
             let v = value.trim();
             cfg.check_deadlock = match v {
                 "TRUE" => Some(true),
@@ -104,23 +138,44 @@ pub fn parse_tla_config(input: &str) -> Result<TlaConfig> {
             continue;
         }
 
-        if let Some(item) = line.strip_prefix("INVARIANT ") {
-            cfg.invariants.push(item.trim().to_string());
+        // Handle "INVARIANT foo" or "INVARIANTS foo bar baz" (multiple items on same line)
+        if let Some(items) = line
+            .strip_prefix("INVARIANT ")
+            .or(line.strip_prefix("INVARIANTS "))
+        {
+            for item in items.split_whitespace() {
+                cfg.invariants.push(item.to_string());
+            }
             section = Some(Section::Invariants);
             continue;
         }
-        if let Some(item) = line.strip_prefix("PROPERTY ") {
-            cfg.properties.push(item.trim().to_string());
+        if let Some(items) = line
+            .strip_prefix("PROPERTY ")
+            .or(line.strip_prefix("PROPERTIES "))
+        {
+            for item in items.split_whitespace() {
+                cfg.properties.push(item.to_string());
+            }
             section = Some(Section::Properties);
             continue;
         }
-        if let Some(item) = line.strip_prefix("CONSTRAINT ") {
-            cfg.constraints.push(item.trim().to_string());
+        if let Some(items) = line
+            .strip_prefix("CONSTRAINT ")
+            .or(line.strip_prefix("CONSTRAINTS "))
+        {
+            for item in items.split_whitespace() {
+                cfg.constraints.push(item.to_string());
+            }
             section = Some(Section::Constraints);
             continue;
         }
-        if let Some(item) = line.strip_prefix("ACTION_CONSTRAINT ") {
-            cfg.action_constraints.push(item.trim().to_string());
+        if let Some(items) = line
+            .strip_prefix("ACTION_CONSTRAINT ")
+            .or(line.strip_prefix("ACTION_CONSTRAINTS "))
+        {
+            for item in items.split_whitespace() {
+                cfg.action_constraints.push(item.to_string());
+            }
             section = Some(Section::ActionConstraints);
             continue;
         }
@@ -131,6 +186,34 @@ pub fn parse_tla_config(input: &str) -> Result<TlaConfig> {
             Some(Section::Properties) => cfg.properties.push(line.to_string()),
             Some(Section::Constraints) => cfg.constraints.push(line.to_string()),
             Some(Section::ActionConstraints) => cfg.action_constraints.push(line.to_string()),
+            Some(Section::Specification) => {
+                cfg.specification = Some(line.to_string());
+                section = None;
+            }
+            Some(Section::Init) => {
+                cfg.init = Some(line.to_string());
+                section = None;
+            }
+            Some(Section::Next) => {
+                cfg.next = Some(line.to_string());
+                section = None;
+            }
+            Some(Section::Symmetry) => {
+                cfg.symmetry = Some(line.to_string());
+                section = None;
+            }
+            Some(Section::View) => {
+                cfg.view = Some(line.to_string());
+                section = None;
+            }
+            Some(Section::CheckDeadlock) => {
+                cfg.check_deadlock = match line {
+                    "TRUE" => Some(true),
+                    "FALSE" => Some(false),
+                    _ => return Err(anyhow!("invalid CHECK_DEADLOCK value: {}", line)),
+                };
+                section = None;
+            }
             None => {
                 return Err(anyhow!(
                     "unrecognized config line outside section: {}",
@@ -371,6 +454,53 @@ mod tests {
         assert_eq!(cfg.check_deadlock, Some(false));
         assert_eq!(cfg.invariants.len(), 2);
         assert_eq!(cfg.constants.get("MaxTime"), Some(&ConfigValue::Int(2)));
+    }
+
+    #[test]
+    fn parses_multiline_section_format() {
+        let cfg = parse_tla_config(
+            r#"
+            CONSTANTS
+                MaxBeanCount = 100
+
+            SPECIFICATION
+                Spec
+
+            PROPERTY
+                EventuallyTerminates
+                MonotonicDecrease
+
+            INVARIANTS
+                TypeInvariant
+            "#,
+        )
+        .expect("cfg should parse");
+
+        assert_eq!(cfg.specification.as_deref(), Some("Spec"));
+        assert_eq!(
+            cfg.properties,
+            vec!["EventuallyTerminates", "MonotonicDecrease"]
+        );
+        assert_eq!(cfg.invariants, vec!["TypeInvariant"]);
+        assert_eq!(
+            cfg.constants.get("MaxBeanCount"),
+            Some(&ConfigValue::Int(100))
+        );
+    }
+
+    #[test]
+    fn parses_multiple_invariants_on_same_line() {
+        let cfg = parse_tla_config(
+            r#"
+            SPECIFICATION Spec
+            INVARIANTS TypeOK NotSolved Safety
+            PROPERTIES Liveness Progress
+            "#,
+        )
+        .expect("cfg should parse");
+
+        assert_eq!(cfg.invariants, vec!["TypeOK", "NotSolved", "Safety"]);
+        assert_eq!(cfg.properties, vec!["Liveness", "Progress"]);
     }
 
     #[test]
