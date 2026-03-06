@@ -894,6 +894,15 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
         return Ok(out);
     }
 
+    let cup_parts = split_top_level_keyword(expr, "\\cup");
+    if cup_parts.len() > 1 {
+        let mut out = eval_expr_inner(&cup_parts[0], ctx, depth + 1)?;
+        for part in &cup_parts[1..] {
+            out = out.set_union(&eval_expr_inner(part, ctx, depth + 1)?)?;
+        }
+        return Ok(out);
+    }
+
     let intersect_parts = split_top_level_keyword(expr, "\\intersect");
     if intersect_parts.len() > 1 {
         let mut out = eval_expr_inner(&intersect_parts[0], ctx, depth + 1)?;
@@ -906,6 +915,15 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
     if intersect_parts.len() > 1 {
         let mut out = eval_expr_inner(&intersect_parts[0], ctx, depth + 1)?;
         for part in &intersect_parts[1..] {
+            out = out.set_intersection(&eval_expr_inner(part, ctx, depth + 1)?)?;
+        }
+        return Ok(out);
+    }
+
+    let cap_parts = split_top_level_keyword(expr, "\\cap");
+    if cap_parts.len() > 1 {
+        let mut out = eval_expr_inner(&cap_parts[0], ctx, depth + 1)?;
+        for part in &cap_parts[1..] {
             out = out.set_intersection(&eval_expr_inner(part, ctx, depth + 1)?)?;
         }
         return Ok(out);
@@ -3861,6 +3879,23 @@ mod tests {
         assert_eq!(
             eval_expr("(x = 4) /\\ (y # 3)", &ctx).expect("expr should evaluate"),
             TlaValue::Bool(true)
+        );
+    }
+
+    #[test]
+    fn evals_cup_and_cap_aliases() {
+        let state = TlaState::new();
+        let ctx = EvalContext::new(&state);
+        assert_eq!(
+            eval_expr("{1} \\cup {2}", &ctx).expect("union alias should evaluate"),
+            TlaValue::Set(Arc::new(BTreeSet::from([
+                TlaValue::Int(1),
+                TlaValue::Int(2)
+            ])))
+        );
+        assert_eq!(
+            eval_expr("{1, 2} \\cap {2, 3}", &ctx).expect("intersection alias should evaluate"),
+            TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(2)])))
         );
     }
 
