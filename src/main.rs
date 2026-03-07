@@ -82,6 +82,11 @@ struct RuntimeArgs {
     numa_pinning: bool,
     #[arg(
         long,
+        help = "NUMA nodes to use (e.g., 0,1 or 0-2). Restricts workers to cores on these nodes only."
+    )]
+    numa_nodes: Option<String>,
+    #[arg(
+        long,
         value_parser = parse_byte_size,
         help = "Hard memory ceiling (supports units: 200GB, 10GiB, 512MB, etc.)"
     )]
@@ -264,6 +269,12 @@ fn build_engine_config(
         None => None,
     };
 
+    // Parse NUMA node list (uses same format as CPU list: "0,1" or "0-2")
+    let numa_nodes = match &runtime.numa_nodes {
+        Some(spec) => Some(parse_cpu_list(spec)?),
+        None => None,
+    };
+
     let fp_flush_every_ms = if storage.fp_flush_every_ms == 0 {
         None
     } else {
@@ -275,6 +286,7 @@ fn build_engine_config(
         core_ids,
         enforce_cgroups: runtime.enforce_cgroups,
         numa_pinning: runtime.numa_pinning,
+        numa_nodes,
         memory_max_bytes: runtime.memory_max_bytes,
         estimated_state_bytes: runtime.estimated_state_bytes,
         work_dir: runtime.work_dir.clone(),

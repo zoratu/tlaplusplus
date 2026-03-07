@@ -33,6 +33,8 @@ pub struct EngineConfig {
     pub core_ids: Option<Vec<usize>>,
     pub enforce_cgroups: bool,
     pub numa_pinning: bool,
+    /// Restrict workers to specific NUMA nodes (e.g., Some(vec![0, 1]))
+    pub numa_nodes: Option<Vec<usize>>,
     pub memory_max_bytes: Option<u64>,
     pub estimated_state_bytes: usize,
     pub work_dir: PathBuf,
@@ -71,6 +73,7 @@ impl Default for EngineConfig {
             core_ids: None,
             enforce_cgroups: true,
             numa_pinning: true,
+            numa_nodes: None,
             memory_max_bytes: None,
             estimated_state_bytes: 256,
             work_dir: PathBuf::from("./.tlapp"),
@@ -680,6 +683,7 @@ where
         enforce_cgroups: config.enforce_cgroups,
         enable_numa_pinning: config.numa_pinning,
         requested_core_ids: config.core_ids.clone(),
+        requested_numa_nodes: config.numa_nodes.clone(),
     });
 
     let _fp_path = config.work_dir.join("fingerprints");
