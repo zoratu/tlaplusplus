@@ -820,6 +820,11 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
         }
         return Ok(TlaValue::Bool(false));
     }
+    // Handle case where expression starts with \/ but has only one disjunct
+    // e.g., "\/ x > 0" should be treated as just "x > 0"
+    if expr.trim().starts_with("\\/") && or_parts.len() == 1 {
+        return eval_expr_inner(&or_parts[0], ctx, depth + 1);
+    }
 
     let and_parts = split_top_level_symbol(expr, "/\\");
     if and_parts.len() > 1 {
@@ -829,6 +834,11 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
             }
         }
         return Ok(TlaValue::Bool(true));
+    }
+    // Handle case where expression starts with /\ but has only one conjunct
+    // e.g., "/\ x > 0" should be treated as just "x > 0"
+    if expr.trim().starts_with("/\\") && and_parts.len() == 1 {
+        return eval_expr_inner(&and_parts[0], ctx, depth + 1);
     }
 
     if let Some(rest) = expr.strip_prefix('~') {
@@ -4724,5 +4734,218 @@ mod tests {
             eval_expr("IsOdd(3)", &ctx).expect("IsOdd(3)"),
             TlaValue::Bool(true)
         );
+    }
+
+    #[test]
+    fn conjunction_with_nested_quantifier_conjunction() {
+        // This test reproduces a bug where parsing:
+        //   /\ \A i \in Inodes :
+        //       /\ inodeState[i].readers >= 0
+        //       /\ inodeState[i].writers >= 0
+        // would incorrectly split and result in "/" being parsed as an expression atom
+
+        let state = TlaState::from([
+            (
+                "Inodes".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::ModelValue(
+                    "i1".to_string(),
+                )]))),
+            ),
+            (
+                "inodeState".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([(
+                    TlaValue::ModelValue("i1".to_string()),
+                    TlaValue::Record(Arc::new(BTreeMap::from([
+                        ("readers".to_string(), TlaValue::Int(0)),
+                        ("writers".to_string(), TlaValue::Int(0)),
+                    ]))),
+                )]))),
+            ),
+        ]);
+        let ctx = EvalContext::new(&state);
+
+        // Test simple nested conjunction inside quantifier
+        let expr = r#"/\ \A i \in Inodes :
+        /\ inodeState[i].readers >= 0
+        /\ inodeState[i].writers >= 0"#;
+
+        let result = eval_expr(expr, &ctx);
+        assert!(
+            result.is_ok(),
+            "Nested conjunction in quantifier should not fail with: {:?}",
+            result.err()
+        );
+        assert_eq!(result.unwrap(), TlaValue::Bool(true));
+    }
+
+    #[test]
+    fn two_quantifiers_conjunction() {
+        // Test the CoherentIO TypeOK pattern:
+        //   /\ \A i \in Inodes : ...
+        //   /\ \A c \in Clients, i \in Inodes : ...
+
+        let state = TlaState::from([
+            (
+                "Inodes".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::ModelValue(
+                    "i1".to_string(),
+                )]))),
+            ),
+            (
+                "Clients".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::ModelValue(
+                    "c1".to_string(),
+                )]))),
+            ),
+            (
+                "inodeState".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([(
+                    TlaValue::ModelValue("i1".to_string()),
+                    TlaValue::Record(Arc::new(BTreeMap::from([
+                        ("readers".to_string(), TlaValue::Int(0)),
+                        ("writers".to_string(), TlaValue::Int(0)),
+                        ("dataVerifier".to_string(), TlaValue::Int(0)),
+                    ]))),
+                )]))),
+            ),
+            (
+                "serverCharters".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([(
+                    TlaValue::ModelValue("i1".to_string()),
+                    TlaValue::Function(Arc::new(BTreeMap::from([(
+                        TlaValue::ModelValue("c1".to_string()),
+                        TlaValue::Record(Arc::new(BTreeMap::from([(
+                            "givenAccess".to_string(),
+                            TlaValue::String("NONE".to_string()),
+                        )]))),
+                    )]))),
+                )]))),
+            ),
+            (
+                "clientCharters".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([(
+                    TlaValue::ModelValue("c1".to_string()),
+                    TlaValue::Function(Arc::new(BTreeMap::from([(
+                        TlaValue::ModelValue("i1".to_string()),
+                        TlaValue::Record(Arc::new(BTreeMap::from([(
+                            "givenAccess".to_string(),
+                            TlaValue::String("NONE".to_string()),
+                        )]))),
+                    )]))),
+                )]))),
+            ),
+            (
+                "AccessLevel".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([
+                    TlaValue::String("NONE".to_string()),
+                    TlaValue::String("READ".to_string()),
+                    TlaValue::String("WRITE".to_string()),
+                ]))),
+            ),
+        ]);
+        let ctx = EvalContext::new(&state);
+
+        // TypeOK pattern with two quantifiers
+        let expr = r#"/\ \A i \in Inodes :
+        /\ inodeState[i].readers >= 0
+        /\ inodeState[i].writers >= 0
+        /\ inodeState[i].dataVerifier >= 0
+    /\ \A c \in Clients, i \in Inodes :
+        /\ serverCharters[i][c].givenAccess \in AccessLevel
+        /\ clientCharters[c][i].givenAccess \in AccessLevel"#;
+
+        let result = eval_expr(expr, &ctx);
+        assert!(
+            result.is_ok(),
+            "Two quantifiers conjunction should not fail with: {:?}",
+            result.err()
+        );
+        assert_eq!(result.unwrap(), TlaValue::Bool(true));
+    }
+
+    #[test]
+    fn two_quantifiers_compiled() {
+        use crate::tla::{compile_expr, eval_compiled};
+
+        // Test the CoherentIO TypeOK pattern with compiled expressions
+
+        let state = TlaState::from([
+            (
+                "Inodes".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::ModelValue(
+                    "i1".to_string(),
+                )]))),
+            ),
+            (
+                "Clients".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::ModelValue(
+                    "c1".to_string(),
+                )]))),
+            ),
+            (
+                "inodeState".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([(
+                    TlaValue::ModelValue("i1".to_string()),
+                    TlaValue::Record(Arc::new(BTreeMap::from([
+                        ("readers".to_string(), TlaValue::Int(0)),
+                        ("writers".to_string(), TlaValue::Int(0)),
+                        ("dataVerifier".to_string(), TlaValue::Int(0)),
+                    ]))),
+                )]))),
+            ),
+            (
+                "serverCharters".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([(
+                    TlaValue::ModelValue("i1".to_string()),
+                    TlaValue::Function(Arc::new(BTreeMap::from([(
+                        TlaValue::ModelValue("c1".to_string()),
+                        TlaValue::Record(Arc::new(BTreeMap::from([(
+                            "givenAccess".to_string(),
+                            TlaValue::String("NONE".to_string()),
+                        )]))),
+                    )]))),
+                )]))),
+            ),
+            (
+                "clientCharters".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([(
+                    TlaValue::ModelValue("c1".to_string()),
+                    TlaValue::Function(Arc::new(BTreeMap::from([(
+                        TlaValue::ModelValue("i1".to_string()),
+                        TlaValue::Record(Arc::new(BTreeMap::from([(
+                            "givenAccess".to_string(),
+                            TlaValue::String("NONE".to_string()),
+                        )]))),
+                    )]))),
+                )]))),
+            ),
+            (
+                "AccessLevel".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([
+                    TlaValue::String("NONE".to_string()),
+                    TlaValue::String("READ".to_string()),
+                    TlaValue::String("WRITE".to_string()),
+                ]))),
+            ),
+        ]);
+        let ctx = EvalContext::new(&state);
+
+        // TypeOK pattern with two quantifiers
+        let expr = r#"/\ \A i \in Inodes :
+        /\ inodeState[i].readers >= 0
+        /\ inodeState[i].writers >= 0
+        /\ inodeState[i].dataVerifier >= 0
+    /\ \A c \in Clients, i \in Inodes :
+        /\ serverCharters[i][c].givenAccess \in AccessLevel
+        /\ clientCharters[c][i].givenAccess \in AccessLevel"#;
+
+        let compiled = compile_expr(expr);
+        let result = eval_compiled(&compiled, &ctx);
+        assert!(
+            result.is_ok(),
+            "Compiled two quantifiers conjunction should not fail with: {:?}",
+            result.err()
+        );
+        assert_eq!(result.unwrap(), TlaValue::Bool(true));
     }
 }
