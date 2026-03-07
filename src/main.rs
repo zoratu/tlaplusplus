@@ -577,7 +577,7 @@ where
                 .as_secs(),
             states_generated: outcome.stats.states_generated,
             states_distinct: outcome.stats.states_distinct,
-            queue_pending: 0, // Completed
+            queue_pending: 0,     // Completed
             min_segment_id: None, // No segments needed - run is complete
         };
 

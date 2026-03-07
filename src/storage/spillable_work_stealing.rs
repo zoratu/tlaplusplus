@@ -81,6 +81,7 @@ impl<T> SpillableWorkerState<T> {
 
 /// A batch of items to spill, tagged with worker ID for debugging
 struct SpillBatch<T> {
+    #[allow(dead_code)]
     worker_id: usize,
     items: Vec<T>,
 }
@@ -301,10 +302,12 @@ where
             // because loader thought queue was full when it was actually empty.
             let hot_queues_empty = hot.is_empty();
             let pending = hot.pending_count();
+            #[allow(unused_variables)]
             let should_load_aggressively = hot_queues_empty || pending < LOW_WATER_MARK;
 
             // Queue is low or empty - check if disk has items
             let has_work = overflow.has_pending_work();
+            #[allow(unused_variables)]
             let segment_count = overflow.segment_count();
 
             // CRITICAL: Update hot queue's disk_has_pending_work flag BEFORE any continue.
@@ -363,6 +366,7 @@ where
             // Aggressively load from disk - no sleep between loads when disk has work
             match overflow.pop_bulk(LOAD_BATCH_SIZE) {
                 Ok(items) if !items.is_empty() => {
+                    #[allow(unused_variables)]
                     let count = items.len();
                     for item in items {
                         hot.push_global(item);
@@ -867,40 +871,42 @@ where
                     let mut consecutive_empty = 0u32;
 
                     // Helper to write a batch to disk
-                    let write_batch = |batch: &mut Vec<T>,
-                                       local_drained: &mut u64,
-                                       local_segments: &mut u64,
-                                       errors: &Mutex<Vec<String>>| {
-                        if batch.is_empty() {
-                            return;
-                        }
+                    let write_batch =
+                        |batch: &mut Vec<T>,
+                         local_drained: &mut u64,
+                         local_segments: &mut u64,
+                         errors: &Mutex<Vec<String>>| {
+                            if batch.is_empty() {
+                                return;
+                            }
 
-                        let segment_id = overflow.allocate_segment_id();
-                        let segment_path = spill_dir.join(format!("segment-{segment_id:016}.bin"));
+                            let segment_id = overflow.allocate_segment_id();
+                            let segment_path =
+                                spill_dir.join(format!("segment-{segment_id:016}.bin"));
 
-                        match serialize_compressed(batch) {
-                            Ok(bytes) => match std::fs::write(&segment_path, &bytes) {
-                                Ok(()) => {
-                                    overflow.register_segment(segment_path);
-                                    *local_drained += batch.len() as u64;
-                                    *local_segments += 1;
-                                }
+                            match serialize_compressed(batch) {
+                                Ok(bytes) => match std::fs::write(&segment_path, &bytes) {
+                                    Ok(()) => {
+                                        overflow.register_segment(segment_path);
+                                        *local_drained += batch.len() as u64;
+                                        *local_segments += 1;
+                                    }
+                                    Err(e) => {
+                                        errors.lock().push(format!(
+                                            "thread {}: write error: {}",
+                                            thread_id, e
+                                        ));
+                                    }
+                                },
                                 Err(e) => {
                                     errors.lock().push(format!(
-                                        "thread {}: write error: {}",
+                                        "thread {}: serialize error: {}",
                                         thread_id, e
                                     ));
                                 }
-                            },
-                            Err(e) => {
-                                errors.lock().push(format!(
-                                    "thread {}: serialize error: {}",
-                                    thread_id, e
-                                ));
                             }
-                        }
-                        batch.clear();
-                    };
+                            batch.clear();
+                        };
 
                     loop {
                         let mut found_any = false;
@@ -922,7 +928,12 @@ where
 
                         // Write if batch is full
                         if batch.len() >= BATCH_SIZE {
-                            write_batch(&mut batch, &mut local_drained, &mut local_segments, errors);
+                            write_batch(
+                                &mut batch,
+                                &mut local_drained,
+                                &mut local_segments,
+                                errors,
+                            );
                         }
 
                         // Steal from NUMA injectors
@@ -941,7 +952,12 @@ where
                                 }
                             }
                             if batch.len() >= BATCH_SIZE {
-                                write_batch(&mut batch, &mut local_drained, &mut local_segments, errors);
+                                write_batch(
+                                    &mut batch,
+                                    &mut local_drained,
+                                    &mut local_segments,
+                                    errors,
+                                );
                             }
                         }
 
@@ -961,7 +977,12 @@ where
                                 }
                             }
                             if batch.len() >= BATCH_SIZE {
-                                write_batch(&mut batch, &mut local_drained, &mut local_segments, errors);
+                                write_batch(
+                                    &mut batch,
+                                    &mut local_drained,
+                                    &mut local_segments,
+                                    errors,
+                                );
                             }
                         }
 
@@ -970,7 +991,12 @@ where
                             consecutive_empty += 1;
                             if consecutive_empty > MAX_CONSECUTIVE_EMPTY {
                                 // Write any remaining items in partial batch
-                                write_batch(&mut batch, &mut local_drained, &mut local_segments, errors);
+                                write_batch(
+                                    &mut batch,
+                                    &mut local_drained,
+                                    &mut local_segments,
+                                    errors,
+                                );
                                 break;
                             }
                             // Yield to let other threads make progress

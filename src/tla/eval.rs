@@ -324,6 +324,7 @@ struct ActionEvalBranch {
 /// Evaluate a LET expression that contains primed assignments.
 ///
 /// This wrapper preserves the previous single-successor shape for legacy callers.
+#[allow(dead_code)]
 pub(crate) fn eval_let_action(
     expr: &str,
     ctx: &EvalContext<'_>,

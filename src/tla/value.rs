@@ -232,6 +232,7 @@ mod proptests {
     }
 
     /// Generate a sequence of TlaValues
+    #[allow(dead_code)]
     fn arb_tla_seq() -> impl Strategy<Value = TlaValue> {
         prop::collection::vec(arb_tla_value(), 0..10).prop_map(|v| TlaValue::Seq(Arc::new(v)))
     }

@@ -22,7 +22,6 @@ use dashmap::DashMap;
 use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::hash::Hasher;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -482,6 +481,7 @@ fn prune_old_checkpoints(checkpoint_dir: &Path, keep_count: usize) -> Result<()>
     Ok(())
 }
 
+#[allow(dead_code)]
 struct CheckpointContext<'a, T> {
     checkpoint_path: &'a Path,
     model_name: &'a str,
@@ -499,6 +499,7 @@ struct CheckpointContext<'a, T> {
     resumed_from_checkpoint: bool,
 }
 
+#[allow(dead_code)]
 fn checkpoint_once<T>(ctx: &CheckpointContext<T>) -> Result<()>
 where
     T: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
@@ -1665,6 +1666,7 @@ where
                     worker_model.next_states(&state, &mut successors);
                 }
 
+                #[allow(unused_variables)]
                 let successors_before_filter = successors.len();
                 local_states_generated += successors.len() as u64;
 
@@ -2196,7 +2198,6 @@ pub fn reconstruct_trace_limited<M: Model>(
 #[cfg(test)]
 mod tests {
     use super::{EngineConfig, run_model};
-    use crate::chaos;
     use crate::models::counter_grid::CounterGridModel;
     use anyhow::Result;
     use std::time::{SystemTime, UNIX_EPOCH};
