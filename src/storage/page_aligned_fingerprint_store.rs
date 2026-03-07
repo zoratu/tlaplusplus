@@ -357,6 +357,94 @@ impl FingerprintShard {
         }
     }
 
+    /// Check if fingerprint exists (read-only, no insert)
+    ///
+    /// Returns true if fingerprint exists, false otherwise.
+    /// This is completely non-blocking.
+    fn contains(&self, fp: u64) -> bool {
+        let fp = if fp == 0 { 1 } else { fp };
+
+        loop {
+            let seq_before = self.seq.load(Ordering::Acquire);
+            if seq_before % 2 == 1 {
+                // RESIZE IN PROGRESS - check both old and new tables
+
+                // Check old table
+                let old_table_ptr = self.old_table.load(Ordering::Acquire);
+                let old_cap = self.old_capacity.load(Ordering::Acquire);
+
+                if !old_table_ptr.is_null() && old_cap > 0 {
+                    let old_table = unsafe { std::slice::from_raw_parts(old_table_ptr, old_cap) };
+                    let mut index = (fp as usize) % old_cap;
+                    let mut probes = 0u64;
+
+                    while probes < old_cap as u64 {
+                        let stored_fp = old_table[index].fp.load(Ordering::Acquire);
+                        if stored_fp == fp {
+                            return true;
+                        }
+                        if stored_fp == 0 {
+                            break;
+                        }
+                        index = (index + 1) % old_cap;
+                        probes += 1;
+                    }
+                }
+
+                // Check new table
+                let new_table_ptr = self.new_table.load(Ordering::Acquire);
+                let new_cap = self.new_capacity.load(Ordering::Acquire);
+
+                if !new_table_ptr.is_null() && new_cap > 0 {
+                    let new_table = unsafe { std::slice::from_raw_parts(new_table_ptr, new_cap) };
+                    let mut index = (fp as usize) % new_cap;
+                    let mut probes = 0u64;
+
+                    while probes < new_cap as u64 {
+                        let stored_fp = new_table[index].fp.load(Ordering::Acquire);
+                        if stored_fp == fp {
+                            return true;
+                        }
+                        if stored_fp == 0 {
+                            break;
+                        }
+                        index = (index + 1) % new_cap;
+                        probes += 1;
+                    }
+                }
+
+                return false;
+            }
+
+            // NORMAL PATH - check main table
+            let capacity = self.get_capacity();
+            let table_ptr = self.get_table();
+            let table = unsafe { std::slice::from_raw_parts(table_ptr, capacity) };
+
+            let mut index = (fp as usize) % capacity;
+            let mut probes = 0u64;
+
+            while probes < capacity as u64 {
+                let stored_fp = table[index].fp.load(Ordering::Acquire);
+                if stored_fp == fp {
+                    return true;
+                }
+                if stored_fp == 0 {
+                    break;
+                }
+                index = (index + 1) % capacity;
+                probes += 1;
+            }
+
+            // Check if resize happened during our operation
+            let seq_after = self.seq.load(Ordering::Acquire);
+            if seq_before == seq_after {
+                return false;
+            }
+            // Resize happened, retry
+        }
+    }
+
     /// Check if fingerprint exists or insert it (lock-free with resize support)
     ///
     /// Returns true if fingerprint already existed, false if newly inserted
@@ -1004,6 +1092,43 @@ impl PageAlignedFingerprintStore {
         let numa = self.home_numa(fp);
         let shard_within_numa = (fp as usize) % self.shards_per_numa;
         (numa * self.shards_per_numa + shard_within_numa).min(self.shards.len() - 1)
+    }
+
+    /// Check if fingerprint exists (read-only, no insert)
+    pub fn contains(&self, fp: u64) -> bool {
+        let fp = if fp == 0 { 1 } else { fp };
+        let shard_id = self.shard_id_for(fp);
+        let shard = &self.shards[shard_id];
+        shard.contains(fp)
+    }
+
+    /// Batch check for fingerprints (read-only, no insert)
+    pub fn contains_batch(&self, fps: &[u64], seen: &mut Vec<bool>) {
+        seen.clear();
+        seen.resize(fps.len(), false);
+
+        let num_shards = self.shards.len();
+
+        // Group by shard for cache locality
+        let mut shard_groups: Vec<Vec<(usize, u64)>> = vec![Vec::new(); num_shards];
+
+        for (idx, &fp) in fps.iter().enumerate() {
+            let shard_id = self.shard_id_for(fp);
+            shard_groups[shard_id].push((idx, fp));
+        }
+
+        // Process each shard's fingerprints
+        for (shard_id, group) in shard_groups.iter().enumerate() {
+            if group.is_empty() {
+                continue;
+            }
+
+            let shard = &self.shards[shard_id];
+
+            for &(idx, fp) in group {
+                seen[idx] = shard.contains(fp);
+            }
+        }
     }
 
     /// Check if fingerprint exists or insert it

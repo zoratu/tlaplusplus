@@ -153,6 +153,21 @@ struct StorageArgs {
     /// This drastically reduces memory usage at the cost of possibly re-exploring ~1% of states
     #[arg(long, default_value_t = false)]
     use_bloom_fingerprints: bool,
+    /// Enable automatic switching from exact to bloom filter fingerprints
+    /// When enabled, starts with exact fingerprints and switches to bloom when:
+    /// - Memory usage exceeds --bloom-switch-memory-threshold, OR
+    /// - State count exceeds --bloom-switch-threshold
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    bloom_auto_switch: bool,
+    /// State count threshold to trigger bloom auto-switch (default: 1 billion)
+    #[arg(long, default_value_t = 1_000_000_000)]
+    bloom_switch_threshold: u64,
+    /// Memory pressure threshold to trigger bloom auto-switch (0.0-1.0, default: 0.85)
+    #[arg(long, default_value_t = 0.85)]
+    bloom_switch_memory_threshold: f64,
+    /// False positive rate for bloom filter after auto-switch (default: 0.001 = 0.1%)
+    #[arg(long, default_value_t = 0.001)]
+    bloom_switch_fpr: f64,
 }
 
 #[derive(Args, Clone, Debug, Default)]
@@ -299,6 +314,10 @@ fn build_engine_config(
         auto_tune: runtime.auto_tune,
         enable_fp_persistence: runtime.resume || !storage.disable_fp_persistence,
         use_bloom_fingerprints: storage.use_bloom_fingerprints,
+        bloom_auto_switch: storage.bloom_auto_switch && !storage.use_bloom_fingerprints,
+        bloom_switch_threshold: storage.bloom_switch_threshold,
+        bloom_switch_memory_threshold: storage.bloom_switch_memory_threshold,
+        bloom_switch_fpr: storage.bloom_switch_fpr,
     })
 }
 
