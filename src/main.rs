@@ -101,13 +101,9 @@ struct RuntimeArgs {
     work_dir: std::path::PathBuf,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     clean_work_dir: bool,
-    #[arg(
-        long,
-        default_value_t = false,
-        action = clap::ArgAction::Set,
-        help = "Resume from existing checkpoint/work dir"
-    )]
-    resume: bool,
+    /// Start fresh, ignoring any existing checkpoint (default: auto-resume when S3 is configured)
+    #[arg(long, default_value_t = false)]
+    fresh: bool,
     /// Checkpoint interval in seconds (0 = disabled, default: 600 with S3, 0 without)
     #[arg(long, default_value_t = 0)]
     checkpoint_interval_secs: u64,
@@ -296,6 +292,7 @@ enum Command {
 fn build_engine_config(
     runtime: &RuntimeArgs,
     storage: &StorageArgs,
+    s3_enabled: bool,
 ) -> anyhow::Result<EngineConfig> {
     let core_ids = match &runtime.core_ids {
         Some(spec) => Some(parse_cpu_list(spec)?),
@@ -324,7 +321,8 @@ fn build_engine_config(
         estimated_state_bytes: runtime.estimated_state_bytes,
         work_dir: runtime.work_dir.clone(),
         clean_work_dir: runtime.clean_work_dir,
-        resume_from_checkpoint: runtime.resume,
+        // Auto-resume from checkpoint when S3 is enabled (unless --fresh is specified)
+        resume_from_checkpoint: s3_enabled && !runtime.fresh,
         checkpoint_interval_secs: runtime.checkpoint_interval_secs,
         checkpoint_on_exit: runtime.checkpoint_on_exit,
         poll_sleep_ms: runtime.poll_sleep_ms,
@@ -342,7 +340,7 @@ fn build_engine_config(
         enable_queue_spilling: !storage.disable_queue_spilling,
         queue_max_inmem_items: storage.queue_max_inmem_items,
         auto_tune: runtime.auto_tune,
-        enable_fp_persistence: runtime.resume || !storage.disable_fp_persistence,
+        enable_fp_persistence: (s3_enabled && !runtime.fresh) || !storage.disable_fp_persistence,
         use_bloom_fingerprints: storage.use_bloom_fingerprints,
         bloom_auto_switch: storage.bloom_auto_switch && !storage.use_bloom_fingerprints,
         bloom_switch_threshold: storage.bloom_switch_threshold,
@@ -465,20 +463,35 @@ where
 
     // Download existing state if resuming
     if config.resume_from_checkpoint {
-        eprintln!("S3: Checking for existing state to resume...");
+        eprintln!("S3: Checking for existing checkpoint to resume...");
         match rt.block_on(s3_persist.download_state()) {
             Ok(tlaplusplus::storage::s3_persistence::DownloadResult::Resumed {
                 manifest, ..
             }) => {
-                eprintln!("S3: Resuming from checkpoint in run {}", manifest.run_id);
+                eprintln!("S3: Found checkpoint in run '{}'", manifest.run_id);
+                if let Some(ref cp) = manifest.checkpoint {
+                    eprintln!("S3: Resuming from checkpoint:");
+                    eprintln!("      States generated: {}", cp.states_generated);
+                    eprintln!("      Distinct states:  {}", cp.states_distinct);
+                    eprintln!("      Queue pending:    {}", cp.queue_pending);
+                    let ts = chrono::DateTime::from_timestamp(manifest.updated_at as i64, 0)
+                        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    eprintln!("      Last updated:     {}", ts);
+                } else {
+                    eprintln!("S3: Resuming from manifest (no checkpoint state)");
+                }
             }
             Ok(tlaplusplus::storage::s3_persistence::DownloadResult::NoExistingState) => {
-                eprintln!("S3: No existing state found, starting fresh");
+                eprintln!("S3: No existing checkpoint found, starting fresh");
             }
             Err(e) => {
                 eprintln!("S3: Warning: failed to download state: {}", e);
+                eprintln!("S3: Starting fresh due to download error");
             }
         }
+    } else if s3.s3_bucket.is_some() {
+        eprintln!("S3: Starting fresh (--fresh specified, ignoring any existing checkpoint)");
     }
 
     // Start background upload
@@ -666,7 +679,7 @@ fn main() -> anyhow::Result<()> {
             s3,
         } => {
             let model = CounterGridModel::new(max_x, max_y, max_sum);
-            let config = build_engine_config(&runtime, &storage)?;
+            let config = build_engine_config(&runtime, &storage, s3.s3_bucket.is_some())?;
             let outcome = run_model_with_s3(model, config, &s3)?;
             print_stats("counter-grid", &outcome.stats);
             if let Some(violation) = outcome.violation {
@@ -685,7 +698,7 @@ fn main() -> anyhow::Result<()> {
             s3,
         } => {
             let model = FlurmJobLifecycleModel::new(max_jobs, max_time_limit);
-            let config = build_engine_config(&runtime, &storage)?;
+            let config = build_engine_config(&runtime, &storage, s3.s3_bucket.is_some())?;
             let outcome = run_model_with_s3(model, config, &s3)?;
             print_stats("flurm-job-lifecycle", &outcome.stats);
             if let Some(violation) = outcome.violation {
@@ -704,7 +717,7 @@ fn main() -> anyhow::Result<()> {
             s3,
         } => {
             let model = HighBranchingModel::new(max_depth, branching_factor);
-            let config = build_engine_config(&runtime, &storage)?;
+            let config = build_engine_config(&runtime, &storage, s3.s3_bucket.is_some())?;
             let outcome = run_model_with_s3(model, config, &s3)?;
             print_stats("high-branching", &outcome.stats);
             if let Some(violation) = outcome.violation {
@@ -817,7 +830,7 @@ fn main() -> anyhow::Result<()> {
                 }
             });
 
-            let config = build_engine_config(&runtime, &storage)?;
+            let config = build_engine_config(&runtime, &storage, false)?;
             let outcome = run_model(model, config)?;
 
             // Signal monitor thread to stop
@@ -1178,7 +1191,7 @@ fn main() -> anyhow::Result<()> {
             // Clone model for post-processing (liveness checking)
             let model_for_liveness = model.clone();
 
-            let config = build_engine_config(&runtime, &storage)?;
+            let config = build_engine_config(&runtime, &storage, s3.s3_bucket.is_some())?;
             let outcome = run_model_with_s3(model, config, &s3).map_err(|e| {
                 eprintln!("Error running model:");
                 eprintln!("  {}", e);
