@@ -569,6 +569,7 @@ where
         eprintln!("S3: Performing final flush...");
 
         // Add checkpoint state
+        // Note: min_segment_id is None here because we're at completion - no segments needed
         let checkpoint = tlaplusplus::storage::s3_persistence::CheckpointState {
             id: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -577,6 +578,7 @@ where
             states_generated: outcome.stats.states_generated,
             states_distinct: outcome.stats.states_distinct,
             queue_pending: 0, // Completed
+            min_segment_id: None, // No segments needed - run is complete
         };
 
         rt.block_on(async {
