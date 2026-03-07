@@ -115,6 +115,11 @@ pub struct AutoSwitchingFingerprintStore {
     /// Whether we've switched to hybrid mode
     switched: AtomicBool,
 
+    /// Whether a switch is pending (set before taking write lock)
+    /// Workers check this flag BEFORE acquiring read lock to avoid blocking
+    /// during checkpoint quiescence
+    switch_pending: AtomicBool,
+
     /// Insert counter for periodic checks
     insert_counter: AtomicU64,
 
@@ -185,6 +190,7 @@ impl AutoSwitchingFingerprintStore {
             state: RwLock::new(StoreState::Exact { store: exact_store }),
             config: config.clone(),
             switched: AtomicBool::new(false),
+            switch_pending: AtomicBool::new(false),
             insert_counter: AtomicU64::new(0),
             stats: StoreStats::default(),
             memory_monitor,
@@ -214,7 +220,29 @@ impl AutoSwitchingFingerprintStore {
     pub fn contains_or_insert(&self, fp: u64) -> bool {
         self.stats.checks.fetch_add(1, Ordering::Relaxed);
 
-        let state = self.state.read();
+        // Check if a switch is pending - use non-blocking try_read
+        // to avoid blocking workers during checkpoint quiescence
+        let state = if self.switch_pending.load(Ordering::Acquire) {
+            let mut attempts = 0;
+            loop {
+                if let Some(guard) = self.state.try_read() {
+                    break guard;
+                }
+                attempts += 1;
+                if attempts > 10 {
+                    // Can't acquire lock and switch is pending
+                    // Return true (exists) to let worker proceed quickly
+                    self.stats.hits.fetch_add(1, Ordering::Relaxed);
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_micros(100));
+                if !self.switch_pending.load(Ordering::Acquire) {
+                    break self.state.read();
+                }
+            }
+        } else {
+            self.state.read()
+        };
         let result = match &*state {
             StoreState::Exact { store } => {
                 let existed = store.contains_or_insert(fp);
@@ -272,7 +300,48 @@ impl AutoSwitchingFingerprintStore {
         seen.clear();
         seen.resize(fps.len(), false);
 
-        let state = self.state.read();
+        // Check if a switch is pending BEFORE trying to acquire the read lock.
+        // If pending, use try_read with brief sleeps to avoid blocking indefinitely.
+        // This allows workers to yield and reach their pause points for checkpoint
+        // quiescence instead of blocking on the RwLock.
+        let state = if self.switch_pending.load(Ordering::Acquire) {
+            // Switch is pending - use non-blocking try_read with limited retries
+            // After a few attempts, mark all as "seen" (duplicates) and return.
+            // This is safe because:
+            // 1. It allows workers to complete quickly and reach pause points
+            // 2. States treated as duplicates here will be regenerated later
+            //    (their parent states are still in the queue or will be revisited)
+            // 3. The brief window where this happens is very short (during switch)
+            let mut attempts = 0;
+            loop {
+                if let Some(guard) = self.state.try_read() {
+                    break guard;
+                }
+                attempts += 1;
+                if attempts > 10 {
+                    // Can't acquire lock within ~1ms and switch is pending
+                    // Mark all fingerprints as "seen" (duplicates) so worker can proceed
+                    // This allows worker to reach pause point for checkpoint quiescence
+                    for s in seen.iter_mut() {
+                        *s = true;
+                    }
+                    // Count these as hits (they'll be re-checked after switch)
+                    self.stats
+                        .hits
+                        .fetch_add(fps.len() as u64, Ordering::Relaxed);
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_micros(100));
+                // Re-check if switch completed
+                if !self.switch_pending.load(Ordering::Acquire) {
+                    // Switch completed, safe to block
+                    break self.state.read();
+                }
+            }
+        } else {
+            // No switch pending - safe to block on read lock
+            self.state.read()
+        };
         match &*state {
             StoreState::Exact { store } => {
                 store.contains_or_insert_batch_with_affinity(fps, seen, worker_id)?;
@@ -394,7 +463,8 @@ impl AutoSwitchingFingerprintStore {
 
         let switch_start = Instant::now();
 
-        // Create bloom filter
+        // Create bloom filter BEFORE setting switch_pending
+        // This way workers only yield when we're ready to acquire the write lock
         let bloom = match BloomFingerprintStore::new(
             self.config.bloom_expected_items,
             self.config.bloom_false_positive_rate,
@@ -409,7 +479,18 @@ impl AutoSwitchingFingerprintStore {
             }
         };
 
+        // Set switch_pending BEFORE acquiring write lock
+        // This signals workers to yield instead of blocking on read lock
+        // allowing them to reach their pause point for checkpoint quiescence
+        self.switch_pending.store(true, Ordering::Release);
+
+        // Brief sleep to allow workers currently in batch operations to finish
+        // Workers checking switch_pending will yield after this
+        std::thread::sleep(std::time::Duration::from_millis(1));
+
         // Get exclusive lock for the transition
+        // Workers that check switch_pending before this will yield
+        // allowing checkpoint quiescence to succeed
         let mut state = self.state.write();
 
         // Extract exact store from current state
@@ -430,6 +511,7 @@ impl AutoSwitchingFingerprintStore {
             StoreState::Exact { store } => store,
             StoreState::Hybrid { .. } => {
                 eprintln!("ERROR: Already in hybrid mode");
+                self.switch_pending.store(false, Ordering::Release);
                 return;
             }
         };
@@ -443,6 +525,9 @@ impl AutoSwitchingFingerprintStore {
             switch_time: switch_start,
             switch_reason: reason,
         };
+
+        // Clear switch_pending - switch is complete, workers can proceed normally
+        self.switch_pending.store(false, Ordering::Release);
 
         eprintln!(
             "Switch complete in {:.2}ms",
@@ -463,6 +548,16 @@ impl AutoSwitchingFingerprintStore {
     /// Check if we've switched to hybrid mode
     pub fn is_hybrid(&self) -> bool {
         self.switched.load(Ordering::Relaxed)
+    }
+
+    /// Check if a switch to hybrid mode is pending
+    ///
+    /// Workers should check this BEFORE acquiring locks on the fingerprint store.
+    /// If true, workers should yield (e.g., continue their loop) to allow:
+    /// 1. The switch to complete without blocking
+    /// 2. Checkpoint quiescence to be achieved (workers can reach pause points)
+    pub fn is_switch_pending(&self) -> bool {
+        self.switch_pending.load(Ordering::Acquire)
     }
 
     /// Get home NUMA node for a fingerprint

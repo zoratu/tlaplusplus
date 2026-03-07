@@ -31,6 +31,11 @@
 //! - `io_slow` - Add artificial I/O latency (value = ms)
 //! - `io_fail` - Fail I/O operation
 //!
+//! ### Quiescence Operations
+//! - `quiescence_timeout` - Force timeout in wait_for_quiescence
+//! - `fp_switch_slow` - Add delay during switch_to_hybrid (value = ms)
+//! - `worker_pause_delay` - Delay worker entering pause (value = ms)
+//!
 //! ## Usage in Tests
 //!
 //! ```rust,ignore
@@ -252,6 +257,173 @@ mod tests {
         assert!(should_fail_alloc());
 
         set_alloc_fail_probability(0);
+    }
+}
+
+// =============================================================================
+// Quiescence Chaos Testing Support
+// =============================================================================
+
+/// Worker pause delay in milliseconds (0 = no delay)
+pub static CHAOS_WORKER_PAUSE_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
+/// FP switch delay in milliseconds (0 = no delay)
+pub static CHAOS_FP_SWITCH_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Force quiescence timeout (for testing timeout recovery)
+pub static CHAOS_FORCE_QUIESCENCE_TIMEOUT: AtomicBool = AtomicBool::new(false);
+
+/// Set worker pause delay (simulates slow workers)
+pub fn set_worker_pause_delay_ms(delay_ms: u64) {
+    CHAOS_WORKER_PAUSE_DELAY_MS.store(delay_ms, Ordering::Release);
+}
+
+/// Get worker pause delay
+pub fn get_worker_pause_delay_ms() -> u64 {
+    CHAOS_WORKER_PAUSE_DELAY_MS.load(Ordering::Acquire)
+}
+
+/// Apply worker pause delay if configured
+pub fn apply_worker_pause_delay() {
+    let delay = get_worker_pause_delay_ms();
+    if delay > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(delay));
+    }
+}
+
+/// Set FP switch delay (simulates slow hybrid switch)
+pub fn set_fp_switch_delay_ms(delay_ms: u64) {
+    CHAOS_FP_SWITCH_DELAY_MS.store(delay_ms, Ordering::Release);
+}
+
+/// Get FP switch delay
+pub fn get_fp_switch_delay_ms() -> u64 {
+    CHAOS_FP_SWITCH_DELAY_MS.load(Ordering::Acquire)
+}
+
+/// Apply FP switch delay if configured
+pub fn apply_fp_switch_delay() {
+    let delay = get_fp_switch_delay_ms();
+    if delay > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(delay));
+    }
+}
+
+/// Force quiescence timeout (for testing timeout recovery)
+pub fn set_force_quiescence_timeout(force: bool) {
+    CHAOS_FORCE_QUIESCENCE_TIMEOUT.store(force, Ordering::Release);
+}
+
+/// Check if quiescence should force timeout
+pub fn should_force_quiescence_timeout() -> bool {
+    CHAOS_FORCE_QUIESCENCE_TIMEOUT.load(Ordering::Acquire)
+}
+
+/// Macro to apply worker pause delay with failpoint support
+#[macro_export]
+macro_rules! apply_worker_pause_delay {
+    () => {{
+        // Check failpoint first (if feature enabled)
+        #[cfg(feature = "failpoints")]
+        {
+            // fail::eval returns Option<T> where T is the return type of the closure
+            // The closure receives the failpoint value as Option<String>
+            let delay_applied = ::fail::eval("worker_pause_delay", |v: Option<String>| {
+                if let Some(val) = v {
+                    if let Ok(ms) = val.parse::<u64>() {
+                        std::thread::sleep(std::time::Duration::from_millis(ms));
+                        return true;
+                    }
+                }
+                false
+            });
+            // If failpoint didn't apply delay, apply chaos delay
+            if !delay_applied.unwrap_or(false) {
+                $crate::chaos::apply_worker_pause_delay();
+            }
+        }
+        #[cfg(not(feature = "failpoints"))]
+        {
+            $crate::chaos::apply_worker_pause_delay();
+        }
+    }};
+}
+
+/// Macro to apply FP switch delay with failpoint support
+#[macro_export]
+macro_rules! apply_fp_switch_delay {
+    () => {{
+        // Check failpoint first (if feature enabled)
+        #[cfg(feature = "failpoints")]
+        {
+            let delay_applied = ::fail::eval("fp_switch_slow", |v: Option<String>| {
+                if let Some(val) = v {
+                    if let Ok(ms) = val.parse::<u64>() {
+                        std::thread::sleep(std::time::Duration::from_millis(ms));
+                        return true;
+                    }
+                }
+                false
+            });
+            // If failpoint didn't apply delay, apply chaos delay
+            if !delay_applied.unwrap_or(false) {
+                $crate::chaos::apply_fp_switch_delay();
+            }
+        }
+        #[cfg(not(feature = "failpoints"))]
+        {
+            $crate::chaos::apply_fp_switch_delay();
+        }
+    }};
+}
+
+/// Macro to check for quiescence timeout override
+#[macro_export]
+macro_rules! should_force_quiescence_timeout {
+    () => {{
+        #[cfg(feature = "failpoints")]
+        {
+            if ::fail::eval("quiescence_timeout", |_| true).is_some() {
+                true
+            } else {
+                $crate::chaos::should_force_quiescence_timeout()
+            }
+        }
+        #[cfg(not(feature = "failpoints"))]
+        {
+            $crate::chaos::should_force_quiescence_timeout()
+        }
+    }};
+}
+
+/// Result of quiescence wait operation
+#[derive(Debug, Clone)]
+pub enum QuiescenceResult {
+    /// All workers successfully paused
+    Achieved {
+        paused_workers: usize,
+        elapsed_ms: u64,
+    },
+    /// Timeout waiting for workers to pause
+    Timeout {
+        paused_workers: usize,
+        total_workers: usize,
+        elapsed_ms: u64,
+        stuck_workers: Vec<usize>,
+    },
+    /// Interrupted by stop signal
+    Interrupted,
+}
+
+impl QuiescenceResult {
+    /// Check if quiescence was achieved
+    pub fn is_achieved(&self) -> bool {
+        matches!(self, QuiescenceResult::Achieved { .. })
+    }
+
+    /// Check if operation timed out
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, QuiescenceResult::Timeout { .. })
     }
 }
 
