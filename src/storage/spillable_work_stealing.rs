@@ -829,12 +829,17 @@ where
     /// 2. Each thread competes to steal from global/NUMA injectors and worker stealers
     /// 3. When a thread fills its batch (50K items), it writes to disk immediately
     /// 4. Threads exit after consecutive empty steals (all sources drained)
+    /// 5. Has a 5-minute timeout to prevent infinite hangs
     fn drain_injectors_parallel(&self) -> Result<u64> {
         use crossbeam_deque::Steal;
         use parking_lot::Mutex;
+        use std::time::{Duration, Instant};
 
         const BATCH_SIZE: usize = 50_000;
         const MAX_CONSECUTIVE_EMPTY: u32 = 100; // Exit after this many empty steal rounds
+        const MAX_RETRY_PER_STEAL: u32 = 10; // Max retries before treating as empty
+        const DRAIN_TIMEOUT: Duration = Duration::from_secs(300); // 5 minute timeout
+        const PROGRESS_INTERVAL: Duration = Duration::from_secs(30); // Log progress every 30s
 
         let num_threads = std::thread::available_parallelism()
             .map(|p| p.get())
@@ -847,10 +852,13 @@ where
         let total_drained = AtomicU64::new(0);
         let segments_written = AtomicU64::new(0);
         let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let start_time = Instant::now();
+        let should_stop = AtomicBool::new(false);
 
         eprintln!(
-            "Checkpoint: drain_injectors_streaming - starting with {} threads",
-            num_threads
+            "Checkpoint: drain_injectors_streaming - starting with {} threads (timeout: {}s)",
+            num_threads,
+            DRAIN_TIMEOUT.as_secs()
         );
 
         std::thread::scope(|s| {
@@ -863,12 +871,14 @@ where
                 let global = &self.hot.global;
                 let numa_injectors = &self.hot.numa_injectors;
                 let stealers = &self.hot.stealers;
+                let should_stop = &should_stop;
 
                 s.spawn(move || {
                     let mut batch: Vec<T> = Vec::with_capacity(BATCH_SIZE);
                     let mut local_drained = 0u64;
                     let mut local_segments = 0u64;
                     let mut consecutive_empty = 0u32;
+                    let mut last_progress = Instant::now();
 
                     // Helper to write a batch to disk
                     let write_batch =
@@ -908,21 +918,90 @@ where
                             batch.clear();
                         };
 
+                    // Helper to steal with retry limit
+                    let steal_with_limit = |stealer: &crossbeam_deque::Injector<T>| -> Option<T> {
+                        let mut retries = 0u32;
+                        loop {
+                            match stealer.steal() {
+                                Steal::Success(item) => return Some(item),
+                                Steal::Empty => return None,
+                                Steal::Retry => {
+                                    retries += 1;
+                                    if retries > MAX_RETRY_PER_STEAL {
+                                        return None; // Treat as empty after too many retries
+                                    }
+                                    std::hint::spin_loop();
+                                }
+                            }
+                        }
+                    };
+
+                    let steal_worker_with_limit =
+                        |stealer: &crossbeam_deque::Stealer<T>| -> Option<T> {
+                            let mut retries = 0u32;
+                            loop {
+                                match stealer.steal() {
+                                    Steal::Success(item) => return Some(item),
+                                    Steal::Empty => return None,
+                                    Steal::Retry => {
+                                        retries += 1;
+                                        if retries > MAX_RETRY_PER_STEAL {
+                                            return None;
+                                        }
+                                        std::hint::spin_loop();
+                                    }
+                                }
+                            }
+                        };
+
                     loop {
+                        // Check timeout
+                        if start_time.elapsed() > DRAIN_TIMEOUT {
+                            if thread_id == 0 {
+                                eprintln!(
+                                    "Checkpoint: drain timeout after {}s, writing partial results",
+                                    start_time.elapsed().as_secs()
+                                );
+                            }
+                            should_stop.store(true, Ordering::Relaxed);
+                        }
+
+                        if should_stop.load(Ordering::Relaxed) {
+                            // Write any remaining items before exiting
+                            write_batch(
+                                &mut batch,
+                                &mut local_drained,
+                                &mut local_segments,
+                                errors,
+                            );
+                            break;
+                        }
+
+                        // Progress logging (thread 0 only)
+                        if thread_id == 0 && last_progress.elapsed() > PROGRESS_INTERVAL {
+                            let current_total = total_drained.load(Ordering::Relaxed);
+                            let current_segs = segments_written.load(Ordering::Relaxed);
+                            eprintln!(
+                                "Checkpoint: drain progress - {} items in {} segments ({:.1}s elapsed)",
+                                current_total + local_drained,
+                                current_segs + local_segments,
+                                start_time.elapsed().as_secs_f32()
+                            );
+                            last_progress = Instant::now();
+                        }
+
                         let mut found_any = false;
 
                         // Steal from global injector
                         for _ in 0..100 {
-                            match global.steal() {
-                                Steal::Success(item) => {
-                                    batch.push(item);
-                                    found_any = true;
-                                    if batch.len() >= BATCH_SIZE {
-                                        break;
-                                    }
+                            if let Some(item) = steal_with_limit(global) {
+                                batch.push(item);
+                                found_any = true;
+                                if batch.len() >= BATCH_SIZE {
+                                    break;
                                 }
-                                Steal::Empty => break,
-                                Steal::Retry => std::hint::spin_loop(),
+                            } else {
+                                break;
                             }
                         }
 
@@ -939,16 +1018,14 @@ where
                         // Steal from NUMA injectors
                         for injector in numa_injectors.iter() {
                             for _ in 0..100 {
-                                match injector.steal() {
-                                    Steal::Success(item) => {
-                                        batch.push(item);
-                                        found_any = true;
-                                        if batch.len() >= BATCH_SIZE {
-                                            break;
-                                        }
+                                if let Some(item) = steal_with_limit(injector) {
+                                    batch.push(item);
+                                    found_any = true;
+                                    if batch.len() >= BATCH_SIZE {
+                                        break;
                                     }
-                                    Steal::Empty => break,
-                                    Steal::Retry => std::hint::spin_loop(),
+                                } else {
+                                    break;
                                 }
                             }
                             if batch.len() >= BATCH_SIZE {
@@ -964,16 +1041,14 @@ where
                         // Steal from worker stealers
                         for stealer in stealers.iter() {
                             for _ in 0..100 {
-                                match stealer.steal() {
-                                    Steal::Success(item) => {
-                                        batch.push(item);
-                                        found_any = true;
-                                        if batch.len() >= BATCH_SIZE {
-                                            break;
-                                        }
+                                if let Some(item) = steal_worker_with_limit(stealer) {
+                                    batch.push(item);
+                                    found_any = true;
+                                    if batch.len() >= BATCH_SIZE {
+                                        break;
                                     }
-                                    Steal::Empty => break,
-                                    Steal::Retry => std::hint::spin_loop(),
+                                } else {
+                                    break;
                                 }
                             }
                             if batch.len() >= BATCH_SIZE {
@@ -1022,8 +1097,10 @@ where
         let segs = segments_written.load(Ordering::Relaxed);
 
         eprintln!(
-            "Checkpoint: drain_injectors_streaming completed - {} items in {} segments",
-            drained, segs
+            "Checkpoint: drain_injectors_streaming completed - {} items in {} segments ({:.1}s)",
+            drained,
+            segs,
+            start_time.elapsed().as_secs_f32()
         );
 
         Ok(drained)
