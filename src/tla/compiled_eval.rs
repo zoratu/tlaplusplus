@@ -29,6 +29,11 @@ fn get_or_compile_operator(name: &str, body: &str) -> Arc<CompiledExpr> {
             return Arc::clone(cached);
         }
 
+        // Debug: trace operator compilation
+        if std::env::var("TLAPP_TRACE_OPCACHE").is_ok() {
+            eprintln!("OPCACHE compiling '{}': {}", name, body.chars().take(100).collect::<String>());
+        }
+
         // Compile and cache
         let compiled = Arc::new(compile_expr(body));
         cache.insert(cache_key, Arc::clone(&compiled));
@@ -102,9 +107,34 @@ fn eval_compiled_inner(
         CompiledExpr::ModelValue(s) => Ok(TlaValue::ModelValue(s.clone())),
 
         // Variable reference
-        CompiledExpr::Var(name) => ctx
-            .resolve_identifier(name, depth)
-            .map_err(|e| anyhow!("failed to resolve {}: {}", name, e)),
+        CompiledExpr::Var(name) => {
+            // First check local variables
+            if let Some(v) = ctx.runtime_value(name) {
+                if std::env::var("TLAPP_TRACE_VAR").is_ok() {
+                    eprintln!("VAR {} -> Ok({:?})", name, v);
+                }
+                return Ok(v);
+            }
+
+            // Then check if it's a no-arg operator - use compiled evaluation
+            if let Some(def) = ctx.definition(name) {
+                if def.params.is_empty() {
+                    // Get or compile the operator body
+                    let compiled_body = get_or_compile_operator(name, &def.body);
+                    let result = eval_compiled_inner(&compiled_body, ctx, depth + 1);
+                    if std::env::var("TLAPP_TRACE_VAR").is_ok() {
+                        eprintln!("VAR {} (operator) -> {:?}", name, result);
+                    }
+                    return result.map_err(|e| anyhow!("failed to resolve {}: {}", name, e));
+                }
+            }
+
+            // Fall back to model value for undefined identifiers
+            if std::env::var("TLAPP_TRACE_VAR").is_ok() {
+                eprintln!("VAR {} -> ModelValue", name);
+            }
+            Ok(TlaValue::ModelValue(name.to_string()))
+        }
 
         // Primed variable reference (next-state value)
         CompiledExpr::PrimedVar(name) => {
@@ -402,7 +432,13 @@ fn eval_compiled_inner(
             Ok(TlaValue::Function(Arc::new(func)))
         }
         CompiledExpr::FuncApply(f, args) => {
+            if std::env::var("TLAPP_TRACE_FUNCAPPLY").is_ok() {
+                eprintln!("FUNCAPPLY: {:?}[{:?}]", f, args);
+            }
             let func = eval_compiled_inner(f, ctx, depth + 1)?;
+            if std::env::var("TLAPP_TRACE_FUNCAPPLY").is_ok() {
+                eprintln!("  func evaluated to: {}", tla_value_to_string(&func));
+            }
 
             match &func {
                 TlaValue::Function(map) => {
@@ -416,9 +452,22 @@ fn eval_compiled_inner(
                             .collect::<Result<_>>()?;
                         TlaValue::Seq(Arc::new(tuple))
                     };
-                    map.get(&key)
-                        .cloned()
-                        .ok_or_else(|| anyhow!("function application failed: key not in domain"))
+                    map.get(&key).cloned().ok_or_else(|| {
+                        // Build helpful error message with key and domain
+                        let key_str = tla_value_to_string(&key);
+                        let domain_keys: Vec<String> =
+                            map.keys().take(10).map(tla_value_to_string).collect();
+                        let domain_str = if map.len() > 10 {
+                            format!("{{{},...}} ({} keys)", domain_keys.join(", "), map.len())
+                        } else {
+                            format!("{{{}}}", domain_keys.join(", "))
+                        };
+                        anyhow!(
+                            "function application failed: key {} not in domain {}",
+                            key_str,
+                            domain_str
+                        )
+                    })
                 }
                 TlaValue::Seq(seq) => {
                     // Sequence indexing (1-based)
@@ -446,7 +495,19 @@ fn eval_compiled_inner(
                         .cloned()
                         .ok_or_else(|| anyhow!("record field not found: {}", field))
                 }
-                _ => Err(anyhow!("cannot apply function to {:?}", func)),
+                _ => {
+                    // Include the expression being indexed for better debugging
+                    let func_str = tla_value_to_string(&func);
+                    let args_str: Vec<String> = args
+                        .iter()
+                        .map(|a| format!("{:?}", a))
+                        .collect();
+                    Err(anyhow!(
+                        "cannot index {} with [{}] - only functions/sequences/records can be indexed",
+                        func_str,
+                        args_str.join(", ")
+                    ))
+                }
             }
         }
         CompiledExpr::Domain(e) => {
@@ -555,8 +616,14 @@ fn eval_compiled_inner(
         CompiledExpr::Forall { var, domain, body } => {
             let domain_val = eval_compiled_inner(domain, ctx, depth + 1)?;
             let domain_set = domain_val.as_set()?;
+            if std::env::var("TLAPP_TRACE_FORALL").is_ok() {
+                eprintln!("FORALL {} in {:?}, ctx.locals: {:?}, depth: {}", var, domain, ctx.locals, depth);
+            }
             for elem in domain_set.iter() {
                 let new_ctx = ctx.with_local_value(var, elem.clone());
+                if std::env::var("TLAPP_TRACE_FORALL").is_ok() {
+                    eprintln!("  FORALL {} = {:?}, new_ctx.locals: {:?}, depth: {}", var, elem, new_ctx.locals, depth);
+                }
                 if !eval_compiled_inner(body, &new_ctx, depth + 1)?.as_bool()? {
                     return Ok(TlaValue::Bool(false));
                 }
@@ -1824,6 +1891,88 @@ fn test_full_price_bands_invariant() {
 
     let result = eval_compiled(&expr, &ctx);
     println!("Result: {:?}", result);
+    assert!(result.is_ok(), "Evaluation failed: {:?}", result);
+    assert_eq!(result.unwrap(), TlaValue::Bool(true));
+}
+
+#[test]
+fn test_nested_quantifiers_typeok_evaluation() {
+    // Test the exact pattern from ClusterLeaseFailover's TypeOK with nested quantifiers
+    // \A s \in Shards :
+    //     /\ shardTerm[s] \in 0..MaxTerm
+    //     /\ \A c \in Clients :
+    //         /\ leases[s][c].held \in BOOLEAN
+
+    let mut state = TlaState::new();
+
+    // Create Shards set
+    let shards_set: BTreeSet<TlaValue> = ["s1", "s2"]
+        .iter()
+        .map(|s| TlaValue::ModelValue(s.to_string()))
+        .collect();
+    state.insert("Shards".to_string(), TlaValue::Set(Arc::new(shards_set)));
+
+    // Create Clients set
+    let clients_set: BTreeSet<TlaValue> = ["c1", "c2"]
+        .iter()
+        .map(|s| TlaValue::ModelValue(s.to_string()))
+        .collect();
+    state.insert("Clients".to_string(), TlaValue::Set(Arc::new(clients_set)));
+
+    // Create shardTerm function: s1 -> 1, s2 -> 2
+    let mut shardterm_map = BTreeMap::new();
+    shardterm_map.insert(
+        TlaValue::ModelValue("s1".to_string()),
+        TlaValue::Int(1),
+    );
+    shardterm_map.insert(
+        TlaValue::ModelValue("s2".to_string()),
+        TlaValue::Int(2),
+    );
+    state.insert(
+        "shardTerm".to_string(),
+        TlaValue::Function(Arc::new(shardterm_map)),
+    );
+
+    // Create leases nested function: leases[s][c] = {held: TRUE, ...}
+    let mut leases_outer = BTreeMap::new();
+    for shard in ["s1", "s2"] {
+        let mut inner_map = BTreeMap::new();
+        for client in ["c1", "c2"] {
+            let mut lease_rec = BTreeMap::new();
+            lease_rec.insert("held".to_string(), TlaValue::Bool(true));
+            lease_rec.insert("grantedTerm".to_string(), TlaValue::Int(1));
+            inner_map.insert(
+                TlaValue::ModelValue(client.to_string()),
+                TlaValue::Record(Arc::new(lease_rec)),
+            );
+        }
+        leases_outer.insert(
+            TlaValue::ModelValue(shard.to_string()),
+            TlaValue::Function(Arc::new(inner_map)),
+        );
+    }
+    state.insert(
+        "leases".to_string(),
+        TlaValue::Function(Arc::new(leases_outer)),
+    );
+
+    state.insert("MaxTerm".to_string(), TlaValue::Int(10));
+
+    let ctx = EvalContext::new(&state);
+
+    // Compile and evaluate the nested quantifier expression
+    let expr_str = r#"\A s \in Shards :
+/\ shardTerm[s] \in 0..MaxTerm
+/\ \A c \in Clients :
+    /\ leases[s][c].held \in BOOLEAN"#;
+
+    let expr = compile_expr(expr_str);
+    println!("Nested quantifier expr: {:#?}", expr);
+
+    let result = eval_compiled(&expr, &ctx);
+    println!("Result: {:?}", result);
+
     assert!(result.is_ok(), "Evaluation failed: {:?}", result);
     assert_eq!(result.unwrap(), TlaValue::Bool(true));
 }

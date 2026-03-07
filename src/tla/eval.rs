@@ -1612,9 +1612,22 @@ fn apply_value(
             if args.len() != 1 {
                 return Err(anyhow!("Function application expects exactly 1 argument"));
             }
-            map.get(&args[0])
-                .cloned()
-                .ok_or_else(|| anyhow!("function missing key {:?}", args[0]))
+            map.get(&args[0]).cloned().ok_or_else(|| {
+                // Build helpful error message with key and domain
+                let key_str = tla_to_string(&args[0]);
+                let domain_keys: Vec<String> =
+                    map.keys().take(10).map(tla_to_string).collect();
+                let domain_str = if map.len() > 10 {
+                    format!("{{{},...}} ({} keys)", domain_keys.join(", "), map.len())
+                } else {
+                    format!("{{{}}}", domain_keys.join(", "))
+                };
+                anyhow!(
+                    "function application failed: key {} not in domain {}",
+                    key_str,
+                    domain_str
+                )
+            })
         }
         _ => Err(anyhow!("Cannot apply non-function value: {func:?}")),
     }
@@ -2553,7 +2566,37 @@ fn tla_to_string(value: &TlaValue) -> String {
             }
         }
         TlaValue::ModelValue(v) => v.clone(),
-        other => format!("{other:?}"),
+        TlaValue::Set(s) => {
+            let items: Vec<String> = s.iter().map(tla_to_string).collect();
+            format!("{{{}}}", items.join(", "))
+        }
+        TlaValue::Seq(s) => {
+            let items: Vec<String> = s.iter().map(tla_to_string).collect();
+            format!("<<{}>>", items.join(", "))
+        }
+        TlaValue::Record(r) => {
+            let items: Vec<String> = r
+                .iter()
+                .map(|(k, v)| format!("{} |-> {}", k, tla_to_string(v)))
+                .collect();
+            format!("[{}]", items.join(", "))
+        }
+        TlaValue::Function(f) => {
+            let items: Vec<String> = f
+                .iter()
+                .take(10)
+                .map(|(k, v)| format!("{} :> {}", tla_to_string(k), tla_to_string(v)))
+                .collect();
+            if f.len() > 10 {
+                format!("({}, ...{} more)", items.join(" @@ "), f.len() - 10)
+            } else {
+                format!("({})", items.join(" @@ "))
+            }
+        }
+        TlaValue::Lambda { params, body, .. } => {
+            format!("LAMBDA {}: {}", params.join(", "), body)
+        }
+        TlaValue::Undefined => "UNDEFINED".to_string(),
     }
 }
 
