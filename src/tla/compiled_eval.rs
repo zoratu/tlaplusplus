@@ -1550,6 +1550,7 @@ mod tests {
                     name: "Double".to_string(),
                     params: vec!["x".to_string()],
                     body: "x + x".to_string(),
+                    is_recursive: false,
                 },
             );
             // Add(a, b) == a + b
@@ -1559,6 +1560,7 @@ mod tests {
                     name: "Add".to_string(),
                     params: vec!["a".to_string(), "b".to_string()],
                     body: "a + b".to_string(),
+                    is_recursive: false,
                 },
             );
             // Triple(x) == Double(x) + x (recursive call to another operator)
@@ -1568,6 +1570,7 @@ mod tests {
                     name: "Triple".to_string(),
                     params: vec!["x".to_string()],
                     body: "Double(x) + x".to_string(),
+                    is_recursive: false,
                 },
             );
             // Constant == 42 (no parameters)
@@ -1577,6 +1580,7 @@ mod tests {
                     name: "Constant".to_string(),
                     params: vec![],
                     body: "42".to_string(),
+                    is_recursive: false,
                 },
             );
             defs

@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
-const MAX_EVAL_DEPTH: usize = 256;
+const MAX_EVAL_DEPTH: usize = 100;
 
 /// Context for evaluating expressions on a single state
 /// Uses Rc for copy-on-write semantics to avoid cloning entire context
@@ -1996,6 +1996,7 @@ fn parse_let_definitions(defs_text: &str) -> Result<BTreeMap<String, TlaDefiniti
                     name,
                     params,
                     body: body.to_string(),
+                    is_recursive: false,
                 },
             );
         }
@@ -4101,6 +4102,7 @@ mod tests {
                     name: "CanAct".to_string(),
                     params: vec!["p".to_string()],
                     body: "actionCount[p] < MaxActionsPerTick".to_string(),
+                    is_recursive: false,
                 },
             ),
             (
@@ -4109,6 +4111,7 @@ mod tests {
                     name: "MaxActionsPerTick".to_string(),
                     params: vec![],
                     body: "3".to_string(),
+                    is_recursive: false,
                 },
             ),
         ]);
@@ -4231,6 +4234,7 @@ mod tests {
                 name: "SelectSeq".to_string(),
                 params: vec!["s".to_string(), "Test".to_string()],
                 body: "SelectSeq(s, Test)".to_string(),
+                is_recursive: false,
             },
         )]);
         let ctx = EvalContext::with_definitions(&state, &defs);
@@ -4372,5 +4376,176 @@ mod tests {
             TlaValue::Int(3),
         ])));
         assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn evaluates_recursive_factorial() {
+        // Define a recursive Factorial operator
+        let defs = BTreeMap::from([(
+            "Factorial".to_string(),
+            TlaDefinition {
+                name: "Factorial".to_string(),
+                params: vec!["n".to_string()],
+                body: "IF n <= 1 THEN 1 ELSE n * Factorial(n - 1)".to_string(),
+                is_recursive: true,
+            },
+        )]);
+
+        let state = TlaState::new();
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        // Test various factorial values
+        assert_eq!(
+            eval_expr("Factorial(0)", &ctx).expect("Factorial(0)"),
+            TlaValue::Int(1)
+        );
+        assert_eq!(
+            eval_expr("Factorial(1)", &ctx).expect("Factorial(1)"),
+            TlaValue::Int(1)
+        );
+        assert_eq!(
+            eval_expr("Factorial(2)", &ctx).expect("Factorial(2)"),
+            TlaValue::Int(2)
+        );
+        assert_eq!(
+            eval_expr("Factorial(3)", &ctx).expect("Factorial(3)"),
+            TlaValue::Int(6)
+        );
+        assert_eq!(
+            eval_expr("Factorial(4)", &ctx).expect("Factorial(4)"),
+            TlaValue::Int(24)
+        );
+        assert_eq!(
+            eval_expr("Factorial(5)", &ctx).expect("Factorial(5)"),
+            TlaValue::Int(120)
+        );
+    }
+
+    #[test]
+    fn evaluates_recursive_sum_seq() {
+        // Define a recursive SumSeq operator
+        let defs = BTreeMap::from([(
+            "SumSeq".to_string(),
+            TlaDefinition {
+                name: "SumSeq".to_string(),
+                params: vec!["s".to_string()],
+                body: "IF s = <<>> THEN 0 ELSE Head(s) + SumSeq(Tail(s))".to_string(),
+                is_recursive: true,
+            },
+        )]);
+
+        let state = TlaState::new();
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        // Test summing sequences
+        assert_eq!(
+            eval_expr("SumSeq(<<>>)", &ctx).expect("SumSeq empty"),
+            TlaValue::Int(0)
+        );
+        assert_eq!(
+            eval_expr("SumSeq(<<1>>)", &ctx).expect("SumSeq single"),
+            TlaValue::Int(1)
+        );
+        assert_eq!(
+            eval_expr("SumSeq(<<1, 2>>)", &ctx).expect("SumSeq two"),
+            TlaValue::Int(3)
+        );
+        assert_eq!(
+            eval_expr("SumSeq(<<1, 2, 3>>)", &ctx).expect("SumSeq three"),
+            TlaValue::Int(6)
+        );
+        assert_eq!(
+            eval_expr("SumSeq(<<1, 2, 3, 4, 5>>)", &ctx).expect("SumSeq five"),
+            TlaValue::Int(15)
+        );
+    }
+
+    #[test]
+    fn recursive_operator_respects_depth_limit() {
+        // Define a recursive operator that never terminates (no base case)
+        let defs = BTreeMap::from([(
+            "Forever".to_string(),
+            TlaDefinition {
+                name: "Forever".to_string(),
+                params: vec!["n".to_string()],
+                body: "Forever(n + 1)".to_string(),
+                is_recursive: true,
+            },
+        )]);
+
+        let state = TlaState::new();
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        // This should fail with a depth limit error, not hang forever
+        let result = eval_expr("Forever(0)", &ctx);
+        assert!(
+            result.is_err(),
+            "Forever should fail with recursion depth limit"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("recursion depth") || err_msg.contains("depth limit"),
+            "Error should mention recursion depth: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn evaluates_mutually_recursive_operators() {
+        // Define mutually recursive operators: IsEven and IsOdd
+        // IsEven(n) == IF n = 0 THEN TRUE ELSE IsOdd(n - 1)
+        // IsOdd(n) == IF n = 0 THEN FALSE ELSE IsEven(n - 1)
+        let defs = BTreeMap::from([
+            (
+                "IsEven".to_string(),
+                TlaDefinition {
+                    name: "IsEven".to_string(),
+                    params: vec!["n".to_string()],
+                    body: "IF n = 0 THEN TRUE ELSE IsOdd(n - 1)".to_string(),
+                    is_recursive: true,
+                },
+            ),
+            (
+                "IsOdd".to_string(),
+                TlaDefinition {
+                    name: "IsOdd".to_string(),
+                    params: vec!["n".to_string()],
+                    body: "IF n = 0 THEN FALSE ELSE IsEven(n - 1)".to_string(),
+                    is_recursive: true,
+                },
+            ),
+        ]);
+
+        let state = TlaState::new();
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        assert_eq!(
+            eval_expr("IsEven(0)", &ctx).expect("IsEven(0)"),
+            TlaValue::Bool(true)
+        );
+        assert_eq!(
+            eval_expr("IsEven(1)", &ctx).expect("IsEven(1)"),
+            TlaValue::Bool(false)
+        );
+        assert_eq!(
+            eval_expr("IsEven(2)", &ctx).expect("IsEven(2)"),
+            TlaValue::Bool(true)
+        );
+        assert_eq!(
+            eval_expr("IsEven(4)", &ctx).expect("IsEven(4)"),
+            TlaValue::Bool(true)
+        );
+        assert_eq!(
+            eval_expr("IsOdd(0)", &ctx).expect("IsOdd(0)"),
+            TlaValue::Bool(false)
+        );
+        assert_eq!(
+            eval_expr("IsOdd(1)", &ctx).expect("IsOdd(1)"),
+            TlaValue::Bool(true)
+        );
+        assert_eq!(
+            eval_expr("IsOdd(3)", &ctx).expect("IsOdd(3)"),
+            TlaValue::Bool(true)
+        );
     }
 }

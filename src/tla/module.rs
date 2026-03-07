@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8,6 +8,9 @@ pub struct TlaDefinition {
     pub name: String,
     pub params: Vec<String>,
     pub body: String,
+    /// Whether this operator was declared with RECURSIVE
+    #[serde(default)]
+    pub is_recursive: bool,
 }
 
 /// Represents a module instance (INSTANCE declaration)
@@ -37,6 +40,9 @@ pub struct TlaModule {
     pub instances: BTreeMap<String, TlaModuleInstance>,
     /// True if module contains PlusCal code (detected via --algorithm marker)
     pub is_pluscal: bool,
+    /// Set of operator names declared with RECURSIVE
+    #[serde(default)]
+    pub recursive_declarations: BTreeSet<String>,
 }
 
 pub fn parse_tla_module_file(path: &Path) -> Result<TlaModule> {
@@ -188,6 +194,16 @@ pub fn parse_tla_module_text(input: &str) -> Result<TlaModule> {
             continue;
         }
 
+        // Parse RECURSIVE declarations
+        // Format: RECURSIVE Op1(_), Op2(_, _), ...
+        if let Some(rest) = trimmed.strip_prefix("RECURSIVE ") {
+            flush_definition(&mut module, &mut current_def);
+            current_def_indent = 0;
+            mode = NameListMode::None;
+            parse_recursive_declarations(rest, &mut module.recursive_declarations);
+            continue;
+        }
+
         // Parse INSTANCE declarations
         // Formats:
         //   Alias == INSTANCE ModuleName
@@ -212,6 +228,7 @@ pub fn parse_tla_module_text(input: &str) -> Result<TlaModule> {
                 name,
                 params,
                 body: rhs.trim().to_string(),
+                is_recursive: false, // Will be set by flush_definition
             });
             continue;
         }
@@ -251,7 +268,9 @@ pub fn parse_tla_module_text(input: &str) -> Result<TlaModule> {
 }
 
 fn flush_definition(module: &mut TlaModule, current: &mut Option<TlaDefinition>) {
-    if let Some(def) = current.take() {
+    if let Some(mut def) = current.take() {
+        // Mark definition as recursive if it was declared with RECURSIVE
+        def.is_recursive = module.recursive_declarations.contains(&def.name);
         module.definitions.insert(def.name.clone(), def);
     }
 }
@@ -512,6 +531,61 @@ fn parse_instance_declaration(line: &str) -> Option<TlaModuleInstance> {
     })
 }
 
+/// Parse RECURSIVE declarations like "Op1(_), Op2(_, _)" and extract operator names.
+/// The underscore placeholders represent the arity but we just need the names.
+fn parse_recursive_declarations(text: &str, recursive_names: &mut BTreeSet<String>) {
+    // Split on commas at the top level (not inside parentheses)
+    let mut depth: usize = 0;
+    let mut start = 0;
+    let chars: Vec<char> = text.chars().collect();
+
+    for i in 0..chars.len() {
+        match chars[i] {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                let part = text[start..i].trim();
+                if let Some(name) = extract_recursive_op_name(part) {
+                    recursive_names.insert(name);
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+
+    // Handle the last part
+    if start < text.len() {
+        let part = text[start..].trim();
+        if let Some(name) = extract_recursive_op_name(part) {
+            recursive_names.insert(name);
+        }
+    }
+}
+
+/// Extract the operator name from a RECURSIVE declaration like "Op(_)" or "Op(_, _)".
+fn extract_recursive_op_name(decl: &str) -> Option<String> {
+    let decl = decl.trim();
+    if decl.is_empty() {
+        return None;
+    }
+
+    // Find the opening parenthesis
+    if let Some(open) = decl.find('(') {
+        let name = decl[..open].trim();
+        if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return Some(name.to_string());
+        }
+    } else {
+        // No parenthesis - just a name (zero-arity recursive operator, though rare)
+        if decl.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return Some(decl.to_string());
+        }
+    }
+
+    None
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NameListMode {
     None,
@@ -600,5 +674,73 @@ mod tests {
             // parse_tla_module_text may return Ok or Err, but must not panic
             let _ = parse_tla_module_text(input);
         }
+    }
+
+    #[test]
+    fn parses_recursive_declarations() {
+        let src = r#"
+        ---- MODULE RecursiveDemo ----
+        EXTENDS Naturals
+
+        RECURSIVE Factorial(_)
+        RECURSIVE SumSeq(_), SeqLen(_)
+
+        Factorial(n) ==
+            IF n <= 1 THEN 1
+            ELSE n * Factorial(n - 1)
+
+        SumSeq(s) ==
+            IF s = <<>> THEN 0
+            ELSE Head(s) + SumSeq(Tail(s))
+
+        SeqLen(s) ==
+            IF s = <<>> THEN 0
+            ELSE 1 + SeqLen(Tail(s))
+
+        NonRecursive(x) == x + 1
+        ====
+        "#;
+
+        let m = parse_tla_module_text(src).expect("parse should work");
+
+        // Check recursive declarations are tracked
+        assert!(m.recursive_declarations.contains("Factorial"));
+        assert!(m.recursive_declarations.contains("SumSeq"));
+        assert!(m.recursive_declarations.contains("SeqLen"));
+        assert!(!m.recursive_declarations.contains("NonRecursive"));
+
+        // Check definitions are marked as recursive
+        assert!(m.definitions["Factorial"].is_recursive);
+        assert!(m.definitions["SumSeq"].is_recursive);
+        assert!(m.definitions["SeqLen"].is_recursive);
+        assert!(!m.definitions["NonRecursive"].is_recursive);
+
+        // Check the definitions have the expected bodies
+        assert!(m.definitions["Factorial"].body.contains("Factorial(n - 1)"));
+        assert!(m.definitions["SumSeq"].body.contains("SumSeq(Tail(s))"));
+    }
+
+    #[test]
+    fn extracts_recursive_op_names() {
+        // Test the helper function directly
+        assert_eq!(
+            extract_recursive_op_name("Factorial(_)"),
+            Some("Factorial".to_string())
+        );
+        assert_eq!(
+            extract_recursive_op_name("Sum(_, _)"),
+            Some("Sum".to_string())
+        );
+        assert_eq!(
+            extract_recursive_op_name("Op(_,_,_)"),
+            Some("Op".to_string())
+        );
+        assert_eq!(
+            extract_recursive_op_name("NoParams"),
+            Some("NoParams".to_string())
+        );
+        assert_eq!(extract_recursive_op_name("  Spaced(x)  "), Some("Spaced".to_string()));
+        assert_eq!(extract_recursive_op_name(""), None);
+        assert_eq!(extract_recursive_op_name("   "), None);
     }
 }
