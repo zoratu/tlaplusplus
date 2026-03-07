@@ -281,6 +281,7 @@ fn parse_cpulist(cpulist: &str) -> Vec<usize> {
 
 /// Memory policy modes for set_mempolicy
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 mod mempolicy {
     pub const MPOL_DEFAULT: i32 = 0;
     pub const MPOL_PREFERRED: i32 = 1;
