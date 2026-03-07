@@ -2,7 +2,7 @@ use crate::tla::action_ir::{parse_action_exists, parse_action_if, split_action_b
 use crate::tla::{
     ActionClause, ActionIr, ClauseKind, TlaDefinition, TlaState, TlaValue, classify_clause,
 };
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -509,7 +509,9 @@ fn eval_action_clause_text_multi(
             branch.unchanged_vars.extend(vars);
             Ok(vec![branch])
         }
-        ClauseKind::UnprimedEquality { .. } | ClauseKind::Other => {
+        ClauseKind::UnprimedEquality { .. }
+        | ClauseKind::UnprimedMembership { .. }
+        | ClauseKind::Other => {
             if trimmed.starts_with("LET") && trimmed.contains('\'') {
                 eval_let_action_multi_branch(trimmed, ctx, branch)
             } else if eval_guard(trimmed, &eval_ctx)? {
@@ -763,6 +765,13 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
     }
     if expr == "FALSE" {
         return Ok(TlaValue::Bool(false));
+    }
+    if expr == "BOOLEAN" {
+        // BOOLEAN is the set {TRUE, FALSE}
+        let set: BTreeSet<TlaValue> = [TlaValue::Bool(false), TlaValue::Bool(true)]
+            .into_iter()
+            .collect();
+        return Ok(TlaValue::Set(Arc::new(set)));
     }
     if expr == "@" {
         return ctx
@@ -1446,6 +1455,86 @@ fn eval_bracket_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> R
             record.insert(key, value);
         }
         return Ok(TlaValue::Record(Arc::new(record)));
+    }
+
+    // Check for function set: [Domain -> Range]
+    if let Some((domain_text, range_text)) = split_once_top_level(expr, "->") {
+        let domain_text = domain_text.trim();
+        let range_text = range_text.trim();
+
+        let domain_val = eval_expr_inner(domain_text, ctx, depth + 1)?;
+        let range_val = eval_expr_inner(range_text, ctx, depth + 1)?;
+
+        let domain_set = domain_val
+            .as_set()
+            .with_context(|| format!("function set domain is not a set: {domain_text}"))?;
+        let range_set = range_val
+            .as_set()
+            .with_context(|| format!("function set range is not a set: {range_text}"))?;
+
+        // Generate all possible functions from domain to range
+        let domain_elems: Vec<TlaValue> = domain_set.iter().cloned().collect();
+        let range_elems: Vec<TlaValue> = range_set.iter().cloned().collect();
+
+        if domain_elems.is_empty() {
+            // Only one function from empty domain: the empty function
+            let empty_func = BTreeMap::new();
+            let mut result = BTreeSet::new();
+            result.insert(TlaValue::Function(Arc::new(empty_func)));
+            return Ok(TlaValue::Set(Arc::new(result)));
+        }
+
+        if range_elems.is_empty() {
+            // No functions from non-empty domain to empty range
+            return Ok(TlaValue::Set(Arc::new(BTreeSet::new())));
+        }
+
+        let n = domain_elems.len();
+        let m = range_elems.len();
+
+        // Limit the size to avoid memory explosion
+        let max_functions = 1_000_000usize;
+        let total = (m as u64).saturating_pow(n as u32);
+        if total > max_functions as u64 {
+            return Err(anyhow!(
+                "function set [D -> R] too large: {} elements in domain, {} in range = {} functions (max {})",
+                n,
+                m,
+                total,
+                max_functions
+            ));
+        }
+
+        // Generate all functions by iterating through all combinations
+        let mut result = BTreeSet::new();
+        let mut indices = vec![0usize; n];
+
+        loop {
+            // Build function for current indices
+            let mut func: BTreeMap<TlaValue, TlaValue> = BTreeMap::new();
+            for (i, d) in domain_elems.iter().enumerate() {
+                func.insert(d.clone(), range_elems[indices[i]].clone());
+            }
+            result.insert(TlaValue::Function(Arc::new(func)));
+
+            // Increment indices (like counting in base m)
+            let mut carry = true;
+            for idx in indices.iter_mut() {
+                if carry {
+                    *idx += 1;
+                    if *idx >= m {
+                        *idx = 0;
+                    } else {
+                        carry = false;
+                    }
+                }
+            }
+            if carry {
+                break;
+            }
+        }
+
+        return Ok(TlaValue::Set(Arc::new(result)));
     }
 
     Err(anyhow!("unsupported bracket expression: [{expr}]"))
