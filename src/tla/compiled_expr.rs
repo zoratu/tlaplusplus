@@ -77,6 +77,9 @@ pub enum CompiledExpr {
     // Record operations
     RecordLiteral(Vec<(String, CompiledExpr)>),
     RecordAccess(Box<CompiledExpr>, String),
+    /// Record set construction: [field: Set, field2: Set, ...]
+    /// Represents the Cartesian product of all field/set pairs as records.
+    RecordSet(Vec<(String, CompiledExpr)>),
 
     // Function operations
     FuncLiteral(Vec<(CompiledExpr, CompiledExpr)>),
@@ -229,7 +232,7 @@ impl CompiledExpr {
             CompiledExpr::SetLiteral(exprs) | CompiledExpr::SeqLiteral(exprs) => {
                 exprs.iter().all(|e| e.is_fully_compiled())
             }
-            CompiledExpr::RecordLiteral(fields) => {
+            CompiledExpr::RecordLiteral(fields) | CompiledExpr::RecordSet(fields) => {
                 fields.iter().all(|(_, e)| e.is_fully_compiled())
             }
             CompiledExpr::FuncLiteral(entries) => entries
@@ -588,6 +591,12 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
             if !fields.is_empty() {
                 return CompiledExpr::RecordLiteral(fields);
             }
+        }
+
+        // Record set construction: [field: Set, field2: Set, ...]
+        // This creates the Cartesian product of all field/set pairs as records.
+        if let Some(record_set) = try_parse_record_set(inner) {
+            return record_set;
         }
     }
 
@@ -1197,6 +1206,44 @@ fn try_parse_function_set(inner: &str) -> Option<CompiledExpr> {
     })
 }
 
+/// Try to parse a record set construction: [field: Set, field2: Set, ...]
+/// This creates the Cartesian product of all field/set pairs as records.
+/// For example: [a: {1,2}, b: {3,4}] produces all combinations of a and b values.
+fn try_parse_record_set(inner: &str) -> Option<CompiledExpr> {
+    let entries = split_top_level(inner, ",");
+    if entries.is_empty() {
+        return None;
+    }
+
+    let mut fields = Vec::new();
+
+    for entry in &entries {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+
+        // Find colon at top level
+        let colon_idx = find_top_level_colon(entry)?;
+
+        let field_name = entry[..colon_idx].trim();
+        let set_expr = entry[colon_idx + 1..].trim();
+
+        // Field name must be a valid identifier
+        if !is_identifier(field_name) {
+            return None;
+        }
+
+        fields.push((field_name.to_string(), compile_expr(set_expr)));
+    }
+
+    if fields.is_empty() {
+        return None;
+    }
+
+    Some(CompiledExpr::RecordSet(fields))
+}
+
 /// Find " -> " at top level (not inside brackets)
 fn find_top_level_arrow(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();
@@ -1493,7 +1540,7 @@ fn split_quantifier_bindings(s: &str) -> Vec<String> {
     parts
 }
 
-fn find_top_level_colon(expr: &str) -> Option<usize> {
+pub fn find_top_level_colon(expr: &str) -> Option<usize> {
     let mut depth = 0;
     let bytes = expr.as_bytes();
 

@@ -3,8 +3,9 @@
 //! This module provides evaluation of pre-compiled expressions, avoiding
 //! the overhead of string parsing on every evaluation.
 
-use crate::tla::compiled_expr::{CompiledExpr, compile_expr};
+use crate::tla::compiled_expr::{CompiledExpr, compile_expr, find_top_level_colon};
 use crate::tla::eval::{EvalContext, eval_expr};
+use crate::tla::formula::split_top_level;
 use crate::tla::value::TlaValue;
 use anyhow::{Result, anyhow};
 use std::cell::RefCell;
@@ -389,6 +390,69 @@ fn eval_compiled_inner(
             rec.get(field)
                 .cloned()
                 .ok_or_else(|| anyhow!("record field not found: {}", field))
+        }
+        CompiledExpr::RecordSet(fields) => {
+            // Evaluate each field's domain set
+            let mut field_sets: Vec<(String, Vec<TlaValue>)> = Vec::new();
+            for (name, expr) in fields {
+                let set_value = eval_compiled_inner(expr, ctx, depth + 1)?;
+                let set = set_value.as_set()?;
+                let elements: Vec<TlaValue> = set.iter().cloned().collect();
+                field_sets.push((name.clone(), elements));
+            }
+
+            // Check for empty sets - if any field has an empty domain, the result is empty
+            if field_sets.iter().any(|(_, elems)| elems.is_empty()) {
+                return Ok(TlaValue::Set(Arc::new(BTreeSet::new())));
+            }
+
+            // Calculate total number of records (product of all set sizes)
+            let total_records: u64 = field_sets
+                .iter()
+                .map(|(_, elems)| elems.len() as u64)
+                .product();
+
+            // Limit the size to avoid memory explosion
+            let max_records = 1_000_000u64;
+            if total_records > max_records {
+                return Err(anyhow!(
+                    "record set too large: {} records (max {})",
+                    total_records,
+                    max_records
+                ));
+            }
+
+            // Generate all records using Cartesian product
+            let mut result = BTreeSet::new();
+            let n = field_sets.len();
+            let mut indices = vec![0usize; n];
+
+            loop {
+                // Build record for current indices
+                let mut record: BTreeMap<String, TlaValue> = BTreeMap::new();
+                for (i, (field_name, elements)) in field_sets.iter().enumerate() {
+                    record.insert(field_name.clone(), elements[indices[i]].clone());
+                }
+                result.insert(TlaValue::Record(Arc::new(record)));
+
+                // Increment indices (like counting in mixed-radix number system)
+                let mut carry = true;
+                for i in 0..n {
+                    if carry {
+                        indices[i] += 1;
+                        if indices[i] >= field_sets[i].1.len() {
+                            indices[i] = 0;
+                        } else {
+                            carry = false;
+                        }
+                    }
+                }
+                if carry {
+                    break;
+                }
+            }
+
+            Ok(TlaValue::Set(Arc::new(result)))
         }
 
         // Function operations
@@ -819,26 +883,27 @@ fn membership_matches_text(
                 if inner.contains(':') {
                     return match value {
                         TlaValue::Record(rec) => {
-                            let field_specs: Vec<&str> = inner.split(',').collect();
+                            // Use top-level split to handle sets like {1, 2} correctly
+                            let field_specs = split_top_level(inner, ",");
                             let mut expected_fields = std::collections::HashSet::<String>::new();
                             for spec in field_specs {
-                                let parts: Vec<&str> = spec.split(':').collect();
-                                if parts.len() != 2 {
-                                    continue;
-                                }
-                                let field_name = parts[0].trim();
-                                let field_type = parts[1].trim();
-                                expected_fields.insert(field_name.to_string());
-                                let Some(field_value) = rec.get(field_name) else {
-                                    return Ok(false);
-                                };
-                                if !membership_matches_text(
-                                    field_value,
-                                    field_type,
-                                    ctx,
-                                    depth + 1,
-                                )? {
-                                    return Ok(false);
+                                let spec = spec.trim();
+                                // Find the first colon at top level for field:type separation
+                                if let Some(colon_idx) = find_top_level_colon(spec) {
+                                    let field_name = spec[..colon_idx].trim();
+                                    let field_type = spec[colon_idx + 1..].trim();
+                                    expected_fields.insert(field_name.to_string());
+                                    let Some(field_value) = rec.get(field_name) else {
+                                        return Ok(false);
+                                    };
+                                    if !membership_matches_text(
+                                        field_value,
+                                        field_type,
+                                        ctx,
+                                        depth + 1,
+                                    )? {
+                                        return Ok(false);
+                                    }
                                 }
                             }
                             Ok(rec.len() == expected_fields.len())
