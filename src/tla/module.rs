@@ -240,6 +240,13 @@ pub fn parse_tla_module_text(input: &str) -> Result<TlaModule> {
             if !def.body.is_empty() {
                 def.body.push('\n');
             }
+            // Preserve indentation relative to the definition start
+            // This is important for TLA+ parsing where indentation indicates scope
+            let line_indent = line.chars().take_while(|c| c.is_whitespace()).count();
+            let indent_diff = line_indent.saturating_sub(current_def_indent);
+            for _ in 0..indent_diff {
+                def.body.push(' ');
+            }
             def.body.push_str(trimmed);
             continue;
         }
@@ -739,7 +746,10 @@ mod tests {
             extract_recursive_op_name("NoParams"),
             Some("NoParams".to_string())
         );
-        assert_eq!(extract_recursive_op_name("  Spaced(x)  "), Some("Spaced".to_string()));
+        assert_eq!(
+            extract_recursive_op_name("  Spaced(x)  "),
+            Some("Spaced".to_string())
+        );
         assert_eq!(extract_recursive_op_name(""), None);
         assert_eq!(extract_recursive_op_name("   "), None);
     }
