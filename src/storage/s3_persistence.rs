@@ -893,12 +893,13 @@ async fn prune_deleted_files(
     client: &Client,
     bucket: &str,
     prefix: &str,
-    _local_dir: &Path, // No longer used - we use manifest-based pruning
+    local_dir: &Path,
     uploaded_offsets: &DashMap<String, u64>,
     keep_checkpoints: usize,
 ) -> Result<()> {
     let mut checkpoints_deleted = 0u64;
     let mut segments_deleted = 0u64;
+    let mut local_segments_deleted = 0u64;
 
     // First, fetch the manifest to get the min_segment_id
     let manifest_key = format!("{}/manifest.json", prefix);
@@ -1060,10 +1061,33 @@ async fn prune_deleted_files(
         }
     }
 
-    if checkpoints_deleted > 0 || segments_deleted > 0 {
+    // 3. Also prune LOCAL segment files with ID < min_segment_id
+    // This frees local disk space after segments have been uploaded to S3
+    let local_spill_dir = local_dir.join("queue-spill");
+    if local_spill_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&local_spill_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().map(|e| e == "bin").unwrap_or(false) {
+                    if let Some(segment_id) =
+                        extract_segment_id(path.file_name().and_then(|n| n.to_str()).unwrap_or(""))
+                    {
+                        // Only delete if segment ID is below the minimum needed
+                        if segment_id < min_id {
+                            if std::fs::remove_file(&path).is_ok() {
+                                local_segments_deleted += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if checkpoints_deleted > 0 || segments_deleted > 0 || local_segments_deleted > 0 {
         eprintln!(
-            "S3: Pruned {} checkpoints, {} queue segments from S3 (min_segment_id={})",
-            checkpoints_deleted, segments_deleted, min_id
+            "S3: Pruned {} checkpoints, {} S3 segments, {} local segments (min_segment_id={})",
+            checkpoints_deleted, segments_deleted, local_segments_deleted, min_id
         );
     }
 

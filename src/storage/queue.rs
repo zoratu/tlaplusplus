@@ -538,29 +538,40 @@ where
         Ok(())
     }
 
-    /// Delete all consumed segments (called during checkpoint to free disk space)
-    /// Only deletes segments that have been fully loaded into memory
-    fn delete_consumed_segments(&self) {
-        let segments_to_delete: Vec<PathBuf> = {
-            let mut consumed = self.consumed_segments.lock();
-            std::mem::take(&mut *consumed)
-        };
+    /// Take consumed segments for external deletion (used by S3 sync).
+    /// Returns the list of segment paths that have been fully loaded into memory.
+    /// IMPORTANT: Call this only after confirming the segments have been synced to S3.
+    pub fn take_consumed_segments(&self) -> Vec<PathBuf> {
+        let mut consumed = self.consumed_segments.lock();
+        std::mem::take(&mut *consumed)
+    }
 
-        for path in segments_to_delete {
+    /// Delete specific segment files from disk.
+    /// Call this after confirming segments have been synced to S3.
+    pub fn delete_segment_files(paths: &[PathBuf]) {
+        for path in paths {
             if let Err(err) = crate::chaos::retry_with_backoff(
-                || std::fs::remove_file(&path).map_err(|e| anyhow::anyhow!("{}", e)),
+                || std::fs::remove_file(path).map_err(|e| anyhow::anyhow!("{}", e)),
                 2,   // 2 retries
                 50,  // 50ms
                 500, // max 500ms
             ) {
                 eprintln!(
-                    "Warning: failed to remove consumed segment {} after retries: {}",
+                    "Warning: failed to remove segment {} after retries: {}",
                     path.display(),
                     err
                 );
                 // Don't fail - segment removal is cleanup, not critical
             }
         }
+    }
+
+    /// Delete all consumed segments (called during checkpoint to free disk space)
+    /// DEPRECATED: Prefer take_consumed_segments() + delete_segment_files() for S3 coordination.
+    /// Only deletes segments that have been fully loaded into memory.
+    fn delete_consumed_segments(&self) {
+        let segments_to_delete = self.take_consumed_segments();
+        Self::delete_segment_files(&segments_to_delete);
     }
 
     pub fn is_drained(&self) -> bool {
@@ -648,7 +659,23 @@ where
     /// Parallel checkpoint flush - writes batches using multiple threads
     /// This is faster than checkpoint_flush because it bypasses the async channel
     /// and writes directly to disk in parallel.
+    ///
+    /// If `skip_segment_deletion` is true, consumed segments are NOT deleted.
+    /// Use this when S3 sync handles segment cleanup to avoid race conditions.
     pub fn parallel_checkpoint_flush(&self, num_threads: usize) -> Result<()> {
+        self.parallel_checkpoint_flush_inner(num_threads, false)
+    }
+
+    /// Parallel checkpoint flush with option to skip segment deletion.
+    pub fn parallel_checkpoint_flush_defer_delete(&self, num_threads: usize) -> Result<()> {
+        self.parallel_checkpoint_flush_inner(num_threads, true)
+    }
+
+    fn parallel_checkpoint_flush_inner(
+        &self,
+        num_threads: usize,
+        skip_deletion: bool,
+    ) -> Result<()> {
         eprintln!(
             "DiskBackedQueue: parallel_checkpoint_flush starting with {} threads",
             num_threads
@@ -682,7 +709,9 @@ where
         let total_batches = batches.len();
         if total_batches == 0 {
             eprintln!("DiskBackedQueue: parallel_checkpoint_flush - nothing to flush");
-            self.delete_consumed_segments();
+            if !skip_deletion {
+                self.delete_consumed_segments();
+            }
             return Ok(());
         }
 
@@ -770,8 +799,18 @@ where
             written, total_batches
         );
 
-        // Delete consumed segments
-        self.delete_consumed_segments();
+        // Delete consumed segments (unless deferred for S3 coordination)
+        if !skip_deletion {
+            self.delete_consumed_segments();
+        } else {
+            let consumed_count = self.consumed_segments.lock().len();
+            if consumed_count > 0 {
+                eprintln!(
+                    "DiskBackedQueue: deferred deletion of {} consumed segments (S3 will handle)",
+                    consumed_count
+                );
+            }
+        }
 
         self.check_error()
     }
@@ -838,20 +877,73 @@ where
         // Find the minimum segment ID from all segment paths
         segments
             .iter()
-            .filter_map(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .and_then(|name| {
-                        if name.starts_with("segment-") && name.ends_with(".bin") {
-                            let id_str =
-                                name.trim_start_matches("segment-").trim_end_matches(".bin");
-                            id_str.parse::<u64>().ok()
-                        } else {
-                            None
-                        }
-                    })
-            })
+            .filter_map(|path| Self::extract_segment_id(path))
             .min()
+    }
+
+    /// Extract segment ID from a path like ".../segment-0000000000000042.bin"
+    fn extract_segment_id(path: &std::path::Path) -> Option<u64> {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| {
+                if name.starts_with("segment-") && name.ends_with(".bin") {
+                    let id_str = name.trim_start_matches("segment-").trim_end_matches(".bin");
+                    id_str.parse::<u64>().ok()
+                } else {
+                    None
+                }
+            })
+    }
+
+    /// Prune local segment files with ID < min_segment_id.
+    /// Returns the number of segments deleted and bytes freed.
+    /// This is called after S3 confirms upload to free local disk space.
+    pub fn prune_local_segments(&self, min_segment_id: u64) -> std::io::Result<(u64, u64)> {
+        let dir = &self.spill_dir_path;
+
+        if !dir.exists() {
+            return Ok((0, 0));
+        }
+
+        let mut deleted_count = 0u64;
+        let mut deleted_bytes = 0u64;
+
+        // Get segments currently tracked by the queue
+        let tracked_segments: std::collections::HashSet<_> =
+            { self.segments.lock().iter().cloned().collect() };
+
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            // Only process .bin segment files
+            if path.extension().map(|e| e == "bin").unwrap_or(false) {
+                if let Some(segment_id) = Self::extract_segment_id(&path) {
+                    // Only delete if:
+                    // 1. Segment ID is below the minimum needed
+                    // 2. Segment is not currently tracked (consumed)
+                    if segment_id < min_segment_id && !tracked_segments.contains(&path) {
+                        if let Ok(metadata) = entry.metadata() {
+                            deleted_bytes += metadata.len();
+                        }
+                        if std::fs::remove_file(&path).is_ok() {
+                            deleted_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        if deleted_count > 0 {
+            eprintln!(
+                "Queue: pruned {} local segments < {} ({:.1} MB freed)",
+                deleted_count,
+                min_segment_id,
+                deleted_bytes as f64 / 1_048_576.0
+            );
+        }
+
+        Ok((deleted_count, deleted_bytes))
     }
 
     /// Get the spill directory path
