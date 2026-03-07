@@ -135,6 +135,12 @@ pub enum CompiledExpr {
         body: Box<CompiledExpr>,
     },
 
+    // Function set: [Domain -> Range] - set of all functions from Domain to Range
+    FunctionSet {
+        domain: Box<CompiledExpr>,
+        range: Box<CompiledExpr>,
+    },
+
     // Operator/definition call
     OpCall {
         name: String,
@@ -187,7 +193,11 @@ impl CompiledExpr {
             | CompiledExpr::Append(a, b)
             | CompiledExpr::Concat(a, b)
             | CompiledExpr::FuncPair(a, b)
-            | CompiledExpr::FuncOverride(a, b) => a.is_fully_compiled() && b.is_fully_compiled(),
+            | CompiledExpr::FuncOverride(a, b)
+            | CompiledExpr::FunctionSet {
+                domain: a,
+                range: b,
+            } => a.is_fully_compiled() && b.is_fully_compiled(),
             CompiledExpr::If {
                 cond,
                 then_branch,
@@ -554,6 +564,11 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
         // Check for function construction: [x \in S |-> expr]
         if let Some(func) = try_parse_func_construct(inner) {
             return func;
+        }
+
+        // Check for function set: [Domain -> Range]
+        if let Some(func_set) = try_parse_function_set(inner) {
+            return func_set;
         }
 
         // Check for EXCEPT: [f EXCEPT ![key] = val] or [f EXCEPT ![k1][k2] = val]
@@ -1149,6 +1164,56 @@ fn try_parse_func_construct(inner: &str) -> Option<CompiledExpr> {
                 body: Box::new(compile_expr(body)),
             });
         }
+    }
+    None
+}
+
+/// Try to parse a function set: [Domain -> Range]
+/// This is the set of all functions from Domain to Range.
+fn try_parse_function_set(inner: &str) -> Option<CompiledExpr> {
+    // Find " -> " at top level (not inside nested brackets)
+    // Must not contain "|->", which would be function construction
+    if inner.contains("|->") {
+        return None;
+    }
+
+    // Find the "->" at top level
+    let arrow_idx = find_top_level_arrow(inner)?;
+
+    let domain = inner[..arrow_idx].trim();
+    let range = inner[arrow_idx + 2..].trim();
+
+    if domain.is_empty() || range.is_empty() {
+        return None;
+    }
+
+    Some(CompiledExpr::FunctionSet {
+        domain: Box::new(compile_expr(domain)),
+        range: Box::new(compile_expr(range)),
+    })
+}
+
+/// Find " -> " at top level (not inside brackets)
+fn find_top_level_arrow(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth: i32 = 0;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = (depth - 1).max(0),
+            b'-' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b'>' => {
+                // Check it's not "|->"
+                if i > 0 && bytes[i - 1] == b'|' {
+                    i += 1;
+                    continue;
+                }
+                return Some(i);
+            }
+            _ => {}
+        }
+        i += 1;
     }
     None
 }
@@ -1832,7 +1897,9 @@ fn compile_action_clause_text(expr: &str) -> CompiledActionClause {
             expr: compile_expr(&expr),
         },
         ClauseKind::Unchanged { vars } => CompiledActionClause::Unchanged { vars },
-        ClauseKind::UnprimedEquality { .. } | ClauseKind::Other => {
+        ClauseKind::UnprimedEquality { .. }
+        | ClauseKind::UnprimedMembership { .. }
+        | ClauseKind::Other => {
             if trimmed.starts_with("LET") && trimmed.contains('\'') {
                 match compile_let_with_primes(trimmed) {
                     Some(compiled) => compiled,
@@ -2119,14 +2186,25 @@ mod tests {
     }
 
     #[test]
-    fn test_bracketed_function_set_is_not_misparsed_as_function_application() {
+    fn test_bracketed_function_set_parsed_correctly() {
         let expr = compile_expr("[S -> T]");
         match expr {
-            CompiledExpr::Unparsed(raw) => assert_eq!(raw, "[S -> T]"),
+            CompiledExpr::FunctionSet { domain, range } => {
+                assert!(matches!(*domain, CompiledExpr::Var(ref s) if s == "S"));
+                assert!(matches!(*range, CompiledExpr::Var(ref s) if s == "T"));
+            }
             other => {
-                panic!("expected bracketed function-set type to stay unparsed, got: {other:?}")
+                panic!("expected FunctionSet, got: {other:?}")
             }
         }
+
+        // Test with more complex expressions
+        let expr = compile_expr("[{1, 2} -> BOOLEAN]");
+        assert!(matches!(expr, CompiledExpr::FunctionSet { .. }));
+
+        // Test that function construction is not misparsed as function set
+        let expr = compile_expr("[x \\in S |-> x + 1]");
+        assert!(matches!(expr, CompiledExpr::FuncConstruct { .. }));
     }
 
     #[test]

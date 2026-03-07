@@ -2,9 +2,22 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClauseKind {
-    PrimedAssignment { var: String, expr: String },
-    UnprimedEquality { var: String, expr: String },
-    Unchanged { vars: Vec<String> },
+    PrimedAssignment {
+        var: String,
+        expr: String,
+    },
+    UnprimedEquality {
+        var: String,
+        expr: String,
+    },
+    /// Membership assignment: var \in set (used in Init to assign var from set)
+    UnprimedMembership {
+        var: String,
+        set_expr: String,
+    },
+    Unchanged {
+        vars: Vec<String>,
+    },
     Other,
 }
 
@@ -238,7 +251,53 @@ pub fn classify_clause(clause: &str) -> ClauseKind {
         }
     }
 
+    // Check for membership: var \in set (used in Init to pick from set)
+    if let Some((var, set_expr)) = split_membership(trimmed) {
+        if is_simple_name(&var) && !set_expr.is_empty() {
+            return ClauseKind::UnprimedMembership { var, set_expr };
+        }
+    }
+
     ClauseKind::Other
+}
+
+/// Split "var \in set_expr" into (var, set_expr)
+fn split_membership(s: &str) -> Option<(String, String)> {
+    // Look for " \in " at top level (not inside brackets)
+    let in_patterns = [" \\in ", " ∈ "];
+
+    for pattern in in_patterns {
+        if let Some(pos) = find_top_level_pattern(s, pattern) {
+            let var = s[..pos].trim().to_string();
+            let set_expr = s[pos + pattern.len()..].trim().to_string();
+            return Some((var, set_expr));
+        }
+    }
+    None
+}
+
+/// Find pattern at top level (not inside brackets/parens)
+fn find_top_level_pattern(s: &str, pattern: &str) -> Option<usize> {
+    let mut depth: usize = 0;
+    let mut i = 0;
+    let bytes = s.as_bytes();
+    let pattern_bytes = pattern.as_bytes();
+
+    while i + pattern_bytes.len() <= bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => {
+                // Check if pattern matches at this position
+                if &bytes[i..i + pattern_bytes.len()] == pattern_bytes {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 fn is_simple_name(text: &str) -> bool {

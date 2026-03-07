@@ -26,7 +26,7 @@ pub struct TlaModel {
     pub action_constraints: Vec<(String, String)>,
     pub symmetry: Option<SymmetrySpec>,
     pub view: Option<String>,
-    pub initial_state: TlaState,
+    pub initial_states_vec: Vec<TlaState>,
     /// Pre-compiled action definitions for fast execution
     pub compiled_actions: BTreeMap<String, Arc<CompiledActionIr>>,
     /// Pre-compiled invariant expressions (name, compiled expr)
@@ -62,7 +62,7 @@ impl TlaModel {
             next_override.map(ToString::to_string),
         )?;
 
-        let initial_state = evaluate_init_state(&module, &config, &init_name)?;
+        let initial_states_vec = evaluate_init_states(&module, &config, &init_name)?;
         let invariant_exprs = resolve_invariant_exprs(&module, &config);
         let temporal_properties = resolve_temporal_properties(&module, &config)?;
         let mut fairness_constraints = extract_fairness_constraints(&temporal_properties);
@@ -138,7 +138,7 @@ impl TlaModel {
             action_constraints,
             symmetry,
             view,
-            initial_state,
+            initial_states_vec,
             compiled_actions,
             compiled_invariants,
             compiled_state_constraints,
@@ -154,7 +154,7 @@ impl Model for TlaModel {
     }
 
     fn initial_states(&self) -> Vec<Self::State> {
-        vec![self.initial_state.clone()]
+        self.initial_states_vec.clone()
     }
 
     fn next_states(&self, state: &Self::State, out: &mut Vec<Self::State>) {
@@ -710,7 +710,16 @@ fn parse_simple_identifier(text: &str) -> Option<String> {
     }
 }
 
-fn evaluate_init_state(module: &TlaModule, cfg: &TlaConfig, init_name: &str) -> Result<TlaState> {
+/// Evaluate Init predicate and return all possible initial states.
+/// Handles:
+/// - Equality assignments: var = expr (deterministic)
+/// - Membership assignments: var \in Set (nondeterministic - enumerate all values)
+/// - Guards: other predicates that must be TRUE
+fn evaluate_init_states(
+    module: &TlaModule,
+    cfg: &TlaConfig,
+    init_name: &str,
+) -> Result<Vec<TlaState>> {
     let init_def = module
         .definitions
         .get(init_name)
@@ -722,30 +731,37 @@ fn evaluate_init_state(module: &TlaModule, cfg: &TlaConfig, init_name: &str) -> 
         // Check if this is a reference to another definition (not just a bare identifier)
         if module.definitions.contains_key(&ref_name) && ref_name != init_name {
             // Recursively evaluate the referenced init
-            return evaluate_init_state(module, cfg, &ref_name);
+            return evaluate_init_states(module, cfg, &ref_name);
         }
     }
 
-    let mut state = BTreeMap::new();
+    // Start with constants from config
+    let mut base_state = BTreeMap::new();
     for (k, v) in &cfg.constants {
         if let Some(tv) = config_value_to_tla(v) {
-            state.insert(k.clone(), tv);
+            base_state.insert(k.clone(), tv);
         }
     }
 
-    let mut assignments: Vec<(String, String)> = Vec::new();
+    // Classify all clauses
+    let mut equality_assignments: Vec<(String, String)> = Vec::new();
+    let mut membership_assignments: Vec<(String, String)> = Vec::new();
     let mut guards: Vec<String> = Vec::new();
 
     for clause in split_top_level(&init_def.body, "/\\") {
         match classify_clause(&clause) {
             ClauseKind::UnprimedEquality { var, expr } if module.variables.contains(&var) => {
-                assignments.push((var, expr));
+                equality_assignments.push((var, expr));
+            }
+            ClauseKind::UnprimedMembership { var, set_expr } if module.variables.contains(&var) => {
+                membership_assignments.push((var, set_expr));
             }
             _ => guards.push(clause),
         }
     }
 
-    let mut pending = assignments;
+    // First, resolve equality assignments (deterministic)
+    let mut pending = equality_assignments;
     for _ in 0..pending.len().saturating_add(1) {
         if pending.is_empty() {
             break;
@@ -755,13 +771,13 @@ fn evaluate_init_state(module: &TlaModule, cfg: &TlaConfig, init_name: &str) -> 
         let mut next_pending = Vec::new();
         for (var, expr) in pending {
             let ctx = EvalContext::with_definitions_and_instances(
-                &state,
+                &base_state,
                 &module.definitions,
                 &module.instances,
             );
             match eval_expr(&expr, &ctx) {
                 Ok(value) => {
-                    state.insert(var, value);
+                    base_state.insert(var, value);
                     progress = true;
                 }
                 Err(_) => next_pending.push((var, expr)),
@@ -780,27 +796,123 @@ fn evaluate_init_state(module: &TlaModule, cfg: &TlaConfig, init_name: &str) -> 
         pending = next_pending;
     }
 
-    let ctx =
-        EvalContext::with_definitions_and_instances(&state, &module.definitions, &module.instances);
-    for guard in guards {
-        if guard.trim().is_empty() {
-            continue;
+    // Now handle membership assignments (nondeterministic)
+    // Evaluate each set expression and collect possible values
+    let mut membership_choices: Vec<(String, Vec<TlaValue>)> = Vec::new();
+
+    for (var, set_expr) in membership_assignments {
+        let ctx = EvalContext::with_definitions_and_instances(
+            &base_state,
+            &module.definitions,
+            &module.instances,
+        );
+        let set_val = eval_expr(&set_expr, &ctx)
+            .with_context(|| format!("failed evaluating membership set for {var}: {set_expr}"))?;
+        let set = set_val
+            .as_set()
+            .with_context(|| format!("membership expression for {var} is not a set: {set_expr}"))?;
+
+        if set.is_empty() {
+            return Err(anyhow!(
+                "membership set for {var} is empty, no initial states possible"
+            ));
         }
-        let ok = eval_expr(&guard, &ctx)
-            .with_context(|| format!("failed evaluating Init guard: {guard}"))?
-            .as_bool()?;
-        if !ok {
-            return Err(anyhow!("Init guard evaluated to FALSE: {guard}"));
+
+        let values: Vec<TlaValue> = set.iter().cloned().collect();
+        membership_choices.push((var, values));
+    }
+
+    // Generate all combinations of membership choices (cross product)
+    let had_membership_choices = !membership_choices.is_empty();
+    let base_state_for_error = base_state.clone();
+    let mut states = vec![base_state];
+
+    for (var, values) in membership_choices {
+        let mut new_states = Vec::new();
+        for state in states {
+            for value in &values {
+                let mut new_state = state.clone();
+                new_state.insert(var.clone(), value.clone());
+                new_states.push(new_state);
+            }
+        }
+        states = new_states;
+
+        // Limit total number of initial states
+        const MAX_INIT_STATES: usize = 1_000_000;
+        if states.len() > MAX_INIT_STATES {
+            return Err(anyhow!(
+                "too many initial states ({} > {}). Consider constraining Init.",
+                states.len(),
+                MAX_INIT_STATES
+            ));
         }
     }
 
-    for var in &module.variables {
-        if !state.contains_key(var) {
-            return Err(anyhow!("Init does not assign variable '{var}'"));
+    // Filter states by guards
+    let mut valid_states = Vec::new();
+    for state in states {
+        let ctx = EvalContext::with_definitions_and_instances(
+            &state,
+            &module.definitions,
+            &module.instances,
+        );
+
+        let mut all_guards_pass = true;
+        for guard in &guards {
+            if guard.trim().is_empty() {
+                continue;
+            }
+            match eval_expr(guard, &ctx) {
+                Ok(val) => {
+                    if !val.as_bool().unwrap_or(false) {
+                        all_guards_pass = false;
+                        break;
+                    }
+                }
+                Err(_) => {
+                    all_guards_pass = false;
+                    break;
+                }
+            }
+        }
+
+        if all_guards_pass {
+            // Verify all variables are assigned
+            let all_assigned = module.variables.iter().all(|v| state.contains_key(v));
+            if all_assigned {
+                valid_states.push(state);
+            }
         }
     }
 
-    Ok(state)
+    if valid_states.is_empty() {
+        // Provide helpful error message
+        if had_membership_choices {
+            return Err(anyhow!(
+                "no valid initial states found (membership assignments didn't produce valid states)"
+            ));
+        }
+        // Check which variables are missing
+        let missing: Vec<_> = module
+            .variables
+            .iter()
+            .filter(|v| !base_state_for_error.contains_key(*v))
+            .collect();
+        if !missing.is_empty() {
+            return Err(anyhow!(
+                "Init does not assign variables: {}",
+                missing
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        return Err(anyhow!("no valid initial states found"));
+    }
+
+    Ok(valid_states)
 }
 
 fn config_value_to_tla(value: &ConfigValue) -> Option<TlaValue> {
