@@ -56,7 +56,7 @@ impl Default for AutoSwitchConfig {
             enabled: true,
             state_count_threshold: 1_000_000_000, // 1 billion
             memory_threshold: 0.85,
-            bloom_false_positive_rate: 0.001, // 0.1%
+            bloom_false_positive_rate: 0.001,     // 0.1%
             bloom_expected_items: 10_000_000_000, // 10 billion
             shard_count: 64,
             shard_size_mb: 1024,
@@ -69,9 +69,7 @@ impl Default for AutoSwitchConfig {
 /// State of the fingerprint store
 enum StoreState {
     /// Using exact store only (pre-switch)
-    Exact {
-        store: PageAlignedFingerprintStore,
-    },
+    Exact { store: PageAlignedFingerprintStore },
     /// Transitioning: exact is read-only, bloom accepts new inserts
     /// Invariant: check exact first, then bloom
     Hybrid {
@@ -159,7 +157,11 @@ impl AutoSwitchingFingerprintStore {
 
         eprintln!(
             "Auto-switching fingerprint store initialized (auto-switch: {})",
-            if config.enabled { "enabled" } else { "disabled" }
+            if config.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
         );
         if config.enabled {
             eprintln!(
@@ -446,9 +448,15 @@ impl AutoSwitchingFingerprintStore {
             "Switch complete in {:.2}ms",
             switch_start.elapsed().as_secs_f64() * 1000.0
         );
-        eprintln!("  Exact store: {} fingerprints (now read-only)", exact_count);
+        eprintln!(
+            "  Exact store: {} fingerprints (now read-only)",
+            exact_count
+        );
         eprintln!("  Bloom filter: ready for new fingerprints");
-        eprintln!("  FPR: {:.2}%", self.config.bloom_false_positive_rate * 100.0);
+        eprintln!(
+            "  FPR: {:.2}%",
+            self.config.bloom_false_positive_rate * 100.0
+        );
         eprintln!("=================================================");
     }
 
@@ -637,7 +645,11 @@ mod tests {
 
         // New fingerprints should be found (in bloom)
         for i in 100..200 {
-            assert!(store.contains_or_insert(i), "fp {} should exist in bloom", i);
+            assert!(
+                store.contains_or_insert(i),
+                "fp {} should exist in bloom",
+                i
+            );
         }
 
         let ext_stats = store.extended_stats();
@@ -679,7 +691,10 @@ mod tests {
         store
             .contains_or_insert_batch(&initial_fps, &mut seen)
             .unwrap();
-        assert!(seen.iter().all(|&s| s), "All should be found in exact store");
+        assert!(
+            seen.iter().all(|&s| s),
+            "All should be found in exact store"
+        );
 
         // Insert new batch - should go to bloom
         let new_fps: Vec<u64> = (100..150).collect();
@@ -688,11 +703,16 @@ mod tests {
 
         // Verify new batch is in bloom
         store.contains_or_insert_batch(&new_fps, &mut seen).unwrap();
-        assert!(seen.iter().all(|&s| s), "All should be found in bloom store");
+        assert!(
+            seen.iter().all(|&s| s),
+            "All should be found in bloom store"
+        );
 
         // Mixed batch (some in exact, some in bloom, some new)
         let mixed_fps: Vec<u64> = vec![25, 125, 200]; // exact, bloom, new
-        store.contains_or_insert_batch(&mixed_fps, &mut seen).unwrap();
+        store
+            .contains_or_insert_batch(&mixed_fps, &mut seen)
+            .unwrap();
         assert_eq!(seen, vec![true, true, false]);
     }
 }
