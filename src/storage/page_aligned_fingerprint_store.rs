@@ -1592,4 +1592,67 @@ mod tests {
             }
         }
     }
+
+    /// Property-based tests for fingerprint store
+    mod proptests {
+        use super::{FingerprintShard, FingerprintStatsAtomic};
+        use proptest::prelude::*;
+        use std::collections::HashSet;
+
+        proptest! {
+            /// Insert then contains always returns true (no false negatives)
+            #[test]
+            fn insert_then_contains(fps in prop::collection::vec(1u64..1_000_000, 1..100)) {
+                let shard = FingerprintShard::new(64, 0).unwrap();
+                let stats = FingerprintStatsAtomic::default();
+
+                // Insert all
+                for &fp in &fps {
+                    shard.contains_or_insert(fp, &stats);
+                }
+
+                // Verify all exist
+                for &fp in &fps {
+                    prop_assert!(
+                        shard.contains_or_insert(fp, &stats),
+                        "Inserted fingerprint {} must be found",
+                        fp
+                    );
+                }
+            }
+
+            /// Duplicate inserts return true (second insert sees it exists)
+            #[test]
+            fn duplicate_insert_returns_true(fp: u64) {
+                let shard = FingerprintShard::new(16, 0).unwrap();
+                let stats = FingerprintStatsAtomic::default();
+
+                // First insert - should not exist yet
+                let first = shard.contains_or_insert(fp, &stats);
+                prop_assert!(!first, "First insert should return false (not previously present)");
+
+                // Second insert - should exist now
+                let second = shard.contains_or_insert(fp, &stats);
+                prop_assert!(second, "Second insert should return true (already present)");
+            }
+
+            /// Count matches unique fingerprints inserted
+            #[test]
+            fn count_matches_unique_inserts(fps in prop::collection::vec(any::<u64>(), 1..200)) {
+                let shard = FingerprintShard::new(64, 0).unwrap();
+                let stats = FingerprintStatsAtomic::default();
+                let unique: HashSet<_> = fps.iter().copied().collect();
+
+                for &fp in &fps {
+                    shard.contains_or_insert(fp, &stats);
+                }
+
+                prop_assert_eq!(
+                    shard.len() as usize,
+                    unique.len(),
+                    "Count should match unique fingerprints"
+                );
+            }
+        }
+    }
 }
