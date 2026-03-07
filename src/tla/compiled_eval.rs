@@ -1827,3 +1827,81 @@ fn test_full_price_bands_invariant() {
     assert!(result.is_ok(), "Evaluation failed: {:?}", result);
     assert_eq!(result.unwrap(), TlaValue::Bool(true));
 }
+
+#[test]
+fn test_set_comprehension_with_except() {
+    // Regression test for: {[w EXCEPT !.state = "FAILED"] : w \in pendingWrites}
+    // This should apply EXCEPT to each record in the set, not treat 'w' as a ModelValue
+    use crate::tla::compiled_expr::compile_expr;
+
+    // Create a state with pendingWrites as a set of records
+    let mut state = TlaState::new();
+
+    // Create a set of record values
+    let mut rec1 = BTreeMap::new();
+    rec1.insert("id".to_string(), TlaValue::Int(1));
+    rec1.insert("state".to_string(), TlaValue::String("PENDING".to_string()));
+
+    let mut rec2 = BTreeMap::new();
+    rec2.insert("id".to_string(), TlaValue::Int(2));
+    rec2.insert("state".to_string(), TlaValue::String("PENDING".to_string()));
+
+    let pending_writes: BTreeSet<TlaValue> = [
+        TlaValue::Record(Arc::new(rec1)),
+        TlaValue::Record(Arc::new(rec2)),
+    ]
+    .into_iter()
+    .collect();
+
+    state.insert(
+        "pendingWrites".to_string(),
+        TlaValue::Set(Arc::new(pending_writes)),
+    );
+
+    let ctx = EvalContext::new(&state);
+
+    // First, let's test that the expression compiles correctly
+    let expr_str = r#"{[w EXCEPT !.state = "FAILED"] : w \in pendingWrites}"#;
+    let expr = compile_expr(expr_str);
+    println!("Compiled expression: {:#?}", expr);
+
+    // Verify it's a SetComprehension with FuncExcept body
+    match &expr {
+        CompiledExpr::SetComprehension { var, body, .. } => {
+            assert_eq!(var, "w");
+            match body.as_ref() {
+                CompiledExpr::FuncExcept(base, _) => {
+                    // The base should be Var("w"), not ModelValue("w")
+                    match base.as_ref() {
+                        CompiledExpr::Var(name) => assert_eq!(name, "w"),
+                        other => panic!("Expected Var(\"w\") as EXCEPT base, got: {:?}", other),
+                    }
+                }
+                other => panic!("Expected FuncExcept body, got: {:?}", other),
+            }
+        }
+        other => panic!("Expected SetComprehension, got: {:?}", other),
+    }
+
+    // Now evaluate the expression
+    let result = eval_compiled(&expr, &ctx);
+    println!("Evaluation result: {:?}", result);
+
+    // The evaluation should succeed
+    assert!(result.is_ok(), "Evaluation failed: {:?}", result);
+
+    let result_set = result.unwrap();
+    let set = result_set.as_set().expect("result should be a set");
+
+    // Each record in the result should have state = "FAILED"
+    assert_eq!(set.len(), 2, "Expected 2 records in result");
+    for record_val in set.iter() {
+        let record = record_val.as_record().expect("element should be a record");
+        assert_eq!(
+            record.get("state"),
+            Some(&TlaValue::String("FAILED".to_string())),
+            "Record state should be FAILED: {:?}",
+            record
+        );
+    }
+}

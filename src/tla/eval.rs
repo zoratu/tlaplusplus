@@ -4373,4 +4373,56 @@ mod tests {
         ])));
         assert_eq!(result, expected);
     }
+
+    #[test]
+    fn test_set_comprehension_with_except_string_eval() {
+        // Regression test for: {[w EXCEPT !.state = "FAILED"] : w \in pendingWrites}
+        // This should apply EXCEPT to each record in the set, not treat 'w' as a ModelValue
+
+        // Create a state with pendingWrites as a set of records
+        let mut rec1 = BTreeMap::new();
+        rec1.insert("id".to_string(), TlaValue::Int(1));
+        rec1.insert("state".to_string(), TlaValue::String("PENDING".to_string()));
+
+        let mut rec2 = BTreeMap::new();
+        rec2.insert("id".to_string(), TlaValue::Int(2));
+        rec2.insert("state".to_string(), TlaValue::String("PENDING".to_string()));
+
+        let pending_writes: BTreeSet<TlaValue> = [
+            TlaValue::Record(Arc::new(rec1)),
+            TlaValue::Record(Arc::new(rec2)),
+        ]
+        .into_iter()
+        .collect();
+
+        let state = TlaState::from([(
+            "pendingWrites".to_string(),
+            TlaValue::Set(Arc::new(pending_writes)),
+        )]);
+
+        let ctx = EvalContext::new(&state);
+
+        // Evaluate the expression using string-based eval
+        let expr_str = r#"{[w EXCEPT !.state = "FAILED"] : w \in pendingWrites}"#;
+        let result = eval_expr(expr_str, &ctx);
+        println!("String eval result: {:?}", result);
+
+        // The evaluation should succeed
+        assert!(result.is_ok(), "Evaluation failed: {:?}", result);
+
+        let result_set = result.unwrap();
+        let set = result_set.as_set().expect("result should be a set");
+
+        // Each record in the result should have state = "FAILED"
+        assert_eq!(set.len(), 2, "Expected 2 records in result");
+        for record_val in set.iter() {
+            let record = record_val.as_record().expect("element should be a record");
+            assert_eq!(
+                record.get("state"),
+                Some(&TlaValue::String("FAILED".to_string())),
+                "Record state should be FAILED: {:?}",
+                record
+            );
+        }
+    }
 }
