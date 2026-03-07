@@ -292,6 +292,7 @@ fn parse_def_head(lhs: &str) -> (String, Vec<String>) {
 
     if let Some(open) = lhs.find('(')
         && let Some(close) = lhs.rfind(')')
+        && close > open
     {
         let name = lhs[..open].trim().to_string();
         let params = lhs[open + 1..close]
@@ -579,5 +580,25 @@ mod tests {
         ====
         "#;
         assert!(!detect_pluscal(normal_src));
+    }
+
+    #[test]
+    fn malformed_input_does_not_panic() {
+        // Regression test for fuzzer-found bug: ')' before '(' in def head
+        // The parser should handle malformed input gracefully without panicking
+        let malformed_inputs = [
+            ")]..(==y",
+            "Op)==x",
+            "Foo ) ( Bar",
+            "((()))",
+            "",
+            "   ",
+            "-----MODULE Test-----",
+        ];
+
+        for input in &malformed_inputs {
+            // parse_tla_module_text may return Ok or Err, but must not panic
+            let _ = parse_tla_module_text(input);
+        }
     }
 }

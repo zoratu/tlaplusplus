@@ -1062,6 +1062,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
         Ok(())
     }
+
+    /// Property-based tests for queue serialization
+    mod proptests {
+        use super::super::{deserialize_compressed, serialize_compressed};
+        use proptest::prelude::*;
+
+        proptest! {
+            /// Serialization roundtrip preserves data for simple types
+            #[test]
+            fn serialization_roundtrip_u64(value: u64) {
+                let compressed = serialize_compressed(&value).unwrap();
+                let recovered: u64 = deserialize_compressed(&compressed).unwrap();
+                prop_assert_eq!(value, recovered);
+            }
+
+            /// Serialization roundtrip preserves data for vectors
+            #[test]
+            fn serialization_roundtrip_vec(values in prop::collection::vec(any::<i64>(), 0..100)) {
+                let compressed = serialize_compressed(&values).unwrap();
+                let recovered: Vec<i64> = deserialize_compressed(&compressed).unwrap();
+                prop_assert_eq!(values, recovered);
+            }
+
+            /// Serialization roundtrip preserves nested structures
+            #[test]
+            fn serialization_roundtrip_nested(
+                outer in prop::collection::vec(
+                    prop::collection::vec(any::<u32>(), 0..10),
+                    0..10
+                )
+            ) {
+                let compressed = serialize_compressed(&outer).unwrap();
+                let recovered: Vec<Vec<u32>> = deserialize_compressed(&compressed).unwrap();
+                prop_assert_eq!(outer, recovered);
+            }
+        }
+    }
 }
 
 /// Failpoint tests for queue I/O resilience
