@@ -199,4 +199,16 @@ impl UnifiedFingerprintStore {
             _ => false,
         }
     }
+
+    /// Check if a switch to hybrid mode is pending
+    ///
+    /// Workers should check this BEFORE acquiring locks on the fingerprint store.
+    /// If true, workers should yield to allow the switch to complete and
+    /// checkpoint quiescence to be achieved.
+    pub fn is_switch_pending(&self) -> bool {
+        match self {
+            Self::AutoSwitch(store) => store.is_switch_pending(),
+            _ => false,
+        }
+    }
 }
