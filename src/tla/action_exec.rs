@@ -218,6 +218,7 @@ fn execute_branch(
         name: "<inline>".to_string(),
         params: Vec::new(),
         body: trimmed.to_string(),
+        is_recursive: false,
     };
 
     let mut ctx = EvalContext::with_definitions(state, definitions);
@@ -574,6 +575,7 @@ mod tests {
                     name: "Inc".to_string(),
                     params: vec!["i".to_string()],
                     body: "/\\ x' = x + 1 /\\ UNCHANGED <<y, S>>".to_string(),
+                    is_recursive: false,
                 },
             ),
             (
@@ -582,6 +584,7 @@ mod tests {
                     name: "Next".to_string(),
                     params: vec![],
                     body: "\\E i \\in S : Inc(i)".to_string(),
+                    is_recursive: false,
                 },
             ),
         ]);

@@ -307,6 +307,7 @@ mod tests {
             name: "Tick".to_string(),
             params: vec![],
             body: "/\\ x' = x + 1 /\\ UNCHANGED <<y>> /\\ x < 10".to_string(),
+            is_recursive: false,
         };
 
         let ir = compile_action_ir(&def);
