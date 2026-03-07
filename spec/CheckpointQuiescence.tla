@@ -105,6 +105,7 @@ Init ==
 (* Worker processes a state - needs to acquire read lock on FP store *)
 WorkerProcessState(w) ==
     /\ workerState[w] = "working"
+    /\ w \notin readLockHolders  \* Must not already hold the lock
     /\ ~pauseRequested
     /\ stepCount < MaxSteps
     /\ IF CanAcquireReadLock
@@ -452,8 +453,7 @@ LiveSpec == Spec /\ Fairness /\ StrongFairness
 StateConstraint == stepCount <= MaxSteps
 
 -----------------------------------------------------------------------------
-(* Symmetry for Optimization *)
-
-Symmetry == Permutations(Workers)
+(* Symmetry for Optimization - defined in .cfg file *)
+(* TLC uses SYMMETRY directive in config file for worker permutation *)
 
 =============================================================================
