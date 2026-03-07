@@ -1038,6 +1038,7 @@ fn inject_constants_into_definitions(module: &mut TlaModule, config: &TlaConfig)
                 name: name.clone(),
                 params: vec![],
                 body,
+                is_recursive: false,
             },
         );
     }
