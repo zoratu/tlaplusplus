@@ -172,6 +172,29 @@ fn execute_branch(
         return Err(anyhow!("empty branch expression"));
     }
 
+    // Handle nested disjunctions: \/ A \/ B \/ C
+    // This happens when a quantifier body contains disjunctions, e.g.:
+    //   \E op \in pendingOps : \/ JournalOperation(op) \/ CommitOperation(op)
+    // We only handle this if split_top_level actually produces multiple parts.
+    // If it returns just one part (e.g., when the disjunction is inside a quantifier),
+    // we should proceed with other handling (like \E processing).
+    if trimmed.starts_with("\\/") || contains_top_level_disjunction(trimmed) {
+        let disjuncts = split_top_level(trimmed, "\\/");
+        // Only handle as disjunction if we actually split into multiple parts
+        if disjuncts.len() > 1 || (disjuncts.len() == 1 && disjuncts[0].trim() != trimmed) {
+            let mut out = Vec::new();
+            for disj in disjuncts {
+                let disj_trimmed = disj.trim();
+                if !disj_trimmed.is_empty() {
+                    let successors = execute_branch(disj_trimmed, locals, definitions, state)?;
+                    out.extend(successors);
+                }
+            }
+            return Ok(out);
+        }
+        // Otherwise, fall through to other handling (e.g., \E quantifier)
+    }
+
     if let Some(after_exists) = trimmed.strip_prefix("\\E") {
         return execute_exists_branch(after_exists.trim_start(), locals, definitions, state);
     }
@@ -378,6 +401,54 @@ fn strip_outer_parens(expr: &str) -> &str {
         current = current[1..current.len() - 1].trim();
     }
     current
+}
+
+/// Check if expression contains a top-level disjunction (\\/)
+/// Returns true if there's a \\/ outside of any brackets/parens
+fn contains_top_level_disjunction(expr: &str) -> bool {
+    let mut paren = 0usize;
+    let mut bracket = 0usize;
+    let mut brace = 0usize;
+    let mut angle = 0usize;
+    let mut i = 0usize;
+
+    while i < expr.len() {
+        let ch = expr[i..].chars().next().expect("char at byte index");
+        let len = ch.len_utf8();
+        let next = expr[i + len..].chars().next();
+
+        // Handle << >> pairs
+        if ch == '<' && next == Some('<') {
+            angle += 1;
+            i += 2;
+            continue;
+        }
+        if ch == '>' && next == Some('>') {
+            angle = angle.saturating_sub(1);
+            i += 2;
+            continue;
+        }
+
+        match ch {
+            '(' => paren += 1,
+            ')' => paren = paren.saturating_sub(1),
+            '[' => bracket += 1,
+            ']' => bracket = bracket.saturating_sub(1),
+            '{' => brace += 1,
+            '}' => brace = brace.saturating_sub(1),
+            '\\' if paren == 0 && bracket == 0 && brace == 0 && angle == 0 => {
+                // Check for \/ at top level
+                if next == Some('/') {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+
+        i += len;
+    }
+
+    false
 }
 
 fn is_wrapped_by(expr: &str, open: char, close: char) -> bool {
@@ -603,5 +674,112 @@ mod tests {
         assert_eq!(probe.supported_disjuncts, 1);
         assert_eq!(probe.generated_successors, 1);
         assert!(probe.failures.is_empty());
+    }
+
+    /// Test for nested disjunctions inside quantifier body
+    /// This is the pattern from ClusterLeaseFailover.tla that was failing with
+    /// "empty branch expression" error.
+    ///
+    /// The pattern is:
+    /// ```tla
+    /// Next ==
+    ///     \/ \E op \in pendingOps :
+    ///         \/ JournalOperation(op)
+    ///         \/ CommitOperation(op)
+    ///         \/ FailOperation(op)
+    /// ```
+    #[test]
+    fn handles_nested_disjunction_in_quantifier_body() {
+        let defs = BTreeMap::from([
+            (
+                "ActionA".to_string(),
+                TlaDefinition {
+                    name: "ActionA".to_string(),
+                    params: vec!["op".to_string()],
+                    body: "/\\ x' = x + 1 /\\ y' = y".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "ActionB".to_string(),
+                TlaDefinition {
+                    name: "ActionB".to_string(),
+                    params: vec!["op".to_string()],
+                    body: "/\\ x' = x /\\ y' = y + 1".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "ActionC".to_string(),
+                TlaDefinition {
+                    name: "ActionC".to_string(),
+                    params: vec!["op".to_string()],
+                    body: "/\\ x' = x + 10 /\\ y' = y + 10".to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+
+        let state = TlaState::from([
+            ("x".to_string(), TlaValue::Int(0)),
+            ("y".to_string(), TlaValue::Int(0)),
+            (
+                "pendingOps".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([
+                    TlaValue::Int(1),
+                    TlaValue::Int(2),
+                ]))),
+            ),
+        ]);
+
+        // Test the nested disjunction pattern:
+        // \E op \in pendingOps : \/ ActionA(op) \/ ActionB(op) \/ ActionC(op)
+        let next_body = r#"\E op \in pendingOps :
+            \/ ActionA(op)
+            \/ ActionB(op)
+            \/ ActionC(op)"#;
+
+        let result = evaluate_next_states(next_body, &defs, &state);
+        assert!(
+            result.is_ok(),
+            "Nested disjunction should not fail: {:?}",
+            result.err()
+        );
+
+        let successors = result.unwrap();
+        // With 2 ops and 3 actions, we should get 6 successor states (2 * 3)
+        assert_eq!(
+            successors.len(),
+            6,
+            "Expected 6 successors (2 ops * 3 actions), got {}",
+            successors.len()
+        );
+
+        // Verify the states are what we expect
+        let x_values: Vec<i64> = successors
+            .iter()
+            .filter_map(|s| s.get("x").and_then(|v| v.as_int().ok()))
+            .collect();
+        // ActionA: x+1=1 (x2 ops), ActionB: x=0 (x2 ops), ActionC: x+10=10 (x2 ops)
+        assert!(x_values.contains(&1), "Should have x=1 from ActionA");
+        assert!(x_values.contains(&0), "Should have x=0 from ActionB");
+        assert!(x_values.contains(&10), "Should have x=10 from ActionC");
+    }
+
+    #[test]
+    fn contains_top_level_disjunction_works() {
+        // Basic cases
+        assert!(contains_top_level_disjunction(r"\/ A \/ B"));
+        assert!(contains_top_level_disjunction(r"A \/ B"));
+        assert!(!contains_top_level_disjunction(r"A /\ B"));
+        assert!(!contains_top_level_disjunction(r"Action(x)"));
+
+        // Nested in parens - should not count
+        assert!(!contains_top_level_disjunction(r"(A \/ B)"));
+        assert!(!contains_top_level_disjunction(r"Action((a \/ b))"));
+
+        // Mixed
+        assert!(contains_top_level_disjunction(r"A \/ (B /\ C)"));
+        assert!(contains_top_level_disjunction(r"(A /\ B) \/ C"));
     }
 }
