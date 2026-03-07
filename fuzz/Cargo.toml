@@ -7,6 +7,11 @@ edition = "2024"
 [package.metadata]
 cargo-fuzz = true
 
+# Profile for AddressSanitizer builds
+# Run with: cargo +nightly fuzz run <target> --sanitizer=address
+[profile.release]
+debug = true  # Enable debug info for better ASAN stack traces
+
 [dependencies]
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1.3", features = ["derive"] }
