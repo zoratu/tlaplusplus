@@ -100,6 +100,7 @@ pub fn canonicalize_tla_state(state: &TlaState, symmetry: &SymmetrySpec) -> TlaS
 
     // For each group, compute the canonical permutation based on found values
     let mut full_permutation: HashMap<String, String> = HashMap::new();
+    #[allow(unused_variables)]
     for (group_idx, (group, found)) in groups.iter().zip(found_values.iter()).enumerate() {
         if found.is_empty() {
             continue;

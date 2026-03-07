@@ -293,45 +293,6 @@ where
     Err(last_error.unwrap())
 }
 
-/// Retry an operation with exponential backoff (async version)
-#[cfg(feature = "tokio")]
-pub async fn retry_with_backoff_async<T, E, F, Fut>(
-    mut op: F,
-    max_retries: usize,
-    initial_delay_ms: u64,
-    max_delay_ms: u64,
-) -> Result<T, E>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, E>>,
-    E: std::fmt::Display,
-{
-    let mut delay_ms = initial_delay_ms;
-    let mut last_error = None;
-
-    for attempt in 0..=max_retries {
-        match op().await {
-            Ok(result) => return Ok(result),
-            Err(e) => {
-                if attempt < max_retries {
-                    eprintln!(
-                        "Async operation failed (attempt {}/{}): {}. Retrying in {}ms...",
-                        attempt + 1,
-                        max_retries + 1,
-                        e,
-                        delay_ms
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                    delay_ms = (delay_ms * 2).min(max_delay_ms);
-                }
-                last_error = Some(e);
-            }
-        }
-    }
-
-    Err(last_error.unwrap())
-}
-
 #[cfg(all(test, feature = "failpoints"))]
 mod failpoint_tests {
     use super::*;

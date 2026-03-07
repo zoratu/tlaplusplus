@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
@@ -461,21 +461,19 @@ impl S3Persistence {
             .send()
             .await
         {
-            Ok(response) => {
-                match response.body.collect().await {
-                    Ok(data) => {
-                        let bytes = data.into_bytes();
-                        match serde_json::from_slice::<S3Manifest>(&bytes) {
-                            Ok(manifest) => manifest
-                                .checkpoint
-                                .as_ref()
-                                .and_then(|cp| cp.min_segment_id),
-                            Err(_) => None,
-                        }
+            Ok(response) => match response.body.collect().await {
+                Ok(data) => {
+                    let bytes = data.into_bytes();
+                    match serde_json::from_slice::<S3Manifest>(&bytes) {
+                        Ok(manifest) => manifest
+                            .checkpoint
+                            .as_ref()
+                            .and_then(|cp| cp.min_segment_id),
+                        Err(_) => None,
                     }
-                    Err(_) => None,
                 }
-            }
+                Err(_) => None,
+            },
             Err(_) => None,
         };
 
@@ -865,21 +863,19 @@ async fn prune_deleted_files(
         .send()
         .await
     {
-        Ok(response) => {
-            match response.body.collect().await {
-                Ok(data) => {
-                    let bytes = data.into_bytes();
-                    match serde_json::from_slice::<S3Manifest>(&bytes) {
-                        Ok(manifest) => manifest
-                            .checkpoint
-                            .as_ref()
-                            .and_then(|cp| cp.min_segment_id),
-                        Err(_) => None,
-                    }
+        Ok(response) => match response.body.collect().await {
+            Ok(data) => {
+                let bytes = data.into_bytes();
+                match serde_json::from_slice::<S3Manifest>(&bytes) {
+                    Ok(manifest) => manifest
+                        .checkpoint
+                        .as_ref()
+                        .and_then(|cp| cp.min_segment_id),
+                    Err(_) => None,
                 }
-                Err(_) => None,
             }
-        }
+            Err(_) => None,
+        },
         Err(_) => None,
     };
 
@@ -1058,10 +1054,7 @@ mod tests {
     #[test]
     fn test_extract_segment_id() {
         // Valid segment filenames
-        assert_eq!(
-            extract_segment_id("segment-0000000000000042.bin"),
-            Some(42)
-        );
+        assert_eq!(extract_segment_id("segment-0000000000000042.bin"), Some(42));
         assert_eq!(extract_segment_id("segment-0000000000000000.bin"), Some(0));
         assert_eq!(
             extract_segment_id("segment-9999999999999999.bin"),

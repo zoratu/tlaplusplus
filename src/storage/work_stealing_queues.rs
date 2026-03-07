@@ -51,9 +51,11 @@ pub struct WorkStealingQueues<T> {
     worker_active: Vec<CachePadded<AtomicU8>>,
 
     /// Total workers
+    #[allow(dead_code)]
     num_workers: usize,
 
     /// Number of NUMA nodes
+    #[allow(dead_code)]
     num_numa_nodes: usize,
 
     /// NUMA node for each worker (worker_id -> numa_node)

@@ -843,9 +843,8 @@ where
                     .and_then(|name| name.to_str())
                     .and_then(|name| {
                         if name.starts_with("segment-") && name.ends_with(".bin") {
-                            let id_str = name
-                                .trim_start_matches("segment-")
-                                .trim_end_matches(".bin");
+                            let id_str =
+                                name.trim_start_matches("segment-").trim_end_matches(".bin");
                             id_str.parse::<u64>().ok()
                         } else {
                             None
@@ -1051,7 +1050,10 @@ mod tests {
         // Should have segments now - min_segment_id should be 0 or close to it
         let min_id = queue.get_min_segment_id();
         if queue.segment_count() > 0 {
-            assert!(min_id.is_some(), "Should have min_segment_id when segments exist");
+            assert!(
+                min_id.is_some(),
+                "Should have min_segment_id when segments exist"
+            );
             // First segment starts at 0
             assert!(min_id.unwrap() < 10, "First segments should have low IDs");
         }

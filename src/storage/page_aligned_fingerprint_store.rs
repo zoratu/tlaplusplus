@@ -38,9 +38,11 @@ const MADV_HUGEPAGE: i32 = 14; // From linux/mman.h
 const RESIZE_LOAD_THRESHOLD: f64 = 0.75;
 /// How often to check load factor (every N inserts)
 const RESIZE_CHECK_INTERVAL: u64 = 1_000;
-/// Maximum spin iterations before yielding during resize wait
+/// Maximum spin iterations before yielding during resize wait (reserved for future backoff)
+#[allow(dead_code)]
 const MAX_SPIN_BEFORE_YIELD: u32 = 64;
-/// Maximum yields before sleeping
+/// Maximum yields before sleeping (reserved for future backoff)
+#[allow(dead_code)]
 const MAX_YIELDS_BEFORE_SLEEP: u32 = 16;
 /// Maximum retry iterations in fingerprint operations before warning
 const MAX_RETRIES_BEFORE_WARN: u32 = 10_000;
@@ -96,6 +98,7 @@ struct HashTableEntry {
 }
 
 impl HashTableEntry {
+    #[allow(dead_code)]
     const fn new() -> Self {
         Self {
             fp: AtomicU64::new(0),
@@ -870,6 +873,7 @@ impl Drop for FingerprintShard {
 /// Page-aligned fingerprint store with NUMA awareness
 pub struct PageAlignedFingerprintStore {
     shards: Vec<FingerprintShard>,
+    #[allow(dead_code)]
     shard_mask: usize,
     stats: FingerprintStatsAtomic,
     /// Optional persistence channels (one per shard)
@@ -990,6 +994,7 @@ impl PageAlignedFingerprintStore {
     /// 1. Compute home NUMA from fingerprint
     /// 2. Select shard within that NUMA's range
     #[inline]
+    #[allow(dead_code)]
     fn shard_for(&self, fp: u64) -> &FingerprintShard {
         let numa = self.home_numa(fp);
         // Select shard within this NUMA's range

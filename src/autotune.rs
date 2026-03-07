@@ -17,7 +17,9 @@ struct CpuSample {
     user: u64,
     nice: u64,
     system: u64,
+    #[allow(dead_code)]
     idle: u64,
+    #[allow(dead_code)]
     iowait: u64,
     irq: u64,
     softirq: u64,
@@ -111,7 +113,8 @@ pub struct WorkerThrottle {
     active_target: AtomicUsize,
     /// Actual max workers
     max_workers: usize,
-    /// Counter for workers to check their turn
+    /// Counter for workers to check their turn (reserved for future use)
+    #[allow(dead_code)]
     worker_counter: AtomicU64,
 }
 
@@ -159,8 +162,10 @@ pub struct AutoTuner {
     throttle: Arc<WorkerThrottle>,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
-    /// Best observed throughput and worker count
+    /// Best observed throughput and worker count (reserved for future adaptive tuning)
+    #[allow(dead_code)]
     best_throughput: AtomicU64,
+    #[allow(dead_code)]
     best_workers: AtomicUsize,
 }
 
