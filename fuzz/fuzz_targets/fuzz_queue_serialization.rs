@@ -23,7 +23,8 @@ fuzz_target!(|state: FuzzState| {
     // Serialize the state
     if let Ok(compressed) = serialize_compressed(&state) {
         // Deserialize should succeed and produce equal value
-        if let Ok(recovered): Result<FuzzState, _> = deserialize_compressed(&compressed) {
+        let result: Result<FuzzState, _> = deserialize_compressed(&compressed);
+        if let Ok(recovered) = result {
             assert_eq!(state, recovered, "Round-trip should preserve data");
         }
     }
