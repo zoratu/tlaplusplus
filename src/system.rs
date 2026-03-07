@@ -23,6 +23,8 @@ pub struct WorkerPlanRequest {
     pub enforce_cgroups: bool,
     pub enable_numa_pinning: bool,
     pub requested_core_ids: Option<Vec<usize>>,
+    /// Restrict workers to specific NUMA nodes (e.g., vec![0, 1] uses only nodes 0 and 1)
+    pub requested_numa_nodes: Option<Vec<usize>>,
 }
 
 fn read_trimmed(path: &Path) -> Option<String> {
@@ -251,6 +253,34 @@ pub fn build_worker_plan(req: WorkerPlanRequest) -> WorkerPlan {
         && quota < allowed_cpus.len()
     {
         allowed_cpus.truncate(quota.max(1));
+    }
+
+    // Filter CPUs to requested NUMA nodes if specified
+    if let Some(ref requested_nodes) = req.requested_numa_nodes {
+        if !requested_nodes.is_empty() {
+            let raw_numa = discover_numa_nodes();
+            let mut node_cpus: Vec<usize> = Vec::new();
+            for &node_id in requested_nodes {
+                if node_id < raw_numa.len() {
+                    node_cpus.extend(&raw_numa[node_id]);
+                }
+            }
+            node_cpus.sort_unstable();
+            node_cpus.dedup();
+            if !node_cpus.is_empty() {
+                allowed_cpus = intersect_sorted(&allowed_cpus, &node_cpus);
+                eprintln!(
+                    "NUMA node selection: using nodes {:?} ({} CPUs)",
+                    requested_nodes,
+                    allowed_cpus.len()
+                );
+            }
+        }
+    }
+
+    if allowed_cpus.is_empty() {
+        eprintln!("Warning: NUMA node selection resulted in no CPUs, using all available");
+        allowed_cpus = online_cpu_list().unwrap_or_else(|| (0..host_cpus).collect());
     }
 
     // Calculate optimal worker count based on NUMA topology when auto mode (workers = 0)

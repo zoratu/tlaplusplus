@@ -365,6 +365,50 @@ pub fn reset_mempolicy() -> Result<()> {
     Ok(())
 }
 
+/// Strictly bind memory allocations to specific NUMA nodes
+/// Unlike set_preferred_node, this FAILS allocations if the nodes are full
+#[cfg(target_os = "linux")]
+pub fn bind_to_nodes(node_ids: &[usize]) -> Result<()> {
+    use std::io::Error;
+
+    if node_ids.is_empty() {
+        return Ok(());
+    }
+
+    // Create nodemask with all specified nodes set
+    let mut nodemask: [libc::c_ulong; 16] = [0; 16]; // Support up to 1024 nodes
+    for &node_id in node_ids {
+        let word_idx = node_id / (std::mem::size_of::<libc::c_ulong>() * 8);
+        let bit_idx = node_id % (std::mem::size_of::<libc::c_ulong>() * 8);
+        if word_idx < nodemask.len() {
+            nodemask[word_idx] |= 1 << bit_idx;
+        }
+    }
+
+    // SAFETY: set_mempolicy is a system call that sets memory policy for the calling thread
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_set_mempolicy,
+            mempolicy::MPOL_BIND,
+            nodemask.as_ptr(),
+            (nodemask.len() * std::mem::size_of::<libc::c_ulong>() * 8) as libc::c_ulong,
+        )
+    };
+
+    if result != 0 {
+        let err = Error::last_os_error();
+        anyhow::bail!("Failed to bind to NUMA nodes {:?}: {}", node_ids, err);
+    }
+
+    Ok(())
+}
+
+/// Strictly bind memory allocations to specific NUMA nodes (no-op on non-Linux)
+#[cfg(not(target_os = "linux"))]
+pub fn bind_to_nodes(_node_ids: &[usize]) -> Result<()> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
