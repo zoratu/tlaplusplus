@@ -1225,10 +1225,17 @@ fn find_top_level_arrow(s: &str) -> Option<usize> {
 /// - `f EXCEPT ![k1] = val, ![k2] = val2` (multiple updates)
 /// - `f EXCEPT ![k] = @ + 1` (@ refers to original value)
 fn try_parse_except(inner: &str) -> Option<CompiledExpr> {
-    // Find "EXCEPT" keyword
-    let except_pos = inner.find(" EXCEPT ")?;
+    // Find "EXCEPT" keyword (may be followed by space or newline)
+    // Try " EXCEPT " first, then " EXCEPT\n"
+    let (except_pos, keyword_len) = if let Some(pos) = inner.find(" EXCEPT ") {
+        (pos, 8) // " EXCEPT " is 8 characters
+    } else if let Some(pos) = inner.find(" EXCEPT\n") {
+        (pos, 8) // " EXCEPT\n" is also 8 characters
+    } else {
+        return None;
+    };
     let base = inner[..except_pos].trim();
-    let updates_str = inner[except_pos + 8..].trim();
+    let updates_str = inner[except_pos + keyword_len..].trim();
 
     if base.is_empty() || updates_str.is_empty() {
         return None;
@@ -1262,9 +1269,10 @@ fn parse_except_updates(s: &str) -> Option<Vec<(Vec<CompiledExpr>, CompiledExpr)
         }
 
         // Find the = sign (not inside brackets)
+        // Note: eq_pos is relative to part[1..], so we add 1 to get the position in part
         let eq_pos = find_top_level_eq(&part[1..])?;
-        let path_str = &part[1..eq_pos + 1].trim();
-        let value_str = part[eq_pos + 2..].trim();
+        let path_str = part[1..1 + eq_pos].trim();
+        let value_str = part[1 + eq_pos + 1..].trim();
 
         // Parse the path: [k1][k2][k3]...
         let path = parse_except_path(path_str)?;
@@ -2391,6 +2399,77 @@ mod tests {
         // After IN, it should be able to split
         let result = split_binary_op("LET x IN a = b", "=");
         assert!(result.is_some(), "split_binary_op should split after IN");
+    }
+
+    #[test]
+    fn test_except_with_record_literal_value() {
+        // Test EXCEPT expression where the replacement value is a record literal
+        // This tests the fix for the bug where EXCEPT followed by newline was not recognized
+        let expr_with_newline = r#"[f EXCEPT
+![key] = [a |-> 1, b |-> 2]]"#;
+        let compiled = compile_expr(expr_with_newline);
+
+        // Should be parsed as FuncExcept, not as RecordLiteral
+        assert!(
+            matches!(compiled, CompiledExpr::FuncExcept(_, _)),
+            "EXCEPT with newline should be parsed as FuncExcept, got: {:?}",
+            compiled
+        );
+
+        // Verify the structure: FuncExcept with one update whose value is a RecordLiteral
+        if let CompiledExpr::FuncExcept(_, updates) = &compiled {
+            assert_eq!(updates.len(), 1, "Should have exactly one update");
+            let (_, value_expr) = &updates[0];
+            assert!(
+                matches!(value_expr, CompiledExpr::RecordLiteral(_)),
+                "Update value should be RecordLiteral, got: {:?}",
+                value_expr
+            );
+            if let CompiledExpr::RecordLiteral(fields) = value_expr {
+                assert_eq!(fields.len(), 2, "Record should have 2 fields");
+                assert_eq!(fields[0].0, "a");
+                assert_eq!(fields[1].0, "b");
+            }
+        }
+    }
+
+    #[test]
+    fn test_except_with_multiline_record_literal() {
+        // Test the specific pattern from the bug report
+        let expr = r#"[serverCharters EXCEPT
+![inode][client] = [
+    issuedClock |-> newClock,
+    givenAccess |-> grantedAccess,
+    isRevoked |-> FALSE
+]]"#;
+        let compiled = compile_expr(expr);
+
+        assert!(
+            matches!(compiled, CompiledExpr::FuncExcept(_, _)),
+            "Should be parsed as FuncExcept, got: {:?}",
+            compiled
+        );
+
+        if let CompiledExpr::FuncExcept(base, updates) = &compiled {
+            // Base should be the serverCharters variable
+            assert!(
+                matches!(base.as_ref(), CompiledExpr::Var(name) if name == "serverCharters"),
+                "Base should be Var(serverCharters), got: {:?}",
+                base
+            );
+
+            // Should have exactly one update with a 2-element path
+            assert_eq!(updates.len(), 1, "Should have exactly one update");
+            let (path, value) = &updates[0];
+            assert_eq!(path.len(), 2, "Path should have 2 elements (inode and client)");
+
+            // Value should be a record literal with 3 fields
+            assert!(
+                matches!(value, CompiledExpr::RecordLiteral(fields) if fields.len() == 3),
+                "Value should be RecordLiteral with 3 fields, got: {:?}",
+                value
+            );
+        }
     }
 }
 
