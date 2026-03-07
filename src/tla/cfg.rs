@@ -48,8 +48,12 @@ pub fn parse_tla_config(input: &str) -> Result<TlaConfig> {
     let mut cfg = TlaConfig::default();
     let mut section: Option<Section> = None;
 
-    for raw_line in input.lines() {
-        let line = strip_comment(raw_line).trim();
+    // First strip block comments (* ... *) which can span multiple lines
+    let input_no_block_comments = strip_block_comments(input);
+
+    for raw_line in input_no_block_comments.lines() {
+        // Then strip line comments \* ...
+        let line = strip_line_comment(raw_line).trim();
         if line.is_empty() {
             continue;
         }
@@ -118,6 +122,20 @@ pub fn parse_tla_config(input: &str) -> Result<TlaConfig> {
         }
 
         if line == "CONSTANT" || line == "CONSTANTS" {
+            section = Some(Section::Constants);
+            continue;
+        }
+        // Handle inline constant assignment: "CONSTANT Name = Value" or "CONSTANT Name <- Op"
+        if let Some(rest) = line
+            .strip_prefix("CONSTANT ")
+            .or(line.strip_prefix("CONSTANTS "))
+        {
+            // Check if this is an assignment (contains = or <-)
+            if rest.contains('=') || rest.contains("<-") {
+                parse_constant_line(rest, &mut cfg)?;
+                continue;
+            }
+            // Otherwise it's just "CONSTANT" with items listed after, fall through to section handling
             section = Some(Section::Constants);
             continue;
         }
@@ -226,11 +244,58 @@ pub fn parse_tla_config(input: &str) -> Result<TlaConfig> {
     Ok(cfg)
 }
 
-fn strip_comment(line: &str) -> &str {
+fn strip_line_comment(line: &str) -> &str {
     match line.find("\\*") {
         Some(i) => &line[..i],
         None => line,
     }
+}
+
+/// Strip TLA+ block comments (* ... *) from input, supporting nested comments.
+/// Returns the input with all block comments replaced by spaces (to preserve spacing).
+fn strip_block_comments(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0;
+    let mut depth = 0;
+
+    while i < chars.len() {
+        // Check for opening comment (*
+        if i + 1 < chars.len() && chars[i] == '(' && chars[i + 1] == '*' {
+            depth += 1;
+            // Replace with spaces to preserve line structure
+            result.push(' ');
+            result.push(' ');
+            i += 2;
+            continue;
+        }
+
+        // Check for closing comment *)
+        if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == ')' {
+            if depth > 0 {
+                depth -= 1;
+                result.push(' ');
+                result.push(' ');
+                i += 2;
+                continue;
+            }
+            // If depth is 0, this is an unmatched *) - just pass through
+        }
+
+        if depth > 0 {
+            // Inside a comment - preserve newlines for line structure, replace others with space
+            if chars[i] == '\n' {
+                result.push('\n');
+            } else {
+                result.push(' ');
+            }
+        } else {
+            result.push(chars[i]);
+        }
+        i += 1;
+    }
+
+    result
 }
 
 fn parse_constant_line(line: &str, cfg: &mut TlaConfig) -> Result<()> {
@@ -522,5 +587,187 @@ mod tests {
             Some(ConfigValue::Tuple(v)) => assert_eq!(v.len(), 2),
             other => panic!("unexpected tuple parse result: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_inline_constant_assignment() {
+        let cfg = parse_tla_config(
+            r#"
+            SPECIFICATION Spec
+            CONSTANT N = 3
+            CONSTANT Flag = TRUE
+            CONSTANT Server = s1
+            CONSTANT Procs = {p1, p2, p3}
+            CONSTANT SeqOp <- BoundedSeq
+            INVARIANT TypeOK
+            "#,
+        )
+        .expect("cfg should parse");
+
+        assert_eq!(cfg.specification.as_deref(), Some("Spec"));
+        assert_eq!(cfg.constants.get("N"), Some(&ConfigValue::Int(3)));
+        assert_eq!(cfg.constants.get("Flag"), Some(&ConfigValue::Bool(true)));
+        assert_eq!(
+            cfg.constants.get("Server"),
+            Some(&ConfigValue::ModelValue("s1".to_string()))
+        );
+        match cfg.constants.get("Procs") {
+            Some(ConfigValue::Set(items)) => {
+                assert_eq!(items.len(), 3);
+                assert_eq!(items[0], ConfigValue::ModelValue("p1".to_string()));
+                assert_eq!(items[1], ConfigValue::ModelValue("p2".to_string()));
+                assert_eq!(items[2], ConfigValue::ModelValue("p3".to_string()));
+            }
+            other => panic!("unexpected Procs parse result: {other:?}"),
+        }
+        assert_eq!(
+            cfg.constants.get("SeqOp"),
+            Some(&ConfigValue::OperatorRef("BoundedSeq".to_string()))
+        );
+        assert_eq!(cfg.invariants, vec!["TypeOK"]);
+    }
+
+    #[test]
+    fn parses_mixed_constant_formats() {
+        // Test mixing inline CONSTANT with block CONSTANTS
+        let cfg = parse_tla_config(
+            r#"
+            CONSTANT A = 1
+            CONSTANTS
+                B = 2
+                C = 3
+            CONSTANT D = 4
+            "#,
+        )
+        .expect("cfg should parse");
+
+        assert_eq!(cfg.constants.get("A"), Some(&ConfigValue::Int(1)));
+        assert_eq!(cfg.constants.get("B"), Some(&ConfigValue::Int(2)));
+        assert_eq!(cfg.constants.get("C"), Some(&ConfigValue::Int(3)));
+        assert_eq!(cfg.constants.get("D"), Some(&ConfigValue::Int(4)));
+    }
+
+    #[test]
+    fn parses_single_line_block_comment() {
+        let cfg = parse_tla_config(
+            r#"
+            (* This is a comment *)
+            SPECIFICATION Spec
+            CONSTANT N = 3
+            "#,
+        )
+        .expect("cfg should parse");
+
+        assert_eq!(cfg.specification.as_deref(), Some("Spec"));
+        assert_eq!(cfg.constants.get("N"), Some(&ConfigValue::Int(3)));
+    }
+
+    #[test]
+    fn parses_inline_block_comment() {
+        let cfg = parse_tla_config(
+            r#"
+            SPECIFICATION Spec
+            CONSTANT N = 3  (* inline comment *)
+            INVARIANT TypeOK
+            "#,
+        )
+        .expect("cfg should parse");
+
+        assert_eq!(cfg.specification.as_deref(), Some("Spec"));
+        assert_eq!(cfg.constants.get("N"), Some(&ConfigValue::Int(3)));
+        assert_eq!(cfg.invariants, vec!["TypeOK"]);
+    }
+
+    #[test]
+    fn parses_multi_line_block_comment() {
+        let cfg = parse_tla_config(
+            r#"
+            (* Multi-line
+               comment here *)
+            SPECIFICATION Spec
+            INVARIANT TypeOK
+            "#,
+        )
+        .expect("cfg should parse");
+
+        assert_eq!(cfg.specification.as_deref(), Some("Spec"));
+        assert_eq!(cfg.invariants, vec!["TypeOK"]);
+    }
+
+    #[test]
+    fn parses_nested_block_comments() {
+        let cfg = parse_tla_config(
+            r#"
+            (* outer (* inner *) outer *)
+            SPECIFICATION Spec
+            CONSTANT N = 5
+            "#,
+        )
+        .expect("cfg should parse");
+
+        assert_eq!(cfg.specification.as_deref(), Some("Spec"));
+        assert_eq!(cfg.constants.get("N"), Some(&ConfigValue::Int(5)));
+    }
+
+    #[test]
+    fn parses_mixed_comment_styles() {
+        let cfg = parse_tla_config(
+            r#"
+            (* block comment *)
+            SPECIFICATION Spec
+            CONSTANT N = 3  \* line comment
+            (* another block *)
+            INVARIANT TypeOK
+            "#,
+        )
+        .expect("cfg should parse");
+
+        assert_eq!(cfg.specification.as_deref(), Some("Spec"));
+        assert_eq!(cfg.constants.get("N"), Some(&ConfigValue::Int(3)));
+        assert_eq!(cfg.invariants, vec!["TypeOK"]);
+    }
+
+    #[test]
+    fn strip_block_comments_basic() {
+        // Check that comment content is removed and replaced with spaces
+        let result = strip_block_comments("hello (* world *) test");
+        assert!(result.contains("hello"));
+        assert!(result.contains("test"));
+        assert!(!result.contains("world"));
+        assert!(!result.contains("(*"));
+        assert!(!result.contains("*)"));
+
+        // Empty after stripping
+        let result = strip_block_comments("(* comment *)");
+        assert!(result.trim().is_empty());
+
+        // No comments - unchanged
+        assert_eq!(strip_block_comments("no comments here"), "no comments here");
+    }
+
+    #[test]
+    fn strip_block_comments_nested() {
+        let result = strip_block_comments("a (* outer (* inner *) outer *) b");
+        assert!(result.contains("a"));
+        assert!(result.contains("b"));
+        assert!(!result.contains("outer"));
+        assert!(!result.contains("inner"));
+        assert!(!result.contains("(*"));
+        assert!(!result.contains("*)"));
+    }
+
+    #[test]
+    fn strip_block_comments_multiline() {
+        let input = "line1\n(* comment\nspanning\nlines *)\nline2";
+        let result = strip_block_comments(input);
+        // Should preserve line structure
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines.len(), 5);
+        assert_eq!(lines[0], "line1");
+        assert_eq!(lines[4], "line2");
+        // Middle lines should be empty/whitespace after stripping
+        assert!(lines[1].trim().is_empty());
+        assert!(lines[2].trim().is_empty());
+        assert!(lines[3].trim().is_empty());
     }
 }
