@@ -105,13 +105,19 @@ DrainComplete(t) ==
     /\ threadState' = [threadState EXCEPT ![t] = "done"]
     /\ UNCHANGED <<queue>>
 
+(* Terminal condition - all threads done *)
+Terminated ==
+    \A t \in Threads: threadState[t] = "done"
+
 (* Next state relation *)
 Next ==
-    \E t \in Threads:
+    \/ \E t \in Threads:
         \/ StealItem(t)
         \/ BatchFull(t)
         \/ WriteBatch(t)
         \/ DrainComplete(t)
+    \* Allow stuttering when terminated (prevents TLC deadlock error)
+    \/ (Terminated /\ UNCHANGED vars)
 
 (* Fairness - each thread eventually gets to act *)
 Fairness ==
@@ -156,7 +162,7 @@ SafetyInvariant ==
 
 (* All threads eventually complete *)
 AllThreadsComplete ==
-    <>(\A t \in Threads: threadState[t] = "done")
+    <>Terminated
 
 (* All items eventually written (no loss) *)
 AllItemsWritten ==
