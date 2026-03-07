@@ -1101,7 +1101,8 @@ impl PageAlignedFingerprintStore {
 
     /// Check if fingerprint exists (read-only, no insert)
     pub fn contains(&self, fp: u64) -> bool {
-        let fp = if fp == 0 { 1 } else { fp };
+        // Route using original fp to match insert path
+        // The shard normalizes fp=0 to fp=1 internally
         let shard_id = self.shard_id_for(fp);
         let shard = &self.shards[shard_id];
         shard.contains(fp)
@@ -1418,6 +1419,60 @@ mod tests {
         let mixed = vec![1, 100, 2, 200, 3];
         store.contains_or_insert_batch(&mixed, &mut seen).unwrap();
         assert_eq!(seen, vec![true, false, true, false, true]);
+    }
+
+    #[test]
+    fn test_edge_case_fingerprints() {
+        // Regression test for fp=0 edge case found by fuzzing
+        // fp=0 is normalized to fp=1 internally, but routing must be consistent
+        let config = FingerprintStoreConfig {
+            shard_count: 4,
+            expected_items: 1000,
+            shard_size_mb: 64,
+        };
+
+        let worker_cpus = vec![Some(0), Some(1), Some(2), Some(3)];
+        let store = PageAlignedFingerprintStore::new(config, &worker_cpus).unwrap();
+
+        // Test fp=0 via single insert
+        assert!(!store.contains_or_insert(0), "fp=0 should be new");
+        assert!(store.contains(0), "fp=0 should exist after insert");
+        assert!(
+            store.contains_or_insert(0),
+            "fp=0 should exist on second insert"
+        );
+
+        // Test fp=u64::MAX
+        assert!(!store.contains_or_insert(u64::MAX), "fp=MAX should be new");
+        assert!(store.contains(u64::MAX), "fp=MAX should exist after insert");
+
+        // Test fp=0 and fp=u64::MAX via batch
+        let fps = vec![0, 1, u64::MAX, u64::MAX - 1];
+        let mut seen = Vec::new();
+
+        // Reset with fresh store
+        let config2 = FingerprintStoreConfig {
+            shard_count: 4,
+            expected_items: 1000,
+            shard_size_mb: 64,
+        };
+        let store2 = PageAlignedFingerprintStore::new(config2, &worker_cpus).unwrap();
+
+        store2.contains_or_insert_batch(&fps, &mut seen).unwrap();
+        assert_eq!(seen, vec![false, false, false, false], "All should be new");
+
+        // Verify all exist via contains
+        for &fp in &fps {
+            assert!(
+                store2.contains(fp),
+                "fp={} should exist after batch insert",
+                fp
+            );
+        }
+
+        // Second batch should find all
+        store2.contains_or_insert_batch(&fps, &mut seen).unwrap();
+        assert_eq!(seen, vec![true, true, true, true], "All should exist");
     }
 
     #[test]
