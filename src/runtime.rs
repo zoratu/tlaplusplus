@@ -106,10 +106,10 @@ impl Default for EngineConfig {
             auto_tune: false,
             enable_fp_persistence: true, // Enable by default for resume support
             use_bloom_fingerprints: false, // Use page-aligned by default (faster)
-            bloom_auto_switch: true, // Enable auto-switch by default
+            bloom_auto_switch: true,     // Enable auto-switch by default
             bloom_switch_threshold: 1_000_000_000, // 1 billion states
             bloom_switch_memory_threshold: 0.85, // 85% memory pressure
-            bloom_switch_fpr: 0.001, // 0.1% FPR after switch
+            bloom_switch_fpr: 0.001,     // 0.1% FPR after switch
         }
     }
 }
