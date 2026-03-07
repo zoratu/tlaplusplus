@@ -35,6 +35,8 @@ pub struct TlaModule {
     pub variables: Vec<String>,
     pub definitions: BTreeMap<String, TlaDefinition>,
     pub instances: BTreeMap<String, TlaModuleInstance>,
+    /// True if module contains PlusCal code (detected via --algorithm marker)
+    pub is_pluscal: bool,
 }
 
 pub fn parse_tla_module_file(path: &Path) -> Result<TlaModule> {
@@ -43,10 +45,22 @@ pub fn parse_tla_module_file(path: &Path) -> Result<TlaModule> {
     let mut module = parse_tla_module_text(&raw)?;
     module.path = path.display().to_string();
 
+    // Detect PlusCal by looking for --algorithm or --fair algorithm marker in the raw text
+    // PlusCal algorithms are typically in block comments: (* --algorithm Name ... *)
+    module.is_pluscal = detect_pluscal(&raw);
+
     // Load module instances
     load_module_instances(&mut module, path)?;
 
     Ok(module)
+}
+
+/// Detect if the module contains PlusCal code by looking for the algorithm marker.
+/// PlusCal specs contain `--algorithm` or `--fair algorithm` inside a block comment.
+fn detect_pluscal(raw: &str) -> bool {
+    // Look for --algorithm or --fair algorithm in the raw text
+    // These markers indicate PlusCal code which generates Init_ and Next_
+    raw.contains("--algorithm") || raw.contains("--fair algorithm")
 }
 
 /// Load modules referenced by INSTANCE declarations
@@ -519,7 +533,7 @@ mod tests {
 
         Init == x = 0 /\\ y = 1
         Next(a) == a' = a + 1
-        ==== 
+        ====
         "#;
 
         let m = parse_tla_module_text(src).expect("parse should work");
@@ -530,5 +544,40 @@ mod tests {
         assert!(m.definitions.contains_key("Init"));
         assert!(m.definitions.contains_key("Next"));
         assert_eq!(m.definitions["Next"].params, vec!["a"]);
+    }
+
+    #[test]
+    fn detect_pluscal_detects_algorithm_marker() {
+        // Test --algorithm marker
+        let pluscal_src = r#"
+        ---- MODULE PlusCal ----
+        (* --algorithm Counter
+        begin
+          skip;
+        end algorithm; *)
+        ====
+        "#;
+        assert!(detect_pluscal(pluscal_src));
+
+        // Test --fair algorithm marker
+        let fair_pluscal_src = r#"
+        ---- MODULE FairPlusCal ----
+        (* --fair algorithm Counter
+        begin
+          skip;
+        end algorithm; *)
+        ====
+        "#;
+        assert!(detect_pluscal(fair_pluscal_src));
+
+        // Test non-PlusCal module
+        let normal_src = r#"
+        ---- MODULE Normal ----
+        VARIABLES x
+        Init == x = 0
+        Next == x' = x + 1
+        ====
+        "#;
+        assert!(!detect_pluscal(normal_src));
     }
 }
