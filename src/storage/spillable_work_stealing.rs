@@ -36,6 +36,10 @@ pub struct SpillableConfig {
     pub worker_spill_buffer_size: usize,
     /// Channel bound per worker (backpressure threshold)
     pub worker_channel_bound: usize,
+    /// Skip segment deletion during checkpoint (use when S3 handles cleanup)
+    /// When true, segments are retained on disk after being consumed.
+    /// S3 sync will upload them, then prune based on min_segment_id.
+    pub defer_segment_deletion: bool,
 }
 
 impl Default for SpillableConfig {
@@ -47,6 +51,7 @@ impl Default for SpillableConfig {
             load_existing: false,
             worker_spill_buffer_size: 4096, // Each worker buffers 4K items locally
             worker_channel_bound: 16,       // 16 batches in flight per worker
+            defer_segment_deletion: false,  // Delete locally by default
         }
     }
 }
@@ -112,6 +117,9 @@ pub struct SpillableWorkStealingQueues<T> {
     /// Flag to pause loader during checkpoint drain (prevents race with drain)
     /// Only set during the actual drain operation, not the whole checkpoint
     checkpoint_draining: Arc<AtomicBool>,
+
+    /// Skip segment deletion during checkpoint (S3 handles cleanup)
+    defer_segment_deletion: bool,
 
     /// Stats
     spill_redirects: AtomicU64,
@@ -195,6 +203,7 @@ where
             stop_signal,
             checkpoint_in_progress,
             checkpoint_draining,
+            defer_segment_deletion: config.defer_segment_deletion,
             spill_redirects: AtomicU64::new(0),
             disk_loads: AtomicU64::new(0),
             spill_batches_sent: AtomicU64::new(0),
@@ -769,11 +778,16 @@ where
             .unwrap_or(4)
             .min(32); // Cap at 32 threads for I/O
         eprintln!(
-            "Checkpoint: calling overflow.parallel_checkpoint_flush with {} threads",
-            num_checkpoint_threads
+            "Checkpoint: calling overflow.parallel_checkpoint_flush with {} threads (defer_delete={})",
+            num_checkpoint_threads, self.defer_segment_deletion
         );
-        self.overflow
-            .parallel_checkpoint_flush(num_checkpoint_threads)?;
+        if self.defer_segment_deletion {
+            self.overflow
+                .parallel_checkpoint_flush_defer_delete(num_checkpoint_threads)?;
+        } else {
+            self.overflow
+                .parallel_checkpoint_flush(num_checkpoint_threads)?;
+        }
         eprintln!("Checkpoint: overflow.parallel_checkpoint_flush completed");
 
         // CRITICAL: Set disk_has_pending_work BEFORE resuming workers/loader.
@@ -1391,6 +1405,26 @@ where
     pub fn cleanup_spill_dir(&self) -> std::io::Result<u64> {
         self.overflow.cleanup_spill_dir()
     }
+
+    /// Take consumed segment paths for external deletion.
+    /// Returns paths of segments that have been loaded into memory.
+    /// IMPORTANT: Call delete_segment_files() after confirming S3 sync.
+    pub fn take_consumed_segments(&self) -> Vec<PathBuf> {
+        self.overflow.take_consumed_segments()
+    }
+
+    /// Delete specific segment files from disk.
+    /// Use this after confirming segments have been synced to S3.
+    pub fn delete_segment_files(paths: &[PathBuf]) {
+        crate::storage::queue::DiskBackedQueue::<()>::delete_segment_files(paths);
+    }
+
+    /// Prune local segment files with ID < min_segment_id.
+    /// Returns the number of segments deleted and bytes freed.
+    /// This is called by S3 after upload to free local disk space.
+    pub fn prune_local_segments(&self, min_segment_id: u64) -> std::io::Result<(u64, u64)> {
+        self.overflow.prune_local_segments(min_segment_id)
+    }
 }
 
 impl<T> Drop for SpillableWorkStealingQueues<T> {
@@ -1425,6 +1459,7 @@ mod tests {
             load_existing: false,
             worker_spill_buffer_size: 50,
             worker_channel_bound: 4,
+            defer_segment_deletion: false,
         };
 
         let (queues, mut workers) = SpillableWorkStealingQueues::<u64>::new(2, vec![0, 0], config)?;
@@ -1459,6 +1494,7 @@ mod tests {
             load_existing: false,
             worker_spill_buffer_size: 10,
             worker_channel_bound: 4,
+            defer_segment_deletion: false,
         };
 
         let (queues, mut workers) = SpillableWorkStealingQueues::<u64>::new(2, vec![0, 0], config)?;
@@ -1522,6 +1558,7 @@ mod tests {
             load_existing: false,
             worker_spill_buffer_size: 20,
             worker_channel_bound: 8,
+            defer_segment_deletion: false,
         };
 
         let num_workers = 8;
@@ -1591,6 +1628,7 @@ mod tests {
             load_existing: false,
             worker_spill_buffer_size: 100,
             worker_channel_bound: 8,
+            defer_segment_deletion: false,
         };
 
         let num_workers = 4;
@@ -1681,6 +1719,7 @@ mod tests {
             load_existing: false,
             worker_spill_buffer_size: 1000,
             worker_channel_bound: 8,
+            defer_segment_deletion: false,
         };
 
         let num_workers = 4;
