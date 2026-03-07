@@ -407,10 +407,7 @@ mod tests {
     #[test]
     fn splits_disjunction_after_simple_quantifier_body() {
         // When the quantifier body doesn't start with \/, subsequent \/ should be split
-        let parts = split_top_level(
-            r"\/ A \/ \E x \in S: (C \/ D) \/ E",
-            "\\/",
-        );
+        let parts = split_top_level(r"\/ A \/ \E x \in S: (C \/ D) \/ E", "\\/");
         // Should split into 3 parts:
         // 1. A
         // 2. \E x \in S: (C \/ D)
