@@ -611,6 +611,84 @@ fn eval_compiled_inner(
             Ok(TlaValue::Function(Arc::new(func)))
         }
 
+        // Function set: [Domain -> Range] - set of all functions from Domain to Range
+        CompiledExpr::FunctionSet { domain, range } => {
+            let domain_val = eval_compiled_inner(domain, ctx, depth + 1)?;
+            let range_val = eval_compiled_inner(range, ctx, depth + 1)?;
+            let domain_set = domain_val.as_set()?;
+            let range_set = range_val.as_set()?;
+
+            // Generate all possible functions from domain to range
+            // For domain of size n and range of size m, there are m^n functions
+            let domain_elems: Vec<TlaValue> = domain_set.iter().cloned().collect();
+            let range_elems: Vec<TlaValue> = range_set.iter().cloned().collect();
+
+            if domain_elems.is_empty() {
+                // Only one function from empty domain: the empty function
+                let empty_func = BTreeMap::new();
+                let mut result = BTreeSet::new();
+                result.insert(TlaValue::Function(Arc::new(empty_func)));
+                return Ok(TlaValue::Set(Arc::new(result)));
+            }
+
+            if range_elems.is_empty() {
+                // No functions from non-empty domain to empty range
+                return Ok(TlaValue::Set(Arc::new(BTreeSet::new())));
+            }
+
+            let n = domain_elems.len();
+            let m = range_elems.len();
+
+            // Limit the size to avoid memory explosion
+            // m^n can be huge; limit to reasonable size
+            let max_functions = 1_000_000usize;
+            let total = (m as u64).saturating_pow(n as u32);
+            if total > max_functions as u64 {
+                return Err(anyhow!(
+                    "function set [D -> R] too large: {} elements in domain, {} in range = {} functions (max {})",
+                    n,
+                    m,
+                    total,
+                    max_functions
+                ));
+            }
+
+            // Generate all functions by iterating through all combinations
+            // Each function is a mapping from each domain element to some range element
+            let mut result = BTreeSet::new();
+
+            // indices[i] is the index into range_elems for domain_elems[i]
+            let mut indices = vec![0usize; n];
+
+            loop {
+                // Build function for current indices
+                let mut func = BTreeMap::new();
+                for (i, d) in domain_elems.iter().enumerate() {
+                    func.insert(d.clone(), range_elems[indices[i]].clone());
+                }
+                result.insert(TlaValue::Function(Arc::new(func)));
+
+                // Increment indices (like counting in base m)
+                let mut carry = true;
+                for i in 0..n {
+                    if carry {
+                        indices[i] += 1;
+                        if indices[i] >= m {
+                            indices[i] = 0;
+                        } else {
+                            carry = false;
+                        }
+                    }
+                }
+                if carry {
+                    // All combinations exhausted
+                    break;
+                }
+            }
+
+            Ok(TlaValue::Set(Arc::new(result)))
+        }
+
         // Operator call - evaluate using compiled expressions
         CompiledExpr::OpCall { name, args } => eval_compiled_opcall(name, args, ctx, depth),
 
