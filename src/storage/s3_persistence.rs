@@ -191,7 +191,11 @@ impl S3Persistence {
         };
 
         eprintln!("S3: Found existing state from run {}", manifest.run_id);
-        eprintln!("S3: Downloading {} files...", manifest.files.len());
+        let total_files = manifest.files.len();
+        eprintln!(
+            "S3: [DOWNLOAD] Starting download of {} files...",
+            total_files
+        );
 
         // Create local directory
         tokio::fs::create_dir_all(&self.local_dir).await?;
@@ -199,6 +203,8 @@ impl S3Persistence {
         // Download all files
         let mut downloaded_bytes = 0u64;
         let mut downloaded_files = 0u64;
+        let start_time = std::time::Instant::now();
+        let mut last_progress_time = start_time;
 
         for (rel_path, file_state) in &manifest.files {
             let local_path = self.local_dir.join(rel_path);
@@ -227,12 +233,36 @@ impl S3Persistence {
             // Track as already uploaded
             self.uploaded_offsets
                 .insert(rel_path.clone(), file_state.uploaded_bytes);
+
+            // Show progress every 2 seconds or every 100 files
+            let now = std::time::Instant::now();
+            if now.duration_since(last_progress_time).as_secs() >= 2 || downloaded_files % 100 == 0
+            {
+                let pct = (downloaded_files as f64 / total_files as f64) * 100.0;
+                let elapsed = now.duration_since(start_time).as_secs_f64();
+                let rate_mbps = if elapsed > 0.0 {
+                    (downloaded_bytes as f64 / 1_048_576.0) / elapsed
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "S3: [DOWNLOAD] {}/{} files ({:.1}%) - {:.1} MB @ {:.1} MB/s",
+                    downloaded_files,
+                    total_files,
+                    pct,
+                    downloaded_bytes as f64 / 1_048_576.0,
+                    rate_mbps
+                );
+                last_progress_time = now;
+            }
         }
 
+        let elapsed = start_time.elapsed().as_secs_f64();
         eprintln!(
-            "S3: Downloaded {} files ({:.2} MB)",
+            "S3: [DOWNLOAD] Complete: {} files ({:.1} MB) in {:.1}s",
             downloaded_files,
-            downloaded_bytes as f64 / 1_048_576.0
+            downloaded_bytes as f64 / 1_048_576.0,
+            elapsed
         );
 
         Ok(DownloadResult::Resumed {
@@ -292,6 +322,22 @@ impl S3Persistence {
 
                 // Periodically prune S3 files that no longer exist locally
                 iteration_count += 1;
+
+                // Log cumulative upload stats periodically
+                if iteration_count % PRUNE_INTERVAL == 0 {
+                    let total_bytes = bytes_uploaded.load(Ordering::Relaxed);
+                    let total_files = files_uploaded.load(Ordering::Relaxed);
+                    if total_files > 0 {
+                        eprintln!(
+                            "S3: [UPLOAD] Cumulative: {} files ({:.1} MB) synced to s3://{}/{}",
+                            total_files,
+                            total_bytes as f64 / 1_048_576.0,
+                            bucket,
+                            prefix
+                        );
+                    }
+                }
+
                 if iteration_count % PRUNE_INTERVAL == 0 {
                     if let Err(e) = prune_deleted_files(
                         &client,
@@ -311,7 +357,7 @@ impl S3Persistence {
 
         self.upload_handle = Some(handle);
         eprintln!(
-            "S3: Started background upload (interval: {}s)",
+            "S3: [UPLOAD] Background sync started (interval: {}s)",
             interval_secs
         );
     }
@@ -345,14 +391,14 @@ impl S3Persistence {
 
         let duration = start.elapsed();
         eprintln!(
-            "S3: Emergency flush complete in {:.2}s ({} files, {:.2} MB)",
+            "S3: [UPLOAD] Emergency flush complete in {:.2}s ({} files, {:.1} MB)",
             duration.as_secs_f64(),
             result.files_uploaded,
             result.bytes_uploaded as f64 / 1_048_576.0
         );
         if result.queue_files_uploaded > 0 {
             eprintln!(
-                "S3:   Including {} queue-spill files ({:.2} MB)",
+                "S3: [UPLOAD]   Including {} queue-spill files ({:.1} MB)",
                 result.queue_files_uploaded,
                 result.queue_bytes_uploaded as f64 / 1_048_576.0
             );
