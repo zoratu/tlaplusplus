@@ -646,14 +646,48 @@ fn resolve_init_next_names(
         }
     }
 
-    let init = init.unwrap_or_else(|| "Init".to_string());
-    let next = next.unwrap_or_else(|| "Next".to_string());
+    let mut init = init.unwrap_or_else(|| "Init".to_string());
+    let mut next = next.unwrap_or_else(|| "Next".to_string());
 
+    // PlusCal fallback: If the requested Init/Next don't exist but this is a PlusCal spec,
+    // try Init_/Next_ which are the names PlusCal generates.
+    // Also try fallback if the config specifies Init/Next but they don't exist in the module.
     if !module.definitions.contains_key(&init) {
-        return Err(anyhow!("Init definition '{init}' not found in module"));
+        let pluscal_init = format!("{}_", init);
+        if module.definitions.contains_key(&pluscal_init) {
+            if module.is_pluscal {
+                // PlusCal detected, silently use the fallback
+                init = pluscal_init;
+            } else {
+                // Not detected as PlusCal but Init_ exists - still use it with a note
+                eprintln!(
+                    "Note: '{}' not found but '{}' exists, using PlusCal-generated name",
+                    init, pluscal_init
+                );
+                init = pluscal_init;
+            }
+        } else {
+            return Err(anyhow!("Init definition '{init}' not found in module"));
+        }
     }
+
     if !module.definitions.contains_key(&next) {
-        return Err(anyhow!("Next definition '{next}' not found in module"));
+        let pluscal_next = format!("{}_", next);
+        if module.definitions.contains_key(&pluscal_next) {
+            if module.is_pluscal {
+                // PlusCal detected, silently use the fallback
+                next = pluscal_next;
+            } else {
+                // Not detected as PlusCal but Next_ exists - still use it with a note
+                eprintln!(
+                    "Note: '{}' not found but '{}' exists, using PlusCal-generated name",
+                    next, pluscal_next
+                );
+                next = pluscal_next;
+            }
+        } else {
+            return Err(anyhow!("Next definition '{next}' not found in module"));
+        }
     }
 
     Ok((init, next))
@@ -1177,5 +1211,140 @@ INVARIANT TypeOK
             invariant_result.is_ok(),
             "unexpected invariant result: {invariant_result:?}"
         );
+    }
+
+    #[test]
+    fn pluscal_naming_fallback_uses_init_underscore_and_next_underscore() {
+        // Test that PlusCal specs with Init_ and Next_ work when config specifies Init/Next
+        let tmp = std::env::temp_dir().join("tlapp-pluscal-naming-test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should be created");
+
+        // Create a spec that mimics PlusCal-generated code:
+        // - Contains --algorithm marker in a comment
+        // - Has Init_ and Next_ instead of Init and Next
+        let module = tmp.join("PlusCal.tla");
+        fs::write(
+            &module,
+            r#"
+---- MODULE PlusCal ----
+EXTENDS Naturals
+
+(* --algorithm Counter
+variables x = 0;
+begin
+  while x < 3 do
+    x := x + 1;
+  end while;
+end algorithm; *)
+
+\* BEGIN TRANSLATION (this is what PlusCal translator generates)
+VARIABLES x, pc
+
+vars == << x, pc >>
+
+Init_ == /\ x = 0
+         /\ pc = "start"
+
+Next_ == \/ /\ pc = "start"
+            /\ x < 3
+            /\ x' = x + 1
+            /\ pc' = pc
+         \/ /\ pc = "start"
+            /\ x >= 3
+            /\ pc' = "Done"
+            /\ x' = x
+         \/ /\ pc = "Done"
+            /\ UNCHANGED <<x, pc>>
+
+Spec == Init_ /\ [][Next_]_vars
+
+TypeOK == x >= 0 /\ x <= 3
+\* END TRANSLATION
+====
+"#,
+        )
+        .expect("module should be written");
+
+        // Config file specifies INIT and NEXT without underscore (standard TLC style)
+        let cfg = tmp.join("PlusCal.cfg");
+        fs::write(
+            &cfg,
+            r#"
+INIT Init
+NEXT Next
+INVARIANT TypeOK
+"#,
+        )
+        .expect("cfg should be written");
+
+        // This should work because the code detects PlusCal and falls back to Init_/Next_
+        let model =
+            TlaModel::from_files(&module, Some(&cfg), None, None).expect("model should build");
+
+        // Verify the correct names were resolved
+        assert_eq!(model.init_name, "Init_");
+        assert_eq!(model.next_name, "Next_");
+
+        // Verify model works correctly
+        let init = model.initial_states();
+        assert_eq!(init.len(), 1);
+        assert_eq!(init[0].get("x"), Some(&TlaValue::Int(0)));
+        assert_eq!(
+            init[0].get("pc"),
+            Some(&TlaValue::String("start".to_string()))
+        );
+
+        let mut next = Vec::new();
+        model.next_states(&init[0], &mut next);
+        assert!(!next.is_empty());
+        assert!(model.check_invariants(&init[0]).is_ok());
+    }
+
+    #[test]
+    fn pluscal_fallback_works_without_algorithm_marker() {
+        // Test that fallback also works when Init_ exists but --algorithm is not present
+        // (e.g., hand-written spec that happens to use Init_/Next_ naming)
+        let tmp = std::env::temp_dir().join("tlapp-pluscal-fallback-no-marker");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should be created");
+
+        let module = tmp.join("ManualUnderscore.tla");
+        fs::write(
+            &module,
+            r#"
+---- MODULE ManualUnderscore ----
+EXTENDS Naturals
+VARIABLES x
+
+Init_ == x = 0
+Next_ == x' = x + 1 \/ UNCHANGED x
+TypeOK == x >= 0
+====
+"#,
+        )
+        .expect("module should be written");
+
+        let cfg = tmp.join("ManualUnderscore.cfg");
+        fs::write(
+            &cfg,
+            r#"
+INIT Init
+NEXT Next
+INVARIANT TypeOK
+"#,
+        )
+        .expect("cfg should be written");
+
+        // Should still work - fallback to Init_/Next_ even without PlusCal marker
+        let model =
+            TlaModel::from_files(&module, Some(&cfg), None, None).expect("model should build");
+
+        assert_eq!(model.init_name, "Init_");
+        assert_eq!(model.next_name, "Next_");
+
+        let init = model.initial_states();
+        assert_eq!(init.len(), 1);
+        assert!(model.check_invariants(&init[0]).is_ok());
     }
 }
