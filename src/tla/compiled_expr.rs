@@ -434,6 +434,12 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
     // Conjunction: /\
     let and_parts = split_top_level(expr, "/\\");
     if and_parts.len() > 1 {
+        if std::env::var("TLAPP_TRACE_AND").is_ok() {
+            eprintln!("AND split ({} parts):", and_parts.len());
+            for (i, p) in and_parts.iter().enumerate() {
+                eprintln!("  [{i}]: {}", p.chars().take(200).collect::<String>());
+            }
+        }
         return CompiledExpr::And(and_parts.into_iter().map(|s| compile_expr(&s)).collect());
     }
 
@@ -708,11 +714,36 @@ fn split_top_level(expr: &str, delim: &str) -> Vec<String> {
     let mut let_depth: usize = 0; // Track LET...IN nesting
     let mut if_depth: usize = 0; // Track IF...ELSE nesting
     let mut case_depth: usize = 0; // Track CASE expression nesting
-    let mut in_quantifier_body = false; // Track if we're in a quantifier body
+    // Track quantifier body with its base indentation level
+    // When we see a quantifier, we record its indentation. Any nested quantifier
+    // with greater indentation is part of the body, not a new top-level conjunct.
+    let mut quantifier_base_indent: Option<usize> = None;
     let mut in_string = false;
     let chars: Vec<char> = expr.chars().collect();
     let delim_chars: Vec<char> = delim.chars().collect();
     let mut i = 0;
+
+    // Helper to get indentation at position i (looking back to last newline)
+    let get_indent_at = |pos: usize, chars: &[char]| -> usize {
+        // Find the last newline before this position
+        let mut newline_pos = 0;
+        for j in (0..pos).rev() {
+            if chars[j] == '\n' {
+                newline_pos = j + 1;
+                break;
+            }
+        }
+        // Count whitespace from newline to first non-whitespace
+        let mut indent = 0;
+        for j in newline_pos..pos {
+            if chars[j].is_whitespace() && chars[j] != '\n' {
+                indent += 1;
+            } else {
+                break;
+            }
+        }
+        indent
+    };
 
     while i < chars.len() {
         let c = chars[i];
@@ -816,7 +847,10 @@ fn split_top_level(expr: &str, delim: &str) -> Vec<String> {
                         ')' | ']' | '}' => inner_depth -= 1,
                         ':' if inner_depth == 0 => {
                             // Found the colon - everything after this is quantifier body
-                            in_quantifier_body = true;
+                            // Only set base indent if we don't already have one (outermost wins)
+                            if quantifier_base_indent.is_none() {
+                                quantifier_base_indent = Some(get_indent_at(i, &chars));
+                            }
                             // Push everything up to and including the colon
                             for k in i..=j {
                                 current.push(chars[k]);
@@ -840,19 +874,35 @@ fn split_top_level(expr: &str, delim: &str) -> Vec<String> {
             let remaining: String = chars[i..].iter().collect();
             if remaining.starts_with(delim) {
                 // If we're in a quantifier body, check if what follows is a new quantifier
-                // If so, we should split here (the quantifier body ends)
-                // If not, we should NOT split (still inside quantifier body)
-                if in_quantifier_body {
+                // If so, we should split here ONLY if it's at the SAME indentation level
+                // (not more indented, which would indicate a nested quantifier)
+                if let Some(base_indent) = quantifier_base_indent {
                     // Look ahead past the delimiter and whitespace
                     let after_delim = &remaining[delim.len()..].trim_start();
-                    // If what follows is \A or \E, this is a new top-level conjunct
+                    // If what follows is \A or \E, this MIGHT be a new top-level conjunct
                     let starts_new_quantifier = after_delim.starts_with("\\A ")
                         || after_delim.starts_with("\\A(")
                         || after_delim.starts_with("\\E ")
                         || after_delim.starts_with("\\E(");
-                    if starts_new_quantifier {
+
+                    // Check if we're at the start of a line
+                    let is_at_line_start = i == 0 || {
+                        let before: String = chars[..i].iter().collect();
+                        let last_newline = before.rfind('\n').unwrap_or(0);
+                        let since_newline = &before[last_newline..];
+                        since_newline.trim().is_empty() || since_newline.trim() == "\n"
+                    };
+
+                    // Get the indentation of this delimiter
+                    let this_indent = get_indent_at(i, &chars);
+
+                    // Only split if:
+                    // 1. It starts a new quantifier AND
+                    // 2. It's at line start AND
+                    // 3. It's at the SAME or LESS indentation as the base (not nested)
+                    if starts_new_quantifier && is_at_line_start && this_indent <= base_indent {
                         // End current quantifier body, split here
-                        in_quantifier_body = false;
+                        quantifier_base_indent = None;
                         if !current.trim().is_empty() {
                             parts.push(current.trim().to_string());
                         }
@@ -1073,6 +1123,13 @@ fn parse_func_apply(expr: &str) -> Option<(&str, Vec<String>)> {
                 .get(4)
                 .map_or(false, |c| c.is_ascii_alphanumeric()))
     {
+        return None;
+    }
+
+    // Prefix operators like DOMAIN and SUBSET bind tighter than function application
+    // DOMAIN f[x] should be DOMAIN(f[x]), not (DOMAIN f)[x]
+    // Similarly, SUBSET S[x] should be SUBSET(S[x]), not (SUBSET S)[x]
+    if trimmed.starts_with("DOMAIN ") || trimmed.starts_with("SUBSET ") {
         return None;
     }
 
@@ -1663,7 +1720,7 @@ fn try_parse_exists(expr: &str) -> Option<CompiledExpr> {
     // Try to parse multiple separate bindings: "x \in S, y \in T"
     if let Some(bindings) = parse_multiple_bindings(binding) {
         // Convert to nested exists
-        let compiled_body = compile_expr(body);
+        let compiled_body = compile_quantifier_body(body);
         let mut result = compiled_body;
         for (var, domain) in bindings.into_iter().rev() {
             result = CompiledExpr::Exists {
@@ -1678,7 +1735,7 @@ fn try_parse_exists(expr: &str) -> Option<CompiledExpr> {
     // Try multi-variable binding with same domain: "i, j \in S"
     if let Some((vars, domain)) = parse_multi_in_binding(binding) {
         // Convert to nested exists: \E i \in S : \E j \in S : body
-        let compiled_body = compile_expr(body);
+        let compiled_body = compile_quantifier_body(body);
         let compiled_domain = compile_expr(domain);
 
         // Build from inside out
@@ -1699,8 +1756,99 @@ fn try_parse_exists(expr: &str) -> Option<CompiledExpr> {
     Some(CompiledExpr::Exists {
         var: var.to_string(),
         domain: Box::new(compile_expr(domain)),
-        body: Box::new(compile_expr(body)),
+        body: Box::new(compile_quantifier_body(body)),
     })
+}
+
+/// Compile a quantifier body without splitting at the top level.
+/// Quantifier bodies extend to the end of the expression, so we should NOT
+/// split them on /\ or \/ unless that's part of the body structure.
+fn compile_quantifier_body(body: &str) -> CompiledExpr {
+    let body = body.trim();
+
+    // If the body is wrapped in parentheses, strip them and compile normally
+    let stripped = strip_outer_parens(body);
+    if stripped != body {
+        return compile_expr(stripped);
+    }
+
+    // If the body starts with /\ it's a conjunction (bullet list syntax)
+    // We need to handle this specially to preserve the quantifier scope
+    if body.starts_with("/\\") || body.starts_with("\\/") {
+        // The body IS the conjunction/disjunction - compile it directly
+        // But we need to prevent re-splitting, so we handle it here
+        let is_and = body.starts_with("/\\");
+        let delim = if is_and { "/\\" } else { "\\/" };
+
+        // Split but preserve quantifier bodies
+        let parts = split_quantifier_body_conjuncts(body, delim);
+
+        if parts.len() > 1 {
+            let compiled_parts: Vec<CompiledExpr> =
+                parts.into_iter().map(|s| compile_expr(&s)).collect();
+            return if is_and {
+                CompiledExpr::And(compiled_parts)
+            } else {
+                CompiledExpr::Or(compiled_parts)
+            };
+        } else if parts.len() == 1 {
+            // Single part - compile it directly (the split already stripped the /\ prefix)
+            return compile_expr(&parts[0]);
+        }
+    }
+
+    // Otherwise compile normally
+    compile_expr(body)
+}
+
+/// Split a quantifier body's conjunction/disjunction WITHOUT splitting
+/// nested quantifier bodies. Uses indentation to determine scope.
+fn split_quantifier_body_conjuncts(body: &str, delim: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut base_indent: Option<usize> = None;
+
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            current.push('\n');
+            continue;
+        }
+
+        let line_indent = line.chars().take_while(|c| c.is_whitespace()).count();
+
+        // If line starts with the delimiter at base indent level, start a new part
+        if trimmed.starts_with(delim) {
+            if let Some(base) = base_indent {
+                if line_indent <= base {
+                    // This is a new top-level part
+                    if !current.trim().is_empty() {
+                        parts.push(current.trim().to_string());
+                    }
+                    // Start new part without the leading delimiter
+                    current = trimmed[delim.len()..].trim().to_string();
+                    continue;
+                }
+            } else {
+                // First part - set base indent
+                base_indent = Some(line_indent);
+                current = trimmed[delim.len()..].trim().to_string();
+                continue;
+            }
+        }
+
+        // Continue current part
+        if !current.is_empty() {
+            current.push('\n');
+        }
+        current.push_str(trimmed);
+    }
+
+    if !current.trim().is_empty() {
+        parts.push(current.trim().to_string());
+    }
+
+    parts
 }
 
 fn try_parse_forall(expr: &str) -> Option<CompiledExpr> {
@@ -1715,7 +1863,7 @@ fn try_parse_forall(expr: &str) -> Option<CompiledExpr> {
     // Try to parse multiple separate bindings: "x \in S, y \in T"
     if let Some(bindings) = parse_multiple_bindings(binding) {
         // Convert to nested forall
-        let compiled_body = compile_expr(body);
+        let compiled_body = compile_quantifier_body(body);
         let mut result = compiled_body;
         for (var, domain) in bindings.into_iter().rev() {
             result = CompiledExpr::Forall {
@@ -1730,7 +1878,7 @@ fn try_parse_forall(expr: &str) -> Option<CompiledExpr> {
     // Try multi-variable binding with same domain: "i, j \in S"
     if let Some((vars, domain)) = parse_multi_in_binding(binding) {
         // Convert to nested forall: \A i \in S : \A j \in S : body
-        let compiled_body = compile_expr(body);
+        let compiled_body = compile_quantifier_body(body);
         let compiled_domain = compile_expr(domain);
 
         // Build from inside out
@@ -1751,7 +1899,7 @@ fn try_parse_forall(expr: &str) -> Option<CompiledExpr> {
     Some(CompiledExpr::Forall {
         var: var.to_string(),
         domain: Box::new(compile_expr(domain)),
-        body: Box::new(compile_expr(body)),
+        body: Box::new(compile_quantifier_body(body)),
     })
 }
 
@@ -2512,7 +2660,11 @@ mod tests {
             // Should have exactly one update with a 2-element path
             assert_eq!(updates.len(), 1, "Should have exactly one update");
             let (path, value) = &updates[0];
-            assert_eq!(path.len(), 2, "Path should have 2 elements (inode and client)");
+            assert_eq!(
+                path.len(),
+                2,
+                "Path should have 2 elements (inode and client)"
+            );
 
             // Value should be a record literal with 3 fields
             assert!(
@@ -2615,31 +2767,94 @@ fn test_domain_with_function_application() {
     // NOT as FuncApply(Domain(f), [x]) which would be incorrect
     let expr = compile_expr("DOMAIN leases[s]");
     match &expr {
-        CompiledExpr::Domain(inner) => {
-            match inner.as_ref() {
-                CompiledExpr::FuncApply(func, args) => {
+        CompiledExpr::Domain(inner) => match inner.as_ref() {
+            CompiledExpr::FuncApply(func, args) => {
+                assert!(
+                    matches!(func.as_ref(), CompiledExpr::Var(name) if name == "leases"),
+                    "Expected FuncApply of 'leases', got: {:?}",
+                    func
+                );
+                assert_eq!(args.len(), 1, "Expected 1 argument");
+                assert!(
+                    matches!(&args[0], CompiledExpr::Var(name) if name == "s"),
+                    "Expected argument 's', got: {:?}",
+                    args[0]
+                );
+            }
+            other => panic!(
+                "DOMAIN f[x] should have FuncApply inside Domain, got: {:?}",
+                other
+            ),
+        },
+        other => panic!("DOMAIN f[x] should parse as Domain, got: {:?}", other),
+    }
+}
+
+#[test]
+fn test_nested_quantifiers_in_typeok_pattern() {
+    // This tests the exact pattern from ClusterLeaseFailover's TypeOK:
+    // \A s \in Shards :
+    //     /\ shardTerm[s] \in 0..MaxTerm
+    //     /\ \A c \in Clients :
+    //         /\ leases[s][c].held \in BOOLEAN
+    let expr_str = r#"\A s \in Shards :
+/\ shardTerm[s] \in 0..MaxTerm
+/\ \A c \in Clients :
+    /\ leases[s][c].held \in BOOLEAN"#;
+
+    let expr = compile_expr(expr_str);
+    println!("Nested quantifier compiled: {:#?}", expr);
+
+    // The outer \A s should contain the body including the inner \A c
+    // The inner \A c should be able to reference 's'
+    match &expr {
+        CompiledExpr::Forall {
+            var: outer_var,
+            body: outer_body,
+            ..
+        } => {
+            assert_eq!(outer_var, "s", "Outer var should be 's'");
+
+            // The body should be And with the nested quantifier inside
+            match outer_body.as_ref() {
+                CompiledExpr::And(parts) => {
+                    println!("Outer body is And with {} parts", parts.len());
+                    // One of the parts should be the inner Forall
+                    let has_inner_forall = parts
+                        .iter()
+                        .any(|p| matches!(p, CompiledExpr::Forall { var, .. } if var == "c"));
                     assert!(
-                        matches!(func.as_ref(), CompiledExpr::Var(name) if name == "leases"),
-                        "Expected FuncApply of 'leases', got: {:?}",
-                        func
+                        has_inner_forall,
+                        "Should have inner Forall with var 'c'. Parts: {:#?}",
+                        parts
                     );
-                    assert_eq!(args.len(), 1, "Expected 1 argument");
-                    assert!(
-                        matches!(&args[0], CompiledExpr::Var(name) if name == "s"),
-                        "Expected argument 's', got: {:?}",
-                        args[0]
-                    );
+
+                    // Check that the inner forall's body correctly has the conjunction
+                    for part in parts {
+                        if let CompiledExpr::Forall {
+                            var,
+                            body: inner_body,
+                            ..
+                        } = part
+                        {
+                            if var == "c" {
+                                println!("Inner Forall body: {:#?}", inner_body);
+                                // The inner body should be an In check with proper FuncApply
+                                // Make sure it's not a SetMinus with Unparsed
+                                let body_str = format!("{:?}", inner_body);
+                                assert!(
+                                    !body_str.contains("Unparsed"),
+                                    "Inner body should not have Unparsed parts: {:#?}",
+                                    inner_body
+                                );
+                            }
+                        }
+                    }
                 }
-                other => panic!(
-                    "DOMAIN f[x] should have FuncApply inside Domain, got: {:?}",
-                    other
-                ),
+                _ => panic!("Outer body should be And, got: {:#?}", outer_body),
             }
         }
-        other => panic!(
-            "DOMAIN f[x] should parse as Domain, got: {:?}",
-            other
-        ),
+        _ => panic!("Expected outer Forall, got: {:#?}", expr),
     }
 }
 
@@ -2681,26 +2896,115 @@ fn test_domain_equality() {
 }
 
 #[test]
+fn test_domain_leases_s_compilation() {
+    // This tests DOMAIN leases[s] = Clients pattern from TypeOK
+    let expr_str = "DOMAIN leases[s] = Clients";
+    let expr = compile_expr(expr_str);
+    println!("Compiled: {:#?}", expr);
+
+    // Should be Eq(Domain(FuncApply(leases, [s])), Var(Clients))
+    match &expr {
+        CompiledExpr::Eq(left, right) => {
+            // Left should be Domain(FuncApply(leases, [s]))
+            match left.as_ref() {
+                CompiledExpr::Domain(inner) => match inner.as_ref() {
+                    CompiledExpr::FuncApply(func, args) => {
+                        assert!(
+                            matches!(func.as_ref(), CompiledExpr::Var(name) if name == "leases"),
+                            "Function should be 'leases', got: {:#?}",
+                            func
+                        );
+                        assert_eq!(args.len(), 1);
+                        assert!(
+                            matches!(&args[0], CompiledExpr::Var(name) if name == "s"),
+                            "Arg should be 's', got: {:#?}",
+                            args[0]
+                        );
+                    }
+                    _ => panic!("Domain inner should be FuncApply, got: {:#?}", inner),
+                },
+                _ => panic!("Left should be Domain, got: {:#?}", left),
+            }
+            // Right should be Var(Clients)
+            assert!(
+                matches!(right.as_ref(), CompiledExpr::Var(name) if name == "Clients"),
+                "Right should be Var(Clients), got: {:#?}",
+                right
+            );
+        }
+        _ => panic!("Expected Eq, got: {:#?}", expr),
+    }
+}
+
+#[test]
 fn test_subset_with_function_application() {
     // Similar test for SUBSET prefix operator
     let expr = compile_expr("SUBSET sets[i]");
     match &expr {
-        CompiledExpr::PowerSet(inner) => {
-            match inner.as_ref() {
-                CompiledExpr::FuncApply(func, args) => {
-                    assert!(
-                        matches!(func.as_ref(), CompiledExpr::Var(name) if name == "sets"),
-                        "Expected FuncApply of 'sets', got: {:?}",
-                        func
-                    );
-                    assert_eq!(args.len(), 1);
+        CompiledExpr::PowerSet(inner) => match inner.as_ref() {
+            CompiledExpr::FuncApply(func, args) => {
+                assert!(
+                    matches!(func.as_ref(), CompiledExpr::Var(name) if name == "sets"),
+                    "Expected FuncApply of 'sets', got: {:?}",
+                    func
+                );
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!(
+                "SUBSET f[x] should have FuncApply inside PowerSet, got: {:?}",
+                other
+            ),
+        },
+        other => panic!("Expected PowerSet, got: {:?}", other),
+    }
+}
+
+#[test]
+fn test_full_typeok_body_compilation() {
+    // Full TypeOK body with leading spaces as preserved from module parser
+    let expr_str = r#"/\ DOMAIN shardTerm = Shards
+/\ DOMAIN shardLeader = Shards
+/\ DOMAIN leases = Shards
+/\ \A s \in Shards :
+    /\ shardTerm[s] \in 0..MaxTerm
+    /\ shardLeader[s] \in {"none", "stable", "electing"}
+    /\ DOMAIN leases[s] = Clients
+    /\ \A c \in Clients :
+        /\ leases[s][c].held \in BOOLEAN
+        /\ leases[s][c].grantedTerm \in 0..MaxTerm
+        /\ leases[s][c].access \in {"none", "read", "write", "exclusive"}"#;
+
+    let expr = compile_expr(expr_str);
+    println!("Full TypeOK compiled: {:#?}", expr);
+
+    // Should be And with 4 parts
+    match &expr {
+        CompiledExpr::And(parts) => {
+            println!("And with {} parts", parts.len());
+            assert_eq!(parts.len(), 4, "TypeOK should have 4 top-level conjuncts");
+
+            // Last part should be Forall
+            match &parts[3] {
+                CompiledExpr::Forall { var, body, .. } => {
+                    assert_eq!(var, "s", "Outer forall var should be 's'");
+                    println!("Outer Forall body: {:#?}", body);
+
+                    // Body should be And with 4 parts (check s, check leader, DOMAIN, inner forall)
+                    match body.as_ref() {
+                        CompiledExpr::And(inner_parts) => {
+                            println!("Inner And with {} parts", inner_parts.len());
+                            // Check we have the nested forall with var c
+                            let has_inner_forall = inner_parts.iter().any(
+                                |p| matches!(p, CompiledExpr::Forall { var, .. } if var == "c"),
+                            );
+                            assert!(has_inner_forall, "Should have inner Forall with var 'c'");
+                        }
+                        _ => panic!("Forall body should be And, got: {:#?}", body),
+                    }
                 }
-                other => panic!(
-                    "SUBSET f[x] should have FuncApply inside PowerSet, got: {:?}",
-                    other
-                ),
+                _ => panic!("4th part should be Forall, got: {:#?}", parts[3]),
             }
         }
-        other => panic!("Expected PowerSet, got: {:?}", other),
+        _ => panic!("Expected And, got: {:#?}", expr),
     }
 }

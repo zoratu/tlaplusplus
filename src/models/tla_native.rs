@@ -433,6 +433,12 @@ fn resolve_invariant_exprs(module: &TlaModule, cfg: &TlaConfig) -> Vec<(String, 
             if let Some(def) = module.definitions.get(inv)
                 && def.params.is_empty()
             {
+                if std::env::var("TLAPP_TRACE_INVARIANT").is_ok() {
+                    eprintln!(
+                        "=== Invariant '{}' body ===\n{}\n=== End ===",
+                        inv, def.body
+                    );
+                }
                 return (inv.clone(), def.body.clone());
             }
             (inv.clone(), inv.clone())
