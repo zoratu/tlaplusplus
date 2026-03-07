@@ -1352,6 +1352,13 @@ where
         self.overflow.segment_paths()
     }
 
+    /// Get the minimum segment ID needed for resume.
+    /// Returns the ID of the oldest segment in the queue, or None if no segments exist.
+    /// This is used by S3 pruning to determine which segments can be safely deleted.
+    pub fn get_min_segment_id(&self) -> Option<u64> {
+        self.overflow.get_min_segment_id()
+    }
+
     /// Clean up all segment files in the spill directory
     /// Call this after confirming segments have been uploaded to S3
     /// CAUTION: Only call if you're sure the segments are safely backed up elsewhere!

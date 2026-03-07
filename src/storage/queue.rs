@@ -829,6 +829,32 @@ where
         self.segments.lock().iter().cloned().collect()
     }
 
+    /// Get the minimum segment ID needed for resume.
+    /// Returns the ID of the oldest segment in the queue, or None if no segments exist.
+    /// This is used by S3 pruning to determine which segments can be safely deleted.
+    pub fn get_min_segment_id(&self) -> Option<u64> {
+        let segments = self.segments.lock();
+
+        // Find the minimum segment ID from all segment paths
+        segments
+            .iter()
+            .filter_map(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| {
+                        if name.starts_with("segment-") && name.ends_with(".bin") {
+                            let id_str = name
+                                .trim_start_matches("segment-")
+                                .trim_end_matches(".bin");
+                            id_str.parse::<u64>().ok()
+                        } else {
+                            None
+                        }
+                    })
+            })
+            .min()
+    }
+
     /// Get the spill directory path
     pub fn spill_dir_path(&self) -> &Path {
         &self.spill_dir_path
@@ -996,6 +1022,41 @@ mod tests {
         assert_eq!(out[199], 199);
 
         resumed.shutdown()?;
+        let _ = std::fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_min_segment_id() -> Result<()> {
+        let dir = temp_path("queue-min-segment");
+        let queue = DiskBackedQueue::<u64>::new(DiskQueueConfig {
+            spill_dir: dir.clone(),
+            inmem_limit: 8, // Small to force spilling
+            spill_batch: 4,
+            spill_channel_bound: 8,
+            load_existing_segments: false,
+        })?;
+
+        // Initially, no segments - should return None
+        assert_eq!(queue.get_min_segment_id(), None);
+
+        // Push enough items to trigger spilling
+        for i in 0..100u64 {
+            queue.push(i)?;
+        }
+
+        // Wait for spill to complete
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Should have segments now - min_segment_id should be 0 or close to it
+        let min_id = queue.get_min_segment_id();
+        if queue.segment_count() > 0 {
+            assert!(min_id.is_some(), "Should have min_segment_id when segments exist");
+            // First segment starts at 0
+            assert!(min_id.unwrap() < 10, "First segments should have low IDs");
+        }
+
+        queue.shutdown()?;
         let _ = std::fs::remove_dir_all(dir);
         Ok(())
     }
