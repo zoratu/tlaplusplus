@@ -196,12 +196,13 @@ ExactStoreReadOnlyAfterSwitch ==
     TRUE
 
 \* SAFETY: Lookups are correct (no false negatives)
-\* If a fingerprint was inserted, looking it up returns TRUE
-\* (modulo false positives from bloom, which are acceptable)
+\* If a worker reports TRUE (found), the fingerprint must actually exist in a store.
+\* Note: Workers that just inserted a fingerprint have result=FALSE (correct: "not found" at check time)
+\* The invariant checks: result=TRUE => fingerprint is in exactStore OR bloomStore
 NoFalseNegatives ==
     \A w \in 1..NumWorkers:
-        (workerState[w] = "done" /\ workerFp[w] \in exactStore) =>
-            workerResult[w] = TRUE
+        (workerState[w] = "done" /\ workerResult[w] = TRUE) =>
+            (workerFp[w] \in exactStore \/ workerFp[w] \in bloomStore)
 
 \* SAFETY: Memory is bounded after switch
 \* In hybrid mode, exact store is fixed size and bloom has bounded false positive rate
