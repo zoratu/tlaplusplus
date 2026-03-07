@@ -10,7 +10,7 @@ use crate::storage::page_aligned_fingerprint_store::FingerprintStats;
 use crate::storage::queue::{DiskBackedQueue, QueueStats};
 use crate::storage::spillable_work_stealing::{SpillableConfig, SpillableWorkStealingQueues};
 use crate::storage::unified_fingerprint_store::{
-    UnifiedFingerprintConfig, UnifiedFingerprintStore,
+    AutoSwitchConfigInput, UnifiedFingerprintConfig, UnifiedFingerprintStore,
 };
 use crate::system::{
     MemoryMonitor, MemoryStatus, WorkerPlan, WorkerPlanRequest, build_worker_plan,
@@ -63,6 +63,14 @@ pub struct EngineConfig {
     pub enable_fp_persistence: bool,
     /// Use bloom filter for fingerprints (bounded memory, ~1% false positive rate)
     pub use_bloom_fingerprints: bool,
+    /// Enable automatic switching from exact to bloom filter under memory/state pressure
+    pub bloom_auto_switch: bool,
+    /// State count threshold to trigger bloom auto-switch
+    pub bloom_switch_threshold: u64,
+    /// Memory pressure threshold (0.0-1.0) to trigger bloom auto-switch
+    pub bloom_switch_memory_threshold: f64,
+    /// False positive rate for bloom filter after auto-switch
+    pub bloom_switch_fpr: f64,
 }
 
 impl Default for EngineConfig {
@@ -96,6 +104,10 @@ impl Default for EngineConfig {
             auto_tune: false,
             enable_fp_persistence: true, // Enable by default for resume support
             use_bloom_fingerprints: false, // Use page-aligned by default (faster)
+            bloom_auto_switch: true, // Enable auto-switch by default
+            bloom_switch_threshold: 1_000_000_000, // 1 billion states
+            bloom_switch_memory_threshold: 0.85, // 85% memory pressure
+            bloom_switch_fpr: 0.001, // 0.1% FPR after switch
         }
     }
 }
@@ -745,14 +757,26 @@ where
         }
     }
 
-    // Create unified fingerprint store (either page-aligned or bloom filter)
+    // Create unified fingerprint store (page-aligned, bloom, or auto-switch)
+    let auto_switch_config = if config.bloom_auto_switch {
+        Some(AutoSwitchConfigInput {
+            state_count_threshold: Some(config.bloom_switch_threshold),
+            memory_threshold: Some(config.bloom_switch_memory_threshold),
+            bloom_false_positive_rate: Some(config.bloom_switch_fpr),
+        })
+    } else {
+        None
+    };
+
     let fp_config = UnifiedFingerprintConfig {
         use_bloom: config.use_bloom_fingerprints,
+        use_auto_switch: config.bloom_auto_switch && !config.use_bloom_fingerprints,
         shard_count,
         expected_items: config.fp_expected_items,
         false_positive_rate: config.fp_false_positive_rate,
         shard_size_mb,
         num_numa_nodes: worker_plan.numa_nodes_used.max(1),
+        auto_switch_config,
     };
 
     let mut fp_store = UnifiedFingerprintStore::new(fp_config, &worker_plan.assigned_cpus)?;
