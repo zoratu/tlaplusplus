@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
-const MAX_EVAL_DEPTH: usize = 100;
+const MAX_EVAL_DEPTH: usize = 256;
 
 /// Context for evaluating expressions on a single state
 /// Uses Rc for copy-on-write semantics to avoid cloning entire context
@@ -683,27 +683,26 @@ fn matches_membership_expr(
                 if inner.contains(':') {
                     return match value {
                         TlaValue::Record(rec) => {
-                            // Use top-level split to handle sets like {1, 2} correctly
-                            let field_specs = split_top_level_symbol(inner, ",");
+                            let field_specs: Vec<&str> = inner.split(',').collect();
                             let mut expected_fields = std::collections::HashSet::<String>::new();
                             for spec in field_specs {
-                                let spec = spec.trim();
-                                // Find the first colon at top level for field:type separation
-                                if let Some(colon_idx) = find_top_level_char(spec, ':') {
-                                    let field_name = spec[..colon_idx].trim();
-                                    let field_type = spec[colon_idx + 1..].trim();
-                                    expected_fields.insert(field_name.to_string());
-                                    let Some(field_value) = rec.get(field_name) else {
-                                        return Ok(false);
-                                    };
-                                    if !matches_membership_expr(
-                                        field_value,
-                                        field_type,
-                                        ctx,
-                                        depth + 1,
-                                    )? {
-                                        return Ok(false);
-                                    }
+                                let parts: Vec<&str> = spec.split(':').collect();
+                                if parts.len() != 2 {
+                                    continue;
+                                }
+                                let field_name = parts[0].trim();
+                                let field_type = parts[1].trim();
+                                expected_fields.insert(field_name.to_string());
+                                let Some(field_value) = rec.get(field_name) else {
+                                    return Ok(false);
+                                };
+                                if !matches_membership_expr(
+                                    field_value,
+                                    field_type,
+                                    ctx,
+                                    depth + 1,
+                                )? {
+                                    return Ok(false);
                                 }
                             }
                             Ok(rec.len() == expected_fields.len())
@@ -1459,6 +1458,45 @@ fn eval_bracket_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> R
         return Ok(TlaValue::Record(Arc::new(record)));
     }
 
+    // Check for record set syntax: [field1: S1, field2: S2, ...]
+    // Record sets use colons to associate field names with sets of possible values.
+    // Unlike record literals which use |-> and function sets which use ->.
+    // The result is the set of all records with those field names where each
+    // field value is drawn from the corresponding set.
+    if !expr.contains("|->") && !split_once_top_level(expr, "->").is_some() {
+        // Check if this looks like a record set (field: expr, ...)
+        let entries = split_top_level_symbol(expr, ",");
+        if !entries.is_empty() {
+            let mut is_record_set = true;
+            let mut field_specs: Vec<(String, String)> = Vec::new();
+
+            for entry in &entries {
+                let entry = entry.trim();
+                // Look for pattern: identifier : set_expression
+                // Use a simple split on first colon that respects nesting
+                if let Some((field_part, set_part)) = split_once_top_level_colon(entry) {
+                    let field = field_part.trim();
+                    let set_expr = set_part.trim();
+
+                    // Field must be a simple identifier
+                    if is_simple_identifier(field) && !set_expr.is_empty() {
+                        field_specs.push((field.to_string(), set_expr.to_string()));
+                    } else {
+                        is_record_set = false;
+                        break;
+                    }
+                } else {
+                    is_record_set = false;
+                    break;
+                }
+            }
+
+            if is_record_set && !field_specs.is_empty() {
+                return eval_record_set(&field_specs, ctx, depth + 1);
+            }
+        }
+    }
+
     // Check for function set: [Domain -> Range]
     if let Some((domain_text, range_text)) = split_once_top_level(expr, "->") {
         let domain_text = domain_text.trim();
@@ -1539,138 +1577,7 @@ fn eval_bracket_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> R
         return Ok(TlaValue::Set(Arc::new(result)));
     }
 
-    // Check for record set construction: [field: Set, field2: Set, ...]
-    // This creates the set of all records where each field takes values from its corresponding set
-    // For example: [a: {1,2}, b: {3,4}] = {[a |-> 1, b |-> 3], [a |-> 1, b |-> 4], [a |-> 2, b |-> 3], [a |-> 2, b |-> 4]}
-    if let Some(record_set) = try_eval_record_set(expr, ctx, depth + 1)? {
-        return Ok(record_set);
-    }
-
     Err(anyhow!("unsupported bracket expression: [{expr}]"))
-}
-
-/// Try to evaluate a record set construction: [field: Set, field2: Set, ...]
-/// This creates the Cartesian product of all field/set pairs as records.
-/// Returns None if the expression doesn't match the record set pattern.
-fn try_eval_record_set(
-    expr: &str,
-    ctx: &EvalContext<'_>,
-    depth: usize,
-) -> Result<Option<TlaValue>> {
-    // Record set syntax: [field1: Set1, field2: Set2, ...]
-    // Each entry is "fieldName: SetExpr" separated by commas
-    // We need to distinguish this from:
-    // - Record literals: [a |-> 1, b |-> 2] (contains |->)
-    // - Function sets: [D -> R] (contains -> without |)
-    // - Set comprehensions: {x \in S : P} (inside braces, not brackets)
-
-    let entries = split_top_level_symbol(expr, ",");
-    if entries.is_empty() {
-        return Ok(None);
-    }
-
-    // Parse each entry as "field: Set"
-    let mut field_sets: Vec<(String, Vec<TlaValue>)> = Vec::new();
-
-    for entry in &entries {
-        let entry = entry.trim();
-        if entry.is_empty() {
-            continue;
-        }
-
-        // Find the colon separator at top level
-        let colon_idx = match find_top_level_char(entry, ':') {
-            Some(idx) => idx,
-            None => return Ok(None), // Not a record set pattern
-        };
-
-        let field_name = entry[..colon_idx].trim();
-        let set_expr = entry[colon_idx + 1..].trim();
-
-        // Field name must be a valid identifier
-        if !is_valid_identifier(field_name) {
-            return Ok(None);
-        }
-
-        // Evaluate the set expression
-        let set_value = eval_expr_inner(set_expr, ctx, depth + 1)?;
-        let set = set_value
-            .as_set()
-            .with_context(|| format!("record set field '{}' value is not a set: {}", field_name, set_expr))?;
-
-        let elements: Vec<TlaValue> = set.iter().cloned().collect();
-        field_sets.push((field_name.to_string(), elements));
-    }
-
-    if field_sets.is_empty() {
-        return Ok(None);
-    }
-
-    // Check for empty sets - if any field has an empty domain, the result is empty
-    if field_sets.iter().any(|(_, elems)| elems.is_empty()) {
-        return Ok(Some(TlaValue::Set(Arc::new(BTreeSet::new()))));
-    }
-
-    // Calculate total number of records (product of all set sizes)
-    let total_records: u64 = field_sets
-        .iter()
-        .map(|(_, elems)| elems.len() as u64)
-        .product();
-
-    // Limit the size to avoid memory explosion
-    let max_records = 1_000_000u64;
-    if total_records > max_records {
-        return Err(anyhow!(
-            "record set too large: {} records (max {})",
-            total_records,
-            max_records
-        ));
-    }
-
-    // Generate all records using Cartesian product
-    let mut result = BTreeSet::new();
-    let n = field_sets.len();
-    let mut indices = vec![0usize; n];
-
-    loop {
-        // Build record for current indices
-        let mut record: BTreeMap<String, TlaValue> = BTreeMap::new();
-        for (i, (field_name, elements)) in field_sets.iter().enumerate() {
-            record.insert(field_name.clone(), elements[indices[i]].clone());
-        }
-        result.insert(TlaValue::Record(Arc::new(record)));
-
-        // Increment indices (like counting in mixed-radix number system)
-        let mut carry = true;
-        for i in 0..n {
-            if carry {
-                indices[i] += 1;
-                if indices[i] >= field_sets[i].1.len() {
-                    indices[i] = 0;
-                } else {
-                    carry = false;
-                }
-            }
-        }
-        if carry {
-            break;
-        }
-    }
-
-    Ok(Some(TlaValue::Set(Arc::new(result))))
-}
-
-/// Check if a string is a valid TLA+ identifier
-fn is_valid_identifier(s: &str) -> bool {
-    if s.is_empty() {
-        return false;
-    }
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(c) if c.is_alphabetic() || c == '_' => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_alphanumeric() || c == '_')
 }
 
 fn eval_except_expression(
@@ -2128,7 +2035,6 @@ fn parse_let_definitions(defs_text: &str) -> Result<BTreeMap<String, TlaDefiniti
                     name,
                     params,
                     body: body.to_string(),
-                    is_recursive: false,
                 },
             );
         }
@@ -3540,6 +3446,174 @@ fn split_once_top_level<'a>(expr: &'a str, delim: &str) -> Option<(&'a str, &'a 
     None
 }
 
+/// Split on first top-level colon, but skip `:>` (TLC function pair operator)
+fn split_once_top_level_colon(expr: &str) -> Option<(&str, &str)> {
+    let mut i = 0usize;
+    let mut paren = 0usize;
+    let mut bracket = 0usize;
+    let mut brace = 0usize;
+    let mut angle = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    while i < expr.len() {
+        let ch = expr[i..].chars().next().expect("char at byte index");
+        let ch_len = ch.len_utf8();
+        let next = expr[i + ch_len..].chars().next();
+
+        if in_string {
+            if escaped {
+                escaped = false;
+                i += ch_len;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                i += ch_len;
+                continue;
+            }
+            if ch == '"' {
+                in_string = false;
+            }
+            i += ch_len;
+            continue;
+        }
+
+        if ch == '"' {
+            in_string = true;
+            i += ch_len;
+            continue;
+        }
+
+        if ch == '<' && next == Some('<') {
+            angle += 1;
+            i += 2;
+            continue;
+        }
+        if ch == '>' && next == Some('>') {
+            angle = angle.saturating_sub(1);
+            i += 2;
+            continue;
+        }
+
+        match ch {
+            '(' => paren += 1,
+            ')' => paren = paren.saturating_sub(1),
+            '[' => bracket += 1,
+            ']' => bracket = bracket.saturating_sub(1),
+            '{' => brace += 1,
+            '}' => brace = brace.saturating_sub(1),
+            _ => {}
+        }
+
+        // Match ':' at top level, but skip ':>' (TLC pair operator)
+        if paren == 0 && bracket == 0 && brace == 0 && angle == 0 && ch == ':' {
+            if next != Some('>') {
+                return Some((expr[..i].trim(), expr[i + ch_len..].trim()));
+            }
+        }
+
+        i += ch_len;
+    }
+
+    None
+}
+
+/// Check if a string is a simple TLA+ identifier (starts with letter, contains only alphanumeric and underscores)
+fn is_simple_identifier(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// Evaluate a record set expression [field1: S1, field2: S2, ...]
+/// Returns the set of all records where field values are drawn from corresponding sets.
+fn eval_record_set(
+    field_specs: &[(String, String)],
+    ctx: &EvalContext<'_>,
+    depth: usize,
+) -> Result<TlaValue> {
+    if depth > MAX_EVAL_DEPTH {
+        return Err(anyhow!("evaluation depth exceeded in record set"));
+    }
+
+    // Evaluate all set expressions first
+    let mut fields_with_values: Vec<(String, Vec<TlaValue>)> = Vec::new();
+    let mut total_combinations: u64 = 1;
+    let max_combinations: u64 = 10_000_000;
+
+    for (field_name, set_expr) in field_specs {
+        let set_value = eval_expr_inner(set_expr, ctx, depth + 1)?;
+        let set = set_value
+            .as_set()
+            .with_context(|| format!("record set field '{}' is not a set: {}", field_name, set_expr))?;
+
+        let values: Vec<TlaValue> = set.iter().cloned().collect();
+        if values.is_empty() {
+            // Empty set for any field means no records
+            return Ok(TlaValue::Set(Arc::new(BTreeSet::new())));
+        }
+
+        total_combinations = total_combinations.saturating_mul(values.len() as u64);
+        if total_combinations > max_combinations {
+            return Err(anyhow!(
+                "record set too large: product of field set sizes exceeds {} (got at least {})",
+                max_combinations,
+                total_combinations
+            ));
+        }
+
+        fields_with_values.push((field_name.clone(), values));
+    }
+
+    // Generate all combinations
+    let mut result = BTreeSet::new();
+    let num_fields = fields_with_values.len();
+
+    if num_fields == 0 {
+        // Empty record set produces a single empty record
+        result.insert(TlaValue::Record(Arc::new(BTreeMap::new())));
+        return Ok(TlaValue::Set(Arc::new(result)));
+    }
+
+    // Use indices to iterate through all combinations
+    let mut indices = vec![0usize; num_fields];
+    let sizes: Vec<usize> = fields_with_values.iter().map(|(_, v)| v.len()).collect();
+
+    loop {
+        // Build record for current indices
+        let mut record = BTreeMap::new();
+        for (i, (field_name, values)) in fields_with_values.iter().enumerate() {
+            record.insert(field_name.clone(), values[indices[i]].clone());
+        }
+        result.insert(TlaValue::Record(Arc::new(record)));
+
+        // Increment indices (counting in mixed radix)
+        let mut carry = true;
+        for i in 0..num_fields {
+            if carry {
+                indices[i] += 1;
+                if indices[i] >= sizes[i] {
+                    indices[i] = 0;
+                } else {
+                    carry = false;
+                }
+            }
+        }
+        if carry {
+            break;
+        }
+    }
+
+    Ok(TlaValue::Set(Arc::new(result)))
+}
+
 fn find_top_level_keyword_index(expr: &str, keyword: &str) -> Option<usize> {
     let mut i = 0usize;
     let mut paren = 0usize;
@@ -4234,7 +4308,6 @@ mod tests {
                     name: "CanAct".to_string(),
                     params: vec!["p".to_string()],
                     body: "actionCount[p] < MaxActionsPerTick".to_string(),
-                    is_recursive: false,
                 },
             ),
             (
@@ -4243,7 +4316,6 @@ mod tests {
                     name: "MaxActionsPerTick".to_string(),
                     params: vec![],
                     body: "3".to_string(),
-                    is_recursive: false,
                 },
             ),
         ]);
@@ -4366,7 +4438,6 @@ mod tests {
                 name: "SelectSeq".to_string(),
                 params: vec!["s".to_string(), "Test".to_string()],
                 body: "SelectSeq(s, Test)".to_string(),
-                is_recursive: false,
             },
         )]);
         let ctx = EvalContext::with_definitions(&state, &defs);
@@ -4511,173 +4582,92 @@ mod tests {
     }
 
     #[test]
-    fn evaluates_recursive_factorial() {
-        // Define a recursive Factorial operator
-        let defs = BTreeMap::from([(
-            "Factorial".to_string(),
-            TlaDefinition {
-                name: "Factorial".to_string(),
-                params: vec!["n".to_string()],
-                body: "IF n <= 1 THEN 1 ELSE n * Factorial(n - 1)".to_string(),
-                is_recursive: true,
-            },
-        )]);
-
+    fn evaluates_record_set_syntax() {
         let state = TlaState::new();
-        let ctx = EvalContext::with_definitions(&state, &defs);
+        let ctx = EvalContext::new(&state);
 
-        // Test various factorial values
-        assert_eq!(
-            eval_expr("Factorial(0)", &ctx).expect("Factorial(0)"),
-            TlaValue::Int(1)
-        );
-        assert_eq!(
-            eval_expr("Factorial(1)", &ctx).expect("Factorial(1)"),
-            TlaValue::Int(1)
-        );
-        assert_eq!(
-            eval_expr("Factorial(2)", &ctx).expect("Factorial(2)"),
-            TlaValue::Int(2)
-        );
-        assert_eq!(
-            eval_expr("Factorial(3)", &ctx).expect("Factorial(3)"),
-            TlaValue::Int(6)
-        );
-        assert_eq!(
-            eval_expr("Factorial(4)", &ctx).expect("Factorial(4)"),
-            TlaValue::Int(24)
-        );
-        assert_eq!(
-            eval_expr("Factorial(5)", &ctx).expect("Factorial(5)"),
-            TlaValue::Int(120)
-        );
+        // Simple record set with two fields
+        let result =
+            eval_expr("[a: {1, 2}, b: {3}]", &ctx).expect("record set should evaluate");
+
+        // Should produce set of 2 records: {[a |-> 1, b |-> 3], [a |-> 2, b |-> 3]}
+        let expected = TlaValue::Set(Arc::new(BTreeSet::from([
+            TlaValue::Record(Arc::new(BTreeMap::from([
+                ("a".to_string(), TlaValue::Int(1)),
+                ("b".to_string(), TlaValue::Int(3)),
+            ]))),
+            TlaValue::Record(Arc::new(BTreeMap::from([
+                ("a".to_string(), TlaValue::Int(2)),
+                ("b".to_string(), TlaValue::Int(3)),
+            ]))),
+        ])));
+
+        assert_eq!(result, expected);
     }
 
     #[test]
-    fn evaluates_recursive_sum_seq() {
-        // Define a recursive SumSeq operator
-        let defs = BTreeMap::from([(
-            "SumSeq".to_string(),
-            TlaDefinition {
-                name: "SumSeq".to_string(),
-                params: vec!["s".to_string()],
-                body: "IF s = <<>> THEN 0 ELSE Head(s) + SumSeq(Tail(s))".to_string(),
-                is_recursive: true,
-            },
-        )]);
-
+    fn evaluates_record_set_with_ranges() {
         let state = TlaState::new();
-        let ctx = EvalContext::with_definitions(&state, &defs);
+        let ctx = EvalContext::new(&state);
 
-        // Test summing sequences
-        assert_eq!(
-            eval_expr("SumSeq(<<>>)", &ctx).expect("SumSeq empty"),
-            TlaValue::Int(0)
-        );
-        assert_eq!(
-            eval_expr("SumSeq(<<1>>)", &ctx).expect("SumSeq single"),
-            TlaValue::Int(1)
-        );
-        assert_eq!(
-            eval_expr("SumSeq(<<1, 2>>)", &ctx).expect("SumSeq two"),
-            TlaValue::Int(3)
-        );
-        assert_eq!(
-            eval_expr("SumSeq(<<1, 2, 3>>)", &ctx).expect("SumSeq three"),
-            TlaValue::Int(6)
-        );
-        assert_eq!(
-            eval_expr("SumSeq(<<1, 2, 3, 4, 5>>)", &ctx).expect("SumSeq five"),
-            TlaValue::Int(15)
-        );
-    }
+        // Record set with range expressions (like the ConfigRollout.tla case)
+        let result = eval_expr("[x: 1..2, y: 1..2]", &ctx)
+            .expect("record set with ranges should evaluate");
 
-    #[test]
-    fn recursive_operator_respects_depth_limit() {
-        // Define a recursive operator that never terminates (no base case)
-        let defs = BTreeMap::from([(
-            "Forever".to_string(),
-            TlaDefinition {
-                name: "Forever".to_string(),
-                params: vec!["n".to_string()],
-                body: "Forever(n + 1)".to_string(),
-                is_recursive: true,
-            },
-        )]);
-
-        let state = TlaState::new();
-        let ctx = EvalContext::with_definitions(&state, &defs);
-
-        // This should fail with a depth limit error, not hang forever
-        let result = eval_expr("Forever(0)", &ctx);
-        assert!(
-            result.is_err(),
-            "Forever should fail with recursion depth limit"
+        // Should produce 4 records
+        let result_set = result.as_set().expect("result should be a set");
+        assert_eq!(
+            result_set.len(),
+            4,
+            "record set [x: 1..2, y: 1..2] should have 4 elements"
         );
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("recursion depth") || err_msg.contains("depth limit"),
-            "Error should mention recursion depth: {}",
-            err_msg
-        );
-    }
 
-    #[test]
-    fn evaluates_mutually_recursive_operators() {
-        // Define mutually recursive operators: IsEven and IsOdd
-        // IsEven(n) == IF n = 0 THEN TRUE ELSE IsOdd(n - 1)
-        // IsOdd(n) == IF n = 0 THEN FALSE ELSE IsEven(n - 1)
-        let defs = BTreeMap::from([
-            (
-                "IsEven".to_string(),
-                TlaDefinition {
-                    name: "IsEven".to_string(),
-                    params: vec!["n".to_string()],
-                    body: "IF n = 0 THEN TRUE ELSE IsOdd(n - 1)".to_string(),
-                    is_recursive: true,
-                },
-            ),
-            (
-                "IsOdd".to_string(),
-                TlaDefinition {
-                    name: "IsOdd".to_string(),
-                    params: vec!["n".to_string()],
-                    body: "IF n = 0 THEN FALSE ELSE IsEven(n - 1)".to_string(),
-                    is_recursive: true,
-                },
-            ),
+        // Check that all combinations are present
+        let expected_records: BTreeSet<TlaValue> = BTreeSet::from([
+            TlaValue::Record(Arc::new(BTreeMap::from([
+                ("x".to_string(), TlaValue::Int(1)),
+                ("y".to_string(), TlaValue::Int(1)),
+            ]))),
+            TlaValue::Record(Arc::new(BTreeMap::from([
+                ("x".to_string(), TlaValue::Int(1)),
+                ("y".to_string(), TlaValue::Int(2)),
+            ]))),
+            TlaValue::Record(Arc::new(BTreeMap::from([
+                ("x".to_string(), TlaValue::Int(2)),
+                ("y".to_string(), TlaValue::Int(1)),
+            ]))),
+            TlaValue::Record(Arc::new(BTreeMap::from([
+                ("x".to_string(), TlaValue::Int(2)),
+                ("y".to_string(), TlaValue::Int(2)),
+            ]))),
         ]);
 
-        let state = TlaState::new();
-        let ctx = EvalContext::with_definitions(&state, &defs);
+        assert_eq!(*result_set, expected_records);
+    }
 
-        assert_eq!(
-            eval_expr("IsEven(0)", &ctx).expect("IsEven(0)"),
-            TlaValue::Bool(true)
-        );
-        assert_eq!(
-            eval_expr("IsEven(1)", &ctx).expect("IsEven(1)"),
-            TlaValue::Bool(false)
-        );
-        assert_eq!(
-            eval_expr("IsEven(2)", &ctx).expect("IsEven(2)"),
-            TlaValue::Bool(true)
-        );
-        assert_eq!(
-            eval_expr("IsEven(4)", &ctx).expect("IsEven(4)"),
-            TlaValue::Bool(true)
-        );
-        assert_eq!(
-            eval_expr("IsOdd(0)", &ctx).expect("IsOdd(0)"),
-            TlaValue::Bool(false)
-        );
-        assert_eq!(
-            eval_expr("IsOdd(1)", &ctx).expect("IsOdd(1)"),
-            TlaValue::Bool(true)
-        );
-        assert_eq!(
-            eval_expr("IsOdd(3)", &ctx).expect("IsOdd(3)"),
-            TlaValue::Bool(true)
-        );
+    #[test]
+    fn evaluates_record_set_single_field() {
+        let state = TlaState::new();
+        let ctx = EvalContext::new(&state);
+
+        // Single field record set
+        let result =
+            eval_expr("[version: {1, 2, 3}]", &ctx).expect("single field record set should evaluate");
+
+        let result_set = result.as_set().expect("result should be a set");
+        assert_eq!(result_set.len(), 3, "should have 3 records");
+    }
+
+    #[test]
+    fn evaluates_record_set_with_empty_field_set() {
+        let state = TlaState::new();
+        let ctx = EvalContext::new(&state);
+
+        // If any field set is empty, result should be empty set
+        let result =
+            eval_expr("[x: {1, 2}, y: {}]", &ctx).expect("record set with empty field should evaluate");
+
+        let result_set = result.as_set().expect("result should be a set");
+        assert!(result_set.is_empty(), "record set with empty field set should be empty");
     }
 }

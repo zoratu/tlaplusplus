@@ -7,7 +7,7 @@ use crate::tla::compiled_expr::{CompiledExpr, compile_expr, find_top_level_colon
 use crate::tla::eval::{EvalContext, eval_expr};
 use crate::tla::formula::split_top_level;
 use crate::tla::value::TlaValue;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
@@ -746,6 +746,77 @@ fn eval_compiled_inner(
                 }
                 if carry {
                     // All combinations exhausted
+                    break;
+                }
+            }
+
+            Ok(TlaValue::Set(Arc::new(result)))
+        }
+
+        // Record set: [field1: S1, field2: S2, ...] - set of all records
+        CompiledExpr::RecordSet { fields } => {
+            // Evaluate all field sets
+            let mut fields_with_values: Vec<(String, Vec<TlaValue>)> = Vec::new();
+            let mut total_combinations: u64 = 1;
+            let max_combinations: u64 = 10_000_000;
+
+            for (field_name, set_expr) in fields {
+                let set_value = eval_compiled_inner(set_expr, ctx, depth + 1)?;
+                let set = set_value.as_set().with_context(|| {
+                    format!("record set field '{}' is not a set", field_name)
+                })?;
+
+                let values: Vec<TlaValue> = set.iter().cloned().collect();
+                if values.is_empty() {
+                    // Empty set for any field means no records
+                    return Ok(TlaValue::Set(Arc::new(BTreeSet::new())));
+                }
+
+                total_combinations = total_combinations.saturating_mul(values.len() as u64);
+                if total_combinations > max_combinations {
+                    return Err(anyhow!(
+                        "record set too large: product of field set sizes exceeds {}",
+                        max_combinations
+                    ));
+                }
+
+                fields_with_values.push((field_name.clone(), values));
+            }
+
+            // Generate all combinations
+            let mut result = BTreeSet::new();
+            let num_fields = fields_with_values.len();
+
+            if num_fields == 0 {
+                // Empty record set produces a single empty record
+                result.insert(TlaValue::Record(Arc::new(BTreeMap::new())));
+                return Ok(TlaValue::Set(Arc::new(result)));
+            }
+
+            let mut indices = vec![0usize; num_fields];
+            let sizes: Vec<usize> = fields_with_values.iter().map(|(_, v)| v.len()).collect();
+
+            loop {
+                // Build record for current indices
+                let mut record = BTreeMap::new();
+                for (i, (field_name, values)) in fields_with_values.iter().enumerate() {
+                    record.insert(field_name.clone(), values[indices[i]].clone());
+                }
+                result.insert(TlaValue::Record(Arc::new(record)));
+
+                // Increment indices (counting in mixed radix)
+                let mut carry = true;
+                for i in 0..num_fields {
+                    if carry {
+                        indices[i] += 1;
+                        if indices[i] >= sizes[i] {
+                            indices[i] = 0;
+                        } else {
+                            carry = false;
+                        }
+                    }
+                }
+                if carry {
                     break;
                 }
             }

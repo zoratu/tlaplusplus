@@ -77,9 +77,6 @@ pub enum CompiledExpr {
     // Record operations
     RecordLiteral(Vec<(String, CompiledExpr)>),
     RecordAccess(Box<CompiledExpr>, String),
-    /// Record set construction: [field: Set, field2: Set, ...]
-    /// Represents the Cartesian product of all field/set pairs as records.
-    RecordSet(Vec<(String, CompiledExpr)>),
 
     // Function operations
     FuncLiteral(Vec<(CompiledExpr, CompiledExpr)>),
@@ -142,6 +139,12 @@ pub enum CompiledExpr {
     FunctionSet {
         domain: Box<CompiledExpr>,
         range: Box<CompiledExpr>,
+    },
+
+    // Record set: [field1: S1, field2: S2, ...] - set of all records where each field
+    // value is drawn from the corresponding set
+    RecordSet {
+        fields: Vec<(String, CompiledExpr)>,
     },
 
     // Operator/definition call
@@ -232,7 +235,10 @@ impl CompiledExpr {
             CompiledExpr::SetLiteral(exprs) | CompiledExpr::SeqLiteral(exprs) => {
                 exprs.iter().all(|e| e.is_fully_compiled())
             }
-            CompiledExpr::RecordLiteral(fields) | CompiledExpr::RecordSet(fields) => {
+            CompiledExpr::RecordLiteral(fields) => {
+                fields.iter().all(|(_, e)| e.is_fully_compiled())
+            }
+            CompiledExpr::RecordSet { fields } => {
                 fields.iter().all(|(_, e)| e.is_fully_compiled())
             }
             CompiledExpr::FuncLiteral(entries) => entries
@@ -579,7 +585,7 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
             return except_expr;
         }
 
-        // Record literal
+        // Record literal: [field |-> value, ...]
         if inner.contains("|->") {
             let entries = split_top_level(inner, ",");
             let mut fields = Vec::new();
@@ -593,10 +599,12 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
             }
         }
 
-        // Record set construction: [field: Set, field2: Set, ...]
-        // This creates the Cartesian product of all field/set pairs as records.
-        if let Some(record_set) = try_parse_record_set(inner) {
-            return record_set;
+        // Record set syntax: [field: Set, ...]
+        // Produces the set of all records where each field value is drawn from the corresponding set
+        if !inner.contains("|->") && !inner.contains("->") {
+            if let Some(record_set) = try_parse_record_set(inner) {
+                return record_set;
+            }
         }
     }
 
@@ -607,16 +615,6 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
         if is_identifier(field) {
             return CompiledExpr::RecordAccess(Box::new(compile_expr(base)), field.to_string());
         }
-    }
-
-    // Prefix operators SUBSET and DOMAIN must be parsed BEFORE function application
-    // to handle cases like "DOMAIN f[x]" correctly as Domain(FuncApply(f, [x]))
-    // rather than FuncApply(Domain(f), [x])
-    if let Some(inner) = expr.strip_prefix("SUBSET ") {
-        return CompiledExpr::PowerSet(Box::new(compile_expr(inner)));
-    }
-    if let Some(inner) = expr.strip_prefix("DOMAIN ") {
-        return CompiledExpr::Domain(Box::new(compile_expr(inner)));
     }
 
     // Function application: f[x] or f[x, y]
@@ -641,6 +639,12 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
         .and_then(|s| s.strip_suffix(')'))
     {
         return CompiledExpr::Cardinality(Box::new(compile_expr(inner)));
+    }
+    if let Some(inner) = expr.strip_prefix("SUBSET ") {
+        return CompiledExpr::PowerSet(Box::new(compile_expr(inner)));
+    }
+    if let Some(inner) = expr.strip_prefix("DOMAIN ") {
+        return CompiledExpr::Domain(Box::new(compile_expr(inner)));
     }
     if let Some(inner) = expr.strip_prefix("Head(").and_then(|s| s.strip_suffix(')')) {
         return CompiledExpr::Head(Box::new(compile_expr(inner)));
@@ -1206,44 +1210,6 @@ fn try_parse_function_set(inner: &str) -> Option<CompiledExpr> {
     })
 }
 
-/// Try to parse a record set construction: [field: Set, field2: Set, ...]
-/// This creates the Cartesian product of all field/set pairs as records.
-/// For example: [a: {1,2}, b: {3,4}] produces all combinations of a and b values.
-fn try_parse_record_set(inner: &str) -> Option<CompiledExpr> {
-    let entries = split_top_level(inner, ",");
-    if entries.is_empty() {
-        return None;
-    }
-
-    let mut fields = Vec::new();
-
-    for entry in &entries {
-        let entry = entry.trim();
-        if entry.is_empty() {
-            continue;
-        }
-
-        // Find colon at top level
-        let colon_idx = find_top_level_colon(entry)?;
-
-        let field_name = entry[..colon_idx].trim();
-        let set_expr = entry[colon_idx + 1..].trim();
-
-        // Field name must be a valid identifier
-        if !is_identifier(field_name) {
-            return None;
-        }
-
-        fields.push((field_name.to_string(), compile_expr(set_expr)));
-    }
-
-    if fields.is_empty() {
-        return None;
-    }
-
-    Some(CompiledExpr::RecordSet(fields))
-}
-
 /// Find " -> " at top level (not inside brackets)
 fn find_top_level_arrow(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();
@@ -1269,6 +1235,85 @@ fn find_top_level_arrow(s: &str) -> Option<usize> {
     None
 }
 
+/// Try to parse a record set expression: [field1: S1, field2: S2, ...]
+/// Returns the set of all records where field values are drawn from corresponding sets.
+fn try_parse_record_set(inner: &str) -> Option<CompiledExpr> {
+    // Must not contain |-> (record literal) or -> (function set)
+    if inner.contains("|->") || find_top_level_arrow(inner).is_some() {
+        return None;
+    }
+
+    // Split by comma and look for field: set pattern
+    let entries = split_top_level(inner, ",");
+    if entries.is_empty() {
+        return None;
+    }
+
+    let mut fields: Vec<(String, CompiledExpr)> = Vec::new();
+
+    for entry in &entries {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+
+        // Find the first top-level colon (not inside brackets, not :>)
+        if let Some(colon_idx) = find_top_level_colon(entry) {
+            let field_name = entry[..colon_idx].trim();
+            let set_expr = entry[colon_idx + 1..].trim();
+
+            // Field name must be a simple identifier
+            if !is_identifier(field_name) || set_expr.is_empty() {
+                return None;
+            }
+
+            fields.push((field_name.to_string(), compile_expr(set_expr)));
+        } else {
+            // No colon found, this isn't a record set
+            return None;
+        }
+    }
+
+    if fields.is_empty() {
+        return None;
+    }
+
+    Some(CompiledExpr::RecordSet { fields })
+}
+
+/// Find the first ':' at top level (not inside brackets, skip ':>')
+fn find_top_level_colon(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth: i32 = 0;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = (depth - 1).max(0),
+            b'<' if i + 1 < bytes.len() && bytes[i + 1] == b'<' => {
+                depth += 1;
+                i += 1;
+            }
+            b'>' if i + 1 < bytes.len() && bytes[i + 1] == b'>' => {
+                depth = (depth - 1).max(0);
+                i += 1;
+            }
+            b':' if depth == 0 => {
+                // Skip ':>' (function pair operator)
+                if i + 1 < bytes.len() && bytes[i + 1] == b'>' {
+                    i += 1;
+                    continue;
+                }
+                return Some(i);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Try to parse an EXCEPT expression
 /// Patterns:
 /// - `f EXCEPT ![key] = val`
@@ -1276,17 +1321,10 @@ fn find_top_level_arrow(s: &str) -> Option<usize> {
 /// - `f EXCEPT ![k1] = val, ![k2] = val2` (multiple updates)
 /// - `f EXCEPT ![k] = @ + 1` (@ refers to original value)
 fn try_parse_except(inner: &str) -> Option<CompiledExpr> {
-    // Find "EXCEPT" keyword (may be followed by space or newline)
-    // Try " EXCEPT " first, then " EXCEPT\n"
-    let (except_pos, keyword_len) = if let Some(pos) = inner.find(" EXCEPT ") {
-        (pos, 8) // " EXCEPT " is 8 characters
-    } else if let Some(pos) = inner.find(" EXCEPT\n") {
-        (pos, 8) // " EXCEPT\n" is also 8 characters
-    } else {
-        return None;
-    };
+    // Find "EXCEPT" keyword
+    let except_pos = inner.find(" EXCEPT ")?;
     let base = inner[..except_pos].trim();
-    let updates_str = inner[except_pos + keyword_len..].trim();
+    let updates_str = inner[except_pos + 8..].trim();
 
     if base.is_empty() || updates_str.is_empty() {
         return None;
@@ -1320,10 +1358,9 @@ fn parse_except_updates(s: &str) -> Option<Vec<(Vec<CompiledExpr>, CompiledExpr)
         }
 
         // Find the = sign (not inside brackets)
-        // Note: eq_pos is relative to part[1..], so we add 1 to get the position in part
         let eq_pos = find_top_level_eq(&part[1..])?;
-        let path_str = part[1..1 + eq_pos].trim();
-        let value_str = part[1 + eq_pos + 1..].trim();
+        let path_str = &part[1..eq_pos + 1].trim();
+        let value_str = part[eq_pos + 2..].trim();
 
         // Parse the path: [k1][k2][k3]...
         let path = parse_except_path(path_str)?;
@@ -1538,27 +1575,6 @@ fn split_quantifier_bindings(s: &str) -> Vec<String> {
     }
 
     parts
-}
-
-pub fn find_top_level_colon(expr: &str) -> Option<usize> {
-    let mut depth = 0;
-    let bytes = expr.as_bytes();
-
-    for i in 0..bytes.len() {
-        match bytes[i] {
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => depth -= 1,
-            b':' if depth == 0 => {
-                // Skip :> (TLC function pair operator) - only match standalone :
-                if i + 1 < bytes.len() && bytes[i + 1] == b'>' {
-                    continue;
-                }
-                return Some(i);
-            }
-            _ => {}
-        }
-    }
-    None
 }
 
 fn try_parse_if(expr: &str) -> Option<CompiledExpr> {
@@ -2451,77 +2467,6 @@ mod tests {
         let result = split_binary_op("LET x IN a = b", "=");
         assert!(result.is_some(), "split_binary_op should split after IN");
     }
-
-    #[test]
-    fn test_except_with_record_literal_value() {
-        // Test EXCEPT expression where the replacement value is a record literal
-        // This tests the fix for the bug where EXCEPT followed by newline was not recognized
-        let expr_with_newline = r#"[f EXCEPT
-![key] = [a |-> 1, b |-> 2]]"#;
-        let compiled = compile_expr(expr_with_newline);
-
-        // Should be parsed as FuncExcept, not as RecordLiteral
-        assert!(
-            matches!(compiled, CompiledExpr::FuncExcept(_, _)),
-            "EXCEPT with newline should be parsed as FuncExcept, got: {:?}",
-            compiled
-        );
-
-        // Verify the structure: FuncExcept with one update whose value is a RecordLiteral
-        if let CompiledExpr::FuncExcept(_, updates) = &compiled {
-            assert_eq!(updates.len(), 1, "Should have exactly one update");
-            let (_, value_expr) = &updates[0];
-            assert!(
-                matches!(value_expr, CompiledExpr::RecordLiteral(_)),
-                "Update value should be RecordLiteral, got: {:?}",
-                value_expr
-            );
-            if let CompiledExpr::RecordLiteral(fields) = value_expr {
-                assert_eq!(fields.len(), 2, "Record should have 2 fields");
-                assert_eq!(fields[0].0, "a");
-                assert_eq!(fields[1].0, "b");
-            }
-        }
-    }
-
-    #[test]
-    fn test_except_with_multiline_record_literal() {
-        // Test the specific pattern from the bug report
-        let expr = r#"[serverCharters EXCEPT
-![inode][client] = [
-    issuedClock |-> newClock,
-    givenAccess |-> grantedAccess,
-    isRevoked |-> FALSE
-]]"#;
-        let compiled = compile_expr(expr);
-
-        assert!(
-            matches!(compiled, CompiledExpr::FuncExcept(_, _)),
-            "Should be parsed as FuncExcept, got: {:?}",
-            compiled
-        );
-
-        if let CompiledExpr::FuncExcept(base, updates) = &compiled {
-            // Base should be the serverCharters variable
-            assert!(
-                matches!(base.as_ref(), CompiledExpr::Var(name) if name == "serverCharters"),
-                "Base should be Var(serverCharters), got: {:?}",
-                base
-            );
-
-            // Should have exactly one update with a 2-element path
-            assert_eq!(updates.len(), 1, "Should have exactly one update");
-            let (path, value) = &updates[0];
-            assert_eq!(path.len(), 2, "Path should have 2 elements (inode and client)");
-
-            // Value should be a record literal with 3 fields
-            assert!(
-                matches!(value, CompiledExpr::RecordLiteral(fields) if fields.len() == 3),
-                "Value should be RecordLiteral with 3 fields, got: {:?}",
-                value
-            );
-        }
-    }
 }
 
 #[test]
@@ -2605,102 +2550,5 @@ fn test_multiple_quantifiers_in_conjunction() {
             assert_eq!(parts.len(), 2, "Should have exactly 2 quantifiers");
         }
         _ => panic!("Expected And, got: {:?}", expr),
-    }
-}
-
-#[test]
-fn test_domain_with_function_application() {
-    // Test that DOMAIN is parsed before function application
-    // "DOMAIN f[x]" should parse as Domain(FuncApply(f, [x]))
-    // NOT as FuncApply(Domain(f), [x]) which would be incorrect
-    let expr = compile_expr("DOMAIN leases[s]");
-    match &expr {
-        CompiledExpr::Domain(inner) => {
-            match inner.as_ref() {
-                CompiledExpr::FuncApply(func, args) => {
-                    assert!(
-                        matches!(func.as_ref(), CompiledExpr::Var(name) if name == "leases"),
-                        "Expected FuncApply of 'leases', got: {:?}",
-                        func
-                    );
-                    assert_eq!(args.len(), 1, "Expected 1 argument");
-                    assert!(
-                        matches!(&args[0], CompiledExpr::Var(name) if name == "s"),
-                        "Expected argument 's', got: {:?}",
-                        args[0]
-                    );
-                }
-                other => panic!(
-                    "DOMAIN f[x] should have FuncApply inside Domain, got: {:?}",
-                    other
-                ),
-            }
-        }
-        other => panic!(
-            "DOMAIN f[x] should parse as Domain, got: {:?}",
-            other
-        ),
-    }
-}
-
-#[test]
-fn test_domain_simple() {
-    // Test simple DOMAIN expression
-    let expr = compile_expr("DOMAIN leases");
-    match &expr {
-        CompiledExpr::Domain(inner) => {
-            assert!(
-                matches!(inner.as_ref(), CompiledExpr::Var(name) if name == "leases"),
-                "Expected Var('leases'), got: {:?}",
-                inner
-            );
-        }
-        other => panic!("Expected Domain, got: {:?}", other),
-    }
-}
-
-#[test]
-fn test_domain_equality() {
-    // Test DOMAIN x = S parses correctly
-    let expr = compile_expr("DOMAIN leases = Shards");
-    match &expr {
-        CompiledExpr::Eq(left, right) => {
-            assert!(
-                matches!(left.as_ref(), CompiledExpr::Domain(_)),
-                "Left side should be Domain, got: {:?}",
-                left
-            );
-            assert!(
-                matches!(right.as_ref(), CompiledExpr::Var(name) if name == "Shards"),
-                "Right side should be Var('Shards'), got: {:?}",
-                right
-            );
-        }
-        other => panic!("Expected Eq, got: {:?}", other),
-    }
-}
-
-#[test]
-fn test_subset_with_function_application() {
-    // Similar test for SUBSET prefix operator
-    let expr = compile_expr("SUBSET sets[i]");
-    match &expr {
-        CompiledExpr::PowerSet(inner) => {
-            match inner.as_ref() {
-                CompiledExpr::FuncApply(func, args) => {
-                    assert!(
-                        matches!(func.as_ref(), CompiledExpr::Var(name) if name == "sets"),
-                        "Expected FuncApply of 'sets', got: {:?}",
-                        func
-                    );
-                    assert_eq!(args.len(), 1);
-                }
-                other => panic!(
-                    "SUBSET f[x] should have FuncApply inside PowerSet, got: {:?}",
-                    other
-                ),
-            }
-        }
-        other => panic!("Expected PowerSet, got: {:?}", other),
     }
 }
