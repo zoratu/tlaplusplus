@@ -430,17 +430,21 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
     if or_parts.len() > 1 {
         return CompiledExpr::Or(or_parts.into_iter().map(|s| compile_expr(&s)).collect());
     }
+    // Handle case where expression starts with \/ but has only one disjunct
+    // e.g., "\/ x > 0" should be treated as just "x > 0"
+    if expr.trim().starts_with("\\/") && or_parts.len() == 1 && !or_parts[0].is_empty() {
+        return compile_expr(&or_parts[0]);
+    }
 
     // Conjunction: /\
     let and_parts = split_top_level(expr, "/\\");
     if and_parts.len() > 1 {
-        if std::env::var("TLAPP_TRACE_AND").is_ok() {
-            eprintln!("AND split ({} parts):", and_parts.len());
-            for (i, p) in and_parts.iter().enumerate() {
-                eprintln!("  [{i}]: {}", p.chars().take(200).collect::<String>());
-            }
-        }
         return CompiledExpr::And(and_parts.into_iter().map(|s| compile_expr(&s)).collect());
+    }
+    // Handle case where expression starts with /\ but has only one conjunct
+    // e.g., "/\ x > 0" should be treated as just "x > 0"
+    if expr.trim().starts_with("/\\") && and_parts.len() == 1 && !and_parts[0].is_empty() {
+        return compile_expr(&and_parts[0]);
     }
 
     // Negation: ~
