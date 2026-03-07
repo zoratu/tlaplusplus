@@ -30,10 +30,13 @@ VARIABLES
 vars == <<seqlock, tableVersion, readerState, readerSeq, readerData, writerState, opsCount>>
 
 TypeOK ==
-    /\ seqlock \in 0..MaxOps
+    \* seqlock increments twice per resize cycle (once to odd, once to even),
+    \* so its maximum value is 2*MaxOps (or 2*MaxOps-1 mid-cycle)
+    /\ seqlock \in 0..(2*MaxOps)
     /\ tableVersion \in 0..MaxOps
     /\ readerState \in [1..NumReaders -> {"idle", "reading_seq", "reading_data", "checking_seq", "success", "retry"}]
-    /\ readerSeq \in [1..NumReaders -> 0..MaxOps]
+    \* readerSeq captures seqlock values, so it has the same range
+    /\ readerSeq \in [1..NumReaders -> 0..(2*MaxOps)]
     /\ readerData \in [1..NumReaders -> 0..MaxOps]
     /\ writerState \in {"idle", "incrementing", "resizing", "finalizing"}
     /\ opsCount \in 0..MaxOps
@@ -131,6 +134,11 @@ Next ==
     \/ WriterFinalize
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
+    \* Strong fairness for writer actions to ensure resize completes
+    \* even when reader retries are continuously possible
+    /\ SF_vars(WriterIncrementOdd)
+    /\ SF_vars(WriterResize)
+    /\ SF_vars(WriterFinalize)
 
 (* Safety: Successful reads see consistent data *)
 (* If a reader succeeded, the data it read matches the seqlock it observed *)
