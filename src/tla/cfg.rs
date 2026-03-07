@@ -125,12 +125,17 @@ pub fn parse_tla_config(input: &str) -> Result<TlaConfig> {
             section = Some(Section::Constants);
             continue;
         }
-        // Handle "CONSTANT foo = bar" on the same line
+        // Handle inline constant assignment: "CONSTANT Name = Value" or "CONSTANT Name <- Op"
         if let Some(rest) = line
             .strip_prefix("CONSTANT ")
             .or(line.strip_prefix("CONSTANTS "))
         {
-            parse_constant_line(rest, &mut cfg)?;
+            // Check if this is an assignment (contains = or <-)
+            if rest.contains('=') || rest.contains("<-") {
+                parse_constant_line(rest, &mut cfg)?;
+                continue;
+            }
+            // Otherwise it's just "CONSTANT" with items listed after, fall through to section handling
             section = Some(Section::Constants);
             continue;
         }
@@ -582,6 +587,64 @@ mod tests {
             Some(ConfigValue::Tuple(v)) => assert_eq!(v.len(), 2),
             other => panic!("unexpected tuple parse result: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_inline_constant_assignment() {
+        let cfg = parse_tla_config(
+            r#"
+            SPECIFICATION Spec
+            CONSTANT N = 3
+            CONSTANT Flag = TRUE
+            CONSTANT Server = s1
+            CONSTANT Procs = {p1, p2, p3}
+            CONSTANT SeqOp <- BoundedSeq
+            INVARIANT TypeOK
+            "#,
+        )
+        .expect("cfg should parse");
+
+        assert_eq!(cfg.specification.as_deref(), Some("Spec"));
+        assert_eq!(cfg.constants.get("N"), Some(&ConfigValue::Int(3)));
+        assert_eq!(cfg.constants.get("Flag"), Some(&ConfigValue::Bool(true)));
+        assert_eq!(
+            cfg.constants.get("Server"),
+            Some(&ConfigValue::ModelValue("s1".to_string()))
+        );
+        match cfg.constants.get("Procs") {
+            Some(ConfigValue::Set(items)) => {
+                assert_eq!(items.len(), 3);
+                assert_eq!(items[0], ConfigValue::ModelValue("p1".to_string()));
+                assert_eq!(items[1], ConfigValue::ModelValue("p2".to_string()));
+                assert_eq!(items[2], ConfigValue::ModelValue("p3".to_string()));
+            }
+            other => panic!("unexpected Procs parse result: {other:?}"),
+        }
+        assert_eq!(
+            cfg.constants.get("SeqOp"),
+            Some(&ConfigValue::OperatorRef("BoundedSeq".to_string()))
+        );
+        assert_eq!(cfg.invariants, vec!["TypeOK"]);
+    }
+
+    #[test]
+    fn parses_mixed_constant_formats() {
+        // Test mixing inline CONSTANT with block CONSTANTS
+        let cfg = parse_tla_config(
+            r#"
+            CONSTANT A = 1
+            CONSTANTS
+                B = 2
+                C = 3
+            CONSTANT D = 4
+            "#,
+        )
+        .expect("cfg should parse");
+
+        assert_eq!(cfg.constants.get("A"), Some(&ConfigValue::Int(1)));
+        assert_eq!(cfg.constants.get("B"), Some(&ConfigValue::Int(2)));
+        assert_eq!(cfg.constants.get("C"), Some(&ConfigValue::Int(3)));
+        assert_eq!(cfg.constants.get("D"), Some(&ConfigValue::Int(4)));
     }
 
     #[test]
