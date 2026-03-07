@@ -600,6 +600,16 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
         }
     }
 
+    // Prefix operators SUBSET and DOMAIN must be parsed BEFORE function application
+    // to handle cases like "DOMAIN f[x]" correctly as Domain(FuncApply(f, [x]))
+    // rather than FuncApply(Domain(f), [x])
+    if let Some(inner) = expr.strip_prefix("SUBSET ") {
+        return CompiledExpr::PowerSet(Box::new(compile_expr(inner)));
+    }
+    if let Some(inner) = expr.strip_prefix("DOMAIN ") {
+        return CompiledExpr::Domain(Box::new(compile_expr(inner)));
+    }
+
     // Function application: f[x] or f[x, y]
     if let Some((func, args)) = parse_func_apply(expr) {
         return CompiledExpr::FuncApply(
@@ -622,12 +632,6 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
         .and_then(|s| s.strip_suffix(')'))
     {
         return CompiledExpr::Cardinality(Box::new(compile_expr(inner)));
-    }
-    if let Some(inner) = expr.strip_prefix("SUBSET ") {
-        return CompiledExpr::PowerSet(Box::new(compile_expr(inner)));
-    }
-    if let Some(inner) = expr.strip_prefix("DOMAIN ") {
-        return CompiledExpr::Domain(Box::new(compile_expr(inner)));
     }
     if let Some(inner) = expr.strip_prefix("Head(").and_then(|s| s.strip_suffix(')')) {
         return CompiledExpr::Head(Box::new(compile_expr(inner)));
@@ -2554,5 +2558,102 @@ fn test_multiple_quantifiers_in_conjunction() {
             assert_eq!(parts.len(), 2, "Should have exactly 2 quantifiers");
         }
         _ => panic!("Expected And, got: {:?}", expr),
+    }
+}
+
+#[test]
+fn test_domain_with_function_application() {
+    // Test that DOMAIN is parsed before function application
+    // "DOMAIN f[x]" should parse as Domain(FuncApply(f, [x]))
+    // NOT as FuncApply(Domain(f), [x]) which would be incorrect
+    let expr = compile_expr("DOMAIN leases[s]");
+    match &expr {
+        CompiledExpr::Domain(inner) => {
+            match inner.as_ref() {
+                CompiledExpr::FuncApply(func, args) => {
+                    assert!(
+                        matches!(func.as_ref(), CompiledExpr::Var(name) if name == "leases"),
+                        "Expected FuncApply of 'leases', got: {:?}",
+                        func
+                    );
+                    assert_eq!(args.len(), 1, "Expected 1 argument");
+                    assert!(
+                        matches!(&args[0], CompiledExpr::Var(name) if name == "s"),
+                        "Expected argument 's', got: {:?}",
+                        args[0]
+                    );
+                }
+                other => panic!(
+                    "DOMAIN f[x] should have FuncApply inside Domain, got: {:?}",
+                    other
+                ),
+            }
+        }
+        other => panic!(
+            "DOMAIN f[x] should parse as Domain, got: {:?}",
+            other
+        ),
+    }
+}
+
+#[test]
+fn test_domain_simple() {
+    // Test simple DOMAIN expression
+    let expr = compile_expr("DOMAIN leases");
+    match &expr {
+        CompiledExpr::Domain(inner) => {
+            assert!(
+                matches!(inner.as_ref(), CompiledExpr::Var(name) if name == "leases"),
+                "Expected Var('leases'), got: {:?}",
+                inner
+            );
+        }
+        other => panic!("Expected Domain, got: {:?}", other),
+    }
+}
+
+#[test]
+fn test_domain_equality() {
+    // Test DOMAIN x = S parses correctly
+    let expr = compile_expr("DOMAIN leases = Shards");
+    match &expr {
+        CompiledExpr::Eq(left, right) => {
+            assert!(
+                matches!(left.as_ref(), CompiledExpr::Domain(_)),
+                "Left side should be Domain, got: {:?}",
+                left
+            );
+            assert!(
+                matches!(right.as_ref(), CompiledExpr::Var(name) if name == "Shards"),
+                "Right side should be Var('Shards'), got: {:?}",
+                right
+            );
+        }
+        other => panic!("Expected Eq, got: {:?}", other),
+    }
+}
+
+#[test]
+fn test_subset_with_function_application() {
+    // Similar test for SUBSET prefix operator
+    let expr = compile_expr("SUBSET sets[i]");
+    match &expr {
+        CompiledExpr::PowerSet(inner) => {
+            match inner.as_ref() {
+                CompiledExpr::FuncApply(func, args) => {
+                    assert!(
+                        matches!(func.as_ref(), CompiledExpr::Var(name) if name == "sets"),
+                        "Expected FuncApply of 'sets', got: {:?}",
+                        func
+                    );
+                    assert_eq!(args.len(), 1);
+                }
+                other => panic!(
+                    "SUBSET f[x] should have FuncApply inside PowerSet, got: {:?}",
+                    other
+                ),
+            }
+        }
+        other => panic!("Expected PowerSet, got: {:?}", other),
     }
 }
