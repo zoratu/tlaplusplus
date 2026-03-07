@@ -68,6 +68,11 @@ pub struct CheckpointState {
     pub states_distinct: u64,
     /// Queue pending at checkpoint
     pub queue_pending: u64,
+    /// Minimum segment ID needed by this checkpoint.
+    /// All segments with ID >= min_segment_id must be retained for resume to work.
+    /// Segments with ID < min_segment_id can be safely pruned.
+    #[serde(default)]
+    pub min_segment_id: Option<u64>,
 }
 
 /// S3 persistence manager
@@ -437,11 +442,42 @@ impl S3Persistence {
     }
 
     /// Prune old checkpoints from S3, keeping only the most recent `keep_count`.
-    /// Also removes queue-spill segments that are no longer present locally.
-    /// This should be called after local pruning to keep S3 in sync.
+    /// Also removes queue-spill segments that are no longer needed.
+    ///
+    /// CRITICAL: Segments are only pruned if their ID is below the min_segment_id
+    /// stored in the manifest. This ensures that segments needed for resume are
+    /// never deleted, even if they've been consumed locally.
     pub async fn prune_old_checkpoints(&self, keep_count: usize) -> Result<PruneResult> {
         let mut checkpoints_deleted = 0u64;
         let mut segments_deleted = 0u64;
+
+        // First, fetch the manifest to get the min_segment_id
+        let manifest_key = format!("{}/manifest.json", self.prefix);
+        let min_segment_id: Option<u64> = match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&manifest_key)
+            .send()
+            .await
+        {
+            Ok(response) => {
+                match response.body.collect().await {
+                    Ok(data) => {
+                        let bytes = data.into_bytes();
+                        match serde_json::from_slice::<S3Manifest>(&bytes) {
+                            Ok(manifest) => manifest
+                                .checkpoint
+                                .as_ref()
+                                .and_then(|cp| cp.min_segment_id),
+                            Err(_) => None,
+                        }
+                    }
+                    Err(_) => None,
+                }
+            }
+            Err(_) => None,
+        };
 
         // List all checkpoint files on S3
         let checkpoint_prefix = format!("{}/checkpoints/checkpoint-", self.prefix);
@@ -503,10 +539,22 @@ impl S3Persistence {
             }
         }
 
-        // Prune queue-spill segments that no longer exist locally
-        let queue_prefix = format!("{}/queue-spill/", self.prefix);
-        let local_queue_dir = self.local_dir.join("queue-spill");
+        // Prune queue-spill segments ONLY if we have a min_segment_id
+        let Some(min_id) = min_segment_id else {
+            // No min_segment_id - skip segment pruning to be safe
+            if checkpoints_deleted > 0 {
+                eprintln!(
+                    "S3: Pruned {} checkpoints (skipped segment pruning - no min_segment_id)",
+                    checkpoints_deleted
+                );
+            }
+            return Ok(PruneResult {
+                checkpoints_deleted,
+                segments_deleted: 0,
+            });
+        };
 
+        let queue_prefix = format!("{}/queue-spill/", self.prefix);
         let mut s3_segments: Vec<String> = Vec::new();
         continuation_token = None;
 
@@ -536,14 +584,18 @@ impl S3Persistence {
             }
         }
 
-        // Check each S3 segment against local existence
+        // Only prune segments with ID < min_segment_id
         for key in s3_segments {
-            // Extract filename from S3 key
             let filename = key.split('/').last().unwrap_or(&key);
-            let local_path = local_queue_dir.join(filename);
 
-            // If local file doesn't exist, delete from S3
-            if !local_path.exists() {
+            // Extract segment ID from filename
+            let segment_id = match extract_segment_id(filename) {
+                Some(id) => id,
+                None => continue, // Skip non-segment files
+            };
+
+            // CRITICAL: Only prune if segment ID is BELOW the minimum needed
+            if segment_id < min_id {
                 match self
                     .client
                     .delete_object()
@@ -567,8 +619,8 @@ impl S3Persistence {
 
         if checkpoints_deleted > 0 || segments_deleted > 0 {
             eprintln!(
-                "S3: Pruned {} checkpoints, {} segments",
-                checkpoints_deleted, segments_deleted
+                "S3: Pruned {} checkpoints, {} segments (min_segment_id={})",
+                checkpoints_deleted, segments_deleted, min_id
             );
         }
 
@@ -770,18 +822,66 @@ async fn collect_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-/// Prune S3 files that no longer exist locally.
-/// This keeps S3 in sync with local pruning (checkpoints, consumed queue segments).
+/// Extract segment ID from a segment filename like "segment-0000000000000042.bin"
+fn extract_segment_id(filename: &str) -> Option<u64> {
+    if !filename.starts_with("segment-") || !filename.ends_with(".bin") {
+        return None;
+    }
+    let id_str = filename
+        .trim_start_matches("segment-")
+        .trim_end_matches(".bin");
+    id_str.parse::<u64>().ok()
+}
+
+/// Prune S3 files that are no longer needed.
+///
+/// CRITICAL FIX: This function now respects segment dependencies.
+/// Previously, it deleted segments that didn't exist locally, but this caused
+/// resume to fail because:
+/// 1. Segments are deleted locally after being consumed (loaded into memory)
+/// 2. S3 pruning would then delete them from S3 too
+/// 3. On resume (after rm -rf ~/.tlapp), segments were missing
+///
+/// The fix: Only prune segments with ID < min_segment_id from the manifest.
+/// The min_segment_id represents the minimum segment ID needed for resume.
+/// Any segment with ID >= min_segment_id must be retained.
 async fn prune_deleted_files(
     client: &Client,
     bucket: &str,
     prefix: &str,
-    local_dir: &Path,
+    _local_dir: &Path, // No longer used - we use manifest-based pruning
     uploaded_offsets: &DashMap<String, u64>,
     keep_checkpoints: usize,
 ) -> Result<()> {
     let mut checkpoints_deleted = 0u64;
     let mut segments_deleted = 0u64;
+
+    // First, fetch the manifest to get the min_segment_id
+    let manifest_key = format!("{}/manifest.json", prefix);
+    let min_segment_id: Option<u64> = match client
+        .get_object()
+        .bucket(bucket)
+        .key(&manifest_key)
+        .send()
+        .await
+    {
+        Ok(response) => {
+            match response.body.collect().await {
+                Ok(data) => {
+                    let bytes = data.into_bytes();
+                    match serde_json::from_slice::<S3Manifest>(&bytes) {
+                        Ok(manifest) => manifest
+                            .checkpoint
+                            .as_ref()
+                            .and_then(|cp| cp.min_segment_id),
+                        Err(_) => None,
+                    }
+                }
+                Err(_) => None,
+            }
+        }
+        Err(_) => None,
+    };
 
     // 1. Prune old checkpoint files (keep last N)
     let checkpoint_prefix = format!("{}/checkpoints/checkpoint-", prefix);
@@ -839,10 +939,21 @@ async fn prune_deleted_files(
         }
     }
 
-    // 2. Prune queue-spill segments that no longer exist locally
-    let queue_prefix = format!("{}/queue-spill/", prefix);
-    let local_queue_dir = local_dir.join("queue-spill");
+    // 2. Prune queue-spill segments ONLY if we have a min_segment_id
+    // Without min_segment_id, we cannot safely determine which segments are pruneable
+    let Some(min_id) = min_segment_id else {
+        // No min_segment_id in manifest - skip segment pruning to be safe
+        // This happens on first checkpoint or with old manifests
+        if checkpoints_deleted > 0 {
+            eprintln!(
+                "S3: Pruned {} checkpoints (skipped segment pruning - no min_segment_id)",
+                checkpoints_deleted
+            );
+        }
+        return Ok(());
+    };
 
+    let queue_prefix = format!("{}/queue-spill/", prefix);
     let mut s3_segments: Vec<String> = Vec::new();
     continuation_token = None;
 
@@ -880,13 +991,19 @@ async fn prune_deleted_files(
         }
     }
 
-    // Check each S3 segment against local existence
+    // Only prune segments with ID < min_segment_id
+    // Segments with ID >= min_segment_id are needed for resume
     for key in s3_segments {
         let filename = key.split('/').last().unwrap_or(&key);
-        let local_path = local_queue_dir.join(filename);
 
-        // If local file doesn't exist, delete from S3
-        if !local_path.exists() {
+        // Extract segment ID from filename
+        let segment_id = match extract_segment_id(filename) {
+            Some(id) => id,
+            None => continue, // Skip non-segment files
+        };
+
+        // CRITICAL: Only prune if segment ID is BELOW the minimum needed
+        if segment_id < min_id {
             match client.delete_object().bucket(bucket).key(&key).send().await {
                 Ok(_) => {
                     segments_deleted += 1;
@@ -903,8 +1020,8 @@ async fn prune_deleted_files(
 
     if checkpoints_deleted > 0 || segments_deleted > 0 {
         eprintln!(
-            "S3: Pruned {} checkpoints, {} queue segments from S3",
-            checkpoints_deleted, segments_deleted
+            "S3: Pruned {} checkpoints, {} queue segments from S3 (min_segment_id={})",
+            checkpoints_deleted, segments_deleted, min_id
         );
     }
 
@@ -926,6 +1043,7 @@ mod tests {
                 states_generated: 1000,
                 states_distinct: 900,
                 queue_pending: 500,
+                min_segment_id: Some(42),
             }),
         };
 
@@ -934,5 +1052,80 @@ mod tests {
 
         assert_eq!(parsed.run_id, "test-run");
         assert!(parsed.checkpoint.is_some());
+        assert_eq!(parsed.checkpoint.as_ref().unwrap().min_segment_id, Some(42));
+    }
+
+    #[test]
+    fn test_extract_segment_id() {
+        // Valid segment filenames
+        assert_eq!(
+            extract_segment_id("segment-0000000000000042.bin"),
+            Some(42)
+        );
+        assert_eq!(extract_segment_id("segment-0000000000000000.bin"), Some(0));
+        assert_eq!(
+            extract_segment_id("segment-9999999999999999.bin"),
+            Some(9999999999999999)
+        );
+
+        // Invalid filenames
+        assert_eq!(extract_segment_id("checkpoint-123.json"), None);
+        assert_eq!(extract_segment_id("segment-abc.bin"), None);
+        assert_eq!(extract_segment_id("segment-42"), None);
+        assert_eq!(extract_segment_id("other.bin"), None);
+        assert_eq!(extract_segment_id(""), None);
+    }
+
+    #[test]
+    fn test_manifest_backwards_compatibility() {
+        // Test that old manifests without min_segment_id can still be parsed
+        let old_manifest_json = r#"{
+            "updated_at": 1234567890,
+            "run_id": "old-run",
+            "files": {},
+            "checkpoint": {
+                "id": 1,
+                "states_generated": 1000,
+                "states_distinct": 900,
+                "queue_pending": 500
+            }
+        }"#;
+
+        let parsed: S3Manifest = serde_json::from_str(old_manifest_json).unwrap();
+        assert_eq!(parsed.run_id, "old-run");
+        assert!(parsed.checkpoint.is_some());
+        // min_segment_id should default to None for old manifests
+        assert_eq!(parsed.checkpoint.as_ref().unwrap().min_segment_id, None);
+    }
+
+    #[test]
+    fn test_checkpoint_state_with_min_segment_id() {
+        // Test serialization and deserialization with min_segment_id
+        let checkpoint = CheckpointState {
+            id: 123,
+            states_generated: 5000,
+            states_distinct: 4500,
+            queue_pending: 100,
+            min_segment_id: Some(42),
+        };
+
+        let json = serde_json::to_string(&checkpoint).unwrap();
+        let parsed: CheckpointState = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.id, 123);
+        assert_eq!(parsed.min_segment_id, Some(42));
+
+        // Test with None
+        let checkpoint_none = CheckpointState {
+            id: 456,
+            states_generated: 1000,
+            states_distinct: 900,
+            queue_pending: 0,
+            min_segment_id: None,
+        };
+
+        let json = serde_json::to_string(&checkpoint_none).unwrap();
+        let parsed: CheckpointState = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.min_segment_id, None);
     }
 }
