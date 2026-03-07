@@ -232,20 +232,46 @@ impl PauseController {
         self.wait_cv.notify_all();
     }
 
+    /// Wait for all workers to pause (quiescence).
+    /// Returns true if quiescence was achieved, false if timeout occurred.
+    /// Timeout: 5 minutes (300 seconds)
     fn wait_for_quiescence(
         &self,
         stop: &AtomicBool,
         active_workers: &AtomicUsize,
         live_workers: &AtomicUsize,
-    ) {
-        eprintln!("Checkpoint: entering wait_for_quiescence");
+    ) -> bool {
+        const QUIESCENCE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
+
+        eprintln!(
+            "Checkpoint: entering wait_for_quiescence (timeout: {}s)",
+            QUIESCENCE_TIMEOUT.as_secs()
+        );
         let mut iterations = 0u64;
         let start = Instant::now();
         loop {
             if stop.load(Ordering::Acquire) {
                 eprintln!("Checkpoint: wait_for_quiescence breaking due to stop");
-                break;
+                return false;
             }
+
+            // Check timeout
+            if start.elapsed() > QUIESCENCE_TIMEOUT {
+                let paused = self.paused_workers.load(Ordering::Acquire);
+                let live = live_workers.load(Ordering::Acquire);
+                let active = active_workers.load(Ordering::Acquire);
+                eprintln!(
+                    "Checkpoint: TIMEOUT waiting for quiescence after {:.1}s! paused={}/{}, active={}, {} workers not responding",
+                    start.elapsed().as_secs_f64(),
+                    paused,
+                    live,
+                    active,
+                    live.saturating_sub(paused)
+                );
+                eprintln!("Checkpoint: skipping this checkpoint, will retry at next interval");
+                return false;
+            }
+
             let paused = self.paused_workers.load(Ordering::Acquire);
             let live = live_workers.load(Ordering::Acquire);
             let active = active_workers.load(Ordering::Acquire);
@@ -270,7 +296,7 @@ impl PauseController {
                     active,
                     start.elapsed().as_secs_f64()
                 );
-                break;
+                return true;
             }
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -520,8 +546,15 @@ where
     T: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
 {
     ctx.pause.request_pause();
-    ctx.pause
-        .wait_for_quiescence(ctx.stop, ctx.active_workers, ctx.live_workers);
+    let quiescence_achieved =
+        ctx.pause
+            .wait_for_quiescence(ctx.stop, ctx.active_workers, ctx.live_workers);
+
+    if !quiescence_achieved {
+        // Quiescence timed out - skip this checkpoint and resume workers
+        ctx.pause.resume();
+        return Ok(());
+    }
 
     let checkpoint_result = (|| -> Result<()> {
         // Chaos: fail point for queue flush
@@ -1093,11 +1126,22 @@ where
 
                 // Request pause and wait for workers to quiesce
                 ckpt_pause.request_pause();
-                ckpt_pause.wait_for_quiescence(
+                let quiescence_achieved = ckpt_pause.wait_for_quiescence(
                     &ckpt_exploration_stop,
                     &ckpt_active_workers,
                     &ckpt_live_workers,
                 );
+
+                // If quiescence timed out, skip this checkpoint
+                if !quiescence_achieved {
+                    eprintln!(
+                        "Checkpoint: quiescence timeout, skipping checkpoint and resuming workers"
+                    );
+                    ckpt_pause.resume();
+                    ckpt_queue.set_pause_requested(false);
+                    ckpt_queue.set_checkpoint_in_progress(false);
+                    continue;
+                }
 
                 // Flush queue state to disk
                 if let Err(e) = ckpt_queue.checkpoint_flush() {
