@@ -61,6 +61,8 @@ pub enum CompiledExpr {
     Union(Box<CompiledExpr>, Box<CompiledExpr>),
     Intersect(Box<CompiledExpr>, Box<CompiledExpr>),
     SetMinus(Box<CompiledExpr>, Box<CompiledExpr>),
+    /// Cartesian product: \X or \times
+    CartesianProduct(Box<CompiledExpr>, Box<CompiledExpr>),
     Subset(Box<CompiledExpr>, Box<CompiledExpr>),
     Cardinality(Box<CompiledExpr>),
     PowerSet(Box<CompiledExpr>),
@@ -191,6 +193,7 @@ impl CompiledExpr {
             | CompiledExpr::Union(a, b)
             | CompiledExpr::Intersect(a, b)
             | CompiledExpr::SetMinus(a, b)
+            | CompiledExpr::CartesianProduct(a, b)
             | CompiledExpr::Subset(a, b)
             | CompiledExpr::SetRange(a, b)
             | CompiledExpr::Append(a, b)
@@ -525,8 +528,31 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
     if let Some((left, right)) = split_binary_op(expr, "\\o") {
         return CompiledExpr::Concat(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
     }
+    // Handle cartesian product: \X and \times are synonyms
+    // Must be before \ (set minus) since \ would match \X or \times
+    if let Some((left, right)) = split_binary_op(expr, "\\X") {
+        return CompiledExpr::CartesianProduct(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
+    }
+    if let Some((left, right)) = split_binary_op(expr, "\\times") {
+        return CompiledExpr::CartesianProduct(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
+    }
     if let Some((left, right)) = split_binary_op(expr, "\\") {
-        return CompiledExpr::SetMinus(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
+        // Only treat as set minus if right side doesn't start with a known keyword
+        // (this avoids incorrectly splitting \union, \cup, \cap, \intersect, \div, etc.)
+        let right_trimmed = right.trim();
+        if !right_trimmed.starts_with("union")
+            && !right_trimmed.starts_with("cup")
+            && !right_trimmed.starts_with("cap")
+            && !right_trimmed.starts_with("intersect")
+            && !right_trimmed.starts_with("div")
+            && !right_trimmed.starts_with("in")
+            && !right_trimmed.starts_with("notin")
+            && !right_trimmed.starts_with("subseteq")
+            && !right_trimmed.starts_with("E")
+            && !right_trimmed.starts_with("A")
+        {
+            return CompiledExpr::SetMinus(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
+        }
     }
 
     // TLC module: Function pair constructor :>
