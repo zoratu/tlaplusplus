@@ -205,23 +205,71 @@ impl AtomicRunStats {
     }
 }
 
-#[derive(Default)]
 struct PauseController {
     requested: AtomicBool,
     paused_workers: AtomicUsize,
     wait_lock: Mutex<()>,
     wait_cv: Condvar,
+    /// Per-worker pause status for debugging (worker_id -> is_paused)
+    /// Only populated when debugging is enabled via TLAPP_DEBUG_PAUSE env var
+    worker_pause_status: parking_lot::RwLock<Vec<AtomicBool>>,
+}
+
+impl Default for PauseController {
+    fn default() -> Self {
+        Self {
+            requested: AtomicBool::new(false),
+            paused_workers: AtomicUsize::new(0),
+            wait_lock: Mutex::new(()),
+            wait_cv: Condvar::new(),
+            worker_pause_status: parking_lot::RwLock::new(Vec::new()),
+        }
+    }
 }
 
 impl PauseController {
-    fn worker_pause_point(&self, stop: &AtomicBool) {
+    /// Initialize per-worker tracking for debugging
+    fn init_worker_tracking(&self, num_workers: usize) {
+        let mut status = self.worker_pause_status.write();
+        status.clear();
+        for _ in 0..num_workers {
+            status.push(AtomicBool::new(false));
+        }
+    }
+
+    /// Get list of worker IDs that are NOT paused (for debugging)
+    fn get_unpaused_workers(&self) -> Vec<usize> {
+        let status = self.worker_pause_status.read();
+        status
+            .iter()
+            .enumerate()
+            .filter(|(_, paused)| !paused.load(Ordering::Acquire))
+            .map(|(id, _)| id)
+            .collect()
+    }
+}
+
+impl PauseController {
+    fn worker_pause_point(&self, stop: &AtomicBool, worker_id: usize) {
         if !self.requested.load(Ordering::Acquire) {
             return;
         }
+
+        // Mark this worker as paused (for debugging)
+        {
+            let status = self.worker_pause_status.read();
+            if let Some(paused) = status.get(worker_id) {
+                paused.store(true, Ordering::Release);
+            }
+        }
+
         let paused_count = self.paused_workers.fetch_add(1, Ordering::AcqRel) + 1;
         // Log when first few workers pause and periodically after
         if paused_count <= 5 || paused_count % 10 == 0 {
-            eprintln!("Worker pausing: {} workers now paused", paused_count);
+            eprintln!(
+                "Worker {} pausing: {} workers now paused",
+                worker_id, paused_count
+            );
         }
         let mut guard = self.wait_lock.lock();
         while self.requested.load(Ordering::Acquire) && !stop.load(Ordering::Acquire) {
@@ -229,6 +277,14 @@ impl PauseController {
         }
         drop(guard);
         self.paused_workers.fetch_sub(1, Ordering::AcqRel);
+
+        // Mark this worker as unpaused
+        {
+            let status = self.worker_pause_status.read();
+            if let Some(paused) = status.get(worker_id) {
+                paused.store(false, Ordering::Release);
+            }
+        }
     }
 
     fn request_pause(&self) {
@@ -264,6 +320,7 @@ impl PauseController {
                 let paused = self.paused_workers.load(Ordering::Acquire);
                 let live = live_workers.load(Ordering::Acquire);
                 let active = active_workers.load(Ordering::Acquire);
+                let unpaused_workers = self.get_unpaused_workers();
                 eprintln!(
                     "Checkpoint: TIMEOUT waiting for quiescence after {:.1}s! paused={}/{}, active={}, {} workers not responding",
                     start.elapsed().as_secs_f64(),
@@ -272,6 +329,12 @@ impl PauseController {
                     active,
                     live.saturating_sub(paused)
                 );
+                if !unpaused_workers.is_empty() {
+                    eprintln!(
+                        "Checkpoint: STUCK WORKERS: {:?} (these workers never reached pause point)",
+                        unpaused_workers
+                    );
+                }
                 eprintln!("Checkpoint: skipping this checkpoint, will retry at next interval");
                 return false;
             }
@@ -1514,6 +1577,9 @@ where
         None
     };
 
+    // Initialize per-worker pause tracking for debugging stuck workers
+    pause.init_worker_tracking(worker_plan.worker_count);
+
     let mut workers = Vec::with_capacity(worker_plan.worker_count);
     for (worker_id, mut worker_state) in worker_states.into_iter().enumerate() {
         let worker_model = Arc::clone(&model);
@@ -1622,7 +1688,7 @@ where
                     panic!("chaos: failpoint worker_panic triggered");
                 }
 
-                worker_pause.worker_pause_point(&worker_stop);
+                worker_pause.worker_pause_point(&worker_stop, worker_id);
                 if worker_stop.load(Ordering::Acquire) {
                     break;
                 }
