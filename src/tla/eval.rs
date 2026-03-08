@@ -2072,6 +2072,30 @@ fn eval_operator_call(
                 }
             }
         }
+        // TLC module: FunAsSeq(f, a, b) - converts a function to a sequence
+        // FunAsSeq(f, a, b) == [i \in 1..b |-> f[a + i - 1]]
+        // This creates a sequence of length b by extracting values from f
+        // starting at index a
+        "FunAsSeq" => {
+            if args.len() != 3 {
+                return Err(anyhow!("FunAsSeq expects 3 arguments: f, a, b"));
+            }
+            let func = &args[0];
+            let a = args[1].as_int()?;
+            let b = args[2].as_int()?;
+
+            if b < 0 {
+                return Err(anyhow!("FunAsSeq: b must be non-negative, got {}", b));
+            }
+
+            let mut result = Vec::with_capacity(b as usize);
+            for i in 1..=b {
+                let key = TlaValue::Int(a + i - 1);
+                let val = func.apply(&key)?.clone();
+                result.push(val);
+            }
+            return Ok(TlaValue::Seq(Arc::new(result)));
+        }
         _ => {}
     }
 
@@ -4954,8 +4978,8 @@ mod tests {
     /// This should compile to nested Forall without any Unparsed nodes.
     #[test]
     fn test_multi_var_quantifier_different_domains() {
-        use crate::tla::compile_expr;
         use crate::tla::CompiledExpr;
+        use crate::tla::compile_expr;
 
         // Multi-variable quantifier with different domains
         let expr = r#"\A c \in Clients, i \in Inodes :
@@ -4966,24 +4990,41 @@ mod tests {
 
         // Should compile to nested Forall: \A c \in Clients : \A i \in Inodes : body
         match &compiled {
-            CompiledExpr::Forall { var: var1, body: body1, .. } => {
+            CompiledExpr::Forall {
+                var: var1,
+                body: body1,
+                ..
+            } => {
                 assert_eq!(var1, "c", "First binding should be 'c'");
                 match body1.as_ref() {
-                    CompiledExpr::Forall { var: var2, body: body2, .. } => {
+                    CompiledExpr::Forall {
+                        var: var2,
+                        body: body2,
+                        ..
+                    } => {
                         assert_eq!(var2, "i", "Second binding should be 'i'");
                         // Body should be an And with 2 In expressions
                         match body2.as_ref() {
                             CompiledExpr::And(parts) => {
                                 assert_eq!(parts.len(), 2, "Body should have 2 conjuncts");
-                                assert!(matches!(&parts[0], CompiledExpr::In(_, _)),
-                                    "First part should be In, got: {:?}", parts[0]);
-                                assert!(matches!(&parts[1], CompiledExpr::In(_, _)),
-                                    "Second part should be In, got: {:?}", parts[1]);
+                                assert!(
+                                    matches!(&parts[0], CompiledExpr::In(_, _)),
+                                    "First part should be In, got: {:?}",
+                                    parts[0]
+                                );
+                                assert!(
+                                    matches!(&parts[1], CompiledExpr::In(_, _)),
+                                    "Second part should be In, got: {:?}",
+                                    parts[1]
+                                );
                             }
                             other => panic!("Body should be And, got: {:?}", other),
                         }
                     }
-                    other => panic!("First Forall body should be nested Forall, got: {:?}", other),
+                    other => panic!(
+                        "First Forall body should be nested Forall, got: {:?}",
+                        other
+                    ),
                 }
             }
             other => panic!("Should compile to Forall, got: {:?}", other),
@@ -5151,5 +5192,108 @@ mod tests {
             result.err()
         );
         assert_eq!(result.unwrap(), TlaValue::Bool(true));
+    }
+
+    #[test]
+    fn test_funasseq_basic() {
+        // FunAsSeq(f, a, b) == [i \in 1..b |-> f[a + i - 1]]
+        // Create a function mapping 1->10, 2->20, 3->30
+        let func = TlaValue::Function(Arc::new(BTreeMap::from([
+            (TlaValue::Int(1), TlaValue::Int(10)),
+            (TlaValue::Int(2), TlaValue::Int(20)),
+            (TlaValue::Int(3), TlaValue::Int(30)),
+        ])));
+
+        let state = TlaState::from([("f".to_string(), func)]);
+        let ctx = EvalContext::new(&state);
+
+        // FunAsSeq(f, 1, 3) should produce <<10, 20, 30>>
+        let result = eval_expr("FunAsSeq(f, 1, 3)", &ctx).expect("FunAsSeq should evaluate");
+        let expected = TlaValue::Seq(Arc::new(vec![
+            TlaValue::Int(10),
+            TlaValue::Int(20),
+            TlaValue::Int(30),
+        ]));
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_funasseq_offset() {
+        // Test with offset: FunAsSeq(f, 2, 2) extracts elements starting at index 2
+        let func = TlaValue::Function(Arc::new(BTreeMap::from([
+            (TlaValue::Int(1), TlaValue::Int(10)),
+            (TlaValue::Int(2), TlaValue::Int(20)),
+            (TlaValue::Int(3), TlaValue::Int(30)),
+            (TlaValue::Int(4), TlaValue::Int(40)),
+        ])));
+
+        let state = TlaState::from([("f".to_string(), func)]);
+        let ctx = EvalContext::new(&state);
+
+        // FunAsSeq(f, 2, 2) should produce <<20, 30>>
+        let result = eval_expr("FunAsSeq(f, 2, 2)", &ctx).expect("FunAsSeq should evaluate");
+        let expected = TlaValue::Seq(Arc::new(vec![TlaValue::Int(20), TlaValue::Int(30)]));
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_funasseq_empty() {
+        // FunAsSeq(f, 1, 0) should produce empty sequence
+        let func = TlaValue::Function(Arc::new(BTreeMap::from([(
+            TlaValue::Int(1),
+            TlaValue::Int(10),
+        )])));
+
+        let state = TlaState::from([("f".to_string(), func)]);
+        let ctx = EvalContext::new(&state);
+
+        let result = eval_expr("FunAsSeq(f, 1, 0)", &ctx).expect("FunAsSeq should evaluate");
+        let expected = TlaValue::Seq(Arc::new(vec![]));
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_funasseq_compiled() {
+        use crate::tla::{compile_expr, eval_compiled};
+
+        // Test compiled version
+        let func = TlaValue::Function(Arc::new(BTreeMap::from([
+            (TlaValue::Int(1), TlaValue::Int(100)),
+            (TlaValue::Int(2), TlaValue::Int(200)),
+            (TlaValue::Int(3), TlaValue::Int(300)),
+        ])));
+
+        let state = TlaState::from([("f".to_string(), func)]);
+        let ctx = EvalContext::new(&state);
+
+        let compiled = compile_expr("FunAsSeq(f, 1, 3)");
+        let result = eval_compiled(&compiled, &ctx).expect("Compiled FunAsSeq should evaluate");
+        let expected = TlaValue::Seq(Arc::new(vec![
+            TlaValue::Int(100),
+            TlaValue::Int(200),
+            TlaValue::Int(300),
+        ]));
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_funasseq_with_sequence() {
+        // TLA+ sequences are functions with domain 1..n
+        // Test FunAsSeq on a sequence (which is a function)
+        let seq = TlaValue::Seq(Arc::new(vec![
+            TlaValue::Int(1),
+            TlaValue::Int(2),
+            TlaValue::Int(3),
+            TlaValue::Int(4),
+        ]));
+
+        let state = TlaState::from([("s".to_string(), seq)]);
+        let ctx = EvalContext::new(&state);
+
+        // FunAsSeq(s, 2, 2) should produce <<2, 3>>
+        let result =
+            eval_expr("FunAsSeq(s, 2, 2)", &ctx).expect("FunAsSeq should evaluate on sequence");
+        let expected = TlaValue::Seq(Arc::new(vec![TlaValue::Int(2), TlaValue::Int(3)]));
+        assert_eq!(result, expected);
     }
 }

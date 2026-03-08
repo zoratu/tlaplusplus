@@ -2781,10 +2781,14 @@ fn test_split_forall_body_with_leading_conjunction() {
     assert_eq!(parts.len(), 2, "Body should split into exactly 2 parts");
 
     // Verify the second part contains the inner quantifier's full body
-    assert!(parts[1].contains("\\A c \\in Clients"),
-        "Second part should contain the nested quantifier");
-    assert!(parts[1].contains("leases[s][c].held"),
-        "Second part should contain the nested quantifier's body");
+    assert!(
+        parts[1].contains("\\A c \\in Clients"),
+        "Second part should contain the nested quantifier"
+    );
+    assert!(
+        parts[1].contains("leases[s][c].held"),
+        "Second part should contain the nested quantifier's body"
+    );
 }
 
 #[test]
@@ -2812,10 +2816,16 @@ fn test_typeok_pattern_domain_checks_then_quantifier() {
             assert_eq!(parts.len(), 3, "Should have exactly 3 conjuncts");
 
             // First two should be Eq (DOMAIN x = S)
-            assert!(matches!(&parts[0], CompiledExpr::Eq(_, _)),
-                "First conjunct should be Eq: {:?}", parts[0]);
-            assert!(matches!(&parts[1], CompiledExpr::Eq(_, _)),
-                "Second conjunct should be Eq: {:?}", parts[1]);
+            assert!(
+                matches!(&parts[0], CompiledExpr::Eq(_, _)),
+                "First conjunct should be Eq: {:?}",
+                parts[0]
+            );
+            assert!(
+                matches!(&parts[1], CompiledExpr::Eq(_, _)),
+                "Second conjunct should be Eq: {:?}",
+                parts[1]
+            );
 
             // Third should be Forall
             match &parts[2] {
@@ -2826,8 +2836,12 @@ fn test_typeok_pattern_domain_checks_then_quantifier() {
                     // The body should be an And with 2 parts
                     match body.as_ref() {
                         CompiledExpr::And(body_parts) => {
-                            assert_eq!(body_parts.len(), 2,
-                                "Forall body should have 2 conjuncts, got: {:?}", body_parts);
+                            assert_eq!(
+                                body_parts.len(),
+                                2,
+                                "Forall body should have 2 conjuncts, got: {:?}",
+                                body_parts
+                            );
                         }
                         other => panic!("Forall body should be And, got: {:?}", other),
                     }
@@ -2859,21 +2873,35 @@ fn test_forall_with_leading_conjunction_body() {
             // The body should be an And with 2 parts
             match body.as_ref() {
                 CompiledExpr::And(body_parts) => {
-                    assert_eq!(body_parts.len(), 2,
+                    assert_eq!(
+                        body_parts.len(),
+                        2,
                         "Forall body should have 2 conjuncts, got {} parts: {:?}",
-                        body_parts.len(), body_parts);
+                        body_parts.len(),
+                        body_parts
+                    );
 
                     // First part should be In (shardTerm[s] \in 0..MaxTerm)
-                    assert!(matches!(&body_parts[0], CompiledExpr::In(_, _)),
-                        "First body part should be In, got: {:?}", body_parts[0]);
+                    assert!(
+                        matches!(&body_parts[0], CompiledExpr::In(_, _)),
+                        "First body part should be In, got: {:?}",
+                        body_parts[0]
+                    );
 
                     // Second part should be nested Forall
                     match &body_parts[1] {
-                        CompiledExpr::Forall { var: inner_var, body: inner_body, .. } => {
+                        CompiledExpr::Forall {
+                            var: inner_var,
+                            body: inner_body,
+                            ..
+                        } => {
                             assert_eq!(inner_var, "c", "Inner quantifier variable should be 'c'");
                             // Inner body should be In (leases[s][c].held \in BOOLEAN)
-                            assert!(matches!(inner_body.as_ref(), CompiledExpr::In(_, _)),
-                                "Inner body should be In, got: {:?}", inner_body);
+                            assert!(
+                                matches!(inner_body.as_ref(), CompiledExpr::In(_, _)),
+                                "Inner body should be In, got: {:?}",
+                                inner_body
+                            );
                         }
                         other => panic!("Second body part should be Forall, got: {:?}", other),
                     }
@@ -2889,11 +2917,17 @@ fn test_forall_with_leading_conjunction_body() {
 fn test_single_conjunct_with_leading_conjunction() {
     // Test that "/\ expr" compiles to just "expr" when there's only one conjunct
     let expr = compile_expr("/\\ x > 0");
-    assert!(matches!(expr, CompiledExpr::Gt(_, _)),
-        "Single conjunct should compile to the inner expression, got: {:?}", expr);
+    assert!(
+        matches!(expr, CompiledExpr::Gt(_, _)),
+        "Single conjunct should compile to the inner expression, got: {:?}",
+        expr
+    );
 
     // Same for disjunction
     let expr = compile_expr("\\/ x > 0");
-    assert!(matches!(expr, CompiledExpr::Gt(_, _)),
-        "Single disjunct should compile to the inner expression, got: {:?}", expr);
+    assert!(
+        matches!(expr, CompiledExpr::Gt(_, _)),
+        "Single disjunct should compile to the inner expression, got: {:?}",
+        expr
+    );
 }

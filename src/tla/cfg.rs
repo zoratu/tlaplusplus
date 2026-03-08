@@ -330,10 +330,8 @@ fn parse_constant_line(line: &str, cfg: &mut TlaConfig) -> Result<()> {
                 if op_name.is_empty() {
                     return Err(anyhow!("expected operator name after '<-' in: {}", line));
                 }
-                cfg.constants.insert(
-                    name.to_string(),
-                    ConfigValue::OperatorRef(op_name.clone()),
-                );
+                cfg.constants
+                    .insert(name.to_string(), ConfigValue::OperatorRef(op_name.clone()));
                 // Move offset past: Name <- whitespace OpName
                 offset += arrow_pos + 2 + ws_len + op_name.len();
                 continue;
