@@ -429,12 +429,20 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
     let or_parts = split_top_level(expr, "\\/");
     if or_parts.len() > 1 {
         return CompiledExpr::Or(or_parts.into_iter().map(|s| compile_expr(&s)).collect());
+    } else if or_parts.len() == 1 && expr.trim_start().starts_with("\\/") {
+        // Expression starts with \/ but has only one disjunct - strip the leading \/
+        // This handles cases like "\/ single_expr" in quantifier bodies
+        return compile_expr(&or_parts[0]);
     }
 
     // Conjunction: /\
     let and_parts = split_top_level(expr, "/\\");
     if and_parts.len() > 1 {
         return CompiledExpr::And(and_parts.into_iter().map(|s| compile_expr(&s)).collect());
+    } else if and_parts.len() == 1 && expr.trim_start().starts_with("/\\") {
+        // Expression starts with /\ but has only one conjunct - strip the leading /\
+        // This handles cases like "/\ single_expr" in quantifier bodies
+        return compile_expr(&and_parts[0]);
     }
 
     // Negation: ~
@@ -2700,4 +2708,148 @@ fn test_subset_with_function_application() {
         },
         other => panic!("Expected PowerSet, got: {:?}", other),
     }
+}
+
+#[test]
+fn test_split_forall_body_with_leading_conjunction() {
+    // This is the exact body extracted from:
+    // \A s \in Shards :
+    // /\ shardTerm[s] \in 0..MaxTerm
+    // /\ \A c \in Clients :
+    //     /\ leases[s][c].held \in BOOLEAN
+
+    let body = r#"/\ shardTerm[s] \in 0..MaxTerm
+/\ \A c \in Clients :
+    /\ leases[s][c].held \in BOOLEAN"#;
+
+    let parts = split_top_level(body.trim(), "/\\");
+
+    println!("Body: {:?}", body);
+    println!("Number of parts: {}", parts.len());
+    for (i, part) in parts.iter().enumerate() {
+        println!("Part {}: {:?}", i, part);
+    }
+
+    // The body should split into 2 parts:
+    // 1. shardTerm[s] \in 0..MaxTerm
+    // 2. \A c \in Clients : /\ leases[s][c].held \in BOOLEAN
+    // NOT 3 parts where the inner /\ is also split
+    assert_eq!(parts.len(), 2, "Body should split into exactly 2 parts");
+
+    // Verify the second part contains the inner quantifier's full body
+    assert!(parts[1].contains("\\A c \\in Clients"),
+        "Second part should contain the nested quantifier");
+    assert!(parts[1].contains("leases[s][c].held"),
+        "Second part should contain the nested quantifier's body");
+}
+
+#[test]
+fn test_typeok_pattern_domain_checks_then_quantifier() {
+    // The exact TypeOK pattern that fails:
+    // /\ DOMAIN shardTerm = Shards
+    // /\ DOMAIN shardLeader = Shards
+    // /\ \A s \in Shards :
+    //     /\ shardTerm[s] \in 0..MaxTerm
+    //     /\ shardLeader[s] \in {"none", "stable", "electing"}
+
+    let expr_str = r#"/\ DOMAIN shardTerm = Shards
+/\ DOMAIN shardLeader = Shards
+/\ \A s \in Shards :
+    /\ shardTerm[s] \in 0..MaxTerm
+    /\ shardLeader[s] \in {"none", "stable", "electing"}"#;
+
+    let expr = compile_expr(expr_str);
+    println!("TypeOK pattern compiled: {:#?}", expr);
+
+    // Should compile to And([Eq(...), Eq(...), Forall{...}])
+    match &expr {
+        CompiledExpr::And(parts) => {
+            println!("And with {} parts", parts.len());
+            assert_eq!(parts.len(), 3, "Should have exactly 3 conjuncts");
+
+            // First two should be Eq (DOMAIN x = S)
+            assert!(matches!(&parts[0], CompiledExpr::Eq(_, _)),
+                "First conjunct should be Eq: {:?}", parts[0]);
+            assert!(matches!(&parts[1], CompiledExpr::Eq(_, _)),
+                "Second conjunct should be Eq: {:?}", parts[1]);
+
+            // Third should be Forall
+            match &parts[2] {
+                CompiledExpr::Forall { var, body, .. } => {
+                    assert_eq!(var, "s", "Quantifier variable should be 's'");
+                    println!("Forall body: {:#?}", body);
+
+                    // The body should be an And with 2 parts
+                    match body.as_ref() {
+                        CompiledExpr::And(body_parts) => {
+                            assert_eq!(body_parts.len(), 2,
+                                "Forall body should have 2 conjuncts, got: {:?}", body_parts);
+                        }
+                        other => panic!("Forall body should be And, got: {:?}", other),
+                    }
+                }
+                other => panic!("Third conjunct should be Forall, got: {:?}", other),
+            }
+        }
+        other => panic!("Expected And, got: {:?}", other),
+    }
+}
+
+#[test]
+fn test_forall_with_leading_conjunction_body() {
+    // This is the EXACT pattern from the failing test in compiled_eval.rs
+    // The quantifier body starts with /\ on a new line
+
+    let expr_str = r#"\A s \in Shards :
+/\ shardTerm[s] \in 0..MaxTerm
+/\ \A c \in Clients :
+    /\ leases[s][c].held \in BOOLEAN"#;
+
+    let expr = compile_expr(expr_str);
+
+    // Should compile to Forall { var: "s", domain: ..., body: And([In(...), Forall{...}]) }
+    match &expr {
+        CompiledExpr::Forall { var, body, .. } => {
+            assert_eq!(var, "s", "Outer quantifier variable should be 's'");
+
+            // The body should be an And with 2 parts
+            match body.as_ref() {
+                CompiledExpr::And(body_parts) => {
+                    assert_eq!(body_parts.len(), 2,
+                        "Forall body should have 2 conjuncts, got {} parts: {:?}",
+                        body_parts.len(), body_parts);
+
+                    // First part should be In (shardTerm[s] \in 0..MaxTerm)
+                    assert!(matches!(&body_parts[0], CompiledExpr::In(_, _)),
+                        "First body part should be In, got: {:?}", body_parts[0]);
+
+                    // Second part should be nested Forall
+                    match &body_parts[1] {
+                        CompiledExpr::Forall { var: inner_var, body: inner_body, .. } => {
+                            assert_eq!(inner_var, "c", "Inner quantifier variable should be 'c'");
+                            // Inner body should be In (leases[s][c].held \in BOOLEAN)
+                            assert!(matches!(inner_body.as_ref(), CompiledExpr::In(_, _)),
+                                "Inner body should be In, got: {:?}", inner_body);
+                        }
+                        other => panic!("Second body part should be Forall, got: {:?}", other),
+                    }
+                }
+                other => panic!("Forall body should be And, got: {:?}", other),
+            }
+        }
+        other => panic!("Expected Forall, got: {:?}", other),
+    }
+}
+
+#[test]
+fn test_single_conjunct_with_leading_conjunction() {
+    // Test that "/\ expr" compiles to just "expr" when there's only one conjunct
+    let expr = compile_expr("/\\ x > 0");
+    assert!(matches!(expr, CompiledExpr::Gt(_, _)),
+        "Single conjunct should compile to the inner expression, got: {:?}", expr);
+
+    // Same for disjunction
+    let expr = compile_expr("\\/ x > 0");
+    assert!(matches!(expr, CompiledExpr::Gt(_, _)),
+        "Single disjunct should compile to the inner expression, got: {:?}", expr);
 }
