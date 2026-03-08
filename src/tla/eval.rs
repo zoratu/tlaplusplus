@@ -4948,4 +4948,208 @@ mod tests {
         );
         assert_eq!(result.unwrap(), TlaValue::Bool(true));
     }
+
+    /// Test multi-variable quantifier with different domains
+    /// Pattern: \A c \in Clients, i \in Inodes : body
+    /// This should compile to nested Forall without any Unparsed nodes.
+    #[test]
+    fn test_multi_var_quantifier_different_domains() {
+        use crate::tla::compile_expr;
+        use crate::tla::CompiledExpr;
+
+        // Multi-variable quantifier with different domains
+        let expr = r#"\A c \in Clients, i \in Inodes :
+    /\ serverCharters[i][c].givenAccess \in AccessLevel
+    /\ clientCharters[c][i].givenAccess \in AccessLevel"#;
+
+        let compiled = compile_expr(expr);
+
+        // Should compile to nested Forall: \A c \in Clients : \A i \in Inodes : body
+        match &compiled {
+            CompiledExpr::Forall { var: var1, body: body1, .. } => {
+                assert_eq!(var1, "c", "First binding should be 'c'");
+                match body1.as_ref() {
+                    CompiledExpr::Forall { var: var2, body: body2, .. } => {
+                        assert_eq!(var2, "i", "Second binding should be 'i'");
+                        // Body should be an And with 2 In expressions
+                        match body2.as_ref() {
+                            CompiledExpr::And(parts) => {
+                                assert_eq!(parts.len(), 2, "Body should have 2 conjuncts");
+                                assert!(matches!(&parts[0], CompiledExpr::In(_, _)),
+                                    "First part should be In, got: {:?}", parts[0]);
+                                assert!(matches!(&parts[1], CompiledExpr::In(_, _)),
+                                    "Second part should be In, got: {:?}", parts[1]);
+                            }
+                            other => panic!("Body should be And, got: {:?}", other),
+                        }
+                    }
+                    other => panic!("First Forall body should be nested Forall, got: {:?}", other),
+                }
+            }
+            other => panic!("Should compile to Forall, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_multivar_quantifier_full_typeok_pattern() {
+        use crate::tla::compile_expr;
+        use crate::tla::compiled_eval::eval_compiled;
+
+        // Exact pattern from failing TypeOK - this is the full TypeOK with
+        // both single-var and multi-var quantifiers with different domains
+        let state = TlaState::from_iter([
+            (
+                "inodeState".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from_iter([
+                    (
+                        TlaValue::Int(1),
+                        TlaValue::Record(Arc::new(BTreeMap::from_iter([
+                            ("readers".to_string(), TlaValue::Int(0)),
+                            ("writers".to_string(), TlaValue::Int(0)),
+                            ("dataVerifier".to_string(), TlaValue::Int(0)),
+                        ]))),
+                    ),
+                    (
+                        TlaValue::Int(2),
+                        TlaValue::Record(Arc::new(BTreeMap::from_iter([
+                            ("readers".to_string(), TlaValue::Int(0)),
+                            ("writers".to_string(), TlaValue::Int(0)),
+                            ("dataVerifier".to_string(), TlaValue::Int(0)),
+                        ]))),
+                    ),
+                ]))),
+            ),
+            (
+                "serverCharters".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from_iter([
+                    (
+                        TlaValue::Int(1),
+                        TlaValue::Function(Arc::new(BTreeMap::from_iter([
+                            (
+                                TlaValue::String("a".to_string()),
+                                TlaValue::Record(Arc::new(BTreeMap::from_iter([(
+                                    "givenAccess".to_string(),
+                                    TlaValue::String("Read".to_string()),
+                                )]))),
+                            ),
+                            (
+                                TlaValue::String("b".to_string()),
+                                TlaValue::Record(Arc::new(BTreeMap::from_iter([(
+                                    "givenAccess".to_string(),
+                                    TlaValue::String("None".to_string()),
+                                )]))),
+                            ),
+                        ]))),
+                    ),
+                    (
+                        TlaValue::Int(2),
+                        TlaValue::Function(Arc::new(BTreeMap::from_iter([
+                            (
+                                TlaValue::String("a".to_string()),
+                                TlaValue::Record(Arc::new(BTreeMap::from_iter([(
+                                    "givenAccess".to_string(),
+                                    TlaValue::String("None".to_string()),
+                                )]))),
+                            ),
+                            (
+                                TlaValue::String("b".to_string()),
+                                TlaValue::Record(Arc::new(BTreeMap::from_iter([(
+                                    "givenAccess".to_string(),
+                                    TlaValue::String("Write".to_string()),
+                                )]))),
+                            ),
+                        ]))),
+                    ),
+                ]))),
+            ),
+            (
+                "clientCharters".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from_iter([
+                    (
+                        TlaValue::String("a".to_string()),
+                        TlaValue::Function(Arc::new(BTreeMap::from_iter([
+                            (
+                                TlaValue::Int(1),
+                                TlaValue::Record(Arc::new(BTreeMap::from_iter([(
+                                    "givenAccess".to_string(),
+                                    TlaValue::String("Read".to_string()),
+                                )]))),
+                            ),
+                            (
+                                TlaValue::Int(2),
+                                TlaValue::Record(Arc::new(BTreeMap::from_iter([(
+                                    "givenAccess".to_string(),
+                                    TlaValue::String("None".to_string()),
+                                )]))),
+                            ),
+                        ]))),
+                    ),
+                    (
+                        TlaValue::String("b".to_string()),
+                        TlaValue::Function(Arc::new(BTreeMap::from_iter([
+                            (
+                                TlaValue::Int(1),
+                                TlaValue::Record(Arc::new(BTreeMap::from_iter([(
+                                    "givenAccess".to_string(),
+                                    TlaValue::String("None".to_string()),
+                                )]))),
+                            ),
+                            (
+                                TlaValue::Int(2),
+                                TlaValue::Record(Arc::new(BTreeMap::from_iter([(
+                                    "givenAccess".to_string(),
+                                    TlaValue::String("Write".to_string()),
+                                )]))),
+                            ),
+                        ]))),
+                    ),
+                ]))),
+            ),
+            (
+                "Inodes".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from_iter([
+                    TlaValue::Int(1),
+                    TlaValue::Int(2),
+                ]))),
+            ),
+            (
+                "Clients".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from_iter([
+                    TlaValue::String("a".to_string()),
+                    TlaValue::String("b".to_string()),
+                ]))),
+            ),
+            (
+                "AccessLevel".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from_iter([
+                    TlaValue::String("Read".to_string()),
+                    TlaValue::String("Write".to_string()),
+                    TlaValue::String("None".to_string()),
+                ]))),
+            ),
+        ]);
+        let ctx = EvalContext::new(&state);
+
+        // Full TypeOK with both single and multi-var quantifiers
+        // IMPORTANT: Both quantifiers must be at the same indentation level (column 0)
+        // to be recognized as siblings at the top level
+        let expr = r#"/\ \A i \in Inodes :
+    /\ inodeState[i].readers >= 0
+    /\ inodeState[i].writers >= 0
+    /\ inodeState[i].dataVerifier >= 0
+/\ \A c \in Clients, i \in Inodes :
+    /\ serverCharters[i][c].givenAccess \in AccessLevel
+    /\ clientCharters[c][i].givenAccess \in AccessLevel"#;
+
+        let compiled = compile_expr(expr);
+        println!("Full TypeOK compiled: {:#?}", compiled);
+
+        let result = eval_compiled(&compiled, &ctx);
+        assert!(
+            result.is_ok(),
+            "Full TypeOK should not fail with: {:?}",
+            result.err()
+        );
+        assert_eq!(result.unwrap(), TlaValue::Bool(true));
+    }
 }
