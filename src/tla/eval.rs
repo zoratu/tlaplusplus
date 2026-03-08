@@ -977,7 +977,12 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
         return Ok(out);
     }
 
-    let cartesian_parts = split_top_level_keyword(expr, "\\X");
+    // Handle cartesian product: \X and \times are synonyms
+    let mut cartesian_parts = split_top_level_keyword(expr, "\\X");
+    if cartesian_parts.len() == 1 {
+        // Try \times as an alternative syntax
+        cartesian_parts = split_top_level_keyword(expr, "\\times");
+    }
     if cartesian_parts.len() > 1 {
         let mut result = eval_expr_inner(&cartesian_parts[0], ctx, depth + 1)?;
         for part in &cartesian_parts[1..] {
@@ -4207,6 +4212,29 @@ mod tests {
             eval_expr("{1, 2} \\cap {2, 3}", &ctx).expect("intersection alias should evaluate"),
             TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(2)])))
         );
+    }
+
+    #[test]
+    fn evals_cartesian_product_times_alias() {
+        // Test that \times works as an alias for \X (cartesian product)
+        let state = TlaState::new();
+        let ctx = EvalContext::new(&state);
+
+        // Test \X (standard syntax)
+        let result_x = eval_expr("{1, 2} \\X {3}", &ctx).expect("\\X should evaluate");
+
+        // Test \times (alternate syntax)
+        let result_times = eval_expr("{1, 2} \\times {3}", &ctx).expect("\\times should evaluate");
+
+        // Both should produce the same result
+        assert_eq!(result_x, result_times);
+
+        // Verify the result is correct: {<<1, 3>>, <<2, 3>>}
+        let expected = TlaValue::Set(Arc::new(BTreeSet::from([
+            TlaValue::Seq(Arc::new(vec![TlaValue::Int(1), TlaValue::Int(3)])),
+            TlaValue::Seq(Arc::new(vec![TlaValue::Int(2), TlaValue::Int(3)])),
+        ])));
+        assert_eq!(result_times, expected);
     }
 
     #[test]

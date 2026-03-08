@@ -312,6 +312,20 @@ fn eval_compiled_inner(
             let diff: BTreeSet<TlaValue> = left_set.difference(&right_set).cloned().collect();
             Ok(TlaValue::Set(Arc::new(diff)))
         }
+        CompiledExpr::CartesianProduct(a, b) => {
+            let left = eval_compiled_inner(a, ctx, depth + 1)?;
+            let right = eval_compiled_inner(b, ctx, depth + 1)?;
+            let left_set = left.as_set()?;
+            let right_set = right.as_set()?;
+            let mut product = BTreeSet::new();
+            for lhs_val in left_set {
+                for rhs_val in right_set {
+                    let tuple = TlaValue::Seq(Arc::new(vec![lhs_val.clone(), rhs_val.clone()]));
+                    product.insert(tuple);
+                }
+            }
+            Ok(TlaValue::Set(Arc::new(product)))
+        }
         CompiledExpr::Subset(a, b) => {
             let left = eval_compiled_inner(a, ctx, depth + 1)?;
             let right = eval_compiled_inner(b, ctx, depth + 1)?;
@@ -2194,4 +2208,32 @@ fn test_nested_quantifiers_typeok_evaluation() {
 
     assert!(result.is_ok(), "Evaluation failed: {:?}", result);
     assert_eq!(result.unwrap(), TlaValue::Bool(true));
+}
+
+#[test]
+fn test_compiled_cartesian_product_times() {
+    // Test that \\times is correctly compiled and evaluated as cartesian product
+    use crate::tla::TlaState;
+    use crate::tla::compiled_expr::compile_expr;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    let state = TlaState::new();
+    let ctx = EvalContext::new(&state);
+
+    // Test \\X (standard syntax)
+    let result_x = eval_compiled(&compile_expr("{1, 2} \\X {3}"), &ctx).unwrap();
+
+    // Test \\times (alternate syntax)
+    let result_times = eval_compiled(&compile_expr("{1, 2} \\times {3}"), &ctx).unwrap();
+
+    // Both should produce the same result
+    assert_eq!(result_x, result_times);
+
+    // Verify the result is correct: {<<1, 3>>, <<2, 3>>}
+    let expected = TlaValue::Set(Arc::new(BTreeSet::from([
+        TlaValue::Seq(Arc::new(vec![TlaValue::Int(1), TlaValue::Int(3)])),
+        TlaValue::Seq(Arc::new(vec![TlaValue::Int(2), TlaValue::Int(3)])),
+    ])));
+    assert_eq!(result_times, expected);
 }
