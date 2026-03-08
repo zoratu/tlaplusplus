@@ -1716,4 +1716,185 @@ NEXT AltNext
         assert_eq!(init.len(), 1);
         assert_eq!(init[0].get("x"), Some(&TlaValue::Int(10)));
     }
+
+    #[test]
+    fn extends_inherits_init_next_from_base_module() {
+        // Test case: MCDieHarder EXTENDS DieHarder where Init, Next, Spec are in DieHarder
+        let tmp = std::env::temp_dir().join("tlapp-extends-full-model-test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should be created");
+
+        // Create base module with Init, Next, Spec
+        let base_module = tmp.join("DieHarder.tla");
+        fs::write(
+            &base_module,
+            r#"
+---- MODULE DieHarder ----
+EXTENDS Naturals
+
+VARIABLES small, big
+
+Init ==
+    /\ small = 0
+    /\ big = 0
+
+Next ==
+    \/ /\ small' = 3
+       /\ big' = big
+    \/ /\ big' = 5
+       /\ small' = small
+    \/ /\ small' = 0
+       /\ big' = big
+    \/ /\ big' = 0
+       /\ small' = small
+    \/ /\ UNCHANGED <<small, big>>
+
+Goal == small + big <= 10
+
+Spec == Init /\ [][Next]_<<small, big>>
+====
+"#,
+        )
+        .expect("base module should be written");
+
+        // Create extending module
+        let extending_module = tmp.join("MCDieHarder.tla");
+        fs::write(
+            &extending_module,
+            r#"
+---- MODULE MCDieHarder ----
+EXTENDS DieHarder
+
+\* Additional invariant for model checking
+TypeOK ==
+    /\ small \in 0..5
+    /\ big \in 0..5
+====
+"#,
+        )
+        .expect("extending module should be written");
+
+        // Create config file referencing Init/Next from extended module
+        let cfg = tmp.join("MCDieHarder.cfg");
+        fs::write(
+            &cfg,
+            r#"
+INIT Init
+NEXT Next
+INVARIANT TypeOK
+INVARIANT Goal
+"#,
+        )
+        .expect("cfg should be written");
+
+        // Build the model - this should work because Init/Next are inherited from DieHarder
+        let model = TlaModel::from_files(&extending_module, Some(&cfg), None, None)
+            .expect("model should build with inherited Init/Next");
+
+        // Verify that init_name and next_name are resolved
+        assert_eq!(model.init_name, "Init");
+        assert_eq!(model.next_name, "Next");
+
+        // Check initial states
+        let init = model.initial_states();
+        assert_eq!(init.len(), 1);
+        assert_eq!(init[0].get("small"), Some(&TlaValue::Int(0)));
+        assert_eq!(init[0].get("big"), Some(&TlaValue::Int(0)));
+
+        // Check that next states work
+        let mut next = Vec::new();
+        model.next_states(&init[0], &mut next);
+        assert!(!next.is_empty(), "Next states should be computed");
+
+        // Verify invariants work
+        let invariant_result = model.check_invariants(&init[0]);
+        assert!(
+            invariant_result.is_ok(),
+            "Initial state should satisfy invariants"
+        );
+
+        // Clean up
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn extends_chain_model_works() {
+        // Test a chain of EXTENDS: C extends B extends A
+        let tmp = std::env::temp_dir().join("tlapp-extends-chain-model-test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should be created");
+
+        // Module A: Base definitions
+        let module_a = tmp.join("BaseSpec.tla");
+        fs::write(
+            &module_a,
+            r#"
+---- MODULE BaseSpec ----
+EXTENDS Naturals
+
+VARIABLES x
+
+Init == x = 0
+====
+"#,
+        )
+        .expect("module A should be written");
+
+        // Module B: Extends A, adds Next
+        let module_b = tmp.join("MidSpec.tla");
+        fs::write(
+            &module_b,
+            r#"
+---- MODULE MidSpec ----
+EXTENDS BaseSpec
+
+Next == x' = x + 1 \/ UNCHANGED x
+====
+"#,
+        )
+        .expect("module B should be written");
+
+        // Module C: Extends B, adds invariants
+        let module_c = tmp.join("TopSpec.tla");
+        fs::write(
+            &module_c,
+            r#"
+---- MODULE TopSpec ----
+EXTENDS MidSpec
+
+TypeOK == x \in 0..10
+====
+"#,
+        )
+        .expect("module C should be written");
+
+        let cfg = tmp.join("TopSpec.cfg");
+        fs::write(
+            &cfg,
+            r#"
+INIT Init
+NEXT Next
+INVARIANT TypeOK
+"#,
+        )
+        .expect("cfg should be written");
+
+        // Build model - Init from BaseSpec, Next from MidSpec, TypeOK from TopSpec
+        let model = TlaModel::from_files(&module_c, Some(&cfg), None, None)
+            .expect("model should build with chain of EXTENDS");
+
+        assert_eq!(model.init_name, "Init");
+        assert_eq!(model.next_name, "Next");
+
+        let init = model.initial_states();
+        assert_eq!(init.len(), 1);
+        assert_eq!(init[0].get("x"), Some(&TlaValue::Int(0)));
+
+        let mut next = Vec::new();
+        model.next_states(&init[0], &mut next);
+        assert!(!next.is_empty());
+
+        // Clean up
+        let _ = fs::remove_dir_all(&tmp);
+    }
 }
