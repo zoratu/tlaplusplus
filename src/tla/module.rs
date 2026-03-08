@@ -1,6 +1,6 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,7 +45,35 @@ pub struct TlaModule {
     pub recursive_declarations: BTreeSet<String>,
 }
 
+/// Standard library modules that are built-in and don't need to be loaded from disk.
+/// These modules' operators are implemented directly in the evaluator.
+const BUILTIN_MODULES: &[&str] = &[
+    "Naturals",
+    "Integers",
+    "Reals",
+    "Sequences",
+    "FiniteSets",
+    "TLC",
+    "Bags",
+    "Randomization",
+    "Json",
+    "TLCExt",
+];
+
+/// Check if a module name is a built-in standard library module.
+pub fn is_builtin_module(name: &str) -> bool {
+    BUILTIN_MODULES.contains(&name)
+}
+
 pub fn parse_tla_module_file(path: &Path) -> Result<TlaModule> {
+    parse_tla_module_file_with_visited(path, &mut HashSet::new())
+}
+
+/// Internal function that tracks visited modules to detect circular EXTENDS.
+fn parse_tla_module_file_with_visited(
+    path: &Path,
+    visited: &mut HashSet<String>,
+) -> Result<TlaModule> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("failed reading module {}", path.display()))?;
     let mut module = parse_tla_module_text(&raw)?;
@@ -55,10 +83,111 @@ pub fn parse_tla_module_file(path: &Path) -> Result<TlaModule> {
     // PlusCal algorithms are typically in block comments: (* --algorithm Name ... *)
     module.is_pluscal = detect_pluscal(&raw);
 
+    // Check for circular EXTENDS
+    let canonical_path = path
+        .canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string();
+    if visited.contains(&canonical_path) {
+        return Err(anyhow!(
+            "Circular EXTENDS detected: module '{}' has already been loaded",
+            module.name
+        ));
+    }
+    visited.insert(canonical_path);
+
+    // Load extended modules and merge their definitions
+    load_extended_modules(&mut module, path, visited)?;
+
     // Load module instances
     load_module_instances(&mut module, path)?;
 
     Ok(module)
+}
+
+/// Load modules referenced by EXTENDS declarations and merge their definitions
+/// into the current module.
+///
+/// Definitions from extended modules are available in the extending module but can
+/// be overridden. Variables and constants are also inherited.
+fn load_extended_modules(
+    module: &mut TlaModule,
+    base_path: &Path,
+    visited: &mut HashSet<String>,
+) -> Result<()> {
+    let module_dir = base_path.parent().unwrap_or_else(|| Path::new("."));
+
+    for extended_name in module.extends.clone() {
+        // Skip built-in modules - their operators are implemented in the evaluator
+        if is_builtin_module(&extended_name) {
+            continue;
+        }
+
+        // Try to find the extended module file
+        let extended_path = module_dir.join(format!("{}.tla", extended_name));
+
+        if extended_path.exists() {
+            // Load the extended module recursively
+            let extended_module =
+                parse_tla_module_file_with_visited(&extended_path, visited).with_context(|| {
+                    format!(
+                        "failed to load extended module '{}' from '{}'",
+                        extended_name,
+                        extended_path.display()
+                    )
+                })?;
+
+            // Merge definitions from extended module into current module
+            // Extended module definitions come first, current module definitions override them
+            for (name, def) in extended_module.definitions {
+                // Only insert if not already defined in current module (current overrides extended)
+                if !module.definitions.contains_key(&name) {
+                    module.definitions.insert(name, def);
+                }
+            }
+
+            // Merge constants from extended module
+            for constant in extended_module.constants {
+                if !module.constants.contains(&constant) {
+                    module.constants.push(constant);
+                }
+            }
+
+            // Merge variables from extended module
+            for variable in extended_module.variables {
+                if !module.variables.contains(&variable) {
+                    module.variables.push(variable);
+                }
+            }
+
+            // Merge recursive declarations
+            for rec_decl in extended_module.recursive_declarations {
+                module.recursive_declarations.insert(rec_decl);
+            }
+
+            // Merge instances from extended module
+            for (alias, instance) in extended_module.instances {
+                if !module.instances.contains_key(&alias) {
+                    module.instances.insert(alias, instance);
+                }
+            }
+
+            // If extended module is PlusCal, current module is also considered PlusCal
+            if extended_module.is_pluscal {
+                module.is_pluscal = true;
+            }
+        } else {
+            // Extended module not found - this might be an error or a missing dependency
+            eprintln!(
+                "Warning: Extended module '{}' not found at {}",
+                extended_name,
+                extended_path.display()
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// Detect if the module contains PlusCal code by looking for the algorithm marker.
@@ -89,8 +218,7 @@ fn load_module_instances(module: &mut TlaModule, base_path: &Path) -> Result<()>
             instance.module = Some(Box::new(instance_module));
         } else {
             // Check if it's a built-in module that we can skip
-            let builtin_modules = ["Naturals", "Integers", "Sequences", "FiniteSets", "TLC"];
-            if !builtin_modules.contains(&instance.module_name.as_str()) {
+            if !is_builtin_module(&instance.module_name) {
                 eprintln!(
                     "Warning: Instance module '{}' not found at {}",
                     instance.module_name,
@@ -752,5 +880,292 @@ mod tests {
         );
         assert_eq!(extract_recursive_op_name(""), None);
         assert_eq!(extract_recursive_op_name("   "), None);
+    }
+
+    #[test]
+    fn extends_inherits_definitions_from_base_module() {
+        use std::fs;
+
+        let tmp = std::env::temp_dir().join("tlapp-extends-test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should be created");
+
+        // Create base module with Init, Next, Spec definitions
+        let base_module = tmp.join("DieHarder.tla");
+        fs::write(
+            &base_module,
+            r#"
+---- MODULE DieHarder ----
+EXTENDS Naturals
+
+VARIABLES small, big
+
+Init ==
+    /\ small = 0
+    /\ big = 0
+
+Next ==
+    \/ /\ small' = 3
+       /\ big' = big
+    \/ /\ big' = 5
+       /\ small' = small
+    \/ /\ small' = 0
+       /\ big' = big
+    \/ /\ big' = 0
+       /\ small' = small
+
+Spec == Init /\ [][Next]_<<small, big>>
+
+Goal == small + big <= 10
+====
+"#,
+        )
+        .expect("base module should be written");
+
+        // Create extending module
+        let extending_module = tmp.join("MCDieHarder.tla");
+        fs::write(
+            &extending_module,
+            r#"
+---- MODULE MCDieHarder ----
+EXTENDS DieHarder
+
+CONSTANTS MaxVal
+
+TypeOK == small \in 0..MaxVal /\ big \in 0..MaxVal
+====
+"#,
+        )
+        .expect("extending module should be written");
+
+        // Parse the extending module
+        let module =
+            parse_tla_module_file(&extending_module).expect("extending module should parse");
+
+        // Check that inherited definitions are present
+        assert!(
+            module.definitions.contains_key("Init"),
+            "Init should be inherited from DieHarder"
+        );
+        assert!(
+            module.definitions.contains_key("Next"),
+            "Next should be inherited from DieHarder"
+        );
+        assert!(
+            module.definitions.contains_key("Spec"),
+            "Spec should be inherited from DieHarder"
+        );
+        assert!(
+            module.definitions.contains_key("Goal"),
+            "Goal should be inherited from DieHarder"
+        );
+
+        // Check that local definitions are present
+        assert!(
+            module.definitions.contains_key("TypeOK"),
+            "TypeOK should be defined in MCDieHarder"
+        );
+
+        // Check inherited variables
+        assert!(
+            module.variables.contains(&"small".to_string()),
+            "small should be inherited"
+        );
+        assert!(
+            module.variables.contains(&"big".to_string()),
+            "big should be inherited"
+        );
+
+        // Check local constants
+        assert!(
+            module.constants.contains(&"MaxVal".to_string()),
+            "MaxVal should be local constant"
+        );
+
+        // Clean up
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn extends_local_definitions_override_inherited() {
+        use std::fs;
+
+        let tmp = std::env::temp_dir().join("tlapp-extends-override-test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should be created");
+
+        // Create base module with an Init definition
+        let base_module = tmp.join("Base.tla");
+        fs::write(
+            &base_module,
+            r#"
+---- MODULE Base ----
+VARIABLES x
+Init == x = 0
+SharedOp == x + 1
+====
+"#,
+        )
+        .expect("base module should be written");
+
+        // Create extending module that overrides Init
+        let extending_module = tmp.join("Derived.tla");
+        fs::write(
+            &extending_module,
+            r#"
+---- MODULE Derived ----
+EXTENDS Base
+
+\* Override Init
+Init == x = 100
+
+\* New operator
+NewOp == x * 2
+====
+"#,
+        )
+        .expect("extending module should be written");
+
+        let module =
+            parse_tla_module_file(&extending_module).expect("extending module should parse");
+
+        // Check that local Init overrides inherited Init
+        let init_def = module.definitions.get("Init").expect("Init should exist");
+        assert!(
+            init_def.body.contains("100"),
+            "Init should be overridden to use 100, got: {}",
+            init_def.body
+        );
+
+        // Check that inherited SharedOp is present
+        assert!(
+            module.definitions.contains_key("SharedOp"),
+            "SharedOp should be inherited"
+        );
+
+        // Check that NewOp is present
+        assert!(
+            module.definitions.contains_key("NewOp"),
+            "NewOp should be defined"
+        );
+
+        // Clean up
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn extends_chain_inherits_transitively() {
+        use std::fs;
+
+        let tmp = std::env::temp_dir().join("tlapp-extends-chain-test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should be created");
+
+        // Create base module
+        let base_module = tmp.join("Level0.tla");
+        fs::write(
+            &base_module,
+            r#"
+---- MODULE Level0 ----
+VARIABLES x
+BaseOp == x + 1
+====
+"#,
+        )
+        .expect("base module should be written");
+
+        // Create intermediate module
+        let mid_module = tmp.join("Level1.tla");
+        fs::write(
+            &mid_module,
+            r#"
+---- MODULE Level1 ----
+EXTENDS Level0
+MidOp == x + 2
+====
+"#,
+        )
+        .expect("intermediate module should be written");
+
+        // Create final extending module
+        let top_module = tmp.join("Level2.tla");
+        fs::write(
+            &top_module,
+            r#"
+---- MODULE Level2 ----
+EXTENDS Level1
+TopOp == x + 3
+====
+"#,
+        )
+        .expect("top module should be written");
+
+        let module = parse_tla_module_file(&top_module).expect("top module should parse");
+
+        // Check that all operators are transitively inherited
+        assert!(
+            module.definitions.contains_key("BaseOp"),
+            "BaseOp should be inherited from Level0"
+        );
+        assert!(
+            module.definitions.contains_key("MidOp"),
+            "MidOp should be inherited from Level1"
+        );
+        assert!(
+            module.definitions.contains_key("TopOp"),
+            "TopOp should be defined in Level2"
+        );
+
+        // Check that variable is inherited through the chain
+        assert!(
+            module.variables.contains(&"x".to_string()),
+            "x should be inherited"
+        );
+
+        // Clean up
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn extends_builtin_modules_are_skipped() {
+        // Test that built-in modules don't cause errors
+        let src = r#"
+---- MODULE TestBuiltin ----
+EXTENDS Naturals, Integers, Sequences, FiniteSets, TLC
+VARIABLES x
+Init == x = 0
+====
+"#;
+        let module = parse_tla_module_text(src).expect("parse should work");
+
+        // Should have the EXTENDS list but no definitions from builtins
+        // (they are implemented in the evaluator)
+        assert!(module.extends.contains(&"Naturals".to_string()));
+        assert!(module.extends.contains(&"Integers".to_string()));
+        assert!(module.extends.contains(&"Sequences".to_string()));
+        assert!(module.extends.contains(&"FiniteSets".to_string()));
+        assert!(module.extends.contains(&"TLC".to_string()));
+
+        // Local definitions should be present
+        assert!(module.definitions.contains_key("Init"));
+    }
+
+    #[test]
+    fn is_builtin_module_returns_correct_results() {
+        assert!(is_builtin_module("Naturals"));
+        assert!(is_builtin_module("Integers"));
+        assert!(is_builtin_module("Sequences"));
+        assert!(is_builtin_module("FiniteSets"));
+        assert!(is_builtin_module("TLC"));
+        assert!(is_builtin_module("Bags"));
+        assert!(is_builtin_module("Reals"));
+        assert!(is_builtin_module("Randomization"));
+        assert!(is_builtin_module("Json"));
+        assert!(is_builtin_module("TLCExt"));
+
+        // Non-builtin modules
+        assert!(!is_builtin_module("MyModule"));
+        assert!(!is_builtin_module("DieHarder"));
+        assert!(!is_builtin_module(""));
     }
 }
