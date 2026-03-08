@@ -717,8 +717,10 @@ fn split_top_level(expr: &str, delim: &str) -> Vec<String> {
     let mut if_depth: usize = 0; // Track IF...ELSE nesting
     let mut case_depth: usize = 0; // Track CASE expression nesting
     let mut quantifier_depth: usize = 0; // Track nested quantifier depth (not just boolean!)
-    let mut quantifier_base_col: Option<usize> = None; // Column of first quantifier's colon
+    let mut quantifier_base_indent: Option<usize> = None; // Indentation of first quantifier's line
     let mut current_col: usize = 0; // Current column position
+    let mut line_indent: usize = 0; // Indentation of current line (spaces at start)
+    let mut at_line_start = true; // Are we at the start of a line (counting spaces)?
     let mut in_string = false;
     let chars: Vec<char> = expr.chars().collect();
     let delim_chars: Vec<char> = delim.chars().collect();
@@ -727,10 +729,19 @@ fn split_top_level(expr: &str, delim: &str) -> Vec<String> {
     while i < chars.len() {
         let c = chars[i];
 
-        // Track column position
+        // Track column position and line indentation
         if c == '\n' {
             current_col = 0;
+            line_indent = 0;
+            at_line_start = true;
         } else {
+            if at_line_start {
+                if c == ' ' || c == '\t' {
+                    line_indent += if c == '\t' { 4 } else { 1 };
+                } else {
+                    at_line_start = false;
+                }
+            }
             current_col += 1;
         }
 
@@ -843,10 +854,10 @@ fn split_top_level(expr: &str, delim: &str) -> Vec<String> {
                             // Found the colon - everything after this is quantifier body
                             // INCREMENT depth instead of setting boolean - this handles nesting!
                             quantifier_depth += 1;
-                            // Record the column of the first quantifier's colon
-                            // (use current_col since we're at the start of the quantifier)
-                            if quantifier_base_col.is_none() {
-                                quantifier_base_col = Some(current_col);
+                            // Record the INDENTATION of the first quantifier's line
+                            // This is used to detect sibling quantifiers at the same indentation level
+                            if quantifier_base_indent.is_none() {
+                                quantifier_base_indent = Some(line_indent);
                             }
                             // Push everything up to and including the colon
                             let chars_pushed = j - i + 1;
@@ -884,17 +895,16 @@ fn split_top_level(expr: &str, delim: &str) -> Vec<String> {
                         || after_delim.starts_with("\\E(");
 
                     if starts_new_quantifier {
-                        // Check indentation: if we're at or before the base column,
-                        // this is a sibling quantifier, not nested
-                        // Use current_col which is the column right before the delimiter
-                        let is_sibling = quantifier_base_col
-                            .map(|base| current_col <= base)
+                        // Check indentation: if the current line's indentation is at or before
+                        // the base quantifier's indentation, this is a sibling quantifier
+                        let is_sibling = quantifier_base_indent
+                            .map(|base| line_indent <= base)
                             .unwrap_or(false);
 
                         if is_sibling {
                             // Split here - this is a sibling quantifier
                             quantifier_depth = 0;
-                            quantifier_base_col = None;
+                            quantifier_base_indent = None;
                             if !current.trim().is_empty() {
                                 parts.push(current.trim().to_string());
                             }
