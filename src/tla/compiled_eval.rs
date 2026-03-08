@@ -1296,6 +1296,30 @@ fn eval_compiled_opcall(
             let s = tla_value_to_string(&arg_values[0]);
             return Ok(TlaValue::String(s));
         }
+        // TLC module: FunAsSeq(f, a, b) - converts a function to a sequence
+        // FunAsSeq(f, a, b) == [i \in 1..b |-> f[a + i - 1]]
+        // This creates a sequence of length b by extracting values from f
+        // starting at index a
+        "FunAsSeq" => {
+            if arg_values.len() != 3 {
+                return Err(anyhow!("FunAsSeq expects 3 arguments: f, a, b"));
+            }
+            let func = &arg_values[0];
+            let a = arg_values[1].as_int()?;
+            let b = arg_values[2].as_int()?;
+
+            if b < 0 {
+                return Err(anyhow!("FunAsSeq: b must be non-negative, got {}", b));
+            }
+
+            let mut result = Vec::with_capacity(b as usize);
+            for i in 1..=b {
+                let key = TlaValue::Int(a + i - 1);
+                let val = func.apply(&key)?.clone();
+                result.push(val);
+            }
+            return Ok(TlaValue::Seq(Arc::new(result)));
+        }
         _ => {}
     }
 
@@ -1993,10 +2017,7 @@ fn test_full_typeok_pattern_cluster_lease_failover() {
             let mut lease_rec = BTreeMap::new();
             lease_rec.insert("held".to_string(), TlaValue::Bool(true));
             lease_rec.insert("grantedTerm".to_string(), TlaValue::Int(1));
-            lease_rec.insert(
-                "access".to_string(),
-                TlaValue::String("read".to_string()),
-            );
+            lease_rec.insert("access".to_string(), TlaValue::String("read".to_string()));
             inner_map.insert(
                 TlaValue::ModelValue(client.to_string()),
                 TlaValue::Record(Arc::new(lease_rec)),
