@@ -1916,6 +1916,134 @@ mod forall_tests {
 }
 
 #[test]
+fn test_full_typeok_pattern_cluster_lease_failover() {
+    // Test the FULL TypeOK pattern from ClusterLeaseFailover.tla that fails:
+    // - 3 DOMAIN checks
+    // - 1 outer quantifier (\A s \in Shards) with 4 conjuncts in body
+    // - 1 nested quantifier (\A c \in Clients) with 3 conjuncts
+    // Error: "key s not in domain {s1, s2, s3, s4}"
+    //
+    // TypeOK ==
+    //     /\ DOMAIN shardTerm = Shards
+    //     /\ DOMAIN shardLeader = Shards
+    //     /\ DOMAIN leases = Shards
+    //     /\ \A s \in Shards :
+    //         /\ shardTerm[s] \in 0..MaxTerm
+    //         /\ shardLeader[s] \in {"none", "stable", "electing"}
+    //         /\ DOMAIN leases[s] = Clients
+    //         /\ \A c \in Clients :
+    //             /\ leases[s][c].held \in BOOLEAN
+    //             /\ leases[s][c].grantedTerm \in 0..MaxTerm
+    //             /\ leases[s][c].access \in {"none", "read", "write", "exclusive"}
+
+    use crate::tla::TlaState;
+    use crate::tla::compiled_expr::compile_expr;
+    use std::sync::Arc;
+
+    let mut state = TlaState::new();
+
+    // Create Shards set (use 4 shards like in the error message)
+    let shards_set: BTreeSet<TlaValue> = ["s1", "s2", "s3", "s4"]
+        .iter()
+        .map(|s| TlaValue::ModelValue(s.to_string()))
+        .collect();
+    state.insert("Shards".to_string(), TlaValue::Set(Arc::new(shards_set)));
+
+    // Create Clients set
+    let clients_set: BTreeSet<TlaValue> = ["c1", "c2"]
+        .iter()
+        .map(|s| TlaValue::ModelValue(s.to_string()))
+        .collect();
+    state.insert("Clients".to_string(), TlaValue::Set(Arc::new(clients_set)));
+
+    // Create shardTerm function: s1 -> 1, s2 -> 2, s3 -> 3, s4 -> 4
+    let mut shardterm_map = BTreeMap::new();
+    for (i, s) in ["s1", "s2", "s3", "s4"].iter().enumerate() {
+        shardterm_map.insert(
+            TlaValue::ModelValue(s.to_string()),
+            TlaValue::Int(i as i64 + 1),
+        );
+    }
+    state.insert(
+        "shardTerm".to_string(),
+        TlaValue::Function(Arc::new(shardterm_map)),
+    );
+
+    // Create shardLeader function: s1 -> "stable", s2 -> "none", etc.
+    // Use String values (not ModelValue) to match the set literal {"none", "stable", "electing"}
+    let mut shardleader_map = BTreeMap::new();
+    let statuses = ["stable", "none", "electing", "stable"];
+    for (i, s) in ["s1", "s2", "s3", "s4"].iter().enumerate() {
+        shardleader_map.insert(
+            TlaValue::ModelValue(s.to_string()),
+            TlaValue::String(statuses[i].to_string()),
+        );
+    }
+    state.insert(
+        "shardLeader".to_string(),
+        TlaValue::Function(Arc::new(shardleader_map)),
+    );
+
+    // Create leases nested function: leases[s][c] = {held: TRUE, grantedTerm: 1, access: "read"}
+    // Use String values for access to match the set literal {"none", "read", "write", "exclusive"}
+    let mut leases_outer = BTreeMap::new();
+    for shard in ["s1", "s2", "s3", "s4"] {
+        let mut inner_map = BTreeMap::new();
+        for client in ["c1", "c2"] {
+            let mut lease_rec = BTreeMap::new();
+            lease_rec.insert("held".to_string(), TlaValue::Bool(true));
+            lease_rec.insert("grantedTerm".to_string(), TlaValue::Int(1));
+            lease_rec.insert(
+                "access".to_string(),
+                TlaValue::String("read".to_string()),
+            );
+            inner_map.insert(
+                TlaValue::ModelValue(client.to_string()),
+                TlaValue::Record(Arc::new(lease_rec)),
+            );
+        }
+        leases_outer.insert(
+            TlaValue::ModelValue(shard.to_string()),
+            TlaValue::Function(Arc::new(inner_map)),
+        );
+    }
+    state.insert(
+        "leases".to_string(),
+        TlaValue::Function(Arc::new(leases_outer)),
+    );
+
+    state.insert("MaxTerm".to_string(), TlaValue::Int(10));
+
+    let ctx = EvalContext::new(&state);
+
+    // The FULL TypeOK invariant expression
+    let expr_str = r#"/\ DOMAIN shardTerm = Shards
+/\ DOMAIN shardLeader = Shards
+/\ DOMAIN leases = Shards
+/\ \A s \in Shards :
+    /\ shardTerm[s] \in 0..MaxTerm
+    /\ shardLeader[s] \in {"none", "stable", "electing"}
+    /\ DOMAIN leases[s] = Clients
+    /\ \A c \in Clients :
+        /\ leases[s][c].held \in BOOLEAN
+        /\ leases[s][c].grantedTerm \in 0..MaxTerm
+        /\ leases[s][c].access \in {"none", "read", "write", "exclusive"}"#;
+
+    let expr = compile_expr(expr_str);
+    println!("Full TypeOK compiled: {:#?}", expr);
+
+    let result = eval_compiled(&expr, &ctx);
+    println!("Full TypeOK result: {:?}", result);
+
+    assert!(
+        result.is_ok(),
+        "Full TypeOK evaluation failed: {:?}",
+        result
+    );
+    assert_eq!(result.unwrap(), TlaValue::Bool(true));
+}
+
+#[test]
 fn test_full_price_bands_invariant() {
     // Replicate the full PriceBandsRespected invariant
     let expr_str = r#"\A l \in listings : l.price >= MinPrice /\ l.price <= MaxPrice"#;
