@@ -72,6 +72,9 @@ pub struct EngineConfig {
     pub bloom_switch_memory_threshold: f64,
     /// False positive rate for bloom filter after auto-switch
     pub bloom_switch_fpr: f64,
+    /// Defer queue segment deletion (for S3 coordination)
+    /// When true, consumed segments are retained until S3 confirms upload.
+    pub defer_queue_segment_deletion: bool,
 }
 
 impl Default for EngineConfig {
@@ -110,6 +113,7 @@ impl Default for EngineConfig {
             bloom_switch_threshold: 1_000_000_000, // 1 billion states
             bloom_switch_memory_threshold: 0.85, // 85% memory pressure
             bloom_switch_fpr: 0.001,     // 0.1% FPR after switch
+            defer_queue_segment_deletion: false, // Only true when S3 is active
         }
     }
 }
@@ -924,6 +928,8 @@ where
         // Per-worker spill buffer settings for lock-free spilling
         worker_spill_buffer_size: 4096, // Each worker buffers 4K items locally
         worker_channel_bound: 16,       // 16 batches in flight per worker
+        // When S3 is active, defer segment deletion until S3 confirms upload
+        defer_segment_deletion: config.defer_queue_segment_deletion,
     };
     let (queue, worker_states) = SpillableWorkStealingQueues::new(
         worker_plan.worker_count,

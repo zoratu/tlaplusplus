@@ -346,6 +346,8 @@ fn build_engine_config(
         bloom_switch_threshold: storage.bloom_switch_threshold,
         bloom_switch_memory_threshold: storage.bloom_switch_memory_threshold,
         bloom_switch_fpr: storage.bloom_switch_fpr,
+        // Default to false - set to true in run_model_with_s3 when S3 is active
+        defer_queue_segment_deletion: false,
     })
 }
 
@@ -436,6 +438,10 @@ where
         config.checkpoint_interval_secs = 600; // 10 minutes
         eprintln!("S3: Using default checkpoint interval of 10 minutes for spot instance safety");
     }
+
+    // With S3 enabled, defer queue segment deletion until S3 confirms upload
+    // This prevents the race condition where segments are deleted before being synced
+    config.defer_queue_segment_deletion = true;
 
     let bucket = s3.s3_bucket.as_ref().unwrap();
     let prefix = if s3.s3_prefix.is_empty() {
