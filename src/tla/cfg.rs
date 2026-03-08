@@ -133,6 +133,8 @@ pub fn parse_tla_config(input: &str) -> Result<TlaConfig> {
             // Check if this is an assignment (contains = or <-)
             if rest.contains('=') || rest.contains("<-") {
                 parse_constant_line(rest, &mut cfg)?;
+                // Set section for continuation lines (e.g., multi-line CONSTANTS blocks)
+                section = Some(Section::Constants);
                 continue;
             }
             // Otherwise it's just "CONSTANT" with items listed after, fall through to section handling
@@ -958,5 +960,33 @@ mod tests {
             Some(&ConfigValue::OperatorRef("BoundedSeq".to_string()))
         );
         assert_eq!(cfg.constants.get("M"), Some(&ConfigValue::Int(5)));
+    }
+
+    #[test]
+    fn parses_inline_constant_with_continuation_lines() {
+        // This is the DieHarder-style format: inline assignment followed by continuation lines
+        let cfg = parse_tla_config(
+            r#"
+            CONSTANTS Goal     =  4
+                      Jug      <- MCJug
+                      Capacity <- MCCapacity
+
+            SPECIFICATION Spec
+            INVARIANTS TypeOK NotSolved
+            "#,
+        )
+        .expect("cfg should parse");
+
+        assert_eq!(cfg.constants.get("Goal"), Some(&ConfigValue::Int(4)));
+        assert_eq!(
+            cfg.constants.get("Jug"),
+            Some(&ConfigValue::OperatorRef("MCJug".to_string()))
+        );
+        assert_eq!(
+            cfg.constants.get("Capacity"),
+            Some(&ConfigValue::OperatorRef("MCCapacity".to_string()))
+        );
+        assert_eq!(cfg.specification.as_deref(), Some("Spec"));
+        assert_eq!(cfg.invariants, vec!["TypeOK", "NotSolved"]);
     }
 }
