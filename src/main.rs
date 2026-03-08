@@ -7,7 +7,7 @@ use tlaplusplus::models::high_branching::HighBranchingModel;
 use tlaplusplus::models::tla_native::TlaModel;
 use tlaplusplus::system::parse_cpu_list;
 use tlaplusplus::tla::{
-    ActionClause, ClauseKind, ConfigValue, EvalContext, TlaState, TlaValue, classify_clause,
+    TlaConfig, TlaDefinition, TlaModule, ActionClause, ClauseKind, ConfigValue, EvalContext, TlaState, TlaValue, classify_clause,
     compile_action_ir, eval_expr, looks_like_action, parse_tla_config, parse_tla_module_file,
     probe_next_disjuncts, scan_module_closure, split_top_level,
 };
@@ -853,7 +853,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::AnalyzeTla { module, config } => {
-            let parsed_module = parse_tla_module_file(&module)?;
+            let mut parsed_module = parse_tla_module_file(&module)?;
             let scan = scan_module_closure(&module)?;
             let parsed_cfg = match config.as_ref() {
                 Some(cfg_path) => {
@@ -862,6 +862,10 @@ fn main() -> anyhow::Result<()> {
                 }
                 None => None,
             };
+            // Inject constants from config into module definitions (handles OperatorRef)
+            if let Some(cfg) = parsed_cfg.as_ref() {
+                inject_constants_into_definitions(&mut parsed_module, cfg);
+            }
             println!("entry_module={}", module.display());
             println!(
                 "parsed_module_name={} parsed_constants={} parsed_variables={} parsed_definitions={}",
@@ -1689,6 +1693,54 @@ fn format_num(n: u64) -> String {
         result.push(c);
     }
     result.chars().rev().collect()
+}
+
+/// Inject constant bindings from config file into module definitions.
+///
+/// This handles OperatorRef constants (e.g., `Node <- N1`) by creating
+/// definitions that reference the operator, allowing the evaluator to
+/// resolve them properly.
+fn inject_constants_into_definitions(module: &mut TlaModule, config: &TlaConfig) {
+    for (name, value) in &config.constants {
+        // Convert ConfigValue to a TLA+ expression string
+        let body = config_value_to_expr(value);
+
+        // Add as a zero-parameter definition
+        module.definitions.insert(
+            name.clone(),
+            TlaDefinition {
+                name: name.clone(),
+                params: vec![],
+                body,
+                is_recursive: false,
+            },
+        );
+    }
+}
+
+/// Convert a ConfigValue to a TLA+ expression string
+fn config_value_to_expr(value: &ConfigValue) -> String {
+    match value {
+        ConfigValue::Int(n) => n.to_string(),
+        ConfigValue::String(s) => format!("\"{}\"", s),
+        ConfigValue::ModelValue(s) => s.clone(),
+        ConfigValue::Bool(b) => {
+            if *b {
+                "TRUE".to_string()
+            } else {
+                "FALSE".to_string()
+            }
+        }
+        ConfigValue::Set(values) => {
+            let items: Vec<String> = values.iter().map(config_value_to_expr).collect();
+            format!("{{{}}}", items.join(", "))
+        }
+        ConfigValue::Tuple(values) => {
+            let items: Vec<String> = values.iter().map(config_value_to_expr).collect();
+            format!("<<{}>>", items.join(", "))
+        }
+        ConfigValue::OperatorRef(name) => name.clone(),
+    }
 }
 
 fn config_value_to_tla(value: &ConfigValue) -> Option<TlaValue> {
