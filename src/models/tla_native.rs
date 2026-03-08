@@ -56,7 +56,7 @@ impl TlaModel {
         inject_constants_into_definitions(&mut module, &config);
 
         let (init_name, next_name) = resolve_init_next_names(
-            &module,
+            &mut module,
             &config,
             init_override.map(ToString::to_string),
             next_override.map(ToString::to_string),
@@ -630,8 +630,18 @@ fn resolve_view(module: &TlaModule, cfg: &TlaConfig) -> Option<String> {
     })
 }
 
+/// Result of extracting Init or Next from a SPECIFICATION formula.
+/// Can be either a reference to an existing definition or an inline expression.
+#[derive(Debug, Clone)]
+enum SpecComponent {
+    /// Reference to an existing definition (e.g., "Init", "Next")
+    Reference(String),
+    /// Inline expression that needs to be wrapped in a synthetic definition
+    Inline(String),
+}
+
 fn resolve_init_next_names(
-    module: &TlaModule,
+    module: &mut TlaModule,
     cfg: &TlaConfig,
     init_override: Option<String>,
     next_override: Option<String>,
@@ -639,16 +649,60 @@ fn resolve_init_next_names(
     let mut init = init_override.or_else(|| cfg.init.clone());
     let mut next = next_override.or_else(|| cfg.next.clone());
 
-    if (init.is_none() || next.is_none())
-        && let Some(spec_name) = cfg.specification.as_ref()
-        && let Some(spec_def) = module.definitions.get(spec_name)
-        && let Some((spec_init, spec_next)) = extract_init_next_from_spec(&spec_def.body)
-    {
-        if init.is_none() {
-            init = Some(spec_init);
-        }
-        if next.is_none() {
-            next = Some(spec_next);
+    // Try to extract Init/Next from SPECIFICATION if not explicitly provided
+    if init.is_none() || next.is_none() {
+        if let Some(spec_name) = cfg.specification.as_ref() {
+            if let Some(spec_def) = module.definitions.get(spec_name).cloned() {
+                let (spec_init, spec_next) = extract_init_next_from_spec(&spec_def.body, module);
+
+                if init.is_none() {
+                    if let Some(component) = spec_init {
+                        match component {
+                            SpecComponent::Reference(name) => {
+                                init = Some(name);
+                            }
+                            SpecComponent::Inline(expr) => {
+                                // Create a synthetic definition for the inline Init
+                                let synth_name = "__SyntheticInit__".to_string();
+                                module.definitions.insert(
+                                    synth_name.clone(),
+                                    TlaDefinition {
+                                        name: synth_name.clone(),
+                                        params: vec![],
+                                        body: expr,
+                                        is_recursive: false,
+                                    },
+                                );
+                                init = Some(synth_name);
+                            }
+                        }
+                    }
+                }
+
+                if next.is_none() {
+                    if let Some(component) = spec_next {
+                        match component {
+                            SpecComponent::Reference(name) => {
+                                next = Some(name);
+                            }
+                            SpecComponent::Inline(expr) => {
+                                // Create a synthetic definition for the inline Next
+                                let synth_name = "__SyntheticNext__".to_string();
+                                module.definitions.insert(
+                                    synth_name.clone(),
+                                    TlaDefinition {
+                                        name: synth_name.clone(),
+                                        params: vec![],
+                                        body: expr,
+                                        is_recursive: false,
+                                    },
+                                );
+                                next = Some(synth_name);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -699,36 +753,74 @@ fn resolve_init_next_names(
     Ok((init, next))
 }
 
-fn extract_init_next_from_spec(spec_body: &str) -> Option<(String, String)> {
+/// Extract Init and Next components from a SPECIFICATION formula.
+///
+/// Handles patterns like:
+/// - `Spec == Init /\ [][Next]_vars`
+/// - `Spec == /\ Init /\ [][Next]_vars`
+/// - `Spec == Init /\ [][Next]_<<x, y, z>>`
+/// - `Spec == x = 0 /\ [][x' = x + 1]_vars` (inline expressions)
+///
+/// Returns (Option<SpecComponent>, Option<SpecComponent>) for Init and Next respectively.
+fn extract_init_next_from_spec(
+    spec_body: &str,
+    module: &TlaModule,
+) -> (Option<SpecComponent>, Option<SpecComponent>) {
     let parts = split_top_level(spec_body, "/\\");
-    let mut init = None;
-    let mut next = None;
+    let mut init: Option<SpecComponent> = None;
+    let mut next: Option<SpecComponent> = None;
 
     for part in parts {
         let part = part.trim();
-
-        if init.is_none()
-            && let Some(name) = parse_simple_identifier(part)
-        {
-            init = Some(name);
+        if part.is_empty() {
             continue;
         }
 
-        if next.is_none()
-            && let Some(rest) = part.strip_prefix("[][")
-            && let Some(idx) = rest.find("]_")
-        {
-            let candidate = rest[..idx].trim();
-            if let Some(name) = parse_simple_identifier(candidate) {
-                next = Some(name);
+        // Check for [][...]_vars pattern (Next)
+        if next.is_none() {
+            if let Some(rest) = part.strip_prefix("[][") {
+                if let Some(idx) = rest.find("]_") {
+                    let action_expr = rest[..idx].trim();
+                    if let Some(name) = parse_simple_identifier(action_expr) {
+                        // It's a reference to a definition
+                        if module.definitions.contains_key(&name) {
+                            next = Some(SpecComponent::Reference(name));
+                        } else {
+                            // Treat as inline expression (might be a variable name used as action)
+                            next = Some(SpecComponent::Inline(action_expr.to_string()));
+                        }
+                    } else {
+                        // It's an inline expression
+                        next = Some(SpecComponent::Inline(action_expr.to_string()));
+                    }
+                    continue;
+                }
+            }
+        }
+
+        // Check for WF_/SF_ fairness constraints - skip these for Init/Next extraction
+        if part.starts_with("WF_") || part.starts_with("SF_") {
+            continue;
+        }
+
+        // Otherwise, it might be Init
+        if init.is_none() {
+            if let Some(name) = parse_simple_identifier(part) {
+                // It's a simple identifier - check if it's a known definition
+                if module.definitions.contains_key(&name) {
+                    init = Some(SpecComponent::Reference(name));
+                } else {
+                    // Might be a variable being constrained - treat as inline
+                    init = Some(SpecComponent::Inline(part.to_string()));
+                }
+            } else {
+                // It's an inline expression (e.g., "x = 0" or "x \in 1..10")
+                init = Some(SpecComponent::Inline(part.to_string()));
             }
         }
     }
 
-    match (init, next) {
-        (Some(i), Some(n)) => Some((i, n)),
-        _ => None,
-    }
+    (init, next)
 }
 
 fn parse_simple_identifier(text: &str) -> Option<String> {
@@ -1353,5 +1445,275 @@ INVARIANT TypeOK
         let init = model.initial_states();
         assert_eq!(init.len(), 1);
         assert!(model.check_invariants(&init[0]).is_ok());
+    }
+
+    #[test]
+    fn specification_with_inline_init_and_next() {
+        // Test that inline Init/Next expressions in SPECIFICATION work
+        let tmp = std::env::temp_dir().join("tlapp-spec-inline-init-next");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should be created");
+
+        let module = tmp.join("InlineSpec.tla");
+        fs::write(
+            &module,
+            r#"
+---- MODULE InlineSpec ----
+EXTENDS Naturals
+VARIABLES x
+vars == <<x>>
+Spec == x = 0 /\ [][x' = x + 1 \/ UNCHANGED x]_vars
+====
+"#,
+        )
+        .expect("module should be written");
+
+        let cfg = tmp.join("InlineSpec.cfg");
+        fs::write(
+            &cfg,
+            r#"
+SPECIFICATION Spec
+"#,
+        )
+        .expect("cfg should be written");
+
+        let model =
+            TlaModel::from_files(&module, Some(&cfg), None, None).expect("model should build");
+
+        // Synthetic definitions should be created
+        assert_eq!(model.init_name, "__SyntheticInit__");
+        assert_eq!(model.next_name, "__SyntheticNext__");
+
+        let init = model.initial_states();
+        assert_eq!(init.len(), 1);
+        assert_eq!(init[0].get("x"), Some(&TlaValue::Int(0)));
+
+        let mut next = Vec::new();
+        model.next_states(&init[0], &mut next);
+        assert!(!next.is_empty());
+    }
+
+    #[test]
+    fn specification_with_named_init_and_next() {
+        // Test that named Init/Next references in SPECIFICATION work
+        let tmp = std::env::temp_dir().join("tlapp-spec-named-init-next");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should be created");
+
+        let module = tmp.join("NamedSpec.tla");
+        fs::write(
+            &module,
+            r#"
+---- MODULE NamedSpec ----
+EXTENDS Naturals
+VARIABLES x
+MyInit == x = 0
+MyNext == x' = x + 1 \/ UNCHANGED x
+vars == <<x>>
+Spec == MyInit /\ [][MyNext]_vars
+====
+"#,
+        )
+        .expect("module should be written");
+
+        let cfg = tmp.join("NamedSpec.cfg");
+        fs::write(
+            &cfg,
+            r#"
+SPECIFICATION Spec
+"#,
+        )
+        .expect("cfg should be written");
+
+        let model =
+            TlaModel::from_files(&module, Some(&cfg), None, None).expect("model should build");
+
+        // Named definitions should be referenced directly
+        assert_eq!(model.init_name, "MyInit");
+        assert_eq!(model.next_name, "MyNext");
+
+        let init = model.initial_states();
+        assert_eq!(init.len(), 1);
+        assert_eq!(init[0].get("x"), Some(&TlaValue::Int(0)));
+
+        let mut next = Vec::new();
+        model.next_states(&init[0], &mut next);
+        assert!(!next.is_empty());
+    }
+
+    #[test]
+    fn specification_with_leading_conjunction() {
+        // Test Spec == /\ Init /\ [][Next]_vars pattern
+        let tmp = std::env::temp_dir().join("tlapp-spec-leading-conj");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should be created");
+
+        let module = tmp.join("LeadingConj.tla");
+        fs::write(
+            &module,
+            r#"
+---- MODULE LeadingConj ----
+EXTENDS Naturals
+VARIABLES x
+Init == x = 0
+Next == x' = x + 1 \/ UNCHANGED x
+vars == <<x>>
+Spec == /\ Init /\ [][Next]_vars
+====
+"#,
+        )
+        .expect("module should be written");
+
+        let cfg = tmp.join("LeadingConj.cfg");
+        fs::write(
+            &cfg,
+            r#"
+SPECIFICATION Spec
+"#,
+        )
+        .expect("cfg should be written");
+
+        let model =
+            TlaModel::from_files(&module, Some(&cfg), None, None).expect("model should build");
+
+        assert_eq!(model.init_name, "Init");
+        assert_eq!(model.next_name, "Next");
+
+        let init = model.initial_states();
+        assert_eq!(init.len(), 1);
+    }
+
+    #[test]
+    fn specification_with_tuple_vars() {
+        // Test Spec == Init /\ [][Next]_<<x, y>> pattern
+        let tmp = std::env::temp_dir().join("tlapp-spec-tuple-vars");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should be created");
+
+        let module = tmp.join("TupleVars.tla");
+        fs::write(
+            &module,
+            r#"
+---- MODULE TupleVars ----
+EXTENDS Naturals
+VARIABLES x, y
+Init == x = 0 /\ y = 0
+Next == x' = x + 1 /\ y' = y \/ UNCHANGED <<x, y>>
+Spec == Init /\ [][Next]_<<x, y>>
+====
+"#,
+        )
+        .expect("module should be written");
+
+        let cfg = tmp.join("TupleVars.cfg");
+        fs::write(
+            &cfg,
+            r#"
+SPECIFICATION Spec
+"#,
+        )
+        .expect("cfg should be written");
+
+        let model =
+            TlaModel::from_files(&module, Some(&cfg), None, None).expect("model should build");
+
+        assert_eq!(model.init_name, "Init");
+        assert_eq!(model.next_name, "Next");
+
+        let init = model.initial_states();
+        assert_eq!(init.len(), 1);
+        assert_eq!(init[0].get("x"), Some(&TlaValue::Int(0)));
+        assert_eq!(init[0].get("y"), Some(&TlaValue::Int(0)));
+    }
+
+    #[test]
+    fn specification_with_mixed_inline_and_named() {
+        // Test inline Init with named Next
+        let tmp = std::env::temp_dir().join("tlapp-spec-mixed-inline-named");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should be created");
+
+        let module = tmp.join("MixedSpec.tla");
+        fs::write(
+            &module,
+            r#"
+---- MODULE MixedSpec ----
+EXTENDS Naturals
+VARIABLES x
+MyNext == x' = x + 1 \/ UNCHANGED x
+vars == <<x>>
+Spec == x = 0 /\ [][MyNext]_vars
+====
+"#,
+        )
+        .expect("module should be written");
+
+        let cfg = tmp.join("MixedSpec.cfg");
+        fs::write(
+            &cfg,
+            r#"
+SPECIFICATION Spec
+"#,
+        )
+        .expect("cfg should be written");
+
+        let model =
+            TlaModel::from_files(&module, Some(&cfg), None, None).expect("model should build");
+
+        // Init should be synthetic, Next should be named
+        assert_eq!(model.init_name, "__SyntheticInit__");
+        assert_eq!(model.next_name, "MyNext");
+
+        let init = model.initial_states();
+        assert_eq!(init.len(), 1);
+        assert_eq!(init[0].get("x"), Some(&TlaValue::Int(0)));
+    }
+
+    #[test]
+    fn explicit_init_next_overrides_specification() {
+        // Test that explicit INIT/NEXT in config override SPECIFICATION extraction
+        let tmp = std::env::temp_dir().join("tlapp-spec-explicit-override");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should be created");
+
+        let module = tmp.join("OverrideSpec.tla");
+        fs::write(
+            &module,
+            r#"
+---- MODULE OverrideSpec ----
+EXTENDS Naturals
+VARIABLES x
+Init == x = 0
+AltInit == x = 10
+Next == x' = x + 1 \/ UNCHANGED x
+AltNext == x' = x + 2 \/ UNCHANGED x
+vars == <<x>>
+Spec == Init /\ [][Next]_vars
+====
+"#,
+        )
+        .expect("module should be written");
+
+        let cfg = tmp.join("OverrideSpec.cfg");
+        fs::write(
+            &cfg,
+            r#"
+SPECIFICATION Spec
+INIT AltInit
+NEXT AltNext
+"#,
+        )
+        .expect("cfg should be written");
+
+        let model =
+            TlaModel::from_files(&module, Some(&cfg), None, None).expect("model should build");
+
+        // Explicit INIT/NEXT should override SPECIFICATION extraction
+        assert_eq!(model.init_name, "AltInit");
+        assert_eq!(model.next_name, "AltNext");
+
+        let init = model.initial_states();
+        assert_eq!(init.len(), 1);
+        assert_eq!(init[0].get("x"), Some(&TlaValue::Int(10)));
     }
 }
