@@ -716,7 +716,9 @@ fn split_top_level(expr: &str, delim: &str) -> Vec<String> {
     let mut let_depth: usize = 0; // Track LET...IN nesting
     let mut if_depth: usize = 0; // Track IF...ELSE nesting
     let mut case_depth: usize = 0; // Track CASE expression nesting
-    let mut in_quantifier_body = false; // Track if we're in a quantifier body
+    let mut quantifier_depth: usize = 0; // Track nested quantifier depth (not just boolean!)
+    let mut quantifier_base_col: Option<usize> = None; // Column of first quantifier's colon
+    let mut current_col: usize = 0; // Current column position
     let mut in_string = false;
     let chars: Vec<char> = expr.chars().collect();
     let delim_chars: Vec<char> = delim.chars().collect();
@@ -724,6 +726,13 @@ fn split_top_level(expr: &str, delim: &str) -> Vec<String> {
 
     while i < chars.len() {
         let c = chars[i];
+
+        // Track column position
+        if c == '\n' {
+            current_col = 0;
+        } else {
+            current_col += 1;
+        }
 
         if c == '"' && (i == 0 || chars[i - 1] != '\\') {
             in_string = !in_string;
@@ -745,6 +754,7 @@ fn split_top_level(expr: &str, delim: &str) -> Vec<String> {
                 current.push(c);
                 current.push(chars[i + 1]);
                 i += 2;
+                current_col += 1;
                 continue;
             }
             if c == '>' && chars[i + 1] == '>' {
@@ -752,6 +762,7 @@ fn split_top_level(expr: &str, delim: &str) -> Vec<String> {
                 current.push(c);
                 current.push(chars[i + 1]);
                 i += 2;
+                current_col += 1;
                 continue;
             }
         }
@@ -776,12 +787,14 @@ fn split_top_level(expr: &str, delim: &str) -> Vec<String> {
                 let_depth += 1;
                 current.push_str("LET");
                 i += 3;
+                current_col += 2;
                 continue;
             }
             // Just push IN without decrementing - the LET body extends to the end
             if let_depth > 0 && matches_keyword_at(&chars, i, "IN") {
                 current.push_str("IN");
                 i += 2;
+                current_col += 1;
                 continue;
             }
 
@@ -790,12 +803,14 @@ fn split_top_level(expr: &str, delim: &str) -> Vec<String> {
                 if_depth += 1;
                 current.push_str("IF");
                 i += 2;
+                current_col += 1;
                 continue;
             }
             if if_depth > 0 && matches_keyword_at(&chars, i, "ELSE") {
                 if_depth = if_depth.saturating_sub(1);
                 current.push_str("ELSE");
                 i += 4;
+                current_col += 3;
                 continue;
             }
 
@@ -804,12 +819,14 @@ fn split_top_level(expr: &str, delim: &str) -> Vec<String> {
                 case_depth += 1;
                 current.push_str("CASE");
                 i += 4;
+                current_col += 3;
                 continue;
             }
         }
 
         // Check for quantifier start: \A or \E followed by space
         // These bind loosely - everything after : is part of the quantifier body
+        // We track nesting depth to handle nested quantifiers properly
         if depth == 0 && c == '\\' && i + 2 < chars.len() {
             let next = chars[i + 1];
             let after = chars[i + 2];
@@ -824,12 +841,21 @@ fn split_top_level(expr: &str, delim: &str) -> Vec<String> {
                         ')' | ']' | '}' => inner_depth -= 1,
                         ':' if inner_depth == 0 => {
                             // Found the colon - everything after this is quantifier body
-                            in_quantifier_body = true;
+                            // INCREMENT depth instead of setting boolean - this handles nesting!
+                            quantifier_depth += 1;
+                            // Record the column of the first quantifier's colon
+                            // (use current_col since we're at the start of the quantifier)
+                            if quantifier_base_col.is_none() {
+                                quantifier_base_col = Some(current_col);
+                            }
                             // Push everything up to and including the colon
+                            let chars_pushed = j - i + 1;
                             for k in i..=j {
                                 current.push(chars[k]);
                             }
                             i = j + 1;
+                            // Adjust current_col for the characters we just pushed
+                            current_col += chars_pushed;
                             break;
                         }
                         _ => {}
@@ -847,30 +873,38 @@ fn split_top_level(expr: &str, delim: &str) -> Vec<String> {
             // Check for delimiter
             let remaining: String = chars[i..].iter().collect();
             if remaining.starts_with(delim) {
-                // If we're in a quantifier body, check if what follows is a new quantifier
-                // If so, we should split here (the quantifier body ends)
-                // If not, we should NOT split (still inside quantifier body)
-                if in_quantifier_body {
-                    // Look ahead past the delimiter and whitespace
-                    let after_delim = &remaining[delim.len()..].trim_start();
-                    // If what follows is \A or \E, this is a new top-level conjunct
+                if quantifier_depth > 0 {
+                    // We're in a quantifier body - but should we split?
+                    // Check if what follows is a new quantifier at the SAME or LESSER
+                    // indentation level (indicating a sibling, not nested)
+                    let after_delim = remaining[delim.len()..].trim_start();
                     let starts_new_quantifier = after_delim.starts_with("\\A ")
                         || after_delim.starts_with("\\A(")
                         || after_delim.starts_with("\\E ")
                         || after_delim.starts_with("\\E(");
+
                     if starts_new_quantifier {
-                        // End current quantifier body, split here
-                        in_quantifier_body = false;
-                        if !current.trim().is_empty() {
-                            parts.push(current.trim().to_string());
+                        // Check indentation: if we're at or before the base column,
+                        // this is a sibling quantifier, not nested
+                        // Use current_col which is the column right before the delimiter
+                        let is_sibling = quantifier_base_col
+                            .map(|base| current_col <= base)
+                            .unwrap_or(false);
+
+                        if is_sibling {
+                            // Split here - this is a sibling quantifier
+                            quantifier_depth = 0;
+                            quantifier_base_col = None;
+                            if !current.trim().is_empty() {
+                                parts.push(current.trim().to_string());
+                            }
+                            current = String::new();
+                            case_depth = 0;
+                            i += delim_chars.len();
+                            continue;
                         }
-                        current = String::new();
-                        // Reset case depth when we split
-                        case_depth = 0;
-                        i += delim_chars.len();
-                        continue;
                     }
-                    // Otherwise, don't split - we're still in the quantifier body
+                    // Otherwise don't split - we're inside a quantifier body
                     current.push(c);
                     i += 1;
                     continue;
