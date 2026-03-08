@@ -298,31 +298,103 @@ fn strip_block_comments(input: &str) -> String {
     result
 }
 
+/// Parse one or more constant assignments from a single line.
+/// Supports multiple space-separated assignments like: `a1=a1  a2=a2  a3=a3`
 fn parse_constant_line(line: &str, cfg: &mut TlaConfig) -> Result<()> {
-    if let Some((name, rhs)) = line.split_once("<-") {
-        cfg.constants.insert(
-            name.trim().to_string(),
-            ConfigValue::OperatorRef(rhs.trim().to_string()),
-        );
-        return Ok(());
-    }
-    if let Some((name, rhs)) = line.split_once('=') {
-        let value = parse_value(rhs.trim())?;
-        cfg.constants.insert(name.trim().to_string(), value);
-        return Ok(());
+    let mut offset = 0;
+    let line = line.trim();
+
+    while offset < line.len() {
+        // Skip leading whitespace
+        let remaining = &line[offset..];
+        let trimmed = remaining.trim_start();
+        offset += remaining.len() - trimmed.len();
+
+        if offset >= line.len() {
+            break;
+        }
+
+        let remaining = &line[offset..];
+
+        // Try operator reference first (Name <- Op)
+        if let Some(arrow_pos) = remaining.find("<-") {
+            // Check if there's a `=` before the `<-` (indicating a different assignment type comes first)
+            let eq_pos = remaining.find('=');
+            if eq_pos.is_none() || arrow_pos < eq_pos.unwrap() {
+                let name = remaining[..arrow_pos].trim();
+                let after_arrow = &remaining[arrow_pos + 2..];
+                let after_arrow_trimmed = after_arrow.trim_start();
+                let ws_len = after_arrow.len() - after_arrow_trimmed.len();
+                // Read the operator name (identifier)
+                let op_name = read_identifier(after_arrow_trimmed);
+                if op_name.is_empty() {
+                    return Err(anyhow!("expected operator name after '<-' in: {}", line));
+                }
+                cfg.constants.insert(
+                    name.to_string(),
+                    ConfigValue::OperatorRef(op_name.clone()),
+                );
+                // Move offset past: Name <- whitespace OpName
+                offset += arrow_pos + 2 + ws_len + op_name.len();
+                continue;
+            }
+        }
+
+        // Try value assignment (Name = Value)
+        if let Some(eq_pos) = remaining.find('=') {
+            let name = remaining[..eq_pos].trim();
+            if name.is_empty() {
+                return Err(anyhow!("empty constant name in: {}", line));
+            }
+            let after_eq = &remaining[eq_pos + 1..];
+            let after_eq_trimmed = after_eq.trim_start();
+            let ws_len = after_eq.len() - after_eq_trimmed.len();
+            let mut p = ValueParser::new(after_eq_trimmed);
+            let value = p.parse_value()?;
+            cfg.constants.insert(name.to_string(), value);
+            // Move offset past: Name = whitespace Value
+            let consumed = after_eq_trimmed.len() - p.rest().len();
+            offset += eq_pos + 1 + ws_len + consumed;
+            continue;
+        }
+
+        // No more assignments found
+        let remaining = &line[offset..].trim();
+        if !remaining.is_empty() {
+            return Err(anyhow!("invalid constant assignment: {}", remaining));
+        }
+        break;
     }
 
-    Err(anyhow!("invalid constant assignment: {}", line))
+    Ok(())
 }
 
-fn parse_value(input: &str) -> Result<ConfigValue> {
-    let mut p = ValueParser::new(input);
-    let value = p.parse_value()?;
-    p.skip_ws();
-    if !p.is_eof() {
-        return Err(anyhow!("unexpected trailing value content: {}", p.rest()));
+/// Read an identifier (sequence of alphanumeric chars and underscores, starting with letter or _)
+fn read_identifier(s: &str) -> String {
+    let mut chars = s.chars().peekable();
+    let mut ident = String::new();
+
+    // First char must be letter or underscore
+    if let Some(&c) = chars.peek() {
+        if c.is_alphabetic() || c == '_' {
+            ident.push(c);
+            chars.next();
+        } else {
+            return ident;
+        }
     }
-    Ok(value)
+
+    // Rest can be alphanumeric or underscore
+    while let Some(&c) = chars.peek() {
+        if c.is_alphanumeric() || c == '_' {
+            ident.push(c);
+            chars.next();
+        } else {
+            break;
+        }
+    }
+
+    ident
 }
 
 struct ValueParser<'a> {
@@ -333,10 +405,6 @@ struct ValueParser<'a> {
 impl<'a> ValueParser<'a> {
     fn new(src: &'a str) -> Self {
         Self { src, pos: 0 }
-    }
-
-    fn is_eof(&self) -> bool {
-        self.pos >= self.src.len()
     }
 
     fn rest(&self) -> &str {
@@ -769,5 +837,128 @@ mod tests {
         assert!(lines[1].trim().is_empty());
         assert!(lines[2].trim().is_empty());
         assert!(lines[3].trim().is_empty());
+    }
+
+    #[test]
+    fn parses_multiple_constants_on_same_line() {
+        // This is the Paxos-style format that was failing
+        let cfg = parse_tla_config(
+            r#"
+            CONSTANTS
+              a1=a1  a2=a2  a3=a3  v1=v1  v2=v2
+            SPECIFICATION Spec
+            "#,
+        )
+        .expect("cfg should parse");
+
+        assert_eq!(
+            cfg.constants.get("a1"),
+            Some(&ConfigValue::ModelValue("a1".to_string()))
+        );
+        assert_eq!(
+            cfg.constants.get("a2"),
+            Some(&ConfigValue::ModelValue("a2".to_string()))
+        );
+        assert_eq!(
+            cfg.constants.get("a3"),
+            Some(&ConfigValue::ModelValue("a3".to_string()))
+        );
+        assert_eq!(
+            cfg.constants.get("v1"),
+            Some(&ConfigValue::ModelValue("v1".to_string()))
+        );
+        assert_eq!(
+            cfg.constants.get("v2"),
+            Some(&ConfigValue::ModelValue("v2".to_string()))
+        );
+        assert_eq!(cfg.specification.as_deref(), Some("Spec"));
+    }
+
+    #[test]
+    fn parses_multiple_constants_with_mixed_types_on_same_line() {
+        let cfg = parse_tla_config(
+            r#"
+            CONSTANTS
+              N=3  M=5  Flag=TRUE  Server=s1
+            SPECIFICATION Spec
+            "#,
+        )
+        .expect("cfg should parse");
+
+        assert_eq!(cfg.constants.get("N"), Some(&ConfigValue::Int(3)));
+        assert_eq!(cfg.constants.get("M"), Some(&ConfigValue::Int(5)));
+        assert_eq!(cfg.constants.get("Flag"), Some(&ConfigValue::Bool(true)));
+        assert_eq!(
+            cfg.constants.get("Server"),
+            Some(&ConfigValue::ModelValue("s1".to_string()))
+        );
+    }
+
+    #[test]
+    fn parses_multiple_constants_with_sets_on_same_line() {
+        let cfg = parse_tla_config(
+            r#"
+            CONSTANTS
+              Acceptors={a1, a2}  Values={v1, v2, v3}
+            SPECIFICATION Spec
+            "#,
+        )
+        .expect("cfg should parse");
+
+        match cfg.constants.get("Acceptors") {
+            Some(ConfigValue::Set(items)) => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0], ConfigValue::ModelValue("a1".to_string()));
+                assert_eq!(items[1], ConfigValue::ModelValue("a2".to_string()));
+            }
+            other => panic!("unexpected Acceptors parse result: {other:?}"),
+        }
+
+        match cfg.constants.get("Values") {
+            Some(ConfigValue::Set(items)) => {
+                assert_eq!(items.len(), 3);
+            }
+            other => panic!("unexpected Values parse result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_multiple_operator_refs_on_same_line() {
+        let cfg = parse_tla_config(
+            r#"
+            CONSTANTS
+              Seq1<-BoundedSeq  Seq2<-AnotherSeq
+            SPECIFICATION Spec
+            "#,
+        )
+        .expect("cfg should parse");
+
+        assert_eq!(
+            cfg.constants.get("Seq1"),
+            Some(&ConfigValue::OperatorRef("BoundedSeq".to_string()))
+        );
+        assert_eq!(
+            cfg.constants.get("Seq2"),
+            Some(&ConfigValue::OperatorRef("AnotherSeq".to_string()))
+        );
+    }
+
+    #[test]
+    fn parses_mixed_assignments_and_operator_refs_on_same_line() {
+        let cfg = parse_tla_config(
+            r#"
+            CONSTANTS
+              N=3  Seq<-BoundedSeq  M=5
+            SPECIFICATION Spec
+            "#,
+        )
+        .expect("cfg should parse");
+
+        assert_eq!(cfg.constants.get("N"), Some(&ConfigValue::Int(3)));
+        assert_eq!(
+            cfg.constants.get("Seq"),
+            Some(&ConfigValue::OperatorRef("BoundedSeq".to_string()))
+        );
+        assert_eq!(cfg.constants.get("M"), Some(&ConfigValue::Int(5)));
     }
 }
