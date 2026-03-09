@@ -871,13 +871,13 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
                 let right = eval_expr_inner(rhs, ctx, depth + 1)?;
                 Ok(TlaValue::Bool(left != right))
             }
-            "<" | "<=" | ">" | ">=" => {
+            "<" | "<=" | "\\leq" | ">" | ">=" | "\\geq" => {
                 let right = eval_expr_inner(rhs, ctx, depth + 1)?;
                 let cmp = match op {
                     "<" => left.as_int()? < right.as_int()?,
-                    "<=" => left.as_int()? <= right.as_int()?,
+                    "<=" | "\\leq" => left.as_int()? <= right.as_int()?,
                     ">" => left.as_int()? > right.as_int()?,
-                    ">=" => left.as_int()? >= right.as_int()?,
+                    ">=" | "\\geq" => left.as_int()? >= right.as_int()?,
                     _ => unreachable!(),
                 };
                 Ok(TlaValue::Bool(cmp))
@@ -1057,6 +1057,7 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
         return match op {
             "*" => Ok(TlaValue::Int(left * right)),
             "\\div" => Ok(TlaValue::Int(left / right)),
+            "%" => Ok(TlaValue::Int(left % right)),
             _ => Err(anyhow!("unsupported multiplicative operator {op}")),
         };
     }
@@ -3243,6 +3244,8 @@ fn split_top_level_comparison(expr: &str) -> Option<(&str, &'static str, &str)> 
         "\\notin",
         "\\in",
         "..",
+        "\\leq",
+        "\\geq",
         "<=",
         ">=",
         "/=",
@@ -3494,6 +3497,7 @@ fn split_top_level_additive(expr: &str) -> Option<(&str, char, &str)> {
 fn split_top_level_multiplicative(expr: &str) -> Option<(&str, &'static str, &str)> {
     let mut star_idx: Option<usize> = None;
     let mut div_idx: Option<usize> = None;
+    let mut mod_idx: Option<usize> = None;
 
     let mut i = 0usize;
     let mut paren = 0usize;
@@ -3564,50 +3568,34 @@ fn split_top_level_multiplicative(expr: &str) -> Option<(&str, &'static str, &st
                     div_idx = Some(i);
                 }
             }
+            if ch == '%' && is_binary_operator(expr, i, ch_len) {
+                mod_idx = Some(i);
+            }
         }
 
         i += ch_len;
     }
 
-    match (star_idx, div_idx) {
-        (None, None) => None,
-        (Some(s), None) => {
-            let lhs = expr[..s].trim();
-            let rhs = expr[s + 1..].trim();
-            if lhs.is_empty() || rhs.is_empty() {
-                None
-            } else {
-                Some((lhs, "*", rhs))
-            }
-        }
-        (None, Some(d)) => {
-            let lhs = expr[..d].trim();
-            let rhs = expr[d + "\\div".len()..].trim();
-            if lhs.is_empty() || rhs.is_empty() {
-                None
-            } else {
-                Some((lhs, "\\div", rhs))
-            }
-        }
-        (Some(s), Some(d)) => {
-            if s > d {
-                let lhs = expr[..s].trim();
-                let rhs = expr[s + 1..].trim();
-                if lhs.is_empty() || rhs.is_empty() {
-                    None
-                } else {
-                    Some((lhs, "*", rhs))
-                }
-            } else {
-                let lhs = expr[..d].trim();
-                let rhs = expr[d + "\\div".len()..].trim();
-                if lhs.is_empty() || rhs.is_empty() {
-                    None
-                } else {
-                    Some((lhs, "\\div", rhs))
-                }
-            }
-        }
+    // Find the rightmost operator for left-to-right associativity
+    let mut candidates: Vec<(usize, &str, usize)> = Vec::new(); // (idx, op_str, op_len)
+    if let Some(s) = star_idx {
+        candidates.push((s, "*", 1));
+    }
+    if let Some(d) = div_idx {
+        candidates.push((d, "\\div", "\\div".len()));
+    }
+    if let Some(m) = mod_idx {
+        candidates.push((m, "%", 1));
+    }
+    // Pick the rightmost (largest index)
+    candidates.sort_by_key(|(idx, _, _)| *idx);
+    let (idx, op, op_len) = candidates.last()?;
+    let lhs = expr[..*idx].trim();
+    let rhs = expr[idx + op_len..].trim();
+    if lhs.is_empty() || rhs.is_empty() {
+        None
+    } else {
+        Some((lhs, *op, rhs))
     }
 }
 
