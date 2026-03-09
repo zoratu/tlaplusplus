@@ -7,9 +7,10 @@ use tlaplusplus::models::high_branching::HighBranchingModel;
 use tlaplusplus::models::tla_native::TlaModel;
 use tlaplusplus::system::parse_cpu_list;
 use tlaplusplus::tla::{
-    TlaConfig, TlaDefinition, TlaModule, ActionClause, ClauseKind, ConfigValue, EvalContext, TlaState, TlaValue, classify_clause,
-    compile_action_ir, eval_expr, looks_like_action, parse_tla_config, parse_tla_module_file,
-    probe_next_disjuncts, scan_module_closure, split_top_level,
+    ActionClause, ClauseKind, ConfigValue, EvalContext, TlaConfig, TlaDefinition, TlaModule,
+    TlaState, TlaValue, classify_clause, compile_action_ir, eval_expr, looks_like_action,
+    parse_tla_config, parse_tla_module_file, probe_next_disjuncts, scan_module_closure,
+    split_top_level,
 };
 use tlaplusplus::{EngineConfig, run_model};
 
@@ -959,20 +960,32 @@ fn main() -> anyhow::Result<()> {
             let mut probe_init_unresolved = 0usize;
             let mut probe_init_unresolved_vars: Vec<String> = Vec::new();
             if let Some(init_def) = parsed_module.definitions.get("Init") {
-                let mut pending = Vec::new();
+                // Collect both equality and membership assignments
+                let mut pending_eq: Vec<(String, String)> = Vec::new();
+                let mut pending_mem: Vec<(String, String)> = Vec::new();
                 for clause in split_top_level(&init_def.body, "/\\") {
-                    if let ClauseKind::UnprimedEquality { var, expr } = classify_clause(&clause) {
-                        pending.push((var, expr));
+                    match classify_clause(&clause) {
+                        ClauseKind::UnprimedEquality { var, expr } => {
+                            pending_eq.push((var, expr));
+                        }
+                        ClauseKind::UnprimedMembership { var, set_expr } => {
+                            pending_mem.push((var, set_expr));
+                        }
+                        _ => {}
                     }
                 }
 
-                for _ in 0..pending.len().saturating_add(1) {
-                    if pending.is_empty() {
+                // Process both types together with fixed-point iteration
+                let total_pending = pending_eq.len() + pending_mem.len();
+                for _ in 0..total_pending.saturating_add(1) {
+                    if pending_eq.is_empty() && pending_mem.is_empty() {
                         break;
                     }
                     let mut progress = false;
-                    let mut next_pending = Vec::new();
-                    for (var, expr) in pending {
+
+                    // Process equality assignments
+                    let mut next_pending_eq = Vec::new();
+                    for (var, expr) in pending_eq {
                         let ctx =
                             EvalContext::with_definitions(&probe_state, &parsed_module.definitions);
                         match eval_expr(&expr, &ctx) {
@@ -981,17 +994,42 @@ fn main() -> anyhow::Result<()> {
                                 probe_init_seeded += 1;
                                 progress = true;
                             }
-                            Err(_) => next_pending.push((var, expr)),
+                            Err(_) => next_pending_eq.push((var, expr)),
+                        }
+                    }
+
+                    // Process membership assignments - pick representative value
+                    let mut next_pending_mem = Vec::new();
+                    for (var, set_expr) in pending_mem {
+                        let ctx =
+                            EvalContext::with_definitions(&probe_state, &parsed_module.definitions);
+                        match eval_expr(&set_expr, &ctx) {
+                            Ok(set_val) => {
+                                // Pick a representative from the set
+                                if let Some(repr) = pick_representative_from_set(&set_val) {
+                                    probe_state.insert(var, repr);
+                                    probe_init_seeded += 1;
+                                    progress = true;
+                                } else {
+                                    // Set was empty or not a set, keep pending
+                                    next_pending_mem.push((var, set_expr));
+                                }
+                            }
+                            Err(_) => next_pending_mem.push((var, set_expr)),
                         }
                     }
 
                     if !progress {
-                        probe_init_unresolved = next_pending.len();
-                        probe_init_unresolved_vars =
-                            next_pending.iter().map(|(var, _)| var.clone()).collect();
+                        probe_init_unresolved = next_pending_eq.len() + next_pending_mem.len();
+                        probe_init_unresolved_vars = next_pending_eq
+                            .iter()
+                            .chain(next_pending_mem.iter())
+                            .map(|(var, _)| var.clone())
+                            .collect();
                         break;
                     }
-                    pending = next_pending;
+                    pending_eq = next_pending_eq;
+                    pending_mem = next_pending_mem;
                 }
             }
             for var in &parsed_module.variables {
@@ -1809,4 +1847,18 @@ fn sample_param_value(param: &str, probe_state: &TlaState) -> TlaValue {
     }
 
     TlaValue::ModelValue(param.to_string())
+}
+
+/// Picks a representative value from a set for probing purposes.
+/// For membership constraints like `v \in [Proc -> Values]`, this picks
+/// one element from the set to seed the probe_state. The actual model
+/// checking in evaluate_init_states handles full enumeration.
+fn pick_representative_from_set(set_val: &TlaValue) -> Option<TlaValue> {
+    match set_val {
+        TlaValue::Set(values) => {
+            // Pick the first element from the set
+            values.iter().next().cloned()
+        }
+        _ => None,
+    }
 }
