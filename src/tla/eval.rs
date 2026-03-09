@@ -2077,6 +2077,33 @@ fn eval_operator_call(
                 }
             }
         }
+        // TLC module: Range(f) - returns the set of all values in the range of function f
+        // Range(f) == {f[x] : x \in DOMAIN f}
+        "Range" => {
+            if args.len() != 1 {
+                return Err(anyhow!("Range expects 1 argument"));
+            }
+            match &args[0] {
+                TlaValue::Function(map) => {
+                    let values = map.values().cloned().collect::<BTreeSet<_>>();
+                    return Ok(TlaValue::Set(Arc::new(values)));
+                }
+                TlaValue::Seq(seq) => {
+                    // Range of a sequence is the set of all its elements
+                    let values = seq.iter().cloned().collect::<BTreeSet<_>>();
+                    return Ok(TlaValue::Set(Arc::new(values)));
+                }
+                TlaValue::Record(map) => {
+                    // Range of a record is the set of all its field values
+                    let values = map.values().cloned().collect::<BTreeSet<_>>();
+                    return Ok(TlaValue::Set(Arc::new(values)));
+                }
+                _ => {
+                    return Err(anyhow!("Range expects a function, sequence, or record"));
+                }
+            }
+        }
+
         // TLC module: FunAsSeq(f, a, b) - converts a function to a sequence
         // FunAsSeq(f, a, b) == [i \in 1..b |-> f[a + i - 1]]
         // This creates a sequence of length b by extracting values from f
@@ -5324,4 +5351,106 @@ mod tests {
         let expected = TlaValue::Seq(Arc::new(vec![TlaValue::Int(2), TlaValue::Int(3)]));
         assert_eq!(result, expected);
     }
+
+    #[test]
+    fn test_range_function() {
+        // Range(f) returns the set of all values in the range of f
+        // For f = [x \in {1, 2, 3} |-> x * 10], Range(f) = {10, 20, 30}
+        let func = TlaValue::Function(Arc::new(BTreeMap::from([
+            (TlaValue::Int(1), TlaValue::Int(10)),
+            (TlaValue::Int(2), TlaValue::Int(20)),
+            (TlaValue::Int(3), TlaValue::Int(30)),
+        ])));
+
+        let state = TlaState::from([("f".to_string(), func)]);
+        let ctx = EvalContext::new(&state);
+
+        let result = eval_expr("Range(f)", &ctx).expect("Range should evaluate");
+        let expected = TlaValue::Set(Arc::new(BTreeSet::from([
+            TlaValue::Int(10),
+            TlaValue::Int(20),
+            TlaValue::Int(30),
+        ])));
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_range_sequence() {
+        // Range of a sequence returns the set of all its elements
+        let seq = TlaValue::Seq(Arc::new(vec![
+            TlaValue::Int(1),
+            TlaValue::Int(2),
+            TlaValue::Int(2), // Duplicate to test set semantics
+            TlaValue::Int(3),
+        ]));
+
+        let state = TlaState::from([("s".to_string(), seq)]);
+        let ctx = EvalContext::new(&state);
+
+        let result = eval_expr("Range(s)", &ctx).expect("Range should evaluate on sequence");
+        // Duplicates are removed since Range returns a set
+        let expected = TlaValue::Set(Arc::new(BTreeSet::from([
+            TlaValue::Int(1),
+            TlaValue::Int(2),
+            TlaValue::Int(3),
+        ])));
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_range_record() {
+        // Range of a record returns the set of all its field values
+        let rec = TlaValue::Record(Arc::new(BTreeMap::from([
+            ("a".to_string(), TlaValue::Int(10)),
+            ("b".to_string(), TlaValue::Int(20)),
+            ("c".to_string(), TlaValue::Int(10)), // Duplicate value
+        ])));
+
+        let state = TlaState::from([("r".to_string(), rec)]);
+        let ctx = EvalContext::new(&state);
+
+        let result = eval_expr("Range(r)", &ctx).expect("Range should evaluate on record");
+        // Duplicates are removed since Range returns a set
+        let expected = TlaValue::Set(Arc::new(BTreeSet::from([
+            TlaValue::Int(10),
+            TlaValue::Int(20),
+        ])));
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_range_empty_function() {
+        // Range of an empty function is the empty set
+        let func = TlaValue::Function(Arc::new(BTreeMap::new()));
+
+        let state = TlaState::from([("f".to_string(), func)]);
+        let ctx = EvalContext::new(&state);
+
+        let result = eval_expr("Range(f)", &ctx).expect("Range should evaluate on empty function");
+        let expected = TlaValue::Set(Arc::new(BTreeSet::new()));
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_range_compiled() {
+        use crate::tla::{compile_expr, eval_compiled};
+
+        // Test compiled version
+        let func = TlaValue::Function(Arc::new(BTreeMap::from([
+            (TlaValue::Int(1), TlaValue::Int(100)),
+            (TlaValue::Int(2), TlaValue::Int(200)),
+        ])));
+
+        let state = TlaState::from([("f".to_string(), func)]);
+        let ctx = EvalContext::new(&state);
+
+        let compiled = compile_expr("Range(f)");
+        let result = eval_compiled(&compiled, &ctx).expect("Compiled Range should evaluate");
+        let expected = TlaValue::Set(Arc::new(BTreeSet::from([
+            TlaValue::Int(100),
+            TlaValue::Int(200),
+        ])));
+        assert_eq!(result, expected);
+    }
+
 }
