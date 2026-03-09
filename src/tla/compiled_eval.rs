@@ -4,7 +4,7 @@
 //! the overhead of string parsing on every evaluation.
 
 use crate::tla::compiled_expr::{CompiledExpr, compile_expr, find_top_level_colon};
-use crate::tla::eval::{EvalContext, eval_expr};
+use crate::tla::eval::{EvalContext, eval_expr, normalize_param_name};
 use crate::tla::formula::split_top_level;
 use crate::tla::value::TlaValue;
 use anyhow::{Result, anyhow};
@@ -1398,7 +1398,7 @@ fn eval_compiled_opcall(
     // Create new context with parameter bindings
     let mut new_ctx = ctx.clone();
     for (param, value) in def.params.iter().zip(arg_values.into_iter()) {
-        new_ctx = new_ctx.with_local_value(param, value);
+        new_ctx = new_ctx.with_local_value(normalize_param_name(param), value);
     }
 
     // Evaluate the compiled body

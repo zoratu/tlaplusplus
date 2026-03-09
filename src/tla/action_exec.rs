@@ -1,9 +1,10 @@
 use crate::fairness::{ActionLabel, LabeledTransition};
+use crate::tla::module::TlaModuleInstance;
 use crate::tla::{
     CompiledActionIr, EvalContext, TlaDefinition, TlaState, TlaValue,
-    apply_compiled_action_ir_multi, compile_action_ir, eval_expr, split_top_level,
+    apply_compiled_action_ir_multi, compile_action_ir, eval_expr, normalize_param_name,
+    split_top_level,
 };
-use crate::tla::module::TlaModuleInstance;
 use anyhow::{Result, anyhow};
 use dashmap::DashMap;
 use std::cell::RefCell;
@@ -118,7 +119,8 @@ pub fn evaluate_next_states_with_instances(
     let disjuncts = split_top_level(next_body, "\\/");
     let mut out = Vec::new();
     for disj in disjuncts {
-        let successors = execute_branch(disj.trim(), &BTreeMap::new(), definitions, instances, state)?;
+        let successors =
+            execute_branch(disj.trim(), &BTreeMap::new(), definitions, instances, state)?;
         out.extend(successors);
     }
     Ok(out)
@@ -149,7 +151,8 @@ pub fn evaluate_next_states_labeled_with_instances(
     let mut out = Vec::new();
 
     for (disjunct_idx, disj) in disjuncts.iter().enumerate() {
-        let successors = execute_branch(disj.trim(), &BTreeMap::new(), definitions, instances, state)?;
+        let successors =
+            execute_branch(disj.trim(), &BTreeMap::new(), definitions, instances, state)?;
 
         // Extract action name from disjunct (e.g., "SendMsg(m)" -> "SendMsg")
         let action_name = extract_action_name(disj.trim()).unwrap_or_else(|| next_name.to_string());
@@ -218,7 +221,8 @@ fn execute_branch(
             for disj in disjuncts {
                 let disj_trimmed = disj.trim();
                 if !disj_trimmed.is_empty() {
-                    let successors = execute_branch(disj_trimmed, locals, definitions, instances, state)?;
+                    let successors =
+                        execute_branch(disj_trimmed, locals, definitions, instances, state)?;
                     out.extend(successors);
                 }
             }
@@ -228,7 +232,13 @@ fn execute_branch(
     }
 
     if let Some(after_exists) = trimmed.strip_prefix("\\E") {
-        return execute_exists_branch(after_exists.trim_start(), locals, definitions, instances, state);
+        return execute_exists_branch(
+            after_exists.trim_start(),
+            locals,
+            definitions,
+            instances,
+            state,
+        );
     }
 
     // Try to parse as an action call
@@ -263,7 +273,7 @@ fn execute_branch(
         {
             let locals_mut = std::rc::Rc::make_mut(&mut ctx.locals);
             for (param, arg) in def.params.iter().zip(args.into_iter()) {
-                locals_mut.insert(param.clone(), arg);
+                locals_mut.insert(normalize_param_name(param).to_string(), arg);
             }
         }
 
@@ -346,7 +356,16 @@ fn expand_binders(
     let (name, values) = &binders[idx];
     for value in values {
         assignments.insert(name.clone(), value.clone());
-        expand_binders(idx + 1, binders, body, assignments, definitions, instances, state, out)?;
+        expand_binders(
+            idx + 1,
+            binders,
+            body,
+            assignments,
+            definitions,
+            instances,
+            state,
+            out,
+        )?;
     }
     assignments.remove(name);
 
