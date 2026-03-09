@@ -161,6 +161,9 @@ pub struct AutoTuner {
     config: AutoTuneConfig,
     throttle: Arc<WorkerThrottle>,
     stop: Arc<AtomicBool>,
+    /// Optional pause check function - when pause is requested (checkpoint in progress),
+    /// AutoTune should NOT make any adjustments to avoid interfering with quiescence.
+    pause_requested: Option<Arc<AtomicBool>>,
     handle: Option<JoinHandle<()>>,
     /// Best observed throughput and worker count (reserved for future adaptive tuning)
     #[allow(dead_code)]
@@ -179,10 +182,18 @@ impl AutoTuner {
             config,
             throttle,
             stop,
+            pause_requested: None,
             handle: None,
             best_throughput: AtomicU64::new(0),
             best_workers: AtomicUsize::new(0),
         }
+    }
+
+    /// Set the pause_requested flag for checkpoint coordination.
+    /// When this flag is true, AutoTune will skip all worker count adjustments
+    /// to avoid interfering with checkpoint quiescence.
+    pub fn set_pause_requested(&mut self, pause_requested: Arc<AtomicBool>) {
+        self.pause_requested = Some(pause_requested);
     }
 
     /// Start the auto-tuning thread with a function to read throughput
@@ -193,11 +204,12 @@ impl AutoTuner {
         let config = self.config.clone();
         let throttle = Arc::clone(&self.throttle);
         let stop = Arc::clone(&self.stop);
+        let pause_requested = self.pause_requested.clone();
 
         let handle = std::thread::Builder::new()
             .name("autotune".to_string())
             .spawn(move || {
-                Self::tuner_loop(config, throttle, stop, get_throughput);
+                Self::tuner_loop(config, throttle, stop, pause_requested, get_throughput);
             })
             .expect("Failed to spawn autotune thread");
 
@@ -208,6 +220,7 @@ impl AutoTuner {
         config: AutoTuneConfig,
         throttle: Arc<WorkerThrottle>,
         stop: Arc<AtomicBool>,
+        pause_requested: Option<Arc<AtomicBool>>,
         get_throughput: F,
     ) where
         F: Fn() -> u64,
@@ -254,6 +267,24 @@ impl AutoTuner {
 
             let time_since_adjustment = last_adjustment.elapsed();
             let can_adjust = time_since_adjustment >= config.adjustment_cooldown;
+
+            // CRITICAL: Skip all adjustments during checkpoint quiescence!
+            // If pause is requested (checkpoint in progress), we must NOT change
+            // the active worker count. Increasing workers during quiescence would
+            // allow previously-throttled workers to become active without them
+            // having received the pause signal, causing checkpoint to hang waiting
+            // for workers that never pause.
+            let pause_active = pause_requested
+                .as_ref()
+                .map(|p| p.load(Ordering::Acquire))
+                .unwrap_or(false);
+
+            if pause_active {
+                // Skip adjustment during checkpoint - just update samples and continue
+                prev_sample = Some(current_sample);
+                prev_throughput = current_throughput;
+                continue;
+            }
 
             if can_adjust {
                 // Don't reduce workers if throughput has dropped significantly from best

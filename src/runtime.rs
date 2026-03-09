@@ -206,7 +206,8 @@ impl AtomicRunStats {
 }
 
 struct PauseController {
-    requested: AtomicBool,
+    /// Pause requested flag - shared with AutoTune to coordinate checkpoint quiescence
+    requested: Arc<AtomicBool>,
     paused_workers: AtomicUsize,
     wait_lock: Mutex<()>,
     wait_cv: Condvar,
@@ -218,12 +219,20 @@ struct PauseController {
 impl Default for PauseController {
     fn default() -> Self {
         Self {
-            requested: AtomicBool::new(false),
+            requested: Arc::new(AtomicBool::new(false)),
             paused_workers: AtomicUsize::new(0),
             wait_lock: Mutex::new(()),
             wait_cv: Condvar::new(),
             worker_pause_status: parking_lot::RwLock::new(Vec::new()),
         }
+    }
+}
+
+impl PauseController {
+    /// Get a clone of the pause_requested flag for sharing with AutoTune.
+    /// This allows AutoTune to check if checkpoint is in progress and skip adjustments.
+    fn pause_requested_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.requested)
     }
 }
 
@@ -290,6 +299,11 @@ impl PauseController {
     fn request_pause(&self) {
         self.requested.store(true, Ordering::Release);
         self.wait_cv.notify_all();
+    }
+
+    /// Check if pause is currently requested (for AutoTune coordination)
+    fn is_pause_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
     }
 
     /// Wait for all workers to pause (quiescence).
@@ -1570,6 +1584,10 @@ where
             ..Default::default()
         };
         let mut tuner = AutoTuner::new(tune_config, Arc::clone(&throttle), Arc::clone(&stop));
+        // CRITICAL: Share pause_requested flag with AutoTune to prevent adjustments during checkpoint.
+        // Without this, AutoTune could increase active_target during quiescence, allowing
+        // previously-throttled workers to become active without pausing, causing checkpoint hangs.
+        tuner.set_pause_requested(pause.pause_requested_flag());
         let stats_for_tuner = Arc::clone(&run_stats);
         tuner.start(move || stats_for_tuner.states_generated.load(Ordering::Relaxed));
         Some(tuner)
@@ -1695,6 +1713,16 @@ where
 
                 // Auto-tune throttle: workers over the limit yield briefly
                 worker_throttle.worker_throttle_point(worker_id);
+
+                // CRITICAL: Re-check pause after throttle point!
+                // Race condition: AutoTune may increase active_target (un-throttling workers)
+                // just as checkpoint requests pause. Workers that were throttled would have
+                // already passed their pause_point check above, then become un-throttled,
+                // and proceed to do work without pausing. This second check catches that case.
+                worker_pause.worker_pause_point(&worker_stop, worker_id);
+                if worker_stop.load(Ordering::Acquire) {
+                    break;
+                }
 
                 // Work-stealing: try local queue first, then steal from others
                 // This has zero contention on the common path
