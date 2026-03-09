@@ -151,6 +151,24 @@ pub fn compile_action_ir(def: &TlaDefinition) -> ActionIr {
 }
 
 pub fn looks_like_action(def: &TlaDefinition) -> bool {
+    // Filter out THEOREM/LEMMA/proof definitions that contain primes
+    // in proof steps but are not actual action definitions
+    let name_upper = def.name.to_uppercase();
+    if name_upper.starts_with("THEOREM")
+        || name_upper.starts_with("LEMMA")
+        || name_upper.starts_with("COROLLARY")
+        || name_upper.starts_with("PROPOSITION")
+    {
+        return false;
+    }
+    // Proof bodies contain step labels like <1>, BY DEF, QED, SUFFICES
+    if def.body.contains("BY DEF ")
+        || def.body.contains(" QED")
+        || def.body.contains("SUFFICES")
+        || def.body.contains("<1>")
+    {
+        return false;
+    }
     def.body.contains('\'') || def.body.contains("UNCHANGED")
 }
 
