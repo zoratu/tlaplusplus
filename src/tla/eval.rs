@@ -2905,6 +2905,7 @@ fn split_top_level(expr: &str, delim: &str, keyword: bool) -> Vec<String> {
     let mut let_depth = 0usize; // Count of LET keywords seen (increases on LET, decreases on IN)
     let mut if_depth = 0usize; // Count of IF keywords seen (increases on IF, decreases on ELSE)
     let mut case_depth = 0usize; // Count of CASE keywords seen
+    let mut else_branch_uses_delimiter = false; // True if ELSE branch starts with the delimiter
     let mut in_string = false;
     let mut escaped = false;
 
@@ -2973,7 +2974,15 @@ fn split_top_level(expr: &str, delim: &str, keyword: bool) -> Vec<String> {
                         .next()
                         .map_or(true, |c| !c.is_alphanumeric())
                 {
-                    if_depth = if_depth.saturating_sub(1);
+                    // Check if ELSE is followed by the delimiter (indicating ELSE branch uses delimiter)
+                    let remaining = after_else.trim_start();
+                    if remaining.starts_with(delim) {
+                        // ELSE branch starts with delimiter - don't decrement if_depth
+                        else_branch_uses_delimiter = true;
+                    } else {
+                        // ELSE branch doesn't start with delimiter - can decrement
+                        if_depth = if_depth.saturating_sub(1);
+                    }
                 }
             }
 
@@ -3036,7 +3045,7 @@ fn split_top_level(expr: &str, delim: &str, keyword: bool) -> Vec<String> {
                 let should_split = if let_depth > 0 && is_conjunction {
                     // We're inside a LET expression, don't split on conjunctions
                     false
-                } else if if_depth > 0 && is_conjunction {
+                } else if (if_depth > 0 || else_branch_uses_delimiter) && is_conjunction {
                     // We're inside IF-THEN (before ELSE), don't split on conjunctions
                     false
                 } else if case_depth > 0 && is_conjunction {
@@ -3065,12 +3074,13 @@ fn split_top_level(expr: &str, delim: &str, keyword: bool) -> Vec<String> {
                     if !part.is_empty() {
                         out.push(part.to_string());
                     }
-                    // Reset quantifier, LET, IF, and CASE tracking for next part
+                    // Reset quantifier, LET, IF, CASE, and else-branch tracking for next part
                     quantifier_depth = 0;
                     seen_colon_for_quantifier = 0;
                     let_depth = 0;
                     if_depth = 0;
                     case_depth = 0;
+                    else_branch_uses_delimiter = false;
                     start = delim_end;
                     i = delim_end;
                     continue;
@@ -5350,6 +5360,91 @@ mod tests {
             eval_expr("FunAsSeq(s, 2, 2)", &ctx).expect("FunAsSeq should evaluate on sequence");
         let expected = TlaValue::Seq(Arc::new(vec![TlaValue::Int(2), TlaValue::Int(3)]));
         assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn evals_multiline_if_then_else() {
+        // Test IF-THEN-ELSE with newlines (as would come from a parsed module)
+        let state = TlaState::from([
+            ("condition".to_string(), TlaValue::Bool(false)),
+        ]);
+        let ctx = EvalContext::new(&state);
+
+        // Expression with newlines as stored in TlaDefinition body
+        let expr = "IF condition\nTHEN 1\nELSE 2";
+        let result = eval_expr(expr, &ctx).expect("multiline IF should evaluate");
+        assert_eq!(result, TlaValue::Int(2), "condition is false, should return ELSE branch");
+
+        // Test with condition=true
+        let state_true = TlaState::from([
+            ("condition".to_string(), TlaValue::Bool(true)),
+        ]);
+        let ctx_true = EvalContext::new(&state_true);
+        let result_true = eval_expr(expr, &ctx_true).expect("multiline IF should evaluate");
+        assert_eq!(result_true, TlaValue::Int(1), "condition is true, should return THEN branch");
+    }
+
+    #[test]
+    fn evals_multiline_else_with_conjunction() {
+        // Test ELSE branch with conjunction spanning multiple lines
+        let state = TlaState::from([
+            ("condition".to_string(), TlaValue::Bool(false)),
+        ]);
+        let ctx = EvalContext::new(&state);
+
+        // Expression like DiningPhilosophers with multiline ELSE containing /\
+        let expr = "IF condition\nTHEN TRUE\nELSE /\\ TRUE\n     /\\ TRUE";
+        let result = eval_expr(expr, &ctx).expect("multiline IF with conjunction should evaluate");
+        assert_eq!(result, TlaValue::Bool(true), "ELSE branch conjunction should evaluate to TRUE");
+    }
+
+    #[test]
+    fn evals_nested_multiline_if_then_else() {
+        // Test nested IF-THEN-ELSE where outer ELSE contains another IF
+        let state = TlaState::from([
+            ("outer".to_string(), TlaValue::Bool(false)),
+            ("inner".to_string(), TlaValue::Bool(false)),
+        ]);
+        let ctx = EvalContext::new(&state);
+
+        let expr = "IF outer\nTHEN 1\nELSE IF inner\n     THEN 2\n     ELSE 3";
+        let result = eval_expr(expr, &ctx).expect("nested multiline IF should evaluate");
+        assert_eq!(result, TlaValue::Int(3), "outer=false, inner=false should return 3");
+
+        // Test inner=true case
+        let state_inner = TlaState::from([
+            ("outer".to_string(), TlaValue::Bool(false)),
+            ("inner".to_string(), TlaValue::Bool(true)),
+        ]);
+        let ctx_inner = EvalContext::new(&state_inner);
+        let result_inner = eval_expr(expr, &ctx_inner).expect("nested multiline IF should evaluate");
+        assert_eq!(result_inner, TlaValue::Int(2), "outer=false, inner=true should return 2");
+    }
+
+    #[test]
+    fn find_outer_else_handles_newlines() {
+        // Test that find_outer_else correctly finds ELSE across newlines
+        assert_eq!(find_outer_else("something\nELSE other"), Some(10));
+        assert_eq!(find_outer_else("something ELSE other"), Some(10));
+        
+        // Nested IF should not confuse it
+        let nested = "IF inner THEN a ELSE b\nELSE outer";
+        assert_eq!(find_outer_else(nested), Some(23));
+    }
+
+    #[test]
+    fn evals_else_starting_with_conjunction_and_nested_if() {
+        // Test the exact pattern from DiningPhilosophers:
+        // ELSE /\ IF nested_cond THEN ... ELSE ...
+        let state = TlaState::from([
+            ("outer".to_string(), TlaValue::Bool(false)),
+            ("inner".to_string(), TlaValue::Bool(false)),
+        ]);
+        let ctx = EvalContext::new(&state);
+
+        let expr = "IF outer\nTHEN TRUE\nELSE /\\ IF inner\n        THEN FALSE\n        ELSE TRUE\n     /\\ TRUE";
+        let result = eval_expr(expr, &ctx).expect("complex nested IF should evaluate");
+        assert_eq!(result, TlaValue::Bool(true), "outer=false, inner=false: /\\ TRUE /\\ TRUE = TRUE");
     }
 
     #[test]
