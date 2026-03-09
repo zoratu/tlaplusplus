@@ -1061,6 +1061,16 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
         };
     }
 
+    // Handle UNCHANGED in expression/guard context.
+    // When UNCHANGED appears inside a disjunction that is evaluated as a guard
+    // (e.g., \/ Action1(self) \/ Action2(self) \/ UNCHANGED vars), the action
+    // semantics (keeping variables at their current values) are handled by the
+    // action IR layer. In the expression evaluation context, UNCHANGED simply
+    // represents an always-enabled stuttering step, so we return TRUE.
+    if starts_with_keyword(expr, "UNCHANGED") {
+        return Ok(TlaValue::Bool(true));
+    }
+
     if starts_with_keyword(expr, "SUBSET") {
         let rest = expr["SUBSET".len()..].trim();
         let set = eval_expr_inner(rest, ctx, depth + 1)?;
@@ -5669,5 +5679,33 @@ mod tests {
         // Test H!AddConst(7) = 17 (7 + 10)
         let result = eval_expr("H!AddConst(7)", &ctx).expect("H!AddConst(7) should evaluate");
         assert_eq!(result, TlaValue::Int(17));
+    }
+
+    #[test]
+    fn test_unchanged_in_expression_context() {
+        // UNCHANGED in expression/guard context should evaluate to TRUE.
+        // This handles cases like: \/ Action1(self) \/ UNCHANGED vars
+        // where the disjunction is evaluated as a guard expression.
+        let state = TlaState::new();
+        let definitions = BTreeMap::new();
+        let ctx = EvalContext::with_definitions(&state, &definitions);
+
+        // Single variable form
+        let result = eval_expr("UNCHANGED x", &ctx).expect("UNCHANGED x should evaluate");
+        assert_eq!(result, TlaValue::Bool(true));
+
+        // Tuple form
+        let result =
+            eval_expr("UNCHANGED <<x, y>>", &ctx).expect("UNCHANGED <<x, y>> should evaluate");
+        assert_eq!(result, TlaValue::Bool(true));
+
+        // Inside a disjunction (the motivating use case)
+        let result = eval_expr("TRUE \\/ UNCHANGED vars", &ctx)
+            .expect("disjunction with UNCHANGED should evaluate");
+        assert_eq!(result, TlaValue::Bool(true));
+
+        let result = eval_expr("FALSE \\/ UNCHANGED <<x, y>>", &ctx)
+            .expect("disjunction with UNCHANGED tuple should evaluate");
+        assert_eq!(result, TlaValue::Bool(true));
     }
 }
