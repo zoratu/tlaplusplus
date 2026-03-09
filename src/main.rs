@@ -7,10 +7,10 @@ use tlaplusplus::models::high_branching::HighBranchingModel;
 use tlaplusplus::models::tla_native::TlaModel;
 use tlaplusplus::system::parse_cpu_list;
 use tlaplusplus::tla::{
-    ActionClause, ClauseKind, ConfigValue, EvalContext, TlaConfig, TlaDefinition, TlaModule,
-    TlaState, TlaValue, classify_clause, compile_action_ir, eval_expr, looks_like_action,
-    parse_tla_config, parse_tla_module_file, probe_next_disjuncts, scan_module_closure,
-    split_top_level,
+    ActionClause, ClauseKind, CompiledExpr, ConfigValue, EvalContext, TlaConfig, TlaDefinition,
+    TlaModule, TlaState, TlaValue, classify_clause, compile_action_ir, compile_expr, eval_compiled,
+    eval_expr, looks_like_action, parse_tla_config, parse_tla_module_file, probe_next_disjuncts,
+    scan_module_closure, split_top_level,
 };
 use tlaplusplus::{EngineConfig, run_model};
 
@@ -1015,7 +1015,20 @@ fn main() -> anyhow::Result<()> {
                                     next_pending_mem.push((var, set_expr));
                                 }
                             }
-                            Err(_) => next_pending_mem.push((var, set_expr)),
+                            Err(_) => {
+                                // Evaluation failed - try to create a representative function
+                                // This handles cases like [Domain -> Range] where the function
+                                // set is too large to enumerate but we can create a representative
+                                if let Some(repr) =
+                                    try_create_representative_function(&set_expr, &ctx)
+                                {
+                                    probe_state.insert(var, repr);
+                                    probe_init_seeded += 1;
+                                    progress = true;
+                                } else {
+                                    next_pending_mem.push((var, set_expr));
+                                }
+                            }
                         }
                     }
 
@@ -1860,5 +1873,153 @@ fn pick_representative_from_set(set_val: &TlaValue) -> Option<TlaValue> {
             values.iter().next().cloned()
         }
         _ => None,
+    }
+}
+
+/// Try to create a representative function from a function set expression.
+/// This handles cases where `[Domain -> Range]` is too large to enumerate.
+/// Instead of enumerating all possible functions, we create a single representative
+/// function that maps each domain element to the first element of the range.
+fn try_create_representative_function(
+    set_expr: &str,
+    ctx: &EvalContext<'_>,
+) -> Option<TlaValue> {
+    // Compile the expression to see if it's a function set
+    let compiled = compile_expr(set_expr);
+
+    match compiled {
+        CompiledExpr::FunctionSet { domain, range } => {
+            // Evaluate the domain and range sets
+            let domain_val = eval_compiled(&domain, ctx).ok()?;
+            let range_val = eval_compiled(&range, ctx).ok()?;
+
+            let domain_set = domain_val.as_set().ok()?;
+            let range_set = range_val.as_set().ok()?;
+
+            // Pick the first element from the range as the representative value
+            let repr_val = range_set.iter().next()?.clone();
+
+            // Build a function mapping each domain element to the representative value
+            let mut func = std::collections::BTreeMap::new();
+            for elem in domain_set.iter() {
+                func.insert(elem.clone(), repr_val.clone());
+            }
+
+            Some(TlaValue::Function(Arc::new(func)))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_try_create_representative_function_basic() {
+        // Test creating a representative function from [A -> B]
+        let state = TlaState::new();
+        let mut defs = BTreeMap::new();
+
+        // Define A = {1, 2} and B = {10, 20}
+        defs.insert(
+            "A".to_string(),
+            TlaDefinition {
+                name: "A".to_string(),
+                params: vec![],
+                body: "{1, 2}".to_string(),
+                is_recursive: false,
+            },
+        );
+        defs.insert(
+            "B".to_string(),
+            TlaDefinition {
+                name: "B".to_string(),
+                params: vec![],
+                body: "{10, 20}".to_string(),
+                is_recursive: false,
+            },
+        );
+
+        let ctx = EvalContext::with_definitions(&state, &defs);
+        let result = try_create_representative_function("[A -> B]", &ctx);
+
+        assert!(result.is_some(), "should create a representative function");
+        let func = result.unwrap();
+
+        // Check it's a function with 2 keys (one for each element in A)
+        if let TlaValue::Function(f) = func {
+            assert_eq!(f.len(), 2, "function should have 2 entries");
+            // Both values should be the first element of B (which is 10)
+            for (_, val) in f.iter() {
+                assert_eq!(
+                    *val,
+                    TlaValue::Int(10),
+                    "all values should be the first element of B"
+                );
+            }
+        } else {
+            panic!("expected Function, got {:?}", func);
+        }
+    }
+
+    #[test]
+    fn test_try_create_representative_function_non_function_set() {
+        // Test that non-function-set expressions return None
+        let state = TlaState::new();
+        let defs = BTreeMap::new();
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        // Plain set - not a function set
+        let result = try_create_representative_function("{1, 2, 3}", &ctx);
+        assert!(result.is_none(), "should return None for plain set");
+
+        // Variable reference - not a function set
+        let result = try_create_representative_function("x", &ctx);
+        assert!(result.is_none(), "should return None for variable reference");
+    }
+
+    #[test]
+    fn test_try_create_representative_function_with_model_values() {
+        // Test with model values (common in TLA+ specs)
+        let mut state = TlaState::new();
+        state.insert(
+            "N".to_string(),
+            TlaValue::Set(Arc::new(
+                [
+                    TlaValue::ModelValue("n1".to_string()),
+                    TlaValue::ModelValue("n2".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            )),
+        );
+        state.insert(
+            "R".to_string(),
+            TlaValue::Set(Arc::new(
+                [TlaValue::Int(0), TlaValue::Int(1), TlaValue::Int(2)]
+                    .into_iter()
+                    .collect(),
+            )),
+        );
+
+        let defs = BTreeMap::new();
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        let result = try_create_representative_function("[N -> R]", &ctx);
+        assert!(
+            result.is_some(),
+            "should create representative function with model values"
+        );
+
+        if let Some(TlaValue::Function(f)) = result {
+            assert_eq!(f.len(), 2, "function should have 2 entries for N");
+            // All values should be the first element of R (which is 0)
+            for (_, val) in f.iter() {
+                assert_eq!(*val, TlaValue::Int(0), "all values should be 0");
+            }
+        } else {
+            panic!("expected Some(Function(...)), got {:?}", result);
+        }
     }
 }
