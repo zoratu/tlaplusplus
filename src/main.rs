@@ -5,7 +5,7 @@ use tlaplusplus::models::counter_grid::CounterGridModel;
 use tlaplusplus::models::flurm_job_lifecycle::FlurmJobLifecycleModel;
 use tlaplusplus::models::high_branching::HighBranchingModel;
 use tlaplusplus::models::tla_native::TlaModel;
-use tlaplusplus::system::parse_cpu_list;
+use tlaplusplus::system::{check_thp_and_warn, parse_cpu_list};
 use tlaplusplus::tla::{
     ActionClause, ClauseKind, CompiledExpr, ConfigValue, EvalContext, TlaConfig, TlaDefinition,
     TlaModule, TlaState, TlaValue, classify_clause, compile_action_ir, compile_expr, eval_compiled,
@@ -117,6 +117,9 @@ struct RuntimeArgs {
     /// Auto-tune worker count based on CPU utilization (reduces workers when sys% is high)
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     auto_tune: bool,
+    /// Skip system configuration checks (THP, etc.) at startup
+    #[arg(long, default_value_t = false)]
+    skip_system_checks: bool,
 }
 
 #[derive(Args, Clone, Debug)]
@@ -673,6 +676,14 @@ where
     Ok(outcome)
 }
 
+/// Run system configuration checks (THP, etc.) unless skipped
+fn run_system_checks(skip: bool) {
+    if skip {
+        return;
+    }
+    check_thp_and_warn();
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -685,6 +696,7 @@ fn main() -> anyhow::Result<()> {
             storage,
             s3,
         } => {
+            run_system_checks(runtime.skip_system_checks);
             let model = CounterGridModel::new(max_x, max_y, max_sum);
             let config = build_engine_config(&runtime, &storage, s3.s3_bucket.is_some())?;
             let outcome = run_model_with_s3(model, config, &s3)?;
@@ -704,6 +716,7 @@ fn main() -> anyhow::Result<()> {
             storage,
             s3,
         } => {
+            run_system_checks(runtime.skip_system_checks);
             let model = FlurmJobLifecycleModel::new(max_jobs, max_time_limit);
             let config = build_engine_config(&runtime, &storage, s3.s3_bucket.is_some())?;
             let outcome = run_model_with_s3(model, config, &s3)?;
@@ -723,6 +736,7 @@ fn main() -> anyhow::Result<()> {
             storage,
             s3,
         } => {
+            run_system_checks(runtime.skip_system_checks);
             let model = HighBranchingModel::new(max_depth, branching_factor);
             let config = build_engine_config(&runtime, &storage, s3.s3_bucket.is_some())?;
             let outcome = run_model_with_s3(model, config, &s3)?;
@@ -745,6 +759,7 @@ fn main() -> anyhow::Result<()> {
             storage,
             s3: _, // S3 not yet integrated with adaptive branching
         } => {
+            run_system_checks(runtime.skip_system_checks);
             use std::sync::Arc;
             use std::sync::atomic::{AtomicBool, Ordering};
             use std::thread;
@@ -1218,6 +1233,7 @@ fn main() -> anyhow::Result<()> {
             storage,
             s3,
         } => {
+            run_system_checks(runtime.skip_system_checks);
             // Auto-detect config file if not specified
             let config_path = config.or_else(|| {
                 let cfg_path = module.with_extension("cfg");
@@ -1880,10 +1896,7 @@ fn pick_representative_from_set(set_val: &TlaValue) -> Option<TlaValue> {
 /// This handles cases where `[Domain -> Range]` is too large to enumerate.
 /// Instead of enumerating all possible functions, we create a single representative
 /// function that maps each domain element to the first element of the range.
-fn try_create_representative_function(
-    set_expr: &str,
-    ctx: &EvalContext<'_>,
-) -> Option<TlaValue> {
+fn try_create_representative_function(set_expr: &str, ctx: &EvalContext<'_>) -> Option<TlaValue> {
     // Compile the expression to see if it's a function set
     let compiled = compile_expr(set_expr);
 
@@ -1976,7 +1989,10 @@ mod tests {
 
         // Variable reference - not a function set
         let result = try_create_representative_function("x", &ctx);
-        assert!(result.is_none(), "should return None for variable reference");
+        assert!(
+            result.is_none(),
+            "should return None for variable reference"
+        );
     }
 
     #[test]
@@ -2020,6 +2036,17 @@ mod tests {
             }
         } else {
             panic!("expected Some(Function(...)), got {:?}", result);
+        }
+    }
+
+    #[test]
+    fn parses_skip_system_checks_flag() {
+        let cli = Cli::try_parse_from(["tlaplusplus", "run-counter-grid", "--skip-system-checks"])
+            .expect("cli should parse");
+
+        match cli.command {
+            Command::RunCounterGrid { runtime, .. } => assert!(runtime.skip_system_checks),
+            other => panic!("unexpected command: {:?}", other),
         }
     }
 }

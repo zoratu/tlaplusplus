@@ -5,7 +5,7 @@ use crate::storage::async_fingerprint_writer::{create_persist_channels, fingerpr
 use crate::storage::fingerprint_store::{
     FingerprintStats as OldFingerprintStats, FingerprintStore,
 };
-use crate::storage::numa::set_preferred_node;
+use crate::storage::numa::{NumaDiagnostics, NumaTopology, set_preferred_node};
 use crate::storage::page_aligned_fingerprint_store::FingerprintStats;
 use crate::storage::queue::{DiskBackedQueue, QueueStats};
 use crate::storage::spillable_work_stealing::{SpillableConfig, SpillableWorkStealingQueues};
@@ -213,6 +213,10 @@ struct PauseController {
     /// Per-worker pause status for debugging (worker_id -> is_paused)
     /// Only populated when debugging is enabled via TLAPP_DEBUG_PAUSE env var
     worker_pause_status: parking_lot::RwLock<Vec<AtomicBool>>,
+    /// Per-worker NUMA node assignment (for diagnostics)
+    worker_numa_nodes: parking_lot::RwLock<Vec<usize>>,
+    /// NUMA diagnostics for stuck worker analysis
+    numa_diagnostics: parking_lot::RwLock<Option<NumaDiagnostics>>,
 }
 
 impl Default for PauseController {
@@ -223,18 +227,53 @@ impl Default for PauseController {
             wait_lock: Mutex::new(()),
             wait_cv: Condvar::new(),
             worker_pause_status: parking_lot::RwLock::new(Vec::new()),
+            worker_numa_nodes: parking_lot::RwLock::new(Vec::new()),
+            numa_diagnostics: parking_lot::RwLock::new(None),
         }
     }
 }
 
+const QUIESCENCE_INITIAL_TIMEOUT_SECS: u64 = 60;
+const QUIESCENCE_MAX_TOTAL_TIMEOUT_SECS: u64 = 300;
+const QUIESCENCE_MAX_ATTEMPTS: u32 = 3;
+const QUIESCENCE_RETRY_SETTLE_DELAY_MS: u64 = 100;
+
+fn next_quiescence_timeout_secs(attempt_index: u32, elapsed: Duration) -> Option<u64> {
+    if attempt_index >= QUIESCENCE_MAX_ATTEMPTS {
+        return None;
+    }
+
+    let elapsed_secs = elapsed.as_secs();
+    if elapsed_secs >= QUIESCENCE_MAX_TOTAL_TIMEOUT_SECS {
+        return None;
+    }
+
+    let remaining_secs = QUIESCENCE_MAX_TOTAL_TIMEOUT_SECS - elapsed_secs;
+    let planned_timeout =
+        QUIESCENCE_INITIAL_TIMEOUT_SECS.saturating_mul(1u64 << attempt_index.min(62));
+    Some(planned_timeout.min(remaining_secs.max(1)))
+}
+
 impl PauseController {
     /// Initialize per-worker tracking for debugging
-    fn init_worker_tracking(&self, num_workers: usize) {
+    fn init_worker_tracking(&self, num_workers: usize, worker_numa_nodes: &[usize]) {
         let mut status = self.worker_pause_status.write();
         status.clear();
         for _ in 0..num_workers {
             status.push(AtomicBool::new(false));
         }
+        drop(status);
+
+        // Store NUMA node assignments for each worker
+        let mut numa_nodes = self.worker_numa_nodes.write();
+        numa_nodes.clear();
+        numa_nodes.extend_from_slice(worker_numa_nodes);
+    }
+
+    /// Set NUMA diagnostics for stuck worker analysis
+    fn set_numa_diagnostics(&self, diagnostics: NumaDiagnostics) {
+        let mut diag = self.numa_diagnostics.write();
+        *diag = Some(diagnostics);
     }
 
     /// Get list of worker IDs that are NOT paused (for debugging)
@@ -246,6 +285,11 @@ impl PauseController {
             .filter(|(_, paused)| !paused.load(Ordering::Acquire))
             .map(|(id, _)| id)
             .collect()
+    }
+
+    /// Get the NUMA node assignments for workers
+    fn get_worker_numa_nodes(&self) -> Vec<usize> {
+        self.worker_numa_nodes.read().clone()
     }
 }
 
@@ -294,49 +338,131 @@ impl PauseController {
 
     /// Wait for all workers to pause (quiescence).
     /// Returns true if quiescence was achieved, false if timeout occurred.
-    /// Timeout: 5 minutes (300 seconds)
+    ///
+    /// Uses exponential backoff with a hard overall budget:
+    /// starts at 60s, doubles on each retry, and never exceeds 5 minutes total.
     fn wait_for_quiescence(
         &self,
         stop: &AtomicBool,
         active_workers: &AtomicUsize,
         live_workers: &AtomicUsize,
     ) -> bool {
-        const QUIESCENCE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
+        let mut attempt_index = 0u32;
+        let overall_start = Instant::now();
 
-        eprintln!(
-            "Checkpoint: entering wait_for_quiescence (timeout: {}s)",
-            QUIESCENCE_TIMEOUT.as_secs()
-        );
-        let mut iterations = 0u64;
-        let start = Instant::now();
         loop {
-            if stop.load(Ordering::Acquire) {
-                eprintln!("Checkpoint: wait_for_quiescence breaking due to stop");
+            let Some(current_timeout_secs) =
+                next_quiescence_timeout_secs(attempt_index, overall_start.elapsed())
+            else {
+                eprintln!(
+                    "Checkpoint: giving up after {:.1}s total, skipping checkpoint",
+                    overall_start.elapsed().as_secs_f64()
+                );
+                return false;
+            };
+
+            let timeout = Duration::from_secs(current_timeout_secs);
+            eprintln!(
+                "Checkpoint: entering wait_for_quiescence (attempt {}/{}, timeout: {}s)",
+                attempt_index + 1,
+                QUIESCENCE_MAX_ATTEMPTS,
+                current_timeout_secs
+            );
+
+            if let Some(success) =
+                self.wait_for_quiescence_attempt(stop, active_workers, live_workers, timeout)
+            {
+                if success {
+                    eprintln!(
+                        "Checkpoint: quiescence achieved after {:.1}s total ({} retries)",
+                        overall_start.elapsed().as_secs_f64(),
+                        attempt_index
+                    );
+                    return true;
+                }
+            } else {
+                // Stopped
                 return false;
             }
 
+            // Quiescence failed for this attempt
+            attempt_index += 1;
+            let Some(next_timeout_secs) =
+                next_quiescence_timeout_secs(attempt_index, overall_start.elapsed())
+            else {
+                eprintln!(
+                    "Checkpoint: giving up after {:.1}s total, skipping checkpoint",
+                    overall_start.elapsed().as_secs_f64()
+                );
+                return false;
+            };
+
+            // Exponential backoff: double the timeout
+            eprintln!(
+                "Checkpoint: quiescence timeout, backing off (next timeout: {}s, {:.1}s budget remaining)",
+                next_timeout_secs,
+                (QUIESCENCE_MAX_TOTAL_TIMEOUT_SECS as f64) - overall_start.elapsed().as_secs_f64()
+            );
+
+            // Brief pause before retry to let workers settle
+            std::thread::sleep(Duration::from_millis(QUIESCENCE_RETRY_SETTLE_DELAY_MS));
+        }
+    }
+
+    /// Single attempt to wait for quiescence with a specific timeout.
+    /// Returns Some(true) if achieved, Some(false) if timeout, None if stopped.
+    fn wait_for_quiescence_attempt(
+        &self,
+        stop: &AtomicBool,
+        active_workers: &AtomicUsize,
+        live_workers: &AtomicUsize,
+        timeout: Duration,
+    ) -> Option<bool> {
+        let mut iterations = 0u64;
+        let start = Instant::now();
+
+        loop {
+            if stop.load(Ordering::Acquire) {
+                eprintln!("Checkpoint: wait_for_quiescence breaking due to stop");
+                return None;
+            }
+
             // Check timeout
-            if start.elapsed() > QUIESCENCE_TIMEOUT {
+            if start.elapsed() > timeout {
                 let paused = self.paused_workers.load(Ordering::Acquire);
                 let live = live_workers.load(Ordering::Acquire);
                 let active = active_workers.load(Ordering::Acquire);
                 let unpaused_workers = self.get_unpaused_workers();
                 eprintln!(
-                    "Checkpoint: TIMEOUT waiting for quiescence after {:.1}s! paused={}/{}, active={}, {} workers not responding",
+                    "Checkpoint: TIMEOUT waiting for quiescence after {:.1}s! paused={}/{}, active={}",
                     start.elapsed().as_secs_f64(),
                     paused,
                     live,
-                    active,
-                    live.saturating_sub(paused)
+                    active
                 );
                 if !unpaused_workers.is_empty() {
-                    eprintln!(
-                        "Checkpoint: STUCK WORKERS: {:?} (these workers never reached pause point)",
-                        unpaused_workers
-                    );
+                    eprintln!("Checkpoint: STUCK WORKERS: {:?}", unpaused_workers);
+                    for worker_id in &unpaused_workers {
+                        eprintln!(
+                            "  Worker {}: not at pause point (may be blocked on lock contention)",
+                            worker_id
+                        );
+                    }
+
+                    let worker_numa_nodes = self.get_worker_numa_nodes();
+                    if let Some(ref diagnostics) = *self.numa_diagnostics.read() {
+                        diagnostics
+                            .print_stuck_worker_diagnostics(&unpaused_workers, &worker_numa_nodes);
+                    } else {
+                        eprintln!("NUMA node assignments for stuck workers:");
+                        for &worker_id in &unpaused_workers {
+                            if let Some(&node) = worker_numa_nodes.get(worker_id) {
+                                eprintln!("  Worker {} -> NUMA node {}", worker_id, node);
+                            }
+                        }
+                    }
                 }
-                eprintln!("Checkpoint: skipping this checkpoint, will retry at next interval");
-                return false;
+                return Some(false);
             }
 
             let paused = self.paused_workers.load(Ordering::Acquire);
@@ -346,12 +472,14 @@ impl PauseController {
             // Debug: log progress every 5 seconds
             iterations += 1;
             if iterations % 5000 == 0 {
+                let unpaused_workers = self.get_unpaused_workers();
                 eprintln!(
-                    "Checkpoint: waiting for quiescence: paused={}/{}, active={}, elapsed={:.1}s",
+                    "Checkpoint: waiting for quiescence: paused={}/{}, active={}, elapsed={:.1}s, stuck_workers={:?}",
                     paused,
                     live,
                     active,
-                    start.elapsed().as_secs_f64()
+                    start.elapsed().as_secs_f64(),
+                    unpaused_workers
                 );
             }
 
@@ -363,7 +491,7 @@ impl PauseController {
                     active,
                     start.elapsed().as_secs_f64()
                 );
-                return true;
+                return Some(true);
             }
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -1578,7 +1706,26 @@ where
     };
 
     // Initialize per-worker pause tracking for debugging stuck workers
-    pause.init_worker_tracking(worker_plan.worker_count);
+    pause.init_worker_tracking(worker_plan.worker_count, &worker_plan.worker_numa_nodes);
+
+    // Initialize NUMA diagnostics for stuck worker analysis
+    // Sample fingerprint store shard memory for NUMA location detection.
+    let fp_store_addrs = fp_store.memory_base_addrs();
+    let numa_topology = NumaTopology::detect().unwrap_or_else(|_| NumaTopology {
+        node_count: 1,
+        cpu_to_node: HashMap::new(),
+        distances: vec![vec![10]],
+        cpus_per_node: vec![],
+    });
+    let numa_diagnostics = NumaDiagnostics::new(
+        &numa_topology,
+        &worker_plan.worker_numa_nodes,
+        &fp_store_addrs,
+    );
+
+    // Print startup NUMA diagnostics
+    numa_diagnostics.print_startup_info();
+    pause.set_numa_diagnostics(numa_diagnostics);
 
     let mut workers = Vec::with_capacity(worker_plan.worker_count);
     for (worker_id, mut worker_state) in worker_states.into_iter().enumerate() {
@@ -2341,10 +2488,10 @@ pub fn reconstruct_trace_limited<M: Model>(
 
 #[cfg(test)]
 mod tests {
-    use super::{EngineConfig, run_model};
+    use super::{EngineConfig, next_quiescence_timeout_secs, run_model};
     use crate::models::counter_grid::CounterGridModel;
     use anyhow::Result;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn temp_work_dir(prefix: &str) -> std::path::PathBuf {
         let nanos = SystemTime::now()
@@ -2383,6 +2530,35 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(work_dir);
         Ok(())
+    }
+
+    #[test]
+    fn quiescence_schedule_respects_total_budget() {
+        assert_eq!(next_quiescence_timeout_secs(0, Duration::ZERO), Some(60));
+        assert_eq!(
+            next_quiescence_timeout_secs(1, Duration::from_secs(60)),
+            Some(120)
+        );
+        assert_eq!(
+            next_quiescence_timeout_secs(2, Duration::from_secs(180)),
+            Some(120)
+        );
+        assert_eq!(
+            next_quiescence_timeout_secs(3, Duration::from_secs(180)),
+            None
+        );
+    }
+
+    #[test]
+    fn quiescence_schedule_clamps_to_remaining_budget() {
+        assert_eq!(
+            next_quiescence_timeout_secs(2, Duration::from_secs(250)),
+            Some(50)
+        );
+        assert_eq!(
+            next_quiescence_timeout_secs(0, Duration::from_secs(300)),
+            None
+        );
     }
 
     #[test]
