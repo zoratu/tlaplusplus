@@ -161,6 +161,7 @@ pub enum CompiledExpr {
     Lambda {
         params: Vec<String>,
         body: Box<CompiledExpr>,
+        body_text: String, // Original text for TlaValue::Lambda conversion
     },
 
     // Fallback: unparsed expression (for complex cases we haven't compiled yet)
@@ -476,6 +477,14 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
     if expr.starts_with("LET ") || expr.starts_with("LET\n") {
         if let Some(let_expr) = try_parse_let(expr) {
             return let_expr;
+        }
+    }
+
+    // LAMBDA (must check before logical operators)
+    // LAMBDA binds loosely - everything after the colon is the body
+    if expr.starts_with("LAMBDA ") {
+        if let Some(lambda) = try_parse_lambda(expr) {
+            return lambda;
         }
     }
 
@@ -1793,6 +1802,37 @@ fn try_parse_let(expr: &str) -> Option<CompiledExpr> {
     Some(CompiledExpr::Let {
         bindings,
         body: Box::new(compile_expr(body_str)),
+    })
+}
+
+fn try_parse_lambda(expr: &str) -> Option<CompiledExpr> {
+    // LAMBDA x: body  OR  LAMBDA x, y: body
+    let rest = expr.strip_prefix("LAMBDA ")?.trim();
+
+    let colon_idx = find_top_level_colon(rest)?;
+    let params_str = rest[..colon_idx].trim();
+    let body_str = rest[colon_idx + 1..].trim();
+
+    // Parse parameter names (comma-separated identifiers)
+    let params: Vec<String> = params_str
+        .split(',')
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+
+    if params.is_empty() {
+        return None;
+    }
+
+    // All params should be simple identifiers
+    if !params.iter().all(|p| is_identifier(p)) {
+        return None;
+    }
+
+    Some(CompiledExpr::Lambda {
+        params,
+        body: Box::new(compile_expr(body_str)),
+        body_text: body_str.to_string(),
     })
 }
 
