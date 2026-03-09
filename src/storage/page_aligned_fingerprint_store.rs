@@ -933,6 +933,11 @@ impl FingerprintShard {
     fn load_factor(&self) -> f64 {
         self.len() as f64 / self.get_capacity() as f64
     }
+
+    /// Get the memory base address for NUMA diagnostics
+    fn memory_base_addr(&self) -> *const u8 {
+        self.memory.load(Ordering::Acquire)
+    }
 }
 
 impl Drop for FingerprintShard {
@@ -1282,6 +1287,15 @@ impl PageAlignedFingerprintStore {
     /// Flush (no-op for in-memory store)
     pub fn flush(&self) -> Result<usize> {
         Ok(0)
+    }
+
+    /// Get the base memory address of the first shard for NUMA diagnostics
+    ///
+    /// Returns the address of the first shard's memory allocation, which can be
+    /// used with move_pages() to determine which NUMA node the fingerprint store
+    /// memory is allocated on.
+    pub fn memory_base_addr(&self) -> Option<*const u8> {
+        self.shards.first().map(|s| s.memory_base_addr())
     }
 }
 

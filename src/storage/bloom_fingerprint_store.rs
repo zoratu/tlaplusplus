@@ -280,4 +280,13 @@ impl BloomFingerprintStore {
     pub fn persist_drops(&self) -> u64 {
         self.persist_drops.load(Ordering::Relaxed)
     }
+
+    /// Get the base memory address of the fingerprint store for NUMA diagnostics
+    ///
+    /// Note: Bloom filters use internal allocations that we cannot easily expose,
+    /// so this returns None. Use PageAlignedFingerprintStore for NUMA-aware diagnostics.
+    pub fn memory_base_addr(&self) -> Option<*const u8> {
+        // Bloom filters use internal Vec allocations that we cannot access
+        None
+    }
 }

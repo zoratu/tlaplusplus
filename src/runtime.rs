@@ -5,7 +5,7 @@ use crate::storage::async_fingerprint_writer::{create_persist_channels, fingerpr
 use crate::storage::fingerprint_store::{
     FingerprintStats as OldFingerprintStats, FingerprintStore,
 };
-use crate::storage::numa::set_preferred_node;
+use crate::storage::numa::{set_preferred_node, NumaTopology, NumaDiagnostics};
 use crate::storage::page_aligned_fingerprint_store::FingerprintStats;
 use crate::storage::queue::{DiskBackedQueue, QueueStats};
 use crate::storage::spillable_work_stealing::{SpillableConfig, SpillableWorkStealingQueues};
@@ -213,6 +213,10 @@ struct PauseController {
     /// Per-worker pause status for debugging (worker_id -> is_paused)
     /// Only populated when debugging is enabled via TLAPP_DEBUG_PAUSE env var
     worker_pause_status: parking_lot::RwLock<Vec<AtomicBool>>,
+    /// Per-worker NUMA node assignment (for diagnostics)
+    worker_numa_nodes: parking_lot::RwLock<Vec<usize>>,
+    /// NUMA diagnostics for stuck worker analysis
+    numa_diagnostics: parking_lot::RwLock<Option<NumaDiagnostics>>,
 }
 
 impl Default for PauseController {
@@ -223,18 +227,32 @@ impl Default for PauseController {
             wait_lock: Mutex::new(()),
             wait_cv: Condvar::new(),
             worker_pause_status: parking_lot::RwLock::new(Vec::new()),
+            worker_numa_nodes: parking_lot::RwLock::new(Vec::new()),
+            numa_diagnostics: parking_lot::RwLock::new(None),
         }
     }
 }
 
 impl PauseController {
     /// Initialize per-worker tracking for debugging
-    fn init_worker_tracking(&self, num_workers: usize) {
+    fn init_worker_tracking(&self, num_workers: usize, worker_numa_nodes: &[usize]) {
         let mut status = self.worker_pause_status.write();
         status.clear();
         for _ in 0..num_workers {
             status.push(AtomicBool::new(false));
         }
+        drop(status);
+
+        // Store NUMA node assignments for each worker
+        let mut numa_nodes = self.worker_numa_nodes.write();
+        numa_nodes.clear();
+        numa_nodes.extend_from_slice(worker_numa_nodes);
+    }
+
+    /// Set NUMA diagnostics for stuck worker analysis
+    fn set_numa_diagnostics(&self, diagnostics: NumaDiagnostics) {
+        let mut diag = self.numa_diagnostics.write();
+        *diag = Some(diagnostics);
     }
 
     /// Get list of worker IDs that are NOT paused (for debugging)
@@ -246,6 +264,11 @@ impl PauseController {
             .filter(|(_, paused)| !paused.load(Ordering::Acquire))
             .map(|(id, _)| id)
             .collect()
+    }
+
+    /// Get the NUMA node assignments for workers
+    fn get_worker_numa_nodes(&self) -> Vec<usize> {
+        self.worker_numa_nodes.read().clone()
     }
 }
 
@@ -334,6 +357,20 @@ impl PauseController {
                         "Checkpoint: STUCK WORKERS: {:?} (these workers never reached pause point)",
                         unpaused_workers
                     );
+
+                    // Print NUMA diagnostics for stuck workers
+                    let worker_numa_nodes = self.get_worker_numa_nodes();
+                    if let Some(ref diagnostics) = *self.numa_diagnostics.read() {
+                        diagnostics.print_stuck_worker_diagnostics(&unpaused_workers, &worker_numa_nodes);
+                    } else {
+                        // Fallback: print basic NUMA info without full diagnostics
+                        eprintln!("NUMA node assignments for stuck workers:");
+                        for &worker_id in &unpaused_workers {
+                            if let Some(&node) = worker_numa_nodes.get(worker_id) {
+                                eprintln!("  Worker {} -> NUMA node {}", worker_id, node);
+                            }
+                        }
+                    }
                 }
                 eprintln!("Checkpoint: skipping this checkpoint, will retry at next interval");
                 return false;
@@ -1578,7 +1615,26 @@ where
     };
 
     // Initialize per-worker pause tracking for debugging stuck workers
-    pause.init_worker_tracking(worker_plan.worker_count);
+    pause.init_worker_tracking(worker_plan.worker_count, &worker_plan.worker_numa_nodes);
+
+    // Initialize NUMA diagnostics for stuck worker analysis
+    // Get fingerprint store memory address for NUMA location detection
+    let fp_store_addr = fp_store.memory_base_addr();
+    let numa_topology = NumaTopology::detect().unwrap_or_else(|_| NumaTopology {
+        node_count: 1,
+        cpu_to_node: HashMap::new(),
+        distances: vec![vec![10]],
+        cpus_per_node: vec![],
+    });
+    let numa_diagnostics = NumaDiagnostics::new(
+        &numa_topology,
+        &worker_plan.worker_numa_nodes,
+        fp_store_addr,
+    );
+
+    // Print startup NUMA diagnostics
+    numa_diagnostics.print_startup_info();
+    pause.set_numa_diagnostics(numa_diagnostics);
 
     let mut workers = Vec::with_capacity(worker_plan.worker_count);
     for (worker_id, mut worker_state) in worker_states.into_iter().enumerate() {

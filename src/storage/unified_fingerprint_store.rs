@@ -211,4 +211,16 @@ impl UnifiedFingerprintStore {
             _ => false,
         }
     }
+
+    /// Get the base memory address of the fingerprint store for NUMA diagnostics
+    ///
+    /// Returns the address of the first shard's data, which can be used to
+    /// determine which NUMA node the fingerprint store memory is allocated on.
+    pub fn memory_base_addr(&self) -> Option<*const u8> {
+        match self {
+            Self::PageAligned(store) => store.memory_base_addr(),
+            Self::Bloom(store) => store.memory_base_addr(),
+            Self::AutoSwitch(store) => store.memory_base_addr(),
+        }
+    }
 }

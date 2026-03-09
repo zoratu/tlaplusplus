@@ -629,6 +629,17 @@ impl AutoSwitchingFingerprintStore {
     pub fn shard_count(&self) -> usize {
         self.config.shard_count
     }
+
+    /// Get the base memory address of the fingerprint store for NUMA diagnostics
+    ///
+    /// Returns the address from the underlying exact store (PageAlignedFingerprintStore).
+    pub fn memory_base_addr(&self) -> Option<*const u8> {
+        let state = self.state.read();
+        match &*state {
+            StoreState::Exact { store } => store.memory_base_addr(),
+            StoreState::Hybrid { exact, .. } => exact.memory_base_addr(),
+        }
+    }
 }
 
 /// Extended statistics for auto-switching store
