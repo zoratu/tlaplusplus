@@ -532,9 +532,9 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
             "=" => CompiledExpr::Eq(left_expr, right_expr),
             "/=" | "#" => CompiledExpr::Neq(left_expr, right_expr),
             "<" => CompiledExpr::Lt(left_expr, right_expr),
-            "<=" => CompiledExpr::Le(left_expr, right_expr),
+            "<=" | "\\leq" => CompiledExpr::Le(left_expr, right_expr),
             ">" => CompiledExpr::Gt(left_expr, right_expr),
-            ">=" => CompiledExpr::Ge(left_expr, right_expr),
+            ">=" | "\\geq" => CompiledExpr::Ge(left_expr, right_expr),
             "\\in" => CompiledExpr::In(left_expr, right_expr),
             "\\notin" => CompiledExpr::NotIn(left_expr, right_expr),
             "\\subseteq" => CompiledExpr::Subset(left_expr, right_expr),
@@ -1196,6 +1196,8 @@ fn split_comparison(expr: &str) -> Option<(&str, &str, &str)> {
         "\\subseteq",
         "\\notin",
         "\\in",
+        "\\geq",
+        "\\leq",
         ">=",
         "<=",
         "/=",
@@ -2402,6 +2404,15 @@ mod tests {
 
         let expr = compile_expr("n < 10");
         assert!(matches!(expr, CompiledExpr::Lt(_, _)));
+    }
+
+    #[test]
+    fn test_compile_leq_geq() {
+        let expr = compile_expr("x \\leq 5");
+        assert!(matches!(expr, CompiledExpr::Le(_, _)));
+
+        let expr = compile_expr("x \\geq 5");
+        assert!(matches!(expr, CompiledExpr::Ge(_, _)));
     }
 
     #[test]

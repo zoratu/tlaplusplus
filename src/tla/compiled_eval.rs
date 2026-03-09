@@ -1763,6 +1763,28 @@ mod tests {
     }
 
     #[test]
+    fn test_eval_leq_geq() {
+        let ctx = empty_ctx();
+        assert_eq!(
+            eval_compiled(&compile_expr("3 \\leq 5"), &ctx).unwrap(),
+            TlaValue::Bool(true)
+        );
+        assert_eq!(
+            eval_compiled(&compile_expr("5 \\geq 3"), &ctx).unwrap(),
+            TlaValue::Bool(true)
+        );
+    }
+
+    #[test]
+    fn test_eval_modulo() {
+        let ctx = empty_ctx();
+        assert_eq!(
+            eval_compiled(&compile_expr("10 % 3"), &ctx).unwrap(),
+            TlaValue::Int(1)
+        );
+    }
+
+    #[test]
     fn test_eval_set() {
         let ctx = empty_ctx();
         let result = eval_compiled(&compile_expr("{1, 2, 3}"), &ctx).unwrap();
