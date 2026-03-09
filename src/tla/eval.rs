@@ -9,6 +9,18 @@ use std::sync::Arc;
 
 const MAX_EVAL_DEPTH: usize = 100;
 
+/// Normalize a higher-order operator parameter name.
+/// TLA+ allows parameters like `P(_)` or `Op(_, _)` for higher-order operators.
+/// When binding arguments to these parameters, we need just the base name.
+/// E.g., "P(_)" -> "P", "Op(_, _)" -> "Op", "x" -> "x"
+pub fn normalize_param_name(param: &str) -> &str {
+    if let Some(paren_pos) = param.find('(') {
+        param[..paren_pos].trim()
+    } else {
+        param.trim()
+    }
+}
+
 /// Context for evaluating expressions on a single state
 /// Uses Rc for copy-on-write semantics to avoid cloning entire context
 #[derive(Debug, Clone)]
@@ -1850,7 +1862,7 @@ fn eval_module_instance_call(
     // Bind operator parameters
     let mut bound = Vec::with_capacity(operator_def.params.len());
     for (param, arg) in operator_def.params.iter().zip(args.into_iter()) {
-        bound.push((param.as_str(), arg));
+        bound.push((normalize_param_name(param), arg));
     }
 
     let child_ctx = instance_ctx.with_local_values(&bound);
@@ -2131,6 +2143,13 @@ fn eval_operator_call(
         _ => {}
     }
 
+    // Check if name refers to a local value that's a Lambda (higher-order parameter)
+    if let Some(local_val) = ctx.runtime_value(name) {
+        if matches!(local_val, TlaValue::Lambda { .. }) {
+            return apply_value(&local_val, args, ctx, depth + 1);
+        }
+    }
+
     let def = ctx
         .definition(name)
         .ok_or_else(|| anyhow!("unknown operator/function '{name}'"))?;
@@ -2145,7 +2164,7 @@ fn eval_operator_call(
 
     let mut bound = Vec::with_capacity(def.params.len());
     for (param, arg) in def.params.iter().zip(args.into_iter()) {
-        bound.push((param.as_str(), arg));
+        bound.push((normalize_param_name(param), arg));
     }
     let child = ctx.with_local_values(&bound);
     eval_expr_inner(&def.body, &child, depth + 1)
@@ -4502,6 +4521,38 @@ mod tests {
     }
 
     #[test]
+    fn higher_order_operator_parameters() {
+        // Test operator with P(_) syntax for higher-order parameter
+        // Similar to CigaretteSmokers example: ChooseOne(S, P(_))
+        let state = TlaState::from([("items".to_string(), TlaValue::Set(Arc::new(BTreeSet::from([
+            TlaValue::Int(1),
+            TlaValue::Int(2),
+            TlaValue::Int(3),
+        ]))))]);
+
+        let defs = BTreeMap::from([(
+            "FindOne".to_string(),
+            TlaDefinition {
+                name: "FindOne".to_string(),
+                params: vec!["S".to_string(), "P(_)".to_string()],
+                body: "CHOOSE x \\in S : P(x)".to_string(),
+                is_recursive: false,
+            },
+        )]);
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        // Call FindOne with a lambda
+        let expr = "FindOne(items, LAMBDA x: x > 1)";
+        let result = eval_expr(expr, &ctx).expect("higher-order operator should work");
+
+        // Result should be 2 or 3 (both satisfy x > 1)
+        match result {
+            TlaValue::Int(n) => assert!(n > 1, "result should be > 1, got {}", n),
+            _ => panic!("Expected Int, got {:?}", result),
+        }
+    }
+
+    #[test]
     fn selectseq_with_lambda_predicate() {
         let state = TlaState::new();
         let defs = BTreeMap::from([(
@@ -5365,37 +5416,43 @@ mod tests {
     #[test]
     fn evals_multiline_if_then_else() {
         // Test IF-THEN-ELSE with newlines (as would come from a parsed module)
-        let state = TlaState::from([
-            ("condition".to_string(), TlaValue::Bool(false)),
-        ]);
+        let state = TlaState::from([("condition".to_string(), TlaValue::Bool(false))]);
         let ctx = EvalContext::new(&state);
 
         // Expression with newlines as stored in TlaDefinition body
         let expr = "IF condition\nTHEN 1\nELSE 2";
         let result = eval_expr(expr, &ctx).expect("multiline IF should evaluate");
-        assert_eq!(result, TlaValue::Int(2), "condition is false, should return ELSE branch");
+        assert_eq!(
+            result,
+            TlaValue::Int(2),
+            "condition is false, should return ELSE branch"
+        );
 
         // Test with condition=true
-        let state_true = TlaState::from([
-            ("condition".to_string(), TlaValue::Bool(true)),
-        ]);
+        let state_true = TlaState::from([("condition".to_string(), TlaValue::Bool(true))]);
         let ctx_true = EvalContext::new(&state_true);
         let result_true = eval_expr(expr, &ctx_true).expect("multiline IF should evaluate");
-        assert_eq!(result_true, TlaValue::Int(1), "condition is true, should return THEN branch");
+        assert_eq!(
+            result_true,
+            TlaValue::Int(1),
+            "condition is true, should return THEN branch"
+        );
     }
 
     #[test]
     fn evals_multiline_else_with_conjunction() {
         // Test ELSE branch with conjunction spanning multiple lines
-        let state = TlaState::from([
-            ("condition".to_string(), TlaValue::Bool(false)),
-        ]);
+        let state = TlaState::from([("condition".to_string(), TlaValue::Bool(false))]);
         let ctx = EvalContext::new(&state);
 
         // Expression like DiningPhilosophers with multiline ELSE containing /\
         let expr = "IF condition\nTHEN TRUE\nELSE /\\ TRUE\n     /\\ TRUE";
         let result = eval_expr(expr, &ctx).expect("multiline IF with conjunction should evaluate");
-        assert_eq!(result, TlaValue::Bool(true), "ELSE branch conjunction should evaluate to TRUE");
+        assert_eq!(
+            result,
+            TlaValue::Bool(true),
+            "ELSE branch conjunction should evaluate to TRUE"
+        );
     }
 
     #[test]
@@ -5409,7 +5466,11 @@ mod tests {
 
         let expr = "IF outer\nTHEN 1\nELSE IF inner\n     THEN 2\n     ELSE 3";
         let result = eval_expr(expr, &ctx).expect("nested multiline IF should evaluate");
-        assert_eq!(result, TlaValue::Int(3), "outer=false, inner=false should return 3");
+        assert_eq!(
+            result,
+            TlaValue::Int(3),
+            "outer=false, inner=false should return 3"
+        );
 
         // Test inner=true case
         let state_inner = TlaState::from([
@@ -5417,8 +5478,13 @@ mod tests {
             ("inner".to_string(), TlaValue::Bool(true)),
         ]);
         let ctx_inner = EvalContext::new(&state_inner);
-        let result_inner = eval_expr(expr, &ctx_inner).expect("nested multiline IF should evaluate");
-        assert_eq!(result_inner, TlaValue::Int(2), "outer=false, inner=true should return 2");
+        let result_inner =
+            eval_expr(expr, &ctx_inner).expect("nested multiline IF should evaluate");
+        assert_eq!(
+            result_inner,
+            TlaValue::Int(2),
+            "outer=false, inner=true should return 2"
+        );
     }
 
     #[test]
@@ -5426,7 +5492,7 @@ mod tests {
         // Test that find_outer_else correctly finds ELSE across newlines
         assert_eq!(find_outer_else("something\nELSE other"), Some(10));
         assert_eq!(find_outer_else("something ELSE other"), Some(10));
-        
+
         // Nested IF should not confuse it
         let nested = "IF inner THEN a ELSE b\nELSE outer";
         assert_eq!(find_outer_else(nested), Some(23));
@@ -5444,7 +5510,11 @@ mod tests {
 
         let expr = "IF outer\nTHEN TRUE\nELSE /\\ IF inner\n        THEN FALSE\n        ELSE TRUE\n     /\\ TRUE";
         let result = eval_expr(expr, &ctx).expect("complex nested IF should evaluate");
-        assert_eq!(result, TlaValue::Bool(true), "outer=false, inner=false: /\\ TRUE /\\ TRUE = TRUE");
+        assert_eq!(
+            result,
+            TlaValue::Bool(true),
+            "outer=false, inner=false: /\\ TRUE /\\ TRUE = TRUE"
+        );
     }
 
     #[test]
@@ -5569,7 +5639,7 @@ mod tests {
             TlaDefinition {
                 name: "AddConst".to_string(),
                 params: vec!["n".to_string()],
-                body: "n + Const".to_string(),  // Uses a constant from substitution
+                body: "n + Const".to_string(), // Uses a constant from substitution
                 is_recursive: false,
             },
         );
@@ -5600,5 +5670,4 @@ mod tests {
         let result = eval_expr("H!AddConst(7)", &ctx).expect("H!AddConst(7) should evaluate");
         assert_eq!(result, TlaValue::Int(17));
     }
-
 }
