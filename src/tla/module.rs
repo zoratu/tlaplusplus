@@ -1168,4 +1168,78 @@ Init == x = 0
         assert!(!is_builtin_module("DieHarder"));
         assert!(!is_builtin_module(""));
     }
+
+    #[test]
+    fn parses_multiline_if_then_else_with_else_on_separate_line() {
+        // This test reproduces the bug where ELSE on a separate line causes
+        // the ELSE branch to be empty or missing
+        let src = r#"
+---- MODULE MultiLineIfThenElse ----
+EXTENDS Integers
+
+Loop(self) ==
+    IF condition
+    THEN something
+    ELSE other_thing
+
+SimpleOp == 42
+====
+"#;
+
+        let m = parse_tla_module_text(src).expect("parse should work");
+        
+        // Check that Loop definition exists and has complete body
+        assert!(m.definitions.contains_key("Loop"), "Loop should be defined");
+        let loop_def = &m.definitions["Loop"];
+        
+        // The body should contain all parts of the IF-THEN-ELSE
+        assert!(loop_def.body.contains("IF"), "Body should contain IF: {}", loop_def.body);
+        assert!(loop_def.body.contains("THEN"), "Body should contain THEN: {}", loop_def.body);
+        assert!(loop_def.body.contains("ELSE"), "Body should contain ELSE: {}", loop_def.body);
+        assert!(loop_def.body.contains("other_thing"), "Body should contain ELSE branch content: {}", loop_def.body);
+        
+        // SimpleOp should also be defined
+        assert!(m.definitions.contains_key("SimpleOp"), "SimpleOp should be defined");
+    }
+
+    #[test]
+    fn parses_nested_multiline_if_then_else() {
+        // Test nested IF-THEN-ELSE spanning multiple lines similar to DiningPhilosophers
+        let src = r#"
+---- MODULE NestedIfThenElse ----
+EXTENDS Integers
+
+Loop(self) ==
+    IF outer_condition
+    THEN outer_then
+    ELSE /\ IF /\ forks[RightFork(self)].holder = self
+              /\ ~forks[RightFork(self)].clean
+         THEN /\ forks' = [forks EXCEPT ![RightFork(self)] = something]
+         ELSE /\ TRUE
+              /\ UNCHANGED forks
+
+Next == TRUE
+====
+"#;
+
+        let m = parse_tla_module_text(src).expect("parse should work");
+        
+        // Check that Loop definition exists and has complete body with nested IF
+        assert!(m.definitions.contains_key("Loop"), "Loop should be defined");
+        let loop_def = &m.definitions["Loop"];
+        
+        // Count IF and ELSE occurrences - there should be 2 of each (outer and nested)
+        let if_count = loop_def.body.matches("IF").count();
+        let else_count = loop_def.body.matches("ELSE").count();
+        
+        assert_eq!(if_count, 2, "Body should have 2 IFs (outer and nested): {}", loop_def.body);
+        assert_eq!(else_count, 2, "Body should have 2 ELSEs (outer and nested): {}", loop_def.body);
+        
+        // The nested ELSE should contain UNCHANGED forks
+        assert!(loop_def.body.contains("UNCHANGED forks"), 
+            "Body should contain UNCHANGED forks from nested ELSE: {}", loop_def.body);
+        
+        // Next should also be defined
+        assert!(m.definitions.contains_key("Next"), "Next should be defined");
+    }
 }
