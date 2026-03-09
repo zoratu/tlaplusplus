@@ -640,10 +640,15 @@ fn eval_compiled_inner(
             Ok(TlaValue::Function(Arc::new(result)))
         }
 
-        // Self-reference (@ in EXCEPT) - should only be evaluated within EXCEPT context
+        // Self-reference (@ in EXCEPT) - check if @ is bound in context
         CompiledExpr::SelfRef => {
-            // This should be handled specially by eval_except
-            Err(anyhow!("@ (self-reference) used outside of EXCEPT context"))
+            // Check if @ was bound by eval_with_self_ref (for nested expressions)
+            if let Some(val) = ctx.runtime_value("@") {
+                Ok(val.clone())
+            } else {
+                // @ used outside EXCEPT context
+                Err(anyhow!("@ (self-reference) used outside of EXCEPT context"))
+            }
         }
 
         // Control flow
@@ -862,7 +867,9 @@ fn eval_compiled_inner(
         }
 
         // Lambda
-        CompiledExpr::Lambda { params, body_text, .. } => {
+        CompiledExpr::Lambda {
+            params, body_text, ..
+        } => {
             // Return lambda as a value that can be applied later
             Ok(TlaValue::Lambda {
                 params: Arc::new(params.clone()),
@@ -1298,7 +1305,12 @@ fn eval_compiled_opcall(
             }
             let seq = match &arg_values[0] {
                 TlaValue::Seq(v) => v,
-                _ => return Err(anyhow!("SelectSeq expects a sequence, got {:?}", arg_values[0])),
+                _ => {
+                    return Err(anyhow!(
+                        "SelectSeq expects a sequence, got {:?}",
+                        arg_values[0]
+                    ));
+                }
             };
             let test_fn = &arg_values[1];
 
@@ -1312,7 +1324,9 @@ fn eval_compiled_opcall(
                         captured_locals,
                     } => {
                         if params.len() != 1 {
-                            return Err(anyhow!("SelectSeq test function must take exactly 1 parameter"));
+                            return Err(anyhow!(
+                                "SelectSeq test function must take exactly 1 parameter"
+                            ));
                         }
                         // Create a context with the captured locals and the parameter bound
                         let mut locals = (**captured_locals).clone();
@@ -1327,12 +1341,15 @@ fn eval_compiled_opcall(
                         };
                         eval_expr(body, &lambda_ctx)?
                     }
-                    TlaValue::Function(map) => {
-                        map.get(elem).cloned().ok_or_else(|| {
-                            anyhow!("SelectSeq test function is missing key {:?}", elem)
-                        })?
+                    TlaValue::Function(map) => map.get(elem).cloned().ok_or_else(|| {
+                        anyhow!("SelectSeq test function is missing key {:?}", elem)
+                    })?,
+                    other => {
+                        return Err(anyhow!(
+                            "SelectSeq test must be a lambda or function, got {:?}",
+                            other
+                        ));
                     }
-                    other => return Err(anyhow!("SelectSeq test must be a lambda or function, got {:?}", other)),
                 };
 
                 if let TlaValue::Bool(true) = test_result {
@@ -1824,7 +1841,10 @@ mod tests {
         let ctx = empty_ctx();
 
         // Test SelectSeq with a simple lambda
-        let result = eval_compiled(&compile_expr("SelectSeq(<<1, 2, 3, 4>>, LAMBDA x: x > 2)"), &ctx);
+        let result = eval_compiled(
+            &compile_expr("SelectSeq(<<1, 2, 3, 4>>, LAMBDA x: x > 2)"),
+            &ctx,
+        );
         println!("SelectSeq result: {:?}", result);
 
         match result {
@@ -2029,6 +2049,90 @@ mod tests {
         assert_eq!(next_xs, std::collections::BTreeSet::from([1, 2]));
         for next in next_states {
             assert_eq!(next.get("y"), Some(&TlaValue::Int(9)));
+        }
+    }
+
+    #[test]
+    fn test_except_with_self_ref_arithmetic() {
+        // Test @ + 1 pattern used in [table EXCEPT ![k] = @ + 1]
+        let ctx = empty_ctx();
+
+        // Create a function (table) to test with
+        let mut func = BTreeMap::new();
+        func.insert(TlaValue::Int(1), TlaValue::Int(5));
+        func.insert(TlaValue::Int(2), TlaValue::Int(10));
+        let func_val = TlaValue::Function(Arc::new(func));
+
+        let ctx_with_table = ctx.with_local_value("table", func_val);
+
+        // Evaluate [table EXCEPT ![1] = @ + 1]
+        let result = eval_compiled(
+            &compile_expr("[table EXCEPT ![1] = @ + 1]"),
+            &ctx_with_table,
+        )
+        .unwrap();
+
+        // Should increment table[1] from 5 to 6
+        if let TlaValue::Function(f) = result {
+            assert_eq!(f.get(&TlaValue::Int(1)), Some(&TlaValue::Int(6)));
+            assert_eq!(f.get(&TlaValue::Int(2)), Some(&TlaValue::Int(10)));
+        } else {
+            panic!("Expected function, got {:?}", result);
+        }
+    }
+
+    #[test]
+    fn test_except_with_self_ref_negation() {
+        // Test ~@ pattern used in [rec EXCEPT !.flag = ~@]
+        let ctx = empty_ctx();
+
+        // Create a record to test with
+        let mut rec = BTreeMap::new();
+        rec.insert("flag".to_string(), TlaValue::Bool(true));
+        rec.insert("count".to_string(), TlaValue::Int(5));
+        let rec_val = TlaValue::Record(Arc::new(rec));
+
+        let ctx_with_rec = ctx.with_local_value("rec", rec_val);
+
+        // Evaluate [rec EXCEPT !.flag = ~@]
+        let result =
+            eval_compiled(&compile_expr("[rec EXCEPT !.flag = ~@]"), &ctx_with_rec).unwrap();
+
+        // Should negate rec.flag from TRUE to FALSE
+        if let TlaValue::Record(r) = result {
+            assert_eq!(r.get("flag"), Some(&TlaValue::Bool(false)));
+            assert_eq!(r.get("count"), Some(&TlaValue::Int(5)));
+        } else {
+            panic!("Expected record, got {:?}", result);
+        }
+    }
+
+    #[test]
+    fn test_except_with_multiple_self_refs() {
+        // Test pattern from LanguageFeatureMatrix: [rec EXCEPT !.flag = ~@, !.count = @ + 1]
+        let ctx = empty_ctx();
+
+        // Create a record to test with
+        let mut rec = BTreeMap::new();
+        rec.insert("flag".to_string(), TlaValue::Bool(false));
+        rec.insert("count".to_string(), TlaValue::Int(10));
+        let rec_val = TlaValue::Record(Arc::new(rec));
+
+        let ctx_with_rec = ctx.with_local_value("rec", rec_val);
+
+        // Evaluate [rec EXCEPT !.flag = ~@, !.count = @ + 1]
+        let result = eval_compiled(
+            &compile_expr("[rec EXCEPT !.flag = ~@, !.count = @ + 1]"),
+            &ctx_with_rec,
+        )
+        .unwrap();
+
+        // Should negate flag (FALSE -> TRUE) and increment count (10 -> 11)
+        if let TlaValue::Record(r) = result {
+            assert_eq!(r.get("flag"), Some(&TlaValue::Bool(true)));
+            assert_eq!(r.get("count"), Some(&TlaValue::Int(11)));
+        } else {
+            panic!("Expected record, got {:?}", result);
         }
     }
 }
