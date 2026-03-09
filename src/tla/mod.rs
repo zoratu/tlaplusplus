@@ -11,8 +11,9 @@ pub mod temporal;
 pub mod value;
 
 pub use action_exec::{
-    NextBranchProbe, evaluate_next_states, evaluate_next_states_labeled, insert_compiled_action,
-    probe_next_disjuncts, evaluate_next_states_with_instances, evaluate_next_states_labeled_with_instances,
+    NextBranchProbe, evaluate_next_states, evaluate_next_states_labeled,
+    evaluate_next_states_labeled_with_instances, evaluate_next_states_with_instances,
+    insert_compiled_action, probe_next_disjuncts,
 };
 pub use action_ir::{ActionClause, ActionIr, compile_action_ir, looks_like_action};
 pub use cfg::{ConfigValue, TlaConfig, parse_tla_config};
@@ -22,7 +23,7 @@ pub use compiled_eval::{
 pub use compiled_expr::{CompiledActionClause, CompiledActionIr, CompiledExpr, compile_expr};
 pub use eval::{
     EvalContext, TransitionContext, apply_action_ir, apply_action_ir_with_context,
-    eval_action_constraint, eval_expr, eval_guard,
+    eval_action_constraint, eval_expr, eval_guard, normalize_param_name,
 };
 pub use formula::{ClauseKind, classify_clause, split_top_level};
 pub use module::{TlaDefinition, TlaModule, parse_tla_module_file, parse_tla_module_text};
