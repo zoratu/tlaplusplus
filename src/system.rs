@@ -853,9 +853,214 @@ pub fn prune_work_dir_segments(work_dir: &Path, keep_count: usize) -> std::io::R
     Ok(total_stats)
 }
 
+/// Transparent Huge Pages (THP) status
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThpStatus {
+    /// THP is enabled system-wide (best for performance)
+    Always,
+    /// THP is enabled only for madvise() regions
+    Madvise,
+    /// THP is disabled
+    Never,
+    /// Could not determine THP status (non-Linux or file not readable)
+    Unknown,
+}
+
+impl std::fmt::Display for ThpStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ThpStatus::Always => write!(f, "always"),
+            ThpStatus::Madvise => write!(f, "madvise"),
+            ThpStatus::Never => write!(f, "never"),
+            ThpStatus::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+/// THP defrag policy
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThpDefrag {
+    /// Synchronous defrag on all allocations (can cause latency)
+    Always,
+    /// Defer defrag to khugepaged
+    Defer,
+    /// Defer + use madvise hints
+    DeferMadvise,
+    /// Only defrag on madvise() regions
+    Madvise,
+    /// No defragmentation
+    Never,
+    /// Could not determine defrag status
+    Unknown,
+}
+
+impl std::fmt::Display for ThpDefrag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ThpDefrag::Always => write!(f, "always"),
+            ThpDefrag::Defer => write!(f, "defer"),
+            ThpDefrag::DeferMadvise => write!(f, "defer+madvise"),
+            ThpDefrag::Madvise => write!(f, "madvise"),
+            ThpDefrag::Never => write!(f, "never"),
+            ThpDefrag::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+/// Complete THP configuration status
+#[derive(Debug, Clone)]
+pub struct ThpConfig {
+    pub enabled: ThpStatus,
+    pub defrag: ThpDefrag,
+}
+
+/// Human-readable result of evaluating a THP configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThpCheckReport {
+    pub optimal: bool,
+    pub messages: Vec<String>,
+}
+
+impl ThpCheckReport {
+    fn new() -> Self {
+        Self {
+            optimal: true,
+            messages: Vec::new(),
+        }
+    }
+
+    fn push_block(&mut self, lines: &[&str]) {
+        if !self.messages.is_empty() {
+            self.messages.push(String::new());
+        }
+        self.messages
+            .extend(lines.iter().map(|line| (*line).to_string()));
+    }
+}
+
+/// Parse the bracketed value from THP sysfs files.
+/// Format is like: "always [madvise] never" where the active option is in brackets.
+fn parse_thp_bracketed(content: &str) -> Option<String> {
+    // Find the bracketed option
+    if let Some(start) = content.find('[') {
+        if let Some(end) = content[start..].find(']') {
+            return Some(content[start + 1..start + end].trim().to_string());
+        }
+    }
+    None
+}
+
+/// Parse THP enabled status from the raw sysfs file content.
+pub fn parse_thp_status_content(content: &str) -> ThpStatus {
+    match parse_thp_bracketed(content).as_deref() {
+        Some("always") => ThpStatus::Always,
+        Some("madvise") => ThpStatus::Madvise,
+        Some("never") => ThpStatus::Never,
+        _ => ThpStatus::Unknown,
+    }
+}
+
+/// Parse THP defrag policy from the raw sysfs file content.
+pub fn parse_thp_defrag_content(content: &str) -> ThpDefrag {
+    match parse_thp_bracketed(content).as_deref() {
+        Some("always") => ThpDefrag::Always,
+        Some("defer") => ThpDefrag::Defer,
+        Some("defer+madvise") => ThpDefrag::DeferMadvise,
+        Some("madvise") => ThpDefrag::Madvise,
+        Some("never") => ThpDefrag::Never,
+        _ => ThpDefrag::Unknown,
+    }
+}
+
+/// Check the current THP enabled status by reading /sys/kernel/mm/transparent_hugepage/enabled
+pub fn get_thp_status() -> ThpStatus {
+    let path = Path::new("/sys/kernel/mm/transparent_hugepage/enabled");
+
+    let content = match read_trimmed(path) {
+        Some(c) => c,
+        None => return ThpStatus::Unknown,
+    };
+
+    parse_thp_status_content(&content)
+}
+
+/// Check the current THP defrag policy by reading /sys/kernel/mm/transparent_hugepage/defrag
+pub fn get_thp_defrag() -> ThpDefrag {
+    let path = Path::new("/sys/kernel/mm/transparent_hugepage/defrag");
+
+    let content = match read_trimmed(path) {
+        Some(c) => c,
+        None => return ThpDefrag::Unknown,
+    };
+
+    parse_thp_defrag_content(&content)
+}
+
+/// Get the complete THP configuration
+pub fn get_thp_config() -> ThpConfig {
+    ThpConfig {
+        enabled: get_thp_status(),
+        defrag: get_thp_defrag(),
+    }
+}
+
+/// Evaluate a THP configuration and return the warnings/info that should be shown.
+pub fn evaluate_thp_config(config: &ThpConfig) -> ThpCheckReport {
+    let mut report = ThpCheckReport::new();
+
+    match config.enabled {
+        ThpStatus::Never => {
+            report.optimal = false;
+            report.push_block(&[
+                "Warning: Transparent Huge Pages (THP) is disabled.",
+                "This may cause performance degradation and checkpoint timeouts.",
+                "Consider enabling THP: echo always > /sys/kernel/mm/transparent_hugepage/enabled",
+            ]);
+        }
+        ThpStatus::Madvise => {
+            report.push_block(&[
+                "Info: Transparent Huge Pages (THP) is set to 'madvise'.",
+                "For best performance with large fingerprint stores, consider:",
+                "  echo always > /sys/kernel/mm/transparent_hugepage/enabled",
+            ]);
+        }
+        ThpStatus::Always | ThpStatus::Unknown => {}
+    }
+
+    if config.defrag == ThpDefrag::Always {
+        report.optimal = false;
+        report.push_block(&[
+            "Warning: THP defrag is set to 'always', which can cause latency spikes.",
+            "Consider using 'defer+madvise' or 'madvise' for latency-sensitive workloads:",
+            "  echo defer+madvise > /sys/kernel/mm/transparent_hugepage/defrag",
+        ]);
+    }
+
+    report
+}
+
+/// Check THP configuration and print warnings/recommendations.
+/// Returns true if the configuration is optimal, false if there are warnings.
+pub fn check_thp_and_warn() -> bool {
+    // Only relevant on Linux
+    #[cfg(not(target_os = "linux"))]
+    {
+        return true;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let report = evaluate_thp_config(&get_thp_config());
+        for line in &report.messages {
+            eprintln!("{line}");
+        }
+        report.optimal
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_cpu_list;
+    use super::*;
 
     #[test]
     fn parses_cpu_ranges() {
@@ -867,5 +1072,79 @@ mod tests {
     fn parses_cpu_ranges_with_stride_suffix() {
         let cpus = parse_cpu_list("0-10:2,12").expect("cpu list should parse");
         assert_eq!(cpus, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12]);
+    }
+
+    #[test]
+    fn test_parse_thp_bracketed() {
+        assert_eq!(
+            parse_thp_bracketed("always [madvise] never"),
+            Some("madvise".to_string())
+        );
+        assert_eq!(
+            parse_thp_bracketed("[always] madvise never"),
+            Some("always".to_string())
+        );
+        assert_eq!(
+            parse_thp_bracketed("always madvise [never]"),
+            Some("never".to_string())
+        );
+        assert_eq!(
+            parse_thp_bracketed("always defer [defer+madvise] madvise never"),
+            Some("defer+madvise".to_string())
+        );
+        assert_eq!(parse_thp_bracketed("no brackets here"), None);
+    }
+
+    #[test]
+    fn parses_thp_status_from_content() {
+        assert_eq!(
+            parse_thp_status_content("[always] madvise never"),
+            ThpStatus::Always
+        );
+        assert_eq!(
+            parse_thp_status_content("always [madvise] never"),
+            ThpStatus::Madvise
+        );
+        assert_eq!(
+            parse_thp_status_content("always madvise [never]"),
+            ThpStatus::Never
+        );
+        assert_eq!(
+            parse_thp_status_content("always madvise never"),
+            ThpStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn parses_thp_defrag_from_content() {
+        assert_eq!(
+            parse_thp_defrag_content("always defer [defer+madvise] madvise never"),
+            ThpDefrag::DeferMadvise
+        );
+        assert_eq!(
+            parse_thp_defrag_content("always defer madvise never"),
+            ThpDefrag::Unknown
+        );
+    }
+
+    #[test]
+    fn evaluates_thp_report_messages() {
+        let report = evaluate_thp_config(&ThpConfig {
+            enabled: ThpStatus::Never,
+            defrag: ThpDefrag::Always,
+        });
+        assert!(!report.optimal);
+        assert!(
+            report
+                .messages
+                .iter()
+                .any(|line| line.contains("THP) is disabled"))
+        );
+        assert!(
+            report
+                .messages
+                .iter()
+                .any(|line| line.contains("THP defrag is set to 'always'"))
+        );
     }
 }

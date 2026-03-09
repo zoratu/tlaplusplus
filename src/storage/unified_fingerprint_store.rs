@@ -211,4 +211,13 @@ impl UnifiedFingerprintStore {
             _ => false,
         }
     }
+
+    /// Get shard memory sample addresses for NUMA diagnostics.
+    pub fn memory_base_addrs(&self) -> Vec<*const u8> {
+        match self {
+            Self::PageAligned(store) => store.memory_base_addrs(),
+            Self::Bloom(store) => store.memory_base_addrs(),
+            Self::AutoSwitch(store) => store.memory_base_addrs(),
+        }
+    }
 }

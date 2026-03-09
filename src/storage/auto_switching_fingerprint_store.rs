@@ -149,6 +149,17 @@ struct StoreStats {
     bloom_inserts: AtomicU64,
 }
 
+const TRY_READ_WARN_ATTEMPT: u32 = 11;
+const TRY_READ_BAILOUT_ATTEMPT: u32 = 21;
+
+fn should_log_try_read_attempt(attempts: u32) -> bool {
+    attempts == TRY_READ_WARN_ATTEMPT
+}
+
+fn should_bail_out_try_read(attempts: u32) -> bool {
+    attempts >= TRY_READ_BAILOUT_ATTEMPT
+}
+
 impl AutoSwitchingFingerprintStore {
     /// Create a new auto-switching fingerprint store
     pub fn new(config: AutoSwitchConfig, assigned_cpus: &[Option<usize>]) -> Result<Self> {
@@ -223,14 +234,21 @@ impl AutoSwitchingFingerprintStore {
         // Check if a switch is pending - use non-blocking try_read
         // to avoid blocking workers during checkpoint quiescence
         let state = if self.switch_pending.load(Ordering::Acquire) {
-            let mut attempts = 0;
+            let mut attempts = 0u32;
             loop {
                 if let Some(guard) = self.state.try_read() {
                     break guard;
                 }
                 attempts += 1;
-                if attempts > 10 {
-                    // Can't acquire lock and switch is pending
+                if should_log_try_read_attempt(attempts) {
+                    eprintln!(
+                        "auto_switch: try_read exceeded 10 attempts (now {}), switch_pending={}",
+                        attempts,
+                        self.switch_pending.load(Ordering::Relaxed)
+                    );
+                }
+                if should_bail_out_try_read(attempts) {
+                    // Can't acquire lock and switch is pending (~2ms window)
                     // Return true (exists) to let worker proceed quickly
                     self.stats.hits.fetch_add(1, Ordering::Relaxed);
                     return true;
@@ -312,14 +330,22 @@ impl AutoSwitchingFingerprintStore {
             // 2. States treated as duplicates here will be regenerated later
             //    (their parent states are still in the queue or will be revisited)
             // 3. The brief window where this happens is very short (during switch)
-            let mut attempts = 0;
+            let mut attempts = 0u32;
             loop {
                 if let Some(guard) = self.state.try_read() {
                     break guard;
                 }
                 attempts += 1;
-                if attempts > 10 {
-                    // Can't acquire lock within ~1ms and switch is pending
+                if should_log_try_read_attempt(attempts) {
+                    eprintln!(
+                        "auto_switch: batch try_read exceeded 10 attempts (now {}), switch_pending={}, batch_size={}",
+                        attempts,
+                        self.switch_pending.load(Ordering::Relaxed),
+                        fps.len()
+                    );
+                }
+                if should_bail_out_try_read(attempts) {
+                    // Can't acquire lock within ~2ms and switch is pending
                     // Mark all fingerprints as "seen" (duplicates) so worker can proceed
                     // This allows worker to reach pause point for checkpoint quiescence
                     for s in seen.iter_mut() {
@@ -629,6 +655,17 @@ impl AutoSwitchingFingerprintStore {
     pub fn shard_count(&self) -> usize {
         self.config.shard_count
     }
+
+    /// Get the base memory address of the fingerprint store for NUMA diagnostics
+    ///
+    /// Returns the address from the underlying exact store (PageAlignedFingerprintStore).
+    pub fn memory_base_addrs(&self) -> Vec<*const u8> {
+        let state = self.state.read();
+        match &*state {
+            StoreState::Exact { store } => store.memory_base_addrs(),
+            StoreState::Hybrid { exact, .. } => exact.memory_base_addrs(),
+        }
+    }
 }
 
 /// Extended statistics for auto-switching store
@@ -647,6 +684,15 @@ pub struct AutoSwitchStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn try_read_retry_thresholds_are_stable() {
+        assert!(!should_log_try_read_attempt(10));
+        assert!(should_log_try_read_attempt(11));
+        assert!(!should_log_try_read_attempt(12));
+        assert!(!should_bail_out_try_read(20));
+        assert!(should_bail_out_try_read(21));
+    }
 
     #[test]
     fn test_basic_operations() {

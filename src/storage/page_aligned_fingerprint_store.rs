@@ -933,6 +933,11 @@ impl FingerprintShard {
     fn load_factor(&self) -> f64 {
         self.len() as f64 / self.get_capacity() as f64
     }
+
+    /// Get the memory base address for NUMA diagnostics
+    fn memory_base_addr(&self) -> *const u8 {
+        self.memory.load(Ordering::Acquire)
+    }
 }
 
 impl Drop for FingerprintShard {
@@ -1282,6 +1287,14 @@ impl PageAlignedFingerprintStore {
     /// Flush (no-op for in-memory store)
     pub fn flush(&self) -> Result<usize> {
         Ok(0)
+    }
+
+    /// Get one memory sample address per shard for NUMA diagnostics.
+    pub fn memory_base_addrs(&self) -> Vec<*const u8> {
+        self.shards
+            .iter()
+            .map(|shard| shard.memory_base_addr())
+            .collect()
     }
 }
 
