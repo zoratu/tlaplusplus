@@ -36,6 +36,7 @@ pub fn split_top_level(expr: &str, delimiter: &str) -> Vec<String> {
     let mut let_depth = 0usize; // Track LET...IN nesting
     let mut if_depth = 0usize; // Track IF...ELSE nesting
     let mut case_depth = 0usize; // Track CASE expression nesting
+    let mut else_branch_uses_delimiter = false; // True if ELSE branch starts with the delimiter
     let mut in_quantifier_body = false;
     let mut quantifier_body_uses_delimiter = false; // True if quantifier body starts with the delimiter
 
@@ -105,9 +106,20 @@ pub fn split_top_level(expr: &str, delimiter: &str) -> Vec<String> {
                 continue;
             }
             if if_depth > 0 && matches_keyword_at(&chars, i, "ELSE") {
-                if_depth = if_depth.saturating_sub(1);
+                // Don't decrement if_depth yet - check if ELSE branch starts with delimiter
                 current.push_str("ELSE");
                 i += 4;
+                // Look ahead to see if ELSE is followed by the delimiter (ignoring whitespace)
+                let remaining: String = chars[i..].iter().collect();
+                let remaining_trimmed = remaining.trim_start();
+                if remaining_trimmed.starts_with(delimiter) {
+                    // ELSE branch starts with delimiter - treat the entire IF-THEN-ELSE
+                    // including this ELSE branch as atomic (don't decrement if_depth)
+                    else_branch_uses_delimiter = true;
+                } else {
+                    // ELSE branch doesn't start with delimiter - we can decrement
+                    if_depth = if_depth.saturating_sub(1);
+                }
                 continue;
             }
 
@@ -161,7 +173,7 @@ pub fn split_top_level(expr: &str, delimiter: &str) -> Vec<String> {
             }
         }
 
-        let at_top = at_bracket_top && let_depth == 0 && if_depth == 0 && case_depth == 0;
+        let at_top = at_bracket_top && let_depth == 0 && if_depth == 0 && case_depth == 0 && !else_branch_uses_delimiter;
         if at_top && matches_at(&chars, i, &delim_chars) {
             // Don't split inside quantifier bodies when the body started with the same delimiter
             // For example: \E op \in S : \/ A \/ B \/ C
@@ -434,4 +446,66 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn does_not_split_else_starting_with_conjunction() {
+        // Test the specific pattern that was causing empty ELSE branches:
+        // ELSE /\ content should not split at the /\ after ELSE
+        let expr = "IF cond THEN a ELSE /\\ b /\\ c";
+        let parts = split_top_level(expr, "/\\");
+        
+        // Should be one part - the entire IF-THEN-ELSE including the ELSE branch
+        assert_eq!(parts.len(), 1, "Should not split inside IF-THEN-ELSE when ELSE starts with /\\: {:?}", parts);
+        assert!(parts[0].contains("b"), "Should contain ELSE branch content 'b': {}", parts[0]);
+        assert!(parts[0].contains("c"), "Should contain ELSE branch content 'c': {}", parts[0]);
+    }
+
+    #[test]
+    fn splits_after_else_without_leading_delimiter() {
+        // When ELSE is NOT followed by /\, subsequent /\ should split
+        let expr = "/\\ IF cond THEN a ELSE b /\\ c";
+        let parts = split_top_level(expr, "/\\");
+        
+        // Should split into 2 parts:
+        // 1. IF cond THEN a ELSE b
+        // 2. c
+        assert_eq!(parts.len(), 2, "Should split: {:?}", parts);
+        assert!(parts[0].contains("ELSE b"), "First part should contain complete IF-THEN-ELSE: {}", parts[0]);
+        assert_eq!(parts[1].trim(), "c", "Second part should be 'c': {}", parts[1]);
+    }
+
+    #[test]
+    fn handles_nested_if_then_else_with_else_starting_with_delimiter() {
+        // Test nested IF-THEN-ELSE where both levels have ELSE starting with /\
+        let expr = "IF outer THEN a ELSE /\\ IF inner THEN b ELSE /\\ c /\\ d";
+        let parts = split_top_level(expr, "/\\");
+        
+        // Should be one part - the entire nested structure
+        assert_eq!(parts.len(), 1, "Should not split nested IF-THEN-ELSE: {:?}", parts);
+        assert!(parts[0].contains("outer"), "Should contain outer condition");
+        assert!(parts[0].contains("inner"), "Should contain inner condition");
+        assert!(parts[0].contains("c"), "Should contain nested ELSE content 'c'");
+        assert!(parts[0].contains("d"), "Should contain nested ELSE content 'd'");
+    }
+
+    #[test]
+    fn handles_deeply_nested_if_then_else() {
+        // Test deeply nested IF-THEN-ELSE to check for stack issues
+        let mut expr = String::new();
+        for _ in 0..100 {
+            expr.push_str("IF cond THEN ");
+        }
+        expr.push_str("base");
+        for _ in 0..100 {
+            expr.push_str(" ELSE fallback");
+        }
+        
+        // Should not panic or stack overflow
+        let parts = split_top_level(&expr, "/\\");
+        
+        // Should be one part - the entire deeply nested expression
+        assert_eq!(parts.len(), 1, "Should not split deeply nested IF-THEN-ELSE");
+        assert!(parts[0].contains("base"), "Should contain inner value");
+    }
+
 }
