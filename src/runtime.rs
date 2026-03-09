@@ -294,49 +294,112 @@ impl PauseController {
 
     /// Wait for all workers to pause (quiescence).
     /// Returns true if quiescence was achieved, false if timeout occurred.
-    /// Timeout: 5 minutes (300 seconds)
+    ///
+    /// Uses exponential backoff: starts with 60s timeout, doubles on each retry
+    /// up to 3 retries (60s, 120s, 240s = 7 minutes total max wait).
     fn wait_for_quiescence(
         &self,
         stop: &AtomicBool,
         active_workers: &AtomicUsize,
         live_workers: &AtomicUsize,
     ) -> bool {
-        const QUIESCENCE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
+        const INITIAL_TIMEOUT_SECS: u64 = 60;
+        const MAX_RETRIES: u32 = 3;
 
-        eprintln!(
-            "Checkpoint: entering wait_for_quiescence (timeout: {}s)",
-            QUIESCENCE_TIMEOUT.as_secs()
-        );
-        let mut iterations = 0u64;
-        let start = Instant::now();
+        let mut current_timeout_secs = INITIAL_TIMEOUT_SECS;
+        let mut retry_count = 0u32;
+        let overall_start = Instant::now();
+
         loop {
-            if stop.load(Ordering::Acquire) {
-                eprintln!("Checkpoint: wait_for_quiescence breaking due to stop");
+            let timeout = Duration::from_secs(current_timeout_secs);
+            eprintln!(
+                "Checkpoint: entering wait_for_quiescence (attempt {}/{}, timeout: {}s)",
+                retry_count + 1,
+                MAX_RETRIES,
+                current_timeout_secs
+            );
+
+            if let Some(success) =
+                self.wait_for_quiescence_attempt(stop, active_workers, live_workers, timeout)
+            {
+                if success {
+                    eprintln!(
+                        "Checkpoint: quiescence achieved after {:.1}s total ({} retries)",
+                        overall_start.elapsed().as_secs_f64(),
+                        retry_count
+                    );
+                    return true;
+                }
+            } else {
+                // Stopped
                 return false;
             }
 
+            // Quiescence failed for this attempt
+            retry_count += 1;
+            if retry_count >= MAX_RETRIES {
+                eprintln!(
+                    "Checkpoint: giving up after {} retries ({:.1}s total), skipping checkpoint",
+                    retry_count,
+                    overall_start.elapsed().as_secs_f64()
+                );
+                return false;
+            }
+
+            // Exponential backoff: double the timeout
+            current_timeout_secs *= 2;
+            eprintln!(
+                "Checkpoint: quiescence timeout, backing off (next timeout: {}s)",
+                current_timeout_secs
+            );
+
+            // Brief pause before retry to let workers settle
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Single attempt to wait for quiescence with a specific timeout.
+    /// Returns Some(true) if achieved, Some(false) if timeout, None if stopped.
+    fn wait_for_quiescence_attempt(
+        &self,
+        stop: &AtomicBool,
+        active_workers: &AtomicUsize,
+        live_workers: &AtomicUsize,
+        timeout: Duration,
+    ) -> Option<bool> {
+        let mut iterations = 0u64;
+        let start = Instant::now();
+
+        loop {
+            if stop.load(Ordering::Acquire) {
+                eprintln!("Checkpoint: wait_for_quiescence breaking due to stop");
+                return None;
+            }
+
             // Check timeout
-            if start.elapsed() > QUIESCENCE_TIMEOUT {
+            if start.elapsed() > timeout {
                 let paused = self.paused_workers.load(Ordering::Acquire);
                 let live = live_workers.load(Ordering::Acquire);
                 let active = active_workers.load(Ordering::Acquire);
                 let unpaused_workers = self.get_unpaused_workers();
                 eprintln!(
-                    "Checkpoint: TIMEOUT waiting for quiescence after {:.1}s! paused={}/{}, active={}, {} workers not responding",
+                    "Checkpoint: TIMEOUT waiting for quiescence after {:.1}s! paused={}/{}, active={}",
                     start.elapsed().as_secs_f64(),
                     paused,
                     live,
-                    active,
-                    live.saturating_sub(paused)
+                    active
                 );
                 if !unpaused_workers.is_empty() {
-                    eprintln!(
-                        "Checkpoint: STUCK WORKERS: {:?} (these workers never reached pause point)",
-                        unpaused_workers
-                    );
+                    eprintln!("Checkpoint: STUCK WORKERS: {:?}", unpaused_workers);
+                    // Detailed per-worker status
+                    for worker_id in &unpaused_workers {
+                        eprintln!(
+                            "  Worker {}: not at pause point (may be blocked on lock contention)",
+                            worker_id
+                        );
+                    }
                 }
-                eprintln!("Checkpoint: skipping this checkpoint, will retry at next interval");
-                return false;
+                return Some(false);
             }
 
             let paused = self.paused_workers.load(Ordering::Acquire);
@@ -346,12 +409,14 @@ impl PauseController {
             // Debug: log progress every 5 seconds
             iterations += 1;
             if iterations % 5000 == 0 {
+                let unpaused_workers = self.get_unpaused_workers();
                 eprintln!(
-                    "Checkpoint: waiting for quiescence: paused={}/{}, active={}, elapsed={:.1}s",
+                    "Checkpoint: waiting for quiescence: paused={}/{}, active={}, elapsed={:.1}s, stuck_workers={:?}",
                     paused,
                     live,
                     active,
-                    start.elapsed().as_secs_f64()
+                    start.elapsed().as_secs_f64(),
+                    unpaused_workers
                 );
             }
 
@@ -363,7 +428,7 @@ impl PauseController {
                     active,
                     start.elapsed().as_secs_f64()
                 );
-                return true;
+                return Some(true);
             }
             std::thread::sleep(Duration::from_millis(1));
         }

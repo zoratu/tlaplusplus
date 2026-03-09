@@ -79,3 +79,10 @@ path = "fuzz_targets/fuzz_checkpoint_quiescence.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_quiescence_timeout"
+path = "fuzz_targets/fuzz_quiescence_timeout.rs"
+test = false
+doc = false
+bench = false

@@ -230,7 +230,15 @@ impl AutoSwitchingFingerprintStore {
                 }
                 attempts += 1;
                 if attempts > 10 {
-                    // Can't acquire lock and switch is pending
+                    // Log diagnostic when exceeding initial threshold
+                    eprintln!(
+                        "auto_switch: try_read exceeded 10 attempts (now {}), switch_pending={}",
+                        attempts,
+                        self.switch_pending.load(Ordering::Relaxed)
+                    );
+                }
+                if attempts > 20 {
+                    // Can't acquire lock and switch is pending (~2ms window)
                     // Return true (exists) to let worker proceed quickly
                     self.stats.hits.fetch_add(1, Ordering::Relaxed);
                     return true;
@@ -319,7 +327,16 @@ impl AutoSwitchingFingerprintStore {
                 }
                 attempts += 1;
                 if attempts > 10 {
-                    // Can't acquire lock within ~1ms and switch is pending
+                    // Log diagnostic when exceeding initial threshold
+                    eprintln!(
+                        "auto_switch: batch try_read exceeded 10 attempts (now {}), switch_pending={}, batch_size={}",
+                        attempts,
+                        self.switch_pending.load(Ordering::Relaxed),
+                        fps.len()
+                    );
+                }
+                if attempts > 20 {
+                    // Can't acquire lock within ~2ms and switch is pending
                     // Mark all fingerprints as "seen" (duplicates) so worker can proceed
                     // This allows worker to reach pause point for checkpoint quiescence
                     for s in seen.iter_mut() {
