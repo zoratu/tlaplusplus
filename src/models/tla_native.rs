@@ -4,8 +4,9 @@ use crate::symmetry::{SymmetrySpec, canonicalize_tla_state};
 use crate::tla::{
     ClauseKind, CompiledActionIr, CompiledExpr, ConfigValue, EvalContext, TemporalFormula,
     TlaConfig, TlaDefinition, TlaModule, TlaState, TlaValue, classify_clause, compile_action_ir,
-    compile_expr, eval_action_constraint, eval_compiled, eval_expr, evaluate_next_states,
-    evaluate_next_states_labeled, insert_compiled_action, looks_like_action, parse_tla_config,
+    compile_expr, eval_action_constraint, eval_compiled, eval_expr,
+    evaluate_next_states_with_instances, evaluate_next_states_labeled_with_instances,
+    insert_compiled_action, looks_like_action, parse_tla_config,
     parse_tla_module_file, split_top_level,
 };
 use anyhow::{Context, Result, anyhow};
@@ -164,8 +165,19 @@ impl Model for TlaModel {
             .get(&self.next_name)
             .unwrap_or_else(|| panic!("missing Next definition '{}'", self.next_name));
 
-        let states = evaluate_next_states(&next_def.body, &self.module.definitions, state)
-            .unwrap_or_else(|err| panic!("native next-state evaluation failed: {err}"));
+        let instances = if self.module.instances.is_empty() {
+            None
+        } else {
+            Some(&self.module.instances)
+        };
+
+        let states = evaluate_next_states_with_instances(
+            &next_def.body,
+            &self.module.definitions,
+            instances,
+            state,
+        )
+        .unwrap_or_else(|err| panic!("native next-state evaluation failed: {err}"));
         out.extend(states);
     }
 
@@ -339,10 +351,17 @@ impl Model for TlaModel {
 
         let next_def = self.module.definitions.get(&self.next_name)?;
 
-        match evaluate_next_states_labeled(
+        let instances = if self.module.instances.is_empty() {
+            None
+        } else {
+            Some(&self.module.instances)
+        };
+
+        match evaluate_next_states_labeled_with_instances(
             &next_def.body,
             &self.next_name,
             &self.module.definitions,
+            instances,
             state,
         ) {
             Ok(transitions) => {
@@ -404,10 +423,17 @@ impl TlaModel {
             .get(&self.next_name)
             .ok_or_else(|| format!("missing Next definition '{}'", self.next_name))?;
 
-        evaluate_next_states_labeled(
+        let instances = if self.module.instances.is_empty() {
+            None
+        } else {
+            Some(&self.module.instances)
+        };
+
+        evaluate_next_states_labeled_with_instances(
             &next_def.body,
             &self.next_name,
             &self.module.definitions,
+            instances,
             state,
         )
         .map_err(|e| format!("labeled next-state evaluation failed: {}", e))

@@ -3,6 +3,7 @@ use crate::tla::{
     CompiledActionIr, EvalContext, TlaDefinition, TlaState, TlaValue,
     apply_compiled_action_ir_multi, compile_action_ir, eval_expr, split_top_level,
 };
+use crate::tla::module::TlaModuleInstance;
 use anyhow::{Result, anyhow};
 use dashmap::DashMap;
 use std::cell::RefCell;
@@ -68,6 +69,15 @@ pub fn probe_next_disjuncts(
     definitions: &BTreeMap<String, TlaDefinition>,
     state: &TlaState,
 ) -> NextBranchProbe {
+    probe_next_disjuncts_with_instances(next_body, definitions, None, state)
+}
+
+pub fn probe_next_disjuncts_with_instances(
+    next_body: &str,
+    definitions: &BTreeMap<String, TlaDefinition>,
+    instances: Option<&BTreeMap<String, TlaModuleInstance>>,
+    state: &TlaState,
+) -> NextBranchProbe {
     let disjuncts = split_top_level(next_body, "\\/");
     let mut probe = NextBranchProbe {
         total_disjuncts: disjuncts.len(),
@@ -75,7 +85,7 @@ pub fn probe_next_disjuncts(
     };
 
     for disj in disjuncts {
-        match execute_branch(disj.trim(), &BTreeMap::new(), definitions, state) {
+        match execute_branch(disj.trim(), &BTreeMap::new(), definitions, instances, state) {
             Ok(successors) => {
                 probe.supported_disjuncts += 1;
                 probe.generated_successors += successors.len();
@@ -95,10 +105,20 @@ pub fn evaluate_next_states(
     definitions: &BTreeMap<String, TlaDefinition>,
     state: &TlaState,
 ) -> Result<Vec<TlaState>> {
+    evaluate_next_states_with_instances(next_body, definitions, None, state)
+}
+
+/// Evaluate next states with module instances context
+pub fn evaluate_next_states_with_instances(
+    next_body: &str,
+    definitions: &BTreeMap<String, TlaDefinition>,
+    instances: Option<&BTreeMap<String, TlaModuleInstance>>,
+    state: &TlaState,
+) -> Result<Vec<TlaState>> {
     let disjuncts = split_top_level(next_body, "\\/");
     let mut out = Vec::new();
     for disj in disjuncts {
-        let successors = execute_branch(disj.trim(), &BTreeMap::new(), definitions, state)?;
+        let successors = execute_branch(disj.trim(), &BTreeMap::new(), definitions, instances, state)?;
         out.extend(successors);
     }
     Ok(out)
@@ -114,11 +134,22 @@ pub fn evaluate_next_states_labeled(
     definitions: &BTreeMap<String, TlaDefinition>,
     state: &TlaState,
 ) -> Result<Vec<LabeledTransition<TlaState>>> {
+    evaluate_next_states_labeled_with_instances(next_body, next_name, definitions, None, state)
+}
+
+/// Evaluate next states with action labels and module instances context
+pub fn evaluate_next_states_labeled_with_instances(
+    next_body: &str,
+    next_name: &str,
+    definitions: &BTreeMap<String, TlaDefinition>,
+    instances: Option<&BTreeMap<String, TlaModuleInstance>>,
+    state: &TlaState,
+) -> Result<Vec<LabeledTransition<TlaState>>> {
     let disjuncts = split_top_level(next_body, "\\/");
     let mut out = Vec::new();
 
     for (disjunct_idx, disj) in disjuncts.iter().enumerate() {
-        let successors = execute_branch(disj.trim(), &BTreeMap::new(), definitions, state)?;
+        let successors = execute_branch(disj.trim(), &BTreeMap::new(), definitions, instances, state)?;
 
         // Extract action name from disjunct (e.g., "SendMsg(m)" -> "SendMsg")
         let action_name = extract_action_name(disj.trim()).unwrap_or_else(|| next_name.to_string());
@@ -165,6 +196,7 @@ fn execute_branch(
     expr: &str,
     locals: &BTreeMap<String, TlaValue>,
     definitions: &BTreeMap<String, TlaDefinition>,
+    instances: Option<&BTreeMap<String, TlaModuleInstance>>,
     state: &TlaState,
 ) -> Result<Vec<TlaState>> {
     let trimmed = strip_outer_parens(expr.trim());
@@ -186,7 +218,7 @@ fn execute_branch(
             for disj in disjuncts {
                 let disj_trimmed = disj.trim();
                 if !disj_trimmed.is_empty() {
-                    let successors = execute_branch(disj_trimmed, locals, definitions, state)?;
+                    let successors = execute_branch(disj_trimmed, locals, definitions, instances, state)?;
                     out.extend(successors);
                 }
             }
@@ -196,7 +228,7 @@ fn execute_branch(
     }
 
     if let Some(after_exists) = trimmed.strip_prefix("\\E") {
-        return execute_exists_branch(after_exists.trim_start(), locals, definitions, state);
+        return execute_exists_branch(after_exists.trim_start(), locals, definitions, instances, state);
     }
 
     // Try to parse as an action call
@@ -212,7 +244,11 @@ fn execute_branch(
             ));
         }
 
-        let mut ctx = EvalContext::with_definitions(state, definitions);
+        let mut ctx = if let Some(inst) = instances {
+            EvalContext::with_definitions_and_instances(state, definitions, inst)
+        } else {
+            EvalContext::with_definitions(state, definitions)
+        };
         {
             let locals_mut = std::rc::Rc::make_mut(&mut ctx.locals);
             for (k, v) in locals {
@@ -244,7 +280,11 @@ fn execute_branch(
         is_recursive: false,
     };
 
-    let mut ctx = EvalContext::with_definitions(state, definitions);
+    let mut ctx = if let Some(inst) = instances {
+        EvalContext::with_definitions_and_instances(state, definitions, inst)
+    } else {
+        EvalContext::with_definitions(state, definitions)
+    };
     {
         let locals_mut = std::rc::Rc::make_mut(&mut ctx.locals);
         for (k, v) in locals {
@@ -261,6 +301,7 @@ fn execute_exists_branch(
     expr: &str,
     locals: &BTreeMap<String, TlaValue>,
     definitions: &BTreeMap<String, TlaDefinition>,
+    instances: Option<&BTreeMap<String, TlaModuleInstance>>,
     state: &TlaState,
 ) -> Result<Vec<TlaState>> {
     let colon_idx = find_top_level_char(expr, ':')
@@ -268,7 +309,7 @@ fn execute_exists_branch(
 
     let binder_text = expr[..colon_idx].trim();
     let body = expr[colon_idx + 1..].trim();
-    let binders = parse_binders(binder_text, locals, definitions, state)?;
+    let binders = parse_binders(binder_text, locals, definitions, instances, state)?;
 
     let mut out = Vec::new();
     let mut assignments = locals.clone();
@@ -278,6 +319,7 @@ fn execute_exists_branch(
         body,
         &mut assignments,
         definitions,
+        instances,
         state,
         &mut out,
     )?;
@@ -291,11 +333,12 @@ fn expand_binders(
     body: &str,
     assignments: &mut BTreeMap<String, TlaValue>,
     definitions: &BTreeMap<String, TlaDefinition>,
+    instances: Option<&BTreeMap<String, TlaModuleInstance>>,
     state: &TlaState,
     out: &mut Vec<TlaState>,
 ) -> Result<()> {
     if idx >= binders.len() {
-        let successors = execute_branch(body, assignments, definitions, state)?;
+        let successors = execute_branch(body, assignments, definitions, instances, state)?;
         out.extend(successors);
         return Ok(());
     }
@@ -303,7 +346,7 @@ fn expand_binders(
     let (name, values) = &binders[idx];
     for value in values {
         assignments.insert(name.clone(), value.clone());
-        expand_binders(idx + 1, binders, body, assignments, definitions, state, out)?;
+        expand_binders(idx + 1, binders, body, assignments, definitions, instances, state, out)?;
     }
     assignments.remove(name);
 
@@ -314,6 +357,7 @@ fn parse_binders(
     expr: &str,
     locals: &BTreeMap<String, TlaValue>,
     definitions: &BTreeMap<String, TlaDefinition>,
+    instances: Option<&BTreeMap<String, TlaModuleInstance>>,
     state: &TlaState,
 ) -> Result<Vec<(String, Vec<TlaValue>)>> {
     let mut binders: Vec<(String, Vec<TlaValue>)> = Vec::new();
@@ -342,7 +386,11 @@ fn parse_binders(
             None => (after_in, ""),
         };
 
-        let mut ctx = EvalContext::with_definitions(state, definitions);
+        let mut ctx = if let Some(inst) = instances {
+            EvalContext::with_definitions_and_instances(state, definitions, inst)
+        } else {
+            EvalContext::with_definitions(state, definitions)
+        };
         {
             let locals_mut = std::rc::Rc::make_mut(&mut ctx.locals);
             for (k, v) in locals {

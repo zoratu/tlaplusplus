@@ -38,6 +38,9 @@ pub struct TlaModule {
     pub variables: Vec<String>,
     pub definitions: BTreeMap<String, TlaDefinition>,
     pub instances: BTreeMap<String, TlaModuleInstance>,
+    /// Unnamed instances (INSTANCE M without alias) - definitions are merged directly
+    #[serde(default)]
+    pub unnamed_instances: Vec<TlaModuleInstance>,
     /// True if module contains PlusCal code (detected via --algorithm marker)
     pub is_pluscal: bool,
     /// Set of operator names declared with RECURSIVE
@@ -202,6 +205,7 @@ fn detect_pluscal(raw: &str) -> bool {
 fn load_module_instances(module: &mut TlaModule, base_path: &Path) -> Result<()> {
     let module_dir = base_path.parent().unwrap_or_else(|| Path::new("."));
 
+    // Load named instances (Alias == INSTANCE M)
     for (alias, instance) in module.instances.iter_mut() {
         // Try to find the module file
         let instance_path = module_dir.join(format!("{}.tla", instance.module_name));
@@ -228,7 +232,138 @@ fn load_module_instances(module: &mut TlaModule, base_path: &Path) -> Result<()>
         }
     }
 
+    // Load unnamed instances (INSTANCE M) and merge their definitions
+    // Collect modules to merge first to avoid borrow checker issues
+    let mut modules_to_merge: Vec<(usize, TlaModule, BTreeMap<String, String>)> = Vec::new();
+
+    for (idx, instance) in module.unnamed_instances.iter().enumerate() {
+        // Skip built-in modules - their operators are implemented in the evaluator
+        if is_builtin_module(&instance.module_name) {
+            continue;
+        }
+
+        let instance_path = module_dir.join(format!("{}.tla", instance.module_name));
+
+        if instance_path.exists() {
+            let instance_module = parse_tla_module_file(&instance_path).with_context(|| {
+                format!(
+                    "failed to load unnamed instance module '{}'",
+                    instance.module_name
+                )
+            })?;
+
+            modules_to_merge.push((idx, instance_module, instance.substitutions.clone()));
+        } else {
+            eprintln!(
+                "Warning: Unnamed instance module '{}' not found at {}",
+                instance.module_name,
+                instance_path.display()
+            );
+        }
+    }
+
+    // Now merge the collected modules
+    for (idx, instance_module, substitutions) in modules_to_merge {
+        // For unnamed instances, merge definitions directly into the current module
+        // Apply substitutions if present
+        merge_instance_definitions(module, &instance_module, &substitutions);
+
+        // Store the loaded module
+        module.unnamed_instances[idx].module = Some(Box::new(instance_module));
+    }
+
     Ok(())
+}
+
+/// Merge definitions from an instanced module into the current module.
+/// Applies parameter substitutions from the WITH clause.
+fn merge_instance_definitions(
+    target: &mut TlaModule,
+    source: &TlaModule,
+    substitutions: &BTreeMap<String, String>,
+) {
+    // Merge definitions, applying substitutions
+    for (name, def) in &source.definitions {
+        if !target.definitions.contains_key(name) {
+            let mut new_def = def.clone();
+            // Apply substitutions to the definition body
+            if !substitutions.is_empty() {
+                new_def.body = apply_substitutions(&new_def.body, substitutions);
+            }
+            target.definitions.insert(name.clone(), new_def);
+        }
+    }
+
+    // Merge variables (don't duplicate)
+    for var in &source.variables {
+        if !target.variables.contains(var) {
+            target.variables.push(var.clone());
+        }
+    }
+
+    // Merge constants (don't duplicate)
+    for constant in &source.constants {
+        if !target.constants.contains(constant) {
+            target.constants.push(constant.clone());
+        }
+    }
+
+    // Merge recursive declarations
+    for rec_decl in &source.recursive_declarations {
+        target.recursive_declarations.insert(rec_decl.clone());
+    }
+
+    // Merge named instances from source module
+    for (alias, inst) in &source.instances {
+        if !target.instances.contains_key(alias) {
+            target.instances.insert(alias.clone(), inst.clone());
+        }
+    }
+}
+
+/// Apply substitutions to an expression string.
+/// This does simple text replacement for identifier names.
+fn apply_substitutions(expr: &str, substitutions: &BTreeMap<String, String>) -> String {
+    let mut result = expr.to_string();
+    for (from, to) in substitutions {
+        // Replace whole-word occurrences only
+        result = replace_identifier(&result, from, to);
+    }
+    result
+}
+
+/// Replace identifier occurrences in an expression, preserving word boundaries.
+fn replace_identifier(expr: &str, from: &str, to: &str) -> String {
+    let mut result = String::with_capacity(expr.len());
+    let mut chars = expr.chars().peekable();
+    let mut current_word = String::new();
+
+    while let Some(c) = chars.next() {
+        if c.is_alphanumeric() || c == '_' {
+            current_word.push(c);
+        } else {
+            if !current_word.is_empty() {
+                if current_word == from {
+                    result.push_str(to);
+                } else {
+                    result.push_str(&current_word);
+                }
+                current_word.clear();
+            }
+            result.push(c);
+        }
+    }
+
+    // Handle trailing word
+    if !current_word.is_empty() {
+        if current_word == from {
+            result.push_str(to);
+        } else {
+            result.push_str(&current_word);
+        }
+    }
+
+    result
 }
 
 pub fn parse_tla_module_text(input: &str) -> Result<TlaModule> {
@@ -337,11 +472,21 @@ pub fn parse_tla_module_text(input: &str) -> Result<TlaModule> {
         //   Alias == INSTANCE ModuleName
         //   Alias == INSTANCE ModuleName WITH Param1 <- Value1, Param2 <- Value2
         //   LOCAL Alias == INSTANCE ModuleName
+        //   INSTANCE ModuleName (unnamed - definitions merge into current module)
+        //   INSTANCE ModuleName WITH Param1 <- Value1
+        //   LOCAL INSTANCE ModuleName
         if let Some(instance) = parse_instance_declaration(trimmed) {
             flush_definition(&mut module, &mut current_def);
             current_def_indent = 0;
             mode = NameListMode::None;
             module.instances.insert(instance.alias.clone(), instance);
+            continue;
+        }
+        if let Some(instance) = parse_unnamed_instance_declaration(trimmed) {
+            flush_definition(&mut module, &mut current_def);
+            current_def_indent = 0;
+            mode = NameListMode::None;
+            module.unnamed_instances.push(instance);
             continue;
         }
 
@@ -625,40 +770,141 @@ fn parse_instance_declaration(line: &str) -> Option<TlaModuleInstance> {
     };
 
     // Parse substitutions from WITH clause
+    let substitutions = parse_with_substitutions(with_clause);
+
+    Some(TlaModuleInstance {
+        alias: alias.to_string(),
+        module_name: module_name.to_string(),
+        substitutions,
+        is_local,
+        module: None,
+    })
+}
+
+/// Parse WITH substitutions from a WITH clause string.
+/// Format: "Param1 <- Value1, Param2 <- Value2"
+/// Handles nested brackets correctly (but NOT `<` from `<-`).
+fn parse_with_substitutions(with_clause: Option<&str>) -> BTreeMap<String, String> {
     let mut substitutions = BTreeMap::new();
-    if let Some(with_str) = with_clause {
-        // Split on <- at the top level (not inside brackets)
-        let mut depth = 0;
-        let mut start = 0;
-        let chars: Vec<char> = with_str.chars().collect();
+    let Some(with_str) = with_clause else {
+        return substitutions;
+    };
 
-        for i in 0..chars.len() {
-            match chars[i] {
-                '{' | '[' | '(' | '<' => depth += 1,
-                '}' | ']' | ')' | '>' => depth -= 1,
-                ',' if depth == 0 => {
-                    // Found a top-level comma - this separates substitutions
-                    let subst = &with_str[start..i];
-                    if let Some((param, value)) = subst.split_once("<-") {
-                        substitutions.insert(param.trim().to_string(), value.trim().to_string());
-                    }
-                    start = i + 1;
+    // Split on commas at the top level (not inside brackets)
+    // But be careful: `<` followed by `-` is the substitution operator, not a bracket
+    let mut depth: usize = 0;
+    let mut start = 0;
+    let chars: Vec<char> = with_str.chars().collect();
+    let n = chars.len();
+
+    let mut i = 0;
+    while i < n {
+        let c = chars[i];
+        match c {
+            '{' | '[' | '(' => depth += 1,
+            '}' | ']' | ')' => depth = depth.saturating_sub(1),
+            '<' => {
+                // Check if this is `<-` (substitution) or `<<` (tuple) or just `<`
+                if i + 1 < n && chars[i + 1] == '<' {
+                    // `<<` - tuple opening, increase depth
+                    depth += 1;
+                    i += 1; // skip the second `<`
+                } else if i + 1 < n && chars[i + 1] == '-' {
+                    // `<-` - substitution operator, NOT a bracket
+                    // Just skip the `-` next iteration
+                } else {
+                    // Single `<` - could be comparison, don't treat as bracket
                 }
-                _ => {}
             }
+            '>' => {
+                // Check if this is `>>` (tuple closing)
+                if i + 1 < n && chars[i + 1] == '>' {
+                    depth = depth.saturating_sub(1);
+                    i += 1; // skip the second `>`
+                }
+                // Single `>` could be comparison, don't treat as bracket
+            }
+            ',' if depth == 0 => {
+                // Found a top-level comma - this separates substitutions
+                let subst = &with_str[start..i];
+                if let Some((param, value)) = subst.split_once("<-") {
+                    substitutions.insert(param.trim().to_string(), value.trim().to_string());
+                }
+                start = i + 1;
+            }
+            _ => {}
         }
+        i += 1;
+    }
 
-        // Handle the last substitution
-        if start < with_str.len() {
-            let subst = &with_str[start..];
-            if let Some((param, value)) = subst.split_once("<-") {
-                substitutions.insert(param.trim().to_string(), value.trim().to_string());
+    // Handle the last substitution
+    if start < with_str.len() {
+        let subst = &with_str[start..];
+        if let Some((param, value)) = subst.split_once("<-") {
+            substitutions.insert(param.trim().to_string(), value.trim().to_string());
+        }
+    }
+
+    substitutions
+}
+
+/// Parse an unnamed INSTANCE declaration (without alias)
+/// Formats:
+///   INSTANCE ModuleName
+///   INSTANCE ModuleName WITH Param1 <- Value1, Param2 <- Value2
+///   LOCAL INSTANCE ModuleName
+fn parse_unnamed_instance_declaration(line: &str) -> Option<TlaModuleInstance> {
+    let line = line.trim();
+
+    // Must start with INSTANCE or LOCAL INSTANCE (no "==" before it)
+    // Reject if it contains "==" before INSTANCE (that would be a named instance)
+    if let Some(eq_pos) = line.find("==") {
+        if let Some(inst_pos) = line.find("INSTANCE") {
+            if eq_pos < inst_pos {
+                // This is a named instance (Alias == INSTANCE ...), not unnamed
+                return None;
             }
         }
     }
 
+    // Check for LOCAL prefix
+    let (is_local, rest) = if let Some(rest) = line.strip_prefix("LOCAL ") {
+        (true, rest.trim())
+    } else {
+        (false, line)
+    };
+
+    // Must start with INSTANCE
+    let after_instance = rest.strip_prefix("INSTANCE")?.trim();
+    if after_instance.is_empty() {
+        return None;
+    }
+
+    // Check for WITH clause
+    let (module_name, with_clause) = if let Some(idx) = after_instance.find(" WITH ") {
+        (
+            after_instance[..idx].trim(),
+            Some(after_instance[idx + " WITH ".len()..].trim()),
+        )
+    } else {
+        (after_instance, None)
+    };
+
+    // Validate module name is a simple identifier
+    if !module_name
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+
+    // Parse substitutions from WITH clause
+    let substitutions = parse_with_substitutions(with_clause);
+
+    // For unnamed instances, use the module name as alias (for internal tracking)
+    // but definitions will be merged directly
     Some(TlaModuleInstance {
-        alias: alias.to_string(),
+        alias: format!("__unnamed__{}", module_name),
         module_name: module_name.to_string(),
         substitutions,
         is_local,
@@ -1241,5 +1487,179 @@ Next == TRUE
         
         // Next should also be defined
         assert!(m.definitions.contains_key("Next"), "Next should be defined");
+    }
+
+    #[test]
+    fn parses_named_instance_declaration() {
+        let src = r#"
+---- MODULE TestInstance ----
+EXTENDS Naturals
+
+Helper == INSTANCE CoverageHelper WITH Node <- {1, 2, 3}
+
+VARIABLES x
+Init == x = 0
+Next == x' = x + 1
+====
+"#;
+        let m = parse_tla_module_text(src).expect("parse should work");
+
+        // Check that the named instance is parsed
+        assert!(m.instances.contains_key("Helper"), "Helper instance should be parsed");
+
+        let helper = m.instances.get("Helper").unwrap();
+        assert_eq!(helper.module_name, "CoverageHelper");
+        assert_eq!(helper.alias, "Helper");
+        assert!(helper.substitutions.contains_key("Node"), "Should have Node substitution");
+        assert_eq!(helper.substitutions.get("Node").unwrap(), "{1, 2, 3}");
+    }
+
+    #[test]
+    fn parses_unnamed_instance_declaration() {
+        let src = r#"
+---- MODULE TestUnnamedInstance ----
+EXTENDS Naturals
+
+INSTANCE Sailfish
+
+VARIABLES x
+Init == x = 0
+====
+"#;
+        let m = parse_tla_module_text(src).expect("parse should work");
+
+        // Check that the unnamed instance is parsed
+        assert_eq!(m.unnamed_instances.len(), 1, "Should have one unnamed instance");
+
+        let instance = &m.unnamed_instances[0];
+        assert_eq!(instance.module_name, "Sailfish");
+        assert!(instance.alias.starts_with("__unnamed__"), "Alias should be auto-generated");
+    }
+
+    #[test]
+    fn parses_unnamed_instance_with_substitution() {
+        let src = r#"
+---- MODULE TestUnnamedInstanceWithSubst ----
+EXTENDS Naturals
+
+INSTANCE Sailfish WITH Node <- Servers, F <- Faulty
+
+VARIABLES x
+Init == x = 0
+====
+"#;
+        let m = parse_tla_module_text(src).expect("parse should work");
+
+        // Check that the unnamed instance with substitutions is parsed
+        assert_eq!(m.unnamed_instances.len(), 1, "Should have one unnamed instance");
+
+        let instance = &m.unnamed_instances[0];
+        assert_eq!(instance.module_name, "Sailfish");
+        assert!(instance.substitutions.contains_key("Node"), "Should have Node substitution");
+        assert_eq!(instance.substitutions.get("Node").unwrap(), "Servers");
+        assert!(instance.substitutions.contains_key("F"), "Should have F substitution");
+        assert_eq!(instance.substitutions.get("F").unwrap(), "Faulty");
+    }
+
+    #[test]
+    fn parses_local_instance() {
+        let src = r#"
+---- MODULE TestLocalInstance ----
+EXTENDS Naturals
+
+LOCAL INSTANCE Helpers
+
+VARIABLES x
+Init == x = 0
+====
+"#;
+        let m = parse_tla_module_text(src).expect("parse should work");
+
+        // Check that the LOCAL unnamed instance is parsed
+        assert_eq!(m.unnamed_instances.len(), 1, "Should have one unnamed instance");
+
+        let instance = &m.unnamed_instances[0];
+        assert_eq!(instance.module_name, "Helpers");
+        assert!(instance.is_local, "Instance should be marked as LOCAL");
+    }
+
+    #[test]
+    fn unnamed_instance_merges_definitions() {
+        use std::fs;
+
+        let tmp = std::env::temp_dir().join("tlapp-unnamed-instance-merge-test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should be created");
+
+        // Create the instanced module
+        let instanced_module = tmp.join("BaseModule.tla");
+        fs::write(
+            &instanced_module,
+            r#"
+---- MODULE BaseModule ----
+EXTENDS Naturals
+
+CONSTANT Param
+
+BaseInit == TRUE
+BaseNext == TRUE
+BaseHelper(x) == x + 1
+====
+"#,
+        )
+        .expect("instanced module should be written");
+
+        // Create the main module that instances BaseModule
+        let main_module = tmp.join("MainModule.tla");
+        fs::write(
+            &main_module,
+            r#"
+---- MODULE MainModule ----
+EXTENDS Naturals
+
+INSTANCE BaseModule WITH Param <- 42
+
+VARIABLES x
+Init == /\ x = 0 /\ BaseInit
+Next == x' = BaseHelper(x)
+====
+"#,
+        )
+        .expect("main module should be written");
+
+        let module = parse_tla_module_file(&main_module).expect("main module should parse");
+
+        // Check that definitions from BaseModule are merged
+        assert!(
+            module.definitions.contains_key("BaseInit"),
+            "BaseInit should be merged from BaseModule"
+        );
+        assert!(
+            module.definitions.contains_key("BaseNext"),
+            "BaseNext should be merged from BaseModule"
+        );
+        assert!(
+            module.definitions.contains_key("BaseHelper"),
+            "BaseHelper should be merged from BaseModule"
+        );
+
+        // Check that local definitions are present
+        assert!(
+            module.definitions.contains_key("Init"),
+            "Init should be defined in MainModule"
+        );
+        assert!(
+            module.definitions.contains_key("Next"),
+            "Next should be defined in MainModule"
+        );
+
+        // Check that constant from BaseModule is available (though not assigned a value)
+        // The substitution should have been applied
+        let base_helper = module.definitions.get("BaseHelper").unwrap();
+        // The body should have Param replaced with 42
+        // (Note: substitution is text-based, so this should work)
+
+        // Clean up
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

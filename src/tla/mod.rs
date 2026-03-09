@@ -12,7 +12,7 @@ pub mod value;
 
 pub use action_exec::{
     NextBranchProbe, evaluate_next_states, evaluate_next_states_labeled, insert_compiled_action,
-    probe_next_disjuncts,
+    probe_next_disjuncts, evaluate_next_states_with_instances, evaluate_next_states_labeled_with_instances,
 };
 pub use action_ir::{ActionClause, ActionIr, compile_action_ir, looks_like_action};
 pub use cfg::{ConfigValue, TlaConfig, parse_tla_config};
