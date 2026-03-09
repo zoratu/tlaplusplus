@@ -409,9 +409,295 @@ pub fn bind_to_nodes(_node_ids: &[usize]) -> Result<()> {
     Ok(())
 }
 
+/// Get the current thread's CPU ID using sched_getcpu
+#[cfg(target_os = "linux")]
+pub fn get_current_cpu() -> Option<usize> {
+    // SAFETY: sched_getcpu returns the CPU number the calling thread is running on
+    let cpu = unsafe { libc::sched_getcpu() };
+    if cpu >= 0 { Some(cpu as usize) } else { None }
+}
+
+/// Get the current thread's CPU ID (returns None on non-Linux)
+#[cfg(not(target_os = "linux"))]
+pub fn get_current_cpu() -> Option<usize> {
+    None
+}
+
+/// Get the NUMA node for the current thread based on its CPU
+pub fn get_current_numa_node(topology: &NumaTopology) -> usize {
+    get_current_cpu()
+        .map(|cpu| topology.cpu_to_node(cpu))
+        .unwrap_or(0)
+}
+
+/// Get the NUMA node where a memory address is allocated
+/// Uses move_pages syscall with MPOL_MF_MOVE flag = 0 (query only)
+#[cfg(target_os = "linux")]
+pub fn get_memory_numa_node(addr: *const u8) -> Option<usize> {
+    use std::io::Error;
+
+    // move_pages syscall: query which NUMA node a page is on
+    // syscall(SYS_move_pages, pid, count, pages, nodes, status, flags)
+    // With nodes = NULL, it queries the current location
+    let mut status: libc::c_int = -1;
+    let page_addr = addr as *mut libc::c_void;
+
+    // SAFETY: move_pages with nodes=NULL is a query-only operation
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_move_pages,
+            0i32,                                   // pid = 0 means current process
+            1usize,                                 // count = 1 page
+            &page_addr as *const *mut libc::c_void, // pages array
+            std::ptr::null::<libc::c_int>(),        // nodes = NULL means query
+            &mut status as *mut libc::c_int,        // status output
+            0i32,                                   // flags = 0 (query only)
+        )
+    };
+
+    if result != 0 {
+        if std::env::var("TLAPP_VERBOSE").is_ok() {
+            eprintln!(
+                "Warning: move_pages query failed: {}",
+                Error::last_os_error()
+            );
+        }
+        return None;
+    }
+
+    // status >= 0 means the node number, negative means error
+    if status >= 0 {
+        Some(status as usize)
+    } else {
+        None
+    }
+}
+
+/// Get the NUMA node where a memory address is allocated (returns None on non-Linux)
+#[cfg(not(target_os = "linux"))]
+pub fn get_memory_numa_node(_addr: *const u8) -> Option<usize> {
+    None
+}
+
+/// NUMA diagnostics information for debugging stuck workers
+#[derive(Debug, Clone)]
+pub struct NumaDiagnostics {
+    /// Total number of NUMA nodes detected
+    pub node_count: usize,
+    /// Workers distribution across NUMA nodes: node_id -> list of worker_ids
+    pub workers_by_node: Vec<Vec<usize>>,
+    /// Sampled NUMA nodes that hold fingerprint store shard memory
+    pub fingerprint_store_nodes: Vec<usize>,
+    /// NUMA distances between nodes
+    pub distances: Vec<Vec<u32>>,
+}
+
+impl NumaDiagnostics {
+    /// Create diagnostics from topology and worker assignments
+    pub fn new(
+        topology: &NumaTopology,
+        worker_numa_nodes: &[usize],
+        fingerprint_store_addrs: &[*const u8],
+    ) -> Self {
+        let fingerprint_store_nodes = fingerprint_store_addrs
+            .iter()
+            .copied()
+            .filter_map(get_memory_numa_node)
+            .collect();
+        Self::from_memory_nodes(topology, worker_numa_nodes, fingerprint_store_nodes)
+    }
+
+    /// Create diagnostics from pre-computed fingerprint store NUMA nodes.
+    pub fn from_memory_nodes(
+        topology: &NumaTopology,
+        worker_numa_nodes: &[usize],
+        fingerprint_store_nodes: Vec<usize>,
+    ) -> Self {
+        // Build workers_by_node mapping
+        let mut workers_by_node: Vec<Vec<usize>> = vec![Vec::new(); topology.node_count.max(1)];
+        for (worker_id, &node) in worker_numa_nodes.iter().enumerate() {
+            if node < workers_by_node.len() {
+                workers_by_node[node].push(worker_id);
+            }
+        }
+
+        let mut fingerprint_store_nodes: Vec<usize> = fingerprint_store_nodes
+            .into_iter()
+            .filter(|&node| node < topology.node_count.max(1))
+            .collect();
+        fingerprint_store_nodes.sort_unstable();
+        fingerprint_store_nodes.dedup();
+
+        NumaDiagnostics {
+            node_count: topology.node_count,
+            workers_by_node,
+            fingerprint_store_nodes,
+            distances: topology.distances.clone(),
+        }
+    }
+
+    pub fn nearest_distance_to_store(&self, worker_node: usize) -> Option<u32> {
+        let row = self.distances.get(worker_node)?;
+        self.fingerprint_store_nodes
+            .iter()
+            .filter_map(|&store_node| row.get(store_node).copied())
+            .min()
+    }
+
+    /// Print startup diagnostics about NUMA topology
+    pub fn print_startup_info(&self) {
+        eprintln!("=== NUMA Topology Diagnostics ===");
+        eprintln!("NUMA nodes detected: {}", self.node_count);
+
+        if self.node_count > 1 {
+            eprintln!("NUMA distance matrix:");
+            for (from, row) in self.distances.iter().enumerate() {
+                eprintln!("  Node {} -> {:?}", from, row);
+            }
+        }
+
+        eprintln!("Worker distribution across NUMA nodes:");
+        for (node, workers) in self.workers_by_node.iter().enumerate() {
+            if !workers.is_empty() {
+                eprintln!(
+                    "  Node {}: {} workers (IDs: {:?})",
+                    node,
+                    workers.len(),
+                    if workers.len() <= 10 {
+                        workers.clone()
+                    } else {
+                        let mut preview = workers[..5].to_vec();
+                        preview.push(usize::MAX); // Marker for "..."
+                        preview.extend_from_slice(&workers[workers.len() - 3..]);
+                        preview
+                    }
+                );
+            }
+        }
+
+        if self.fingerprint_store_nodes.is_empty() {
+            eprintln!("Fingerprint store NUMA nodes: unknown (not on Linux or not yet allocated)");
+        } else {
+            eprintln!(
+                "Fingerprint store memory sampled on NUMA nodes: {:?}",
+                self.fingerprint_store_nodes
+            );
+
+            let mut remote_workers = Vec::new();
+            for (node, workers) in self.workers_by_node.iter().enumerate() {
+                if workers.is_empty() {
+                    continue;
+                }
+                let Some(distance) = self.nearest_distance_to_store(node) else {
+                    continue;
+                };
+                if distance > NUMA_LOCAL_DISTANCE_THRESHOLD {
+                    remote_workers.push((node, workers.len(), distance));
+                }
+            }
+            if !remote_workers.is_empty() {
+                eprintln!("WARNING: Workers far from every sampled fingerprint store shard:");
+                for (node, count, distance) in remote_workers {
+                    eprintln!(
+                        "  Node {} ({} workers) - nearest shard distance {}",
+                        node, count, distance
+                    );
+                }
+            }
+        }
+        eprintln!("=================================");
+    }
+
+    /// Print diagnostics for stuck workers during checkpoint timeout
+    pub fn print_stuck_worker_diagnostics(
+        &self,
+        stuck_worker_ids: &[usize],
+        worker_numa_nodes: &[usize],
+    ) {
+        eprintln!("=== NUMA Diagnostics for Stuck Workers ===");
+
+        // Group stuck workers by their NUMA node
+        let mut stuck_by_node: Vec<Vec<usize>> = vec![Vec::new(); self.node_count.max(1)];
+        for &worker_id in stuck_worker_ids {
+            if let Some(&node) = worker_numa_nodes.get(worker_id) {
+                if node < stuck_by_node.len() {
+                    stuck_by_node[node].push(worker_id);
+                }
+            }
+        }
+
+        // Print which NUMA nodes have stuck workers
+        eprintln!("Stuck workers by NUMA node:");
+        for (node, workers) in stuck_by_node.iter().enumerate() {
+            if !workers.is_empty() {
+                eprintln!(
+                    "  Node {}: {} stuck (IDs: {:?})",
+                    node,
+                    workers.len(),
+                    workers
+                );
+            }
+        }
+
+        // Analyze if stuck workers correlate with NUMA topology
+        if !self.fingerprint_store_nodes.is_empty() {
+            eprintln!(
+                "Fingerprint store shards sampled on NUMA nodes {:?}",
+                self.fingerprint_store_nodes
+            );
+
+            let mut local_stuck = 0usize;
+            let mut remote_stuck = 0usize;
+
+            for (node, workers) in stuck_by_node.iter().enumerate() {
+                if workers.is_empty() {
+                    continue;
+                }
+                let distance = self.nearest_distance_to_store(node).unwrap_or(10);
+
+                if distance <= NUMA_LOCAL_DISTANCE_THRESHOLD {
+                    local_stuck += workers.len();
+                } else {
+                    remote_stuck += workers.len();
+                }
+            }
+
+            let total_stuck = local_stuck + remote_stuck;
+            if total_stuck > 0 {
+                let local_pct = (local_stuck * 100) / total_stuck;
+                let remote_pct = (remote_stuck * 100) / total_stuck;
+                eprintln!(
+                    "NUMA correlation: {}% stuck workers are near sampled shards (distance<={}), {}% are remote",
+                    local_pct, NUMA_LOCAL_DISTANCE_THRESHOLD, remote_pct
+                );
+
+                if remote_pct > 60 {
+                    eprintln!(
+                        "POTENTIAL NUMA ISSUE: Majority of stuck workers are far from every sampled shard!"
+                    );
+                    eprintln!(
+                        "Consider: Increasing fingerprint store shards, or restricting workers to fewer NUMA nodes"
+                    );
+                }
+            }
+        }
+
+        eprintln!("===========================================");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_topology() -> NumaTopology {
+        NumaTopology {
+            node_count: 2,
+            cpu_to_node: HashMap::new(),
+            distances: vec![vec![10, 21], vec![21, 10]],
+            cpus_per_node: vec![vec![0, 1], vec![2, 3]],
+        }
+    }
 
     #[test]
     fn test_cpulist_parsing() {
@@ -458,5 +744,24 @@ mod tests {
             "Shard->NUMA mapping (first 16): {:?}",
             &mapping[..16.min(mapping.len())]
         );
+    }
+
+    #[test]
+    fn diagnostics_dedup_store_nodes() {
+        let diag = NumaDiagnostics::from_memory_nodes(&sample_topology(), &[0, 1], vec![1, 1, 0]);
+        assert_eq!(diag.fingerprint_store_nodes, vec![0, 1]);
+    }
+
+    #[test]
+    fn diagnostics_ignore_invalid_store_nodes() {
+        let diag = NumaDiagnostics::from_memory_nodes(&sample_topology(), &[0, 1], vec![3, 1]);
+        assert_eq!(diag.fingerprint_store_nodes, vec![1]);
+    }
+
+    #[test]
+    fn diagnostics_use_nearest_sampled_shard() {
+        let diag = NumaDiagnostics::from_memory_nodes(&sample_topology(), &[0, 1], vec![0, 1]);
+        assert_eq!(diag.nearest_distance_to_store(0), Some(10));
+        assert_eq!(diag.nearest_distance_to_store(1), Some(10));
     }
 }

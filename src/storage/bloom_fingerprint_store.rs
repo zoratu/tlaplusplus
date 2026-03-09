@@ -280,4 +280,9 @@ impl BloomFingerprintStore {
     pub fn persist_drops(&self) -> u64 {
         self.persist_drops.load(Ordering::Relaxed)
     }
+
+    /// Bloom filters do not expose stable shard sample addresses for NUMA diagnostics.
+    pub fn memory_base_addrs(&self) -> Vec<*const u8> {
+        Vec::new()
+    }
 }
