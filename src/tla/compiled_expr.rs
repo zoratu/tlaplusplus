@@ -323,6 +323,58 @@ impl Default for ExprCompiler {
     }
 }
 
+/// Parse a string literal from the start of an expression
+/// Returns (string_content, rest_of_expression) if successful
+fn parse_string_literal(expr: &str) -> Option<(String, &str)> {
+    if !expr.starts_with('"') {
+        return None;
+    }
+
+    let mut out = String::new();
+    let mut escaped = false;
+    let mut i = 1; // Skip opening quote
+
+    let bytes = expr.as_bytes();
+    while i < bytes.len() {
+        let ch = bytes[i] as char;
+
+        if escaped {
+            // Handle escape sequences
+            match ch {
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                'r' => out.push('\r'),
+                '\\' => out.push('\\'),
+                '"' => out.push('"'),
+                _ => {
+                    out.push('\\');
+                    out.push(ch);
+                }
+            }
+            escaped = false;
+            i += 1;
+            continue;
+        }
+
+        if ch == '\\' {
+            escaped = true;
+            i += 1;
+            continue;
+        }
+
+        if ch == '"' {
+            // Found closing quote
+            return Some((out, &expr[i + 1..]));
+        }
+
+        out.push(ch);
+        i += 1;
+    }
+
+    // Unterminated string
+    None
+}
+
 /// Compile a TLA+ expression string to a CompiledExpr
 pub fn compile_expr(expr: &str) -> CompiledExpr {
     let expr = expr.trim();
@@ -363,9 +415,15 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
         }
     }
 
-    // String literal
-    if expr.starts_with('"') && expr.ends_with('"') && expr.len() >= 2 {
-        return CompiledExpr::String(expr[1..expr.len() - 1].to_string());
+    // String literal - must properly parse to find the matching closing quote
+    // The naive check `starts_with('"') && ends_with('"')` is wrong because
+    // it matches expressions like `"hello" = "hello"` as a single string
+    if expr.starts_with('"') {
+        if let Some((string_content, rest)) = parse_string_literal(expr) {
+            if rest.is_empty() {
+                return CompiledExpr::String(string_content);
+            }
+        }
     }
 
     // Self-reference in EXCEPT (the @ operator)
