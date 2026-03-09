@@ -488,6 +488,15 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
         }
     }
 
+    // UNCHANGED in expression/guard context.
+    // When UNCHANGED appears inside a disjunction evaluated as a guard (e.g.,
+    // \/ Action1(self) \/ UNCHANGED vars), the action IR layer handles the
+    // actual variable-preservation semantics. In expression context, UNCHANGED
+    // represents an always-enabled stuttering step, so we compile it as TRUE.
+    if expr.starts_with("UNCHANGED ") || expr == "UNCHANGED" {
+        return CompiledExpr::Bool(true);
+    }
+
     // Logical operators (in precedence order)
 
     // Implication: =>
@@ -3093,4 +3102,38 @@ fn test_single_conjunct_with_leading_conjunction() {
         "Single disjunct should compile to the inner expression, got: {:?}",
         expr
     );
+}
+
+#[test]
+fn test_compile_unchanged_in_expression_context() {
+    // UNCHANGED should compile to Bool(true) in expression context
+    let expr = compile_expr("UNCHANGED x");
+    assert!(
+        matches!(expr, CompiledExpr::Bool(true)),
+        "UNCHANGED x should compile to Bool(true), got: {:?}",
+        expr
+    );
+
+    let expr = compile_expr("UNCHANGED <<x, y>>");
+    assert!(
+        matches!(expr, CompiledExpr::Bool(true)),
+        "UNCHANGED <<x, y>> should compile to Bool(true), got: {:?}",
+        expr
+    );
+
+    // UNCHANGED inside a disjunction should not cause errors
+    let expr = compile_expr("x > 0 \\/ UNCHANGED vars");
+    assert!(
+        matches!(expr, CompiledExpr::Or(_)),
+        "disjunction with UNCHANGED should compile to Or, got: {:?}",
+        expr
+    );
+    if let CompiledExpr::Or(parts) = &expr {
+        assert_eq!(parts.len(), 2);
+        assert!(
+            matches!(parts[1], CompiledExpr::Bool(true)),
+            "UNCHANGED disjunct should be Bool(true), got: {:?}",
+            parts[1]
+        );
+    }
 }
