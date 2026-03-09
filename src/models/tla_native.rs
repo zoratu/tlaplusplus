@@ -1897,4 +1897,141 @@ INVARIANT TypeOK
         // Clean up
         let _ = fs::remove_dir_all(&tmp);
     }
+
+    #[test]
+    fn test_init_membership_constraint() {
+        // Test that Init with membership constraints like `f \in [Proc -> Values]`
+        // correctly enumerates all possible initial states
+        let tmp = std::env::temp_dir().join("tlaplusplus_init_membership_test");
+        let _ = fs::create_dir_all(&tmp);
+
+        let module = tmp.join("MembershipInit.tla");
+        fs::write(
+            &module,
+            r#"
+---- MODULE MembershipInit ----
+EXTENDS Naturals
+
+CONSTANT Proc, Values
+
+VARIABLE f
+
+Init == f \in [Proc -> Values]
+
+Next == UNCHANGED f
+
+TypeOK == f \in [Proc -> Values]
+====
+"#,
+        )
+        .expect("module should be written");
+
+        let cfg = tmp.join("MembershipInit.cfg");
+        fs::write(
+            &cfg,
+            r#"
+CONSTANT Proc = {p1, p2}
+CONSTANT Values = {v1, v2}
+INIT Init
+NEXT Next
+INVARIANT TypeOK
+"#,
+        )
+        .expect("cfg should be written");
+
+        // Build model - should properly enumerate all functions in [Proc -> Values]
+        let model = TlaModel::from_files(&module, Some(&cfg), None, None)
+            .expect("model should build with Init membership constraint");
+
+        let init = model.initial_states();
+        // [Proc -> Values] with |Proc| = 2, |Values| = 2 should give 2^2 = 4 functions
+        assert_eq!(
+            init.len(),
+            4,
+            "Expected 4 initial states for [{{p1, p2}} -> {{v1, v2}}]"
+        );
+
+        // Each initial state should have a function f that is valid for the constraint
+        for state in &init {
+            let f = state.get("f").expect("f should be defined");
+            // f should be a Function
+            assert!(
+                matches!(f, TlaValue::Function(_)),
+                "f should be a function, got: {:?}",
+                f
+            );
+            // The function should have 2 keys (one for each element in Proc)
+            if let TlaValue::Function(func) = f {
+                assert_eq!(func.len(), 2, "function should map 2 domain elements");
+            }
+        }
+
+        // Clean up
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_init_mixed_equality_and_membership() {
+        // Test Init with both equality and membership constraints
+        let tmp = std::env::temp_dir().join("tlaplusplus_init_mixed_test");
+        let _ = fs::create_dir_all(&tmp);
+
+        let module = tmp.join("MixedInit.tla");
+        fs::write(
+            &module,
+            r#"
+---- MODULE MixedInit ----
+EXTENDS Naturals
+
+CONSTANT S
+
+VARIABLES x, y
+
+Init ==
+    /\ x = 0
+    /\ y \in S
+
+Next == UNCHANGED <<x, y>>
+====
+"#,
+        )
+        .expect("module should be written");
+
+        let cfg = tmp.join("MixedInit.cfg");
+        fs::write(
+            &cfg,
+            r#"
+CONSTANT S = {a, b, c}
+INIT Init
+NEXT Next
+"#,
+        )
+        .expect("cfg should be written");
+
+        let model = TlaModel::from_files(&module, Some(&cfg), None, None)
+            .expect("model should build with mixed Init constraints");
+
+        let init = model.initial_states();
+        // x = 0 is deterministic, y \in {a, b, c} gives 3 choices
+        assert_eq!(
+            init.len(),
+            3,
+            "Expected 3 initial states for x=0 and y in {{a, b, c}}"
+        );
+
+        // Each state should have x = 0
+        for state in &init {
+            assert_eq!(state.get("x"), Some(&TlaValue::Int(0)));
+            // y should be one of the model values
+            let y = state.get("y").expect("y should be defined");
+            assert!(
+                matches!(y, TlaValue::ModelValue(_)),
+                "y should be a model value, got: {:?}",
+                y
+            );
+        }
+
+        // Clean up
+        let _ = fs::remove_dir_all(&tmp);
+    }
 }
