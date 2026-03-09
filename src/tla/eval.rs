@@ -5548,4 +5548,57 @@ mod tests {
         assert_eq!(result, expected);
     }
 
+    #[test]
+    fn evals_module_instance_operator_call() {
+        use crate::tla::module::{TlaModule, TlaModuleInstance};
+
+        // Create a helper module with some operators
+        let mut helper_module = TlaModule::default();
+        helper_module.name = "Helper".to_string();
+        helper_module.definitions.insert(
+            "Double".to_string(),
+            TlaDefinition {
+                name: "Double".to_string(),
+                params: vec!["n".to_string()],
+                body: "n * 2".to_string(),
+                is_recursive: false,
+            },
+        );
+        helper_module.definitions.insert(
+            "AddConst".to_string(),
+            TlaDefinition {
+                name: "AddConst".to_string(),
+                params: vec!["n".to_string()],
+                body: "n + Const".to_string(),  // Uses a constant from substitution
+                is_recursive: false,
+            },
+        );
+
+        // Create an instance with Const <- 10 substitution
+        let mut instance = TlaModuleInstance {
+            alias: "H".to_string(),
+            module_name: "Helper".to_string(),
+            substitutions: BTreeMap::from([("Const".to_string(), "10".to_string())]),
+            is_local: false,
+            module: Some(Box::new(helper_module)),
+        };
+
+        // Create instances map
+        let mut instances = BTreeMap::new();
+        instances.insert("H".to_string(), instance);
+
+        // Create state and context
+        let state = TlaState::new();
+        let definitions = BTreeMap::new();
+        let ctx = EvalContext::with_definitions_and_instances(&state, &definitions, &instances);
+
+        // Test H!Double(5) = 10
+        let result = eval_expr("H!Double(5)", &ctx).expect("H!Double(5) should evaluate");
+        assert_eq!(result, TlaValue::Int(10));
+
+        // Test H!AddConst(7) = 17 (7 + 10)
+        let result = eval_expr("H!AddConst(7)", &ctx).expect("H!AddConst(7) should evaluate");
+        assert_eq!(result, TlaValue::Int(17));
+    }
+
 }
