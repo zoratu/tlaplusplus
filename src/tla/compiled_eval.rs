@@ -862,11 +862,11 @@ fn eval_compiled_inner(
         }
 
         // Lambda
-        CompiledExpr::Lambda { params, body } => {
+        CompiledExpr::Lambda { params, body_text, .. } => {
             // Return lambda as a value that can be applied later
             Ok(TlaValue::Lambda {
                 params: Arc::new(params.clone()),
-                body: format!("{:?}", body), // Hack - we'd need proper unparsing
+                body: body_text.clone(),
                 captured_locals: Arc::new((*ctx.locals).clone()),
             })
         }
@@ -1291,6 +1291,55 @@ fn eval_compiled_opcall(
             }
 
             return Ok(TlaValue::Seq(Arc::new(seq[start..end].to_vec())));
+        }
+        "SelectSeq" => {
+            if arg_values.len() != 2 {
+                return Err(anyhow!("SelectSeq expects 2 arguments"));
+            }
+            let seq = match &arg_values[0] {
+                TlaValue::Seq(v) => v,
+                _ => return Err(anyhow!("SelectSeq expects a sequence, got {:?}", arg_values[0])),
+            };
+            let test_fn = &arg_values[1];
+
+            let mut result = Vec::new();
+            for elem in seq.iter() {
+                // Apply the test function to the element
+                let test_result = match test_fn {
+                    TlaValue::Lambda {
+                        params,
+                        body,
+                        captured_locals,
+                    } => {
+                        if params.len() != 1 {
+                            return Err(anyhow!("SelectSeq test function must take exactly 1 parameter"));
+                        }
+                        // Create a context with the captured locals and the parameter bound
+                        let mut locals = (**captured_locals).clone();
+                        locals.insert(params[0].clone(), elem.clone());
+                        // Evaluate using the captured locals context
+                        let lambda_ctx = EvalContext {
+                            state: ctx.state,
+                            locals: std::rc::Rc::new(locals),
+                            local_definitions: ctx.local_definitions.clone(),
+                            definitions: ctx.definitions,
+                            instances: ctx.instances,
+                        };
+                        eval_expr(body, &lambda_ctx)?
+                    }
+                    TlaValue::Function(map) => {
+                        map.get(elem).cloned().ok_or_else(|| {
+                            anyhow!("SelectSeq test function is missing key {:?}", elem)
+                        })?
+                    }
+                    other => return Err(anyhow!("SelectSeq test must be a lambda or function, got {:?}", other)),
+                };
+
+                if let TlaValue::Bool(true) = test_result {
+                    result.push(elem.clone());
+                }
+            }
+            return Ok(TlaValue::Seq(Arc::new(result)));
         }
         "DOMAIN" => {
             if arg_values.len() != 1 {
@@ -1746,6 +1795,45 @@ mod tests {
         let result = eval_compiled(&compile_expr("Tail(<<5, 6, 7>>)"), &ctx).unwrap();
         let expected: Vec<TlaValue> = vec![TlaValue::Int(6), TlaValue::Int(7)];
         assert_eq!(result, TlaValue::Seq(Arc::new(expected)));
+    }
+
+    #[test]
+    fn test_compiled_lambda() {
+        let ctx = empty_ctx();
+
+        // Test that LAMBDA expressions compile and evaluate to Lambda values
+        let compiled = compile_expr("LAMBDA x: x + 1");
+        println!("Compiled LAMBDA: {:?}", compiled);
+
+        let result = eval_compiled(&compiled, &ctx);
+        println!("Evaluated result: {:?}", result);
+
+        match result {
+            Ok(TlaValue::Lambda { params, body, .. }) => {
+                assert_eq!(*params, vec!["x".to_string()]);
+                // Body should be parseable
+                assert!(body.contains("+") || body.contains("x"));
+            }
+            Ok(other) => panic!("Expected Lambda, got {:?}", other),
+            Err(e) => panic!("Error evaluating lambda: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_compiled_selectseq() {
+        let ctx = empty_ctx();
+
+        // Test SelectSeq with a simple lambda
+        let result = eval_compiled(&compile_expr("SelectSeq(<<1, 2, 3, 4>>, LAMBDA x: x > 2)"), &ctx);
+        println!("SelectSeq result: {:?}", result);
+
+        match result {
+            Ok(TlaValue::Seq(seq)) => {
+                assert_eq!(*seq, vec![TlaValue::Int(3), TlaValue::Int(4)]);
+            }
+            Ok(other) => panic!("Expected Seq, got {:?}", other),
+            Err(e) => panic!("Error in SelectSeq: {}", e),
+        }
     }
 
     #[test]
