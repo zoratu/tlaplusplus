@@ -1166,6 +1166,16 @@ fn split_binary_op<'a>(expr: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
                     i += 1;
                     continue;
                 }
+                // For operators that end with letters and could be prefixes of longer operators
+                // (e.g., \in could be prefix of \intersect), check that the next char is not a letter
+                if op.chars().last().map_or(false, |c| c.is_alphabetic()) {
+                    let next_idx = i + op_chars.len();
+                    if next_idx < chars.len() && chars[next_idx].is_alphabetic() {
+                        // This is a prefix match, not a full operator match
+                        i += 1;
+                        continue;
+                    }
+                }
                 // Calculate byte offsets
                 let left_byte_end: usize = chars[..i].iter().map(|c| c.len_utf8()).sum();
                 let right_byte_start: usize = chars[..i + op_chars.len()]
@@ -2401,6 +2411,26 @@ mod tests {
             matches!(expr, CompiledExpr::FuncPair(_, _)),
             "function pair should not be parsed as comparison: {:?}",
             expr
+        );
+    }
+
+    #[test]
+    fn test_intersect_not_confused_with_in() {
+        // Ensure \intersect is not confused with \in
+        // \in should NOT match inside \intersect
+        let expr = compile_expr("seen \\intersect Node");
+        assert!(
+            matches!(expr, CompiledExpr::Intersect(_, _)),
+            "\\intersect should be parsed as Intersect, not In: {:?}",
+            expr
+        );
+
+        // Also test that \in still works on its own
+        let expr2 = compile_expr("x \\in S");
+        assert!(
+            matches!(expr2, CompiledExpr::In(_, _)),
+            "\\in should be parsed as In: {:?}",
+            expr2
         );
     }
 
