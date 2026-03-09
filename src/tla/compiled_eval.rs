@@ -896,6 +896,20 @@ fn compiled_membership_contains(
             set_val.contains(value)
         }
         CompiledExpr::Unparsed(text) => membership_matches_text(value, text, ctx, depth + 1),
+        // Handle Seq(S) - check if value is a sequence with all elements in S
+        CompiledExpr::OpCall { name, args } if name == "Seq" && args.len() == 1 => {
+            match value {
+                TlaValue::Seq(seq) => {
+                    for elem in seq.iter() {
+                        if !compiled_membership_contains(elem, &args[0], ctx, depth + 1)? {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                }
+                _ => Ok(false), // Not a sequence, so not in Seq(S)
+            }
+        }
         _ => {
             let set_val = eval_compiled_inner(set_expr, ctx, depth + 1)?;
             set_val.contains(value)
