@@ -5,9 +5,9 @@ use crate::tla::{
     ClauseKind, CompiledActionIr, CompiledExpr, ConfigValue, EvalContext, TemporalFormula,
     TlaConfig, TlaDefinition, TlaModule, TlaState, TlaValue, classify_clause, compile_action_ir,
     compile_expr, eval_action_constraint, eval_compiled, eval_expr,
-    evaluate_next_states_with_instances, evaluate_next_states_labeled_with_instances,
-    insert_compiled_action, looks_like_action, parse_tla_config,
-    parse_tla_module_file, split_top_level,
+    evaluate_next_states_labeled_with_instances, evaluate_next_states_with_instances,
+    insert_compiled_action, looks_like_action, parse_tla_config, parse_tla_module_file,
+    split_top_level,
 };
 use anyhow::{Context, Result, anyhow};
 use std::collections::{BTreeMap, HashSet};

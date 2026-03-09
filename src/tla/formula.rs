@@ -173,7 +173,11 @@ pub fn split_top_level(expr: &str, delimiter: &str) -> Vec<String> {
             }
         }
 
-        let at_top = at_bracket_top && let_depth == 0 && if_depth == 0 && case_depth == 0 && !else_branch_uses_delimiter;
+        let at_top = at_bracket_top
+            && let_depth == 0
+            && if_depth == 0
+            && case_depth == 0
+            && !else_branch_uses_delimiter;
         if at_top && matches_at(&chars, i, &delim_chars) {
             // Don't split inside quantifier bodies when the body started with the same delimiter
             // For example: \E op \in S : \/ A \/ B \/ C
@@ -453,11 +457,24 @@ mod tests {
         // ELSE /\ content should not split at the /\ after ELSE
         let expr = "IF cond THEN a ELSE /\\ b /\\ c";
         let parts = split_top_level(expr, "/\\");
-        
+
         // Should be one part - the entire IF-THEN-ELSE including the ELSE branch
-        assert_eq!(parts.len(), 1, "Should not split inside IF-THEN-ELSE when ELSE starts with /\\: {:?}", parts);
-        assert!(parts[0].contains("b"), "Should contain ELSE branch content 'b': {}", parts[0]);
-        assert!(parts[0].contains("c"), "Should contain ELSE branch content 'c': {}", parts[0]);
+        assert_eq!(
+            parts.len(),
+            1,
+            "Should not split inside IF-THEN-ELSE when ELSE starts with /\\: {:?}",
+            parts
+        );
+        assert!(
+            parts[0].contains("b"),
+            "Should contain ELSE branch content 'b': {}",
+            parts[0]
+        );
+        assert!(
+            parts[0].contains("c"),
+            "Should contain ELSE branch content 'c': {}",
+            parts[0]
+        );
     }
 
     #[test]
@@ -465,13 +482,22 @@ mod tests {
         // When ELSE is NOT followed by /\, subsequent /\ should split
         let expr = "/\\ IF cond THEN a ELSE b /\\ c";
         let parts = split_top_level(expr, "/\\");
-        
+
         // Should split into 2 parts:
         // 1. IF cond THEN a ELSE b
         // 2. c
         assert_eq!(parts.len(), 2, "Should split: {:?}", parts);
-        assert!(parts[0].contains("ELSE b"), "First part should contain complete IF-THEN-ELSE: {}", parts[0]);
-        assert_eq!(parts[1].trim(), "c", "Second part should be 'c': {}", parts[1]);
+        assert!(
+            parts[0].contains("ELSE b"),
+            "First part should contain complete IF-THEN-ELSE: {}",
+            parts[0]
+        );
+        assert_eq!(
+            parts[1].trim(),
+            "c",
+            "Second part should be 'c': {}",
+            parts[1]
+        );
     }
 
     #[test]
@@ -479,13 +505,24 @@ mod tests {
         // Test nested IF-THEN-ELSE where both levels have ELSE starting with /\
         let expr = "IF outer THEN a ELSE /\\ IF inner THEN b ELSE /\\ c /\\ d";
         let parts = split_top_level(expr, "/\\");
-        
+
         // Should be one part - the entire nested structure
-        assert_eq!(parts.len(), 1, "Should not split nested IF-THEN-ELSE: {:?}", parts);
+        assert_eq!(
+            parts.len(),
+            1,
+            "Should not split nested IF-THEN-ELSE: {:?}",
+            parts
+        );
         assert!(parts[0].contains("outer"), "Should contain outer condition");
         assert!(parts[0].contains("inner"), "Should contain inner condition");
-        assert!(parts[0].contains("c"), "Should contain nested ELSE content 'c'");
-        assert!(parts[0].contains("d"), "Should contain nested ELSE content 'd'");
+        assert!(
+            parts[0].contains("c"),
+            "Should contain nested ELSE content 'c'"
+        );
+        assert!(
+            parts[0].contains("d"),
+            "Should contain nested ELSE content 'd'"
+        );
     }
 
     #[test]
@@ -499,13 +536,16 @@ mod tests {
         for _ in 0..100 {
             expr.push_str(" ELSE fallback");
         }
-        
+
         // Should not panic or stack overflow
         let parts = split_top_level(&expr, "/\\");
-        
+
         // Should be one part - the entire deeply nested expression
-        assert_eq!(parts.len(), 1, "Should not split deeply nested IF-THEN-ELSE");
+        assert_eq!(
+            parts.len(),
+            1,
+            "Should not split deeply nested IF-THEN-ELSE"
+        );
         assert!(parts[0].contains("base"), "Should contain inner value");
     }
-
 }

@@ -891,10 +891,7 @@ fn parse_unnamed_instance_declaration(line: &str) -> Option<TlaModuleInstance> {
     };
 
     // Validate module name is a simple identifier
-    if !module_name
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '_')
-    {
+    if !module_name.chars().all(|c| c.is_alphanumeric() || c == '_') {
         return None;
     }
 
@@ -1433,19 +1430,38 @@ SimpleOp == 42
 "#;
 
         let m = parse_tla_module_text(src).expect("parse should work");
-        
+
         // Check that Loop definition exists and has complete body
         assert!(m.definitions.contains_key("Loop"), "Loop should be defined");
         let loop_def = &m.definitions["Loop"];
-        
+
         // The body should contain all parts of the IF-THEN-ELSE
-        assert!(loop_def.body.contains("IF"), "Body should contain IF: {}", loop_def.body);
-        assert!(loop_def.body.contains("THEN"), "Body should contain THEN: {}", loop_def.body);
-        assert!(loop_def.body.contains("ELSE"), "Body should contain ELSE: {}", loop_def.body);
-        assert!(loop_def.body.contains("other_thing"), "Body should contain ELSE branch content: {}", loop_def.body);
-        
+        assert!(
+            loop_def.body.contains("IF"),
+            "Body should contain IF: {}",
+            loop_def.body
+        );
+        assert!(
+            loop_def.body.contains("THEN"),
+            "Body should contain THEN: {}",
+            loop_def.body
+        );
+        assert!(
+            loop_def.body.contains("ELSE"),
+            "Body should contain ELSE: {}",
+            loop_def.body
+        );
+        assert!(
+            loop_def.body.contains("other_thing"),
+            "Body should contain ELSE branch content: {}",
+            loop_def.body
+        );
+
         // SimpleOp should also be defined
-        assert!(m.definitions.contains_key("SimpleOp"), "SimpleOp should be defined");
+        assert!(
+            m.definitions.contains_key("SimpleOp"),
+            "SimpleOp should be defined"
+        );
     }
 
     #[test]
@@ -1469,22 +1485,33 @@ Next == TRUE
 "#;
 
         let m = parse_tla_module_text(src).expect("parse should work");
-        
+
         // Check that Loop definition exists and has complete body with nested IF
         assert!(m.definitions.contains_key("Loop"), "Loop should be defined");
         let loop_def = &m.definitions["Loop"];
-        
+
         // Count IF and ELSE occurrences - there should be 2 of each (outer and nested)
         let if_count = loop_def.body.matches("IF").count();
         let else_count = loop_def.body.matches("ELSE").count();
-        
-        assert_eq!(if_count, 2, "Body should have 2 IFs (outer and nested): {}", loop_def.body);
-        assert_eq!(else_count, 2, "Body should have 2 ELSEs (outer and nested): {}", loop_def.body);
-        
+
+        assert_eq!(
+            if_count, 2,
+            "Body should have 2 IFs (outer and nested): {}",
+            loop_def.body
+        );
+        assert_eq!(
+            else_count, 2,
+            "Body should have 2 ELSEs (outer and nested): {}",
+            loop_def.body
+        );
+
         // The nested ELSE should contain UNCHANGED forks
-        assert!(loop_def.body.contains("UNCHANGED forks"), 
-            "Body should contain UNCHANGED forks from nested ELSE: {}", loop_def.body);
-        
+        assert!(
+            loop_def.body.contains("UNCHANGED forks"),
+            "Body should contain UNCHANGED forks from nested ELSE: {}",
+            loop_def.body
+        );
+
         // Next should also be defined
         assert!(m.definitions.contains_key("Next"), "Next should be defined");
     }
@@ -1505,12 +1532,18 @@ Next == x' = x + 1
         let m = parse_tla_module_text(src).expect("parse should work");
 
         // Check that the named instance is parsed
-        assert!(m.instances.contains_key("Helper"), "Helper instance should be parsed");
+        assert!(
+            m.instances.contains_key("Helper"),
+            "Helper instance should be parsed"
+        );
 
         let helper = m.instances.get("Helper").unwrap();
         assert_eq!(helper.module_name, "CoverageHelper");
         assert_eq!(helper.alias, "Helper");
-        assert!(helper.substitutions.contains_key("Node"), "Should have Node substitution");
+        assert!(
+            helper.substitutions.contains_key("Node"),
+            "Should have Node substitution"
+        );
         assert_eq!(helper.substitutions.get("Node").unwrap(), "{1, 2, 3}");
     }
 
@@ -1529,11 +1562,18 @@ Init == x = 0
         let m = parse_tla_module_text(src).expect("parse should work");
 
         // Check that the unnamed instance is parsed
-        assert_eq!(m.unnamed_instances.len(), 1, "Should have one unnamed instance");
+        assert_eq!(
+            m.unnamed_instances.len(),
+            1,
+            "Should have one unnamed instance"
+        );
 
         let instance = &m.unnamed_instances[0];
         assert_eq!(instance.module_name, "Sailfish");
-        assert!(instance.alias.starts_with("__unnamed__"), "Alias should be auto-generated");
+        assert!(
+            instance.alias.starts_with("__unnamed__"),
+            "Alias should be auto-generated"
+        );
     }
 
     #[test]
@@ -1551,13 +1591,23 @@ Init == x = 0
         let m = parse_tla_module_text(src).expect("parse should work");
 
         // Check that the unnamed instance with substitutions is parsed
-        assert_eq!(m.unnamed_instances.len(), 1, "Should have one unnamed instance");
+        assert_eq!(
+            m.unnamed_instances.len(),
+            1,
+            "Should have one unnamed instance"
+        );
 
         let instance = &m.unnamed_instances[0];
         assert_eq!(instance.module_name, "Sailfish");
-        assert!(instance.substitutions.contains_key("Node"), "Should have Node substitution");
+        assert!(
+            instance.substitutions.contains_key("Node"),
+            "Should have Node substitution"
+        );
         assert_eq!(instance.substitutions.get("Node").unwrap(), "Servers");
-        assert!(instance.substitutions.contains_key("F"), "Should have F substitution");
+        assert!(
+            instance.substitutions.contains_key("F"),
+            "Should have F substitution"
+        );
         assert_eq!(instance.substitutions.get("F").unwrap(), "Faulty");
     }
 
@@ -1576,7 +1626,11 @@ Init == x = 0
         let m = parse_tla_module_text(src).expect("parse should work");
 
         // Check that the LOCAL unnamed instance is parsed
-        assert_eq!(m.unnamed_instances.len(), 1, "Should have one unnamed instance");
+        assert_eq!(
+            m.unnamed_instances.len(),
+            1,
+            "Should have one unnamed instance"
+        );
 
         let instance = &m.unnamed_instances[0];
         assert_eq!(instance.module_name, "Helpers");

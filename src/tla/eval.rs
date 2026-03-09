@@ -871,11 +871,11 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
                 let right = eval_expr_inner(rhs, ctx, depth + 1)?;
                 Ok(TlaValue::Bool(left != right))
             }
-            "<" | "<=" | "\\leq" | ">" | ">=" | "\\geq" => {
+            "<" | "<=" | "=<" | "\\leq" | ">" | ">=" | "\\geq" => {
                 let right = eval_expr_inner(rhs, ctx, depth + 1)?;
                 let cmp = match op {
                     "<" => left.as_int()? < right.as_int()?,
-                    "<=" | "\\leq" => left.as_int()? <= right.as_int()?,
+                    "<=" | "=<" | "\\leq" => left.as_int()? <= right.as_int()?,
                     ">" => left.as_int()? > right.as_int()?,
                     ">=" | "\\geq" => left.as_int()? >= right.as_int()?,
                     _ => unreachable!(),
@@ -3256,6 +3256,7 @@ fn split_top_level_comparison(expr: &str) -> Option<(&str, &'static str, &str)> 
         "..",
         "\\leq",
         "\\geq",
+        "=<",
         "<=",
         ">=",
         "/=",
@@ -4522,11 +4523,14 @@ mod tests {
     fn higher_order_operator_parameters() {
         // Test operator with P(_) syntax for higher-order parameter
         // Similar to CigaretteSmokers example: ChooseOne(S, P(_))
-        let state = TlaState::from([("items".to_string(), TlaValue::Set(Arc::new(BTreeSet::from([
-            TlaValue::Int(1),
-            TlaValue::Int(2),
-            TlaValue::Int(3),
-        ]))))]);
+        let state = TlaState::from([(
+            "items".to_string(),
+            TlaValue::Set(Arc::new(BTreeSet::from([
+                TlaValue::Int(1),
+                TlaValue::Int(2),
+                TlaValue::Int(3),
+            ]))),
+        )]);
 
         let defs = BTreeMap::from([(
             "FindOne".to_string(),
