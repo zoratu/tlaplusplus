@@ -531,10 +531,16 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
     // Handle cartesian product: \X and \times are synonyms
     // Must be before \ (set minus) since \ would match \X or \times
     if let Some((left, right)) = split_binary_op(expr, "\\X") {
-        return CompiledExpr::CartesianProduct(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
+        return CompiledExpr::CartesianProduct(
+            Box::new(compile_expr(left)),
+            Box::new(compile_expr(right)),
+        );
     }
     if let Some((left, right)) = split_binary_op(expr, "\\times") {
-        return CompiledExpr::CartesianProduct(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
+        return CompiledExpr::CartesianProduct(
+            Box::new(compile_expr(left)),
+            Box::new(compile_expr(right)),
+        );
     }
     if let Some((left, right)) = split_binary_op(expr, "\\") {
         // Only treat as set minus if right side doesn't start with a known keyword
@@ -551,7 +557,10 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
             && !right_trimmed.starts_with("E")
             && !right_trimmed.starts_with("A")
         {
-            return CompiledExpr::SetMinus(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
+            return CompiledExpr::SetMinus(
+                Box::new(compile_expr(left)),
+                Box::new(compile_expr(right)),
+            );
         }
     }
 

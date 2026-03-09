@@ -1302,6 +1302,33 @@ fn eval_compiled_opcall(
                 }
             }
         }
+        // TLC module: Range(f) - returns the set of all values in the range of function f
+        // Range(f) == {f[x] : x \in DOMAIN f}
+        "Range" => {
+            if arg_values.len() != 1 {
+                return Err(anyhow!("Range expects 1 argument"));
+            }
+            match &arg_values[0] {
+                TlaValue::Function(map) => {
+                    let values: BTreeSet<TlaValue> = map.values().cloned().collect();
+                    return Ok(TlaValue::Set(Arc::new(values)));
+                }
+                TlaValue::Seq(seq) => {
+                    // Range of a sequence is the set of all its elements
+                    let values: BTreeSet<TlaValue> = seq.iter().cloned().collect();
+                    return Ok(TlaValue::Set(Arc::new(values)));
+                }
+                TlaValue::Record(map) => {
+                    // Range of a record is the set of all its field values
+                    let values: BTreeSet<TlaValue> = map.values().cloned().collect();
+                    return Ok(TlaValue::Set(Arc::new(values)));
+                }
+                _ => {
+                    return Err(anyhow!("Range expects a function, sequence, or record"));
+                }
+            }
+        }
+
         "ToString" => {
             if arg_values.len() != 1 {
                 return Err(anyhow!("ToString expects 1 argument"));

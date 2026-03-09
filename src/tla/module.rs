@@ -129,8 +129,8 @@ fn load_extended_modules(
 
         if extended_path.exists() {
             // Load the extended module recursively
-            let extended_module =
-                parse_tla_module_file_with_visited(&extended_path, visited).with_context(|| {
+            let extended_module = parse_tla_module_file_with_visited(&extended_path, visited)
+                .with_context(|| {
                     format!(
                         "failed to load extended module '{}' from '{}'",
                         extended_name,
