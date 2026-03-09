@@ -1836,6 +1836,23 @@ fn sample_param_value(param: &str, probe_state: &TlaState) -> TlaValue {
         }
     };
 
+    // Common integer index variables (extremely frequent in TLA+ specs)
+    if matches!(
+        lower.as_str(),
+        "i" | "j" | "k" | "m" | "idx" | "index" | "count" | "x" | "y"
+    ) {
+        return TlaValue::Int(1);
+    }
+
+    // PlusCal "self" parameter: try ProcSet first, then fall back to Int(1)
+    if lower == "self" {
+        if let Some(v) = from_named_set("ProcSet") {
+            return v;
+        }
+        // PlusCal typically uses integer process IDs
+        return TlaValue::Int(1);
+    }
+
     let set_hint = match lower.as_str() {
         "bot" | "buyer" | "holder" | "b" => Some("Bots"),
         "seller" | "writer" | "s" => Some("Sellers"),
@@ -1873,6 +1890,21 @@ fn sample_param_value(param: &str, probe_state: &TlaState) -> TlaValue {
 
     if lower.ends_with("id") {
         return TlaValue::String(format!("{param}_0"));
+    }
+
+    // Last resort: try to find a state variable that looks like a set
+    // containing values appropriate for this parameter, then fall back
+    // to Int(0) which is more useful than ModelValue for arithmetic
+    for (_name, val) in probe_state.iter() {
+        if let TlaValue::Set(values) = val {
+            if let Some(first) = values.iter().next() {
+                // If the set contains integers and parameter name is short
+                // (likely an index), use the first element
+                if matches!(first, TlaValue::Int(_)) && param.len() <= 2 {
+                    return first.clone();
+                }
+            }
+        }
     }
 
     TlaValue::ModelValue(param.to_string())
