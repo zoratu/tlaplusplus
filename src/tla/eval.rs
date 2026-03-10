@@ -362,6 +362,24 @@ pub(crate) fn eval_let_action(
     Ok(())
 }
 
+pub fn eval_action_body_multi(
+    body: &str,
+    ctx: &EvalContext<'_>,
+    staged: &BTreeMap<String, TlaValue>,
+) -> Result<Vec<(BTreeMap<String, TlaValue>, Vec<String>)>> {
+    Ok(eval_action_body_text_multi(
+        body,
+        ctx,
+        ActionEvalBranch {
+            staged: staged.clone(),
+            unchanged_vars: Vec::new(),
+        },
+    )?
+    .into_iter()
+    .map(|branch| (branch.staged, branch.unchanged_vars))
+    .collect())
+}
+
 pub fn eval_let_action_multi(
     expr: &str,
     ctx: &EvalContext<'_>,

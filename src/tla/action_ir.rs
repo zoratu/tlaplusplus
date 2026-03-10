@@ -75,17 +75,43 @@ pub(crate) fn split_action_body_clauses(expr: &str) -> Vec<String> {
     merged
 }
 
+pub fn split_action_body_disjuncts(expr: &str) -> Vec<String> {
+    let trimmed = expr.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("/\\").map(str::trim_start)
+        && rest.starts_with("\\/")
+    {
+        return split_action_body_disjuncts(rest);
+    }
+
+    if let Some(disjuncts) = split_indented_action_disjuncts(trimmed) {
+        return disjuncts;
+    }
+
+    split_top_level(trimmed, "\\/")
+        .into_iter()
+        .filter_map(|part| {
+            let part = part.trim().to_string();
+            if part.is_empty() { None } else { Some(part) }
+        })
+        .collect()
+}
+
 fn split_indented_action_conjuncts(expr: &str) -> Option<Vec<String>> {
     if !expr.contains('\n') {
         return None;
     }
 
+    let normalized = normalize_multiline_action_indentation(expr);
     let mut clauses = Vec::new();
     let mut current = String::new();
     let mut base_indent = None;
     let mut saw_top_level = false;
 
-    for raw_line in expr.lines() {
+    for raw_line in normalized.lines() {
         let line = raw_line.trim_end();
         let trimmed = line.trim_start();
         if trimmed.is_empty() {
@@ -125,6 +151,103 @@ fn split_indented_action_conjuncts(expr: &str) -> Option<Vec<String>> {
     } else {
         None
     }
+}
+
+fn split_indented_action_disjuncts(expr: &str) -> Option<Vec<String>> {
+    if !expr.contains('\n') {
+        return None;
+    }
+
+    let normalized = normalize_multiline_action_indentation(expr);
+    let mut clauses = Vec::new();
+    let mut current = String::new();
+    let mut base_indent = None;
+    let mut saw_top_level = false;
+
+    for raw_line in normalized.lines() {
+        let line = raw_line.trim_end();
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let indent = line.len().saturating_sub(trimmed.len());
+        if trimmed.starts_with("\\/") {
+            let top_level_indent = *base_indent.get_or_insert(indent);
+            if indent == top_level_indent {
+                if !current.trim().is_empty() {
+                    clauses.push(current.trim().to_string());
+                    current.clear();
+                }
+                current.push_str(trimmed.trim_start_matches("\\/").trim_start());
+                saw_top_level = true;
+                continue;
+            }
+        }
+
+        if !saw_top_level {
+            return None;
+        }
+
+        if !current.is_empty() {
+            current.push('\n');
+        }
+        current.push_str(trimmed);
+    }
+
+    if !current.trim().is_empty() {
+        clauses.push(current.trim().to_string());
+    }
+
+    if clauses.len() > 1 {
+        Some(clauses)
+    } else {
+        None
+    }
+}
+
+fn normalize_multiline_action_indentation(expr: &str) -> String {
+    let mut lines = expr.lines();
+    let Some(first) = lines.next() else {
+        return String::new();
+    };
+
+    let rest: Vec<&str> = lines.collect();
+    if rest.is_empty() {
+        return expr.to_string();
+    }
+
+    let dedent = rest
+        .iter()
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(line.len().saturating_sub(trimmed.len()))
+            }
+        })
+        .min()
+        .unwrap_or(0);
+
+    if dedent == 0 {
+        return expr.to_string();
+    }
+
+    let mut normalized = String::with_capacity(expr.len());
+    normalized.push_str(first);
+    for line in rest {
+        normalized.push('\n');
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let indent = line.len().saturating_sub(trimmed.len());
+        let keep = indent.saturating_sub(dedent);
+        normalized.push_str(&" ".repeat(keep));
+        normalized.push_str(trimmed);
+    }
+    normalized
 }
 
 pub(crate) fn parse_action_if(expr: &str) -> Option<(&str, &str, &str)> {
@@ -217,7 +340,7 @@ pub fn compile_action_ir(def: &TlaDefinition) -> ActionIr {
 /// separately instead of feeding raw `\/` separators into `compile_action_ir`.
 pub fn compile_action_ir_branches(def: &TlaDefinition) -> Vec<ActionIr> {
     let trimmed = def.body.trim();
-    let disjuncts = split_top_level(trimmed, "\\/");
+    let disjuncts = split_action_body_disjuncts(trimmed);
     let has_top_level_disjunction = disjuncts.len() > 1 || trimmed.starts_with("\\/");
 
     let branch_bodies = if has_top_level_disjunction {
@@ -509,5 +632,49 @@ mod tests {
         assert!(!clauses.iter().any(|clause| clause.trim().is_empty()));
         assert!(clauses[0].starts_with(r#"\/ /\ rmState[self] = "working""#));
         assert_eq!(clauses[1], r#"pc' = [pc EXCEPT ![self] = "RS"]"#);
+    }
+
+    #[test]
+    fn split_action_body_clauses_reindents_trimmed_if_then_branches() {
+        let clauses = split_action_body_clauses(
+            r#"/\ \/ /\ rmState[self] = "working"
+                             /\ rmState' = [rmState EXCEPT ![self] = "prepared"]
+                          \/ /\ \/ /\ tmState="commit"
+                                   /\ rmState' = [rmState EXCEPT ![self] = "committed"]
+                                \/ /\ rmState[self]="working" \/ tmState="abort"
+                                   /\ rmState' = [rmState EXCEPT ![self] = "aborted"]
+                          \/ /\ IF RMMAYFAIL /\ ~\E rm \in RM:rmState[rm]="failed"
+                                   THEN /\ rmState' = [rmState EXCEPT ![self] = "failed"]
+                                   ELSE /\ TRUE
+                                        /\ UNCHANGED rmState
+                       /\ pc' = [pc EXCEPT ![self] = "RS"]"#,
+        );
+
+        assert_eq!(clauses.len(), 2);
+        assert!(clauses[0].starts_with(r#"\/ /\ rmState[self] = "working""#));
+        assert!(clauses[0].contains(r#"IF RMMAYFAIL /\ ~\E rm \in RM:rmState[rm]="failed""#));
+        assert_eq!(clauses[1], r#"pc' = [pc EXCEPT ![self] = "RS"]"#);
+        assert!(!clauses.iter().any(|clause| clause.trim() == r#"\/"#));
+    }
+
+    #[test]
+    fn split_action_body_disjuncts_preserves_boolean_or_inside_branch_guards() {
+        let disjuncts = split_action_body_disjuncts(
+            r#"/\ \/ /\ tmState="commit"
+                 /\ rmState' = [rmState EXCEPT ![self] = "committed"]
+              \/ /\ rmState[self]="working" \/ tmState="abort"
+                 /\ rmState' = [rmState EXCEPT ![self] = "aborted"]
+              \/ /\ IF RMMAYFAIL /\ ~\E rm \in RM:rmState[rm]="failed"
+                       THEN /\ rmState' = [rmState EXCEPT ![self] = "failed"]
+                       ELSE /\ TRUE
+                            /\ UNCHANGED rmState"#,
+        );
+
+        assert_eq!(disjuncts.len(), 3);
+        assert!(disjuncts[0].starts_with(r#"/\ tmState="commit""#));
+        assert!(disjuncts[0].contains(r#"rmState' = [rmState EXCEPT ![self] = "committed"]"#));
+        assert!(disjuncts[1].contains(r#"rmState[self]="working" \/ tmState="abort""#));
+        assert!(disjuncts[1].contains(r#"rmState' = [rmState EXCEPT ![self] = "aborted"]"#));
+        assert!(disjuncts[2].starts_with(r#"/\ IF RMMAYFAIL /\ ~\E rm \in RM:rmState[rm]="failed""#));
     }
 }
