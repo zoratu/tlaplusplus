@@ -1,4 +1,5 @@
 use crate::fairness::{ActionLabel, LabeledTransition};
+use crate::tla::eval::apply_action_ir_with_context_multi;
 use crate::tla::module::TlaModuleInstance;
 use crate::tla::{
     CompiledActionIr, EvalContext, TlaDefinition, TlaState, TlaValue,
@@ -202,7 +203,7 @@ fn execute_branch(
     instances: Option<&BTreeMap<String, TlaModuleInstance>>,
     state: &TlaState,
 ) -> Result<Vec<TlaState>> {
-    let trimmed = strip_outer_parens(expr.trim());
+    let trimmed = normalize_branch_expr(strip_outer_parens(expr.trim()));
     if trimmed.is_empty() {
         return Err(anyhow!("empty branch expression"));
     }
@@ -270,6 +271,11 @@ fn execute_branch(
         for arg_expr in arg_exprs {
             args.push(eval_expr(&arg_expr, &ctx)?);
         }
+
+        let mut bound_locals = locals.clone();
+        for (param, arg) in def.params.iter().zip(args.iter()) {
+            bound_locals.insert(normalize_param_name(param).to_string(), arg.clone());
+        }
         {
             let locals_mut = std::rc::Rc::make_mut(&mut ctx.locals);
             for (param, arg) in def.params.iter().zip(args.into_iter()) {
@@ -279,7 +285,8 @@ fn execute_branch(
 
         // Use compiled action IR for faster evaluation
         let compiled_ir = get_or_compile_action(def);
-        return apply_compiled_action_ir_multi(&compiled_ir, state, &ctx);
+        return apply_compiled_action_ir_multi(&compiled_ir, state, &ctx)
+            .or_else(|_| execute_branch(&def.body, &bound_locals, definitions, instances, state));
     }
 
     // Not an action call - treat as inline action body (conjunction of constraints)
@@ -305,6 +312,7 @@ fn execute_branch(
     // Use compiled action IR for inline actions too
     let compiled_ir = get_or_compile_action(&inline_def);
     apply_compiled_action_ir_multi(&compiled_ir, state, &ctx)
+        .or_else(|_| apply_action_ir_with_context_multi(&compile_action_ir(&inline_def), state, &ctx))
 }
 
 fn execute_exists_branch(
@@ -466,6 +474,14 @@ fn strip_outer_parens(expr: &str) -> &str {
     let mut current = expr;
     while is_wrapped_by(current, '(', ')') {
         current = current[1..current.len() - 1].trim();
+    }
+    current
+}
+
+fn normalize_branch_expr(expr: &str) -> &str {
+    let mut current = expr.trim();
+    while let Some(rest) = current.strip_prefix("/\\") {
+        current = rest.trim_start();
     }
     current
 }
@@ -831,6 +847,85 @@ mod tests {
         assert!(x_values.contains(&1), "Should have x=1 from ActionA");
         assert!(x_values.contains(&0), "Should have x=0 from ActionB");
         assert!(x_values.contains(&10), "Should have x=10 from ActionC");
+    }
+
+    #[test]
+    fn falls_back_for_nested_action_calls_with_later_prime_references() {
+        let defs = BTreeMap::from([
+            (
+                "CounterAction".to_string(),
+                TlaDefinition {
+                    name: "CounterAction".to_string(),
+                    params: vec!["p".to_string()],
+                    body: "/\\ p = designated /\\ IF light = \"on\" THEN /\\ light' = \"off\" /\\ count' = count + 1 ELSE /\\ UNCHANGED <<light, count>> /\\ announced' = (count' >= threshold) /\\ UNCHANGED designated".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "WardenAction".to_string(),
+                TlaDefinition {
+                    name: "WardenAction".to_string(),
+                    params: vec!["p".to_string()],
+                    body: "/\\ CounterAction(p)".to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+
+        let state = TlaState::from([
+            ("count".to_string(), TlaValue::Int(7)),
+            ("announced".to_string(), TlaValue::Bool(false)),
+            ("light".to_string(), TlaValue::String("off".to_string())),
+            ("designated".to_string(), TlaValue::String("alice".to_string())),
+            ("threshold".to_string(), TlaValue::Int(7)),
+            (
+                "Prisoner".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::String(
+                    "alice".to_string(),
+                )]))),
+            ),
+        ]);
+
+        let probe = probe_next_disjuncts("\\E p \\in Prisoner : WardenAction(p)", &defs, &state);
+        assert_eq!(probe.supported_disjuncts, 1);
+        assert_eq!(probe.generated_successors, 1);
+        assert!(probe.failures.is_empty());
+    }
+
+    #[test]
+    fn falls_back_for_operator_bracket_calls_in_action_bodies() {
+        let defs = BTreeMap::from([
+            (
+                "GetDirection".to_string(),
+                TlaDefinition {
+                    name: "GetDirection".to_string(),
+                    params: vec!["current".to_string(), "destination".to_string()],
+                    body: "IF destination > current THEN \"Up\" ELSE \"Down\"".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Move".to_string(),
+                TlaDefinition {
+                    name: "Move".to_string(),
+                    params: vec![],
+                    body: "/\\ GetDirection[current, destination] = \"Up\" /\\ moved' = TRUE"
+                        .to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+
+        let state = TlaState::from([
+            ("current".to_string(), TlaValue::Int(1)),
+            ("destination".to_string(), TlaValue::Int(2)),
+            ("moved".to_string(), TlaValue::Bool(false)),
+        ]);
+
+        let probe = probe_next_disjuncts("Move()", &defs, &state);
+        assert_eq!(probe.supported_disjuncts, 1);
+        assert_eq!(probe.generated_successors, 1);
+        assert!(probe.failures.is_empty());
     }
 
     #[test]

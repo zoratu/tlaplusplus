@@ -459,7 +459,12 @@ fn eval_action_clause_to_branch(
         }
         ActionClause::Unchanged { vars } => {
             let mut branch = branch;
-            branch.unchanged_vars.extend(vars.iter().cloned());
+            for var in vars {
+                branch.unchanged_vars.push(var.clone());
+                if let Some(value) = ctx.state.get(var) {
+                    branch.staged.entry(var.clone()).or_insert_with(|| value.clone());
+                }
+            }
             Ok(vec![branch])
         }
         ActionClause::Exists { binders, body } => {
@@ -519,7 +524,12 @@ fn eval_action_clause_text_multi(
         }
         ClauseKind::Unchanged { vars } => {
             let mut branch = branch;
-            branch.unchanged_vars.extend(vars);
+            for var in vars {
+                branch.unchanged_vars.push(var.clone());
+                if let Some(value) = ctx.state.get(&var) {
+                    branch.staged.entry(var).or_insert_with(|| value.clone());
+                }
+            }
             Ok(vec![branch])
         }
         ClauseKind::UnprimedEquality { .. }
@@ -1965,7 +1975,7 @@ fn eval_enabled(
     }
 }
 
-fn eval_operator_call(
+pub(crate) fn eval_operator_call(
     name: &str,
     args: Vec<TlaValue>,
     ctx: &EvalContext<'_>,
@@ -3123,8 +3133,15 @@ fn split_top_level(expr: &str, delim: &str, keyword: bool) -> Vec<String> {
                     let after_delim = &expr[delim_end..].trim_start();
                     let next_is_quantifier =
                         after_delim.starts_with("\\A") || after_delim.starts_with("\\E");
+                    let before_delim = expr[..i].trim_end();
+                    let previous_requires_continuation = before_delim.ends_with("=>")
+                        || before_delim.ends_with("/\\")
+                        || before_delim.ends_with("\\/")
+                        || before_delim.ends_with("THEN")
+                        || before_delim.ends_with("ELSE")
+                        || before_delim.ends_with(':');
                     // Split only if followed by another quantifier (this ends the current quantifier)
-                    next_is_quantifier
+                    next_is_quantifier && !previous_requires_continuation
                 } else {
                     // All other cases: split normally
                     true
@@ -4391,6 +4408,35 @@ mod tests {
     }
 
     #[test]
+    fn applies_action_ir_with_unchanged_primes_referenced_later() {
+        let state = TlaState::from([
+            ("flag".to_string(), TlaValue::Bool(false)),
+            ("count".to_string(), TlaValue::Int(7)),
+            ("announced".to_string(), TlaValue::Bool(false)),
+        ]);
+        let action = ActionIr {
+            name: "Counter".to_string(),
+            params: vec![],
+            clauses: vec![
+                ActionClause::Guard {
+                    expr: "IF flag THEN /\\ count' = count + 1 ELSE /\\ UNCHANGED count"
+                        .to_string(),
+                },
+                ActionClause::PrimedAssignment {
+                    var: "announced".to_string(),
+                    expr: "count' >= 7".to_string(),
+                },
+            ],
+        };
+
+        let next = apply_action_ir(&action, &state)
+            .expect("conditional action should evaluate")
+            .expect("branch should succeed");
+        assert_eq!(next.get("count"), Some(&TlaValue::Int(7)));
+        assert_eq!(next.get("announced"), Some(&TlaValue::Bool(true)));
+    }
+
+    #[test]
     fn quantified_let_action_generates_multiple_successors() {
         let state = TlaState::from([
             ("x".to_string(), TlaValue::Int(0)),
@@ -4498,6 +4544,44 @@ mod tests {
         assert_eq!(
             eval_expr("CHOOSE x \\in S : x > 1", &ctx).expect("choose should evaluate"),
             TlaValue::Int(2)
+        );
+    }
+
+    #[test]
+    fn quantifier_body_preserves_implication_rhs_conjunctions() {
+        let defs = BTreeMap::from([
+            (
+                "CanService".to_string(),
+                TlaDefinition {
+                    name: "CanService".to_string(),
+                    params: vec!["e".to_string(), "call".to_string()],
+                    body: "TRUE".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Elevator".to_string(),
+                TlaDefinition {
+                    name: "Elevator".to_string(),
+                    params: vec![],
+                    body: "{1, 2}".to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+        let state = TlaState::from([(
+            "Calls".to_string(),
+            TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(1)]))),
+        )]);
+        let ctx = EvalContext::with_definitions(&state, &defs).with_local_values(&[
+            ("e", TlaValue::Int(1)),
+        ]);
+
+        let expr =
+            "\\A call \\in Calls : /\\ CanService[e, call] => /\\ \\E other \\in Elevator : /\\ other /= e /\\ CanService[other, call]";
+        assert_eq!(
+            eval_expr(expr, &ctx).expect("quantified implication should evaluate"),
+            TlaValue::Bool(true)
         );
     }
 
