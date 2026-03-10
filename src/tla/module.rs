@@ -589,17 +589,9 @@ fn parse_def_head(lhs: &str) -> (String, Vec<String>) {
         lhs
     };
 
-    if let Some(open) = lhs.find('(')
-        && let Some(close) = lhs.rfind(')')
-        && close > open
+    if let Some((open_delim, close_delim)) = first_param_delims(lhs)
+        && let Some((name, params)) = parse_def_head_with_delims(lhs, open_delim, close_delim)
     {
-        let name = lhs[..open].trim().to_string();
-        let params = lhs[open + 1..close]
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
         return (name, params);
     }
 
@@ -609,6 +601,145 @@ fn parse_def_head(lhs: &str) -> (String, Vec<String>) {
         .map(ToString::to_string)
         .unwrap_or_default();
     (name, Vec::new())
+}
+
+fn parse_def_head_with_delims(
+    lhs: &str,
+    open_delim: char,
+    close_delim: char,
+) -> Option<(String, Vec<String>)> {
+    let open = lhs.find(open_delim)?;
+    let close = lhs.rfind(close_delim)?;
+    if close <= open {
+        return None;
+    }
+
+    let name = lhs[..open].trim().to_string();
+    let params = split_operator_params(&lhs[open + 1..close]);
+    Some((name, params))
+}
+
+fn first_param_delims(lhs: &str) -> Option<(char, char)> {
+    match (lhs.find('('), lhs.find('[')) {
+        (Some(paren), Some(bracket)) if bracket < paren => Some(('[', ']')),
+        (Some(_), Some(_)) => Some(('(', ')')),
+        (Some(_), None) => Some(('(', ')')),
+        (None, Some(_)) => Some(('[', ']')),
+        (None, None) => None,
+    }
+}
+
+fn split_operator_params(params_text: &str) -> Vec<String> {
+    split_top_level_commas(params_text)
+        .into_iter()
+        .flat_map(|part| {
+            let lhs = top_level_in_pos(part)
+                .map(|pos| &part[..pos])
+                .unwrap_or(part);
+            split_top_level_commas(lhs)
+                .into_iter()
+                .map(normalize_operator_param)
+                .filter(|param| !param.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn normalize_operator_param(param: &str) -> String {
+    let param = param.trim();
+    if let Some(paren_pos) = param.find('(') {
+        return param[..paren_pos].trim().to_string();
+    }
+    param.to_string()
+}
+
+fn split_top_level_commas(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut paren = 0usize;
+    let mut bracket = 0usize;
+    let mut brace = 0usize;
+    let mut angle = 0usize;
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+
+    let mut i = 0usize;
+    while i < chars.len() {
+        let (byte_idx, ch) = chars[i];
+        match ch {
+            '(' => paren += 1,
+            ')' => paren = paren.saturating_sub(1),
+            '[' => bracket += 1,
+            ']' => bracket = bracket.saturating_sub(1),
+            '{' => brace += 1,
+            '}' => brace = brace.saturating_sub(1),
+            '<' => {
+                if i + 1 < chars.len() && chars[i + 1].1 == '<' {
+                    angle += 1;
+                    i += 1;
+                }
+            }
+            '>' => {
+                if i + 1 < chars.len() && chars[i + 1].1 == '>' {
+                    angle = angle.saturating_sub(1);
+                    i += 1;
+                }
+            }
+            ',' if paren == 0 && bracket == 0 && brace == 0 && angle == 0 => {
+                parts.push(text[start..byte_idx].trim());
+                start = byte_idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    parts.push(text[start..].trim());
+    parts
+}
+
+fn top_level_in_pos(text: &str) -> Option<usize> {
+    let mut paren = 0usize;
+    let mut bracket = 0usize;
+    let mut brace = 0usize;
+    let mut angle = 0usize;
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+
+    let mut i = 0usize;
+    while i < chars.len() {
+        let (byte_idx, ch) = chars[i];
+        match ch {
+            '(' => paren += 1,
+            ')' => paren = paren.saturating_sub(1),
+            '[' => bracket += 1,
+            ']' => bracket = bracket.saturating_sub(1),
+            '{' => brace += 1,
+            '}' => brace = brace.saturating_sub(1),
+            '<' => {
+                if i + 1 < chars.len() && chars[i + 1].1 == '<' {
+                    angle += 1;
+                    i += 1;
+                }
+            }
+            '>' => {
+                if i + 1 < chars.len() && chars[i + 1].1 == '>' {
+                    angle = angle.saturating_sub(1);
+                    i += 1;
+                }
+            }
+            '\\' if paren == 0
+                && bracket == 0
+                && brace == 0
+                && angle == 0
+                && text[byte_idx..].starts_with("\\in") =>
+            {
+                return Some(byte_idx);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    None
 }
 
 fn push_names(text: &str, out: &mut Vec<String>) {
@@ -997,6 +1128,27 @@ mod tests {
         assert!(m.definitions.contains_key("Init"));
         assert!(m.definitions.contains_key("Next"));
         assert_eq!(m.definitions["Next"].params, vec!["a"]);
+    }
+
+    #[test]
+    fn parses_bracketed_operator_parameters() {
+        let src = r#"
+        ---- MODULE Demo ----
+        EXTENDS Naturals
+
+        HaveQuorumFrom[leader \in Node] == leader
+        GetDirection[current, destination \in Floor] == <<current, destination>>
+        HigherOrder[Op(_), value \in Values] == Op(value)
+        ====
+        "#;
+
+        let m = parse_tla_module_text(src).expect("parse should work");
+        assert_eq!(m.definitions["HaveQuorumFrom"].params, vec!["leader"]);
+        assert_eq!(
+            m.definitions["GetDirection"].params,
+            vec!["current", "destination"]
+        );
+        assert_eq!(m.definitions["HigherOrder"].params, vec!["Op", "value"]);
     }
 
     #[test]

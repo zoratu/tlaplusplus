@@ -1639,7 +1639,10 @@ fn eval_compiled_clause_to_branch<'a>(
             for var in vars {
                 branch.unchanged_vars.push(var.clone());
                 if let Some(value) = branch.ctx.state.get(var) {
-                    branch.staged.entry(var.clone()).or_insert_with(|| value.clone());
+                    branch
+                        .staged
+                        .entry(var.clone())
+                        .or_insert_with(|| value.clone());
                 }
             }
             Ok(vec![branch])

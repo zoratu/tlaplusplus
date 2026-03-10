@@ -31,6 +31,10 @@ pub struct ActionIr {
 }
 
 pub(crate) fn split_action_body_clauses(expr: &str) -> Vec<String> {
+    if let Some(clauses) = split_indented_action_conjuncts(expr) {
+        return clauses;
+    }
+
     let trimmed = expr.trim();
     if trimmed.is_empty() {
         return Vec::new();
@@ -38,7 +42,82 @@ pub(crate) fn split_action_body_clauses(expr: &str) -> Vec<String> {
     if trimmed.starts_with("\\E") || trimmed.starts_with("\\A") {
         return vec![trimmed.to_string()];
     }
-    split_top_level(trimmed, "/\\")
+
+    let raw = split_top_level(trimmed, "/\\");
+    let mut merged = Vec::with_capacity(raw.len().max(1));
+    let mut idx = 0usize;
+    while idx < raw.len() {
+        let part = raw[idx].trim().to_string();
+        let starts_quant = part.starts_with("\\E") || part.starts_with("\\A");
+        let open_quant_or_let = (starts_quant && (part.ends_with(':') || part.ends_with("IN")))
+            || (part.starts_with("LET") && part.ends_with("IN"));
+        if open_quant_or_let {
+            let mut combined = part;
+            for rest in raw.iter().skip(idx + 1) {
+                combined.push_str(" /\\ ");
+                combined.push_str(rest.trim());
+            }
+            merged.push(combined);
+            break;
+        }
+
+        merged.push(part);
+        idx += 1;
+    }
+
+    merged
+}
+
+fn split_indented_action_conjuncts(expr: &str) -> Option<Vec<String>> {
+    if !expr.contains('\n') {
+        return None;
+    }
+
+    let mut clauses = Vec::new();
+    let mut current = String::new();
+    let mut base_indent = None;
+    let mut saw_top_level = false;
+
+    for raw_line in expr.lines() {
+        let line = raw_line.trim_end();
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let indent = line.len().saturating_sub(trimmed.len());
+        if trimmed.starts_with("/\\") {
+            let top_level_indent = *base_indent.get_or_insert(indent);
+            if indent == top_level_indent {
+                if !current.trim().is_empty() {
+                    clauses.push(current.trim().to_string());
+                    current.clear();
+                }
+                current.push_str(trimmed.trim_start_matches("/\\").trim_start());
+                saw_top_level = true;
+                continue;
+            }
+        }
+
+        if !saw_top_level {
+            return None;
+        }
+
+        if !current.is_empty() {
+            current.push('\n');
+        }
+        current.push_str(trimmed);
+    }
+
+    if !current.trim().is_empty() {
+        clauses.push(current.trim().to_string());
+    }
+
+    if clauses.len() > 1 {
+        Some(clauses)
+    } else {
+        None
+    }
 }
 
 pub(crate) fn parse_action_if(expr: &str) -> Option<(&str, &str, &str)> {
@@ -77,33 +156,7 @@ pub(crate) fn parse_action_exists(expr: &str) -> Option<(&str, &str)> {
 }
 
 pub fn compile_action_ir(def: &TlaDefinition) -> ActionIr {
-    let trimmed = def.body.trim();
-    let conjuncts = if trimmed.starts_with("\\E") || trimmed.starts_with("\\A") {
-        vec![trimmed.to_string()]
-    } else {
-        let raw = split_top_level(&def.body, "/\\");
-        let mut merged = Vec::with_capacity(raw.len().max(1));
-        let mut idx = 0usize;
-        while idx < raw.len() {
-            let part = raw[idx].trim().to_string();
-            let starts_quant = part.starts_with("\\E") || part.starts_with("\\A");
-            let open_quant_or_let = (starts_quant && (part.ends_with(':') || part.ends_with("IN")))
-                || (part.starts_with("LET") && part.ends_with("IN"));
-            if open_quant_or_let {
-                let mut combined = part;
-                for rest in raw.iter().skip(idx + 1) {
-                    combined.push_str(" /\\ ");
-                    combined.push_str(rest.trim());
-                }
-                merged.push(combined);
-                break;
-            }
-
-            merged.push(part);
-            idx += 1;
-        }
-        merged
-    };
+    let conjuncts = split_action_body_clauses(&def.body);
     let mut clauses = Vec::with_capacity(conjuncts.len().max(1));
 
     if conjuncts.is_empty() {
@@ -404,11 +457,32 @@ mod tests {
 
         for branch in branches {
             assert!(!branch.clauses.is_empty());
-            assert!(
-                !branch.clauses.iter().any(
-                    |clause| matches!(clause, ActionClause::Guard { expr } if expr.trim() == "\\/")
-                )
-            );
+            assert!(!branch.clauses.iter().any(
+                |clause| matches!(clause, ActionClause::Guard { expr } if expr.trim() == "\\/")
+            ));
         }
+    }
+
+    #[test]
+    fn split_action_body_clauses_keeps_quantified_action_bodies_together() {
+        let clauses = split_action_body_clauses(
+            r#"
+                /\ ready
+                /\ \A call \in ActiveCalls :
+                    /\ Service(call) =>
+                        /\ \E worker \in Workers :
+                            /\ worker /= self
+                            /\ ServiceBy(worker, call)
+                /\ nextFloor \in Floor
+                /\ state' = nextState
+            "#,
+        );
+
+        assert_eq!(clauses.len(), 4);
+        assert!(clauses[1].contains(r"\A call \in ActiveCalls"));
+        assert!(clauses[1].contains("ServiceBy(worker, call)"));
+        assert!(!clauses[1].contains("nextFloor \\in Floor"));
+        assert_eq!(clauses[2], "nextFloor \\in Floor");
+        assert_eq!(clauses[3], "state' = nextState");
     }
 }
