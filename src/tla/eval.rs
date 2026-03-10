@@ -1,6 +1,7 @@
 use crate::tla::action_ir::{parse_action_exists, parse_action_if, split_action_body_clauses};
 use crate::tla::{
     ActionClause, ActionIr, ClauseKind, TlaDefinition, TlaState, TlaValue, classify_clause,
+    looks_like_action,
 };
 use anyhow::{Context, Result, anyhow};
 use std::collections::{BTreeMap, BTreeSet};
@@ -488,6 +489,10 @@ fn eval_action_body_text_multi(
     ctx: &EvalContext<'_>,
     branch: ActionEvalBranch,
 ) -> Result<Vec<ActionEvalBranch>> {
+    if let Some(result) = eval_disjunctive_action_body_multi(body, ctx, branch.clone()) {
+        return result;
+    }
+
     let mut branches = vec![branch];
     for clause in split_action_body_clauses(body) {
         let mut next_branches = Vec::new();
@@ -500,6 +505,158 @@ fn eval_action_body_text_multi(
         }
     }
     Ok(branches)
+}
+
+fn eval_disjunctive_action_body_multi(
+    expr: &str,
+    ctx: &EvalContext<'_>,
+    branch: ActionEvalBranch,
+) -> Option<Result<Vec<ActionEvalBranch>>> {
+    let trimmed = expr.trim();
+    let normalized = trimmed.strip_prefix("\\/").map(str::trim_start).unwrap_or(trimmed);
+    let disjuncts = split_top_level_symbol(normalized, "\\/");
+    if disjuncts.len() <= 1 && normalized == trimmed {
+        return None;
+    }
+
+    let mut out = Vec::new();
+    let mut first_err = None;
+    for disjunct in disjuncts {
+        match eval_action_body_text_multi(&disjunct, ctx, branch.clone()) {
+            Ok(mut branches) => out.append(&mut branches),
+            Err(err) => {
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+            }
+        }
+    }
+
+    if !out.is_empty() {
+        Some(Ok(out))
+    } else {
+        Some(Err(first_err.unwrap_or_else(|| {
+            anyhow!("no disjunctive action branch produced a successor")
+        })))
+    }
+}
+
+fn parse_action_call_expr(expr: &str) -> Option<(String, Vec<String>)> {
+    let trimmed = expr.trim_start();
+    let mut chars = trimmed.char_indices();
+    let (_, first) = chars.next()?;
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return None;
+    }
+
+    let mut end = first.len_utf8();
+    for (idx, ch) in chars {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '!' {
+            end = idx + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    let name = trimmed[..end].to_string();
+    let rest = trimmed[end..].trim_start();
+    if rest.is_empty() {
+        return Some((name, Vec::new()));
+    }
+    if !rest.starts_with('(') {
+        return None;
+    }
+
+    let (args_text, tail) = take_bracket_group(rest, '(', ')').ok()?;
+    if !tail.trim().is_empty() {
+        return None;
+    }
+
+    let args = if args_text.trim().is_empty() {
+        Vec::new()
+    } else {
+        split_top_level_symbol(args_text, ",")
+            .into_iter()
+            .map(|arg| arg.trim().to_string())
+            .filter(|arg| !arg.is_empty())
+            .collect()
+    };
+
+    Some((name, args))
+}
+
+fn expand_action_call_multi(
+    expr: &str,
+    ctx: &EvalContext<'_>,
+    branch: ActionEvalBranch,
+) -> Option<Result<Vec<ActionEvalBranch>>> {
+    let (name, arg_exprs) = parse_action_call_expr(expr)?;
+
+    if let Some((alias, operator_name)) = name.split_once('!') {
+        let instances = ctx.instances?;
+        let instance = instances.get(alias)?;
+        let module = instance.module.as_ref()?;
+        let def = module.definitions.get(operator_name)?.clone();
+        if !looks_like_action(&def) || def.body.trim() == expr.trim() {
+            return None;
+        }
+        if def.params.len() != arg_exprs.len() {
+            return Some(Err(anyhow!(
+                "operator '{alias}!{operator_name}' arity mismatch: expected {}, got {}",
+                def.params.len(),
+                arg_exprs.len()
+            )));
+        }
+
+        let mut instance_ctx = ctx.clone();
+        instance_ctx.definitions = Some(&module.definitions);
+        instance_ctx.instances = Some(&module.instances);
+        {
+            let locals_mut = std::rc::Rc::make_mut(&mut instance_ctx.locals);
+            for (param, value_expr) in &instance.substitutions {
+                let value = match eval_expr(value_expr, ctx) {
+                    Ok(value) => value,
+                    Err(err) => return Some(Err(err)),
+                };
+                locals_mut.insert(param.clone(), value);
+            }
+            for (param, arg_expr) in def.params.iter().zip(arg_exprs.iter()) {
+                let value = match eval_expr(arg_expr, ctx) {
+                    Ok(value) => value,
+                    Err(err) => return Some(Err(err)),
+                };
+                locals_mut.insert(normalize_param_name(param).to_string(), value);
+            }
+        }
+
+        return Some(eval_action_body_text_multi(&def.body, &instance_ctx, branch));
+    }
+
+    let def = ctx.definition(&name)?;
+    if !looks_like_action(&def) || def.body.trim() == expr.trim() {
+        return None;
+    }
+    if def.params.len() != arg_exprs.len() {
+        return Some(Err(anyhow!(
+            "operator '{name}' arity mismatch: expected {}, got {}",
+            def.params.len(),
+            arg_exprs.len()
+        )));
+    }
+
+    let mut child_ctx = ctx.clone();
+    {
+        let locals_mut = std::rc::Rc::make_mut(&mut child_ctx.locals);
+        for (param, arg_expr) in def.params.iter().zip(arg_exprs.iter()) {
+            let value = match eval_expr(arg_expr, ctx) {
+                Ok(value) => value,
+                Err(err) => return Some(Err(err)),
+            };
+            locals_mut.insert(normalize_param_name(param).to_string(), value);
+        }
+    }
+
+    Some(eval_action_body_text_multi(&def.body, &child_ctx, branch))
 }
 
 fn eval_action_clause_text_multi(
@@ -523,6 +680,12 @@ fn eval_action_clause_text_multi(
     }
     if let Some((binders, body)) = parse_action_exists(trimmed) {
         return eval_exists_action_multi(binders, body, ctx, branch);
+    }
+    if let Some(result) = eval_disjunctive_action_body_multi(trimmed, ctx, branch.clone()) {
+        return result;
+    }
+    if let Some(result) = expand_action_call_multi(trimmed, ctx, branch.clone()) {
+        return result;
     }
 
     match classify_clause(trimmed) {
@@ -854,7 +1017,11 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
     // Handle case where expression starts with \/ but has only one disjunct
     // e.g., "\/ x > 0" should be treated as just "x > 0"
     if expr.trim().starts_with("\\/") && or_parts.len() == 1 {
-        return eval_expr_inner(&or_parts[0], ctx, depth + 1);
+        let rest = expr.trim().trim_start_matches("\\/").trim_start();
+        if rest.is_empty() {
+            return Err(anyhow!("empty disjunction"));
+        }
+        return eval_expr_inner(rest, ctx, depth + 1);
     }
 
     let and_parts = split_top_level_symbol(expr, "/\\");
@@ -869,7 +1036,11 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
     // Handle case where expression starts with /\ but has only one conjunct
     // e.g., "/\ x > 0" should be treated as just "x > 0"
     if expr.trim().starts_with("/\\") && and_parts.len() == 1 {
-        return eval_expr_inner(&and_parts[0], ctx, depth + 1);
+        let rest = expr.trim().trim_start_matches("/\\").trim_start();
+        if rest.is_empty() {
+            return Err(anyhow!("empty conjunction"));
+        }
+        return eval_expr_inner(rest, ctx, depth + 1);
     }
 
     if let Some(rest) = expr.strip_prefix('~') {
@@ -4491,6 +4662,59 @@ mod tests {
     }
 
     #[test]
+    fn applies_action_ir_with_nested_action_references() {
+        let state = TlaState::from([
+            ("cat_box".to_string(), TlaValue::Int(2)),
+            ("observed_box".to_string(), TlaValue::Int(2)),
+            ("direction".to_string(), TlaValue::String("right".to_string())),
+        ]);
+
+        let mut definitions = BTreeMap::new();
+        definitions.insert(
+            "Move_Cat".to_string(),
+            TlaDefinition {
+                name: "Move_Cat".to_string(),
+                params: vec![],
+                body: "/\\ cat_box' = cat_box + 1\n/\\ cat_box' \\in 1..6".to_string(),
+                is_recursive: false,
+            },
+        );
+        definitions.insert(
+            "Observe_Box".to_string(),
+            TlaDefinition {
+                name: "Observe_Box".to_string(),
+                params: vec![],
+                body: "LET next_box == IF direction = \"right\"\n                  THEN observed_box + 1\n                  ELSE observed_box - 1\nIN \\/ /\\ next_box \\in 2..5\n      /\\ observed_box' = next_box\n      /\\ UNCHANGED direction\n   \\/ /\\ next_box \\notin 2..5\n      /\\ direction' = CHOOSE d \\in {\"left\", \"right\"}: d /= direction\n      /\\ UNCHANGED observed_box".to_string(),
+                is_recursive: false,
+            },
+        );
+
+        let action = ActionIr {
+            name: "Next".to_string(),
+            params: vec![],
+            clauses: vec![
+                ActionClause::Guard {
+                    expr: "Move_Cat".to_string(),
+                },
+                ActionClause::Guard {
+                    expr: "Observe_Box".to_string(),
+                },
+            ],
+        };
+
+        let ctx = EvalContext::with_definitions(&state, &definitions);
+        let next = apply_action_ir_with_context(&action, &state, &ctx)
+            .expect("nested actions should evaluate")
+            .expect("nested actions should produce a successor");
+        assert_eq!(next.get("cat_box"), Some(&TlaValue::Int(3)));
+        assert_eq!(next.get("observed_box"), Some(&TlaValue::Int(3)));
+        assert_eq!(
+            next.get("direction"),
+            Some(&TlaValue::String("right".to_string()))
+        );
+    }
+
+    #[test]
     fn action_guard_can_block_transition() {
         let state = TlaState::from([("x".to_string(), TlaValue::Int(10))]);
         let action = ActionIr {
@@ -4554,6 +4778,30 @@ mod tests {
             .expect("branch should succeed");
         assert_eq!(next.get("count"), Some(&TlaValue::Int(7)));
         assert_eq!(next.get("announced"), Some(&TlaValue::Bool(true)));
+    }
+
+    #[test]
+    fn applies_let_action_with_body_starting_with_disjunction() {
+        let state = TlaState::from([
+            ("observed_box".to_string(), TlaValue::Int(2)),
+            ("direction".to_string(), TlaValue::String("right".to_string())),
+        ]);
+        let action = ActionIr {
+            name: "ObserveBox".to_string(),
+            params: vec![],
+            clauses: vec![ActionClause::LetWithPrimes {
+                expr: "LET next_box == IF direction = \"right\"\n                  THEN observed_box + 1\n                  ELSE observed_box - 1\n  IN \\/ /\\ next_box \\in {2, 3, 4}\n        /\\ observed_box' = next_box\n        /\\ UNCHANGED direction\n     \\/ /\\ next_box \\notin {2, 3, 4}\n        /\\ direction' = CHOOSE d \\in {\"left\", \"right\"}: d /= direction\n        /\\ UNCHANGED observed_box".to_string(),
+            }],
+        };
+
+        let next = apply_action_ir(&action, &state)
+            .expect("LET action should evaluate")
+            .expect("one branch should succeed");
+        assert_eq!(next.get("observed_box"), Some(&TlaValue::Int(3)));
+        assert_eq!(
+            next.get("direction"),
+            Some(&TlaValue::String("right".to_string()))
+        );
     }
 
     #[test]
@@ -6009,6 +6257,16 @@ mod tests {
             TlaValue::Bool(true),
             "outer=false, inner=false: /\\ TRUE /\\ TRUE = TRUE"
         );
+    }
+
+    #[test]
+    fn evals_let_body_starting_with_disjunction() {
+        let state = TlaState::new();
+        let ctx = EvalContext::new(&state);
+        let expr = "LET next_box == 3 IN \\/ /\\ next_box \\in {2, 3, 4}\n                         /\\ TRUE\n                      \\/ /\\ next_box \\notin {2, 3, 4}\n                         /\\ FALSE";
+
+        let result = eval_expr(expr, &ctx).expect("LET body with leading disjunction should evaluate");
+        assert_eq!(result, TlaValue::Bool(true));
     }
 
     #[test]
