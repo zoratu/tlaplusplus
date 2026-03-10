@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -368,13 +368,14 @@ fn replace_identifier(expr: &str, from: &str, to: &str) -> String {
 
 pub fn parse_tla_module_text(input: &str) -> Result<TlaModule> {
     let cleaned = strip_comments(input);
+    let mut pending_lines: VecDeque<String> = cleaned.lines().map(|line| line.to_string()).collect();
     let mut module = TlaModule::default();
 
     let mut current_def: Option<TlaDefinition> = None;
     let mut current_def_indent = 0usize;
     let mut mode = NameListMode::None;
 
-    for line in cleaned.lines() {
+    while let Some(line) = pending_lines.pop_front() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             if let Some(def) = current_def.as_mut() {
@@ -492,7 +493,9 @@ pub fn parse_tla_module_text(input: &str) -> Result<TlaModule> {
 
         let line_indent = line.chars().take_while(|c| c.is_whitespace()).count();
         let can_start_definition = current_def.is_none() || line_indent <= current_def_indent;
-        if can_start_definition && let Some((lhs, rhs)) = split_definition_line(trimmed) {
+        if can_start_definition
+            && let Some((lhs, rhs, remainder)) = split_definition_line_with_remainder(trimmed)
+        {
             flush_definition(&mut module, &mut current_def);
             current_def_indent = line_indent;
             mode = NameListMode::None;
@@ -503,6 +506,11 @@ pub fn parse_tla_module_text(input: &str) -> Result<TlaModule> {
                 body: rhs.trim().to_string(),
                 is_recursive: false, // Will be set by flush_definition
             });
+            if let Some(remainder) = remainder {
+                let indent_width = line.len() - line.trim_start().len();
+                let indent = &line[..indent_width];
+                pending_lines.push_front(format!("{indent}{remainder}"));
+            }
             continue;
         }
 
@@ -547,6 +555,16 @@ pub fn parse_tla_module_text(input: &str) -> Result<TlaModule> {
     Ok(module)
 }
 
+fn split_definition_line_with_remainder(line: &str) -> Option<(&str, &str, Option<&str>)> {
+    let (lhs, rhs) = split_definition_line(line)?;
+    let remainder_start = find_inline_definition_start(rhs);
+    let (body, remainder) = match remainder_start {
+        Some(idx) => (rhs[..idx].trim_end(), Some(rhs[idx..].trim_start())),
+        None => (rhs, None),
+    };
+    Some((lhs, body, remainder.filter(|rest| !rest.is_empty())))
+}
+
 fn flush_definition(module: &mut TlaModule, current: &mut Option<TlaDefinition>) {
     if let Some(mut def) = current.take() {
         // Mark definition as recursive if it was declared with RECURSIVE
@@ -579,6 +597,75 @@ fn split_definition_line(line: &str) -> Option<(&str, &str)> {
     }
 
     Some((lhs, rhs))
+}
+
+fn find_inline_definition_start(rhs: &str) -> Option<usize> {
+    let trimmed = rhs.trim_start();
+    if trimmed.starts_with("LET ")
+        || trimmed.starts_with("LET\n")
+        || trimmed.starts_with("IF ")
+        || trimmed.starts_with("CASE ")
+    {
+        return None;
+    }
+
+    let chars: Vec<(usize, char)> = rhs.char_indices().collect();
+    let mut paren = 0usize;
+    let mut bracket = 0usize;
+    let mut brace = 0usize;
+    let mut angle = 0usize;
+
+    let mut i = 0usize;
+    while i < chars.len() {
+        let (byte_idx, ch) = chars[i];
+        match ch {
+            '(' => paren += 1,
+            ')' => paren = paren.saturating_sub(1),
+            '[' => bracket += 1,
+            ']' => bracket = bracket.saturating_sub(1),
+            '{' => brace += 1,
+            '}' => brace = brace.saturating_sub(1),
+            '<' => {
+                if i + 1 < chars.len() && chars[i + 1].1 == '<' {
+                    angle += 1;
+                    i += 1;
+                }
+            }
+            '>' => {
+                if i + 1 < chars.len() && chars[i + 1].1 == '>' {
+                    angle = angle.saturating_sub(1);
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+
+        if paren == 0 && bracket == 0 && brace == 0 && angle == 0 && ch.is_whitespace() {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].1.is_whitespace() {
+                j += 1;
+            }
+            if j < chars.len() {
+                let candidate = &rhs[chars[j].0..];
+                if let Some((lhs, _)) = split_definition_line(candidate)
+                    && is_plausible_inline_definition_head(lhs)
+                {
+                    return Some(chars[j].0);
+                }
+            }
+        }
+
+        let _ = byte_idx;
+        i += 1;
+    }
+
+    None
+}
+
+fn is_plausible_inline_definition_head(lhs: &str) -> bool {
+    let lhs = lhs.trim();
+    let lhs = lhs.strip_prefix("LOCAL ").unwrap_or(lhs).trim();
+    matches!(lhs.chars().next(), Some(c) if c.is_alphabetic() || c == '_')
 }
 
 fn parse_def_head(lhs: &str) -> (String, Vec<String>) {
@@ -1867,5 +1954,50 @@ Next == x' = BaseHelper(x)
 
         // Clean up
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn parses_multiple_simple_definitions_on_one_line() {
+        let src = r#"
+---- MODULE SlidingLike ----
+EXTENDS Integers
+
+W == 4 H == 5
+Pos == 0 .. W + H
+====
+"#;
+
+        let module = parse_tla_module_text(src).expect("parse should work");
+        assert_eq!(module.definitions.get("W").map(|def| def.body.as_str()), Some("4"));
+        assert_eq!(module.definitions.get("H").map(|def| def.body.as_str()), Some("5"));
+        assert_eq!(
+            module.definitions.get("Pos").map(|def| def.body.as_str()),
+            Some("0 .. W + H")
+        );
+    }
+
+    #[test]
+    fn does_not_split_let_bodies_into_top_level_definitions() {
+        let src = r#"
+---- MODULE SlidingLike ----
+EXTENDS Integers
+
+VARIABLES board
+Next == LET empty == Pos \ UNION board
+        IN  \E e \in empty : board' \in update(e, empty)
+====
+"#;
+
+        let module = parse_tla_module_text(src).expect("parse should work");
+        assert!(module.definitions.contains_key("Next"));
+        assert!(!module.definitions.contains_key("empty"));
+        assert!(
+            module
+                .definitions
+                .get("Next")
+                .unwrap()
+                .body
+                .starts_with("LET empty ==")
+        );
     }
 }

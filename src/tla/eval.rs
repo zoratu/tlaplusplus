@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
-const MAX_EVAL_DEPTH: usize = 100;
+const MAX_EVAL_DEPTH: usize = 256;
 
 /// Normalize a higher-order operator parameter name.
 /// TLA+ allows parameters like `P(_)` or `Op(_, _)` for higher-order operators.
@@ -1109,6 +1109,15 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
         return Ok(TlaValue::Set(Arc::new(powerset(set.as_set()?))));
     }
 
+    if starts_with_keyword(expr, "UNION") {
+        let rest = expr["UNION".len()..].trim();
+        let mut union = BTreeSet::new();
+        for set in eval_expr_inner(rest, ctx, depth + 1)?.as_set()? {
+            union.extend(set.as_set()?.iter().cloned());
+        }
+        return Ok(TlaValue::Set(Arc::new(union)));
+    }
+
     if let Some(rest) = expr.strip_prefix('-')
         && !rest.trim().is_empty()
     {
@@ -1437,8 +1446,8 @@ fn parse_base<'a>(
             return Ok((value, next_rest));
         }
 
-        // Handle prefix operators like DOMAIN and ENABLED that don't use parentheses
-        if matches!(name.as_str(), "DOMAIN") && !has_runtime_value {
+        // Handle prefix operators like DOMAIN, UNION, and ENABLED that don't use parentheses
+        if matches!(name.as_str(), "DOMAIN" | "UNION") && !has_runtime_value {
             // `DOMAIN ReplicatedLog[node]` should apply after postfix indexing, not
             // as `(DOMAIN ReplicatedLog)[node]`.
             let (arg_value, next_rest) =
@@ -2152,6 +2161,27 @@ pub(crate) fn eval_operator_call(
                     return Err(anyhow!("DOMAIN expects a function, record, or sequence"));
                 }
             }
+        }
+        "UNION" => {
+            if args.len() != 1 {
+                return Err(anyhow!("UNION expects 1 argument"));
+            }
+            let mut union = BTreeSet::new();
+            for set in args[0].as_set()? {
+                union.extend(set.as_set()?.iter().cloned());
+            }
+            return Ok(TlaValue::Set(Arc::new(union)));
+        }
+        "RandomElement" => {
+            if args.len() != 1 {
+                return Err(anyhow!("RandomElement expects 1 argument"));
+            }
+            return args[0]
+                .as_set()?
+                .iter()
+                .next()
+                .cloned()
+                .ok_or_else(|| anyhow!("RandomElement expects a non-empty set"));
         }
         // TLC module: Range(f) - returns the set of all values in the range of function f
         // Range(f) == {f[x] : x \in DOMAIN f}
@@ -3325,12 +3355,12 @@ fn split_top_level_set_minus(expr: &str) -> Vec<String> {
         }
 
         let at_top = paren == 0 && bracket == 0 && brace == 0 && angle == 0;
-        if at_top && ch == '\\' {
+        if at_top && ch == '\\' && !starts_with_tla_backslash_operator(&expr[i..]) {
             let prev = expr[..i].chars().next_back();
             let next_char = expr[i + ch_len..].chars().next();
             let ws_before = prev.map(|c| c.is_whitespace()).unwrap_or(false);
             let ws_after = next_char.map(|c| c.is_whitespace()).unwrap_or(false);
-            if ws_before && ws_after {
+            if ws_before || ws_after || next_char.is_some() {
                 let part = expr[start..i].trim();
                 if !part.is_empty() {
                     out.push(part.to_string());
@@ -3352,6 +3382,31 @@ fn split_top_level_set_minus(expr: &str) -> Vec<String> {
     } else {
         out
     }
+}
+
+fn starts_with_tla_backslash_operator(expr: &str) -> bool {
+    [
+        "\\A",
+        "\\E",
+        "\\in",
+        "\\notin",
+        "\\union",
+        "\\intersect",
+        "\\cup",
+        "\\cap",
+        "\\subseteq",
+        "\\supseteq",
+        "\\div",
+        "\\X",
+        "\\times",
+        "\\o",
+        "\\/",
+        "\\*",
+        "\\leq",
+        "\\geq",
+    ]
+    .iter()
+    .any(|op| expr.starts_with(op))
 }
 
 fn split_top_level_comparison(expr: &str) -> Option<(&str, &'static str, &str)> {
@@ -4671,6 +4726,81 @@ mod tests {
                 TlaValue::Int(1),
                 TlaValue::Int(2)
             ])))
+        );
+    }
+
+    #[test]
+    fn union_prefix_accepts_set_of_sets() {
+        let state = TlaState::new();
+        let ctx = EvalContext::new(&state);
+
+        assert_eq!(
+            eval_expr("UNION {{1, 2}, {2, 3}}", &ctx).expect("UNION should evaluate"),
+            TlaValue::Set(Arc::new(BTreeSet::from([
+                TlaValue::Int(1),
+                TlaValue::Int(2),
+                TlaValue::Int(3)
+            ])))
+        );
+    }
+
+    #[test]
+    fn set_minus_accepts_compact_rhs_without_spaces() {
+        let state = TlaState::from([
+            (
+                "Nodes".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([
+                    TlaValue::Int(1),
+                    TlaValue::Int(2),
+                    TlaValue::Int(3),
+                ]))),
+            ),
+            ("n".to_string(), TlaValue::Int(2)),
+        ]);
+        let ctx = EvalContext::new(&state);
+
+        assert_eq!(
+            eval_expr("Nodes\\{n}", &ctx).expect("compact set minus should evaluate"),
+            TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(1), TlaValue::Int(3)])))
+        );
+    }
+
+    #[test]
+    fn set_minus_accepts_union_prefix_rhs() {
+        let state = TlaState::from([
+            (
+                "Pos".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([
+                    TlaValue::Int(1),
+                    TlaValue::Int(2),
+                    TlaValue::Int(3),
+                ]))),
+            ),
+            (
+                "board".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([
+                    TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(1)]))),
+                    TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(3)]))),
+                ]))),
+            ),
+        ]);
+        let ctx = EvalContext::new(&state);
+
+        assert_eq!(
+            eval_expr("Pos \\ UNION board", &ctx).expect("set minus with UNION rhs should work"),
+            TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(2)])))
+        );
+    }
+
+    #[test]
+    fn random_element_picks_a_representative_member() {
+        let state = TlaState::new();
+        let ctx = EvalContext::new(&state);
+
+        assert_eq!(
+            eval_expr("RandomElement({2, 1})", &ctx)
+                .expect("RandomElement should evaluate"),
+            TlaValue::Int(1)
         );
     }
 
