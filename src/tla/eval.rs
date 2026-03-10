@@ -1056,8 +1056,20 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
         let right = eval_expr_inner(rhs, ctx, depth + 1)?.as_int()?;
         return match op {
             "*" => Ok(TlaValue::Int(left * right)),
-            "\\div" => Ok(TlaValue::Int(left / right)),
-            "%" => Ok(TlaValue::Int(left % right)),
+            "\\div" => {
+                if right == 0 {
+                    Err(anyhow!("division by zero"))
+                } else {
+                    Ok(TlaValue::Int(left / right))
+                }
+            }
+            "%" => {
+                if right == 0 {
+                    Err(anyhow!("modulo by zero"))
+                } else {
+                    Ok(TlaValue::Int(left % right))
+                }
+            }
             _ => Err(anyhow!("unsupported multiplicative operator {op}")),
         };
     }
@@ -1405,10 +1417,16 @@ fn parse_base<'a>(
         // Handle ENABLED operator: ENABLED ActionName
         if matches!(name.as_str(), "ENABLED") && !has_runtime_value {
             let action_name_part = rest_after_name.trim_start();
-            // Parse the action name (simple identifier)
             if let Some((action_name, next_rest)) = parse_identifier_prefix(action_name_part) {
-                let value = eval_enabled(&action_name, ctx, depth + 1)?;
-                return Ok((value, next_rest));
+                let mut rest = next_rest.trim_start();
+                let mut args = Vec::new();
+                if rest.starts_with('(') {
+                    let (args_text, tail) = take_bracket_group(rest, '(', ')')?;
+                    args = parse_argument_list(args_text, ctx, depth + 1)?;
+                    rest = tail;
+                }
+                let value = eval_enabled(&action_name, args, ctx, depth + 1)?;
+                return Ok((value, rest));
             } else {
                 return Err(anyhow!("ENABLED expects an action name"));
             }
@@ -1899,8 +1917,13 @@ fn eval_module_instance_ref(
     eval_module_instance_call(alias, name, vec![], ctx, depth)
 }
 
-/// Evaluate ENABLED operator: check if an action is enabled in the current state
-fn eval_enabled(action_name: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<TlaValue> {
+/// Evaluate ENABLED operator: check if an action is enabled in the current state.
+fn eval_enabled(
+    action_name: &str,
+    args: Vec<TlaValue>,
+    ctx: &EvalContext<'_>,
+    depth: usize,
+) -> Result<TlaValue> {
     if depth > MAX_EVAL_DEPTH {
         return Err(anyhow!("ENABLED recursion depth exceeded at {action_name}"));
     }
@@ -1910,13 +1933,21 @@ fn eval_enabled(action_name: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
         .definition(action_name)
         .ok_or_else(|| anyhow!("action '{}' not found for ENABLED", action_name))?;
 
-    // Check if the action has parameters (should be 0 for actions)
-    if !action_def.params.is_empty() {
+    if action_def.params.len() != args.len() {
         return Err(anyhow!(
-            "ENABLED expects a nullary action, but '{}' has {} parameters",
+            "ENABLED action '{}' arity mismatch: expected {}, got {}",
             action_name,
-            action_def.params.len()
+            action_def.params.len(),
+            args.len()
         ));
+    }
+
+    let mut enabled_ctx = ctx.clone();
+    if !args.is_empty() {
+        let locals_mut = Rc::make_mut(&mut enabled_ctx.locals);
+        for (param, arg) in action_def.params.iter().zip(args.into_iter()) {
+            locals_mut.insert(normalize_param_name(param).to_string(), arg);
+        }
     }
 
     // Compile the action to IR
@@ -1924,7 +1955,7 @@ fn eval_enabled(action_name: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
 
     // Try to apply the action to see if it's enabled
     // An action is enabled if it can produce a successor state
-    match apply_action_ir_with_context_multi(&action_ir, ctx.state, ctx) {
+    match apply_action_ir_with_context_multi(&action_ir, ctx.state, &enabled_ctx) {
         Ok(next_states) => Ok(TlaValue::Bool(!next_states.is_empty())),
         Err(_) => {
             // Evaluation error - action is not enabled
@@ -5699,5 +5730,44 @@ mod tests {
         let result = eval_expr("FALSE \\/ UNCHANGED <<x, y>>", &ctx)
             .expect("disjunction with UNCHANGED tuple should evaluate");
         assert_eq!(result, TlaValue::Bool(true));
+    }
+
+    #[test]
+    fn enabled_supports_parameterized_action_calls() {
+        let mut state = TlaState::new();
+        state.insert("x".to_string(), TlaValue::Int(1));
+        state.insert("y".to_string(), TlaValue::Int(2));
+
+        let mut definitions = BTreeMap::new();
+        definitions.insert(
+            "Step".to_string(),
+            TlaDefinition {
+                name: "Step".to_string(),
+                params: vec!["target".to_string()],
+                body: "/\\ x = target /\\ x' = x /\\ UNCHANGED <<y>>".to_string(),
+                is_recursive: false,
+            },
+        );
+
+        let ctx = EvalContext::with_definitions(&state, &definitions);
+
+        let enabled = eval_expr("ENABLED Step(1)", &ctx).expect("ENABLED Step(1)");
+        assert_eq!(enabled, TlaValue::Bool(true));
+
+        let disabled = eval_expr("ENABLED Step(2)", &ctx).expect("ENABLED Step(2)");
+        assert_eq!(disabled, TlaValue::Bool(false));
+    }
+
+    #[test]
+    fn multiplicative_ops_return_errors_for_zero_divisors() {
+        let state = TlaState::new();
+        let definitions = BTreeMap::new();
+        let ctx = EvalContext::with_definitions(&state, &definitions);
+
+        let div_err = eval_expr("5 \\div 0", &ctx).expect_err("division by zero should error");
+        assert!(div_err.to_string().contains("division by zero"));
+
+        let mod_err = eval_expr("5 % 0", &ctx).expect_err("modulo by zero should error");
+        assert!(mod_err.to_string().contains("modulo by zero"));
     }
 }

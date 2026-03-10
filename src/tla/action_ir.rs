@@ -150,6 +150,40 @@ pub fn compile_action_ir(def: &TlaDefinition) -> ActionIr {
     }
 }
 
+/// Compile an action into one or more IR branches for expression probing.
+///
+/// `analyze-tla` evaluates action clauses independently. For actions written as
+/// a top-level disjunction of conjunctive branches, we need to probe each branch
+/// separately instead of feeding raw `\/` separators into `compile_action_ir`.
+pub fn compile_action_ir_branches(def: &TlaDefinition) -> Vec<ActionIr> {
+    let trimmed = def.body.trim();
+    let disjuncts = split_top_level(trimmed, "\\/");
+    let has_top_level_disjunction = disjuncts.len() > 1 || trimmed.starts_with("\\/");
+
+    let branch_bodies = if has_top_level_disjunction {
+        disjuncts
+    } else {
+        vec![trimmed.to_string()]
+    };
+
+    branch_bodies
+        .into_iter()
+        .filter_map(|body| {
+            let body = body.trim().to_string();
+            if body.is_empty() {
+                return None;
+            }
+
+            Some(compile_action_ir(&TlaDefinition {
+                name: def.name.clone(),
+                params: def.params.clone(),
+                body,
+                is_recursive: def.is_recursive,
+            }))
+        })
+        .collect()
+}
+
 pub fn looks_like_action(def: &TlaDefinition) -> bool {
     // Filter out THEOREM/LEMMA/proof definitions that contain primes
     // in proof steps but are not actual action definitions
@@ -346,5 +380,35 @@ mod tests {
         .expect("expected existential action clause");
         assert_eq!(clause.0, "targets \\in SUBSET staleSlots");
         assert!(clause.1.contains("writeTargets' = targets"));
+    }
+
+    #[test]
+    fn compiles_top_level_disjunctive_actions_as_probe_branches() {
+        let def = TlaDefinition {
+            name: "Receive".to_string(),
+            params: vec!["i".to_string()],
+            body: r#"
+  \/ /\ pc[i] = "SENT"
+     /\ x' = x + 1
+     /\ UNCHANGED <<y>>
+  \/ /\ pc[i] = "SENT"
+     /\ y' = y + 1
+     /\ UNCHANGED <<x>>
+"#
+            .to_string(),
+            is_recursive: false,
+        };
+
+        let branches = compile_action_ir_branches(&def);
+        assert_eq!(branches.len(), 2);
+
+        for branch in branches {
+            assert!(!branch.clauses.is_empty());
+            assert!(
+                !branch.clauses.iter().any(
+                    |clause| matches!(clause, ActionClause::Guard { expr } if expr.trim() == "\\/")
+                )
+            );
+        }
     }
 }
