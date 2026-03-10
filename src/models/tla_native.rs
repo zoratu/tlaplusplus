@@ -2095,4 +2095,109 @@ NEXT Next
         // Clean up
         let _ = fs::remove_dir_all(&tmp);
     }
+
+    #[test]
+    fn generated_model_separators_do_not_break_operator_ref_init_resolution() {
+        let tmp = std::env::temp_dir().join("tlapp-generated-model-separators");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should be created");
+
+        let consensus = tmp.join("Consensus.tla");
+        fs::write(
+            &consensus,
+            r#"
+---- MODULE Consensus ----
+VARIABLE chosen
+Init == chosen = {}
+Next == UNCHANGED chosen
+Spec == Init /\ [][Next]_<<chosen>>
+====
+"#,
+        )
+        .expect("consensus module should be written");
+
+        let voting = tmp.join("Voting.tla");
+        fs::write(
+            &voting,
+            r#"
+---- MODULE Voting ----
+EXTENDS Integers
+CONSTANTS Value, Acceptor, Quorum
+Ballot == Nat
+VARIABLES votes, maxBal
+Init == /\ votes  = [a \in Acceptor |-> {}]
+        /\ maxBal = [a \in Acceptor |-> -1]
+IncreaseMaxBal(a, b) ==
+    /\ b > maxBal[a]
+    /\ maxBal' = [maxBal EXCEPT ![a] = b]
+    /\ UNCHANGED votes
+VoteFor(a, b, v) ==
+    /\ maxBal[a] =< b
+    /\ votes' = [votes EXCEPT ![a] = votes[a] \cup {<<b, v>>}]
+    /\ maxBal' = [maxBal EXCEPT ![a] = b]
+Next == \E a \in Acceptor, b \in Ballot :
+            \/ IncreaseMaxBal(a, b)
+            \/ \E v \in Value : VoteFor(a, b, v)
+chosen == {}
+C == INSTANCE Consensus WITH chosen <- chosen
+Spec == Init /\ [][Next]_<<votes, maxBal>>
+====
+"#,
+        )
+        .expect("voting module should be written");
+
+        let model = tmp.join("GeneratedVoting.tla");
+        fs::write(
+            &model,
+            r#"
+---- MODULE GeneratedVoting ----
+EXTENDS Voting, TLC
+CONSTANTS a1, a2, v1, v2
+
+const_acceptor ==
+{a1, a2}
+----
+
+const_value ==
+{v1, v2}
+----
+
+const_quorum ==
+{{a1, a2}}
+----
+
+def_ballot ==
+0..2
+----
+
+====
+"#,
+        )
+        .expect("generated model should be written");
+
+        let cfg = tmp.join("GeneratedVoting.cfg");
+        fs::write(
+            &cfg,
+            r#"
+CONSTANT Acceptor <- const_acceptor
+CONSTANT Value <- const_value
+CONSTANT Quorum <- const_quorum
+CONSTANT Ballot <- def_ballot
+SPECIFICATION Spec
+"#,
+        )
+        .expect("cfg should be written");
+
+        let model = TlaModel::from_files(&model, Some(&cfg), None, None)
+            .expect("generated model should build");
+        let init = model.initial_states();
+
+        assert_eq!(init.len(), 1);
+        let votes = init[0].get("votes").expect("votes should be defined");
+        let max_bal = init[0].get("maxBal").expect("maxBal should be defined");
+        assert!(matches!(votes, TlaValue::Function(_)));
+        assert!(matches!(max_bal, TlaValue::Function(_)));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
 }

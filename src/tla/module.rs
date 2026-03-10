@@ -402,6 +402,13 @@ pub fn parse_tla_module_text(input: &str) -> Result<TlaModule> {
             continue;
         }
 
+        if trimmed.starts_with("ASSUME") || trimmed.starts_with("AXIOM") {
+            flush_definition(&mut module, &mut current_def);
+            current_def_indent = 0;
+            mode = NameListMode::None;
+            continue;
+        }
+
         if let Some(rest) = trimmed.strip_prefix("EXTENDS") {
             flush_definition(&mut module, &mut current_def);
             current_def_indent = 0;
@@ -861,7 +868,7 @@ fn is_pure_name_list(line: &str) -> bool {
 
 fn is_section_separator(line: &str) -> bool {
     let trimmed = line.trim();
-    trimmed.len() >= 5 && trimmed.chars().all(|c| c == '-')
+    trimmed.len() >= 4 && trimmed.chars().all(|c| c == '-')
 }
 
 fn strip_comments(input: &str) -> String {
@@ -1999,5 +2006,57 @@ Next == LET empty == Pos \ UNION board
                 .body
                 .starts_with("LET empty ==")
         );
+    }
+
+    #[test]
+    fn strips_tlc_generated_definition_separators() {
+        let src = r#"
+---- MODULE GeneratedModel ----
+CONSTANTS a1, a2
+
+const_vals ==
+{a1, a2}
+----
+
+def_ov ==
+0..2
+----
+====
+"#;
+
+        let module = parse_tla_module_text(src).expect("parse should work");
+        assert_eq!(
+            module
+                .definitions
+                .get("const_vals")
+                .map(|def| def.body.trim_end()),
+            Some("{a1, a2}")
+        );
+        assert_eq!(
+            module
+                .definitions
+                .get("def_ov")
+                .map(|def| def.body.trim_end()),
+            Some("0..2")
+        );
+    }
+
+    #[test]
+    fn top_level_assume_does_not_extend_previous_definition() {
+        let src = r#"
+---- MODULE SpanTreeRandomLike ----
+Edges ==
+  UNION {{1}, {2}}
+
+ASSUME TRUE
+====
+"#;
+
+        let module = parse_tla_module_text(src).expect("parse should work");
+        let edges = module
+            .definitions
+            .get("Edges")
+            .expect("Edges should be defined");
+        assert_eq!(edges.body.trim(), "UNION {{1}, {2}}");
     }
 }
