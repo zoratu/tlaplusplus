@@ -661,7 +661,7 @@ fn find_top_level_keyword_index(expr: &str, keyword: &str) -> Option<usize> {
             && brace == 0
             && angle == 0
             && expr[i..].starts_with(keyword)
-            && has_word_boundaries(expr, i, i + keyword.len())
+            && has_keyword_boundaries(expr, i, i + keyword.len(), keyword)
         {
             return Some(i);
         }
@@ -732,6 +732,14 @@ fn has_word_boundaries(expr: &str, start: usize, end: usize) -> bool {
     let next_ok = next.map(|c| !is_word_char(c)).unwrap_or(true);
 
     prev_ok && next_ok
+}
+
+fn has_keyword_boundaries(expr: &str, start: usize, end: usize, keyword: &str) -> bool {
+    if keyword.starts_with('\\') {
+        let next = expr[end..].chars().next();
+        return next.map(|c| !c.is_alphabetic()).unwrap_or(true);
+    }
+    has_word_boundaries(expr, start, end)
 }
 
 fn is_word_char(c: char) -> bool {
@@ -999,5 +1007,32 @@ mod tests {
         // Mixed
         assert!(contains_top_level_disjunction(r"A \/ (B /\ C)"));
         assert!(contains_top_level_disjunction(r"(A /\ B) \/ C"));
+    }
+
+    #[test]
+    fn probes_exists_action_call_with_compact_binder() {
+        let defs = BTreeMap::from([(
+            "Inc".to_string(),
+            TlaDefinition {
+                name: "Inc".to_string(),
+                params: vec!["p".to_string()],
+                body: "/\\ count' = count /\\ UNCHANGED <<flag>>".to_string(),
+                is_recursive: false,
+            },
+        )]);
+
+        let state = TlaState::from([
+            ("count".to_string(), TlaValue::Int(1)),
+            ("flag".to_string(), TlaValue::Bool(true)),
+            (
+                "Proc".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(1)]))),
+            ),
+        ]);
+
+        let probe = probe_next_disjuncts("\\E p\\in Proc : Inc(p)", &defs, &state);
+        assert_eq!(probe.supported_disjuncts, 1);
+        assert_eq!(probe.generated_successors, 1);
+        assert!(probe.failures.is_empty());
     }
 }

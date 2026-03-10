@@ -18,7 +18,7 @@ pub use action_exec::{
 pub use action_ir::{
     ActionClause, ActionIr, compile_action_ir, compile_action_ir_branches, looks_like_action,
 };
-pub use cfg::{ConfigValue, TlaConfig, parse_tla_config};
+pub use cfg::{ConfigValue, TlaConfig, normalize_operator_ref_name, parse_tla_config};
 pub use compiled_eval::{
     apply_compiled_action_ir, apply_compiled_action_ir_multi, eval_compiled, eval_compiled_guard,
 };

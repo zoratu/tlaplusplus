@@ -6,8 +6,8 @@ use crate::tla::{
     TlaConfig, TlaDefinition, TlaModule, TlaState, TlaValue, classify_clause, compile_action_ir,
     compile_expr, eval_action_constraint, eval_compiled, eval_expr,
     evaluate_next_states_labeled_with_instances, evaluate_next_states_with_instances,
-    insert_compiled_action, looks_like_action, parse_tla_config, parse_tla_module_file,
-    split_top_level,
+    insert_compiled_action, looks_like_action, normalize_operator_ref_name, parse_tla_config,
+    parse_tla_module_file, split_top_level,
 };
 use anyhow::{Context, Result, anyhow};
 use std::collections::{BTreeMap, HashSet};
@@ -899,7 +899,10 @@ fn evaluate_init_states(
     for (k, v) in &cfg.constants {
         match v {
             ConfigValue::OperatorRef(name) => {
-                deferred_operator_refs.push((k.clone(), name.clone()));
+                deferred_operator_refs.push((
+                    k.clone(),
+                    normalize_operator_ref_name(name).to_string(),
+                ));
             }
             _ => {
                 if let Some(tv) = config_value_to_tla(v) {
@@ -1187,15 +1190,29 @@ fn extract_fairness_from_formula(
 /// zero-parameter operator definitions for each constant.
 fn inject_constants_into_definitions(module: &mut TlaModule, config: &TlaConfig) {
     for (name, value) in &config.constants {
-        // Convert ConfigValue to a TLA+ expression string
-        let body = config_value_to_expr(value);
+        let (params, body) = match value {
+            ConfigValue::OperatorRef(target_name) => {
+                let target_name = normalize_operator_ref_name(target_name);
+                if let Some(target_def) = module.definitions.get(target_name) {
+                    let params = target_def.params.clone();
+                    let body = if params.is_empty() {
+                        target_name.to_string()
+                    } else {
+                        format!("{target_name}({})", params.join(", "))
+                    };
+                    (params, body)
+                } else {
+                    (Vec::new(), target_name.to_string())
+                }
+            }
+            _ => (Vec::new(), config_value_to_expr(value)),
+        };
 
-        // Add as a zero-parameter definition
         module.definitions.insert(
             name.clone(),
             TlaDefinition {
                 name: name.clone(),
-                params: vec![],
+                params,
                 body,
                 is_recursive: false,
             },
@@ -1224,7 +1241,7 @@ fn config_value_to_expr(value: &ConfigValue) -> String {
             let items: Vec<String> = values.iter().map(config_value_to_expr).collect();
             format!("<<{}>>", items.join(", "))
         }
-        ConfigValue::OperatorRef(name) => name.clone(),
+        ConfigValue::OperatorRef(name) => normalize_operator_ref_name(name).to_string(),
     }
 }
 

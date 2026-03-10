@@ -11,7 +11,8 @@ use tlaplusplus::tla::module::TlaModuleInstance;
 use tlaplusplus::tla::{
     ActionClause, ClauseKind, ConfigValue, EvalContext, TlaConfig, TlaDefinition, TlaModule,
     TlaState, TlaValue, classify_clause, compile_action_ir, compile_action_ir_branches, eval_expr,
-    eval_let_action_multi, looks_like_action, normalize_param_name, parse_tla_config,
+    eval_let_action_multi, looks_like_action, normalize_operator_ref_name, normalize_param_name,
+    parse_tla_config,
     parse_tla_module_file, scan_module_closure, split_top_level,
 };
 use tlaplusplus::{EngineConfig, run_model};
@@ -995,7 +996,10 @@ fn main() -> anyhow::Result<()> {
                 for (k, v) in &cfg.constants {
                     match v {
                         ConfigValue::OperatorRef(name) => {
-                            deferred_operator_refs.push((k.clone(), name.clone()));
+                            deferred_operator_refs.push((
+                                k.clone(),
+                                normalize_operator_ref_name(name).to_string(),
+                            ));
                         }
                         _ => {
                             if let Some(tv) = config_value_to_tla(v) {
@@ -1865,15 +1869,29 @@ fn format_num(n: u64) -> String {
 /// resolve them properly.
 fn inject_constants_into_definitions(module: &mut TlaModule, config: &TlaConfig) {
     for (name, value) in &config.constants {
-        // Convert ConfigValue to a TLA+ expression string
-        let body = config_value_to_expr(value);
+        let (params, body) = match value {
+            ConfigValue::OperatorRef(target_name) => {
+                let target_name = normalize_operator_ref_name(target_name);
+                if let Some(target_def) = module.definitions.get(target_name) {
+                    let params = target_def.params.clone();
+                    let body = if params.is_empty() {
+                        target_name.to_string()
+                    } else {
+                        format!("{target_name}({})", params.join(", "))
+                    };
+                    (params, body)
+                } else {
+                    (Vec::new(), target_name.to_string())
+                }
+            }
+            _ => (Vec::new(), config_value_to_expr(value)),
+        };
 
-        // Add as a zero-parameter definition
         module.definitions.insert(
             name.clone(),
             TlaDefinition {
                 name: name.clone(),
-                params: vec![],
+                params,
                 body,
                 is_recursive: false,
             },
@@ -1902,7 +1920,7 @@ fn config_value_to_expr(value: &ConfigValue) -> String {
             let items: Vec<String> = values.iter().map(config_value_to_expr).collect();
             format!("<<{}>>", items.join(", "))
         }
-        ConfigValue::OperatorRef(name) => name.clone(),
+        ConfigValue::OperatorRef(name) => normalize_operator_ref_name(name).to_string(),
     }
 }
 
@@ -2537,15 +2555,73 @@ fn parse_probe_action_if(expr: &str) -> Option<(&str, &str, &str)> {
     }
     let rest = rest.trim_start();
 
-    let then_idx = find_probe_top_level_keyword(rest, "THEN")?;
+    let then_idx = find_probe_outer_then(rest)?;
     let condition = rest[..then_idx].trim();
     let after_then = rest[then_idx + "THEN".len()..].trim();
 
-    let else_idx = find_probe_top_level_keyword(after_then, "ELSE")?;
+    let else_idx = find_probe_outer_else(after_then)?;
     let then_branch = after_then[..else_idx].trim();
     let else_branch = after_then[else_idx + "ELSE".len()..].trim();
 
     Some((condition, then_branch, else_branch))
+}
+
+fn next_probe_word(input: &str, from: usize) -> Option<(&str, usize, usize)> {
+    let mut i = from;
+    while i < input.len() {
+        let ch = input[i..].chars().next()?;
+        let len = ch.len_utf8();
+        if ch.is_ascii_alphabetic() || ch == '_' {
+            break;
+        }
+        i += len;
+    }
+
+    if i >= input.len() {
+        return None;
+    }
+
+    let start = i;
+    while i < input.len() {
+        let ch = input[i..].chars().next()?;
+        let len = ch.len_utf8();
+        if !(ch.is_ascii_alphanumeric() || ch == '_') {
+            break;
+        }
+        i += len;
+    }
+
+    Some((&input[start..i], start, i))
+}
+
+fn find_probe_outer_then(input: &str) -> Option<usize> {
+    let mut nested_if = 0usize;
+    let mut i = 0usize;
+    while let Some((word, start, end)) = next_probe_word(input, i) {
+        match word {
+            "IF" => nested_if += 1,
+            "THEN" if nested_if == 0 => return Some(start),
+            "ELSE" if nested_if > 0 => nested_if = nested_if.saturating_sub(1),
+            _ => {}
+        }
+        i = end;
+    }
+    None
+}
+
+fn find_probe_outer_else(input: &str) -> Option<usize> {
+    let mut nested_if = 0usize;
+    let mut i = 0usize;
+    while let Some((word, start, end)) = next_probe_word(input, i) {
+        match word {
+            "IF" => nested_if += 1,
+            "ELSE" if nested_if == 0 => return Some(start),
+            "ELSE" => nested_if = nested_if.saturating_sub(1),
+            _ => {}
+        }
+        i = end;
+    }
+    None
 }
 
 fn parse_probe_identifier_prefix(expr: &str) -> Option<(String, &str)> {
@@ -4165,5 +4241,68 @@ mod tests {
         assert!(!normalized.contains("\\*"));
         assert!(normalized.trim_start().starts_with("\\/ CounterPath(mode)"));
         assert!(normalized.contains("StandardPath(mode)"));
+    }
+
+    #[test]
+    fn parse_probe_action_if_handles_nested_if_then_branch() {
+        let expr = r#"
+            IF meetingPlace = MeetingPlaceEmpty
+            THEN IF numMeetings < N
+                    THEN /\ meetingPlace' = cid
+                         /\ UNCHANGED <<chameneoses, numMeetings>>
+                    ELSE /\ chameneoses' = [chameneoses EXCEPT ![cid] = <<Faded, @[2]>>]
+                         /\ UNCHANGED <<meetingPlace, numMeetings>>
+            ELSE /\ meetingPlace' = MeetingPlaceEmpty
+        "#;
+
+        let (_, then_branch, else_branch) =
+            parse_probe_action_if(expr).expect("nested IF should parse");
+        assert!(then_branch.starts_with("IF numMeetings < N"));
+        assert!(then_branch.contains("ELSE /\\ chameneoses'"));
+        assert_eq!(else_branch, "/\\ meetingPlace' = MeetingPlaceEmpty");
+    }
+
+    #[test]
+    fn injects_operator_ref_constants_with_target_arity() {
+        let mut module = TlaModule {
+            name: "MCWriteThroughCache".to_string(),
+            path: String::new(),
+            extends: Vec::new(),
+            constants: vec![],
+            variables: vec![],
+            definitions: BTreeMap::from([(
+                "MCSend".to_string(),
+                TlaDefinition {
+                    name: "MCSend".to_string(),
+                    params: vec![
+                        "p".to_string(),
+                        "d".to_string(),
+                        "oldMemInt".to_string(),
+                        "newMemInt".to_string(),
+                    ],
+                    body: "newMemInt = <<p, d>>".to_string(),
+                    is_recursive: false,
+                },
+            )]),
+            recursive_declarations: BTreeSet::new(),
+            instances: BTreeMap::new(),
+            unnamed_instances: Vec::new(),
+            is_pluscal: false,
+        };
+        let config = TlaConfig {
+            constants: BTreeMap::from([(
+                "Send".to_string(),
+                ConfigValue::OperatorRef("MCSend".to_string()),
+            )]),
+            ..TlaConfig::default()
+        };
+
+        inject_constants_into_definitions(&mut module, &config);
+        let send = module
+            .definitions
+            .get("Send")
+            .expect("Send alias should be injected");
+        assert_eq!(send.params, vec!["p", "d", "oldMemInt", "newMemInt"]);
+        assert_eq!(send.body, "MCSend(p, d, oldMemInt, newMemInt)");
     }
 }

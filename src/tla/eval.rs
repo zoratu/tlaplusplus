@@ -1578,7 +1578,7 @@ fn parse_base<'a>(
     if let Some((name, rest_after_name)) = parse_identifier_prefix(s) {
         let mut rest = rest_after_name;
         let has_runtime_value = ctx.runtime_value(&name).is_some();
-        let has_operator = ctx.definition(&name).is_some();
+        let operator_param_count = ctx.definition(&name).map(|def| def.params.len());
 
         // Check for module instance operator: Alias!Operator
         if rest.trim_start().starts_with('!') {
@@ -1609,7 +1609,10 @@ fn parse_base<'a>(
             return Ok((value, next_rest));
         }
 
-        if !has_runtime_value && has_operator && rest.trim_start().starts_with('[') {
+        if !has_runtime_value
+            && operator_param_count.unwrap_or(0) > 0
+            && rest.trim_start().starts_with('[')
+        {
             let trimmed_rest = rest.trim_start();
             let (args_text, next_rest) = take_bracket_group(trimmed_rest, '[', ']')?;
             let args = parse_argument_list(args_text, ctx, depth + 1)?;
@@ -4075,7 +4078,7 @@ fn find_top_level_keyword_index(expr: &str, keyword: &str) -> Option<usize> {
             && brace == 0
             && angle == 0
             && expr[i..].starts_with(keyword)
-            && has_word_boundaries(expr, i, i + keyword.len())
+            && has_keyword_boundaries(expr, i, i + keyword.len(), keyword)
         {
             return Some(i);
         }
@@ -4369,6 +4372,14 @@ fn has_word_boundaries(expr: &str, start: usize, end: usize) -> bool {
     let next_ok = next.map(|c| !is_word_char(c)).unwrap_or(true);
 
     prev_ok && next_ok
+}
+
+fn has_keyword_boundaries(expr: &str, start: usize, end: usize, keyword: &str) -> bool {
+    if keyword.starts_with('\\') {
+        let next = expr[end..].chars().next();
+        return next.map(|c| !c.is_alphabetic()).unwrap_or(true);
+    }
+    has_word_boundaries(expr, start, end)
 }
 
 fn is_word_char(c: char) -> bool {
@@ -6488,5 +6499,41 @@ mod tests {
 
         let mod_err = eval_expr("5 % 0", &ctx).expect_err("modulo by zero should error");
         assert!(mod_err.to_string().contains("modulo by zero"));
+    }
+
+    #[test]
+    fn parses_compact_quantifier_binders_without_space_before_in() {
+        let state = TlaState::new();
+        let defs = BTreeMap::from([(
+            "Proc".to_string(),
+            TlaDefinition {
+                name: "Proc".to_string(),
+                params: vec![],
+                body: "{1, 2}".to_string(),
+                is_recursive: false,
+            },
+        )]);
+        let ctx = EvalContext::with_definitions(&state, &defs);
+        let result = eval_expr("\\A p\\in Proc : p \\in Proc", &ctx)
+            .expect("compact binder should evaluate");
+        assert_eq!(result, TlaValue::Bool(true));
+    }
+
+    #[test]
+    fn bracket_applies_zero_arg_operator_result_as_function() {
+        let state = TlaState::new();
+        let defs = BTreeMap::from([(
+            "Transition".to_string(),
+            TlaDefinition {
+                name: "Transition".to_string(),
+                params: vec![],
+                body: "[\"s0\" |-> [\"H\" |-> \"1\", \"T\" |-> \"2\"]]".to_string(),
+                is_recursive: false,
+            },
+        )]);
+        let ctx = EvalContext::with_definitions(&state, &defs);
+        let value = eval_expr("Transition[\"s0\"][\"H\"]", &ctx)
+            .expect("zero-arg operator result should be indexable");
+        assert_eq!(value, TlaValue::String("1".to_string()));
     }
 }
