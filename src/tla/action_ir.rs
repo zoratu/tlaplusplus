@@ -48,12 +48,19 @@ pub(crate) fn split_action_body_clauses(expr: &str) -> Vec<String> {
     let mut idx = 0usize;
     while idx < raw.len() {
         let part = raw[idx].trim().to_string();
+        if part.is_empty() {
+            idx += 1;
+            continue;
+        }
         let starts_quant = part.starts_with("\\E") || part.starts_with("\\A");
         let open_quant_or_let = (starts_quant && (part.ends_with(':') || part.ends_with("IN")))
             || (part.starts_with("LET") && part.ends_with("IN"));
         if open_quant_or_let {
             let mut combined = part;
             for rest in raw.iter().skip(idx + 1) {
+                if rest.trim().is_empty() {
+                    continue;
+                }
                 combined.push_str(" /\\ ");
                 combined.push_str(rest.trim());
             }
@@ -484,5 +491,23 @@ mod tests {
         assert!(!clauses[1].contains("nextFloor \\in Floor"));
         assert_eq!(clauses[2], "nextFloor \\in Floor");
         assert_eq!(clauses[3], "state' = nextState");
+    }
+
+    #[test]
+    fn split_action_body_clauses_ignores_leading_empty_conjuncts() {
+        let clauses = split_action_body_clauses(
+            r#"
+                /\ \/ /\ rmState[self] = "working"
+                      /\ rmState' = [rmState EXCEPT ![self] = "prepared"]
+                   \/ /\ tmState = "commit"
+                      /\ rmState' = [rmState EXCEPT ![self] = "committed"]
+                /\ pc' = [pc EXCEPT ![self] = "RS"]
+            "#,
+        );
+
+        assert_eq!(clauses.len(), 2);
+        assert!(!clauses.iter().any(|clause| clause.trim().is_empty()));
+        assert!(clauses[0].starts_with(r#"\/ /\ rmState[self] = "working""#));
+        assert_eq!(clauses[1], r#"pc' = [pc EXCEPT ![self] = "RS"]"#);
     }
 }
