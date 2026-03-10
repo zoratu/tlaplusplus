@@ -895,10 +895,45 @@ fn evaluate_init_states(
 
     // Start with constants from config
     let mut base_state = BTreeMap::new();
+    let mut deferred_operator_refs = Vec::new();
     for (k, v) in &cfg.constants {
-        if let Some(tv) = config_value_to_tla(v) {
-            base_state.insert(k.clone(), tv);
+        match v {
+            ConfigValue::OperatorRef(name) => {
+                deferred_operator_refs.push((k.clone(), name.clone()));
+            }
+            _ => {
+                if let Some(tv) = config_value_to_tla(v) {
+                    base_state.insert(k.clone(), tv);
+                }
+            }
         }
+    }
+    for _ in 0..deferred_operator_refs.len().saturating_add(1) {
+        if deferred_operator_refs.is_empty() {
+            break;
+        }
+
+        let mut progress = false;
+        let mut next_deferred = Vec::new();
+        for (name, ref_name) in deferred_operator_refs {
+            let ctx = EvalContext::with_definitions_and_instances(
+                &base_state,
+                &module.definitions,
+                &module.instances,
+            );
+            match eval_expr(&ref_name, &ctx) {
+                Ok(value) => {
+                    base_state.insert(name, value);
+                    progress = true;
+                }
+                Err(_) => next_deferred.push((name, ref_name)),
+            }
+        }
+
+        if !progress {
+            break;
+        }
+        deferred_operator_refs = next_deferred;
     }
 
     // Classify all clauses

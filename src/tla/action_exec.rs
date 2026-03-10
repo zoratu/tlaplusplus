@@ -2,7 +2,7 @@ use crate::fairness::{ActionLabel, LabeledTransition};
 use crate::tla::eval::apply_action_ir_with_context_multi;
 use crate::tla::module::TlaModuleInstance;
 use crate::tla::{
-    CompiledActionIr, EvalContext, TlaDefinition, TlaState, TlaValue,
+    ActionClause, ActionIr, CompiledActionIr, EvalContext, TlaDefinition, TlaState, TlaValue,
     apply_compiled_action_ir_multi, compile_action_ir, eval_expr, normalize_param_name,
     split_top_level,
 };
@@ -240,6 +240,28 @@ fn execute_branch(
             instances,
             state,
         );
+    }
+
+    if trimmed.starts_with("LET") {
+        let mut ctx = if let Some(inst) = instances {
+            EvalContext::with_definitions_and_instances(state, definitions, inst)
+        } else {
+            EvalContext::with_definitions(state, definitions)
+        };
+        {
+            let locals_mut = std::rc::Rc::make_mut(&mut ctx.locals);
+            for (name, value) in locals {
+                locals_mut.insert(name.clone(), value.clone());
+            }
+        }
+        let action = ActionIr {
+            name: "__LetBranch__".to_string(),
+            params: vec![],
+            clauses: vec![ActionClause::LetWithPrimes {
+                expr: trimmed.to_string(),
+            }],
+        };
+        return apply_action_ir_with_context_multi(&action, state, &ctx);
     }
 
     // Try to parse as an action call
@@ -927,6 +949,36 @@ mod tests {
         ]);
 
         let probe = probe_next_disjuncts("Move()", &defs, &state);
+        assert_eq!(probe.supported_disjuncts, 1);
+        assert_eq!(probe.generated_successors, 1);
+        assert!(probe.failures.is_empty());
+    }
+
+    #[test]
+    fn probes_top_level_let_branches() {
+        let state = TlaState::from([
+            (
+                "Pos".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([
+                    TlaValue::Int(1),
+                    TlaValue::Int(2),
+                    TlaValue::Int(3),
+                ]))),
+            ),
+            (
+                "board".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([
+                    TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(1)]))),
+                    TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(3)]))),
+                ]))),
+            ),
+        ]);
+
+        let probe = probe_next_disjuncts(
+            "LET empty == Pos \\ UNION board IN \\E e \\in empty : board' = board",
+            &BTreeMap::new(),
+            &state,
+        );
         assert_eq!(probe.supported_disjuncts, 1);
         assert_eq!(probe.generated_successors, 1);
         assert!(probe.failures.is_empty());
