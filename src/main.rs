@@ -11,9 +11,10 @@ use tlaplusplus::tla::module::TlaModuleInstance;
 use tlaplusplus::tla::{
     ActionClause, ClauseKind, ConfigValue, EvalContext, TlaConfig, TlaDefinition, TlaModule,
     TlaState, TlaValue, classify_clause, compile_action_ir, compile_action_ir_branches, eval_expr,
-    eval_let_action_multi, looks_like_action, normalize_operator_ref_name, normalize_param_name,
-    parse_tla_config,
+    eval_action_body_multi, eval_let_action_multi, looks_like_action, normalize_operator_ref_name,
+    normalize_param_name, parse_tla_config,
     parse_tla_module_file, scan_module_closure, split_top_level,
+    split_action_body_disjuncts,
 };
 use tlaplusplus::{EngineConfig, run_model};
 
@@ -3093,12 +3094,50 @@ fn probe_action_body_into_ctx(body: &str, ctx: &mut EvalContext<'_>) -> anyhow::
     Ok(())
 }
 
+fn probe_action_body_via_runtime_eval(
+    body: &str,
+    ctx: &mut EvalContext<'_>,
+) -> Option<anyhow::Result<()>> {
+    let normalized = strip_probe_comments(body);
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() || !trimmed.contains('\'') {
+        return None;
+    }
+    if !(trimmed.contains("\\/") || trimmed.starts_with("IF ") || trimmed.starts_with("IF\n")) {
+        return None;
+    }
+
+    let staged = current_probe_staged_primes(ctx);
+    Some(eval_action_body_multi(trimmed, ctx, &staged).map(|branches| {
+        let Some((next_staged, _)) = branches
+            .into_iter()
+            .max_by_key(|(candidate, _)| {
+                candidate
+                    .iter()
+                    .filter(|(var, value)| {
+                        staged
+                            .get(*var)
+                            .or_else(|| ctx.state.get(*var))
+                            .is_none_or(|baseline| baseline != *value)
+                    })
+                    .count()
+            })
+        else {
+            return;
+        };
+        let locals_mut = std::rc::Rc::make_mut(&mut ctx.locals);
+        for (var, value) in next_staged {
+            locals_mut.insert(format!("{var}'"), value);
+        }
+    }))
+}
+
 fn probe_disjunctive_action_body(
     expr: &str,
     ctx: &mut EvalContext<'_>,
 ) -> Option<anyhow::Result<()>> {
     let trimmed = strip_probe_outer_parens(expr.trim());
-    let disjuncts = split_top_level(trimmed, "\\/");
+    let disjuncts = split_action_body_disjuncts(trimmed);
     if disjuncts.len() <= 1 && !trimmed.starts_with("\\/") {
         return None;
     }
@@ -3106,7 +3145,12 @@ fn probe_disjunctive_action_body(
     let mut first_err = None;
     for disjunct in disjuncts {
         let mut branch_ctx = ctx.clone();
-        match probe_action_body_into_ctx(&disjunct, &mut branch_ctx) {
+        let attempt = if let Some(result) = probe_action_body_via_runtime_eval(&disjunct, &mut branch_ctx) {
+            result
+        } else {
+            probe_action_body_into_ctx(&disjunct, &mut branch_ctx)
+        };
+        match attempt {
             Ok(()) => {
                 merge_staged_prime_locals(&branch_ctx, ctx);
                 return Some(Ok(()));
@@ -3247,7 +3291,13 @@ fn probe_action_clause_expr(
                         .and_then(|value| value.as_bool())
                         .and_then(|take_then| {
                             let branch = if take_then { then_branch } else { else_branch };
-                            probe_action_body_into_ctx(branch, &mut branch_ctx)
+                            if let Some(result) =
+                                probe_action_body_via_runtime_eval(branch, &mut branch_ctx)
+                            {
+                                result
+                            } else {
+                                probe_action_body_into_ctx(branch, &mut branch_ctx)
+                            }
                         })
                         .map(|_| {
                             merge_staged_prime_locals(&branch_ctx, ctx);
@@ -5526,6 +5576,111 @@ Spec
         assert!(then_branch.starts_with("IF numMeetings < N"));
         assert!(then_branch.contains("ELSE /\\ chameneoses'"));
         assert_eq!(else_branch, "/\\ meetingPlace' = MeetingPlaceEmpty");
+    }
+
+    #[test]
+    fn expr_probe_handles_pluscal_style_disjunctive_if_action_branches() {
+        let rm1 = TlaValue::ModelValue("rm1".to_string());
+        let rm2 = TlaValue::ModelValue("rm2".to_string());
+        let rm3 = TlaValue::ModelValue("rm3".to_string());
+        let state = TlaState::from([
+            (
+                "rmState".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([
+                    (rm1.clone(), TlaValue::String("working".to_string())),
+                    (rm2.clone(), TlaValue::String("working".to_string())),
+                    (rm3.clone(), TlaValue::String("prepared".to_string())),
+                ]))),
+            ),
+            ("tmState".to_string(), TlaValue::String("commit".to_string())),
+            (
+                "pc".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([
+                    (rm1.clone(), TlaValue::String("RS".to_string())),
+                    (rm2.clone(), TlaValue::String("RS".to_string())),
+                    (rm3.clone(), TlaValue::String("RS".to_string())),
+                ]))),
+            ),
+        ]);
+        let defs = BTreeMap::from([
+            (
+                "RM".to_string(),
+                TlaDefinition {
+                    name: "RM".to_string(),
+                    params: vec![],
+                    body: "{rm1, rm2, rm3}".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "RMMAYFAIL".to_string(),
+                TlaDefinition {
+                    name: "RMMAYFAIL".to_string(),
+                    params: vec![],
+                    body: "TRUE".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "RS".to_string(),
+                TlaDefinition {
+                    name: "RS".to_string(),
+                    params: vec!["self".to_string()],
+                    body: r#"
+                        /\ pc[self] = "RS"
+                        /\ IF rmState[self] \in {"working", "prepared"}
+                              THEN /\ \/ /\ rmState[self] = "working"
+                                         /\ rmState' = [rmState EXCEPT ![self] = "prepared"]
+                                      \/ /\ \/ /\ tmState="commit"
+                                               /\ rmState' = [rmState EXCEPT ![self] = "committed"]
+                                            \/ /\ rmState[self]="working" \/ tmState="abort"
+                                               /\ rmState' = [rmState EXCEPT ![self] = "aborted"]
+                                      \/ /\ IF RMMAYFAIL /\ ~\E rm \in RM:rmState[rm]="failed"
+                                               THEN /\ rmState' = [rmState EXCEPT ![self] = "failed"]
+                                               ELSE /\ TRUE
+                                                    /\ UNCHANGED rmState
+                                   /\ pc' = [pc EXCEPT ![self] = "RS"]
+                              ELSE /\ pc' = [pc EXCEPT ![self] = "Done"]
+                                   /\ UNCHANGED rmState
+                        /\ UNCHANGED tmState
+                    "#
+                    .to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+
+        let def = defs.get("RS").unwrap();
+        let ir = compile_action_ir(def);
+        let samples = BTreeMap::from([("self".to_string(), rm3.clone())]);
+        let instances = BTreeMap::new();
+        let mut ctx = build_action_expr_probe_context(
+            &state,
+            &defs,
+            &instances,
+            &ir.params,
+            &ir.clauses,
+            Some(&samples),
+        );
+
+        for clause in &ir.clauses {
+            if let Some(result) = probe_action_clause_expr(clause, &mut ctx) {
+                result.expect("PlusCal-style IF branch should be probeable");
+            }
+        }
+
+        assert_eq!(ctx.locals.get("pc'"), state.get("pc"));
+        let rm_state_prime = ctx.locals.get("rmState'").expect("rmState' should be staged");
+        assert_ne!(Some(rm_state_prime), state.get("rmState"));
+        let TlaValue::Function(map) = rm_state_prime else {
+            panic!("expected function-valued rmState', got {rm_state_prime:?}");
+        };
+        assert_ne!(
+            map.get(&rm3),
+            Some(&TlaValue::String("prepared".to_string())),
+            "probe should pick a branch that changes rmState[self]"
+        );
+        assert_eq!(ctx.locals.get("tmState'"), state.get("tmState"));
     }
 
     #[test]
