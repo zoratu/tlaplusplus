@@ -499,7 +499,11 @@ pub fn parse_tla_module_text(input: &str) -> Result<TlaModule> {
         }
 
         let line_indent = line.chars().take_while(|c| c.is_whitespace()).count();
-        let can_start_definition = current_def.is_none() || line_indent <= current_def_indent;
+        let can_start_definition = current_def.is_none()
+            || line_indent <= current_def_indent
+            || current_def
+                .as_ref()
+                .is_some_and(|def| can_start_indented_definition_after_gap(def, trimmed));
         if can_start_definition
             && let Some((lhs, rhs, remainder)) = split_definition_line_with_remainder(trimmed)
         {
@@ -570,6 +574,38 @@ fn split_definition_line_with_remainder(line: &str) -> Option<(&str, &str, Optio
         None => (rhs, None),
     };
     Some((lhs, body, remainder.filter(|rest| !rest.is_empty())))
+}
+
+fn can_start_indented_definition_after_gap(current_def: &TlaDefinition, line: &str) -> bool {
+    if !current_def.body.ends_with("\n\n") {
+        return false;
+    }
+
+    let last_non_empty_line = current_def
+        .body
+        .trim_end_matches('\n')
+        .rsplit('\n')
+        .find(|segment| !segment.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    if definition_body_requires_continuation(last_non_empty_line) {
+        return false;
+    }
+
+    split_definition_line(line)
+        .map(|(lhs, _)| is_plausible_inline_definition_head(lhs))
+        .unwrap_or(false)
+}
+
+fn definition_body_requires_continuation(line: &str) -> bool {
+    let line = line.trim_end();
+    line.ends_with("LET")
+        || line.ends_with("IN")
+        || line.ends_with("THEN")
+        || line.ends_with("ELSE")
+        || line.ends_with(':')
+        || line.ends_with("/\\")
+        || line.ends_with("\\/")
 }
 
 fn flush_definition(module: &mut TlaModule, current: &mut Option<TlaDefinition>) {
@@ -1981,6 +2017,33 @@ Pos == 0 .. W + H
             module.definitions.get("Pos").map(|def| def.body.as_str()),
             Some("0 .. W + H")
         );
+    }
+
+    #[test]
+    fn parses_indented_top_level_definitions_after_comment_gap() {
+        let src = r#"
+---- MODULE IndentedDefs ----
+Base == 1
+
+\* A comment block between top-level definitions.
+   omem == vmem
+   octl == ctl
+   obuf == buf
+====
+"#;
+
+        let module = parse_tla_module_text(src).expect("parse should work");
+        assert_eq!(
+            module
+                .definitions
+                .get("Base")
+                .map(|def| def.body.trim())
+                .as_deref(),
+            Some("1")
+        );
+        assert_eq!(module.definitions.get("omem").map(|def| def.body.as_str()), Some("vmem"));
+        assert_eq!(module.definitions.get("octl").map(|def| def.body.as_str()), Some("ctl"));
+        assert_eq!(module.definitions.get("obuf").map(|def| def.body.as_str()), Some("buf"));
     }
 
     #[test]
