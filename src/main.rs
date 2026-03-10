@@ -2156,6 +2156,21 @@ fn representative_member_from_domain_expr(expr: &str, ctx: &EvalContext<'_>) -> 
     }
 
     let trimmed = strip_probe_outer_parens(expr.trim());
+    if let Some(repr) = representative_value_from_union_parts(trimmed, ctx) {
+        return Some(repr);
+    }
+    if is_probe_simple_identifier(trimmed)
+        && let Some(def) = ctx
+            .local_definitions
+            .get(trimmed)
+            .or_else(|| ctx.definitions.and_then(|defs| defs.get(trimmed)))
+        && def.params.is_empty()
+        && def.body.trim() != trimmed
+        && let Some(repr) = representative_value_from_definition_body(&def.body, ctx)
+    {
+        return Some(repr);
+    }
+
     match trimmed {
         "Nat" | "Int" => Some(TlaValue::Int(0)),
         "BOOLEAN" => Some(TlaValue::Bool(false)),
@@ -2183,6 +2198,9 @@ fn try_create_representative_value_from_type_expr(
     ctx: &EvalContext<'_>,
 ) -> Option<TlaValue> {
     let trimmed = strip_probe_outer_parens(set_expr.trim());
+    if let Some(repr) = representative_value_from_union_parts(trimmed, ctx) {
+        return Some(repr);
+    }
     if let Some(repr) = try_create_representative_function(trimmed, ctx) {
         return Some(repr);
     }
@@ -2203,6 +2221,19 @@ fn try_create_representative_value_from_type_expr(
         _ if trimmed.starts_with("SUBSET ") => Some(TlaValue::Set(Arc::new(BTreeSet::new()))),
         _ => None,
     }
+}
+
+fn representative_value_from_union_parts(expr: &str, ctx: &EvalContext<'_>) -> Option<TlaValue> {
+    for delim in ["\\cup", "\\union"] {
+        let parts = split_top_level(expr, delim);
+        if parts.len() > 1 {
+            return parts
+                .into_iter()
+                .filter_map(|part| representative_member_from_domain_expr(&part, ctx))
+                .max_by_key(probe_value_score);
+        }
+    }
+    None
 }
 
 fn try_create_representative_record(set_expr: &str, ctx: &EvalContext<'_>) -> Option<TlaValue> {
@@ -2449,22 +2480,6 @@ fn collect_action_param_samples_from_expr(
         return;
     }
 
-    let disjuncts = split_top_level(trimmed, "\\/");
-    if disjuncts.len() > 1 || trimmed.starts_with("\\/") {
-        for disjunct in disjuncts {
-            collect_action_param_samples_from_expr(
-                &disjunct,
-                locals,
-                probe_state,
-                definitions,
-                instances,
-                samples,
-                active_calls,
-            );
-        }
-        return;
-    }
-
     if let Some(rest) = trimmed.strip_prefix("\\E")
         && let Some((binder_text, body)) = split_probe_quantifier(rest)
         && let Some(bound) = sample_exists_quantifier_binders(
@@ -2488,6 +2503,22 @@ fn collect_action_param_samples_from_expr(
             samples,
             active_calls,
         );
+        return;
+    }
+
+    let disjuncts = split_top_level(trimmed, "\\/");
+    if disjuncts.len() > 1 || trimmed.starts_with("\\/") {
+        for disjunct in disjuncts {
+            collect_action_param_samples_from_expr(
+                &disjunct,
+                locals,
+                probe_state,
+                definitions,
+                instances,
+                samples,
+                active_calls,
+            );
+        }
         return;
     }
 
@@ -2939,6 +2970,7 @@ fn build_action_expr_probe_context<'a>(
             .unwrap_or_else(|| {
                 sample_param_value_with_context(param, probe_state, definitions, instances)
             });
+        locals_mut.insert(normalized.to_string(), sample.clone());
         locals_mut.insert(param.clone(), sample);
     }
 
@@ -3658,6 +3690,55 @@ mod tests {
     }
 
     #[test]
+    fn representative_member_from_domain_expr_uses_union_definition_bodies() {
+        let probe_state = TlaState::new();
+        let definitions = BTreeMap::from([
+            (
+                "Ballot".to_string(),
+                TlaDefinition {
+                    name: "Ballot".to_string(),
+                    params: vec![],
+                    body: "Nat".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Value".to_string(),
+                TlaDefinition {
+                    name: "Value".to_string(),
+                    params: vec![],
+                    body: "{v1}".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Message".to_string(),
+                TlaDefinition {
+                    name: "Message".to_string(),
+                    params: vec![],
+                    body: r#"
+                        [type : {"1a"}, bal : Ballot]
+                    \cup [type : {"2a"}, bal : Ballot, val : Value]
+                    "#
+                    .to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+        let instances = BTreeMap::new();
+        let ctx = build_probe_eval_context(&probe_state, &definitions, &instances);
+
+        let repr = representative_member_from_domain_expr("Message", &ctx)
+            .expect("subset domain representative");
+        let TlaValue::Record(fields) = repr else {
+            panic!("expected representative record, got {repr:?}");
+        };
+        assert_eq!(fields.get("type"), Some(&TlaValue::String("2a".to_string())));
+        assert_eq!(fields.get("bal"), Some(&TlaValue::Int(0)));
+        assert_eq!(fields.get("val"), Some(&TlaValue::ModelValue("v1".to_string())));
+    }
+
+    #[test]
     fn structured_function_replacements_outrank_placeholder_values() {
         let current = TlaValue::Function(Arc::new(BTreeMap::from([(
             TlaValue::ModelValue("p1".to_string()),
@@ -3764,6 +3845,317 @@ mod tests {
                 .cloned(),
             Some(acceptor)
         );
+    }
+
+    #[test]
+    fn infers_action_params_from_quantified_disjunctions() {
+        let acceptor = TlaValue::ModelValue("a1".to_string());
+        let probe_state = TlaState::new();
+        let definitions = BTreeMap::from([
+            (
+                "Acceptor".to_string(),
+                TlaDefinition {
+                    name: "Acceptor".to_string(),
+                    params: vec![],
+                    body: "{a1}".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Phase1b".to_string(),
+                TlaDefinition {
+                    name: "Phase1b".to_string(),
+                    params: vec!["a".to_string()],
+                    body: "TRUE".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Phase2b".to_string(),
+                TlaDefinition {
+                    name: "Phase2b".to_string(),
+                    params: vec!["a".to_string()],
+                    body: "TRUE".to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+
+        let samples = infer_action_param_samples_from_next(
+            r#"\E a \in Acceptor : Phase1b(a) \/ Phase2b(a)"#,
+            &probe_state,
+            &definitions,
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(
+            samples
+                .get("Phase1b")
+                .and_then(|params| params.get("a"))
+                .cloned(),
+            Some(acceptor.clone())
+        );
+        assert_eq!(
+            samples
+                .get("Phase2b")
+                .and_then(|params| params.get("a"))
+                .cloned(),
+            Some(acceptor)
+        );
+    }
+
+    #[test]
+    fn analyze_tla_path_infers_phase2b_acceptor_samples() {
+        use std::fs;
+
+        let tmp = std::env::temp_dir().join("tlapp-paxos-phase2b-sample");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should exist");
+
+        let module_path = tmp.join("MCPaxosMini.tla");
+        fs::write(
+            &module_path,
+            r#"
+---- MODULE MCPaxosMini ----
+EXTENDS Integers
+
+CONSTANTS Acceptor, Value
+CONSTANTS a1, v1
+
+const_acceptor == {a1}
+const_value == {v1}
+
+Ballot == Nat
+Message ==
+       [type : {"1a"}, bal : Ballot]
+  \cup [type : {"2a"}, bal : Ballot, val : Value]
+  \cup [type : {"2b"}, acc : Acceptor, bal : Ballot, val : Value]
+
+VARIABLES maxBal, maxVBal, maxVal, msgs
+
+TypeOK == /\ maxBal  \in [Acceptor -> Ballot \cup {-1}]
+          /\ maxVBal \in [Acceptor -> Ballot \cup {-1}]
+          /\ maxVal  \in [Acceptor -> Value]
+          /\ msgs \subseteq Message
+
+Init == /\ maxBal  = [a \in Acceptor |-> -1]
+        /\ maxVBal = [a \in Acceptor |-> -1]
+        /\ maxVal  = [a \in Acceptor |-> v1]
+        /\ msgs = {}
+
+Send(m) == msgs' = msgs \cup {m}
+
+Phase1b(a) ==
+  /\ \E m \in msgs :
+        /\ m.type = "1a"
+        /\ m.bal > maxBal[a]
+  /\ UNCHANGED <<maxVBal, maxVal>>
+
+Phase2b(a) ==
+  \E m \in msgs :
+      /\ m.type = "2a"
+      /\ m.bal >= maxBal[a]
+      /\ maxBal' = [maxBal EXCEPT ![a] = m.bal]
+      /\ maxVBal' = [maxVBal EXCEPT ![a] = m.bal]
+      /\ maxVal' = [maxVal EXCEPT ![a] = m.val]
+      /\ Send([type |-> "2b", acc |-> a, bal |-> m.bal, val |-> m.val])
+
+Next == \E a \in Acceptor : Phase1b(a) \/ Phase2b(a)
+Spec == Init /\ [][Next]_<<maxBal, maxVBal, maxVal, msgs>>
+====
+"#,
+        )
+        .expect("module should be written");
+
+        let cfg_path = tmp.join("MCPaxosMini.cfg");
+        fs::write(
+            &cfg_path,
+            r#"
+CONSTANTS
+a1 = a1
+v1 = v1
+CONSTANT
+Acceptor <- const_acceptor
+CONSTANT
+Value <- const_value
+SPECIFICATION
+Spec
+"#,
+        )
+        .expect("cfg should be written");
+
+        let model =
+            TlaModel::from_files(&module_path, Some(&cfg_path), None, None).expect("model");
+        let probe_state = model
+            .initial_states_vec
+            .first()
+            .cloned()
+            .expect("initial state");
+        let next_def = model
+            .module
+            .definitions
+            .get(&model.next_name)
+            .expect("Next definition");
+
+        let samples = infer_action_param_samples_from_next(
+            &next_def.body,
+            &probe_state,
+            &model.module.definitions,
+            &model.module.instances,
+        );
+        assert_eq!(
+            samples
+                .get("Phase2b")
+                .and_then(|params| params.get("a"))
+                .cloned(),
+            Some(TlaValue::ModelValue("a1".to_string()))
+        );
+
+        let phase2b = model
+            .module
+            .definitions
+            .get("Phase2b")
+            .expect("Phase2b definition");
+        let ir = compile_action_ir_branches(phase2b);
+        let ctx = build_action_expr_probe_context(
+            &probe_state,
+            &model.module.definitions,
+            &model.module.instances,
+            &ir[0].params,
+            &ir[0].clauses,
+            samples.get("Phase2b"),
+        );
+        assert_eq!(
+            eval_expr("maxBal[a]", &ctx).expect("Phase2b param should index maxBal"),
+            TlaValue::Int(-1)
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn analyze_tla_path_infers_phase2b_acceptor_samples_through_extends() {
+        use std::fs;
+
+        let tmp = std::env::temp_dir().join("tlapp-paxos-phase2b-extends");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should exist");
+
+        let base_module_path = tmp.join("PaxosBase.tla");
+        fs::write(
+            &base_module_path,
+            r#"
+---- MODULE PaxosBase ----
+EXTENDS Integers
+
+CONSTANTS Acceptor, Value, DefaultValue
+
+Ballot == Nat
+Message ==
+       [type : {"1a"}, bal : Ballot]
+  \cup [type : {"2a"}, bal : Ballot, val : Value]
+  \cup [type : {"2b"}, acc : Acceptor, bal : Ballot, val : Value]
+
+VARIABLES maxBal, maxVBal, maxVal, msgs
+
+TypeOK == /\ maxBal  \in [Acceptor -> Ballot \cup {-1}]
+          /\ maxVBal \in [Acceptor -> Ballot \cup {-1}]
+          /\ maxVal  \in [Acceptor -> Value]
+          /\ msgs \subseteq Message
+
+Init == /\ maxBal  = [a \in Acceptor |-> -1]
+        /\ maxVBal = [a \in Acceptor |-> -1]
+        /\ maxVal  = [a \in Acceptor |-> DefaultValue]
+        /\ msgs = {}
+
+Send(m) == msgs' = msgs \cup {m}
+
+Phase1b(a) ==
+  /\ \E m \in msgs :
+        /\ m.type = "1a"
+        /\ m.bal > maxBal[a]
+  /\ UNCHANGED <<maxVBal, maxVal>>
+
+Phase2b(a) ==
+  \E m \in msgs :
+      /\ m.type = "2a"
+      /\ m.bal >= maxBal[a]
+      /\ maxBal' = [maxBal EXCEPT ![a] = m.bal]
+      /\ maxVBal' = [maxVBal EXCEPT ![a] = m.bal]
+      /\ maxVal' = [maxVal EXCEPT ![a] = m.val]
+      /\ Send([type |-> "2b", acc |-> a, bal |-> m.bal, val |-> m.val])
+
+Next == \E a \in Acceptor : Phase1b(a) \/ Phase2b(a)
+Spec == Init /\ [][Next]_<<maxBal, maxVBal, maxVal, msgs>>
+====
+"#,
+        )
+        .expect("base module should be written");
+
+        let module_path = tmp.join("MCPaxosMiniExtends.tla");
+        fs::write(
+            &module_path,
+            r#"
+---- MODULE MCPaxosMiniExtends ----
+EXTENDS PaxosBase
+
+CONSTANTS a1, v1
+
+const_acceptor == {a1}
+const_value == {v1}
+default_value == v1
+====
+"#,
+        )
+        .expect("module should be written");
+
+        let cfg_path = tmp.join("MCPaxosMiniExtends.cfg");
+        fs::write(
+            &cfg_path,
+            r#"
+CONSTANTS
+a1 = a1
+v1 = v1
+CONSTANT
+Acceptor <- const_acceptor
+CONSTANT
+Value <- const_value
+CONSTANT
+DefaultValue <- default_value
+SPECIFICATION
+Spec
+"#,
+        )
+        .expect("cfg should be written");
+
+        let model =
+            TlaModel::from_files(&module_path, Some(&cfg_path), None, None).expect("model");
+        let probe_state = model
+            .initial_states_vec
+            .first()
+            .cloned()
+            .expect("initial state");
+        let next_def = model
+            .module
+            .definitions
+            .get(&model.next_name)
+            .expect("Next definition");
+
+        let samples = infer_action_param_samples_from_next(
+            &next_def.body,
+            &probe_state,
+            &model.module.definitions,
+            &model.module.instances,
+        );
+        assert_eq!(
+            samples
+                .get("Phase2b")
+                .and_then(|params| params.get("a"))
+                .cloned(),
+            Some(TlaValue::ModelValue("a1".to_string()))
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -4786,6 +5178,31 @@ mod tests {
         assert_eq!(
             ctx.locals.get("self"),
             Some(&TlaValue::ModelValue("worker-1".to_string()))
+        );
+    }
+
+    #[test]
+    fn build_action_expr_probe_context_binds_normalized_param_names() {
+        let state = TlaState::new();
+        let defs = BTreeMap::new();
+        let instances = BTreeMap::new();
+        let inferred = BTreeMap::from([(
+            "leader".to_string(),
+            TlaValue::ModelValue("node-1".to_string()),
+        )]);
+
+        let ctx = build_action_expr_probe_context(
+            &state,
+            &defs,
+            &instances,
+            &[r"leader \in Node".to_string()],
+            &[],
+            Some(&inferred),
+        );
+
+        assert_eq!(
+            eval_expr("leader", &ctx).expect("normalized param should resolve"),
+            TlaValue::ModelValue("node-1".to_string())
         );
     }
 

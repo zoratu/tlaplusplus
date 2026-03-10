@@ -3390,20 +3390,10 @@ fn split_top_level(expr: &str, delim: &str, keyword: bool) -> Vec<String> {
                 {
                     // We're in quantifier binders (before :), don't split on conjunctions
                     false
-                } else if in_quantifier_body && is_conjunction {
-                    // We're in a quantifier body. Check what follows this /\
-                    let after_delim = &expr[delim_end..].trim_start();
-                    let next_is_quantifier =
-                        after_delim.starts_with("\\A") || after_delim.starts_with("\\E");
-                    let before_delim = expr[..i].trim_end();
-                    let previous_requires_continuation = before_delim.ends_with("=>")
-                        || before_delim.ends_with("/\\")
-                        || before_delim.ends_with("\\/")
-                        || before_delim.ends_with("THEN")
-                        || before_delim.ends_with("ELSE")
-                        || before_delim.ends_with(':');
-                    // Split only if followed by another quantifier (this ends the current quantifier)
-                    next_is_quantifier && !previous_requires_continuation
+                } else if in_quantifier_body && (delim == "/\\" || delim == "\\/") {
+                    // Quantifier bodies consume conjunctions and disjunctions to
+                    // the end of the surrounding grouping.
+                    false
                 } else {
                     // All other cases: split normally
                     true
@@ -4583,6 +4573,19 @@ mod tests {
         assert_eq!(normalize_param_name("leader \\in Node"), "leader");
         assert_eq!(normalize_param_name("Op(_, _)"), "Op");
         assert_eq!(normalize_param_name("HostOf"), "HostOf");
+    }
+
+    #[test]
+    fn split_top_level_keeps_simple_quantified_conjunctions_intact() {
+        let parts =
+            split_top_level_symbol(r#"~ \E m \in msgs : m.type = "2a" /\ m.bal = b"#, "/\\");
+        assert_eq!(parts, vec![r#"~ \E m \in msgs : m.type = "2a" /\ m.bal = b"#]);
+    }
+
+    #[test]
+    fn split_top_level_keeps_simple_quantified_disjunctions_intact() {
+        let parts = split_top_level_symbol(r"\E a \in Acceptor : Phase1b(a) \/ Phase2b(a)", "\\/");
+        assert_eq!(parts, vec![r"\E a \in Acceptor : Phase1b(a) \/ Phase2b(a)"]);
     }
 
     #[test]

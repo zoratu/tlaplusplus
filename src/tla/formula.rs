@@ -38,8 +38,6 @@ pub fn split_top_level(expr: &str, delimiter: &str) -> Vec<String> {
     let mut case_depth = 0usize; // Track CASE expression nesting
     let mut else_branch_uses_delimiter = false; // True if ELSE branch starts with the delimiter
     let mut in_quantifier_body = false;
-    let mut quantifier_body_uses_delimiter = false; // True if quantifier body starts with the delimiter
-
     while i < chars.len() {
         let c = chars[i];
         let next = if i + 1 < chars.len() {
@@ -153,9 +151,6 @@ pub fn split_top_level(expr: &str, delimiter: &str) -> Vec<String> {
                                 in_quantifier_body = true;
                                 // Check if the body starts with the delimiter we're splitting by
                                 // This determines if subsequent delimiters are part of the body
-                                let body_start: String = chars[j + 1..].iter().collect();
-                                let body_start = body_start.trim_start();
-                                quantifier_body_uses_delimiter = body_start.starts_with(delimiter);
                                 for ch in &chars[i..=j] {
                                     current.push(*ch);
                                 }
@@ -179,31 +174,14 @@ pub fn split_top_level(expr: &str, delimiter: &str) -> Vec<String> {
             && case_depth == 0
             && !else_branch_uses_delimiter;
         if at_top && matches_at(&chars, i, &delim_chars) {
-            // Don't split inside quantifier bodies when the body started with the same delimiter
-            // For example: \E op \in S : \/ A \/ B \/ C
-            // The body starts with \/, so all subsequent \/ are part of the body.
-            // But: \E x \in S : (A \/ B) \/ C
-            // The body starts with (, so \/ C is a separate disjunct.
-            if in_quantifier_body && quantifier_body_uses_delimiter {
-                if delimiter == "/\\" {
-                    let after_delim: String = chars[i + delim_chars.len()..].iter().collect();
-                    let after_delim = after_delim.trim_start();
-                    let starts_new_quantifier = after_delim.starts_with("\\A ")
-                        || after_delim.starts_with("\\A(")
-                        || after_delim.starts_with("\\E ")
-                        || after_delim.starts_with("\\E(");
-                    if !starts_new_quantifier {
-                        current.push(c);
-                        i += 1;
-                        continue;
-                    }
-                    // Falls through to split - in_quantifier_body will be reset below
-                } else if delimiter == "\\/" {
-                    // Don't split disjunctions inside quantifier body when body uses disjunction
-                    current.push(c);
-                    i += 1;
-                    continue;
-                }
+            // Quantifier bodies consume conjunctions and disjunctions all the way
+            // to the end of the surrounding grouping. Keep both `/\` and `\/`
+            // inside the quantified body even when the body starts with a plain
+            // expression like `m.type = "2a" /\ ...`.
+            if in_quantifier_body && (delimiter == "/\\" || delimiter == "\\/") {
+                current.push(c);
+                i += 1;
+                continue;
             }
             let piece = current.trim();
             if !piece.is_empty() {
@@ -214,7 +192,6 @@ pub fn split_top_level(expr: &str, delimiter: &str) -> Vec<String> {
             case_depth = 0;
             // Reset quantifier tracking when we split
             in_quantifier_body = false;
-            quantifier_body_uses_delimiter = false;
             i += delim_chars.len();
             continue;
         }
@@ -400,6 +377,12 @@ mod tests {
         assert!(parts[1].contains("writeTargets' = targets"));
     }
 
+    #[test]
+    fn does_not_split_simple_conjunction_inside_quantifier_body() {
+        let parts = split_top_level(r#"~ \E m \in msgs : m.type = "2a" /\ m.bal = b"#, "/\\");
+        assert_eq!(parts, vec![r#"~ \E m \in msgs : m.type = "2a" /\ m.bal = b"#]);
+    }
+
     /// Test that nested disjunctions inside a quantifier body are kept together
     /// when the body starts with \/ (ClusterLeaseFailover pattern)
     #[test]
@@ -419,19 +402,15 @@ mod tests {
         assert!(parts[1].contains("FailOperation(op)"));
     }
 
-    /// Test that disjunctions AFTER a quantifier with a simple body are split correctly
+    /// Disjunctions stay inside the quantified body even when the body starts with
+    /// a plain expression instead of an explicit leading `\/`.
     #[test]
-    fn splits_disjunction_after_simple_quantifier_body() {
-        // When the quantifier body doesn't start with \/, subsequent \/ should be split
+    fn does_not_split_disjunction_after_simple_quantifier_body() {
         let parts = split_top_level(r"\/ A \/ \E x \in S: (C \/ D) \/ E", "\\/");
-        // Should split into 3 parts:
-        // 1. A
-        // 2. \E x \in S: (C \/ D)
-        // 3. E
-        assert_eq!(parts.len(), 3);
+        assert_eq!(parts.len(), 2);
         assert_eq!(parts[0].trim(), "A");
         assert!(parts[1].starts_with("\\E x \\in S:"));
-        assert_eq!(parts[2].trim(), "E");
+        assert!(parts[1].contains("(C \\/ D) \\/ E"));
     }
 
     #[test]
