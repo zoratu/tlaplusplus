@@ -1981,12 +1981,7 @@ fn seed_probe_state_from_membership_body(
 ) -> usize {
     let mut pending = Vec::new();
     for clause in split_top_level(body, "/\\") {
-        if let ClauseKind::UnprimedMembership { var, set_expr } = classify_clause(&clause)
-            && module.variables.contains(&var)
-            && !probe_state.contains_key(&var)
-        {
-            pending.push((var, set_expr));
-        }
+        pending.extend(collect_type_invariant_constraints(&clause, module));
     }
 
     let mut seeded = 0usize;
@@ -1997,14 +1992,20 @@ fn seed_probe_state_from_membership_body(
 
         let mut progress = false;
         let mut next_pending = Vec::new();
-        for (var, set_expr) in pending {
+        for (var, constraint) in pending {
             let ctx = build_probe_eval_context(probe_state, &module.definitions, &module.instances);
-            if let Some(repr) = representative_value_from_set_expr(&set_expr, &ctx) {
-                probe_state.insert(var, repr);
-                seeded += 1;
-                progress = true;
+            if let Some(repr) = representative_value_from_type_constraint(&constraint, &ctx) {
+                let should_update = match probe_state.get(&var) {
+                    None => true,
+                    Some(current) => should_refine_probe_value(current, &repr),
+                };
+                if should_update {
+                    probe_state.insert(var, repr);
+                    seeded += 1;
+                    progress = true;
+                }
             } else {
-                next_pending.push((var, set_expr));
+                next_pending.push((var, constraint));
             }
         }
 
@@ -2015,6 +2016,94 @@ fn seed_probe_state_from_membership_body(
     }
 
     seeded
+}
+
+#[derive(Clone, Copy)]
+enum TypeInvariantConstraintKind {
+    Membership,
+    Subset,
+}
+
+fn collect_type_invariant_constraints(
+    clause: &str,
+    module: &TlaModule,
+) -> Vec<(String, (TypeInvariantConstraintKind, String))> {
+    let mut out = Vec::new();
+    if let ClauseKind::UnprimedMembership { var, set_expr } = classify_clause(clause)
+        && module.variables.contains(&var)
+    {
+        out.push((var, (TypeInvariantConstraintKind::Membership, set_expr)));
+        return out;
+    }
+
+    let trimmed = clause.trim();
+    if let Some(idx) = find_probe_top_level_keyword(trimmed, "\\subseteq") {
+        let var = trimmed[..idx].trim().to_string();
+        let set_expr = trimmed[idx + "\\subseteq".len()..].trim().to_string();
+        if module.variables.contains(&var) && !set_expr.is_empty() {
+            out.push((var, (TypeInvariantConstraintKind::Subset, set_expr)));
+        }
+    }
+
+    out
+}
+
+fn representative_value_from_type_constraint(
+    constraint: &(TypeInvariantConstraintKind, String),
+    ctx: &EvalContext<'_>,
+) -> Option<TlaValue> {
+    match constraint.0 {
+        TypeInvariantConstraintKind::Membership => {
+            representative_value_from_set_expr(&constraint.1, ctx)
+        }
+        TypeInvariantConstraintKind::Subset => representative_member_from_domain_expr(
+            constraint.1.as_str(),
+            ctx,
+        )
+        .map(|member| TlaValue::Set(Arc::new(BTreeSet::from([member])))),
+    }
+}
+
+fn should_refine_probe_value(current: &TlaValue, replacement: &TlaValue) -> bool {
+    if probe_value_score(replacement) > probe_value_score(current) {
+        return true;
+    }
+
+    match (current, replacement) {
+        (TlaValue::Set(values), TlaValue::Set(replacement_values)) => {
+            values.is_empty() && !replacement_values.is_empty()
+        }
+        (TlaValue::Function(values), TlaValue::Function(replacement_values)) => {
+            values.is_empty() && !replacement_values.is_empty()
+        }
+        _ => false,
+    }
+}
+
+fn probe_value_score(value: &TlaValue) -> u32 {
+    match value {
+        TlaValue::Record(fields) => {
+            5_000u32.saturating_add(fields.values().map(probe_value_score).max().unwrap_or(0))
+        }
+        TlaValue::Function(map) => {
+            4_000u32.saturating_add(map.values().map(probe_value_score).max().unwrap_or(0))
+        }
+        TlaValue::Seq(items) => {
+            3_000u32.saturating_add(items.iter().map(probe_value_score).max().unwrap_or(0))
+        }
+        TlaValue::Set(values) => {
+            if values.is_empty() {
+                50
+            } else {
+                2_000u32.saturating_add(values.iter().map(probe_value_score).max().unwrap_or(0))
+            }
+        }
+        TlaValue::String(_) | TlaValue::ModelValue(_) => 100,
+        TlaValue::Bool(_) => 90,
+        TlaValue::Int(_) => 80,
+        TlaValue::Lambda { .. } => 150,
+        TlaValue::Undefined => 0,
+    }
 }
 
 fn representative_value_from_set_expr(set_expr: &str, ctx: &EvalContext<'_>) -> Option<TlaValue> {
@@ -3198,8 +3287,10 @@ fn probe_action_clause_expr(
 fn pick_representative_from_set(set_val: &TlaValue) -> Option<TlaValue> {
     match set_val {
         TlaValue::Set(values) => {
-            // Pick the first element from the set
-            values.iter().next().cloned()
+            values
+                .iter()
+                .max_by_key(|value| probe_value_score(value))
+                .cloned()
         }
         _ => None,
     }
@@ -3399,6 +3490,187 @@ mod tests {
             probe_state.get("pending"),
             Some(&TlaValue::Set(Arc::new(BTreeSet::new())))
         );
+    }
+
+    #[test]
+    fn seeds_probe_state_from_subset_type_invariants() {
+        let mut probe_state = TlaState::from([(
+            "msgs".to_string(),
+            TlaValue::Set(Arc::new(BTreeSet::new())),
+        )]);
+        let module = TlaModule {
+            name: "SubsetSeed".to_string(),
+            path: String::new(),
+            extends: Vec::new(),
+            constants: Vec::new(),
+            variables: vec!["msgs".to_string()],
+            definitions: BTreeMap::from([
+                (
+                    "Message".to_string(),
+                    TlaDefinition {
+                        name: "Message".to_string(),
+                        params: vec![],
+                        body: "[type: {\"1a\"}, bal: {0}]".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+                (
+                    "TypeOK".to_string(),
+                    TlaDefinition {
+                        name: "TypeOK".to_string(),
+                        params: vec![],
+                        body: "msgs \\subseteq Message".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+            ]),
+            instances: BTreeMap::new(),
+            unnamed_instances: Vec::new(),
+            is_pluscal: false,
+            recursive_declarations: BTreeSet::new(),
+        };
+
+        let seeded = seed_probe_state_from_type_invariants(&mut probe_state, &module, None);
+        assert_eq!(seeded, 1);
+        match probe_state.get("msgs") {
+            Some(TlaValue::Set(values)) => {
+                let elem = values.iter().next().expect("subset seed should be non-empty");
+                assert!(matches!(elem, TlaValue::Record(_)));
+            }
+            other => panic!("expected seeded msgs set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn seeds_probe_state_prefers_structured_function_values_from_type_invariants() {
+        let proc_id = TlaValue::ModelValue("p1".to_string());
+        let no_val = TlaValue::ModelValue("NoVal".to_string());
+        let mut probe_state = TlaState::from([(
+            "buf".to_string(),
+            TlaValue::Function(Arc::new(BTreeMap::from([(proc_id.clone(), no_val.clone())]))),
+        )]);
+        let module = TlaModule {
+            name: "BufSeed".to_string(),
+            path: String::new(),
+            extends: Vec::new(),
+            constants: Vec::new(),
+            variables: vec!["buf".to_string()],
+            definitions: BTreeMap::from([
+                (
+                    "Proc".to_string(),
+                    TlaDefinition {
+                        name: "Proc".to_string(),
+                        params: vec![],
+                        body: "{p1}".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+                (
+                    "MReq".to_string(),
+                    TlaDefinition {
+                        name: "MReq".to_string(),
+                        params: vec![],
+                        body: "[op: {\"Wr\"}, adr: {a1}, val: {v1}]".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+                (
+                    "Val".to_string(),
+                    TlaDefinition {
+                        name: "Val".to_string(),
+                        params: vec![],
+                        body: "{v1}".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+                (
+                    "TypeOK".to_string(),
+                    TlaDefinition {
+                        name: "TypeOK".to_string(),
+                        params: vec![],
+                        body: "buf \\in [Proc -> MReq \\cup Val \\cup {NoVal}]".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+            ]),
+            instances: BTreeMap::new(),
+            unnamed_instances: Vec::new(),
+            is_pluscal: false,
+            recursive_declarations: BTreeSet::new(),
+        };
+
+        let seeded = seed_probe_state_from_type_invariants(&mut probe_state, &module, None);
+        assert_eq!(seeded, 1);
+        match probe_state.get("buf") {
+            Some(TlaValue::Function(values)) => {
+                let value = values.get(&proc_id).expect("buf should contain p1");
+                assert!(matches!(value, TlaValue::Record(_)));
+            }
+            other => panic!("expected refined buf function, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn representative_value_from_function_set_prefers_structured_range_members() {
+        let probe_state = TlaState::new();
+        let definitions = BTreeMap::from([
+            (
+                "Proc".to_string(),
+                TlaDefinition {
+                    name: "Proc".to_string(),
+                    params: vec![],
+                    body: "{p1}".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "MReq".to_string(),
+                TlaDefinition {
+                    name: "MReq".to_string(),
+                    params: vec![],
+                    body: "[op: {\"Wr\"}, adr: {a1}, val: {v1}]".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Val".to_string(),
+                TlaDefinition {
+                    name: "Val".to_string(),
+                    params: vec![],
+                    body: "{v1}".to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+        let instances = BTreeMap::new();
+        let ctx = build_probe_eval_context(&probe_state, &definitions, &instances);
+
+        let repr = representative_value_from_set_expr("[Proc -> MReq \\cup Val \\cup {NoVal}]", &ctx)
+            .expect("function-set representative");
+        let TlaValue::Function(values) = repr else {
+            panic!("expected function representative, got {repr:?}");
+        };
+        let value = values
+            .get(&TlaValue::ModelValue("p1".to_string()))
+            .expect("buf should contain p1");
+        assert!(matches!(value, TlaValue::Record(_)));
+    }
+
+    #[test]
+    fn structured_function_replacements_outrank_placeholder_values() {
+        let current = TlaValue::Function(Arc::new(BTreeMap::from([(
+            TlaValue::ModelValue("p1".to_string()),
+            TlaValue::ModelValue("NoVal".to_string()),
+        )])));
+        let replacement = TlaValue::Function(Arc::new(BTreeMap::from([(
+            TlaValue::ModelValue("p1".to_string()),
+            TlaValue::Record(Arc::new(BTreeMap::from([(
+                "op".to_string(),
+                TlaValue::String("Wr".to_string()),
+            )]))),
+        )])));
+
+        assert!(should_refine_probe_value(&current, &replacement));
     }
 
     #[test]
