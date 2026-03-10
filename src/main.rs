@@ -2048,6 +2048,45 @@ fn sample_param_value(param: &str, probe_state: &TlaState) -> TlaValue {
         })
     };
 
+    let set_hint = match lower.as_str() {
+        "asset" | "a" => Some("Assets"),
+        "bot" | "buyer" | "holder" | "b" => Some("Bots"),
+        "call" => Some("ActiveElevatorCalls"),
+        "client" | "p" | "p1" | "p2" => Some("Participants"),
+        "e" | "e1" | "e2" | "elevator" => Some("Elevator"),
+        "f" | "floor" => Some("Floor"),
+        "key" | "k" => Some("Key"),
+        "mm" => Some("MarketMakers"),
+        "node" | "n" | "n1" | "n2" | "other" => Some("Nodes"),
+        "prisoner" => Some("Prisoner"),
+        "reader" | "r" => Some("Readers"),
+        "seller" | "s" => Some("Sellers"),
+        "t" | "tx" | "transaction" => Some("TxId"),
+        "val" | "value" | "v" => Some("Val"),
+        "writer" | "w" => Some("Writers"),
+        _ => None,
+    };
+    if let Some(set_name) = set_hint
+        && let Some(v) = from_named_set(set_name)
+    {
+        return v;
+    }
+
+    let domain_hint = match lower.as_str() {
+        "call" => Some("ActiveElevatorCalls"),
+        "client" | "p" | "p1" | "p2" | "prisoner" => Some("signalled"),
+        "key" | "k" => Some("store"),
+        "t" | "tx" | "transaction" => Some("snapshotStore"),
+        "writer" | "reader" | "w" | "r" => Some("pc"),
+        "self" | "proc" | "process" => Some("rcvd"),
+        _ => None,
+    };
+    if let Some(domain_name) = domain_hint
+        && let Some(v) = from_named_function_domain(domain_name)
+    {
+        return v;
+    }
+
     // Common integer index variables (extremely frequent in TLA+ specs)
     if matches!(
         lower.as_str(),
@@ -2082,39 +2121,6 @@ fn sample_param_value(param: &str, probe_state: &TlaState) -> TlaValue {
         }
         // PlusCal typically uses integer process IDs
         return TlaValue::Int(1);
-    }
-
-    let set_hint = match lower.as_str() {
-        "bot" | "buyer" | "holder" | "b" => Some("Bots"),
-        "seller" | "s" => Some("Sellers"),
-        "mm" => Some("MarketMakers"),
-        "asset" | "a" => Some("Assets"),
-        "node" | "n" | "n1" | "n2" | "other" => Some("Nodes"),
-        "client" | "p" | "p1" | "p2" => Some("Participants"),
-        "writer" | "w" => Some("Writers"),
-        "reader" | "r" => Some("Readers"),
-        "prisoner" => Some("Prisoner"),
-        _ => None,
-    };
-    if let Some(set_name) = set_hint
-        && let Some(v) = from_named_set(set_name)
-    {
-        return v;
-    }
-    if matches!(lower.as_str(), "p" | "p1" | "p2" | "prisoner")
-        && let Some(v) = from_named_function_domain("signalled")
-    {
-        return v;
-    }
-    if matches!(lower.as_str(), "t" | "writer" | "reader" | "w" | "r")
-        && let Some(v) = from_named_function_domain("pc")
-    {
-        return v;
-    }
-    if matches!(lower.as_str(), "self" | "proc" | "process" | "t")
-        && let Some(v) = from_named_function_domain("rcvd")
-    {
-        return v;
     }
 
     if lower.contains("qty")
@@ -3386,6 +3392,24 @@ mod tests {
     fn sample_param_value_prefers_function_domains_and_integer_hints() {
         let mut state = TlaState::new();
         state.insert(
+            "Key".to_string(),
+            TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::ModelValue(
+                "k1".to_string(),
+            )]))),
+        );
+        state.insert(
+            "TxId".to_string(),
+            TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::ModelValue(
+                "t1".to_string(),
+            )]))),
+        );
+        state.insert(
+            "Val".to_string(),
+            TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::ModelValue(
+                "v1".to_string(),
+            )]))),
+        );
+        state.insert(
             "signalled".to_string(),
             TlaValue::Function(Arc::new(BTreeMap::from([(
                 TlaValue::String("Bob".to_string()),
@@ -3406,7 +3430,15 @@ mod tests {
         );
         assert_eq!(
             sample_param_value("t", &state),
-            TlaValue::ModelValue("writer-1".to_string())
+            TlaValue::ModelValue("t1".to_string())
+        );
+        assert_eq!(
+            sample_param_value("k", &state),
+            TlaValue::ModelValue("k1".to_string())
+        );
+        assert_eq!(
+            sample_param_value("v", &state),
+            TlaValue::ModelValue("v1".to_string())
         );
         assert_eq!(sample_param_value("sequence", &state), TlaValue::Int(0));
     }
