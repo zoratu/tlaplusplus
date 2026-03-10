@@ -280,6 +280,18 @@ pub fn parse_tla_config(input: &str) -> Result<TlaConfig> {
     Ok(cfg)
 }
 
+pub fn normalize_operator_ref_name(name: &str) -> &str {
+    let trimmed = name.trim();
+    if !trimmed.starts_with('[') {
+        return trimmed;
+    }
+    let Some(close_idx) = trimmed.find(']') else {
+        return trimmed;
+    };
+    let rest = trimmed[close_idx + 1..].trim_start();
+    if rest.is_empty() { trimmed } else { rest }
+}
+
 fn strip_line_comment(line: &str) -> &str {
     match line.find("\\*") {
         Some(i) => &line[..i],
@@ -1082,5 +1094,18 @@ mod tests {
             cfg.constants.get("Ballot"),
             Some(&ConfigValue::OperatorRef("[Voting]MCBallot".to_string()))
         );
+    }
+
+    #[test]
+    fn normalizes_bracket_qualified_operator_refs() {
+        assert_eq!(
+            normalize_operator_ref_name("[Voting]MCBallot"),
+            "MCBallot"
+        );
+        assert_eq!(
+            normalize_operator_ref_name("[ZSequences] ZSeqNat"),
+            "ZSeqNat"
+        );
+        assert_eq!(normalize_operator_ref_name("BoundedSeq"), "BoundedSeq");
     }
 }
