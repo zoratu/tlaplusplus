@@ -311,8 +311,9 @@ fn execute_branch(
 
     // Use compiled action IR for inline actions too
     let compiled_ir = get_or_compile_action(&inline_def);
-    apply_compiled_action_ir_multi(&compiled_ir, state, &ctx)
-        .or_else(|_| apply_action_ir_with_context_multi(&compile_action_ir(&inline_def), state, &ctx))
+    apply_compiled_action_ir_multi(&compiled_ir, state, &ctx).or_else(|_| {
+        apply_action_ir_with_context_multi(&compile_action_ir(&inline_def), state, &ctx)
+    })
 }
 
 fn execute_exists_branch(
@@ -876,7 +877,10 @@ mod tests {
             ("count".to_string(), TlaValue::Int(7)),
             ("announced".to_string(), TlaValue::Bool(false)),
             ("light".to_string(), TlaValue::String("off".to_string())),
-            ("designated".to_string(), TlaValue::String("alice".to_string())),
+            (
+                "designated".to_string(),
+                TlaValue::String("alice".to_string()),
+            ),
             ("threshold".to_string(), TlaValue::Int(7)),
             (
                 "Prisoner".to_string(),

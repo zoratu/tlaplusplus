@@ -14,6 +14,12 @@ const MAX_EVAL_DEPTH: usize = 100;
 /// When binding arguments to these parameters, we need just the base name.
 /// E.g., "P(_)" -> "P", "Op(_, _)" -> "Op", "x" -> "x"
 pub fn normalize_param_name(param: &str) -> &str {
+    let param = param.trim();
+    let param = if let Some(in_pos) = param.find("\\in") {
+        param[..in_pos].trim()
+    } else {
+        param
+    };
     if let Some(paren_pos) = param.find('(') {
         param[..paren_pos].trim()
     } else {
@@ -355,7 +361,7 @@ pub(crate) fn eval_let_action(
     Ok(())
 }
 
-pub(crate) fn eval_let_action_multi(
+pub fn eval_let_action_multi(
     expr: &str,
     ctx: &EvalContext<'_>,
     staged: &BTreeMap<String, TlaValue>,
@@ -462,7 +468,10 @@ fn eval_action_clause_to_branch(
             for var in vars {
                 branch.unchanged_vars.push(var.clone());
                 if let Some(value) = ctx.state.get(var) {
-                    branch.staged.entry(var.clone()).or_insert_with(|| value.clone());
+                    branch
+                        .staged
+                        .entry(var.clone())
+                        .or_insert_with(|| value.clone());
                 }
             }
             Ok(vec![branch])
@@ -1272,7 +1281,11 @@ fn eval_let_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
     eval_expr_inner(body_text, &child, depth + 1)
 }
 
-fn eval_atom_with_postfix(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<TlaValue> {
+fn parse_atom_with_postfix<'a>(
+    expr: &'a str,
+    ctx: &EvalContext<'_>,
+    depth: usize,
+) -> Result<(TlaValue, &'a str)> {
     let (mut value, mut rest) = parse_base(expr, ctx, depth + 1)?;
 
     loop {
@@ -1291,7 +1304,7 @@ fn eval_atom_with_postfix(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Re
 
         if trimmed.starts_with('[') {
             let (inside, next_rest) = take_bracket_group(trimmed, '[', ']')?;
-            let key = eval_expr_inner(inside, ctx, depth + 1)?;
+            let key = eval_bracket_index_key(inside, ctx, depth + 1)?;
 
             // Handle Lambda application differently from regular function application
             match &value {
@@ -1307,9 +1320,17 @@ fn eval_atom_with_postfix(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Re
             continue;
         }
 
-        return Err(anyhow!("unexpected trailing tokens in expr: {expr}"));
+        break;
     }
 
+    Ok((value, rest))
+}
+
+fn eval_atom_with_postfix(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<TlaValue> {
+    let (value, rest) = parse_atom_with_postfix(expr, ctx, depth + 1)?;
+    if !rest.trim_start().is_empty() {
+        return Err(anyhow!("unexpected trailing tokens in expr: {expr}"));
+    }
     Ok(value)
 }
 
@@ -1418,8 +1439,10 @@ fn parse_base<'a>(
 
         // Handle prefix operators like DOMAIN and ENABLED that don't use parentheses
         if matches!(name.as_str(), "DOMAIN") && !has_runtime_value {
-            // Parse the argument as the next atom
-            let (arg_value, next_rest) = parse_base(rest_after_name.trim_start(), ctx, depth + 1)?;
+            // `DOMAIN ReplicatedLog[node]` should apply after postfix indexing, not
+            // as `(DOMAIN ReplicatedLog)[node]`.
+            let (arg_value, next_rest) =
+                parse_atom_with_postfix(rest_after_name.trim_start(), ctx, depth + 1)?;
             let value = eval_operator_call(&name, vec![arg_value], ctx, depth + 1)?;
             return Ok((value, next_rest));
         }
@@ -2008,10 +2031,8 @@ pub(crate) fn eval_operator_call(
             if args.len() != 1 {
                 return Err(anyhow!("Head expects 1 argument"));
             }
-            let seq = match &args[0] {
-                TlaValue::Seq(v) => v,
-                _ => return Err(anyhow!("Head expects a sequence, got {:?}", args[0])),
-            };
+            let seq = sequence_like_values(&args[0])
+                .ok_or_else(|| anyhow!("Head expects a sequence, got {:?}", args[0]))?;
             if seq.is_empty() {
                 return Err(anyhow!("Head of empty sequence"));
             }
@@ -2021,10 +2042,8 @@ pub(crate) fn eval_operator_call(
             if args.len() != 1 {
                 return Err(anyhow!("Tail expects 1 argument"));
             }
-            let seq = match &args[0] {
-                TlaValue::Seq(v) => v,
-                _ => return Err(anyhow!("Tail expects a sequence, got {:?}", args[0])),
-            };
+            let seq = sequence_like_values(&args[0])
+                .ok_or_else(|| anyhow!("Tail expects a sequence, got {:?}", args[0]))?;
             if seq.is_empty() {
                 return Err(anyhow!("Tail of empty sequence"));
             }
@@ -2034,11 +2053,8 @@ pub(crate) fn eval_operator_call(
             if args.len() != 2 {
                 return Err(anyhow!("Append expects 2 arguments"));
             }
-            let seq = match &args[0] {
-                TlaValue::Seq(v) => v,
-                _ => return Err(anyhow!("Append expects a sequence, got {:?}", args[0])),
-            };
-            let mut new_seq = (**seq).clone();
+            let mut new_seq = sequence_like_values(&args[0])
+                .ok_or_else(|| anyhow!("Append expects a sequence, got {:?}", args[0]))?;
             new_seq.push(args[1].clone());
             return Ok(TlaValue::Seq(Arc::new(new_seq)));
         }
@@ -2046,10 +2062,8 @@ pub(crate) fn eval_operator_call(
             if args.len() != 3 {
                 return Err(anyhow!("SubSeq expects 3 arguments"));
             }
-            let seq = match &args[0] {
-                TlaValue::Seq(v) => v,
-                _ => return Err(anyhow!("SubSeq expects a sequence, got {:?}", args[0])),
-            };
+            let seq = sequence_like_values(&args[0])
+                .ok_or_else(|| anyhow!("SubSeq expects a sequence, got {:?}", args[0]))?;
             let m = args[1].as_int()?;
             let n = args[2].as_int()?;
 
@@ -2080,10 +2094,8 @@ pub(crate) fn eval_operator_call(
             if args.len() != 2 {
                 return Err(anyhow!("SelectSeq expects 2 arguments"));
             }
-            let seq = match &args[0] {
-                TlaValue::Seq(v) => v,
-                _ => return Err(anyhow!("SelectSeq expects a sequence, got {:?}", args[0])),
-            };
+            let seq = sequence_like_values(&args[0])
+                .ok_or_else(|| anyhow!("SelectSeq expects a sequence, got {:?}", args[0]))?;
             let test_fn = &args[1];
 
             let mut result = Vec::new();
@@ -2237,7 +2249,7 @@ fn split_outer_let(expr: &str) -> Option<(&str, &str)> {
                     depth = depth.saturating_sub(1);
                     if depth == 0 {
                         let defs = after_let[..start].trim();
-                        let body = after_let[end..].trim();
+                        let body = after_let[end..].trim_end();
                         return Some((defs, body));
                     }
                 }
@@ -2292,25 +2304,50 @@ fn parse_let_definitions(defs_text: &str) -> Result<BTreeMap<String, TlaDefiniti
 }
 
 fn parse_local_def_head(head: &str) -> (String, Vec<String>) {
-    if let Some(open) = head.find('(')
-        && let Some(close) = head.rfind(')')
-        && close > open
+    if let Some((open, close)) = first_local_def_param_delims(head)
+        && let Some((name, params)) = parse_local_def_head_with_delims(head, open, close)
     {
-        let name = head[..open].trim().to_string();
-        let params = split_top_level_symbol(&head[open + 1..close], ",")
-            .into_iter()
-            .map(|p| p.trim().to_string())
-            .filter(|p| !p.is_empty())
-            .collect::<Vec<_>>();
         return (name, params);
     }
 
-    if let Some(open) = head.find('[')
-        && let Some(close) = head.rfind(']')
-        && close > open
-    {
-        let name = head[..open].trim().to_string();
-        let inside = &head[open + 1..close];
+    let name = head
+        .split_whitespace()
+        .next()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    (name, Vec::new())
+}
+
+fn first_local_def_param_delims(head: &str) -> Option<(char, char)> {
+    match (head.find('('), head.find('[')) {
+        (Some(paren), Some(bracket)) if bracket < paren => Some(('[', ']')),
+        (Some(_), Some(_)) => Some(('(', ')')),
+        (Some(_), None) => Some(('(', ')')),
+        (None, Some(_)) => Some(('[', ']')),
+        (None, None) => None,
+    }
+}
+
+fn parse_local_def_head_with_delims(
+    head: &str,
+    open_delim: char,
+    close_delim: char,
+) -> Option<(String, Vec<String>)> {
+    let open = head.find(open_delim)?;
+    let close = head.rfind(close_delim)?;
+    if close <= open {
+        return None;
+    }
+
+    let name = head[..open].trim().to_string();
+    let inside = &head[open + 1..close];
+    let params = if open_delim == '(' {
+        split_top_level_symbol(inside, ",")
+            .into_iter()
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+    } else {
         let mut params = Vec::new();
         for part in split_top_level_symbol(inside, ",") {
             let part = part.trim();
@@ -2327,15 +2364,9 @@ fn parse_local_def_head(head: &str) -> (String, Vec<String>) {
                 params.push(candidate.to_string());
             }
         }
-        return (name, params);
-    }
-
-    let name = head
-        .split_whitespace()
-        .next()
-        .map(ToString::to_string)
-        .unwrap_or_default();
-    (name, Vec::new())
+        params
+    };
+    Some((name, params))
 }
 
 fn parse_binders(
@@ -2605,7 +2636,7 @@ fn parse_except_path(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<
 
         if rest.starts_with('[') {
             let (inside, next_rest) = take_bracket_group(rest, '[', ']')?;
-            let key = eval_expr_inner(inside, ctx, depth + 1)?;
+            let key = eval_bracket_index_key(inside, ctx, depth + 1)?;
             out.push(PathSegment::Index(key));
             rest = next_rest.trim_start();
             continue;
@@ -2728,6 +2759,33 @@ fn parse_argument_list(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
         args.push(eval_expr_inner(part, ctx, depth + 1)?);
     }
     Ok(args)
+}
+
+fn eval_bracket_index_key(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<TlaValue> {
+    let args = parse_argument_list(expr, ctx, depth + 1)?;
+    match args.len() {
+        0 => Err(anyhow!("empty bracket index")),
+        1 => Ok(args.into_iter().next().expect("single arg exists")),
+        _ => Ok(TlaValue::Seq(Arc::new(args))),
+    }
+}
+
+fn sequence_like_values(value: &TlaValue) -> Option<Vec<TlaValue>> {
+    match value {
+        TlaValue::Seq(seq) => Some((**seq).clone()),
+        TlaValue::Function(map) => {
+            let mut out = Vec::with_capacity(map.len());
+            for (idx, (key, value)) in map.iter().enumerate() {
+                let expected = (idx as i64) + 1;
+                match key {
+                    TlaValue::Int(actual) if *actual == expected => out.push(value.clone()),
+                    _ => return None,
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
 }
 
 fn seq_or_string_concat(lhs: TlaValue, rhs: TlaValue) -> Result<TlaValue> {
@@ -4284,6 +4342,13 @@ mod tests {
     use std::collections::BTreeSet;
 
     #[test]
+    fn normalizes_binder_and_higher_order_param_names() {
+        assert_eq!(normalize_param_name("leader \\in Node"), "leader");
+        assert_eq!(normalize_param_name("Op(_, _)"), "Op");
+        assert_eq!(normalize_param_name("HostOf"), "HostOf");
+    }
+
+    #[test]
     fn evals_arithmetic_and_boolean() {
         let state = TlaState::from([
             ("x".to_string(), TlaValue::Int(4)),
@@ -4526,6 +4591,90 @@ mod tests {
     }
 
     #[test]
+    fn evaluates_tuple_index_function_access() {
+        let tuple_key = TlaValue::Seq(Arc::new(vec![
+            TlaValue::ModelValue("n1".to_string()),
+            TlaValue::ModelValue("n2".to_string()),
+        ]));
+        let state = TlaState::from([
+            (
+                "NetworkPath".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([(
+                    tuple_key,
+                    TlaValue::Bool(true),
+                )]))),
+            ),
+            ("src".to_string(), TlaValue::ModelValue("n1".to_string())),
+            ("dst".to_string(), TlaValue::ModelValue("n2".to_string())),
+        ]);
+
+        let ctx = EvalContext::new(&state);
+        assert_eq!(
+            eval_expr("NetworkPath[src, dst]", &ctx).expect("tuple lookup should evaluate"),
+            TlaValue::Bool(true)
+        );
+    }
+
+    #[test]
+    fn evaluates_tuple_index_except_updates() {
+        let tuple_key = TlaValue::Seq(Arc::new(vec![
+            TlaValue::ModelValue("n1".to_string()),
+            TlaValue::ModelValue("n2".to_string()),
+        ]));
+        let state = TlaState::from([
+            (
+                "NetworkPath".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([(
+                    tuple_key,
+                    TlaValue::Bool(true),
+                )]))),
+            ),
+            ("src".to_string(), TlaValue::ModelValue("n1".to_string())),
+            ("dst".to_string(), TlaValue::ModelValue("n2".to_string())),
+        ]);
+
+        let ctx = EvalContext::new(&state);
+        let updated = eval_expr("[NetworkPath EXCEPT ![src, dst] = FALSE]", &ctx)
+            .expect("tuple EXCEPT update should evaluate");
+
+        let TlaValue::Function(map) = updated else {
+            panic!("expected function value");
+        };
+        let tuple_key = TlaValue::Seq(Arc::new(vec![
+            TlaValue::ModelValue("n1".to_string()),
+            TlaValue::ModelValue("n2".to_string()),
+        ]));
+        assert_eq!(map.get(&tuple_key), Some(&TlaValue::Bool(false)));
+    }
+
+    #[test]
+    fn domain_accepts_indexed_function_values() {
+        let state = TlaState::from([
+            (
+                "ReplicatedLog".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([(
+                    TlaValue::ModelValue("n1".to_string()),
+                    TlaValue::Function(Arc::new(BTreeMap::from([
+                        (TlaValue::Int(1), TlaValue::ModelValue("a".to_string())),
+                        (TlaValue::Int(2), TlaValue::ModelValue("b".to_string())),
+                    ]))),
+                )]))),
+            ),
+            ("node".to_string(), TlaValue::ModelValue("n1".to_string())),
+        ]);
+        let ctx = EvalContext::new(&state);
+
+        assert_eq!(
+            eval_expr("DOMAIN ReplicatedLog[node]", &ctx)
+                .expect("DOMAIN should bind after postfix indexing"),
+            TlaValue::Set(Arc::new(BTreeSet::from([
+                TlaValue::Int(1),
+                TlaValue::Int(2)
+            ])))
+        );
+    }
+
+    #[test]
     fn evaluates_quantifier_and_choose() {
         let state = TlaState::from([(
             "S".to_string(),
@@ -4573,12 +4722,10 @@ mod tests {
             "Calls".to_string(),
             TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(1)]))),
         )]);
-        let ctx = EvalContext::with_definitions(&state, &defs).with_local_values(&[
-            ("e", TlaValue::Int(1)),
-        ]);
+        let ctx = EvalContext::with_definitions(&state, &defs)
+            .with_local_values(&[("e", TlaValue::Int(1))]);
 
-        let expr =
-            "\\A call \\in Calls : /\\ CanService[e, call] => /\\ \\E other \\in Elevator : /\\ other /= e /\\ CanService[other, call]";
+        let expr = "\\A call \\in Calls : /\\ CanService[e, call] => /\\ \\E other \\in Elevator : /\\ other /= e /\\ CanService[other, call]";
         assert_eq!(
             eval_expr(expr, &ctx).expect("quantified implication should evaluate"),
             TlaValue::Bool(true)
@@ -4707,6 +4854,106 @@ mod tests {
                 TlaValue::Int(2),
                 TlaValue::Int(4),
                 TlaValue::Int(5)
+            ]))
+        );
+    }
+
+    #[test]
+    fn split_top_level_preserves_quantified_conjunction_bodies() {
+        let expr = r#"
+            /\ eState.direction /= "Stationary"
+            /\ ~eState.doorsOpen
+            /\ eState.floor \notin eState.buttonsPressed
+            /\ \A call \in ActiveElevatorCalls :
+                /\ CanServiceCall[e, call] =>
+                    /\ \E e2 \in Elevator :
+                        /\ e /= e2
+                        /\ CanServiceCall[e2, call]
+            /\ nextFloor \in Floor
+        "#;
+
+        let parts = split_top_level_symbol(expr, "/\\");
+        assert_eq!(parts.len(), 4);
+        assert!(parts[3].contains(r"\A call \in ActiveElevatorCalls"));
+        assert!(parts[3].contains("CanServiceCall[e2, call]"));
+        assert!(parts[3].contains("nextFloor \\in Floor"));
+    }
+
+    #[test]
+    fn evals_empty_universal_quantifier_with_record_body() {
+        let state = TlaState::from([
+            (
+                "ActiveElevatorCalls".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::new())),
+            ),
+            (
+                "Elevator".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([
+                    TlaValue::ModelValue("e1".to_string()),
+                    TlaValue::ModelValue("e2".to_string()),
+                ]))),
+            ),
+            ("e".to_string(), TlaValue::ModelValue("e1".to_string())),
+            ("nextFloor".to_string(), TlaValue::Int(1)),
+            (
+                "Floor".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([
+                    TlaValue::Int(1),
+                    TlaValue::Int(2),
+                ]))),
+            ),
+        ]);
+        let defs = BTreeMap::from([(
+            "CanServiceCall".to_string(),
+            TlaDefinition {
+                name: "CanServiceCall".to_string(),
+                params: vec!["e".to_string(), "c".to_string()],
+                body: r#"
+                    /\ c.floor = 1
+                    /\ c.direction = "Up"
+                "#
+                .to_string(),
+                is_recursive: false,
+            },
+        )]);
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        let value = eval_expr(
+            r#"
+                \A call \in ActiveElevatorCalls :
+                    /\ CanServiceCall[e, call] =>
+                        /\ \E e2 \in Elevator :
+                            /\ e /= e2
+                            /\ CanServiceCall[e2, call]
+                    /\ nextFloor \in Floor
+            "#,
+            &ctx,
+        )
+        .expect("empty universal quantifier should evaluate");
+
+        assert_eq!(value, TlaValue::Bool(true));
+    }
+
+    #[test]
+    fn subseq_accepts_sequence_like_functions() {
+        let state = TlaState::from([(
+            "log".to_string(),
+            TlaValue::Function(Arc::new(BTreeMap::from([
+                (TlaValue::Int(1), TlaValue::String("a".to_string())),
+                (TlaValue::Int(2), TlaValue::String("b".to_string())),
+                (TlaValue::Int(3), TlaValue::String("c".to_string())),
+            ]))),
+        )]);
+        let ctx = EvalContext::new(&state);
+
+        let result = eval_expr("SubSeq(log, 1, 2)", &ctx)
+            .expect("SubSeq should accept sequence-like functions");
+
+        assert_eq!(
+            result,
+            TlaValue::Seq(Arc::new(vec![
+                TlaValue::String("a".to_string()),
+                TlaValue::String("b".to_string()),
             ]))
         );
     }
