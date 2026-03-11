@@ -2675,7 +2675,7 @@ fn collect_action_param_samples_from_expr(
         return;
     }
 
-    let disjuncts = split_top_level(trimmed, "\\/");
+    let disjuncts = split_action_body_disjuncts(trimmed);
     if disjuncts.len() > 1 || trimmed.starts_with("\\/") {
         for disjunct in disjuncts {
             collect_action_param_samples_from_expr(
@@ -3228,7 +3228,7 @@ fn should_skip_action_expr_probe(expr: &str) -> bool {
     }
 
     if trimmed.contains('\'') {
-        let disjuncts = split_top_level(trimmed, "\\/");
+        let disjuncts = split_action_body_disjuncts(trimmed);
         if disjuncts.len() > 1 || trimmed.starts_with("\\/") {
             return true;
         }
@@ -5318,6 +5318,64 @@ Spec
     }
 
     #[test]
+    fn expr_probe_evaluates_primed_zero_arg_operators_from_staged_bindings() {
+        let state = TlaState::from([
+            ("x".to_string(), TlaValue::Int(1)),
+            ("y".to_string(), TlaValue::Int(2)),
+        ]);
+        let defs = BTreeMap::from([
+            (
+                "PairSum".to_string(),
+                TlaDefinition {
+                    name: "PairSum".to_string(),
+                    params: vec![],
+                    body: "x + y".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "PairSumPositive".to_string(),
+                TlaDefinition {
+                    name: "PairSumPositive".to_string(),
+                    params: vec![],
+                    body: "PairSum > 0".to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+        let def = TlaDefinition {
+            name: "Advance".to_string(),
+            params: vec![],
+            body: r#"
+                /\ x' = 10
+                /\ y' = -3
+                /\ PairSumPositive'
+            "#
+            .to_string(),
+            is_recursive: false,
+        };
+        let ir = compile_action_ir(&def);
+        let instances = BTreeMap::new();
+        let mut ctx = build_action_expr_probe_context(
+            &state,
+            &defs,
+            &instances,
+            &ir.params,
+            &ir.clauses,
+            None,
+        );
+
+        for clause in &ir.clauses {
+            if let Some(result) = probe_action_clause_expr(clause, &mut ctx) {
+                result.expect("primed derived operators should probe against staged state");
+            }
+        }
+
+        assert_eq!(ctx.locals.get("x'"), Some(&TlaValue::Int(10)));
+        assert_eq!(ctx.locals.get("y'"), Some(&TlaValue::Int(-3)));
+    }
+
+    #[test]
     fn expr_probe_expands_nested_action_operator_calls() {
         let mut state = TlaState::new();
         state.insert("x".to_string(), TlaValue::Int(1));
@@ -5666,6 +5724,94 @@ Spec
         assert_eq!(
             samples.get("Cross").and_then(|params| params.get("side")),
             Some(&TlaValue::String("left".to_string()))
+        );
+    }
+
+    #[test]
+    fn infer_action_param_samples_handles_nested_line_leading_disjunctions() {
+        let state = TlaState::new();
+        let defs = BTreeMap::from([
+            (
+                "Acceptor".to_string(),
+                TlaDefinition {
+                    name: "Acceptor".to_string(),
+                    params: vec![],
+                    body: "{a1}".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Ballot".to_string(),
+                TlaDefinition {
+                    name: "Ballot".to_string(),
+                    params: vec![],
+                    body: "0..1".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Value".to_string(),
+                TlaDefinition {
+                    name: "Value".to_string(),
+                    params: vec![],
+                    body: "{v1}".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "IncreaseMaxBal".to_string(),
+                TlaDefinition {
+                    name: "IncreaseMaxBal".to_string(),
+                    params: vec!["a".to_string(), "b".to_string()],
+                    body: "TRUE".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "VoteFor".to_string(),
+                TlaDefinition {
+                    name: "VoteFor".to_string(),
+                    params: vec!["a".to_string(), "b".to_string(), "v".to_string()],
+                    body: "TRUE".to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+
+        let samples = infer_action_param_samples_from_next(
+            r#"\E a \in Acceptor, b \in Ballot :
+                  \/ IncreaseMaxBal(a, b)
+                  \/ \E v \in Value : VoteFor(a, b, v)"#,
+            &state,
+            &defs,
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(
+            samples
+                .get("IncreaseMaxBal")
+                .and_then(|params| params.get("a")),
+            Some(&TlaValue::ModelValue("a1".to_string()))
+        );
+        let increase_ballot = samples
+            .get("IncreaseMaxBal")
+            .and_then(|params| params.get("b"))
+            .and_then(|value| value.as_int().ok())
+            .expect("IncreaseMaxBal should sample a ballot");
+        assert!((0..=1).contains(&increase_ballot));
+        assert_eq!(
+            samples.get("VoteFor").and_then(|params| params.get("a")),
+            Some(&TlaValue::ModelValue("a1".to_string()))
+        );
+        let vote_ballot = samples
+            .get("VoteFor")
+            .and_then(|params| params.get("b"))
+            .and_then(|value| value.as_int().ok())
+            .expect("VoteFor should sample a ballot");
+        assert!((0..=1).contains(&vote_ballot));
+        assert_eq!(
+            samples.get("VoteFor").and_then(|params| params.get("v")),
+            Some(&TlaValue::ModelValue("v1".to_string()))
         );
     }
 

@@ -4,7 +4,7 @@ use crate::tla::module::TlaModuleInstance;
 use crate::tla::{
     ActionClause, ActionIr, CompiledActionIr, EvalContext, TlaDefinition, TlaState, TlaValue,
     apply_compiled_action_ir_multi, compile_action_ir, eval_expr, normalize_param_name,
-    split_top_level,
+    split_action_body_disjuncts, split_top_level,
 };
 use anyhow::{Result, anyhow};
 use dashmap::DashMap;
@@ -580,88 +580,11 @@ fn parse_action_call(expr: &str) -> Option<(String, Vec<String>)> {
 }
 
 fn split_action_disjuncts(expr: &str) -> Vec<String> {
-    let disjuncts = split_top_level(expr, "\\/");
-    if disjuncts.len() > 1 {
-        return disjuncts;
-    }
-
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let chars: Vec<char> = expr.chars().collect();
-    let mut i = 0usize;
-    let mut paren = 0usize;
-    let mut bracket = 0usize;
-    let mut brace = 0usize;
-    let mut angle = 0usize;
-    let mut line_head = true;
-
-    while i < chars.len() {
-        let c = chars[i];
-        let next = chars.get(i + 1).copied();
-
-        if paren == 0
-            && bracket == 0
-            && brace == 0
-            && angle == 0
-            && line_head
-            && c == '\\'
-            && next == Some('/')
-        {
-            let piece = current.trim();
-            if !piece.is_empty() {
-                out.push(piece.to_string());
-                current.clear();
-            }
-            i += 2;
-            line_head = true;
-            continue;
-        }
-
-        if c == '<' && next == Some('<') {
-            angle += 1;
-            current.push(c);
-            current.push('<');
-            i += 2;
-            line_head = false;
-            continue;
-        }
-        if c == '>' && next == Some('>') {
-            angle = angle.saturating_sub(1);
-            current.push(c);
-            current.push('>');
-            i += 2;
-            line_head = false;
-            continue;
-        }
-
-        match c {
-            '(' => paren += 1,
-            ')' => paren = paren.saturating_sub(1),
-            '[' => bracket += 1,
-            ']' => bracket = bracket.saturating_sub(1),
-            '{' => brace += 1,
-            '}' => brace = brace.saturating_sub(1),
-            _ => {}
-        }
-
-        current.push(c);
-        if c == '\n' {
-            line_head = true;
-        } else if !c.is_whitespace() {
-            line_head = false;
-        }
-        i += 1;
-    }
-
-    let piece = current.trim();
-    if !piece.is_empty() {
-        out.push(piece.to_string());
-    }
-
-    if out.is_empty() {
+    let disjuncts = split_action_body_disjuncts(expr);
+    if disjuncts.is_empty() {
         vec![expr.trim().to_string()]
     } else {
-        out
+        disjuncts
     }
 }
 
