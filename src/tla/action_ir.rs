@@ -31,11 +31,8 @@ pub struct ActionIr {
 }
 
 pub(crate) fn split_action_body_clauses(expr: &str) -> Vec<String> {
-    if let Some(clauses) = split_indented_action_conjuncts(expr) {
-        return clauses;
-    }
-
-    let trimmed = expr.trim();
+    let normalized = normalize_multiline_action_indentation(expr);
+    let trimmed = normalized.trim();
     if trimmed.is_empty() {
         return Vec::new();
     }
@@ -614,6 +611,28 @@ mod tests {
         assert!(!clauses[1].contains("nextFloor \\in Floor"));
         assert_eq!(clauses[2], "nextFloor \\in Floor");
         assert_eq!(clauses[3], "state' = nextState");
+    }
+
+    #[test]
+    fn split_action_body_clauses_keeps_exists_bodies_with_nested_conjuncts_together() {
+        let clauses = split_action_body_clauses(
+            r#"
+                /\ \E i \in unchecked[self]:
+                    /\ unchecked' = [unchecked EXCEPT ![self] = unchecked[self] \ {i}]
+                    /\ IF num[i] > max[self]
+                          THEN /\ max' = [max EXCEPT ![self] = num[i]]
+                          ELSE /\ TRUE
+                               /\ max' = max
+                /\ pc' = [pc EXCEPT ![self] = "e2"]
+            "#,
+        );
+
+        assert_eq!(clauses.len(), 1);
+        assert!(clauses[0].starts_with(r"\E i \in unchecked[self]:"));
+        assert!(clauses[0].contains(r#"unchecked' = [unchecked EXCEPT ![self] = unchecked[self] \ {i}]"#));
+        assert!(clauses[0].contains(r#"max' = [max EXCEPT ![self] = num[i]]"#));
+        assert!(clauses[0].contains(r#"max' = max"#));
+        assert!(clauses[0].contains(r#"pc' = [pc EXCEPT ![self] = "e2"]"#));
     }
 
     #[test]
