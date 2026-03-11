@@ -338,17 +338,53 @@ pub fn compile_action_ir(def: &TlaDefinition) -> ActionIr {
 /// separately instead of feeding raw `\/` separators into `compile_action_ir`.
 pub fn compile_action_ir_branches(def: &TlaDefinition) -> Vec<ActionIr> {
     let trimmed = def.body.trim();
-    let disjuncts = split_action_body_disjuncts(trimmed);
-    let has_top_level_disjunction = disjuncts.len() > 1 || trimmed.starts_with("\\/");
-
-    let branch_bodies = if has_top_level_disjunction {
-        disjuncts
+    let clauses = split_action_body_clauses(trimmed);
+    let clause_options: Vec<Vec<String>> = if clauses.is_empty() {
+        vec![vec![trimmed.to_string()]]
     } else {
-        vec![trimmed.to_string()]
+        clauses
+            .iter()
+            .map(|clause| {
+                let disjuncts = split_action_body_disjuncts(clause);
+                if disjuncts.len() > 1 || clause.trim().starts_with("\\/") {
+                    disjuncts
+                        .into_iter()
+                        .map(|disjunct| normalize_branch_clause(&disjunct))
+                        .collect()
+                } else {
+                    vec![clause.trim().to_string()]
+                }
+            })
+            .collect()
     };
+
+    let mut branch_bodies = vec![Vec::<String>::new()];
+    for options in clause_options {
+        let mut next = Vec::new();
+        for existing in &branch_bodies {
+            for option in &options {
+                let mut branch = existing.clone();
+                branch.push(option.clone());
+                next.push(branch);
+            }
+        }
+        branch_bodies = next;
+    }
 
     branch_bodies
         .into_iter()
+        .map(|clauses| {
+            if clauses.len() == 1 {
+                clauses[0].trim().to_string()
+            } else {
+                clauses
+                    .into_iter()
+                    .filter(|clause| !clause.trim().is_empty())
+                    .map(|clause| format!("/\\ {}", clause.trim()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        })
         .filter_map(|body| {
             let body = body.trim().to_string();
             if body.is_empty() {
@@ -363,6 +399,15 @@ pub fn compile_action_ir_branches(def: &TlaDefinition) -> Vec<ActionIr> {
             }))
         })
         .collect()
+}
+
+fn normalize_branch_clause(clause: &str) -> String {
+    clause
+        .trim()
+        .strip_prefix("/\\")
+        .map(str::trim_start)
+        .unwrap_or_else(|| clause.trim())
+        .to_string()
 }
 
 pub fn looks_like_action(def: &TlaDefinition) -> bool {
@@ -728,5 +773,46 @@ mod tests {
         assert!(
             disjuncts[2].starts_with(r#"/\ IF RMMAYFAIL /\ ~\E rm \in RM:rmState[rm]="failed""#)
         );
+    }
+
+    #[test]
+    fn compile_action_ir_branches_expands_nested_disjunctions_with_shared_clauses() {
+        let def = TlaDefinition {
+            name: "e1".to_string(),
+            params: vec!["self".to_string()],
+            body: r#"
+                /\ pc[self] = "e1"
+                /\ \/ /\ flag' = [flag EXCEPT ![self] = ~ flag[self]]
+                      /\ pc' = [pc EXCEPT ![self] = "e1"]
+                   \/ /\ flag' = [flag EXCEPT ![self] = TRUE]
+                      /\ unchecked' = [unchecked EXCEPT ![self] = Procs \ {self}]
+                      /\ pc' = [pc EXCEPT ![self] = "e2"]
+                /\ UNCHANGED num
+            "#
+            .to_string(),
+            is_recursive: false,
+        };
+
+        let branches = compile_action_ir_branches(&def);
+        assert_eq!(branches.len(), 2);
+        for branch in branches {
+            let texts: Vec<String> = branch
+                .clauses
+                .into_iter()
+                .map(|clause| match clause {
+                    ActionClause::Guard { expr }
+                    | ActionClause::PrimedAssignment { expr, .. }
+                    | ActionClause::LetWithPrimes { expr } => expr,
+                    ActionClause::Exists { body, .. } => body,
+                    ActionClause::Unchanged { vars } => vars.join(","),
+                })
+                .collect();
+            assert!(texts.iter().any(|expr| expr.contains(r#"pc[self] = "e1""#)));
+            assert!(
+                texts
+                    .iter()
+                    .any(|expr| expr.contains(r#"pc EXCEPT ![self]"#))
+            );
+        }
     }
 }
