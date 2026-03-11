@@ -955,6 +955,10 @@ fn membership_matches_text(
         "Int" => Ok(value.as_int().is_ok()),
         "BOOLEAN" => Ok(matches!(value, TlaValue::Bool(_))),
         _ => {
+            if let Some(runtime_value) = ctx.runtime_value(rhs_trimmed) {
+                return runtime_value.contains(value);
+            }
+
             if let Some(def) = ctx.definition(rhs_trimmed)
                 && def.params.is_empty()
             {
