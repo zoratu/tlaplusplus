@@ -7,6 +7,7 @@
 
 use anyhow::Result;
 use crossbeam_channel::Sender;
+use std::path::PathBuf;
 
 use crate::storage::async_fingerprint_writer::FingerprintPersistMsg;
 use crate::storage::auto_switching_fingerprint_store::{
@@ -36,6 +37,8 @@ pub struct UnifiedFingerprintConfig {
     pub num_numa_nodes: usize,
     /// Auto-switch configuration (only used when use_auto_switch is true)
     pub auto_switch_config: Option<AutoSwitchConfigInput>,
+    /// Directory for file-backed mmap backing files (None = anonymous mmap)
+    pub backing_dir: Option<PathBuf>,
 }
 
 /// Input configuration for auto-switch mode
@@ -73,7 +76,7 @@ impl UnifiedFingerprintStore {
                 num_numa_nodes: config.num_numa_nodes,
                 check_interval: 10_000,
             };
-            let store = AutoSwitchingFingerprintStore::new(switch_config, assigned_cpus)?;
+            let store = AutoSwitchingFingerprintStore::new(switch_config, assigned_cpus, config.backing_dir.as_deref())?;
             Ok(Self::AutoSwitch(store))
         } else if config.use_bloom {
             // Bloom filter mode - fixed memory
@@ -91,7 +94,11 @@ impl UnifiedFingerprintStore {
                 expected_items: config.expected_items,
                 shard_size_mb: config.shard_size_mb,
             };
-            let store = PageAlignedFingerprintStore::new(pa_config, assigned_cpus)?;
+            let store = PageAlignedFingerprintStore::new_with_backing(
+                pa_config,
+                assigned_cpus,
+                config.backing_dir.as_deref(),
+            )?;
             Ok(Self::PageAligned(store))
         }
     }
@@ -158,6 +165,17 @@ impl UnifiedFingerprintStore {
             Self::PageAligned(store) => store.stats(),
             Self::Bloom(store) => store.stats(),
             Self::AutoSwitch(store) => store.stats(),
+        }
+    }
+
+    /// Advise the kernel that fingerprint memory is cold and can be paged out
+    ///
+    /// Only effective for file-backed mappings.
+    pub fn advise_cold(&self) {
+        match self {
+            Self::PageAligned(store) => store.advise_cold(),
+            Self::Bloom(_) => {} // Bloom filters are already bounded
+            Self::AutoSwitch(store) => store.advise_cold(),
         }
     }
 

@@ -1001,6 +1001,23 @@ where
         None
     };
 
+    // Create directory for file-backed mmap fingerprint store
+    let fp_backing_dir = if !config.use_bloom_fingerprints && config.memory_max_bytes.is_some() {
+        let dir = config.work_dir.join("fingerprints-mmap");
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!(
+                "Warning: Failed to create fingerprint backing dir {}: {}. Using anonymous mmap.",
+                dir.display(),
+                e
+            );
+            None
+        } else {
+            Some(dir)
+        }
+    } else {
+        None
+    };
+
     let fp_config = UnifiedFingerprintConfig {
         use_bloom: config.use_bloom_fingerprints,
         use_auto_switch: config.bloom_auto_switch && !config.use_bloom_fingerprints,
@@ -1010,6 +1027,7 @@ where
         shard_size_mb,
         num_numa_nodes: worker_plan.numa_nodes_used.max(1),
         auto_switch_config,
+        backing_dir: fp_backing_dir,
     };
 
     let mut fp_store = UnifiedFingerprintStore::new(fp_config, &worker_plan.assigned_cpus)?;
@@ -1102,6 +1120,68 @@ where
     }
 
     let fp_store = Arc::new(fp_store);
+
+    // Memory pressure monitor thread - advises kernel to page out cold fingerprints
+    // when RSS approaches memory_max_bytes. Only active for file-backed mmap.
+    let mem_monitor_stop = Arc::new(AtomicBool::new(false));
+    let mem_monitor_thread: Option<std::thread::JoinHandle<()>> = if effective_memory_max.is_some()
+        && !config.use_bloom_fingerprints
+    {
+        let monitor_fp_store = Arc::clone(&fp_store);
+        let monitor_stop = Arc::clone(&mem_monitor_stop);
+        let memory_max = effective_memory_max.unwrap();
+        Some(
+            std::thread::Builder::new()
+                .name("tlapp-mem-monitor".into())
+                .spawn(move || {
+                    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 };
+                    let threshold_90 = (memory_max as f64 * 0.90) as u64;
+                    let threshold_95 = (memory_max as f64 * 0.95) as u64;
+                    let mut warned_95 = false;
+
+                    while !monitor_stop.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_secs(5));
+                        if monitor_stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+
+                        // Read RSS from /proc/self/statm (Linux only)
+                        let rss_bytes = match std::fs::read_to_string("/proc/self/statm") {
+                            Ok(statm) => {
+                                // Field 1 (0-indexed) is RSS in pages
+                                statm
+                                    .split_whitespace()
+                                    .nth(1)
+                                    .and_then(|s| s.parse::<u64>().ok())
+                                    .map(|pages| pages * page_size)
+                                    .unwrap_or(0)
+                            }
+                            Err(_) => continue, // Not on Linux or /proc not available
+                        };
+
+                        if rss_bytes > threshold_95 {
+                            if !warned_95 {
+                                eprintln!(
+                                    "Memory pressure: RSS {} MB exceeds 95% of limit {} MB, advising cold pages",
+                                    rss_bytes / (1024 * 1024),
+                                    memory_max / (1024 * 1024)
+                                );
+                                warned_95 = true;
+                            }
+                            monitor_fp_store.advise_cold();
+                        } else if rss_bytes > threshold_90 {
+                            monitor_fp_store.advise_cold();
+                            warned_95 = false; // Reset warning if we drop back below 95%
+                        } else {
+                            warned_95 = false;
+                        }
+                    }
+                })
+                .expect("Failed to spawn memory monitor thread"),
+        )
+    } else {
+        None
+    };
 
     // Use NUMA-aware work-stealing queues with optional disk spilling
     // Each worker has its own queue, steals from others when idle
@@ -2195,6 +2275,10 @@ where
     // Cleanup checkpoint thread
     queue.finish(); // Signal completion
 
+    mem_monitor_stop.store(true, Ordering::Relaxed);
+    if let Some(handle) = mem_monitor_thread {
+        let _ = handle.join();
+    }
     checkpoint_thread_stop.store(true, Ordering::Release);
     pause.resume();
     if let Some(handle) = checkpoint_thread
