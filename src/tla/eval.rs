@@ -150,10 +150,11 @@ impl<'a> EvalContext<'a> {
             return Ok(v);
         }
 
-        if let Some(def) = self.definition(name)
-            && def.params.is_empty()
-        {
-            return eval_operator_call(name, Vec::new(), self, depth + 1);
+        if let Some(def) = self.definition(name) {
+            if def.params.is_empty() {
+                return eval_operator_call(name, Vec::new(), self, depth + 1);
+            }
+            return Ok(definition_as_lambda(&def, self.locals.as_ref()));
         }
 
         Ok(TlaValue::ModelValue(name.to_string()))
@@ -211,6 +212,17 @@ impl<'a> TransitionContext<'a> {
 
 pub fn eval_expr(expr: &str, ctx: &EvalContext<'_>) -> Result<TlaValue> {
     eval_expr_inner(expr, ctx, 0)
+}
+
+fn definition_as_lambda(
+    def: &TlaDefinition,
+    captured_locals: &BTreeMap<String, TlaValue>,
+) -> TlaValue {
+    TlaValue::Lambda {
+        params: Arc::new(def.params.clone()),
+        body: def.body.clone(),
+        captured_locals: Arc::new(captured_locals.clone()),
+    }
 }
 
 pub fn eval_guard(expr: &str, ctx: &EvalContext<'_>) -> Result<bool> {
@@ -1206,6 +1218,12 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
         };
     }
 
+    if let Some((lhs, op, rhs)) = split_top_level_defined_infix(expr, ctx) {
+        let left = eval_expr_inner(lhs, ctx, depth + 1)?;
+        let right = eval_expr_inner(rhs, ctx, depth + 1)?;
+        return eval_operator_call(&op, vec![left, right], ctx, depth + 1);
+    }
+
     let union_parts = split_top_level_keyword(expr, "\\union");
     if union_parts.len() > 1 {
         let mut out = eval_expr_inner(&union_parts[0], ctx, depth + 1)?;
@@ -1327,6 +1345,12 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
         let mut func = BTreeMap::new();
         func.insert(key, val);
         return Ok(TlaValue::Function(Arc::new(func)));
+    }
+
+    if let Some((lhs, rhs)) = split_once_top_level(expr, "^^") {
+        let left = eval_expr_inner(lhs, ctx, depth + 1)?.as_int()?;
+        let right = eval_expr_inner(rhs, ctx, depth + 1)?.as_int()?;
+        return Ok(TlaValue::Int(left ^ right));
     }
 
     if let Some((lhs, op, rhs)) = split_top_level_additive(expr) {
@@ -4407,6 +4431,152 @@ fn split_once_top_level<'a>(expr: &'a str, delim: &str) -> Option<(&'a str, &'a 
     None
 }
 
+fn split_top_level_defined_infix<'a>(
+    expr: &'a str,
+    ctx: &EvalContext<'_>,
+) -> Option<(&'a str, String, &'a str)> {
+    let mut operators = BTreeSet::new();
+    for defs in [Some(ctx.local_definitions.as_ref()), ctx.definitions] {
+        let Some(defs) = defs else {
+            continue;
+        };
+        for (name, def) in defs.iter() {
+            if def.params.len() == 2 && is_user_defined_infix_operator(name) {
+                operators.insert(name.clone());
+            }
+        }
+    }
+    if operators.is_empty() {
+        return None;
+    }
+
+    let mut operators: Vec<String> = operators.into_iter().collect();
+    operators.sort_by_key(|op| std::cmp::Reverse(op.len()));
+
+    let mut i = 0usize;
+    let mut paren = 0usize;
+    let mut bracket = 0usize;
+    let mut brace = 0usize;
+    let mut angle = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    while i < expr.len() {
+        let ch = expr[i..].chars().next().expect("char at byte index");
+        let ch_len = ch.len_utf8();
+        let next = expr[i + ch_len..].chars().next();
+
+        if in_string {
+            if escaped {
+                escaped = false;
+                i += ch_len;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                i += ch_len;
+                continue;
+            }
+            if ch == '"' {
+                in_string = false;
+            }
+            i += ch_len;
+            continue;
+        }
+
+        if ch == '"' {
+            in_string = true;
+            i += ch_len;
+            continue;
+        }
+
+        if ch == '<' && next == Some('<') {
+            angle += 1;
+            i += 2;
+            continue;
+        }
+        if ch == '>' && next == Some('>') {
+            angle = angle.saturating_sub(1);
+            i += 2;
+            continue;
+        }
+
+        match ch {
+            '(' => paren += 1,
+            ')' => paren = paren.saturating_sub(1),
+            '[' => bracket += 1,
+            ']' => bracket = bracket.saturating_sub(1),
+            '{' => brace += 1,
+            '}' => brace = brace.saturating_sub(1),
+            _ => {}
+        }
+
+        if paren == 0 && bracket == 0 && brace == 0 && angle == 0 {
+            for op in &operators {
+                if !expr[i..].starts_with(op) {
+                    continue;
+                }
+                let lhs = expr[..i].trim();
+                let rhs = expr[i + op.len()..].trim();
+                if lhs.is_empty() || rhs.is_empty() {
+                    continue;
+                }
+                return Some((lhs, op.clone(), rhs));
+            }
+        }
+
+        i += ch_len;
+    }
+
+    None
+}
+
+fn is_user_defined_infix_operator(name: &str) -> bool {
+    if matches!(
+        name,
+        "/\\"
+            | "\\/"
+            | "=>"
+            | "~>"
+            | "="
+            | "/="
+            | "#"
+            | "<"
+            | "<="
+            | "=<"
+            | ">"
+            | ">="
+            | "\\leq"
+            | "\\geq"
+            | "\\in"
+            | "\\notin"
+            | "\\subseteq"
+            | ".."
+            | "\\union"
+            | "\\cup"
+            | "\\intersect"
+            | "\\cap"
+            | "\\o"
+            | "\\X"
+            | "\\times"
+            | "@@"
+            | ":>"
+            | "+"
+            | "-"
+            | "*"
+            | "\\div"
+            | "%"
+            | "^^"
+    ) {
+        return false;
+    }
+
+    !name.is_empty()
+        && name
+            .chars()
+            .any(|ch| !(ch.is_ascii_alphanumeric() || ch == '_'))
+}
+
 fn find_top_level_keyword_index(expr: &str, keyword: &str) -> Option<usize> {
     let mut i = 0usize;
     let mut paren = 0usize;
@@ -4969,6 +5139,7 @@ fn skip_leading_ws(input: &str, mut idx: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::collections::BTreeSet;
 
     #[test]
@@ -5049,6 +5220,78 @@ mod tests {
             TlaValue::Seq(Arc::new(vec![TlaValue::Int(2), TlaValue::Int(3)])),
         ])));
         assert_eq!(result_times, expected);
+    }
+
+    #[test]
+    fn resolves_named_operator_identifiers_as_higher_order_values() {
+        let state = TlaState::from([(
+            "waiting".to_string(),
+            TlaValue::Seq(Arc::new(vec![
+                TlaValue::Seq(Arc::new(vec![
+                    TlaValue::String("read".to_string()),
+                    TlaValue::Int(1),
+                ])),
+                TlaValue::Seq(Arc::new(vec![
+                    TlaValue::String("write".to_string()),
+                    TlaValue::Int(2),
+                ])),
+            ])),
+        )]);
+        let defs = BTreeMap::from([(
+            "read".to_string(),
+            TlaDefinition {
+                name: "read".to_string(),
+                params: vec!["s".to_string()],
+                body: r#"s[1] = "read""#.to_string(),
+                is_recursive: false,
+            },
+        )]);
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        assert_eq!(
+            eval_expr("SelectSeq(waiting, read)", &ctx)
+                .expect("higher-order operator should apply"),
+            TlaValue::Seq(Arc::new(vec![TlaValue::Seq(Arc::new(vec![
+                TlaValue::String("read".to_string()),
+                TlaValue::Int(1),
+            ]))]))
+        );
+    }
+
+    #[test]
+    fn evaluates_user_defined_infix_operator_definitions() {
+        let state = TlaState::new();
+        let defs = BTreeMap::from([(
+            r"\prec".to_string(),
+            TlaDefinition {
+                name: r"\prec".to_string(),
+                params: vec!["a".to_string(), "b".to_string()],
+                body: "a[1] < b[1]".to_string(),
+                is_recursive: false,
+            },
+        )]);
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        assert_eq!(
+            eval_expr("<<1, 2>> \\prec <<2, 1>>", &ctx).expect("infix operator should evaluate"),
+            TlaValue::Bool(true)
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn bitwise_xor_is_self_inverse(a in any::<i64>(), b in any::<i64>()) {
+            let state = TlaState::from([
+                ("a".to_string(), TlaValue::Int(a)),
+                ("b".to_string(), TlaValue::Int(b)),
+            ]);
+            let ctx = EvalContext::new(&state);
+
+            prop_assert_eq!(
+                eval_expr("(a ^^ b) ^^ b", &ctx).expect("xor expression should evaluate"),
+                TlaValue::Int(a)
+            );
+        }
     }
 
     #[test]
@@ -5525,10 +5768,7 @@ mod tests {
         );
 
         let state_with_alias = TlaState::from([
-            (
-                "SignedBlock".to_string(),
-                state["SignedBlock"].clone(),
-            ),
+            ("SignedBlock".to_string(), state["SignedBlock"].clone()),
             ("remembered".to_string(), value.clone()),
         ]);
         let aliased_ctx = EvalContext::new(&state_with_alias);

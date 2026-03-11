@@ -3372,7 +3372,11 @@ fn seed_probe_instance_constant_bindings(
             .local_definitions
             .get(constant)
             .cloned()
-            .or_else(|| parent_ctx.definitions.and_then(|defs| defs.get(constant).cloned()))
+            .or_else(|| {
+                parent_ctx
+                    .definitions
+                    .and_then(|defs| defs.get(constant).cloned())
+            })
         {
             defs_mut.insert(constant.clone(), def);
             continue;
@@ -3475,6 +3479,22 @@ fn current_probe_staged_primes(ctx: &EvalContext<'_>) -> BTreeMap<String, TlaVal
         .collect()
 }
 
+const PROBE_BRANCH_DISABLED_LOCAL: &str = "__probe_branch_disabled";
+
+fn mark_probe_branch_disabled(ctx: &mut EvalContext<'_>) {
+    std::rc::Rc::make_mut(&mut ctx.locals).insert(
+        PROBE_BRANCH_DISABLED_LOCAL.to_string(),
+        TlaValue::Bool(true),
+    );
+}
+
+fn probe_branch_is_disabled(ctx: &EvalContext<'_>) -> bool {
+    matches!(
+        ctx.locals.get(PROBE_BRANCH_DISABLED_LOCAL),
+        Some(TlaValue::Bool(true))
+    )
+}
+
 fn probe_let_action_expr(expr: &str, ctx: &mut EvalContext<'_>) -> anyhow::Result<()> {
     let staged = current_probe_staged_primes(ctx);
     let mut branches = eval_let_action_multi(expr, ctx, &staged, &[])?.into_iter();
@@ -3493,6 +3513,10 @@ fn probe_action_clause_expr(
     clause: &ActionClause,
     ctx: &mut EvalContext<'_>,
 ) -> Option<anyhow::Result<()>> {
+    if probe_branch_is_disabled(ctx) {
+        return None;
+    }
+
     match clause {
         ActionClause::LetWithPrimes { expr } => {
             let expr = strip_probe_comments(expr);
@@ -3528,7 +3552,12 @@ fn probe_action_clause_expr(
             if should_skip_action_expr_probe(&expr) {
                 return None;
             }
-            Some(eval_expr(&expr, ctx).map(|_| ()))
+            Some(eval_expr(&expr, ctx).and_then(|value| {
+                if !value.as_bool()? {
+                    mark_probe_branch_disabled(ctx);
+                }
+                Ok(())
+            }))
         }
         ActionClause::PrimedAssignment { var, expr } => Some(eval_expr(expr, ctx).map(|value| {
             std::rc::Rc::make_mut(&mut ctx.locals).insert(format!("{var}'"), value);
@@ -5381,6 +5410,65 @@ Spec
         }
 
         assert_eq!(ctx.locals.get("x'"), Some(&TlaValue::Int(0)));
+    }
+
+    #[test]
+    fn expr_probe_skips_remaining_clauses_after_false_guard() {
+        let state = TlaState::from([
+            (
+                "signalled".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::<TlaValue, TlaValue>::new())),
+            ),
+            ("light".to_string(), TlaValue::String("off".to_string())),
+        ]);
+        let defs = BTreeMap::from([(
+            "NormalPrisoner".to_string(),
+            TlaDefinition {
+                name: "NormalPrisoner".to_string(),
+                params: vec![],
+                body: "{}".to_string(),
+                is_recursive: false,
+            },
+        )]);
+        let instances = BTreeMap::new();
+        let def = TlaDefinition {
+            name: "StandardAction".to_string(),
+            params: vec!["p".to_string()],
+            body: r#"
+                /\ p \in NormalPrisoner
+                /\ IF light = "off" /\ signalled[p] < 1
+                   THEN /\ light' = "on"
+                        /\ signalled' = [signalled EXCEPT ![p] = @ + 1]
+                   ELSE UNCHANGED <<light, signalled>>
+            "#
+            .to_string(),
+            is_recursive: false,
+        };
+        let ir = compile_action_ir(&def);
+        let inferred = BTreeMap::from([("p".to_string(), TlaValue::String("Alice".to_string()))]);
+        let mut ctx = build_action_expr_probe_context(
+            &state,
+            &defs,
+            &instances,
+            &ir.params,
+            &ir.clauses,
+            Some(&inferred),
+        );
+
+        for clause in &ir.clauses {
+            if let Some(result) = probe_action_clause_expr(clause, &mut ctx) {
+                result.expect("false guard should skip the rest of the branch");
+            }
+        }
+
+        assert_eq!(
+            ctx.locals.get("light'"),
+            Some(&TlaValue::String("off".to_string()))
+        );
+        assert_eq!(
+            ctx.locals.get("signalled'"),
+            Some(&TlaValue::Function(Arc::new(BTreeMap::new())))
+        );
     }
 
     #[test]

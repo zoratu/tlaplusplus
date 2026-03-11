@@ -720,6 +720,10 @@ fn parse_def_head(lhs: &str) -> (String, Vec<String>) {
         lhs
     };
 
+    if let Some((name, params)) = parse_infix_def_head(lhs) {
+        return (name, params);
+    }
+
     if let Some((open_delim, close_delim)) = first_param_delims(lhs)
         && let Some((name, params)) = parse_def_head_with_delims(lhs, open_delim, close_delim)
     {
@@ -732,6 +736,29 @@ fn parse_def_head(lhs: &str) -> (String, Vec<String>) {
         .map(ToString::to_string)
         .unwrap_or_default();
     (name, Vec::new())
+}
+
+fn parse_infix_def_head(lhs: &str) -> Option<(String, Vec<String>)> {
+    let parts: Vec<&str> = lhs.split_whitespace().collect();
+    if parts.len() != 3 {
+        return None;
+    }
+
+    let left = normalize_operator_param(parts[0]);
+    let op = parts[1].trim();
+    let right = normalize_operator_param(parts[2]);
+    if left.is_empty() || right.is_empty() || !is_symbolic_operator_name(op) {
+        return None;
+    }
+
+    Some((op.to_string(), vec![left, right]))
+}
+
+fn is_symbolic_operator_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .any(|ch| !(ch.is_ascii_alphanumeric() || ch == '_'))
 }
 
 fn parse_def_head_with_delims(
@@ -1327,6 +1354,22 @@ mod tests {
             vec!["current", "destination"]
         );
         assert_eq!(m.definitions["HigherOrder"].params, vec!["Op", "value"]);
+    }
+
+    #[test]
+    fn parses_infix_symbolic_operator_definitions() {
+        let src = r#"
+        ---- MODULE Demo ----
+        EXTENDS Naturals
+
+        a \prec b == a < b
+        left ^^ right == left + right
+        ====
+        "#;
+
+        let m = parse_tla_module_text(src).expect("parse should work");
+        assert_eq!(m.definitions[r"\prec"].params, vec!["a", "b"]);
+        assert_eq!(m.definitions["^^"].params, vec!["left", "right"]);
     }
 
     #[test]
