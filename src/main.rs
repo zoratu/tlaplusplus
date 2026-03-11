@@ -3073,10 +3073,20 @@ fn merge_staged_prime_locals(from: &EvalContext<'_>, into: &mut EvalContext<'_>)
 }
 
 fn probe_action_body_into_ctx(body: &str, ctx: &mut EvalContext<'_>) -> anyhow::Result<()> {
+    let normalized = strip_probe_comments(body);
+    let trimmed = normalized.trim();
+    if !trimmed.is_empty() && trimmed.contains('\'') {
+        let mut runtime_ctx = ctx.clone();
+        if let Some(Ok(())) = probe_action_body_via_runtime_eval(trimmed, &mut runtime_ctx) {
+            merge_staged_prime_locals(&runtime_ctx, ctx);
+            return Ok(());
+        }
+    }
+
     let def = TlaDefinition {
         name: "__probe_body".to_string(),
         params: vec![],
-        body: body.to_string(),
+        body: trimmed.to_string(),
         is_recursive: false,
     };
     let ir = compile_action_ir(&def);
@@ -3145,10 +3155,9 @@ fn probe_disjunctive_action_body(
     let mut first_err = None;
     for disjunct in disjuncts {
         let mut branch_ctx = ctx.clone();
-        let attempt = if let Some(result) = probe_action_body_via_runtime_eval(&disjunct, &mut branch_ctx) {
-            result
-        } else {
-            probe_action_body_into_ctx(&disjunct, &mut branch_ctx)
+        let attempt = match probe_action_body_via_runtime_eval(&disjunct, &mut branch_ctx) {
+            Some(Ok(())) => Ok(()),
+            Some(Err(_)) | None => probe_action_body_into_ctx(&disjunct, &mut branch_ctx),
         };
         match attempt {
             Ok(()) => {
@@ -3291,12 +3300,11 @@ fn probe_action_clause_expr(
                         .and_then(|value| value.as_bool())
                         .and_then(|take_then| {
                             let branch = if take_then { then_branch } else { else_branch };
-                            if let Some(result) =
-                                probe_action_body_via_runtime_eval(branch, &mut branch_ctx)
-                            {
-                                result
-                            } else {
-                                probe_action_body_into_ctx(branch, &mut branch_ctx)
+                            match probe_action_body_via_runtime_eval(branch, &mut branch_ctx) {
+                                Some(Ok(())) => Ok(()),
+                                Some(Err(_)) | None => {
+                                    probe_action_body_into_ctx(branch, &mut branch_ctx)
+                                }
                             }
                         })
                         .map(|_| {
@@ -5542,6 +5550,53 @@ Spec
 
         assert_eq!(ctx.locals.get("x'"), Some(&TlaValue::Int(1)));
         assert_eq!(ctx.locals.get("y'"), Some(&TlaValue::Int(1)));
+    }
+
+    #[test]
+    fn expr_probe_expands_exists_action_clauses_with_disjunctions() {
+        let mut state = TlaState::new();
+        state.insert("x".to_string(), TlaValue::Int(0));
+        state.insert("y".to_string(), TlaValue::Int(0));
+
+        let defs = BTreeMap::from([(
+            "Choice".to_string(),
+            TlaDefinition {
+                name: "Choice".to_string(),
+                params: vec![],
+                body: r#"\E v \in {1, 2} :
+                    \/
+                      /\ x' = v
+                      /\ y' = v
+                    \/
+                      /\ x' = 0
+                      /\ y' = 0"#.to_string(),
+                is_recursive: false,
+            },
+        )]);
+        let ir = compile_action_ir(defs.get("Choice").unwrap());
+        let instances = BTreeMap::new();
+        let mut ctx = build_action_expr_probe_context(
+            &state,
+            &defs,
+            &instances,
+            &ir.params,
+            &ir.clauses,
+            None,
+        );
+
+        for clause in &ir.clauses {
+            if let Some(result) = probe_action_clause_expr(clause, &mut ctx) {
+                result.expect("exists disjunctive bodies should be probeable");
+            }
+        }
+
+        let x_prime = ctx.locals.get("x'").expect("x' should be staged");
+        let y_prime = ctx.locals.get("y'").expect("y' should be staged");
+        assert_eq!(x_prime, y_prime);
+        assert!(matches!(
+            x_prime,
+            TlaValue::Int(0) | TlaValue::Int(1) | TlaValue::Int(2)
+        ));
     }
 
     #[test]
