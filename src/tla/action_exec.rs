@@ -266,6 +266,89 @@ fn execute_branch(
 
     // Try to parse as an action call
     if let Some((name, arg_exprs)) = parse_action_call(trimmed) {
+        if let Some((alias, operator_name)) = name.split_once('!') {
+            let instance_map = instances
+                .ok_or_else(|| anyhow!("no module instances available for action '{name}'"))?;
+            let instance = instance_map
+                .get(alias)
+                .ok_or_else(|| anyhow!("unknown module instance '{alias}'"))?;
+            let module = instance.module.as_ref().ok_or_else(|| {
+                anyhow!(
+                    "module '{}' not loaded for instance '{}'",
+                    instance.module_name,
+                    alias
+                )
+            })?;
+            let def = module
+                .definitions
+                .get(operator_name)
+                .ok_or_else(|| anyhow!("unknown action '{name}'"))?;
+            if def.params.len() != arg_exprs.len() {
+                return Err(anyhow!(
+                    "action '{name}' arity mismatch: expected {}, got {}",
+                    def.params.len(),
+                    arg_exprs.len()
+                ));
+            }
+
+            let mut outer_ctx = EvalContext::with_definitions_and_instances(state, definitions, instance_map);
+            {
+                let locals_mut = std::rc::Rc::make_mut(&mut outer_ctx.locals);
+                for (k, v) in locals {
+                    locals_mut.insert(k.clone(), v.clone());
+                }
+            }
+
+            let mut ctx = EvalContext::with_definitions_and_instances(
+                state,
+                &module.definitions,
+                effective_instance_scope(&module.instances, Some(instance_map))
+                    .expect("module instance scope should exist"),
+            );
+            {
+                let locals_mut = std::rc::Rc::make_mut(&mut ctx.locals);
+                for (k, v) in locals {
+                    locals_mut.insert(k.clone(), v.clone());
+                }
+            }
+            seed_instance_constant_bindings(instance, module, &outer_ctx, &mut ctx);
+            {
+                let locals_mut = std::rc::Rc::make_mut(&mut ctx.locals);
+                for (param, value_expr) in &instance.substitutions {
+                    locals_mut.insert(param.clone(), eval_expr(value_expr, &outer_ctx)?);
+                }
+            }
+
+            let mut args = Vec::with_capacity(arg_exprs.len());
+            for arg_expr in arg_exprs {
+                args.push(eval_expr(&arg_expr, &outer_ctx)?);
+            }
+
+            let mut bound_locals = locals.clone();
+            for (param, arg) in def.params.iter().zip(args.iter()) {
+                bound_locals.insert(normalize_param_name(param).to_string(), arg.clone());
+            }
+            {
+                let locals_mut = std::rc::Rc::make_mut(&mut ctx.locals);
+                for (param, arg) in def.params.iter().zip(args.into_iter()) {
+                    locals_mut.insert(normalize_param_name(param).to_string(), arg);
+                }
+            }
+
+            let interpreted_ir = compile_action_ir(def);
+            return apply_action_ir_with_context_multi(&interpreted_ir, state, &ctx).or_else(
+                |_| {
+                    execute_branch(
+                        &def.body,
+                        &bound_locals,
+                        &module.definitions,
+                        effective_instance_scope(&module.instances, Some(instance_map)),
+                        state,
+                    )
+                },
+            );
+        }
+
         let def = definitions
             .get(&name)
             .ok_or_else(|| anyhow!("unknown action '{name}'"))?;
@@ -307,8 +390,10 @@ fn execute_branch(
 
         // Use compiled action IR for faster evaluation
         let compiled_ir = get_or_compile_action(def);
-        return apply_compiled_action_ir_multi(&compiled_ir, state, &ctx)
-            .or_else(|_| execute_branch(&def.body, &bound_locals, definitions, instances, state));
+        return match apply_compiled_action_ir_multi(&compiled_ir, state, &ctx) {
+            Ok(successors) if !successors.is_empty() => Ok(successors),
+            _ => execute_branch(&def.body, &bound_locals, definitions, instances, state),
+        };
     }
 
     // Not an action call - treat as inline action body (conjunction of constraints)
@@ -333,9 +418,10 @@ fn execute_branch(
 
     // Use compiled action IR for inline actions too
     let compiled_ir = get_or_compile_action(&inline_def);
-    apply_compiled_action_ir_multi(&compiled_ir, state, &ctx).or_else(|_| {
-        apply_action_ir_with_context_multi(&compile_action_ir(&inline_def), state, &ctx)
-    })
+    match apply_compiled_action_ir_multi(&compiled_ir, state, &ctx) {
+        Ok(successors) if !successors.is_empty() => Ok(successors),
+        _ => apply_action_ir_with_context_multi(&compile_action_ir(&inline_def), state, &ctx),
+    }
 }
 
 fn execute_exists_branch(
@@ -589,7 +675,7 @@ fn parse_identifier_prefix(expr: &str) -> Option<(String, &str)> {
 
     let mut end = first.len_utf8();
     for (idx, c) in chars {
-        if c.is_alphanumeric() || c == '_' || c == '\'' {
+        if c.is_alphanumeric() || c == '_' || c == '\'' || c == '!' {
             end = idx + c.len_utf8();
         } else {
             break;
@@ -597,6 +683,60 @@ fn parse_identifier_prefix(expr: &str) -> Option<(String, &str)> {
     }
 
     Some((expr[..end].to_string(), &expr[end..]))
+}
+
+fn seed_instance_constant_bindings(
+    instance: &TlaModuleInstance,
+    module: &crate::tla::module::TlaModule,
+    parent_ctx: &EvalContext<'_>,
+    child_ctx: &mut EvalContext<'_>,
+) {
+    let defs_mut = std::rc::Rc::make_mut(&mut child_ctx.local_definitions);
+    seed_parent_definition_fallbacks(module, parent_ctx, defs_mut);
+    let locals_mut = std::rc::Rc::make_mut(&mut child_ctx.locals);
+
+    for constant in &module.constants {
+        if instance.substitutions.contains_key(constant) {
+            continue;
+        }
+        if let Some(def) = parent_ctx.definition(constant) {
+            defs_mut.insert(constant.clone(), def);
+            continue;
+        }
+        if let Ok(value) = eval_expr(constant, parent_ctx) {
+            locals_mut.insert(constant.clone(), value);
+        }
+    }
+}
+
+fn seed_parent_definition_fallbacks(
+    module: &crate::tla::module::TlaModule,
+    parent_ctx: &EvalContext<'_>,
+    defs_mut: &mut BTreeMap<String, TlaDefinition>,
+) {
+    for (name, def) in parent_ctx.local_definitions.iter() {
+        if !module.definitions.contains_key(name) {
+            defs_mut.entry(name.clone()).or_insert_with(|| def.clone());
+        }
+    }
+    if let Some(parent_defs) = parent_ctx.definitions {
+        for (name, def) in parent_defs {
+            if !module.definitions.contains_key(name) {
+                defs_mut.entry(name.clone()).or_insert_with(|| def.clone());
+            }
+        }
+    }
+}
+
+fn effective_instance_scope<'a>(
+    module_instances: &'a BTreeMap<String, TlaModuleInstance>,
+    parent_instances: Option<&'a BTreeMap<String, TlaModuleInstance>>,
+) -> Option<&'a BTreeMap<String, TlaModuleInstance>> {
+    if module_instances.is_empty() {
+        parent_instances
+    } else {
+        Some(module_instances)
+    }
 }
 
 fn take_group(expr: &str, open: char, close: char) -> Result<(&str, &str)> {
@@ -785,9 +925,247 @@ mod tests {
 
         let probe = probe_next_disjuncts("\\E i \\in S : Inc(i)", &defs, &state);
         assert_eq!(probe.total_disjuncts, 1);
+        assert_eq!(probe.supported_disjuncts, 1, "{probe:?}");
+        assert_eq!(probe.generated_successors, 1, "{probe:?}");
+        assert!(probe.failures.is_empty(), "{probe:?}");
+    }
+
+    #[test]
+    fn probes_module_instance_actions_with_inherited_constant_bindings() {
+        use crate::tla::module::{TlaModule, TlaModuleInstance};
+
+        let mut helper_module = TlaModule::default();
+        helper_module.name = "Helper".to_string();
+        helper_module.constants = vec!["KeyPair".to_string()];
+        helper_module.definitions.insert(
+            "Next".to_string(),
+            TlaDefinition {
+                name: "Next".to_string(),
+                params: vec![],
+                body: "/\\ x' = KeyPair[prv1]".to_string(),
+                is_recursive: false,
+            },
+        );
+
+        let instances = BTreeMap::from([(
+            "H".to_string(),
+            TlaModuleInstance {
+                alias: "H".to_string(),
+                module_name: "Helper".to_string(),
+                substitutions: BTreeMap::new(),
+                is_local: false,
+                module: Some(Box::new(helper_module)),
+            },
+        )]);
+        let defs = BTreeMap::from([(
+            "KeyPair".to_string(),
+            TlaDefinition {
+                name: "KeyPair".to_string(),
+                params: vec![],
+                body: "[prv1 |-> pub1]".to_string(),
+                is_recursive: false,
+            },
+        )]);
+        let state = TlaState::from([("x".to_string(), TlaValue::ModelValue("old".to_string()))]);
+
+        let probe = probe_next_disjuncts_with_instances("H!Next", &defs, Some(&instances), &state);
+
+        assert_eq!(probe.total_disjuncts, 1);
+        assert_eq!(probe.supported_disjuncts, 1, "{probe:?}");
+        assert_eq!(probe.generated_successors, 1, "{probe:?}");
+        assert!(probe.failures.is_empty(), "{probe:?}");
+    }
+
+    #[test]
+    fn probes_inline_if_with_module_instance_action_branch() {
+        use crate::tla::module::{TlaModule, TlaModuleInstance};
+
+        let mut helper_module = TlaModule::default();
+        helper_module.name = "Helper".to_string();
+        helper_module.constants = vec!["KeyPair".to_string()];
+        helper_module.definitions.insert(
+            "Next".to_string(),
+            TlaDefinition {
+                name: "Next".to_string(),
+                params: vec![],
+                body: "/\\ x' = KeyPair[prv1]".to_string(),
+                is_recursive: false,
+            },
+        );
+
+        let instances = BTreeMap::from([(
+            "H".to_string(),
+            TlaModuleInstance {
+                alias: "H".to_string(),
+                module_name: "Helper".to_string(),
+                substitutions: BTreeMap::new(),
+                is_local: false,
+                module: Some(Box::new(helper_module)),
+            },
+        )]);
+        let defs = BTreeMap::from([(
+            "KeyPair".to_string(),
+            TlaDefinition {
+                name: "KeyPair".to_string(),
+                params: vec![],
+                body: "[prv1 |-> pub1]".to_string(),
+                is_recursive: false,
+            },
+        )]);
+        let state = TlaState::from([("x".to_string(), TlaValue::ModelValue("old".to_string()))]);
+
+        let probe = probe_next_disjuncts_with_instances(
+            "IF TRUE THEN H!Next ELSE /\\ UNCHANGED x",
+            &defs,
+            Some(&instances),
+            &state,
+        );
+
+        println!("probe={probe:?}");
+        assert_eq!(probe.total_disjuncts, 1);
         assert_eq!(probe.supported_disjuncts, 1);
         assert_eq!(probe.generated_successors, 1);
         assert!(probe.failures.is_empty());
+    }
+
+    #[test]
+    fn probes_module_instance_actions_with_outer_operator_ref_helpers() {
+        use crate::tla::module::{TlaModule, TlaModuleInstance};
+
+        let mut helper_module = TlaModule::default();
+        helper_module.name = "Helper".to_string();
+        helper_module.constants = vec!["Hasher".to_string()];
+        helper_module.definitions.insert(
+            "Next".to_string(),
+            TlaDefinition {
+                name: "Next".to_string(),
+                params: vec!["n".to_string()],
+                body: "/\\ x' = Hasher(n)".to_string(),
+                is_recursive: false,
+            },
+        );
+
+        let instances = BTreeMap::from([(
+            "H".to_string(),
+            TlaModuleInstance {
+                alias: "H".to_string(),
+                module_name: "Helper".to_string(),
+                substitutions: BTreeMap::new(),
+                is_local: false,
+                module: Some(Box::new(helper_module)),
+            },
+        )]);
+        let defs = BTreeMap::from([
+            (
+                "Hasher".to_string(),
+                TlaDefinition {
+                    name: "Hasher".to_string(),
+                    params: vec!["n".to_string()],
+                    body: "HashImpl(n)".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "HashImpl".to_string(),
+                TlaDefinition {
+                    name: "HashImpl".to_string(),
+                    params: vec!["n".to_string()],
+                    body: "n * 2".to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+        let state = TlaState::from([("x".to_string(), TlaValue::Int(0))]);
+
+        let probe =
+            probe_next_disjuncts_with_instances("H!Next(5)", &defs, Some(&instances), &state);
+
+        assert_eq!(probe.total_disjuncts, 1);
+        assert_eq!(probe.supported_disjuncts, 1, "{probe:?}");
+        assert_eq!(probe.generated_successors, 1, "{probe:?}");
+        assert!(probe.failures.is_empty(), "{probe:?}");
+    }
+
+    #[test]
+    fn probes_module_instance_actions_with_outer_helpers_that_reference_outer_instances() {
+        use crate::tla::module::{TlaModule, TlaModuleInstance};
+
+        let mut inner_module = TlaModule::default();
+        inner_module.name = "Inner".to_string();
+        inner_module.definitions.insert(
+            "Double".to_string(),
+            TlaDefinition {
+                name: "Double".to_string(),
+                params: vec!["n".to_string()],
+                body: "n * 2".to_string(),
+                is_recursive: false,
+            },
+        );
+
+        let mut helper_module = TlaModule::default();
+        helper_module.name = "Helper".to_string();
+        helper_module.constants = vec!["Hasher".to_string()];
+        helper_module.definitions.insert(
+            "Next".to_string(),
+            TlaDefinition {
+                name: "Next".to_string(),
+                params: vec!["n".to_string()],
+                body: "/\\ x' = Hasher(n)".to_string(),
+                is_recursive: false,
+            },
+        );
+
+        let instances = BTreeMap::from([
+            (
+                "N".to_string(),
+                TlaModuleInstance {
+                    alias: "N".to_string(),
+                    module_name: "Inner".to_string(),
+                    substitutions: BTreeMap::new(),
+                    is_local: false,
+                    module: Some(Box::new(inner_module)),
+                },
+            ),
+            (
+                "H".to_string(),
+                TlaModuleInstance {
+                    alias: "H".to_string(),
+                    module_name: "Helper".to_string(),
+                    substitutions: BTreeMap::new(),
+                    is_local: false,
+                    module: Some(Box::new(helper_module)),
+                },
+            ),
+        ]);
+        let defs = BTreeMap::from([
+            (
+                "Hasher".to_string(),
+                TlaDefinition {
+                    name: "Hasher".to_string(),
+                    params: vec!["n".to_string()],
+                    body: "HashImpl(n)".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "HashImpl".to_string(),
+                TlaDefinition {
+                    name: "HashImpl".to_string(),
+                    params: vec!["n".to_string()],
+                    body: "N!Double(n)".to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+        let state = TlaState::from([("x".to_string(), TlaValue::Int(0))]);
+
+        let probe =
+            probe_next_disjuncts_with_instances("H!Next(5)", &defs, Some(&instances), &state);
+
+        assert_eq!(probe.total_disjuncts, 1);
+        assert_eq!(probe.supported_disjuncts, 1, "{probe:?}");
+        assert_eq!(probe.generated_successors, 1, "{probe:?}");
+        assert!(probe.failures.is_empty(), "{probe:?}");
     }
 
     /// Test for nested disjunctions inside quantifier body
