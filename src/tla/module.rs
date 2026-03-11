@@ -720,13 +720,13 @@ fn parse_def_head(lhs: &str) -> (String, Vec<String>) {
         lhs
     };
 
-    if let Some((name, params)) = parse_infix_def_head(lhs) {
-        return (name, params);
-    }
-
     if let Some((open_delim, close_delim)) = first_param_delims(lhs)
         && let Some((name, params)) = parse_def_head_with_delims(lhs, open_delim, close_delim)
     {
+        return (name, params);
+    }
+
+    if let Some((name, params)) = parse_infix_def_head(lhs) {
         return (name, params);
     }
 
@@ -739,6 +739,10 @@ fn parse_def_head(lhs: &str) -> (String, Vec<String>) {
 }
 
 fn parse_infix_def_head(lhs: &str) -> Option<(String, Vec<String>)> {
+    if lhs.contains('(') || lhs.contains('[') || lhs.contains(',') {
+        return None;
+    }
+
     let parts: Vec<&str> = lhs.split_whitespace().collect();
     if parts.len() != 3 {
         return None;
@@ -1354,6 +1358,22 @@ mod tests {
             vec!["current", "destination"]
         );
         assert_eq!(m.definitions["HigherOrder"].params, vec!["Op", "value"]);
+    }
+
+    #[test]
+    fn parses_parenthesized_operator_parameters_with_internal_spaces() {
+        let src = r#"
+        ---- MODULE Demo ----
+        Add(t, k, v) == <<t, k, v>>
+        Update(tx, key, value) == <<tx, key, value>>
+        ====
+        "#;
+
+        let m = parse_tla_module_text(src).expect("parse should work");
+        assert!(m.definitions.contains_key("Add"));
+        assert!(m.definitions.contains_key("Update"));
+        assert_eq!(m.definitions["Add"].params, vec!["t", "k", "v"]);
+        assert_eq!(m.definitions["Update"].params, vec!["tx", "key", "value"]);
     }
 
     #[test]

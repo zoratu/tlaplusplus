@@ -80,7 +80,7 @@ pub fn probe_next_disjuncts_with_instances(
     instances: Option<&BTreeMap<String, TlaModuleInstance>>,
     state: &TlaState,
 ) -> NextBranchProbe {
-    let disjuncts = split_top_level(next_body, "\\/");
+    let disjuncts = split_action_disjuncts(next_body);
     let mut probe = NextBranchProbe {
         total_disjuncts: disjuncts.len(),
         ..NextBranchProbe::default()
@@ -117,7 +117,7 @@ pub fn evaluate_next_states_with_instances(
     instances: Option<&BTreeMap<String, TlaModuleInstance>>,
     state: &TlaState,
 ) -> Result<Vec<TlaState>> {
-    let disjuncts = split_top_level(next_body, "\\/");
+    let disjuncts = split_action_disjuncts(next_body);
     let mut out = Vec::new();
     for disj in disjuncts {
         let successors =
@@ -148,7 +148,7 @@ pub fn evaluate_next_states_labeled_with_instances(
     instances: Option<&BTreeMap<String, TlaModuleInstance>>,
     state: &TlaState,
 ) -> Result<Vec<LabeledTransition<TlaState>>> {
-    let disjuncts = split_top_level(next_body, "\\/");
+    let disjuncts = split_action_disjuncts(next_body);
     let mut out = Vec::new();
 
     for (disjunct_idx, disj) in disjuncts.iter().enumerate() {
@@ -215,7 +215,7 @@ fn execute_branch(
     // If it returns just one part (e.g., when the disjunction is inside a quantifier),
     // we should proceed with other handling (like \E processing).
     if trimmed.starts_with("\\/") || contains_top_level_disjunction(trimmed) {
-        let disjuncts = split_top_level(trimmed, "\\/");
+        let disjuncts = split_action_disjuncts(trimmed);
         // Only handle as disjunction if we actually split into multiple parts
         if disjuncts.len() > 1 || (disjuncts.len() == 1 && disjuncts[0].trim() != trimmed) {
             let mut out = Vec::new();
@@ -579,6 +579,92 @@ fn parse_action_call(expr: &str) -> Option<(String, Vec<String>)> {
     Some((name, args))
 }
 
+fn split_action_disjuncts(expr: &str) -> Vec<String> {
+    let disjuncts = split_top_level(expr, "\\/");
+    if disjuncts.len() > 1 {
+        return disjuncts;
+    }
+
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let chars: Vec<char> = expr.chars().collect();
+    let mut i = 0usize;
+    let mut paren = 0usize;
+    let mut bracket = 0usize;
+    let mut brace = 0usize;
+    let mut angle = 0usize;
+    let mut line_head = true;
+
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+
+        if paren == 0
+            && bracket == 0
+            && brace == 0
+            && angle == 0
+            && line_head
+            && c == '\\'
+            && next == Some('/')
+        {
+            let piece = current.trim();
+            if !piece.is_empty() {
+                out.push(piece.to_string());
+                current.clear();
+            }
+            i += 2;
+            line_head = true;
+            continue;
+        }
+
+        if c == '<' && next == Some('<') {
+            angle += 1;
+            current.push(c);
+            current.push('<');
+            i += 2;
+            line_head = false;
+            continue;
+        }
+        if c == '>' && next == Some('>') {
+            angle = angle.saturating_sub(1);
+            current.push(c);
+            current.push('>');
+            i += 2;
+            line_head = false;
+            continue;
+        }
+
+        match c {
+            '(' => paren += 1,
+            ')' => paren = paren.saturating_sub(1),
+            '[' => bracket += 1,
+            ']' => bracket = bracket.saturating_sub(1),
+            '{' => brace += 1,
+            '}' => brace = brace.saturating_sub(1),
+            _ => {}
+        }
+
+        current.push(c);
+        if c == '\n' {
+            line_head = true;
+        } else if !c.is_whitespace() {
+            line_head = false;
+        }
+        i += 1;
+    }
+
+    let piece = current.trim();
+    if !piece.is_empty() {
+        out.push(piece.to_string());
+    }
+
+    if out.is_empty() {
+        vec![expr.trim().to_string()]
+    } else {
+        out
+    }
+}
+
 fn strip_outer_parens(expr: &str) -> &str {
     let mut current = expr;
     while is_wrapped_by(current, '(', ')') {
@@ -889,7 +975,21 @@ fn is_word_char(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::tla_native::TlaModel;
     use std::collections::{BTreeMap, BTreeSet};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(prefix: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "tlapp-action-exec-{prefix}-{nanos}-{}",
+            std::process::id()
+        ))
+    }
 
     #[test]
     fn probes_exists_action_call_branch() {
@@ -927,6 +1027,215 @@ mod tests {
         assert_eq!(probe.total_disjuncts, 1);
         assert_eq!(probe.supported_disjuncts, 1, "{probe:?}");
         assert_eq!(probe.generated_successors, 1, "{probe:?}");
+        assert!(probe.failures.is_empty(), "{probe:?}");
+    }
+
+    #[test]
+    fn splits_line_leading_quantified_disjuncts() {
+        let next_body = r#"\/ \E t \in TxId : OpenTx(t)
+            \/ \E t \in tx : \E k \in Key : \E v \in Val : Add(t, k, v)
+            \/ \E t \in tx : CloseTx(t)"#;
+
+        let disjuncts = split_action_disjuncts(next_body);
+        assert_eq!(disjuncts.len(), 3, "{disjuncts:?}");
+        assert!(disjuncts[0].contains("OpenTx"));
+        assert!(disjuncts[1].contains("Add"));
+        assert!(disjuncts[2].contains("CloseTx"));
+    }
+
+    #[test]
+    fn probes_quantified_line_leading_disjuncts_with_action_calls() {
+        let defs = BTreeMap::from([
+            (
+                "OpenTx".to_string(),
+                TlaDefinition {
+                    name: "OpenTx".to_string(),
+                    params: vec!["t".to_string()],
+                    body: "/\\ tx' = tx \\cup {t} /\\ UNCHANGED <<store, snapshotStore, written, missed>>"
+                        .to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Add".to_string(),
+                TlaDefinition {
+                    name: "Add".to_string(),
+                    params: vec!["t".to_string(), "k".to_string(), "v".to_string()],
+                    body: "/\\ tx' = tx /\\ snapshotStore' = [snapshotStore EXCEPT ![t][k] = v] /\\ written' = [written EXCEPT ![t] = @ \\cup {k}] /\\ UNCHANGED <<store, missed>>"
+                        .to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "CloseTx".to_string(),
+                TlaDefinition {
+                    name: "CloseTx".to_string(),
+                    params: vec!["t".to_string()],
+                    body: "/\\ tx' = tx \\ {t} /\\ UNCHANGED <<store, snapshotStore, written, missed>>"
+                        .to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+
+        let state = TlaState::from([
+            (
+                "TxId".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::String("t1".to_string())]))),
+            ),
+            (
+                "tx".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::String("t1".to_string())]))),
+            ),
+            (
+                "Key".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::String("k1".to_string())]))),
+            ),
+            (
+                "Val".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::String("v1".to_string())]))),
+            ),
+            (
+                "store".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([(
+                    TlaValue::String("k1".to_string()),
+                    TlaValue::String("old".to_string()),
+                )]))),
+            ),
+            (
+                "snapshotStore".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([(
+                    TlaValue::String("t1".to_string()),
+                    TlaValue::Function(Arc::new(BTreeMap::from([(
+                        TlaValue::String("k1".to_string()),
+                        TlaValue::String("old".to_string()),
+                    )]))),
+                )]))),
+            ),
+            (
+                "written".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([(
+                    TlaValue::String("t1".to_string()),
+                    TlaValue::Set(Arc::new(BTreeSet::new())),
+                )]))),
+            ),
+            (
+                "missed".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([(
+                    TlaValue::String("t1".to_string()),
+                    TlaValue::Set(Arc::new(BTreeSet::new())),
+                )]))),
+            ),
+        ]);
+
+        let next_body = r#"\/ \E t \in TxId : OpenTx(t)
+            \/ \E t \in tx : \E k \in Key : \E v \in Val : Add(t, k, v)
+            \/ \E t \in tx : CloseTx(t)"#;
+
+        let probe = probe_next_disjuncts(next_body, &defs, &state);
+        assert_eq!(probe.total_disjuncts, 3, "{probe:?}");
+        assert_eq!(probe.supported_disjuncts, 3, "{probe:?}");
+        assert_eq!(probe.generated_successors, 3, "{probe:?}");
+        assert!(probe.failures.is_empty(), "{probe:?}");
+    }
+
+    #[test]
+    fn probes_actions_inherited_via_extends() {
+        let tmp = temp_dir("extends-actions");
+        fs::create_dir_all(&tmp).unwrap();
+
+        let base = tmp.join("Base.tla");
+        fs::write(
+            &base,
+            r#"---- MODULE Base ----
+CONSTANTS TxId, Key, Val
+VARIABLES tx, snapshotStore, written, store, missed
+Init ==
+    /\ tx = {1}
+    /\ snapshotStore = [t \in TxId |-> [k \in Key |-> 0]]
+    /\ written = [t \in TxId |-> {}]
+    /\ store = [k \in Key |-> 0]
+    /\ missed = [t \in TxId |-> {}]
+
+OpenTx(t) ==
+    /\ tx' = tx \cup {t}
+    /\ UNCHANGED <<snapshotStore, written, store, missed>>
+
+Add(t, k, v) ==
+    /\ tx' = tx
+    /\ snapshotStore' = [snapshotStore EXCEPT ![t][k] = v]
+    /\ written' = [written EXCEPT ![t] = @ \cup {k}]
+    /\ UNCHANGED <<store, missed>>
+
+CloseTx(t) ==
+    /\ tx' = tx \ {t}
+    /\ UNCHANGED <<snapshotStore, written, store, missed>>
+
+Next ==
+    \/ \E t \in TxId : OpenTx(t)
+    \/ \E t \in tx : \E k \in Key : \E v \in Val : Add(t, k, v)
+    \/ \E t \in tx : CloseTx(t)
+====
+"#,
+        )
+        .unwrap();
+
+        let derived = tmp.join("Derived.tla");
+        fs::write(
+            &derived,
+            r#"---- MODULE Derived ----
+EXTENDS Base
+Spec == Init /\ [][Next]_<<tx, snapshotStore, written, store, missed>>
+====
+"#,
+        )
+        .unwrap();
+
+        let cfg = tmp.join("Derived.cfg");
+        fs::write(
+            &cfg,
+            r#"SPECIFICATION Spec
+CONSTANTS
+    TxId = {1}
+    Key = {1}
+    Val = {1}
+"#,
+        )
+        .unwrap();
+
+        let model = TlaModel::from_files(&derived, Some(&cfg), None, None).unwrap();
+        let next_def = model.module.definitions.get(&model.next_name).unwrap();
+        let definition_names: Vec<String> = model.module.definitions.keys().cloned().collect();
+
+        assert!(
+            model.module.definitions.contains_key("Add"),
+            "defs={definition_names:?}"
+        );
+        assert!(
+            model.module.definitions.contains_key("OpenTx"),
+            "defs={definition_names:?}"
+        );
+        assert!(
+            model.module.definitions.contains_key("CloseTx"),
+            "defs={definition_names:?}"
+        );
+
+        let probe = probe_next_disjuncts_with_instances(
+            &next_def.body,
+            &model.module.definitions,
+            if model.module.instances.is_empty() {
+                None
+            } else {
+                Some(&model.module.instances)
+            },
+            &model.initial_states_vec[0],
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+
+        assert_eq!(probe.total_disjuncts, 3, "{probe:?}");
+        assert_eq!(probe.supported_disjuncts, 3, "{probe:?}");
+        assert_eq!(probe.generated_successors, 3, "{probe:?}");
         assert!(probe.failures.is_empty(), "{probe:?}");
     }
 
