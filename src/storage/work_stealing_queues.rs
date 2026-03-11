@@ -309,6 +309,11 @@ impl<T: 'static> WorkStealingQueues<T> {
                         return Some(item);
                     }
                     Steal::Retry => {
+                        // Re-check pause before spinning; continuous Retry
+                        // can starve the checkpoint thread.
+                        if self.pause_requested.load(Ordering::Acquire) {
+                            return None;
+                        }
                         std::hint::spin_loop();
                         continue;
                     }
@@ -323,6 +328,9 @@ impl<T: 'static> WorkStealingQueues<T> {
                     return Some(item);
                 }
                 Steal::Retry => {
+                    if self.pause_requested.load(Ordering::Acquire) {
+                        return None;
+                    }
                     std::hint::spin_loop();
                     continue;
                 }
