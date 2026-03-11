@@ -5,6 +5,7 @@ use crate::tla::{
 };
 use anyhow::{Context, Result, anyhow};
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -531,7 +532,10 @@ fn eval_disjunctive_action_body_multi(
     branch: ActionEvalBranch,
 ) -> Option<Result<Vec<ActionEvalBranch>>> {
     let trimmed = expr.trim();
-    let normalized = trimmed.strip_prefix("\\/").map(str::trim_start).unwrap_or(trimmed);
+    let normalized = trimmed
+        .strip_prefix("\\/")
+        .map(str::trim_start)
+        .unwrap_or(trimmed);
     let disjuncts = split_top_level_symbol(normalized, "\\/");
     if disjuncts.len() <= 1 && normalized == trimmed {
         return None;
@@ -603,6 +607,49 @@ fn parse_action_call_expr(expr: &str) -> Option<(String, Vec<String>)> {
     Some((name, args))
 }
 
+fn seed_implicit_instance_constant_bindings(
+    instance: &crate::tla::module::TlaModuleInstance,
+    module: &crate::tla::module::TlaModule,
+    parent_ctx: &EvalContext<'_>,
+    child_ctx: &mut EvalContext<'_>,
+) {
+    let defs_mut = std::rc::Rc::make_mut(&mut child_ctx.local_definitions);
+    seed_parent_definition_fallbacks(module, parent_ctx, defs_mut);
+    let locals_mut = std::rc::Rc::make_mut(&mut child_ctx.locals);
+
+    for constant in &module.constants {
+        if instance.substitutions.contains_key(constant) {
+            continue;
+        }
+        if let Some(def) = parent_ctx.definition(constant) {
+            defs_mut.insert(constant.clone(), def.clone());
+            continue;
+        }
+        if let Ok(value) = eval_expr(constant, parent_ctx) {
+            locals_mut.insert(constant.clone(), value);
+        }
+    }
+}
+
+fn seed_parent_definition_fallbacks(
+    module: &crate::tla::module::TlaModule,
+    parent_ctx: &EvalContext<'_>,
+    defs_mut: &mut BTreeMap<String, TlaDefinition>,
+) {
+    for (name, def) in parent_ctx.local_definitions.iter() {
+        if !module.definitions.contains_key(name) {
+            defs_mut.entry(name.clone()).or_insert_with(|| def.clone());
+        }
+    }
+    if let Some(parent_defs) = parent_ctx.definitions {
+        for (name, def) in parent_defs {
+            if !module.definitions.contains_key(name) {
+                defs_mut.entry(name.clone()).or_insert_with(|| def.clone());
+            }
+        }
+    }
+}
+
 fn expand_action_call_multi(
     expr: &str,
     ctx: &EvalContext<'_>,
@@ -628,7 +675,8 @@ fn expand_action_call_multi(
 
         let mut instance_ctx = ctx.clone();
         instance_ctx.definitions = Some(&module.definitions);
-        instance_ctx.instances = Some(&module.instances);
+        instance_ctx.instances = effective_instance_scope(&module.instances, ctx.instances);
+        seed_implicit_instance_constant_bindings(instance, module, ctx, &mut instance_ctx);
         {
             let locals_mut = std::rc::Rc::make_mut(&mut instance_ctx.locals);
             for (param, value_expr) in &instance.substitutions {
@@ -647,7 +695,11 @@ fn expand_action_call_multi(
             }
         }
 
-        return Some(eval_action_body_text_multi(&def.body, &instance_ctx, branch));
+        return Some(eval_action_body_text_multi(
+            &def.body,
+            &instance_ctx,
+            branch,
+        ));
     }
 
     let def = ctx.definition(&name)?;
@@ -1014,6 +1066,30 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
     }
     if starts_with_keyword(expr, "LAMBDA") {
         return eval_lambda_expression(expr, ctx, depth + 1);
+    }
+
+    if expr.starts_with("/\\")
+        && let Some(and_parts) = split_indented_top_level_boolean(expr, "/\\")
+        && and_parts.len() > 1
+    {
+        for part in and_parts {
+            if !eval_expr_inner(&part, ctx, depth + 1)?.as_bool()? {
+                return Ok(TlaValue::Bool(false));
+            }
+        }
+        return Ok(TlaValue::Bool(true));
+    }
+
+    if expr.starts_with("\\/")
+        && let Some(or_parts) = split_indented_top_level_boolean(expr, "\\/")
+        && or_parts.len() > 1
+    {
+        for part in or_parts {
+            if eval_expr_inner(&part, ctx, depth + 1)?.as_bool()? {
+                return Ok(TlaValue::Bool(true));
+            }
+        }
+        return Ok(TlaValue::Bool(false));
     }
 
     let implies_parts = split_top_level_symbol(expr, "=>");
@@ -1428,6 +1504,24 @@ fn eval_choose_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Re
     let binders = after_choose[..colon_idx].trim();
     let predicate = after_choose[colon_idx + 1..].trim();
 
+    if find_top_level_keyword_index(binders, "\\in").is_none() {
+        let var = binders.trim();
+        if !is_valid_identifier(var) {
+            return Err(anyhow!(
+                "CHOOSE without a domain currently expects a single identifier: {expr}"
+            ));
+        }
+
+        for value in choose_candidates_without_domain(var, predicate, ctx, depth + 1)? {
+            let child = ctx.with_local_value(var, value.clone());
+            if eval_expr_inner(predicate, &child, depth + 1)?.as_bool()? {
+                return Ok(value);
+            }
+        }
+
+        return Err(anyhow!("CHOOSE found no matching value"));
+    }
+
     let parsed = parse_binders(binders, ctx, depth + 1)?;
     if parsed.len() != 1 {
         return Err(anyhow!("CHOOSE currently expects exactly one binder"));
@@ -1443,6 +1537,67 @@ fn eval_choose_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Re
     }
 
     Err(anyhow!("CHOOSE found no matching value"))
+}
+
+fn choose_candidates_without_domain(
+    var: &str,
+    predicate: &str,
+    ctx: &EvalContext<'_>,
+    depth: usize,
+) -> Result<Vec<TlaValue>> {
+    let mut candidates = Vec::new();
+
+    if let Some((lhs, op, rhs)) = split_top_level_comparison(predicate)
+        && lhs.trim() == var
+    {
+        match op {
+            "\\notin" => {
+                if let Ok(set_val) = eval_expr_inner(rhs, ctx, depth + 1)
+                    && let TlaValue::Set(values) = &set_val
+                    && let Some(sample) = values.iter().next()
+                {
+                    candidates.push(sample.clone());
+                }
+            }
+            "/=" | "#" => {
+                if let Ok(value) = eval_expr_inner(rhs, ctx, depth + 1) {
+                    candidates.push(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for idx in 0..4usize {
+        candidates.push(stable_choose_model_value(var, predicate, idx));
+    }
+    candidates.push(TlaValue::Set(Arc::new(BTreeSet::new())));
+    candidates.push(TlaValue::Seq(Arc::new(Vec::new())));
+    candidates.push(TlaValue::Bool(false));
+    candidates.push(TlaValue::Int(0));
+
+    let mut deduped = Vec::with_capacity(candidates.len());
+    for value in candidates {
+        if deduped.iter().all(|existing| existing != &value) {
+            deduped.push(value);
+        }
+    }
+
+    Ok(deduped)
+}
+
+fn stable_choose_model_value(var: &str, predicate: &str, idx: usize) -> TlaValue {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    var.hash(&mut hasher);
+    predicate.trim().hash(&mut hasher);
+    let digest = hasher.finish();
+    let base = format!("__choose_{var}_{digest:016x}");
+    let name = if idx == 0 {
+        base
+    } else {
+        format!("{base}_{idx}")
+    };
+    TlaValue::ModelValue(name)
 }
 
 fn eval_lambda_expression(expr: &str, ctx: &EvalContext<'_>, _depth: usize) -> Result<TlaValue> {
@@ -2115,7 +2270,8 @@ fn eval_module_instance_call(
     // Create a new context with the instance module's definitions and instances
     let mut instance_ctx = ctx.clone();
     instance_ctx.definitions = Some(&module.definitions);
-    instance_ctx.instances = Some(&module.instances);
+    instance_ctx.instances = effective_instance_scope(&module.instances, ctx.instances);
+    seed_implicit_instance_constant_bindings(instance, module, ctx, &mut instance_ctx);
 
     // Apply substitutions: replace constants in the context
     {
@@ -2137,6 +2293,17 @@ fn eval_module_instance_call(
 
     // Evaluate the operator body
     eval_expr_inner(&operator_def.body, &child_ctx, depth + 1)
+}
+
+fn effective_instance_scope<'a>(
+    module_instances: &'a BTreeMap<String, crate::tla::module::TlaModuleInstance>,
+    parent_instances: Option<&'a BTreeMap<String, crate::tla::module::TlaModuleInstance>>,
+) -> Option<&'a BTreeMap<String, crate::tla::module::TlaModuleInstance>> {
+    if module_instances.is_empty() {
+        parent_instances
+    } else {
+        Some(module_instances)
+    }
 }
 
 /// Evaluate a module instance reference: Alias!Constant
@@ -2624,11 +2791,7 @@ fn parse_binder_pattern_vars(pattern: &str) -> Result<Vec<String>> {
     Ok(vec![trimmed.to_string()])
 }
 
-fn parse_binders(
-    expr: &str,
-    ctx: &EvalContext<'_>,
-    depth: usize,
-) -> Result<Vec<BinderSpec>> {
+fn parse_binders(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<Vec<BinderSpec>> {
     let mut bindings = Vec::new();
     let mut rest = expr.trim();
 
@@ -2899,7 +3062,10 @@ fn binder_key(
     assignments: &BTreeMap<String, TlaValue>,
     binders: &[BinderSpec],
 ) -> Result<TlaValue> {
-    let total_vars = binders.iter().map(|binder| binder.vars.len()).sum::<usize>();
+    let total_vars = binders
+        .iter()
+        .map(|binder| binder.vars.len())
+        .sum::<usize>();
     if total_vars == 1 {
         let name = binders
             .iter()
@@ -3561,6 +3727,136 @@ fn split_top_level(expr: &str, delim: &str, keyword: bool) -> Vec<String> {
     };
 
     result
+}
+
+fn split_indented_top_level_boolean(expr: &str, delim: &str) -> Option<Vec<String>> {
+    if !expr.contains('\n') {
+        return None;
+    }
+
+    let normalized = normalize_multiline_boolean_indentation(expr);
+    let mut clauses = Vec::new();
+    let mut current = String::new();
+    let mut base_indent = None;
+    let mut saw_top_level = false;
+
+    for raw_line in normalized.lines() {
+        let line = raw_line.trim_end();
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let indent = line.len().saturating_sub(trimmed.len());
+        if trimmed.starts_with(delim) {
+            let top_level_indent = *base_indent.get_or_insert(indent);
+            if indent == top_level_indent {
+                if !current.trim().is_empty() {
+                    clauses.push(current.trim().to_string());
+                    current.clear();
+                }
+                current.push_str(trimmed.trim_start_matches(delim).trim_start());
+                saw_top_level = true;
+                continue;
+            }
+        }
+
+        if !saw_top_level {
+            return None;
+        }
+
+        if !current.is_empty() {
+            current.push('\n');
+        }
+        current.push_str(trimmed);
+    }
+
+    if !current.trim().is_empty() {
+        clauses.push(current.trim().to_string());
+    }
+
+    if clauses.len() <= 1 {
+        return None;
+    }
+
+    let mut merged = Vec::with_capacity(clauses.len());
+    let mut idx = 0usize;
+    while idx < clauses.len() {
+        let part = clauses[idx].trim().to_string();
+        if part.is_empty() {
+            idx += 1;
+            continue;
+        }
+
+        let open_quant_or_let = ((part.starts_with("\\A") || part.starts_with("\\E"))
+            && (part.ends_with(':') || part.ends_with("IN")))
+            || (part.starts_with("LET") && part.ends_with("IN"));
+        if open_quant_or_let {
+            let mut combined = part;
+            for rest in clauses.iter().skip(idx + 1) {
+                if rest.trim().is_empty() {
+                    continue;
+                }
+                combined.push(' ');
+                combined.push_str(delim);
+                combined.push(' ');
+                combined.push_str(rest.trim());
+            }
+            merged.push(combined);
+            break;
+        }
+
+        merged.push(part);
+        idx += 1;
+    }
+
+    if merged.len() > 1 { Some(merged) } else { None }
+}
+
+fn normalize_multiline_boolean_indentation(expr: &str) -> String {
+    let mut lines = expr.lines();
+    let Some(first) = lines.next() else {
+        return String::new();
+    };
+
+    let rest: Vec<&str> = lines.collect();
+    if rest.is_empty() {
+        return expr.to_string();
+    }
+
+    let dedent = rest
+        .iter()
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(line.len().saturating_sub(trimmed.len()))
+            }
+        })
+        .min()
+        .unwrap_or(0);
+
+    if dedent == 0 {
+        return expr.to_string();
+    }
+
+    let mut normalized = String::with_capacity(expr.len());
+    normalized.push_str(first);
+    for line in rest {
+        normalized.push('\n');
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let indent = line.len().saturating_sub(trimmed.len());
+        let keep = indent.saturating_sub(dedent);
+        normalized.push_str(&line[..keep]);
+        normalized.push_str(trimmed);
+    }
+
+    normalized
 }
 
 fn split_top_level_set_minus(expr: &str) -> Vec<String> {
@@ -4686,7 +4982,10 @@ mod tests {
     fn split_top_level_keeps_simple_quantified_conjunctions_intact() {
         let parts =
             split_top_level_symbol(r#"~ \E m \in msgs : m.type = "2a" /\ m.bal = b"#, "/\\");
-        assert_eq!(parts, vec![r#"~ \E m \in msgs : m.type = "2a" /\ m.bal = b"#]);
+        assert_eq!(
+            parts,
+            vec![r#"~ \E m \in msgs : m.type = "2a" /\ m.bal = b"#]
+        );
     }
 
     #[test]
@@ -4787,7 +5086,10 @@ mod tests {
         let state = TlaState::from([
             ("cat_box".to_string(), TlaValue::Int(2)),
             ("observed_box".to_string(), TlaValue::Int(2)),
-            ("direction".to_string(), TlaValue::String("right".to_string())),
+            (
+                "direction".to_string(),
+                TlaValue::String("right".to_string()),
+            ),
         ]);
 
         let mut definitions = BTreeMap::new();
@@ -4905,7 +5207,10 @@ mod tests {
     fn applies_let_action_with_body_starting_with_disjunction() {
         let state = TlaState::from([
             ("observed_box".to_string(), TlaValue::Int(2)),
-            ("direction".to_string(), TlaValue::String("right".to_string())),
+            (
+                "direction".to_string(),
+                TlaValue::String("right".to_string()),
+            ),
         ]);
         let action = ActionIr {
             name: "ObserveBox".to_string(),
@@ -5130,7 +5435,10 @@ mod tests {
 
         assert_eq!(
             eval_expr("Nodes\\{n}", &ctx).expect("compact set minus should evaluate"),
-            TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(1), TlaValue::Int(3)])))
+            TlaValue::Set(Arc::new(BTreeSet::from([
+                TlaValue::Int(1),
+                TlaValue::Int(3)
+            ])))
         );
     }
 
@@ -5167,8 +5475,7 @@ mod tests {
         let ctx = EvalContext::new(&state);
 
         assert_eq!(
-            eval_expr("RandomElement({2, 1})", &ctx)
-                .expect("RandomElement should evaluate"),
+            eval_expr("RandomElement({2, 1})", &ctx).expect("RandomElement should evaluate"),
             TlaValue::Int(1)
         );
     }
@@ -5193,6 +5500,96 @@ mod tests {
             eval_expr("CHOOSE x \\in S : x > 1", &ctx).expect("choose should evaluate"),
             TlaValue::Int(2)
         );
+    }
+
+    #[test]
+    fn evaluates_choose_without_domain_using_stable_model_value() {
+        let state = TlaState::from([(
+            "SignedBlock".to_string(),
+            TlaValue::Set(Arc::new(BTreeSet::from([
+                TlaValue::ModelValue("b1".to_string()),
+                TlaValue::ModelValue("b2".to_string()),
+            ]))),
+        )]);
+        let ctx = EvalContext::new(&state);
+
+        let value = eval_expr("CHOOSE b : b \\notin SignedBlock", &ctx)
+            .expect("domainless choose should evaluate");
+
+        assert!(matches!(value, TlaValue::ModelValue(_)));
+        assert!(
+            !state["SignedBlock"]
+                .contains(&value)
+                .expect("SignedBlock should be a set"),
+            "stable choose value should not collide with the existing set"
+        );
+
+        let state_with_alias = TlaState::from([
+            (
+                "SignedBlock".to_string(),
+                state["SignedBlock"].clone(),
+            ),
+            ("remembered".to_string(), value.clone()),
+        ]);
+        let aliased_ctx = EvalContext::new(&state_with_alias);
+        let repeated = eval_expr("CHOOSE b : b \\notin SignedBlock", &aliased_ctx)
+            .expect("domainless choose should stay stable");
+
+        assert_eq!(value, repeated);
+    }
+
+    #[test]
+    fn choose_without_domain_stays_equal_across_repeated_definition_evaluation() {
+        let state = TlaState::from([
+            (
+                "Hash".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([
+                    TlaValue::ModelValue("h1".to_string()),
+                    TlaValue::ModelValue("h2".to_string()),
+                ]))),
+            ),
+            (
+                "SignedBlock".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::new())),
+            ),
+        ]);
+        let definitions = BTreeMap::from([
+            (
+                "NoBlock".to_string(),
+                TlaDefinition {
+                    name: "NoBlock".to_string(),
+                    params: vec![],
+                    body: "CHOOSE b : b \\notin SignedBlock".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "hashFunction".to_string(),
+                TlaDefinition {
+                    name: "hashFunction".to_string(),
+                    params: vec![],
+                    body: "[hash \\in Hash |-> NoBlock]".to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+        let base_ctx = EvalContext::with_definitions(&state, &definitions);
+        let hash_function = eval_expr("hashFunction", &base_ctx).expect("function should evaluate");
+
+        let state_with_function = TlaState::from([
+            ("Hash".to_string(), state["Hash"].clone()),
+            ("SignedBlock".to_string(), state["SignedBlock"].clone()),
+            ("hashFunction".to_string(), hash_function),
+        ]);
+        let ctx = EvalContext::with_definitions(&state_with_function, &definitions);
+
+        let chosen = eval_expr("CHOOSE hash \\in Hash : hashFunction[hash] = NoBlock", &ctx)
+            .expect("matching hash should exist");
+
+        assert!(matches!(
+            chosen,
+            TlaValue::ModelValue(ref name) if name == "h1" || name == "h2"
+        ));
     }
 
     #[test]
@@ -5381,7 +5778,10 @@ mod tests {
             .expect("tuple binder filter should evaluate"),
             TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Seq(Arc::new(vec![
                 TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(1)]))),
-                TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(2), TlaValue::Int(3)]))),
+                TlaValue::Set(Arc::new(BTreeSet::from([
+                    TlaValue::Int(2),
+                    TlaValue::Int(3)
+                ]))),
             ]))])))
         );
     }
@@ -5447,6 +5847,129 @@ mod tests {
         assert!(parts[3].contains(r"\A call \in ActiveElevatorCalls"));
         assert!(parts[3].contains("CanServiceCall[e2, call]"));
         assert!(parts[3].contains("nextFloor \\in Floor"));
+    }
+
+    #[test]
+    fn split_indented_top_level_boolean_keeps_nested_disjunctions_inside_conjuncts() {
+        let expr = r#"
+            /\ ElevatorState[e].direction = c.direction
+            /\  \/ ElevatorState[e].floor = c.floor
+                \/ GetDirection[ElevatorState[e].floor, c.floor] = c.direction
+        "#;
+
+        let parts = split_indented_top_level_boolean(expr, "/\\")
+            .expect("indented conjunction splitter should recognize the top-level clauses");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], "ElevatorState[e].direction = c.direction");
+        assert!(parts[1].starts_with(r#"\/ ElevatorState[e].floor = c.floor"#));
+        assert!(
+            parts[1].contains(r#"GetDirection[ElevatorState[e].floor, c.floor] = c.direction"#)
+        );
+    }
+
+    #[test]
+    fn split_indented_top_level_boolean_keeps_quantifier_body_with_header() {
+        let expr = r#"
+            /\ \A e2 \in stationary \cup approaching :
+                /\ GetDistance[ElevatorState[e].floor, c.floor] <= GetDistance[ElevatorState[e2].floor, c.floor]
+            /\ c \in ActiveElevatorCalls
+        "#;
+
+        let parts = split_indented_top_level_boolean(expr, "/\\")
+            .expect("indented conjunction splitter should recognize the top-level clauses");
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0].starts_with(r#"\A e2 \in stationary \cup approaching :"#));
+        assert!(parts[0].contains(r#"/\ GetDistance[ElevatorState[e].floor, c.floor] <="#));
+        assert_eq!(parts[1], r#"c \in ActiveElevatorCalls"#);
+    }
+
+    #[test]
+    fn split_indented_top_level_boolean_keeps_quantifier_body_after_nested_let_in() {
+        let expr = r#"
+            /\ \E repPublicKey \in {"pub"} :
+                /\ \E srcHash \in {"hash"} :
+                    LET newOpenBlock == srcHash
+                    IN
+                    /\ newOpenBlock = "hash"
+                    /\ repPublicKey = "pub"
+            /\ TRUE
+        "#;
+
+        let parts = split_indented_top_level_boolean(expr, "/\\")
+            .expect("indented conjunction splitter should preserve quantifier LET body");
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0].starts_with(r#"\E repPublicKey \in {"pub"} :"#));
+        assert!(parts[0].contains(r#"LET newOpenBlock == srcHash"#));
+        assert!(parts[0].contains(r#"/\ newOpenBlock = "hash""#));
+        assert!(parts[0].contains(r#"/\ repPublicKey = "pub""#));
+        assert_eq!(parts[1], "TRUE");
+    }
+
+    #[test]
+    fn evaluates_multiline_set_filter_with_nested_disjunction() {
+        let elevator_1 = TlaValue::ModelValue("e1".to_string());
+        let elevator_2 = TlaValue::ModelValue("e2".to_string());
+        let up = TlaValue::String("Up".to_string());
+        let stationary = TlaValue::String("Stationary".to_string());
+
+        let state = TlaState::from([
+            (
+                "Elevator".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([
+                    elevator_1.clone(),
+                    elevator_2.clone(),
+                ]))),
+            ),
+            (
+                "ElevatorState".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([
+                    (
+                        elevator_1.clone(),
+                        TlaValue::Record(Arc::new(BTreeMap::from([
+                            ("floor".to_string(), TlaValue::Int(1)),
+                            ("direction".to_string(), up.clone()),
+                        ]))),
+                    ),
+                    (
+                        elevator_2.clone(),
+                        TlaValue::Record(Arc::new(BTreeMap::from([
+                            ("floor".to_string(), TlaValue::Int(3)),
+                            ("direction".to_string(), stationary),
+                        ]))),
+                    ),
+                ]))),
+            ),
+            (
+                "c".to_string(),
+                TlaValue::Record(Arc::new(BTreeMap::from([
+                    ("floor".to_string(), TlaValue::Int(2)),
+                    ("direction".to_string(), up),
+                ]))),
+            ),
+        ]);
+        let defs = BTreeMap::from([(
+            "GetDirection".to_string(),
+            TlaDefinition {
+                name: "GetDirection".to_string(),
+                params: vec!["from".to_string(), "to".to_string()],
+                body: r#"IF from < to THEN "Up" ELSE IF from > to THEN "Down" ELSE "Stationary""#
+                    .to_string(),
+                is_recursive: false,
+            },
+        )]);
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        let expr = r#"
+            {e \in Elevator :
+                /\ ElevatorState[e].direction = c.direction
+                /\  \/ ElevatorState[e].floor = c.floor
+                    \/ GetDirection[ElevatorState[e].floor, c.floor] = c.direction
+            }
+        "#;
+
+        let value = eval_expr(expr, &ctx).expect("set filter should evaluate");
+        let expected = TlaValue::Set(Arc::new(BTreeSet::from([elevator_1])));
+        assert_eq!(value, expected);
     }
 
     #[test]
@@ -6457,7 +6980,8 @@ mod tests {
         let ctx = EvalContext::new(&state);
         let expr = "LET next_box == 3 IN \\/ /\\ next_box \\in {2, 3, 4}\n                         /\\ TRUE\n                      \\/ /\\ next_box \\notin {2, 3, 4}\n                         /\\ FALSE";
 
-        let result = eval_expr(expr, &ctx).expect("LET body with leading disjunction should evaluate");
+        let result =
+            eval_expr(expr, &ctx).expect("LET body with leading disjunction should evaluate");
         assert_eq!(result, TlaValue::Bool(true));
     }
 
@@ -6589,7 +7113,7 @@ mod tests {
         );
 
         // Create an instance with Const <- 10 substitution
-        let mut instance = TlaModuleInstance {
+        let instance = TlaModuleInstance {
             alias: "H".to_string(),
             module_name: "Helper".to_string(),
             substitutions: BTreeMap::from([("Const".to_string(), "10".to_string())]),
@@ -6613,6 +7137,238 @@ mod tests {
         // Test H!AddConst(7) = 17 (7 + 10)
         let result = eval_expr("H!AddConst(7)", &ctx).expect("H!AddConst(7) should evaluate");
         assert_eq!(result, TlaValue::Int(17));
+    }
+
+    #[test]
+    fn module_instances_inherit_same_named_outer_constant_definitions() {
+        use crate::tla::module::{TlaModule, TlaModuleInstance};
+
+        let mut helper_module = TlaModule::default();
+        helper_module.name = "Helper".to_string();
+        helper_module.constants = vec!["KeyPair".to_string()];
+        helper_module.definitions.insert(
+            "UseKeyPair".to_string(),
+            TlaDefinition {
+                name: "UseKeyPair".to_string(),
+                params: vec!["priv".to_string()],
+                body: "KeyPair[priv]".to_string(),
+                is_recursive: false,
+            },
+        );
+
+        let instance = TlaModuleInstance {
+            alias: "H".to_string(),
+            module_name: "Helper".to_string(),
+            substitutions: BTreeMap::new(),
+            is_local: false,
+            module: Some(Box::new(helper_module)),
+        };
+
+        let definitions = BTreeMap::from([(
+            "KeyPair".to_string(),
+            TlaDefinition {
+                name: "KeyPair".to_string(),
+                params: vec![],
+                body: "[prv1 |-> pub1]".to_string(),
+                is_recursive: false,
+            },
+        )]);
+        let instances = BTreeMap::from([("H".to_string(), instance)]);
+        let state = TlaState::new();
+        let ctx = EvalContext::with_definitions_and_instances(&state, &definitions, &instances);
+
+        let result =
+            eval_expr("H!UseKeyPair(prv1)", &ctx).expect("instance should inherit KeyPair");
+        assert_eq!(result, TlaValue::ModelValue("pub1".to_string()));
+    }
+
+    #[test]
+    fn inline_if_actions_expand_module_instance_calls_with_outer_constants() {
+        use crate::tla::module::{TlaModule, TlaModuleInstance};
+
+        let mut helper_module = TlaModule::default();
+        helper_module.name = "Helper".to_string();
+        helper_module.constants = vec!["KeyPair".to_string()];
+        helper_module.definitions.insert(
+            "Next".to_string(),
+            TlaDefinition {
+                name: "Next".to_string(),
+                params: vec![],
+                body: "/\\ x' = KeyPair[prv1]".to_string(),
+                is_recursive: false,
+            },
+        );
+
+        let instances = BTreeMap::from([(
+            "H".to_string(),
+            TlaModuleInstance {
+                alias: "H".to_string(),
+                module_name: "Helper".to_string(),
+                substitutions: BTreeMap::new(),
+                is_local: false,
+                module: Some(Box::new(helper_module)),
+            },
+        )]);
+        let definitions = BTreeMap::from([(
+            "KeyPair".to_string(),
+            TlaDefinition {
+                name: "KeyPair".to_string(),
+                params: vec![],
+                body: "[prv1 |-> pub1]".to_string(),
+                is_recursive: false,
+            },
+        )]);
+        let state = TlaState::from([("x".to_string(), TlaValue::ModelValue("old".to_string()))]);
+        let ctx = EvalContext::with_definitions_and_instances(&state, &definitions, &instances);
+        let action = crate::tla::compile_action_ir(&TlaDefinition {
+            name: "RootNext".to_string(),
+            params: vec![],
+            body: "IF TRUE THEN H!Next ELSE /\\ UNCHANGED x".to_string(),
+            is_recursive: false,
+        });
+
+        let next = apply_action_ir_with_context_multi(&action, &state, &ctx)
+            .expect("if action should evaluate through instance call");
+
+        assert_eq!(next.len(), 1);
+        assert_eq!(
+            next[0].get("x"),
+            Some(&TlaValue::ModelValue("pub1".to_string()))
+        );
+    }
+
+    #[test]
+    fn module_instances_can_use_outer_operator_ref_helpers() {
+        use crate::tla::module::{TlaModule, TlaModuleInstance};
+
+        let mut helper_module = TlaModule::default();
+        helper_module.name = "Helper".to_string();
+        helper_module.constants = vec!["Hasher".to_string()];
+        helper_module.definitions.insert(
+            "UseHasher".to_string(),
+            TlaDefinition {
+                name: "UseHasher".to_string(),
+                params: vec!["n".to_string()],
+                body: "Hasher(n)".to_string(),
+                is_recursive: false,
+            },
+        );
+
+        let instances = BTreeMap::from([(
+            "H".to_string(),
+            TlaModuleInstance {
+                alias: "H".to_string(),
+                module_name: "Helper".to_string(),
+                substitutions: BTreeMap::new(),
+                is_local: false,
+                module: Some(Box::new(helper_module)),
+            },
+        )]);
+        let definitions = BTreeMap::from([
+            (
+                "Hasher".to_string(),
+                TlaDefinition {
+                    name: "Hasher".to_string(),
+                    params: vec!["n".to_string()],
+                    body: "HashImpl(n)".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "HashImpl".to_string(),
+                TlaDefinition {
+                    name: "HashImpl".to_string(),
+                    params: vec!["n".to_string()],
+                    body: "n * 2".to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+        let state = TlaState::new();
+        let ctx = EvalContext::with_definitions_and_instances(&state, &definitions, &instances);
+
+        let result =
+            eval_expr("H!UseHasher(5)", &ctx).expect("instance should resolve outer helper");
+        assert_eq!(result, TlaValue::Int(10));
+    }
+
+    #[test]
+    fn module_instances_can_use_outer_helpers_that_reference_outer_instances() {
+        use crate::tla::module::{TlaModule, TlaModuleInstance};
+
+        let mut inner_module = TlaModule::default();
+        inner_module.name = "Inner".to_string();
+        inner_module.definitions.insert(
+            "Double".to_string(),
+            TlaDefinition {
+                name: "Double".to_string(),
+                params: vec!["n".to_string()],
+                body: "n * 2".to_string(),
+                is_recursive: false,
+            },
+        );
+
+        let mut helper_module = TlaModule::default();
+        helper_module.name = "Helper".to_string();
+        helper_module.constants = vec!["Hasher".to_string()];
+        helper_module.definitions.insert(
+            "UseHasher".to_string(),
+            TlaDefinition {
+                name: "UseHasher".to_string(),
+                params: vec!["n".to_string()],
+                body: "Hasher(n)".to_string(),
+                is_recursive: false,
+            },
+        );
+
+        let instances = BTreeMap::from([
+            (
+                "N".to_string(),
+                TlaModuleInstance {
+                    alias: "N".to_string(),
+                    module_name: "Inner".to_string(),
+                    substitutions: BTreeMap::new(),
+                    is_local: false,
+                    module: Some(Box::new(inner_module)),
+                },
+            ),
+            (
+                "H".to_string(),
+                TlaModuleInstance {
+                    alias: "H".to_string(),
+                    module_name: "Helper".to_string(),
+                    substitutions: BTreeMap::new(),
+                    is_local: false,
+                    module: Some(Box::new(helper_module)),
+                },
+            ),
+        ]);
+        let definitions = BTreeMap::from([
+            (
+                "Hasher".to_string(),
+                TlaDefinition {
+                    name: "Hasher".to_string(),
+                    params: vec!["n".to_string()],
+                    body: "HashImpl(n)".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "HashImpl".to_string(),
+                TlaDefinition {
+                    name: "HashImpl".to_string(),
+                    params: vec!["n".to_string()],
+                    body: "N!Double(n)".to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+        let state = TlaState::new();
+        let ctx = EvalContext::with_definitions_and_instances(&state, &definitions, &instances);
+
+        let result = eval_expr("H!UseHasher(5)", &ctx)
+            .expect("instance should retain outer instances for helper calls");
+        assert_eq!(result, TlaValue::Int(10));
     }
 
     #[test]

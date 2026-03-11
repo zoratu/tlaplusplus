@@ -608,6 +608,12 @@ impl<'a> ValueParser<'a> {
         if let Ok(v) = atom.parse::<i64>() {
             return Ok(ConfigValue::Int(v));
         }
+        if atom.starts_with('[') {
+            let (op_name, consumed) = read_operator_ref(&atom);
+            if !op_name.is_empty() && consumed == atom.len() {
+                return Ok(ConfigValue::OperatorRef(op_name));
+            }
+        }
         Ok(ConfigValue::ModelValue(atom))
     }
 
@@ -1097,11 +1103,24 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_bracket_qualified_operator_refs() {
+    fn parses_bracket_qualified_equals_assignments_as_operator_refs() {
+        let cfg = parse_tla_config(
+            r#"
+            CONSTANTS
+              NoBlock = [Nano]NoBlockVal
+            "#,
+        )
+        .expect("cfg should parse");
+
         assert_eq!(
-            normalize_operator_ref_name("[Voting]MCBallot"),
-            "MCBallot"
+            cfg.constants.get("NoBlock"),
+            Some(&ConfigValue::OperatorRef("[Nano]NoBlockVal".to_string()))
         );
+    }
+
+    #[test]
+    fn normalizes_bracket_qualified_operator_refs() {
+        assert_eq!(normalize_operator_ref_name("[Voting]MCBallot"), "MCBallot");
         assert_eq!(
             normalize_operator_ref_name("[ZSequences] ZSeqNat"),
             "ZSeqNat"

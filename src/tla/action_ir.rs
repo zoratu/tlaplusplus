@@ -40,7 +40,8 @@ pub(crate) fn split_action_body_clauses(expr: &str) -> Vec<String> {
         return vec![trimmed.to_string()];
     }
 
-    let raw = split_top_level(trimmed, "/\\");
+    let raw =
+        split_indented_action_conjuncts(trimmed).unwrap_or_else(|| split_top_level(trimmed, "/\\"));
     let mut merged = Vec::with_capacity(raw.len().max(1));
     let mut idx = 0usize;
     while idx < raw.len() {
@@ -629,7 +630,10 @@ mod tests {
 
         assert_eq!(clauses.len(), 1);
         assert!(clauses[0].starts_with(r"\E i \in unchecked[self]:"));
-        assert!(clauses[0].contains(r#"unchecked' = [unchecked EXCEPT ![self] = unchecked[self] \ {i}]"#));
+        assert!(
+            clauses[0]
+                .contains(r#"unchecked' = [unchecked EXCEPT ![self] = unchecked[self] \ {i}]"#)
+        );
         assert!(clauses[0].contains(r#"max' = [max EXCEPT ![self] = num[i]]"#));
         assert!(clauses[0].contains(r#"max' = max"#));
         assert!(clauses[0].contains(r#"pc' = [pc EXCEPT ![self] = "e2"]"#));
@@ -677,6 +681,33 @@ mod tests {
     }
 
     #[test]
+    fn split_action_body_clauses_separates_let_assignment_from_unchanged() {
+        let clauses = split_action_body_clauses(
+            r#"
+                /\ c \in ActiveElevatorCalls
+                /\ ElevatorState' =
+                    LET closest == CHOOSE e \in stationary \cup approaching :
+                        /\ \A e2 \in stationary \cup approaching :
+                            /\ GetDistance[ElevatorState[e].floor, c.floor] <= GetDistance[ElevatorState[e2].floor, c.floor]
+                    IN
+                    IF closest \in stationary
+                    THEN [ElevatorState EXCEPT ![closest] = [@ EXCEPT !.floor = c.floor, !.direction = c.direction]]
+                    ELSE ElevatorState
+                /\ UNCHANGED <<PersonState, ActiveElevatorCalls>>
+            "#,
+        );
+
+        assert_eq!(clauses.len(), 3);
+        assert_eq!(clauses[0], r#"c \in ActiveElevatorCalls"#);
+        assert!(clauses[1].starts_with("ElevatorState' ="));
+        assert!(clauses[1].contains("LET closest =="));
+        assert_eq!(
+            clauses[2],
+            r#"UNCHANGED <<PersonState, ActiveElevatorCalls>>"#
+        );
+    }
+
+    #[test]
     fn split_action_body_disjuncts_preserves_boolean_or_inside_branch_guards() {
         let disjuncts = split_action_body_disjuncts(
             r#"/\ \/ /\ tmState="commit"
@@ -694,6 +725,8 @@ mod tests {
         assert!(disjuncts[0].contains(r#"rmState' = [rmState EXCEPT ![self] = "committed"]"#));
         assert!(disjuncts[1].contains(r#"rmState[self]="working" \/ tmState="abort""#));
         assert!(disjuncts[1].contains(r#"rmState' = [rmState EXCEPT ![self] = "aborted"]"#));
-        assert!(disjuncts[2].starts_with(r#"/\ IF RMMAYFAIL /\ ~\E rm \in RM:rmState[rm]="failed""#));
+        assert!(
+            disjuncts[2].starts_with(r#"/\ IF RMMAYFAIL /\ ~\E rm \in RM:rmState[rm]="failed""#)
+        );
     }
 }

@@ -368,7 +368,8 @@ fn replace_identifier(expr: &str, from: &str, to: &str) -> String {
 
 pub fn parse_tla_module_text(input: &str) -> Result<TlaModule> {
     let cleaned = strip_comments(input);
-    let mut pending_lines: VecDeque<String> = cleaned.lines().map(|line| line.to_string()).collect();
+    let mut pending_lines: VecDeque<String> =
+        cleaned.lines().map(|line| line.to_string()).collect();
     let mut module = TlaModule::default();
 
     let mut current_def: Option<TlaDefinition> = None;
@@ -544,10 +545,10 @@ pub fn parse_tla_module_text(input: &str) -> Result<TlaModule> {
         }
 
         match mode {
-            NameListMode::Constants if is_pure_name_list(trimmed) => {
+            NameListMode::Constants if is_name_list_continuation(trimmed, true) => {
                 push_names(trimmed, &mut module.constants);
             }
-            NameListMode::Variables if is_pure_name_list(trimmed) => {
+            NameListMode::Variables if is_name_list_continuation(trimmed, false) => {
                 push_names(trimmed, &mut module.variables);
             }
             _ => {
@@ -873,33 +874,80 @@ fn top_level_in_pos(text: &str) -> Option<usize> {
 }
 
 fn push_names(text: &str, out: &mut Vec<String>) {
-    for token in text.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let mut name = String::new();
-        for c in token.chars() {
-            if c.is_alphanumeric() || c == '_' {
-                name.push(c);
-            } else {
-                break;
-            }
-        }
-        if !name.is_empty() {
+    for token in split_top_level_commas(text)
+        .into_iter()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if let Some((name, _)) = split_declared_name(token) {
             out.push(name);
         }
     }
 }
 
-fn is_pure_name_list(line: &str) -> bool {
-    line.split(',')
+fn is_name_list_continuation(line: &str, allow_operator_params: bool) -> bool {
+    let mut saw_entry = false;
+    for entry in split_top_level_commas(line)
+        .into_iter()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .all(|name| {
-            let mut chars = name.chars();
-            match chars.next() {
-                Some(c) if c.is_alphabetic() || c == '_' => {}
-                _ => return false,
-            }
-            chars.all(|c| c.is_alphanumeric() || c == '_')
-        })
+    {
+        saw_entry = true;
+        if !is_name_list_entry(entry, allow_operator_params) {
+            return false;
+        }
+    }
+    saw_entry
+}
+
+fn is_name_list_entry(entry: &str, allow_operator_params: bool) -> bool {
+    let Some((_, suffix)) = split_declared_name(entry) else {
+        return false;
+    };
+    if suffix.is_empty() {
+        return true;
+    }
+
+    if suffix.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return true;
+    }
+
+    if !allow_operator_params {
+        return false;
+    }
+
+    let Some(rest) = suffix.strip_prefix('(') else {
+        return false;
+    };
+    let Some(args) = rest.strip_suffix(')') else {
+        return false;
+    };
+    if args.trim().is_empty() {
+        return true;
+    }
+    args.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .all(|arg| arg == "_")
+}
+
+fn split_declared_name(entry: &str) -> Option<(String, &str)> {
+    let mut chars = entry.char_indices();
+    match chars.next() {
+        Some((_, c)) if c.is_alphabetic() || c == '_' => {}
+        _ => return None,
+    }
+
+    let mut end = 1usize;
+    for (idx, c) in entry.char_indices().skip(1) {
+        if c.is_alphanumeric() || c == '_' {
+            end = idx + c.len_utf8();
+        } else {
+            end = idx;
+            return Some((entry[..end].to_string(), entry[end..].trim()));
+        }
+    }
+    Some((entry[..end].to_string(), entry[end..].trim()))
 }
 
 fn is_section_separator(line: &str) -> bool {
@@ -2011,8 +2059,14 @@ Pos == 0 .. W + H
 "#;
 
         let module = parse_tla_module_text(src).expect("parse should work");
-        assert_eq!(module.definitions.get("W").map(|def| def.body.as_str()), Some("4"));
-        assert_eq!(module.definitions.get("H").map(|def| def.body.as_str()), Some("5"));
+        assert_eq!(
+            module.definitions.get("W").map(|def| def.body.as_str()),
+            Some("4")
+        );
+        assert_eq!(
+            module.definitions.get("H").map(|def| def.body.as_str()),
+            Some("5")
+        );
         assert_eq!(
             module.definitions.get("Pos").map(|def| def.body.as_str()),
             Some("0 .. W + H")
@@ -2041,9 +2095,18 @@ Base == 1
                 .as_deref(),
             Some("1")
         );
-        assert_eq!(module.definitions.get("omem").map(|def| def.body.as_str()), Some("vmem"));
-        assert_eq!(module.definitions.get("octl").map(|def| def.body.as_str()), Some("ctl"));
-        assert_eq!(module.definitions.get("obuf").map(|def| def.body.as_str()), Some("buf"));
+        assert_eq!(
+            module.definitions.get("omem").map(|def| def.body.as_str()),
+            Some("vmem")
+        );
+        assert_eq!(
+            module.definitions.get("octl").map(|def| def.body.as_str()),
+            Some("ctl")
+        );
+        assert_eq!(
+            module.definitions.get("obuf").map(|def| def.body.as_str()),
+            Some("buf")
+        );
     }
 
     #[test]
@@ -2121,5 +2184,36 @@ ASSUME TRUE
             .get("Edges")
             .expect("Edges should be defined");
         assert_eq!(edges.body.trim(), "UNION {{1}, {2}}");
+    }
+
+    #[test]
+    fn parses_multiline_constants_with_operator_entries() {
+        let src = r#"
+---- MODULE NanoLike ----
+CONSTANTS
+    Hash,
+    CalculateHash(_,_,_),
+    PrivateKey,
+    PublicKey
+VARIABLES
+    lastHash,
+    received
+====
+"#;
+
+        let module = parse_tla_module_text(src).expect("parse should work");
+        assert_eq!(
+            module.constants,
+            vec![
+                "CalculateHash".to_string(),
+                "Hash".to_string(),
+                "PrivateKey".to_string(),
+                "PublicKey".to_string()
+            ]
+        );
+        assert_eq!(
+            module.variables,
+            vec!["lastHash".to_string(), "received".to_string()]
+        );
     }
 }
