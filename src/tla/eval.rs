@@ -842,6 +842,10 @@ fn matches_membership_expr(
         "Int" => Ok(value.as_int().is_ok()),
         "BOOLEAN" => Ok(matches!(value, TlaValue::Bool(_))),
         _ => {
+            if let Some(runtime_value) = ctx.runtime_value(rhs_trimmed) {
+                return runtime_value.contains(value);
+            }
+
             if let Some(def) = ctx.definition(rhs_trimmed)
                 && def.params.is_empty()
             {
@@ -1429,9 +1433,10 @@ fn eval_choose_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Re
         return Err(anyhow!("CHOOSE currently expects exactly one binder"));
     }
 
-    let (var, domain) = &parsed[0];
-    for value in domain {
-        let child = ctx.with_local_value(var.clone(), value.clone());
+    let binder = &parsed[0];
+    for value in &binder.domain {
+        let mut child = ctx.clone();
+        assign_binder_value(std::rc::Rc::make_mut(&mut child.locals), binder, value)?;
         if eval_expr_inner(predicate, &child, depth + 1)?.as_bool()? {
             return Ok(value.clone());
         }
@@ -2591,11 +2596,39 @@ fn parse_local_def_head_with_delims(
     Some((name, params))
 }
 
+#[derive(Debug, Clone)]
+struct BinderSpec {
+    vars: Vec<String>,
+    domain: Vec<TlaValue>,
+}
+
+fn parse_binder_pattern_vars(pattern: &str) -> Result<Vec<String>> {
+    let trimmed = pattern.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("binder pattern is empty"));
+    }
+
+    if trimmed.starts_with("<<") && trimmed.ends_with(">>") {
+        let inner = &trimmed[2..trimmed.len() - 2];
+        let vars = split_top_level_symbol(inner, ",")
+            .into_iter()
+            .map(|var| var.trim().to_string())
+            .filter(|var| !var.is_empty())
+            .collect::<Vec<_>>();
+        if vars.is_empty() {
+            return Err(anyhow!("tuple binder pattern is empty: {pattern}"));
+        }
+        return Ok(vars);
+    }
+
+    Ok(vec![trimmed.to_string()])
+}
+
 fn parse_binders(
     expr: &str,
     ctx: &EvalContext<'_>,
     depth: usize,
-) -> Result<Vec<(String, Vec<TlaValue>)>> {
+) -> Result<Vec<BinderSpec>> {
     let mut bindings = Vec::new();
     let mut rest = expr.trim();
 
@@ -2624,12 +2657,15 @@ fn parse_binders(
         let domain_value = eval_expr_inner(domain_text.trim(), ctx, depth + 1)?;
         let domain = domain_value.as_set()?.iter().cloned().collect::<Vec<_>>();
 
-        for var in split_top_level_symbol(vars_text, ",") {
-            let name = var.trim();
-            if name.is_empty() {
+        for pattern in split_top_level_symbol(vars_text, ",") {
+            let pattern = pattern.trim();
+            if pattern.is_empty() {
                 continue;
             }
-            bindings.push((name.to_string(), domain.clone()));
+            bindings.push(BinderSpec {
+                vars: parse_binder_pattern_vars(pattern)?,
+                domain: domain.clone(),
+            });
         }
 
         rest = next_rest.trim_start();
@@ -2638,9 +2674,49 @@ fn parse_binders(
     Ok(bindings)
 }
 
+fn assign_binder_value(
+    assignments: &mut BTreeMap<String, TlaValue>,
+    binder: &BinderSpec,
+    value: &TlaValue,
+) -> Result<()> {
+    if binder.vars.len() == 1 {
+        assignments.insert(binder.vars[0].clone(), value.clone());
+        return Ok(());
+    }
+
+    let parts = match value {
+        TlaValue::Seq(parts) if parts.len() == binder.vars.len() => parts,
+        TlaValue::Seq(parts) => {
+            return Err(anyhow!(
+                "tuple binder arity mismatch: expected {}, got {}",
+                binder.vars.len(),
+                parts.len()
+            ));
+        }
+        other => {
+            return Err(anyhow!(
+                "tuple binder expects a sequence value, got {:?}",
+                other
+            ));
+        }
+    };
+
+    for (name, part) in binder.vars.iter().zip(parts.iter()) {
+        assignments.insert(name.clone(), part.clone());
+    }
+
+    Ok(())
+}
+
+fn remove_binder_assignments(assignments: &mut BTreeMap<String, TlaValue>, binder: &BinderSpec) {
+    for name in &binder.vars {
+        assignments.remove(name);
+    }
+}
+
 fn evaluate_exists(
     idx: usize,
-    domains: &[(String, Vec<TlaValue>)],
+    domains: &[BinderSpec],
     body: &str,
     assignments: &mut BTreeMap<String, TlaValue>,
     ctx: &EvalContext<'_>,
@@ -2657,21 +2733,22 @@ fn evaluate_exists(
         return eval_expr_inner(body, &child, depth + 1)?.as_bool();
     }
 
-    let (name, values) = &domains[idx];
+    let binder = &domains[idx];
+    let values = binder.domain.clone();
     for value in values {
-        assignments.insert(name.clone(), value.clone());
+        assign_binder_value(assignments, binder, &value)?;
         if evaluate_exists(idx + 1, domains, body, assignments, ctx, depth + 1)? {
-            assignments.remove(name);
+            remove_binder_assignments(assignments, binder);
             return Ok(true);
         }
     }
-    assignments.remove(name);
+    remove_binder_assignments(assignments, binder);
     Ok(false)
 }
 
 fn evaluate_forall(
     idx: usize,
-    domains: &[(String, Vec<TlaValue>)],
+    domains: &[BinderSpec],
     body: &str,
     assignments: &mut BTreeMap<String, TlaValue>,
     ctx: &EvalContext<'_>,
@@ -2688,21 +2765,22 @@ fn evaluate_forall(
         return eval_expr_inner(body, &child, depth + 1)?.as_bool();
     }
 
-    let (name, values) = &domains[idx];
+    let binder = &domains[idx];
+    let values = binder.domain.clone();
     for value in values {
-        assignments.insert(name.clone(), value.clone());
+        assign_binder_value(assignments, binder, &value)?;
         if !evaluate_forall(idx + 1, domains, body, assignments, ctx, depth + 1)? {
-            assignments.remove(name);
+            remove_binder_assignments(assignments, binder);
             return Ok(false);
         }
     }
-    assignments.remove(name);
+    remove_binder_assignments(assignments, binder);
     Ok(true)
 }
 
 fn collect_function_mapping(
     idx: usize,
-    binders: &[(String, Vec<TlaValue>)],
+    binders: &[BinderSpec],
     body: &str,
     assignments: &mut BTreeMap<String, TlaValue>,
     out: &mut BTreeMap<TlaValue, TlaValue>,
@@ -2723,19 +2801,20 @@ fn collect_function_mapping(
         return Ok(());
     }
 
-    let (name, values) = &binders[idx];
+    let binder = &binders[idx];
+    let values = binder.domain.clone();
     for value in values {
-        assignments.insert(name.clone(), value.clone());
+        assign_binder_value(assignments, binder, &value)?;
         collect_function_mapping(idx + 1, binders, body, assignments, out, ctx, depth + 1)?;
     }
-    assignments.remove(name);
+    remove_binder_assignments(assignments, binder);
 
     Ok(())
 }
 
 fn collect_binder_filter_set(
     idx: usize,
-    binders: &[(String, Vec<TlaValue>)],
+    binders: &[BinderSpec],
     predicate: &str,
     assignments: &mut BTreeMap<String, TlaValue>,
     out: &mut BTreeSet<TlaValue>,
@@ -2757,9 +2836,10 @@ fn collect_binder_filter_set(
         return Ok(());
     }
 
-    let (name, values) = &binders[idx];
+    let binder = &binders[idx];
+    let values = binder.domain.clone();
     for value in values {
-        assignments.insert(name.clone(), value.clone());
+        assign_binder_value(assignments, binder, &value)?;
         collect_binder_filter_set(
             idx + 1,
             binders,
@@ -2770,14 +2850,14 @@ fn collect_binder_filter_set(
             depth + 1,
         )?;
     }
-    assignments.remove(name);
+    remove_binder_assignments(assignments, binder);
 
     Ok(())
 }
 
 fn collect_binder_map_set(
     idx: usize,
-    binders: &[(String, Vec<TlaValue>)],
+    binders: &[BinderSpec],
     element_expr: &str,
     assignments: &mut BTreeMap<String, TlaValue>,
     out: &mut BTreeSet<TlaValue>,
@@ -2796,9 +2876,10 @@ fn collect_binder_map_set(
         return Ok(());
     }
 
-    let (name, values) = &binders[idx];
+    let binder = &binders[idx];
+    let values = binder.domain.clone();
     for value in values {
-        assignments.insert(name.clone(), value.clone());
+        assign_binder_value(assignments, binder, &value)?;
         collect_binder_map_set(
             idx + 1,
             binders,
@@ -2809,29 +2890,37 @@ fn collect_binder_map_set(
             depth + 1,
         )?;
     }
-    assignments.remove(name);
+    remove_binder_assignments(assignments, binder);
 
     Ok(())
 }
 
 fn binder_key(
     assignments: &BTreeMap<String, TlaValue>,
-    binders: &[(String, Vec<TlaValue>)],
+    binders: &[BinderSpec],
 ) -> Result<TlaValue> {
-    if binders.len() == 1 {
+    let total_vars = binders.iter().map(|binder| binder.vars.len()).sum::<usize>();
+    if total_vars == 1 {
+        let name = binders
+            .iter()
+            .flat_map(|binder| binder.vars.iter())
+            .next()
+            .ok_or_else(|| anyhow!("missing binder assignment"))?;
         assignments
-            .get(&binders[0].0)
+            .get(name)
             .cloned()
-            .ok_or_else(|| anyhow!("missing binder assignment"))
+            .ok_or_else(|| anyhow!("missing binder assignment for {name}"))
     } else {
-        let mut items = Vec::with_capacity(binders.len());
-        for (name, _) in binders {
-            items.push(
-                assignments
-                    .get(name)
-                    .cloned()
-                    .ok_or_else(|| anyhow!("missing binder assignment for {name}"))?,
-            );
+        let mut items = Vec::with_capacity(total_vars);
+        for binder in binders {
+            for name in &binder.vars {
+                items.push(
+                    assignments
+                        .get(name)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("missing binder assignment for {name}"))?,
+                );
+            }
         }
         Ok(TlaValue::Seq(Arc::new(items)))
     }
@@ -5224,6 +5313,77 @@ mod tests {
             TlaValue::Int(n) => assert!(n > 1, "result should be > 1, got {}", n),
             _ => panic!("Expected Int, got {:?}", result),
         }
+    }
+
+    #[test]
+    fn membership_prefers_runtime_value_over_shadowed_local_definition() {
+        let state = TlaState::new();
+        let ctx = EvalContext::new(&state);
+
+        assert_eq!(
+            eval_expr("LET pc == {1} IN (LAMBDA pc: 2 \\in pc)[{2}]", &ctx)
+                .expect("lambda parameter should shadow local definition in membership"),
+            TlaValue::Bool(true)
+        );
+    }
+
+    #[test]
+    fn higher_order_lambda_predicate_can_reference_let_bound_value_without_recursing() {
+        let piece_a = TlaValue::Set(Arc::new(BTreeSet::from([
+            TlaValue::Seq(Arc::new(vec![TlaValue::Int(1), TlaValue::Int(1)])),
+            TlaValue::Seq(Arc::new(vec![TlaValue::Int(1), TlaValue::Int(2)])),
+        ])));
+        let piece_b = TlaValue::Set(Arc::new(BTreeSet::from([
+            TlaValue::Seq(Arc::new(vec![TlaValue::Int(2), TlaValue::Int(1)])),
+            TlaValue::Seq(Arc::new(vec![TlaValue::Int(2), TlaValue::Int(2)])),
+        ])));
+        let board = TlaValue::Set(Arc::new(BTreeSet::from([piece_a, piece_b.clone()])));
+        let state = TlaState::from([("board".to_string(), board)]);
+        let defs = BTreeMap::from([
+            (
+                "ChooseOne".to_string(),
+                TlaDefinition {
+                    name: "ChooseOne".to_string(),
+                    params: vec!["S".to_string(), "P(_)".to_string()],
+                    body: "CHOOSE x \\in S : P(x)".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "MovePiece".to_string(),
+                TlaDefinition {
+                    name: "MovePiece".to_string(),
+                    params: vec!["p".to_string(), "d".to_string()],
+                    body: "LET s == <<p[1] + d[1], p[2] + d[2]>>\n                  pc == ChooseOne(board, LAMBDA pc : s \\in pc)\n              IN pc".to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        assert_eq!(
+            eval_expr("MovePiece(<<1, 1>>, <<1, 0>>)", &ctx)
+                .expect("higher-order LET should evaluate without recursion"),
+            piece_b
+        );
+    }
+
+    #[test]
+    fn tuple_binders_destructure_sequence_members_in_set_filters() {
+        let state = TlaState::new();
+        let ctx = EvalContext::new(&state);
+
+        assert_eq!(
+            eval_expr(
+                "LET moved == {<<{1}, {2, 3}>>, <<{4}, {5}>>} IN {<<pc, m>> \\in moved : 2 \\in m}",
+                &ctx,
+            )
+            .expect("tuple binder filter should evaluate"),
+            TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Seq(Arc::new(vec![
+                TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(1)]))),
+                TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(2), TlaValue::Int(3)]))),
+            ]))])))
+        );
     }
 
     #[test]
