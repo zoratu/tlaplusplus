@@ -12,6 +12,7 @@ use crate::storage::spillable_work_stealing::{SpillableConfig, SpillableWorkStea
 use crate::storage::unified_fingerprint_store::{
     AutoSwitchConfigInput, UnifiedFingerprintConfig, UnifiedFingerprintStore,
 };
+use crate::storage::work_stealing_queues::WorkStealingQueues;
 use crate::system::{
     MemoryMonitor, MemoryStatus, WorkerPlan, WorkerPlanRequest, build_worker_plan,
     cgroup_memory_max_bytes, check_disk_space, get_disk_stats, pin_current_thread_to_cpu,
@@ -20,7 +21,7 @@ use crate::system::{
 use anyhow::{Context, Result, anyhow};
 use dashmap::DashMap;
 use parking_lot::{Condvar, Mutex};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -501,6 +502,59 @@ impl PauseController {
         self.requested.store(false, Ordering::Release);
         self.wait_cv.notify_all();
     }
+}
+
+trait CheckpointPauseQueue {
+    fn set_checkpoint_pause_requested(&self, requested: bool);
+    fn checkpoint_is_in_progress(&self) -> bool;
+}
+
+impl<T: 'static> CheckpointPauseQueue for WorkStealingQueues<T> {
+    fn set_checkpoint_pause_requested(&self, requested: bool) {
+        self.set_pause_requested(requested);
+    }
+
+    fn checkpoint_is_in_progress(&self) -> bool {
+        self.is_checkpoint_in_progress()
+    }
+}
+
+impl<T> CheckpointPauseQueue for SpillableWorkStealingQueues<T>
+where
+    T: Serialize + DeserializeOwned + Send + Sync + Clone + 'static,
+{
+    fn set_checkpoint_pause_requested(&self, requested: bool) {
+        self.set_pause_requested(requested);
+    }
+
+    fn checkpoint_is_in_progress(&self) -> bool {
+        self.is_checkpoint_in_progress()
+    }
+}
+
+fn request_checkpoint_pause<Q: CheckpointPauseQueue>(queue: &Q, pause: &PauseController) {
+    // Request the pause before flipping the queue flag so workers that
+    // observe pause_requested on the queue can park immediately.
+    pause.request_pause();
+    std::sync::atomic::fence(Ordering::SeqCst);
+    queue.set_checkpoint_pause_requested(true);
+}
+
+fn pause_worker_after_empty_pop_during_checkpoint<Q: CheckpointPauseQueue>(
+    worker_queue: &Q,
+    worker_pause: &PauseController,
+    worker_stop: &AtomicBool,
+    worker_id: usize,
+) -> bool {
+    if !worker_queue.checkpoint_is_in_progress() {
+        return false;
+    }
+
+    // Give the checkpoint thread a chance to publish the pause request,
+    // then re-enter the production pause point directly from the empty-pop path.
+    std::thread::sleep(Duration::from_millis(1));
+    worker_pause.worker_pause_point(worker_stop, worker_id);
+    true
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1316,13 +1370,7 @@ where
                 // and exit before checkpoint can drain/reload items.
                 ckpt_queue.set_checkpoint_in_progress(true);
 
-                // Also set pause_requested so workers exit pop_slow_path
-                // even though checkpoint_in_progress prevents termination.
-                // Without this, workers spin forever in pop_slow_path.
-                ckpt_queue.set_pause_requested(true);
-
-                // Request pause and wait for workers to quiesce
-                ckpt_pause.request_pause();
+                request_checkpoint_pause(ckpt_queue.as_ref(), &ckpt_pause);
                 let quiescence_achieved = ckpt_pause.wait_for_quiescence(
                     &ckpt_exploration_stop,
                     &ckpt_active_workers,
@@ -1849,9 +1897,21 @@ where
                     Some(state) => state,
                     None => {
                         // During checkpoint, pop_for_worker returns None because pause_requested
-                        // is set. Workers should NOT terminate - they need to continue the loop
-                        // to hit the pause_point, wait for resume, and then re-enter pop_for_worker.
-                        if worker_queue.is_checkpoint_in_progress() {
+                        // is set. Workers MUST pause for quiescence. We call worker_pause_point
+                        // directly here instead of relying on  to reach the one at
+                        // the top of the loop. This eliminates a race window where workers
+                        // could spin in a tight continue-loop without ever pausing:
+                        //   continue -> pause_point(requested=false yet) -> pop(None) -> continue ...
+                        // By pausing directly, workers enter quiescence immediately.
+                        if pause_worker_after_empty_pop_during_checkpoint(
+                            worker_queue.as_ref(),
+                            &worker_pause,
+                            &worker_stop,
+                            worker_id,
+                        ) {
+                            if worker_stop.load(Ordering::Acquire) {
+                                break;
+                            }
                             continue;
                         }
                         // After checkpoint, the loader thread may still be loading items from disk.
@@ -2488,10 +2548,17 @@ pub fn reconstruct_trace_limited<M: Model>(
 
 #[cfg(test)]
 mod tests {
-    use super::{EngineConfig, next_quiescence_timeout_secs, run_model};
+    use super::{
+        EngineConfig, PauseController, next_quiescence_timeout_secs,
+        pause_worker_after_empty_pop_during_checkpoint, request_checkpoint_pause, run_model,
+    };
     use crate::models::counter_grid::CounterGridModel;
+    use crate::storage::work_stealing_queues::WorkStealingQueues;
     use anyhow::Result;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     fn temp_work_dir(prefix: &str) -> std::path::PathBuf {
         let nanos = SystemTime::now()
@@ -2559,6 +2626,102 @@ mod tests {
             next_quiescence_timeout_secs(0, Duration::from_secs(300)),
             None
         );
+    }
+
+    #[test]
+    fn worker_pauses_when_checkpoint_is_requested_between_pause_point_and_pop() {
+        let pause = Arc::new(PauseController::default());
+        pause.init_worker_tracking(1, &[0]);
+        let stop = Arc::new(AtomicBool::new(false));
+        let (queue, mut worker_states) = WorkStealingQueues::<u64>::new(1, vec![0]);
+        queue.set_checkpoint_in_progress(true);
+        let worker_state = worker_states.pop().expect("missing worker state");
+
+        let (after_top_pause_tx, after_top_pause_rx) = mpsc::channel();
+        let (checkpoint_requested_tx, checkpoint_requested_rx) = mpsc::channel();
+
+        let worker = {
+            let pause = Arc::clone(&pause);
+            let stop = Arc::clone(&stop);
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || {
+                let mut worker_state = worker_state;
+
+                // Simulate the worker passing the normal top-of-loop pause point
+                // just before the checkpoint thread requests quiescence.
+                pause.worker_pause_point(&stop, 0);
+                after_top_pause_tx.send(()).unwrap();
+                checkpoint_requested_rx.recv().unwrap();
+
+                assert!(queue.pop_for_worker(&mut worker_state).is_none());
+                assert!(pause_worker_after_empty_pop_during_checkpoint(
+                    queue.as_ref(),
+                    pause.as_ref(),
+                    &stop,
+                    0,
+                ));
+            })
+        };
+
+        after_top_pause_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker never reached the pre-checkpoint pause point");
+
+        request_checkpoint_pause(queue.as_ref(), pause.as_ref());
+        assert!(pause.requested.load(Ordering::Acquire));
+        assert!(queue.is_pause_requested());
+        checkpoint_requested_tx.send(()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut paused = false;
+        while Instant::now() < deadline {
+            if pause.paused_workers.load(Ordering::Acquire) == 1 {
+                paused = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        if !paused {
+            stop.store(true, Ordering::Release);
+            pause.resume();
+            let _ = worker.join();
+            panic!("worker did not enter the checkpoint pause path");
+        }
+
+        pause.resume();
+        worker.join().unwrap();
+        assert_eq!(pause.paused_workers.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn request_checkpoint_pause_sets_controller_and_queue_flags() {
+        let pause = PauseController::default();
+        let (queue, _) = WorkStealingQueues::<u64>::new(1, vec![0]);
+
+        request_checkpoint_pause(queue.as_ref(), &pause);
+
+        assert!(
+            pause.requested.load(Ordering::Acquire),
+            "pause controller should become visible before workers observe the queue pause flag"
+        );
+        assert!(queue.is_pause_requested());
+    }
+
+    #[test]
+    fn pause_worker_after_empty_pop_is_noop_without_checkpoint() {
+        let pause = PauseController::default();
+        pause.init_worker_tracking(1, &[0]);
+        let stop = AtomicBool::new(false);
+        let (queue, _) = WorkStealingQueues::<u64>::new(1, vec![0]);
+
+        assert!(!pause_worker_after_empty_pop_during_checkpoint(
+            queue.as_ref(),
+            &pause,
+            &stop,
+            0,
+        ));
+        assert_eq!(pause.paused_workers.load(Ordering::Acquire), 0);
     }
 
     #[test]

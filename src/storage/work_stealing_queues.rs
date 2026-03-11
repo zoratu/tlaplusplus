@@ -573,6 +573,11 @@ impl<T: 'static> WorkStealingQueues<T> {
             .store(in_progress, Ordering::Release);
     }
 
+    /// Check if a checkpoint is currently in progress
+    pub fn is_checkpoint_in_progress(&self) -> bool {
+        self.checkpoint_in_progress.load(Ordering::Acquire)
+    }
+
     /// Set pause requested flag
     /// When true, workers will exit pop_slow_path to allow pause to take effect
     pub fn set_pause_requested(&self, requested: bool) {
@@ -674,4 +679,35 @@ pub struct WorkStealingStats {
     pub popped: u64,
     pub steals: u64,
     pub active_workers: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WorkStealingQueues;
+
+    #[test]
+    fn pop_for_worker_returns_none_without_consuming_work_when_pause_requested() {
+        let (queue, mut workers) = WorkStealingQueues::<u64>::new(1, vec![0]);
+        queue.push_global(7);
+        queue.set_pause_requested(true);
+
+        assert_eq!(queue.pop_for_worker(&mut workers[0]), None);
+        assert!(queue.is_pause_requested());
+        assert!(
+            !queue.global.is_empty(),
+            "pause should short-circuit the slow path before stealing queued work"
+        );
+    }
+
+    #[test]
+    fn checkpoint_in_progress_blocks_termination_while_workers_are_pausing() {
+        let (queue, _) = WorkStealingQueues::<u64>::new(1, vec![0]);
+        queue.set_pause_requested(true);
+        queue.set_checkpoint_in_progress(true);
+
+        assert!(
+            !queue.should_terminate(0),
+            "workers must not terminate while checkpoint drain is in progress"
+        );
+    }
 }
