@@ -159,8 +159,26 @@ fn split_indented_action_disjuncts(expr: &str) -> Option<Vec<String>> {
     let normalized = normalize_multiline_action_indentation(expr);
     let mut clauses = Vec::new();
     let mut current = String::new();
-    let mut base_indent = None;
+    let mut prefix_lines = Vec::new();
+    let mut candidate_indents = Vec::new();
+
+    for raw_line in normalized.lines() {
+        let line = raw_line.trim_end();
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("\\/") {
+            let indent = line.len().saturating_sub(trimmed.len());
+            candidate_indents.push(indent);
+        }
+    }
+
+    let Some(base_indent) = candidate_indents.into_iter().min() else {
+        return None;
+    };
     let mut saw_top_level = false;
+    let mut shared_prefix: Option<String> = None;
 
     for raw_line in normalized.lines() {
         let line = raw_line.trim_end();
@@ -171,20 +189,37 @@ fn split_indented_action_disjuncts(expr: &str) -> Option<Vec<String>> {
 
         let indent = line.len().saturating_sub(trimmed.len());
         if trimmed.starts_with("\\/") {
-            let top_level_indent = *base_indent.get_or_insert(indent);
-            if indent == top_level_indent {
-                if !current.trim().is_empty() {
+            if indent == base_indent {
+                let branch_head = trimmed.trim_start_matches("\\/").trim_start();
+                if !saw_top_level {
+                    let prefix = prefix_lines.join("\n").trim().to_string();
+                    shared_prefix = repeated_disjunct_prefix(&prefix);
+                    if let Some(prefix) = shared_prefix.as_ref() {
+                        current.push_str(prefix);
+                    } else if !prefix.is_empty() {
+                        current.push_str(&prefix);
+                    }
+                } else if !current.trim().is_empty() {
                     clauses.push(current.trim().to_string());
                     current.clear();
                 }
-                current.push_str(trimmed.trim_start_matches("\\/").trim_start());
+                if let Some(prefix) = shared_prefix.as_ref()
+                    && current.is_empty()
+                {
+                    current.push_str(prefix);
+                }
+                if !current.trim().is_empty() && !branch_head.is_empty() {
+                    current.push('\n');
+                }
+                current.push_str(branch_head);
                 saw_top_level = true;
                 continue;
             }
         }
 
         if !saw_top_level {
-            return None;
+            prefix_lines.push(trimmed.to_string());
+            continue;
         }
 
         if !current.is_empty() {
@@ -199,6 +234,22 @@ fn split_indented_action_disjuncts(expr: &str) -> Option<Vec<String>> {
 
     if clauses.len() > 1 {
         Some(clauses)
+    } else {
+        None
+    }
+}
+
+fn repeated_disjunct_prefix(prefix: &str) -> Option<String> {
+    let trimmed = prefix.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.ends_with(':')
+        || trimmed.ends_with("THEN")
+        || trimmed.ends_with("ELSE")
+        || trimmed.ends_with("IN")
+    {
+        Some(trimmed.to_string())
     } else {
         None
     }
@@ -772,6 +823,43 @@ mod tests {
         assert!(disjuncts[1].contains(r#"rmState' = [rmState EXCEPT ![self] = "aborted"]"#));
         assert!(
             disjuncts[2].starts_with(r#"/\ IF RMMAYFAIL /\ ~\E rm \in RM:rmState[rm]="failed""#)
+        );
+    }
+
+    #[test]
+    fn split_action_body_disjuncts_keeps_nested_quantifier_branches_grouped() {
+        let disjuncts = split_action_body_disjuncts(
+            r#"\/ \E proc \in Proc, reg \in Reg :
+                    \/ \E req \in Request : IssueRequest(proc, req, reg)
+                    \/ RespondToRd(proc, reg)
+                    \/ RespondToWr(proc, reg)
+               \/ Internal"#,
+        );
+
+        assert_eq!(disjuncts.len(), 2, "{disjuncts:?}");
+        assert!(disjuncts[0].starts_with(r#"\E proc \in Proc, reg \in Reg :"#));
+        assert!(disjuncts[0].contains("IssueRequest(proc, req, reg)"));
+        assert!(disjuncts[0].contains("RespondToRd(proc, reg)"));
+        assert!(disjuncts[0].contains("RespondToWr(proc, reg)"));
+        assert_eq!(disjuncts[1], "Internal");
+    }
+
+    #[test]
+    fn split_action_body_disjuncts_repeats_quantifier_prefix_for_each_branch() {
+        let disjuncts = split_action_body_disjuncts(
+            r#"\E a \in Acceptor, b \in Ballot :
+                  \/ IncreaseMaxBal(a, b)
+                  \/ \E v \in Value : VoteFor(a, b, v)"#,
+        );
+
+        assert_eq!(disjuncts.len(), 2, "{disjuncts:?}");
+        assert_eq!(
+            disjuncts[0],
+            "\\E a \\in Acceptor, b \\in Ballot :\nIncreaseMaxBal(a, b)"
+        );
+        assert_eq!(
+            disjuncts[1],
+            "\\E a \\in Acceptor, b \\in Ballot :\n\\E v \\in Value : VoteFor(a, b, v)"
         );
     }
 

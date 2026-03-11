@@ -145,9 +145,41 @@ impl<'a> EvalContext<'a> {
         self.definitions.and_then(|defs| defs.get(name).cloned())
     }
 
+    fn eval_primed_zero_arg_definition(&self, name: &str, depth: usize) -> Option<Result<TlaValue>> {
+        let base_name = name.strip_suffix('\'')?;
+        let def = self.definition(base_name)?;
+        if !def.params.is_empty() {
+            return None;
+        }
+
+        let mut primed_ctx = self.clone();
+        let primed_bindings: Vec<(String, TlaValue)> = self
+            .state
+            .keys()
+            .filter_map(|var| {
+                self.locals
+                    .get(&format!("{var}'"))
+                    .cloned()
+                    .map(|value| (var.clone(), value))
+            })
+            .collect();
+        if !primed_bindings.is_empty() {
+            let locals_mut = Rc::make_mut(&mut primed_ctx.locals);
+            for (var, value) in primed_bindings {
+                locals_mut.insert(var, value);
+            }
+        }
+
+        Some(eval_operator_call(base_name, Vec::new(), &primed_ctx, depth + 1))
+    }
+
     pub(crate) fn resolve_identifier(&self, name: &str, depth: usize) -> Result<TlaValue> {
         if let Some(v) = self.runtime_value(name) {
             return Ok(v);
+        }
+
+        if let Some(result) = self.eval_primed_zero_arg_definition(name, depth) {
+            return result;
         }
 
         if let Some(def) = self.definition(name) {
@@ -7663,6 +7695,51 @@ mod tests {
 
         let disabled = eval_expr("ENABLED Step(2)", &ctx).expect("ENABLED Step(2)");
         assert_eq!(disabled, TlaValue::Bool(false));
+    }
+
+    #[test]
+    fn zero_arg_operator_primes_use_staged_next_state_bindings() {
+        let state = TlaState::from([
+            ("x".to_string(), TlaValue::Int(1)),
+            ("y".to_string(), TlaValue::Int(2)),
+        ]);
+        let definitions = BTreeMap::from([
+            (
+                "PairSum".to_string(),
+                TlaDefinition {
+                    name: "PairSum".to_string(),
+                    params: vec![],
+                    body: "x + y".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "PairSumPositive".to_string(),
+                TlaDefinition {
+                    name: "PairSumPositive".to_string(),
+                    params: vec![],
+                    body: "PairSum > 0".to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+
+        let mut ctx = EvalContext::with_definitions(&state, &definitions);
+        {
+            let locals_mut = Rc::make_mut(&mut ctx.locals);
+            locals_mut.insert("x'".to_string(), TlaValue::Int(10));
+            locals_mut.insert("y'".to_string(), TlaValue::Int(-3));
+        }
+
+        assert_eq!(
+            eval_expr("PairSum'", &ctx).expect("primed zero-arg operator should resolve"),
+            TlaValue::Int(7)
+        );
+        assert_eq!(
+            eval_expr("PairSumPositive'", &ctx)
+                .expect("derived primed zero-arg operator should resolve"),
+            TlaValue::Bool(true)
+        );
     }
 
     #[test]
