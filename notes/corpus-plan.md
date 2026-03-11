@@ -19,6 +19,7 @@ Execution harness:
 - `scripts/analyze_tla_corpus.sh` runs the native frontend over the in-repo corpus.
 - Writes parsed summary to `.analyze-tla/corpus/summary.tsv`.
 - Supports sharding with `SHARD_INDEX` / `SHARD_COUNT`.
+- Supports per-spec guardrails with `PER_SPEC_TIMEOUT_SECS`.
 
 Public corpus seed (internet/GitHub sourced):
 
@@ -65,6 +66,7 @@ Use this as a moving baseline, not an acceptance threshold. The gap list should 
 4. Add comparison harness:
    - run TLC and `tlaplusplus` on each corpus entry.
    - record reachability counts, violations, and runtime metrics.
+   - record timeout cases distinctly so hung probes do not stall the whole sweep.
 5. Add regression gates:
    - block merges on semantic mismatches for supported features.
 6. Tie corpus tags and failures back to `notes/tla-feature-reference.md`:
