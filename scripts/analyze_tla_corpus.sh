@@ -7,6 +7,7 @@ OUT_ROOT="${2:-${ROOT_DIR}/.analyze-tla/corpus}"
 BINARY="${BINARY:-${ROOT_DIR}/target/release/tlaplusplus}"
 SHARD_INDEX="${SHARD_INDEX:-0}"
 SHARD_COUNT="${SHARD_COUNT:-1}"
+PER_SPEC_TIMEOUT_SECS="${PER_SPEC_TIMEOUT_SECS:-0}"
 SUMMARY_PATH="${OUT_ROOT}/summary.tsv"
 
 mkdir -p "${OUT_ROOT}"
@@ -18,6 +19,11 @@ fi
 
 if [[ ! -d "${CORPUS_DIR}" ]]; then
   echo "Corpus directory not found: ${CORPUS_DIR}" >&2
+  exit 1
+fi
+
+if [[ "${PER_SPEC_TIMEOUT_SECS}" != "0" ]] && ! command -v timeout >/dev/null 2>&1; then
+  echo "timeout command not found but PER_SPEC_TIMEOUT_SECS=${PER_SPEC_TIMEOUT_SECS}" >&2
   exit 1
 fi
 
@@ -108,7 +114,12 @@ for idx in "${!CFGS[@]}"; do
 
   start_epoch="$(date +%s)"
   set +e
-  "${BINARY}" analyze-tla --module "${module_path}" --config "${cfg_path}" >"${log_path}" 2>&1
+  if [[ "${PER_SPEC_TIMEOUT_SECS}" == "0" ]]; then
+    "${BINARY}" analyze-tla --module "${module_path}" --config "${cfg_path}" >"${log_path}" 2>&1
+  else
+    timeout --foreground "${PER_SPEC_TIMEOUT_SECS}s" \
+      "${BINARY}" analyze-tla --module "${module_path}" --config "${cfg_path}" >"${log_path}" 2>&1
+  fi
   exit_code=$?
   set -e
   end_epoch="$(date +%s)"
@@ -133,7 +144,12 @@ for idx in "${!CFGS[@]}"; do
   [[ -z "${first_example}" ]] && first_example="na"
 
   status="fail"
-  if [[ ${exit_code} -eq 0 ]]; then
+  if [[ ${exit_code} -eq 124 ]]; then
+    status="timeout"
+    if [[ "${first_error}" == "na" ]]; then
+      first_error="timed out after ${PER_SPEC_TIMEOUT_SECS}s"
+    fi
+  elif [[ ${exit_code} -eq 0 ]]; then
     if [[ "${action_eval}" == "true" && "${expr_eval}" == "true" ]]; then
       status="full_pass"
     elif [[ "${action_eval}" == "true" ]]; then
