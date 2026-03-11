@@ -17,6 +17,7 @@
 use anyhow::Result;
 use crossbeam_channel::Sender;
 use parking_lot::RwLock;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -162,14 +163,14 @@ fn should_bail_out_try_read(attempts: u32) -> bool {
 
 impl AutoSwitchingFingerprintStore {
     /// Create a new auto-switching fingerprint store
-    pub fn new(config: AutoSwitchConfig, assigned_cpus: &[Option<usize>]) -> Result<Self> {
+    pub fn new(config: AutoSwitchConfig, assigned_cpus: &[Option<usize>], backing_dir: Option<&Path>) -> Result<Self> {
         let pa_config = PageAlignedConfig {
             shard_count: config.shard_count,
             expected_items: config.bloom_expected_items / 10, // Start with 10% capacity
             shard_size_mb: config.shard_size_mb,
         };
 
-        let exact_store = PageAlignedFingerprintStore::new(pa_config, assigned_cpus)?;
+        let exact_store = PageAlignedFingerprintStore::new_with_backing(pa_config, assigned_cpus, backing_dir)?;
 
         eprintln!(
             "Auto-switching fingerprint store initialized (auto-switch: {})",
@@ -636,6 +637,15 @@ impl AutoSwitchingFingerprintStore {
         }
     }
 
+    /// Advise the kernel that fingerprint memory is cold and can be paged out
+    pub fn advise_cold(&self) {
+        let state = self.state.read();
+        match &*state {
+            StoreState::Exact { store } => store.advise_cold(),
+            StoreState::Hybrid { exact, .. } => exact.advise_cold(),
+        }
+    }
+
     /// Flush to disk
     pub fn flush(&self) -> Result<()> {
         let state = self.state.read();
@@ -703,7 +713,7 @@ mod tests {
             ..Default::default()
         };
 
-        let store = AutoSwitchingFingerprintStore::new(config, &[]).unwrap();
+        let store = AutoSwitchingFingerprintStore::new(config, &[], None).unwrap();
 
         // Insert new fingerprints
         assert!(!store.contains_or_insert(100));
@@ -732,7 +742,7 @@ mod tests {
             ..Default::default()
         };
 
-        let store = AutoSwitchingFingerprintStore::new(config, &[]).unwrap();
+        let store = AutoSwitchingFingerprintStore::new(config, &[], None).unwrap();
 
         let fps = vec![1, 2, 3, 4, 5];
         let mut seen = Vec::new();
@@ -761,7 +771,7 @@ mod tests {
             ..Default::default()
         };
 
-        let store = AutoSwitchingFingerprintStore::new(config, &[]).unwrap();
+        let store = AutoSwitchingFingerprintStore::new(config, &[], None).unwrap();
 
         // Insert some fingerprints in exact mode
         for i in 0..100 {
@@ -814,7 +824,7 @@ mod tests {
             ..Default::default()
         };
 
-        let store = AutoSwitchingFingerprintStore::new(config, &[]).unwrap();
+        let store = AutoSwitchingFingerprintStore::new(config, &[], None).unwrap();
 
         // Insert initial batch in exact mode
         let initial_fps: Vec<u64> = (0..50).collect();

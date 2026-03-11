@@ -29,10 +29,20 @@ const MAP_HUGETLB: libc::c_int = 0;
 #[cfg(not(target_os = "linux"))]
 const MAP_POPULATE: libc::c_int = 0;
 use serde::{Deserialize, Serialize};
+use std::os::unix::io::RawFd;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024; // 2MB
 const MADV_HUGEPAGE: i32 = 14; // From linux/mman.h
+const MADV_RANDOM: i32 = 1; // From linux/mman.h
+const MADV_DONTNEED: i32 = 4; // From linux/mman.h
+
+/// MADV_PAGEOUT - Linux 5.4+, asks kernel to page out (swap/writeback) the pages
+#[cfg(target_os = "linux")]
+const MADV_PAGEOUT: i32 = 21;
+#[cfg(not(target_os = "linux"))]
+const MADV_PAGEOUT: i32 = -1; // Not available
 
 /// Load factor threshold for triggering resize (75% - earlier to reduce contention)
 const RESIZE_LOAD_THRESHOLD: f64 = 0.75;
@@ -141,14 +151,24 @@ struct FingerprintShard {
     /// Old memory regions waiting to be freed (after readers drain)
     #[allow(clippy::type_complexity)]
     old_memory: Mutex<Vec<(*mut u8, usize)>>,
+    /// Backing file path for file-backed mmap (None = anonymous mmap)
+    backing_file: Option<PathBuf>,
+    /// File descriptor for backing file (kept open for madvise operations)
+    backing_fd: Mutex<Option<RawFd>>,
+    /// Shard identifier (for file naming during resize)
+    shard_id: usize,
 }
 
 unsafe impl Send for FingerprintShard {}
 unsafe impl Sync for FingerprintShard {}
 
 impl FingerprintShard {
-    /// Create a new shard with huge page allocation
-    fn new(size_mb: usize, numa_node: usize) -> Result<Self> {
+    /// Create a new shard with huge page allocation or file-backed mmap
+    ///
+    /// When `backing_dir` is Some, uses file-backed mmap so the kernel can page
+    /// cold fingerprints to disk under memory pressure. When None, uses anonymous
+    /// mmap with huge pages (original behavior).
+    fn new(size_mb: usize, numa_node: usize, backing_dir: Option<&Path>, shard_id: usize) -> Result<Self> {
         let memory_size = size_mb * 1024 * 1024;
 
         // Set NUMA preference for this allocation
@@ -156,8 +176,24 @@ impl FingerprintShard {
             eprintln!("Warning: Failed to set NUMA node {}: {}", numa_node, e);
         }
 
-        // Try to allocate with explicit huge pages
-        let memory = unsafe { allocate_huge_pages(memory_size) };
+        // Try file-backed mmap if backing_dir is provided
+        let (memory, backing_file, backing_fd) = if let Some(dir) = backing_dir {
+            let file_path = dir.join(format!("shard-{}.fp", shard_id));
+            match unsafe { allocate_file_backed(memory_size, &file_path) } {
+                Ok((ptr, fd)) => (ptr, Some(file_path), Some(fd)),
+                Err(e) => {
+                    eprintln!(
+                        "Warning: File-backed mmap failed for shard {} ({}), falling back to anonymous mmap",
+                        shard_id, e
+                    );
+                    let ptr = unsafe { allocate_huge_pages(memory_size) };
+                    (ptr, None, None)
+                }
+            }
+        } else {
+            let ptr = unsafe { allocate_huge_pages(memory_size) };
+            (ptr, None, None)
+        };
 
         // Calculate capacity (leave 10% headroom for open addressing)
         let entry_size = std::mem::size_of::<HashTableEntry>();
@@ -185,6 +221,9 @@ impl FingerprintShard {
             new_table: AtomicPtr::new(std::ptr::null_mut()),
             new_capacity: AtomicUsize::new(0),
             old_memory: Mutex::new(Vec::new()),
+            backing_file,
+            backing_fd: Mutex::new(backing_fd),
+            shard_id,
         })
     }
 
@@ -242,8 +281,24 @@ impl FingerprintShard {
         // Set NUMA preference for new allocation
         let _ = crate::storage::numa::set_preferred_node(self.numa_node);
 
-        // Allocate new table
-        let new_memory = unsafe { allocate_huge_pages(new_memory_size) };
+        // Allocate new table (file-backed or anonymous)
+        let (new_memory, new_backing_fd) = if let Some(ref dir) = self.backing_file {
+            // File-backed: create new file, then rename after rehash
+            let dir_path = dir.parent().unwrap_or(Path::new("."));
+            let new_file_path = dir_path.join(format!("shard-{}-new.fp", self.shard_id));
+            match unsafe { allocate_file_backed(new_memory_size, &new_file_path) } {
+                Ok((ptr, fd)) => (ptr, Some((fd, new_file_path))),
+                Err(e) => {
+                    eprintln!(
+                        "Warning: File-backed resize failed for shard {} ({}), using anonymous mmap",
+                        self.shard_id, e
+                    );
+                    (unsafe { allocate_huge_pages(new_memory_size) }, None)
+                }
+            }
+        } else {
+            (unsafe { allocate_huge_pages(new_memory_size) }, None)
+        };
         let new_table = new_memory as *mut HashTableEntry;
 
         // Zero-initialize new table
@@ -336,6 +391,26 @@ impl FingerprintShard {
 
         // Queue old memory for later cleanup (can't free immediately - readers may still use it)
         self.old_memory.lock().push((old_memory, old_memory_size));
+
+        // Handle file-backed resize: close old fd, rename new file, update fd
+        if let Some((new_fd, new_file_path)) = new_backing_fd {
+            // Close old backing fd
+            if let Some(old_fd) = self.backing_fd.lock().take() {
+                unsafe { libc::close(old_fd); }
+            }
+            // Rename new file to replace old file
+            if let Some(ref backing) = self.backing_file {
+                if let Err(e) = std::fs::rename(&new_file_path, backing) {
+                    eprintln!(
+                        "Warning: Failed to rename {} -> {}: {}",
+                        new_file_path.display(),
+                        backing.display(),
+                        e
+                    );
+                }
+            }
+            *self.backing_fd.lock() = Some(new_fd);
+        }
 
         eprintln!(
             "Resize complete: rehashed {} entries, new load factor: {:.1}%",
@@ -934,6 +1009,43 @@ impl FingerprintShard {
         self.len() as f64 / self.get_capacity() as f64
     }
 
+    /// Advise the kernel that this shard's memory is cold and can be paged out
+    ///
+    /// For file-backed MAP_SHARED mappings:
+    /// - MADV_PAGEOUT (Linux 5.4+): asks kernel to write dirty pages to file and reclaim
+    /// - MADV_DONTNEED fallback: drops clean pages from RAM (data stays in file)
+    ///
+    /// For anonymous mappings, MADV_DONTNEED discards pages (they'll be zero on next access),
+    /// so we skip it to avoid data loss.
+    fn advise_cold(&self) {
+        let memory = self.memory.load(Ordering::Acquire);
+        let memory_size = self.memory_size.load(Ordering::Acquire);
+
+        if memory.is_null() || memory_size == 0 {
+            return;
+        }
+
+        // Only advise cold for file-backed mappings (safe - data is in the file)
+        if self.backing_file.is_none() {
+            return;
+        }
+
+        unsafe {
+            // Try MADV_PAGEOUT first (Linux 5.4+)
+            #[cfg(target_os = "linux")]
+            {
+                let ret = libc::madvise(memory as *mut libc::c_void, memory_size, MADV_PAGEOUT);
+                if ret == 0 {
+                    return;
+                }
+                // MADV_PAGEOUT not available, fall back to MADV_DONTNEED
+            }
+            // For file-backed MAP_SHARED, MADV_DONTNEED drops the page from RAM
+            // but the data remains in the file and will be faulted back in on access
+            libc::madvise(memory as *mut libc::c_void, memory_size, MADV_DONTNEED);
+        }
+    }
+
     /// Get the memory base address for NUMA diagnostics
     fn memory_base_addr(&self) -> *const u8 {
         self.memory.load(Ordering::Acquire)
@@ -948,6 +1060,14 @@ impl Drop for FingerprintShard {
         if !memory.is_null() {
             unsafe {
                 munmap(memory as *mut libc::c_void, memory_size);
+            }
+        }
+
+        // Close backing file descriptor if file-backed
+        // Note: we do NOT delete the backing file (allows resume)
+        if let Some(fd) = self.backing_fd.lock().take() {
+            unsafe {
+                libc::close(fd);
             }
         }
 
@@ -985,6 +1105,18 @@ impl PageAlignedFingerprintStore {
     /// - Fingerprints are routed to their home NUMA via `home_numa(fp)`
     /// - This ensures fingerprint checks are local when states are routed correctly
     pub fn new(config: FingerprintStoreConfig, _worker_cpus: &[Option<usize>]) -> Result<Self> {
+        Self::new_with_backing(config, _worker_cpus, None)
+    }
+
+    /// Create new fingerprint store with optional file-backed mmap
+    ///
+    /// When `backing_dir` is Some, shards use file-backed mmap so the kernel
+    /// can page cold fingerprints to disk under memory pressure.
+    pub fn new_with_backing(
+        config: FingerprintStoreConfig,
+        _worker_cpus: &[Option<usize>],
+        backing_dir: Option<&Path>,
+    ) -> Result<Self> {
         let shard_count = config.shard_count.max(1).next_power_of_two();
 
         // Detect NUMA topology
@@ -1015,10 +1147,11 @@ impl PageAlignedFingerprintStore {
             let staggered_size_mb =
                 ((config.shard_size_mb as f64 * stagger_factor) as usize).max(64);
 
-            let shard = FingerprintShard::new(staggered_size_mb, numa_node).context(format!(
-                "Failed to create shard {} on NUMA node {}",
-                shard_id, numa_node
-            ))?;
+            let shard = FingerprintShard::new(staggered_size_mb, numa_node, backing_dir, shard_id)
+                .context(format!(
+                    "Failed to create shard {} on NUMA node {}",
+                    shard_id, numa_node
+                ))?;
 
             if std::env::var("TLAPP_VERBOSE").is_ok() {
                 eprintln!(
@@ -1284,6 +1417,15 @@ impl PageAlignedFingerprintStore {
         self.shards.len()
     }
 
+    /// Advise the kernel that all shard memory is cold and can be paged out
+    ///
+    /// Only effective for file-backed mappings. For anonymous mappings, this is a no-op.
+    pub fn advise_cold(&self) {
+        for shard in &self.shards {
+            shard.advise_cold();
+        }
+    }
+
     /// Flush (no-op for in-memory store)
     pub fn flush(&self) -> Result<usize> {
         Ok(0)
@@ -1296,6 +1438,93 @@ impl PageAlignedFingerprintStore {
             .map(|shard| shard.memory_base_addr())
             .collect()
     }
+}
+
+/// Allocate file-backed mmap memory
+///
+/// Creates/truncates a file at `path`, extends it to `size` bytes (rounded up to
+/// HUGE_PAGE_SIZE), and maps it with MAP_SHARED. The kernel can page cold data
+/// to the file under memory pressure, making memory limits enforceable.
+///
+/// Returns (pointer, file_descriptor) on success.
+unsafe fn allocate_file_backed(size: usize, path: &Path) -> Result<(*mut u8, RawFd)> {
+    use std::ffi::CString;
+
+    let aligned_size = (size + HUGE_PAGE_SIZE - 1) & !(HUGE_PAGE_SIZE - 1);
+
+    // Create/truncate the backing file
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Invalid path: {:?}", path))?;
+    let c_path = CString::new(path_str)
+        .map_err(|e| anyhow::anyhow!("Invalid path string: {}", e))?;
+
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC,
+            0o644,
+        )
+    };
+    if fd < 0 {
+        return Err(anyhow::anyhow!(
+            "Failed to open backing file {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    // Extend file to the required size
+    if unsafe { libc::ftruncate(fd, aligned_size as libc::off_t) } != 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(anyhow::anyhow!(
+            "Failed to ftruncate {} to {} bytes: {}",
+            path.display(),
+            aligned_size,
+            err
+        ));
+    }
+
+    // mmap with MAP_SHARED (NOT MAP_ANONYMOUS, NOT MAP_POPULATE)
+    // MAP_SHARED allows the kernel to write dirty pages back to the file
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            aligned_size,
+            PROT_READ | PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
+    };
+
+    if ptr == MAP_FAILED {
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(anyhow::anyhow!(
+            "Failed to mmap {} ({} bytes): {}",
+            path.display(),
+            aligned_size,
+            err
+        ));
+    }
+
+    // Advise random access pattern (hash table lookups are random)
+    unsafe { libc::madvise(ptr, aligned_size, MADV_RANDOM) };
+
+    // Request transparent huge pages for TLB efficiency
+    unsafe { libc::madvise(ptr, aligned_size, MADV_HUGEPAGE) };
+
+    if std::env::var("TLAPP_VERBOSE").is_ok() {
+        eprintln!(
+            "  Allocated {} MB file-backed mmap at {}",
+            aligned_size / (1024 * 1024),
+            path.display()
+        );
+    }
+
+    Ok((ptr as *mut u8, fd))
 }
 
 /// Allocate memory with huge page support
@@ -1366,7 +1595,7 @@ mod tests {
 
     #[test]
     fn test_shard_basic_operations() {
-        let shard = FingerprintShard::new(64, 0).unwrap();
+        let shard = FingerprintShard::new(64, 0, None, 0).unwrap();
         let stats = FingerprintStatsAtomic::default();
 
         // Insert new fingerprint
@@ -1536,7 +1765,7 @@ mod tests {
         // Create small shard (2MB = ~118K capacity with 90% headroom)
         // With 16-byte entries: 2MB / 16 bytes = 131072 entries
         // 90% of that = 117964 capacity
-        let shard = FingerprintShard::new(2, 0).unwrap();
+        let shard = FingerprintShard::new(2, 0, None, 0).unwrap();
         let stats = FingerprintStatsAtomic::default();
 
         let initial_capacity = shard.get_capacity();
@@ -1601,7 +1830,7 @@ mod tests {
         use std::thread;
 
         // Create small shard to trigger resize quickly
-        let shard = Arc::new(FingerprintShard::new(2, 0).unwrap());
+        let shard = Arc::new(FingerprintShard::new(2, 0, None, 0).unwrap());
         let initial_capacity = shard.get_capacity();
 
         // Target 150% of initial capacity to ensure resize
@@ -1671,7 +1900,7 @@ mod tests {
             /// Insert then contains always returns true (no false negatives)
             #[test]
             fn insert_then_contains(fps in prop::collection::vec(1u64..1_000_000, 1..100)) {
-                let shard = FingerprintShard::new(64, 0).unwrap();
+                let shard = FingerprintShard::new(64, 0, None, 0).unwrap();
                 let stats = FingerprintStatsAtomic::default();
 
                 // Insert all
@@ -1692,7 +1921,7 @@ mod tests {
             /// Duplicate inserts return true (second insert sees it exists)
             #[test]
             fn duplicate_insert_returns_true(fp: u64) {
-                let shard = FingerprintShard::new(16, 0).unwrap();
+                let shard = FingerprintShard::new(16, 0, None, 0).unwrap();
                 let stats = FingerprintStatsAtomic::default();
 
                 // First insert - should not exist yet
@@ -1707,7 +1936,7 @@ mod tests {
             /// Count matches unique fingerprints inserted
             #[test]
             fn count_matches_unique_inserts(fps in prop::collection::vec(any::<u64>(), 1..200)) {
-                let shard = FingerprintShard::new(64, 0).unwrap();
+                let shard = FingerprintShard::new(64, 0, None, 0).unwrap();
                 let stats = FingerprintStatsAtomic::default();
                 let unique: HashSet<_> = fps.iter().copied().collect();
 
