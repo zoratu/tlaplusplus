@@ -1316,13 +1316,21 @@ where
                 // and exit before checkpoint can drain/reload items.
                 ckpt_queue.set_checkpoint_in_progress(true);
 
-                // Also set pause_requested so workers exit pop_slow_path
-                // even though checkpoint_in_progress prevents termination.
-                // Without this, workers spin forever in pop_slow_path.
-                ckpt_queue.set_pause_requested(true);
-
-                // Request pause and wait for workers to quiesce
+                // CRITICAL ORDERING: Set PauseController::requested FIRST,
+                // then queue pause_requested. This ensures that when a worker
+                // exits pop_for_worker (due to queue pause_requested being set),
+                // PauseController::requested is already visible, so the worker
+                // enters the pause point immediately without a race window.
                 ckpt_pause.request_pause();
+
+                // Memory fence: ensure request_pause is globally visible
+                // before we set queue pause_requested. Workers that see
+                // pause_requested=true on the queue will then also see
+                // PauseController::requested=true.
+                std::sync::atomic::fence(Ordering::SeqCst);
+
+                // Now set queue pause_requested to make workers exit pop_slow_path
+                ckpt_queue.set_pause_requested(true);
                 let quiescence_achieved = ckpt_pause.wait_for_quiescence(
                     &ckpt_exploration_stop,
                     &ckpt_active_workers,
@@ -1849,9 +1857,23 @@ where
                     Some(state) => state,
                     None => {
                         // During checkpoint, pop_for_worker returns None because pause_requested
-                        // is set. Workers should NOT terminate - they need to continue the loop
-                        // to hit the pause_point, wait for resume, and then re-enter pop_for_worker.
+                        // is set. Workers MUST pause for quiescence. We call worker_pause_point
+                        // directly here instead of relying on  to reach the one at
+                        // the top of the loop. This eliminates a race window where workers
+                        // could spin in a tight continue-loop without ever pausing:
+                        //   continue -> pause_point(requested=false yet) -> pop(None) -> continue ...
+                        // By pausing directly, workers enter quiescence immediately.
                         if worker_queue.is_checkpoint_in_progress() {
+                            // Brief sleep to avoid starving the checkpoint thread
+                            // (which may still be setting PauseController::requested).
+                            // This is critical: without this sleep, workers spin in a
+                            // tight loop that can prevent the checkpoint thread from
+                            // getting CPU time to set the pause flag.
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                            worker_pause.worker_pause_point(&worker_stop, worker_id);
+                            if worker_stop.load(Ordering::Acquire) {
+                                break;
+                            }
                             continue;
                         }
                         // After checkpoint, the loader thread may still be loading items from disk.
