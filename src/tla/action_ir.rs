@@ -109,12 +109,13 @@ fn split_indented_action_conjuncts(expr: &str) -> Option<Vec<String>> {
         return None;
     }
 
+    let normalized = normalize_multiline_action_indentation(expr);
     let mut clauses = Vec::new();
     let mut current = String::new();
     let mut base_indent = None;
     let mut saw_top_level = false;
 
-    for raw_line in expr.lines() {
+    for raw_line in normalized.lines() {
         let line = raw_line.trim_end();
         let trimmed = line.trim_start();
         if trimmed.is_empty() {
@@ -161,12 +162,13 @@ fn split_indented_action_disjuncts(expr: &str) -> Option<Vec<String>> {
         return None;
     }
 
+    let normalized = normalize_multiline_action_indentation(expr);
     let mut clauses = Vec::new();
     let mut current = String::new();
     let mut prefix_lines = Vec::new();
     let mut candidate_indents = Vec::new();
 
-    for raw_line in expr.lines() {
+    for raw_line in normalized.lines() {
         let line = raw_line.trim_end();
         let trimmed = line.trim_start();
         if trimmed.is_empty() {
@@ -184,7 +186,7 @@ fn split_indented_action_disjuncts(expr: &str) -> Option<Vec<String>> {
     let mut saw_top_level = false;
     let mut shared_prefix: Option<String> = None;
 
-    for raw_line in expr.lines() {
+    for raw_line in normalized.lines() {
         let line = raw_line.trim_end();
         let trimmed = line.trim_start();
         if trimmed.is_empty() {
