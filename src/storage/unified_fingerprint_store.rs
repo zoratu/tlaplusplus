@@ -76,7 +76,11 @@ impl UnifiedFingerprintStore {
                 num_numa_nodes: config.num_numa_nodes,
                 check_interval: 10_000,
             };
-            let store = AutoSwitchingFingerprintStore::new(switch_config, assigned_cpus, config.backing_dir.as_deref())?;
+            let store = AutoSwitchingFingerprintStore::new(
+                switch_config,
+                assigned_cpus,
+                config.backing_dir.as_deref(),
+            )?;
             Ok(Self::AutoSwitch(store))
         } else if config.use_bloom {
             // Bloom filter mode - fixed memory

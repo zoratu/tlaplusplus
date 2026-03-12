@@ -540,6 +540,21 @@ fn compute_effective_memory_max(config: &EngineConfig) -> Option<u64> {
     }
 }
 
+fn should_enable_file_backed_fingerprint_store(
+    config: &EngineConfig,
+    effective_memory_max: Option<u64>,
+) -> bool {
+    !config.use_bloom_fingerprints && effective_memory_max.is_some()
+}
+
+fn should_start_fingerprint_memory_monitor(
+    config: &EngineConfig,
+    effective_memory_max: Option<u64>,
+    backing_dir_enabled: bool,
+) -> bool {
+    should_enable_file_backed_fingerprint_store(config, effective_memory_max) && backing_dir_enabled
+}
+
 fn apply_memory_budget(config: &EngineConfig, effective_memory_max: Option<u64>) -> (u64, usize) {
     let mut fp_cache = config.fp_cache_capacity_bytes;
     let mut queue_limit = config.queue_inmem_limit;
@@ -1002,7 +1017,10 @@ where
     };
 
     // Create directory for file-backed mmap fingerprint store
-    let fp_backing_dir = if !config.use_bloom_fingerprints && config.memory_max_bytes.is_some() {
+    let fp_backing_dir = if should_enable_file_backed_fingerprint_store(
+        &config,
+        effective_memory_max,
+    ) {
         let dir = config.work_dir.join("fingerprints-mmap");
         if let Err(e) = std::fs::create_dir_all(&dir) {
             eprintln!(
@@ -1017,6 +1035,8 @@ where
     } else {
         None
     };
+
+    let fp_backing_dir_enabled = fp_backing_dir.is_some();
 
     let fp_config = UnifiedFingerprintConfig {
         use_bloom: config.use_bloom_fingerprints,
@@ -1122,15 +1142,19 @@ where
     let fp_store = Arc::new(fp_store);
 
     // Memory pressure monitor thread - advises kernel to page out cold fingerprints
-    // when RSS approaches memory_max_bytes. Only active for file-backed mmap.
+    // when RSS approaches the effective memory cap. Only active when file-backed
+    // fingerprints were successfully configured.
     let mem_monitor_stop = Arc::new(AtomicBool::new(false));
-    let mem_monitor_thread: Option<std::thread::JoinHandle<()>> = if effective_memory_max.is_some()
-        && !config.use_bloom_fingerprints
-    {
-        let monitor_fp_store = Arc::clone(&fp_store);
-        let monitor_stop = Arc::clone(&mem_monitor_stop);
-        let memory_max = effective_memory_max.unwrap();
-        Some(
+    let mem_monitor_thread: Option<std::thread::JoinHandle<()>> =
+        if should_start_fingerprint_memory_monitor(
+            &config,
+            effective_memory_max,
+            fp_backing_dir_enabled,
+        ) {
+            let monitor_fp_store = Arc::clone(&fp_store);
+            let monitor_stop = Arc::clone(&mem_monitor_stop);
+            let memory_max = effective_memory_max.unwrap();
+            Some(
             std::thread::Builder::new()
                 .name("tlapp-mem-monitor".into())
                 .spawn(move || {
@@ -1179,9 +1203,9 @@ where
                 })
                 .expect("Failed to spawn memory monitor thread"),
         )
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
     // Use NUMA-aware work-stealing queues with optional disk spilling
     // Each worker has its own queue, steals from others when idle
@@ -2594,7 +2618,10 @@ pub fn reconstruct_trace_limited<M: Model>(
 
 #[cfg(test)]
 mod tests {
-    use super::{EngineConfig, next_quiescence_timeout_secs, run_model};
+    use super::{
+        EngineConfig, next_quiescence_timeout_secs, run_model,
+        should_enable_file_backed_fingerprint_store, should_start_fingerprint_memory_monitor,
+    };
     use crate::models::counter_grid::CounterGridModel;
     use anyhow::Result;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -2665,6 +2692,58 @@ mod tests {
             next_quiescence_timeout_secs(0, Duration::from_secs(300)),
             None
         );
+    }
+
+    #[test]
+    fn file_backed_fingerprint_store_uses_effective_memory_cap() {
+        let config = EngineConfig {
+            use_bloom_fingerprints: false,
+            memory_max_bytes: None,
+            enforce_cgroups: true,
+            ..EngineConfig::default()
+        };
+
+        assert!(should_enable_file_backed_fingerprint_store(
+            &config,
+            Some(8 * 1024 * 1024 * 1024)
+        ));
+        assert!(!should_enable_file_backed_fingerprint_store(&config, None));
+
+        let bloom_config = EngineConfig {
+            use_bloom_fingerprints: true,
+            ..config.clone()
+        };
+        assert!(!should_enable_file_backed_fingerprint_store(
+            &bloom_config,
+            Some(8 * 1024 * 1024 * 1024)
+        ));
+    }
+
+    #[test]
+    fn memory_monitor_requires_file_backed_fingerprint_store() {
+        let config = EngineConfig {
+            use_bloom_fingerprints: false,
+            ..EngineConfig::default()
+        };
+
+        assert!(should_start_fingerprint_memory_monitor(
+            &config,
+            Some(4 * 1024 * 1024 * 1024),
+            true
+        ));
+        assert!(!should_start_fingerprint_memory_monitor(
+            &config,
+            Some(4 * 1024 * 1024 * 1024),
+            false
+        ));
+        assert!(!should_start_fingerprint_memory_monitor(
+            &EngineConfig {
+                use_bloom_fingerprints: true,
+                ..config.clone()
+            },
+            Some(4 * 1024 * 1024 * 1024),
+            true
+        ));
     }
 
     #[test]

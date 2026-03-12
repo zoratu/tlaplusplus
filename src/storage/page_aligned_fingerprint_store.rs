@@ -31,7 +31,7 @@ const MAP_POPULATE: libc::c_int = 0;
 use serde::{Deserialize, Serialize};
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024; // 2MB
 const MADV_HUGEPAGE: i32 = 14; // From linux/mman.h
@@ -151,8 +151,11 @@ struct FingerprintShard {
     /// Old memory regions waiting to be freed (after readers drain)
     #[allow(clippy::type_complexity)]
     old_memory: Mutex<Vec<(*mut u8, usize)>>,
-    /// Backing file path for file-backed mmap (None = anonymous mmap)
-    backing_file: Option<PathBuf>,
+    /// Configured backing file path for file-backed mmap attempts
+    /// (None = always anonymous mmap).
+    backing_path: Option<PathBuf>,
+    /// Whether the current mapping in `memory` is file-backed.
+    mapping_is_file_backed: AtomicBool,
     /// File descriptor for backing file (kept open for madvise operations)
     backing_fd: Mutex<Option<RawFd>>,
     /// Shard identifier (for file naming during resize)
@@ -168,7 +171,12 @@ impl FingerprintShard {
     /// When `backing_dir` is Some, uses file-backed mmap so the kernel can page
     /// cold fingerprints to disk under memory pressure. When None, uses anonymous
     /// mmap with huge pages (original behavior).
-    fn new(size_mb: usize, numa_node: usize, backing_dir: Option<&Path>, shard_id: usize) -> Result<Self> {
+    fn new(
+        size_mb: usize,
+        numa_node: usize,
+        backing_dir: Option<&Path>,
+        shard_id: usize,
+    ) -> Result<Self> {
         let memory_size = size_mb * 1024 * 1024;
 
         // Set NUMA preference for this allocation
@@ -177,22 +185,24 @@ impl FingerprintShard {
         }
 
         // Try file-backed mmap if backing_dir is provided
-        let (memory, backing_file, backing_fd) = if let Some(dir) = backing_dir {
+        let (memory, backing_path, mapping_is_file_backed, backing_fd) = if let Some(dir) =
+            backing_dir
+        {
             let file_path = dir.join(format!("shard-{}.fp", shard_id));
             match unsafe { allocate_file_backed(memory_size, &file_path) } {
-                Ok((ptr, fd)) => (ptr, Some(file_path), Some(fd)),
+                Ok((ptr, fd)) => (ptr, Some(file_path), true, Some(fd)),
                 Err(e) => {
                     eprintln!(
                         "Warning: File-backed mmap failed for shard {} ({}), falling back to anonymous mmap",
                         shard_id, e
                     );
                     let ptr = unsafe { allocate_huge_pages(memory_size) };
-                    (ptr, None, None)
+                    (ptr, Some(file_path), false, None)
                 }
             }
         } else {
             let ptr = unsafe { allocate_huge_pages(memory_size) };
-            (ptr, None, None)
+            (ptr, None, false, None)
         };
 
         // Calculate capacity (leave 10% headroom for open addressing)
@@ -221,7 +231,8 @@ impl FingerprintShard {
             new_table: AtomicPtr::new(std::ptr::null_mut()),
             new_capacity: AtomicUsize::new(0),
             old_memory: Mutex::new(Vec::new()),
-            backing_file,
+            backing_path,
+            mapping_is_file_backed: AtomicBool::new(mapping_is_file_backed),
             backing_fd: Mutex::new(backing_fd),
             shard_id,
         })
@@ -282,9 +293,9 @@ impl FingerprintShard {
         let _ = crate::storage::numa::set_preferred_node(self.numa_node);
 
         // Allocate new table (file-backed or anonymous)
-        let (new_memory, new_backing_fd) = if let Some(ref dir) = self.backing_file {
+        let (new_memory, new_backing_fd) = if let Some(ref backing_path) = self.backing_path {
             // File-backed: create new file, then rename after rehash
-            let dir_path = dir.parent().unwrap_or(Path::new("."));
+            let dir_path = backing_path.parent().unwrap_or(Path::new("."));
             let new_file_path = dir_path.join(format!("shard-{}-new.fp", self.shard_id));
             match unsafe { allocate_file_backed(new_memory_size, &new_file_path) } {
                 Ok((ptr, fd)) => (ptr, Some((fd, new_file_path))),
@@ -392,25 +403,7 @@ impl FingerprintShard {
         // Queue old memory for later cleanup (can't free immediately - readers may still use it)
         self.old_memory.lock().push((old_memory, old_memory_size));
 
-        // Handle file-backed resize: close old fd, rename new file, update fd
-        if let Some((new_fd, new_file_path)) = new_backing_fd {
-            // Close old backing fd
-            if let Some(old_fd) = self.backing_fd.lock().take() {
-                unsafe { libc::close(old_fd); }
-            }
-            // Rename new file to replace old file
-            if let Some(ref backing) = self.backing_file {
-                if let Err(e) = std::fs::rename(&new_file_path, backing) {
-                    eprintln!(
-                        "Warning: Failed to rename {} -> {}: {}",
-                        new_file_path.display(),
-                        backing.display(),
-                        e
-                    );
-                }
-            }
-            *self.backing_fd.lock() = Some(new_fd);
-        }
+        self.finish_resize_backing_transition(new_backing_fd);
 
         eprintln!(
             "Resize complete: rehashed {} entries, new load factor: {:.1}%",
@@ -1009,6 +1002,51 @@ impl FingerprintShard {
         self.len() as f64 / self.get_capacity() as f64
     }
 
+    fn has_file_backed_mapping(&self) -> bool {
+        self.mapping_is_file_backed.load(Ordering::Acquire)
+    }
+
+    fn can_advise_cold(&self) -> bool {
+        self.has_file_backed_mapping()
+    }
+
+    fn finish_resize_backing_transition(&self, new_backing: Option<(RawFd, PathBuf)>) {
+        if let Some((new_fd, new_file_path)) = new_backing {
+            if let Some(ref backing_path) = self.backing_path {
+                if let Err(e) = std::fs::rename(&new_file_path, backing_path) {
+                    eprintln!(
+                        "Warning: Failed to rename {} -> {}: {}",
+                        new_file_path.display(),
+                        backing_path.display(),
+                        e
+                    );
+                }
+            }
+
+            let old_fd = {
+                let mut guard = self.backing_fd.lock();
+                let old_fd = guard.take();
+                *guard = Some(new_fd);
+                old_fd
+            };
+            if let Some(old_fd) = old_fd {
+                unsafe {
+                    libc::close(old_fd);
+                }
+            }
+            self.mapping_is_file_backed.store(true, Ordering::Release);
+            return;
+        }
+
+        let old_fd = self.backing_fd.lock().take();
+        if let Some(old_fd) = old_fd {
+            unsafe {
+                libc::close(old_fd);
+            }
+        }
+        self.mapping_is_file_backed.store(false, Ordering::Release);
+    }
+
     /// Advise the kernel that this shard's memory is cold and can be paged out
     ///
     /// For file-backed MAP_SHARED mappings:
@@ -1026,7 +1064,7 @@ impl FingerprintShard {
         }
 
         // Only advise cold for file-backed mappings (safe - data is in the file)
-        if self.backing_file.is_none() {
+        if !self.can_advise_cold() {
             return;
         }
 
@@ -1456,8 +1494,8 @@ unsafe fn allocate_file_backed(size: usize, path: &Path) -> Result<(*mut u8, Raw
     let path_str = path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid path: {:?}", path))?;
-    let c_path = CString::new(path_str)
-        .map_err(|e| anyhow::anyhow!("Invalid path string: {}", e))?;
+    let c_path =
+        CString::new(path_str).map_err(|e| anyhow::anyhow!("Invalid path string: {}", e))?;
 
     let fd = unsafe {
         libc::open(
@@ -1592,6 +1630,18 @@ unsafe fn allocate_huge_pages(size: usize) -> *mut u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_backing_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "tlapp-page-aligned-{prefix}-{nanos}-{}",
+            std::process::id()
+        ))
+    }
 
     #[test]
     fn test_shard_basic_operations() {
@@ -1609,6 +1659,29 @@ mod tests {
         // Insert another
         assert!(!shard.contains_or_insert(67890, &stats));
         assert_eq!(shard.len(), 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_backed_resize_fallback_disables_cold_advice() {
+        let backing_dir = temp_backing_dir("resize-fallback");
+        std::fs::create_dir_all(&backing_dir).unwrap();
+
+        let shard = FingerprintShard::new(1, 0, Some(&backing_dir), 0).unwrap();
+        assert!(
+            shard.has_file_backed_mapping(),
+            "expected writable file-backed mmap in temp dir"
+        );
+        assert!(shard.can_advise_cold());
+        assert!(shard.backing_fd.lock().is_some());
+
+        shard.finish_resize_backing_transition(None);
+
+        assert!(!shard.has_file_backed_mapping());
+        assert!(!shard.can_advise_cold());
+        assert!(shard.backing_fd.lock().is_none());
+
+        let _ = std::fs::remove_dir_all(backing_dir);
     }
 
     #[test]
