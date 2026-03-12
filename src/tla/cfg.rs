@@ -22,8 +22,10 @@ pub struct TlaConfig {
     pub view: Option<String>,
     pub check_deadlock: Option<bool>,
     pub constants: BTreeMap<String, ConfigValue>,
+    pub aliases: Vec<String>,
     pub invariants: Vec<String>,
     pub properties: Vec<String>,
+    pub postconditions: Vec<String>,
     pub constraints: Vec<String>,
     pub action_constraints: Vec<String>,
 }
@@ -31,8 +33,10 @@ pub struct TlaConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Section {
     Constants,
+    Aliases,
     Invariants,
     Properties,
+    Postconditions,
     Constraints,
     ActionConstraints,
     // Single-value sections (value on next line)
@@ -125,6 +129,10 @@ pub fn parse_tla_config(input: &str) -> Result<TlaConfig> {
             section = Some(Section::Constants);
             continue;
         }
+        if line == "ALIAS" || line == "ALIASES" {
+            section = Some(Section::Aliases);
+            continue;
+        }
         // Handle inline constant assignment: "CONSTANT Name = Value" or "CONSTANT Name <- Op"
         if let Some(rest) = line
             .strip_prefix("CONSTANT ")
@@ -149,6 +157,10 @@ pub fn parse_tla_config(input: &str) -> Result<TlaConfig> {
             section = Some(Section::Properties);
             continue;
         }
+        if line == "POSTCONDITION" || line == "POSTCONDITIONS" {
+            section = Some(Section::Postconditions);
+            continue;
+        }
         if line == "CONSTRAINT" || line == "CONSTRAINTS" {
             section = Some(Section::Constraints);
             continue;
@@ -159,6 +171,16 @@ pub fn parse_tla_config(input: &str) -> Result<TlaConfig> {
         }
 
         // Handle "INVARIANT foo" or "INVARIANTS foo bar baz" (multiple items on same line)
+        if let Some(items) = line
+            .strip_prefix("ALIAS ")
+            .or(line.strip_prefix("ALIASES "))
+        {
+            for item in items.split_whitespace() {
+                cfg.aliases.push(item.to_string());
+            }
+            section = Some(Section::Aliases);
+            continue;
+        }
         if let Some(items) = line
             .strip_prefix("INVARIANT ")
             .or(line.strip_prefix("INVARIANTS "))
@@ -177,6 +199,16 @@ pub fn parse_tla_config(input: &str) -> Result<TlaConfig> {
                 cfg.properties.push(item.to_string());
             }
             section = Some(Section::Properties);
+            continue;
+        }
+        if let Some(items) = line
+            .strip_prefix("POSTCONDITION ")
+            .or(line.strip_prefix("POSTCONDITIONS "))
+        {
+            for item in items.split_whitespace() {
+                cfg.postconditions.push(item.to_string());
+            }
+            section = Some(Section::Postconditions);
             continue;
         }
         if let Some(items) = line
@@ -202,8 +234,10 @@ pub fn parse_tla_config(input: &str) -> Result<TlaConfig> {
 
         match section {
             Some(Section::Constants) => parse_constant_line(line, &mut cfg)?,
+            Some(Section::Aliases) => cfg.aliases.push(line.to_string()),
             Some(Section::Invariants) => cfg.invariants.push(line.to_string()),
             Some(Section::Properties) => cfg.properties.push(line.to_string()),
+            Some(Section::Postconditions) => cfg.postconditions.push(line.to_string()),
             Some(Section::Constraints) => cfg.constraints.push(line.to_string()),
             Some(Section::ActionConstraints) => cfg.action_constraints.push(line.to_string()),
             Some(Section::Specification) => {
@@ -244,6 +278,18 @@ pub fn parse_tla_config(input: &str) -> Result<TlaConfig> {
     }
 
     Ok(cfg)
+}
+
+pub fn normalize_operator_ref_name(name: &str) -> &str {
+    let trimmed = name.trim();
+    if !trimmed.starts_with('[') {
+        return trimmed;
+    }
+    let Some(close_idx) = trimmed.find(']') else {
+        return trimmed;
+    };
+    let rest = trimmed[close_idx + 1..].trim_start();
+    if rest.is_empty() { trimmed } else { rest }
 }
 
 fn strip_line_comment(line: &str) -> &str {
@@ -327,15 +373,14 @@ fn parse_constant_line(line: &str, cfg: &mut TlaConfig) -> Result<()> {
                 let after_arrow = &remaining[arrow_pos + 2..];
                 let after_arrow_trimmed = after_arrow.trim_start();
                 let ws_len = after_arrow.len() - after_arrow_trimmed.len();
-                // Read the operator name (identifier)
-                let op_name = read_identifier(after_arrow_trimmed);
+                let (op_name, consumed) = read_operator_ref(after_arrow_trimmed);
                 if op_name.is_empty() {
                     return Err(anyhow!("expected operator name after '<-' in: {}", line));
                 }
                 cfg.constants
                     .insert(name.to_string(), ConfigValue::OperatorRef(op_name.clone()));
                 // Move offset past: Name <- whitespace OpName
-                offset += arrow_pos + 2 + ws_len + op_name.len();
+                offset += arrow_pos + 2 + ws_len + consumed;
                 continue;
             }
         }
@@ -395,6 +440,29 @@ fn read_identifier(s: &str) -> String {
     }
 
     ident
+}
+
+fn read_operator_ref(s: &str) -> (String, usize) {
+    if let Some(rest) = s.strip_prefix('[')
+        && let Some(close_idx) = rest.find(']')
+    {
+        let module_ref = &s[..close_idx + 2];
+        let after_module = &s[close_idx + 2..];
+        let after_module_trimmed = after_module.trim_start();
+        let ws_len = after_module.len() - after_module_trimmed.len();
+        let ident = read_identifier(after_module_trimmed);
+        if ident.is_empty() {
+            return (String::new(), 0);
+        }
+        return (
+            format!("{module_ref}{ident}"),
+            module_ref.len() + ws_len + ident.len(),
+        );
+    }
+
+    let ident = read_identifier(s);
+    let len = ident.len();
+    (ident, len)
 }
 
 struct ValueParser<'a> {
@@ -539,6 +607,12 @@ impl<'a> ValueParser<'a> {
         }
         if let Ok(v) = atom.parse::<i64>() {
             return Ok(ConfigValue::Int(v));
+        }
+        if atom.starts_with('[') {
+            let (op_name, consumed) = read_operator_ref(&atom);
+            if !op_name.is_empty() && consumed == atom.len() {
+                return Ok(ConfigValue::OperatorRef(op_name));
+            }
         }
         Ok(ConfigValue::ModelValue(atom))
     }
@@ -988,5 +1062,69 @@ mod tests {
         );
         assert_eq!(cfg.specification.as_deref(), Some("Spec"));
         assert_eq!(cfg.invariants, vec!["TypeOK", "NotSolved"]);
+    }
+
+    #[test]
+    fn parses_alias_and_postcondition_sections() {
+        let cfg = parse_tla_config(
+            r#"
+            ALIAS Alias
+            POSTCONDITION Done
+            SPECIFICATION Spec
+            "#,
+        )
+        .expect("cfg should parse");
+
+        assert_eq!(cfg.aliases, vec!["Alias"]);
+        assert_eq!(cfg.postconditions, vec!["Done"]);
+        assert_eq!(cfg.specification.as_deref(), Some("Spec"));
+    }
+
+    #[test]
+    fn parses_bracket_qualified_operator_refs() {
+        let cfg = parse_tla_config(
+            r#"
+            CONSTANTS
+              Nat <- [ZSequences]ZSeqNat
+              Ballot <-[Voting] MCBallot
+            SPECIFICATION Spec
+            "#,
+        )
+        .expect("cfg should parse");
+
+        assert_eq!(
+            cfg.constants.get("Nat"),
+            Some(&ConfigValue::OperatorRef("[ZSequences]ZSeqNat".to_string()))
+        );
+        assert_eq!(
+            cfg.constants.get("Ballot"),
+            Some(&ConfigValue::OperatorRef("[Voting]MCBallot".to_string()))
+        );
+    }
+
+    #[test]
+    fn parses_bracket_qualified_equals_assignments_as_operator_refs() {
+        let cfg = parse_tla_config(
+            r#"
+            CONSTANTS
+              NoBlock = [Nano]NoBlockVal
+            "#,
+        )
+        .expect("cfg should parse");
+
+        assert_eq!(
+            cfg.constants.get("NoBlock"),
+            Some(&ConfigValue::OperatorRef("[Nano]NoBlockVal".to_string()))
+        );
+    }
+
+    #[test]
+    fn normalizes_bracket_qualified_operator_refs() {
+        assert_eq!(normalize_operator_ref_name("[Voting]MCBallot"), "MCBallot");
+        assert_eq!(
+            normalize_operator_ref_name("[ZSequences] ZSeqNat"),
+            "ZSeqNat"
+        );
+        assert_eq!(normalize_operator_ref_name("BoundedSeq"), "BoundedSeq");
     }
 }

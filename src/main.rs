@@ -1,16 +1,19 @@
 use clap::{Args, Parser, Subcommand};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use tlaplusplus::models::counter_grid::CounterGridModel;
 use tlaplusplus::models::flurm_job_lifecycle::FlurmJobLifecycleModel;
 use tlaplusplus::models::high_branching::HighBranchingModel;
 use tlaplusplus::models::tla_native::TlaModel;
 use tlaplusplus::system::{check_thp_and_warn, parse_cpu_list};
+use tlaplusplus::tla::action_exec::probe_next_disjuncts_with_instances;
+use tlaplusplus::tla::module::TlaModuleInstance;
 use tlaplusplus::tla::{
-    ActionClause, ClauseKind, CompiledExpr, ConfigValue, EvalContext, TlaConfig, TlaDefinition,
-    TlaModule, TlaState, TlaValue, classify_clause, compile_action_ir, compile_expr, eval_compiled,
-    eval_expr, looks_like_action, parse_tla_config, parse_tla_module_file, probe_next_disjuncts,
-    scan_module_closure, split_top_level,
+    ActionClause, ClauseKind, ConfigValue, EvalContext, TlaConfig, TlaDefinition, TlaModule,
+    TlaState, TlaValue, classify_clause, compile_action_ir, compile_action_ir_branches,
+    eval_action_body_multi, eval_expr, eval_let_action_multi, looks_like_action,
+    normalize_operator_ref_name, normalize_param_name, parse_tla_config, parse_tla_module_file,
+    scan_module_closure, split_action_body_disjuncts, split_top_level,
 };
 use tlaplusplus::{EngineConfig, run_model};
 
@@ -882,6 +885,18 @@ fn main() -> anyhow::Result<()> {
             if let Some(cfg) = parsed_cfg.as_ref() {
                 inject_constants_into_definitions(&mut parsed_module, cfg);
             }
+            let analyzed_model = TlaModel::from_files(&module, config.as_deref(), None, None).ok();
+            if let Some(model) = analyzed_model.as_ref() {
+                parsed_module = model.module.clone();
+            }
+            let resolved_init_name = analyzed_model
+                .as_ref()
+                .map(|model| model.init_name.clone())
+                .unwrap_or_else(|| "Init".to_string());
+            let resolved_next_name = analyzed_model
+                .as_ref()
+                .map(|model| model.next_name.clone())
+                .unwrap_or_else(|| "Next".to_string());
             println!("entry_module={}", module.display());
             println!(
                 "parsed_module_name={} parsed_constants={} parsed_variables={} parsed_definitions={}",
@@ -896,7 +911,16 @@ fn main() -> anyhow::Result<()> {
                 parsed_module.definitions.contains_key("Next"),
                 parsed_module.definitions.contains_key("Spec")
             );
-            if let Some(next_def) = parsed_module.definitions.get("Next") {
+            println!("resolved_init={resolved_init_name}");
+            println!("resolved_next={resolved_next_name}");
+            println!(
+                "resolved_initial_states={}",
+                analyzed_model
+                    .as_ref()
+                    .map(|model| model.initial_states_vec.len())
+                    .unwrap_or(0)
+            );
+            if let Some(next_def) = parsed_module.definitions.get(&resolved_next_name) {
                 let disjuncts = split_top_level(&next_def.body, "\\/");
                 println!("next_top_level_disjuncts={}", disjuncts.len());
 
@@ -963,22 +987,67 @@ fn main() -> anyhow::Result<()> {
             );
             println!("action_detected_guard_clauses={}", action_guard_clauses);
 
-            let mut probe_state: TlaState = BTreeMap::new();
+            let mut probe_state: TlaState = analyzed_model
+                .as_ref()
+                .and_then(|model| model.initial_states_vec.first().cloned())
+                .unwrap_or_default();
             if let Some(cfg) = parsed_cfg.as_ref() {
+                let mut deferred_operator_refs = Vec::new();
                 for (k, v) in &cfg.constants {
-                    if let Some(tv) = config_value_to_tla(v) {
-                        probe_state.insert(k.clone(), tv);
+                    match v {
+                        ConfigValue::OperatorRef(name) => {
+                            deferred_operator_refs
+                                .push((k.clone(), normalize_operator_ref_name(name).to_string()));
+                        }
+                        _ => {
+                            if let Some(tv) = config_value_to_tla(v) {
+                                probe_state.insert(k.clone(), tv);
+                            }
+                        }
                     }
+                }
+                for _ in 0..deferred_operator_refs.len().saturating_add(1) {
+                    if deferred_operator_refs.is_empty() {
+                        break;
+                    }
+                    let mut progress = false;
+                    let mut next_deferred = Vec::new();
+                    for (name, ref_name) in deferred_operator_refs {
+                        let ctx = build_probe_eval_context(
+                            &probe_state,
+                            &parsed_module.definitions,
+                            &parsed_module.instances,
+                        );
+                        if let Ok(value) = eval_expr(&ref_name, &ctx) {
+                            probe_state.insert(name, value);
+                            progress = true;
+                        } else if let Some(value) =
+                            representative_value_from_set_expr(&ref_name, &ctx)
+                        {
+                            probe_state.insert(name, value);
+                            progress = true;
+                        } else {
+                            next_deferred.push((name, ref_name));
+                        }
+                    }
+                    if !progress {
+                        break;
+                    }
+                    deferred_operator_refs = next_deferred;
                 }
             }
             let mut probe_init_seeded = 0usize;
             let mut probe_init_unresolved = 0usize;
             let mut probe_init_unresolved_vars: Vec<String> = Vec::new();
-            if let Some(init_def) = parsed_module.definitions.get("Init") {
+            if let Some(init_def) = parsed_module.definitions.get(&resolved_init_name) {
                 // Collect both equality and membership assignments
                 let mut pending_eq: Vec<(String, String)> = Vec::new();
                 let mut pending_mem: Vec<(String, String)> = Vec::new();
-                for clause in split_top_level(&init_def.body, "/\\") {
+                for clause in expand_state_predicate_clauses(
+                    &init_def.body,
+                    &parsed_module.definitions,
+                    &parsed_module.instances,
+                ) {
                     match classify_clause(&clause) {
                         ClauseKind::UnprimedEquality { var, expr } => {
                             pending_eq.push((var, expr));
@@ -1001,8 +1070,11 @@ fn main() -> anyhow::Result<()> {
                     // Process equality assignments
                     let mut next_pending_eq = Vec::new();
                     for (var, expr) in pending_eq {
-                        let ctx =
-                            EvalContext::with_definitions(&probe_state, &parsed_module.definitions);
+                        let ctx = build_probe_eval_context(
+                            &probe_state,
+                            &parsed_module.definitions,
+                            &parsed_module.instances,
+                        );
                         match eval_expr(&expr, &ctx) {
                             Ok(value) => {
                                 probe_state.insert(var, value);
@@ -1016,8 +1088,11 @@ fn main() -> anyhow::Result<()> {
                     // Process membership assignments - pick representative value
                     let mut next_pending_mem = Vec::new();
                     for (var, set_expr) in pending_mem {
-                        let ctx =
-                            EvalContext::with_definitions(&probe_state, &parsed_module.definitions);
+                        let ctx = build_probe_eval_context(
+                            &probe_state,
+                            &parsed_module.definitions,
+                            &parsed_module.instances,
+                        );
                         match eval_expr(&set_expr, &ctx) {
                             Ok(set_val) => {
                                 // Pick a representative from the set
@@ -1031,11 +1106,8 @@ fn main() -> anyhow::Result<()> {
                                 }
                             }
                             Err(_) => {
-                                // Evaluation failed - try to create a representative function
-                                // This handles cases like [Domain -> Range] where the function
-                                // set is too large to enumerate but we can create a representative
                                 if let Some(repr) =
-                                    try_create_representative_function(&set_expr, &ctx)
+                                    try_create_representative_value_from_type_expr(&set_expr, &ctx)
                                 {
                                     probe_state.insert(var, repr);
                                     probe_init_seeded += 1;
@@ -1060,6 +1132,11 @@ fn main() -> anyhow::Result<()> {
                     pending_mem = next_pending_mem;
                 }
             }
+            probe_init_seeded += seed_probe_state_from_type_invariants(
+                &mut probe_state,
+                &parsed_module,
+                parsed_cfg.as_ref(),
+            );
             for var in &parsed_module.variables {
                 probe_state.entry(var.clone()).or_insert(TlaValue::Int(0));
             }
@@ -1078,9 +1155,17 @@ fn main() -> anyhow::Result<()> {
             println!("native_frontend.cfg_parse={}", config.is_some());
             println!("native_frontend.value_domain=true");
             let mut action_eval_ready = false;
-            if let Some(next_def) = parsed_module.definitions.get("Next") {
-                let next_probe =
-                    probe_next_disjuncts(&next_def.body, &parsed_module.definitions, &probe_state);
+            if let Some(next_def) = parsed_module.definitions.get(&resolved_next_name) {
+                let next_probe = probe_next_disjuncts_with_instances(
+                    &next_def.body,
+                    &parsed_module.definitions,
+                    if parsed_module.instances.is_empty() {
+                        None
+                    } else {
+                        Some(&parsed_module.instances)
+                    },
+                    &probe_state,
+                );
                 println!("next_branch_probe_total={}", next_probe.total_disjuncts);
                 println!(
                     "next_branch_probe_supported={}",
@@ -1112,45 +1197,62 @@ fn main() -> anyhow::Result<()> {
             let mut expr_ok = 0usize;
             let mut expr_errors: BTreeMap<String, u64> = BTreeMap::new();
             let mut expr_error_examples: BTreeMap<String, String> = BTreeMap::new();
+            let action_param_samples = parsed_module
+                .definitions
+                .get(&resolved_next_name)
+                .map(|next_def| {
+                    infer_action_param_samples_from_next(
+                        &next_def.body,
+                        &probe_state,
+                        &parsed_module.definitions,
+                        &parsed_module.instances,
+                    )
+                })
+                .unwrap_or_default();
             for def in parsed_module.definitions.values() {
                 if !looks_like_action(def) {
                     continue;
                 }
-                let ir = compile_action_ir(def);
-                let mut ctx =
-                    EvalContext::with_definitions(&probe_state, &parsed_module.definitions);
-                {
-                    let locals_mut = std::rc::Rc::make_mut(&mut ctx.locals);
-                    for param in &ir.params {
-                        let sample = sample_param_value(param, &probe_state);
-                        locals_mut.insert(param.clone(), sample);
-                    }
-                }
-                for clause in ir.clauses {
-                    match clause {
-                        ActionClause::Guard { expr }
-                        | ActionClause::PrimedAssignment { expr, .. }
-                        | ActionClause::LetWithPrimes { expr } => {
-                            expr_total += 1;
-                            match eval_expr(&expr, &ctx) {
-                                Ok(_) => expr_ok += 1,
-                                Err(err) => {
-                                    let key = err.to_string();
-                                    *expr_errors.entry(key).or_insert(0) += 1;
-                                    expr_error_examples.entry(err.to_string()).or_insert_with(
-                                        || {
-                                            format!(
-                                                "def={} expr={}",
-                                                def.name,
-                                                expr.replace('\n', " ")
-                                            )
-                                        },
-                                    );
-                                }
+                for ir in compile_action_ir_branches(def) {
+                    let mut ctx = build_action_expr_probe_context(
+                        &probe_state,
+                        &parsed_module.definitions,
+                        &parsed_module.instances,
+                        &ir.params,
+                        &ir.clauses,
+                        action_param_samples.get(&def.name),
+                    );
+                    for clause in &ir.clauses {
+                        let Some(result) = probe_action_clause_expr(clause, &mut ctx) else {
+                            continue;
+                        };
+                        expr_total += 1;
+                        match result {
+                            Ok(()) => expr_ok += 1,
+                            Err(err) => {
+                                let key = err.to_string();
+                                *expr_errors.entry(key).or_insert(0) += 1;
+                                expr_error_examples
+                                    .entry(err.to_string())
+                                    .or_insert_with(|| {
+                                        let expr = match clause {
+                                            ActionClause::Guard { expr }
+                                            | ActionClause::PrimedAssignment { expr, .. }
+                                            | ActionClause::LetWithPrimes { expr } => expr,
+                                            ActionClause::Exists { binders, body } => {
+                                                return format!(
+                                                    "def={} expr=\\\\E {}: {}",
+                                                    def.name,
+                                                    binders.replace('\n', " "),
+                                                    body.replace('\n', " ")
+                                                );
+                                            }
+                                            ActionClause::Unchanged { .. } => unreachable!(),
+                                        };
+                                        format!("def={} expr={}", def.name, expr.replace('\n', " "))
+                                    });
                             }
                         }
-                        ActionClause::Exists { .. } => {}
-                        ActionClause::Unchanged { .. } => {}
                     }
                 }
             }
@@ -1348,9 +1450,10 @@ fn main() -> anyhow::Result<()> {
                         let trace = vec![first_state.clone()];
 
                         match checker.check_finite_trace(&trace, &|state, pred_expr| {
-                            let ctx = EvalContext::with_definitions(
+                            let ctx = build_probe_eval_context(
                                 state,
                                 &model_for_liveness.module.definitions,
+                                &model_for_liveness.module.instances,
                             );
                             match eval_expr(pred_expr, &ctx) {
                                 Ok(TlaValue::Bool(b)) => Ok(b),
@@ -1768,20 +1871,55 @@ fn format_num(n: u64) -> String {
 /// definitions that reference the operator, allowing the evaluator to
 /// resolve them properly.
 fn inject_constants_into_definitions(module: &mut TlaModule, config: &TlaConfig) {
-    for (name, value) in &config.constants {
-        // Convert ConfigValue to a TLA+ expression string
-        let body = config_value_to_expr(value);
+    inject_constants_into_module_tree(module, config, true);
+}
 
-        // Add as a zero-parameter definition
+fn inject_constants_into_module_tree(
+    module: &mut TlaModule,
+    config: &TlaConfig,
+    include_all_constants: bool,
+) {
+    for (name, value) in &config.constants {
+        if !include_all_constants
+            && !module.constants.iter().any(|constant| constant == name)
+            && !module.definitions.contains_key(name)
+        {
+            continue;
+        }
+
+        let (params, body) = match value {
+            ConfigValue::OperatorRef(target_name) => {
+                let target_name = normalize_operator_ref_name(target_name);
+                if let Some(target_def) = module.definitions.get(target_name) {
+                    let params = target_def.params.clone();
+                    let body = if params.is_empty() {
+                        target_name.to_string()
+                    } else {
+                        format!("{target_name}({})", params.join(", "))
+                    };
+                    (params, body)
+                } else {
+                    (Vec::new(), target_name.to_string())
+                }
+            }
+            _ => (Vec::new(), config_value_to_expr(value)),
+        };
+
         module.definitions.insert(
             name.clone(),
             TlaDefinition {
                 name: name.clone(),
-                params: vec![],
+                params,
                 body,
                 is_recursive: false,
             },
         );
+    }
+
+    for instance in module.instances.values_mut() {
+        if let Some(instance_module) = instance.module.as_mut() {
+            inject_constants_into_module_tree(instance_module, config, false);
+        }
     }
 }
 
@@ -1806,7 +1944,7 @@ fn config_value_to_expr(value: &ConfigValue) -> String {
             let items: Vec<String> = values.iter().map(config_value_to_expr).collect();
             format!("<<{}>>", items.join(", "))
         }
-        ConfigValue::OperatorRef(name) => name.clone(),
+        ConfigValue::OperatorRef(name) => normalize_operator_ref_name(name).to_string(),
     }
 }
 
@@ -1826,46 +1964,615 @@ fn config_value_to_tla(value: &ConfigValue) -> Option<TlaValue> {
     }
 }
 
+fn build_probe_eval_context<'a>(
+    state: &'a TlaState,
+    definitions: &'a BTreeMap<String, TlaDefinition>,
+    instances: &'a BTreeMap<String, TlaModuleInstance>,
+) -> EvalContext<'a> {
+    if instances.is_empty() {
+        EvalContext::with_definitions(state, definitions)
+    } else {
+        EvalContext::with_definitions_and_instances(state, definitions, instances)
+    }
+}
+
+fn parse_zero_arg_state_operator_ref(text: &str) -> Option<(Option<String>, String)> {
+    let trimmed = text.trim();
+    if is_probe_simple_identifier(trimmed) {
+        return Some((None, trimmed.to_string()));
+    }
+
+    let (alias, operator) = trimmed.split_once('!')?;
+    let alias = alias.trim();
+    let operator = operator.trim();
+    if is_probe_simple_identifier(alias) && is_probe_simple_identifier(operator) {
+        Some((Some(alias.to_string()), operator.to_string()))
+    } else {
+        None
+    }
+}
+
+fn resolve_zero_arg_state_definition<'a>(
+    expr: &str,
+    definitions: &'a BTreeMap<String, TlaDefinition>,
+    instances: &'a BTreeMap<String, TlaModuleInstance>,
+) -> Option<(
+    String,
+    &'a TlaDefinition,
+    &'a BTreeMap<String, TlaDefinition>,
+    &'a BTreeMap<String, TlaModuleInstance>,
+)> {
+    let (alias, name) = parse_zero_arg_state_operator_ref(expr)?;
+    match alias {
+        Some(alias) => {
+            let instance = instances.get(alias.as_str())?;
+            let module = instance.module.as_ref()?;
+            let def = module.definitions.get(name.as_str())?;
+            if !def.params.is_empty() || def.body.trim() == expr.trim() {
+                return None;
+            }
+            Some((
+                format!("{alias}!{name}"),
+                def,
+                &module.definitions,
+                &module.instances,
+            ))
+        }
+        None => {
+            let def = definitions.get(name.as_str())?;
+            if !def.params.is_empty() || def.body.trim() == expr.trim() {
+                return None;
+            }
+            Some((name.to_string(), def, definitions, instances))
+        }
+    }
+}
+
+fn expand_state_predicate_clauses(
+    body: &str,
+    definitions: &BTreeMap<String, TlaDefinition>,
+    instances: &BTreeMap<String, TlaModuleInstance>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut visiting = BTreeSet::new();
+    append_expanded_state_predicate_clause(body, definitions, instances, &mut visiting, &mut out);
+    out
+}
+
+fn append_expanded_state_predicate_clause(
+    clause: &str,
+    definitions: &BTreeMap<String, TlaDefinition>,
+    instances: &BTreeMap<String, TlaModuleInstance>,
+    visiting: &mut BTreeSet<String>,
+    out: &mut Vec<String>,
+) {
+    let trimmed = clause.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    let parts = split_top_level(trimmed, "/\\");
+    if parts.len() > 1 || trimmed.starts_with("/\\") {
+        for part in parts {
+            append_expanded_state_predicate_clause(&part, definitions, instances, visiting, out);
+        }
+        return;
+    }
+
+    if let Some((key, def, child_definitions, child_instances)) =
+        resolve_zero_arg_state_definition(trimmed, definitions, instances)
+        && visiting.insert(key.clone())
+    {
+        append_expanded_state_predicate_clause(
+            &def.body,
+            child_definitions,
+            child_instances,
+            visiting,
+            out,
+        );
+        visiting.remove(&key);
+        return;
+    }
+
+    out.push(trimmed.to_string());
+}
+
+fn seed_probe_state_from_type_invariants(
+    probe_state: &mut TlaState,
+    module: &TlaModule,
+    cfg: Option<&TlaConfig>,
+) -> usize {
+    let mut invariant_names = BTreeSet::new();
+    if let Some(cfg) = cfg {
+        invariant_names.extend(cfg.invariants.iter().cloned());
+    }
+    for fallback in ["TypeOK", "TypeOk", "TypeInvariant", "TypeInv"] {
+        if module.definitions.contains_key(fallback) {
+            invariant_names.insert(fallback.to_string());
+        }
+    }
+
+    invariant_names
+        .into_iter()
+        .filter_map(|name| module.definitions.get(&name))
+        .map(|def| seed_probe_state_from_membership_body(probe_state, &def.body, module))
+        .sum()
+}
+
+fn seed_probe_state_from_membership_body(
+    probe_state: &mut TlaState,
+    body: &str,
+    module: &TlaModule,
+) -> usize {
+    let mut pending = Vec::new();
+    for clause in split_top_level(body, "/\\") {
+        pending.extend(collect_type_invariant_constraints(&clause, module));
+    }
+
+    let mut seeded = 0usize;
+    for _ in 0..pending.len().saturating_add(1) {
+        if pending.is_empty() {
+            break;
+        }
+
+        let mut progress = false;
+        let mut next_pending = Vec::new();
+        for (var, constraint) in pending {
+            let ctx = build_probe_eval_context(probe_state, &module.definitions, &module.instances);
+            let current_satisfies = probe_state.contains_key(&var)
+                && current_probe_value_satisfies_type_constraint(&var, &constraint, &ctx)
+                    .unwrap_or(false);
+            if let Some(repr) = representative_value_from_type_constraint(&constraint, &ctx) {
+                let should_update = match probe_state.get(&var) {
+                    None => true,
+                    Some(current) => {
+                        !current_satisfies || should_refine_probe_value(current, &repr)
+                    }
+                };
+                if should_update {
+                    probe_state.insert(var, repr);
+                    seeded += 1;
+                    progress = true;
+                }
+            } else {
+                next_pending.push((var, constraint));
+            }
+        }
+
+        if !progress {
+            break;
+        }
+        pending = next_pending;
+    }
+
+    seeded
+}
+
+fn current_probe_value_satisfies_type_constraint(
+    var: &str,
+    constraint: &(TypeInvariantConstraintKind, String),
+    ctx: &EvalContext<'_>,
+) -> Option<bool> {
+    let expr = match constraint.0 {
+        TypeInvariantConstraintKind::Membership => format!("{var} \\in {}", constraint.1),
+        TypeInvariantConstraintKind::Subset => format!("{var} \\subseteq {}", constraint.1),
+    };
+
+    match eval_expr(&expr, ctx) {
+        Ok(TlaValue::Bool(result)) => Some(result),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TypeInvariantConstraintKind {
+    Membership,
+    Subset,
+}
+
+fn collect_type_invariant_constraints(
+    clause: &str,
+    module: &TlaModule,
+) -> Vec<(String, (TypeInvariantConstraintKind, String))> {
+    let mut out = Vec::new();
+    if let ClauseKind::UnprimedMembership { var, set_expr } = classify_clause(clause)
+        && module.variables.contains(&var)
+    {
+        out.push((var, (TypeInvariantConstraintKind::Membership, set_expr)));
+        return out;
+    }
+
+    let trimmed = clause.trim();
+    if let Some(idx) = find_probe_top_level_keyword(trimmed, "\\subseteq") {
+        let var = trimmed[..idx].trim().to_string();
+        let set_expr = trimmed[idx + "\\subseteq".len()..].trim().to_string();
+        if module.variables.contains(&var) && !set_expr.is_empty() {
+            out.push((var, (TypeInvariantConstraintKind::Subset, set_expr)));
+        }
+    }
+
+    out
+}
+
+fn representative_value_from_type_constraint(
+    constraint: &(TypeInvariantConstraintKind, String),
+    ctx: &EvalContext<'_>,
+) -> Option<TlaValue> {
+    match constraint.0 {
+        TypeInvariantConstraintKind::Membership => {
+            representative_value_from_set_expr(&constraint.1, ctx)
+        }
+        TypeInvariantConstraintKind::Subset => {
+            representative_member_from_domain_expr(constraint.1.as_str(), ctx)
+                .map(|member| TlaValue::Set(Arc::new(BTreeSet::from([member]))))
+        }
+    }
+}
+
+fn should_refine_probe_value(current: &TlaValue, replacement: &TlaValue) -> bool {
+    match (current, replacement) {
+        (TlaValue::Set(values), TlaValue::Set(replacement_values))
+            if !values.is_empty() && replacement_values.len() < values.len() =>
+        {
+            return false;
+        }
+        (TlaValue::Seq(values), TlaValue::Seq(replacement_values))
+            if !values.is_empty() && replacement_values.len() < values.len() =>
+        {
+            return false;
+        }
+        (TlaValue::Record(fields), TlaValue::Record(replacement_fields))
+            if !fields.is_empty() && replacement_fields.len() < fields.len() =>
+        {
+            return false;
+        }
+        (TlaValue::Function(values), TlaValue::Function(replacement_values))
+            if !values.is_empty() && replacement_values.len() < values.len() =>
+        {
+            return false;
+        }
+        _ => {}
+    }
+
+    if probe_value_score(replacement) > probe_value_score(current) {
+        return true;
+    }
+
+    match (current, replacement) {
+        (TlaValue::Set(values), TlaValue::Set(replacement_values)) => {
+            values.is_empty() && !replacement_values.is_empty()
+        }
+        (TlaValue::Function(values), TlaValue::Function(replacement_values)) => {
+            values.is_empty() && !replacement_values.is_empty()
+        }
+        _ => false,
+    }
+}
+
+fn probe_value_score(value: &TlaValue) -> u32 {
+    match value {
+        TlaValue::Record(fields) => {
+            5_000u32.saturating_add(fields.values().map(probe_value_score).max().unwrap_or(0))
+        }
+        TlaValue::Function(map) => {
+            4_000u32.saturating_add(map.values().map(probe_value_score).max().unwrap_or(0))
+        }
+        TlaValue::Seq(items) => {
+            3_000u32.saturating_add(items.iter().map(probe_value_score).max().unwrap_or(0))
+        }
+        TlaValue::Set(values) => {
+            if values.is_empty() {
+                50
+            } else {
+                2_000u32.saturating_add(values.iter().map(probe_value_score).max().unwrap_or(0))
+            }
+        }
+        TlaValue::String(_) | TlaValue::ModelValue(_) => 100,
+        TlaValue::Bool(_) => 90,
+        TlaValue::Int(_) => 80,
+        TlaValue::Lambda { .. } => 150,
+        TlaValue::Undefined => 0,
+    }
+}
+
+fn representative_value_from_set_expr(set_expr: &str, ctx: &EvalContext<'_>) -> Option<TlaValue> {
+    if let Ok(set_val) = eval_expr(set_expr, ctx)
+        && let Some(repr) = pick_representative_from_set(&set_val)
+    {
+        return Some(repr);
+    }
+    let trimmed = strip_probe_outer_parens(set_expr.trim());
+    if is_probe_simple_identifier(trimmed)
+        && let Some(def) = ctx
+            .local_definitions
+            .get(trimmed)
+            .or_else(|| ctx.definitions.and_then(|defs| defs.get(trimmed)))
+        && def.params.is_empty()
+        && def.body.trim() != trimmed
+        && let Some(repr) = representative_value_from_definition_body(&def.body, ctx)
+    {
+        return Some(repr);
+    }
+    try_create_representative_value_from_type_expr(set_expr, ctx)
+}
+
+fn representative_value_from_definition_body(
+    body: &str,
+    ctx: &EvalContext<'_>,
+) -> Option<TlaValue> {
+    if let Ok(set_val) = eval_expr(body, ctx)
+        && let Some(repr) = pick_representative_from_set(&set_val)
+    {
+        return Some(repr);
+    }
+    try_create_representative_value_from_type_expr(body, ctx)
+}
+
+fn is_probe_simple_identifier(expr: &str) -> bool {
+    let mut chars = expr.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
+        _ => return false,
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn representative_member_from_domain_expr(expr: &str, ctx: &EvalContext<'_>) -> Option<TlaValue> {
+    if let Ok(set_val) = eval_expr(expr, ctx)
+        && let Some(repr) = pick_representative_from_set(&set_val)
+    {
+        return Some(repr);
+    }
+
+    let trimmed = strip_probe_outer_parens(expr.trim());
+    if let Some(repr) = representative_value_from_union_parts(trimmed, ctx) {
+        return Some(repr);
+    }
+    if is_probe_simple_identifier(trimmed)
+        && let Some(def) = ctx
+            .local_definitions
+            .get(trimmed)
+            .or_else(|| ctx.definitions.and_then(|defs| defs.get(trimmed)))
+        && def.params.is_empty()
+        && def.body.trim() != trimmed
+        && let Some(repr) = representative_value_from_definition_body(&def.body, ctx)
+    {
+        return Some(repr);
+    }
+
+    match trimmed {
+        "Nat" | "Int" => Some(TlaValue::Int(0)),
+        "BOOLEAN" => Some(TlaValue::Bool(false)),
+        _ => {
+            if let Some(inner) = trimmed
+                .strip_prefix("Seq(")
+                .and_then(|rest| rest.strip_suffix(')'))
+            {
+                let sample =
+                    representative_member_from_domain_expr(inner, ctx).unwrap_or(TlaValue::Int(0));
+                Some(TlaValue::Seq(Arc::new(vec![sample])))
+            } else if trimmed.starts_with("SUBSET ") {
+                Some(TlaValue::Set(Arc::new(BTreeSet::new())))
+            } else if let Some(record) = try_create_representative_record(trimmed, ctx) {
+                Some(record)
+            } else {
+                try_create_representative_function(trimmed, ctx)
+            }
+        }
+    }
+}
+
+fn try_create_representative_value_from_type_expr(
+    set_expr: &str,
+    ctx: &EvalContext<'_>,
+) -> Option<TlaValue> {
+    let trimmed = strip_probe_outer_parens(set_expr.trim());
+    if let Some(repr) = representative_value_from_union_parts(trimmed, ctx) {
+        return Some(repr);
+    }
+    if let Some(repr) = try_create_representative_function(trimmed, ctx) {
+        return Some(repr);
+    }
+    if let Some(repr) = try_create_representative_record(trimmed, ctx) {
+        return Some(repr);
+    }
+    if let Some(inner) = trimmed
+        .strip_prefix("Seq(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        let sample = representative_member_from_domain_expr(inner, ctx).unwrap_or(TlaValue::Int(0));
+        return Some(TlaValue::Seq(Arc::new(vec![sample])));
+    }
+
+    match trimmed {
+        "Nat" | "Int" => Some(TlaValue::Int(0)),
+        "BOOLEAN" => Some(TlaValue::Bool(false)),
+        _ if trimmed.starts_with("SUBSET ") => Some(TlaValue::Set(Arc::new(BTreeSet::new()))),
+        _ => None,
+    }
+}
+
+fn representative_value_from_union_parts(expr: &str, ctx: &EvalContext<'_>) -> Option<TlaValue> {
+    for delim in ["\\cup", "\\union"] {
+        let parts = split_top_level(expr, delim);
+        if parts.len() > 1 {
+            return parts
+                .into_iter()
+                .filter_map(|part| representative_member_from_domain_expr(&part, ctx))
+                .max_by_key(probe_value_score);
+        }
+    }
+    None
+}
+
+fn try_create_representative_record(set_expr: &str, ctx: &EvalContext<'_>) -> Option<TlaValue> {
+    let trimmed = strip_probe_outer_parens(set_expr.trim());
+    let inner = trimmed.strip_prefix('[')?.strip_suffix(']')?;
+    if find_probe_top_level_keyword(inner, "->").is_some() {
+        return None;
+    }
+
+    let mut fields = BTreeMap::new();
+    for field_spec in split_top_level(inner, ",") {
+        let colon_idx = find_probe_top_level_char(&field_spec, ':')?;
+        let field_name = field_spec[..colon_idx].trim();
+        let domain_expr = field_spec[colon_idx + 1..].trim();
+        if field_name.is_empty() || domain_expr.is_empty() {
+            return None;
+        }
+        let value = representative_member_from_domain_expr(domain_expr, ctx)?;
+        fields.insert(field_name.to_string(), value);
+    }
+
+    if fields.is_empty() {
+        None
+    } else {
+        Some(TlaValue::Record(Arc::new(fields)))
+    }
+}
+
+#[cfg(test)]
 fn sample_param_value(param: &str, probe_state: &TlaState) -> TlaValue {
+    sample_param_value_with_context(param, probe_state, &BTreeMap::new(), &BTreeMap::new())
+}
+
+fn sample_param_value_with_context(
+    param: &str,
+    probe_state: &TlaState,
+    definitions: &BTreeMap<String, TlaDefinition>,
+    instances: &BTreeMap<String, TlaModuleInstance>,
+) -> TlaValue {
     let lower = param.to_ascii_lowercase();
+    let def_ctx = build_probe_eval_context(probe_state, definitions, instances);
 
     let from_named_set = |name: &str| -> Option<TlaValue> {
         match probe_state.get(name) {
             Some(TlaValue::Set(values)) => values.iter().next().cloned(),
-            _ => None,
+            _ => definitions
+                .get(name)
+                .filter(|def| def.params.is_empty())
+                .and_then(|def| representative_value_from_set_expr(&def.body, &def_ctx)),
         }
     };
+    let from_named_function_domain = |name: &str| -> Option<TlaValue> {
+        match probe_state.get(name) {
+            Some(TlaValue::Function(values)) => values.keys().next().cloned(),
+            _ => definitions
+                .get(name)
+                .filter(|def| def.params.is_empty())
+                .and_then(|def| eval_expr(&def.body, &def_ctx).ok())
+                .and_then(|value| match value {
+                    TlaValue::Function(values) => values.keys().next().cloned(),
+                    _ => None,
+                }),
+        }
+    };
+    let from_any_function_domain = || -> Option<TlaValue> {
+        probe_state
+            .values()
+            .filter_map(|value| match value {
+                TlaValue::Function(values) if !values.is_empty() => {
+                    Some((values.len(), values.keys().next().cloned()))
+                }
+                _ => None,
+            })
+            .min_by_key(|(len, _)| *len)
+            .and_then(|(_, value)| value)
+    };
 
-    // Common integer index variables (extremely frequent in TLA+ specs)
+    let set_hints: &[&str] = match lower.as_str() {
+        "acceptor" | "a" => &["Acceptor", "Acceptors", "Replicas", "Assets"],
+        "bot" | "buyer" | "holder" => &["Bots"],
+        "ballot" => &["Ballots", "Ballot"],
+        "call" | "c" => &["ActiveElevatorCalls", "ElevatorCall"],
+        "client" => &["Participants", "Person"],
+        "p" | "p1" | "p2" => &["Proc", "ProcSet", "Participants", "Person"],
+        "e" | "e1" | "e2" | "elevator" => &["Elevator"],
+        "f" | "floor" => &["Floor"],
+        "key" | "k" => &["Key"],
+        "mm" => &["MarketMakers"],
+        "node" | "n" | "n1" | "n2" | "other" => &["Node", "Nodes"],
+        "pid" => &["SlushQueryProcess", "SlushLoopProcess", "ProcSet"],
+        "prisoner" => &["Prisoner"],
+        "q" | "quorum" => &["Quorums", "Quorum"],
+        "replica" | "rpl" => &["Replicas"],
+        "reader" | "r" => &["Readers"],
+        "seller" | "s" => &["Sellers"],
+        "t" | "tx" | "transaction" => &["TxId"],
+        "b" => &["Ballots", "Ballot", "Bots"],
+        "val" | "value" | "v" => &["Values", "Value", "Val"],
+        "writer" | "w" => &["Writers"],
+        _ => &[],
+    };
+    for set_name in set_hints {
+        if let Some(v) = from_named_set(set_name) {
+            return v;
+        }
+    }
+
+    let domain_hint = match lower.as_str() {
+        "call" | "c" => Some("ActiveElevatorCalls"),
+        "client" | "p" | "p1" | "p2" | "prisoner" => Some("signalled"),
+        "key" | "k" => Some("store"),
+        "t" | "tx" | "transaction" => Some("snapshotStore"),
+        "writer" | "reader" | "w" | "r" => Some("pc"),
+        "self" | "proc" | "process" => Some("rcvd"),
+        _ => None,
+    };
+    if let Some(domain_name) = domain_hint
+        && let Some(v) = from_named_function_domain(domain_name)
+    {
+        return v;
+    }
+
     if matches!(
         lower.as_str(),
         "i" | "j" | "k" | "m" | "idx" | "index" | "count" | "x" | "y"
     ) {
         return TlaValue::Int(1);
     }
-
-    // PlusCal "self" parameter: try ProcSet first, then fall back to Int(1)
-    if lower == "self" {
-        if let Some(v) = from_named_set("ProcSet") {
-            return v;
-        }
-        // PlusCal typically uses integer process IDs
-        return TlaValue::Int(1);
+    if lower == "sequence"
+        || lower == "seq"
+        || lower.contains("seq")
+        || lower == "round"
+        || lower == "min"
+        || lower == "max"
+    {
+        return TlaValue::Int(0);
     }
 
-    let set_hint = match lower.as_str() {
-        "bot" | "buyer" | "holder" | "b" => Some("Bots"),
-        "seller" | "writer" | "s" => Some("Sellers"),
-        "mm" => Some("MarketMakers"),
-        "asset" | "a" => Some("Assets"),
-        "node" | "n" | "n1" | "n2" | "other" => Some("Nodes"),
-        "client" | "p" | "p1" | "p2" => Some("Participants"),
-        _ => None,
-    };
-    if let Some(set_name) = set_hint
-        && let Some(v) = from_named_set(set_name)
-    {
-        return v;
+    if lower == "self" {
+        for name in [
+            "SlushLoopProcess",
+            "SlushQueryProcess",
+            "ProcSet",
+            "Proc",
+            "Corr",
+            "Readers",
+            "Writers",
+            "Prisoner",
+        ] {
+            if let Some(v) = from_named_set(name) {
+                return v;
+            }
+        }
+        for name in [
+            "loopVariant",
+            "sampleSet",
+            "pc",
+            "rcvd",
+            "read",
+            "claimed_sequence",
+            "consumed",
+        ] {
+            if let Some(v) = from_named_function_domain(name) {
+                return v;
+            }
+        }
+        if let Some(v) = from_any_function_domain() {
+            return v;
+        }
+        return TlaValue::Int(1);
     }
 
     if lower.contains("qty")
@@ -1892,22 +2599,1012 @@ fn sample_param_value(param: &str, probe_state: &TlaState) -> TlaValue {
         return TlaValue::String(format!("{param}_0"));
     }
 
-    // Last resort: try to find a state variable that looks like a set
-    // containing values appropriate for this parameter, then fall back
-    // to Int(0) which is more useful than ModelValue for arithmetic
-    for (_name, val) in probe_state.iter() {
-        if let TlaValue::Set(values) = val {
-            if let Some(first) = values.iter().next() {
-                // If the set contains integers and parameter name is short
-                // (likely an index), use the first element
-                if matches!(first, TlaValue::Int(_)) && param.len() <= 2 {
-                    return first.clone();
+    for val in probe_state.values() {
+        if let TlaValue::Set(values) = val
+            && let Some(first) = values.iter().next()
+            && matches!(first, TlaValue::Int(_))
+            && param.len() <= 2
+        {
+            return first.clone();
+        }
+    }
+    if let Some(v) = from_any_function_domain() {
+        return v;
+    }
+
+    TlaValue::ModelValue(param.to_string())
+}
+
+fn infer_action_param_samples_from_next(
+    next_body: &str,
+    probe_state: &TlaState,
+    definitions: &BTreeMap<String, TlaDefinition>,
+    instances: &BTreeMap<String, TlaModuleInstance>,
+) -> BTreeMap<String, BTreeMap<String, TlaValue>> {
+    let mut samples = BTreeMap::new();
+    let mut active_calls = BTreeSet::new();
+    collect_action_param_samples_from_expr(
+        next_body,
+        &BTreeMap::new(),
+        probe_state,
+        definitions,
+        instances,
+        &mut samples,
+        &mut active_calls,
+    );
+    samples
+}
+
+fn collect_action_param_samples_from_expr(
+    expr: &str,
+    locals: &BTreeMap<String, TlaValue>,
+    probe_state: &TlaState,
+    definitions: &BTreeMap<String, TlaDefinition>,
+    instances: &BTreeMap<String, TlaModuleInstance>,
+    samples: &mut BTreeMap<String, BTreeMap<String, TlaValue>>,
+    active_calls: &mut BTreeSet<String>,
+) {
+    let trimmed = strip_probe_outer_parens(expr.trim());
+    if trimmed.is_empty() {
+        return;
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("\\E")
+        && let Some((binder_text, body)) = split_probe_quantifier(rest)
+        && let Some(bound) = sample_exists_quantifier_binders(
+            binder_text,
+            locals,
+            probe_state,
+            definitions,
+            instances,
+        )
+    {
+        let mut child_locals = locals.clone();
+        for (name, value) in bound {
+            child_locals.insert(name, value);
+        }
+        collect_action_param_samples_from_expr(
+            body,
+            &child_locals,
+            probe_state,
+            definitions,
+            instances,
+            samples,
+            active_calls,
+        );
+        return;
+    }
+
+    let disjuncts = split_action_body_disjuncts(trimmed);
+    if disjuncts.len() > 1 || trimmed.starts_with("\\/") {
+        for disjunct in disjuncts {
+            collect_action_param_samples_from_expr(
+                &disjunct,
+                locals,
+                probe_state,
+                definitions,
+                instances,
+                samples,
+                active_calls,
+            );
+        }
+        return;
+    }
+
+    let conjuncts = split_top_level(trimmed, "/\\");
+    if conjuncts.len() > 1 {
+        for conjunct in conjuncts {
+            collect_action_param_samples_from_expr(
+                &conjunct,
+                locals,
+                probe_state,
+                definitions,
+                instances,
+                samples,
+                active_calls,
+            );
+        }
+        return;
+    }
+
+    let Some((name, arg_exprs)) = parse_probe_action_call(trimmed) else {
+        return;
+    };
+    let Some(def) = definitions.get(&name) else {
+        return;
+    };
+    if def.params.len() != arg_exprs.len() {
+        return;
+    }
+
+    let mut ctx = build_probe_eval_context(probe_state, definitions, instances);
+    {
+        let locals_mut = std::rc::Rc::make_mut(&mut ctx.locals);
+        for (local_name, value) in locals {
+            locals_mut.insert(local_name.clone(), value.clone());
+        }
+    }
+
+    let entry = samples.entry(name.clone()).or_default();
+    let mut child_locals = locals.clone();
+    for (param, arg_expr) in def.params.iter().zip(arg_exprs) {
+        let param_name = normalize_param_name(param).to_string();
+        if let Ok(value) = eval_expr(&arg_expr, &ctx) {
+            child_locals.insert(param_name.clone(), value.clone());
+            entry.entry(param_name).or_insert(value);
+        }
+    }
+
+    if active_calls.insert(name.clone()) {
+        collect_action_param_samples_from_expr(
+            &def.body,
+            &child_locals,
+            probe_state,
+            definitions,
+            instances,
+            samples,
+            active_calls,
+        );
+        active_calls.remove(&name);
+    }
+}
+
+fn split_probe_quantifier(expr: &str) -> Option<(&str, &str)> {
+    let colon_idx = find_probe_top_level_char(expr, ':')?;
+    Some((expr[..colon_idx].trim(), expr[colon_idx + 1..].trim()))
+}
+
+fn sample_exists_quantifier_binders(
+    binder_text: &str,
+    locals: &BTreeMap<String, TlaValue>,
+    probe_state: &TlaState,
+    definitions: &BTreeMap<String, TlaDefinition>,
+    instances: &BTreeMap<String, TlaModuleInstance>,
+) -> Option<Vec<(String, TlaValue)>> {
+    let mut bound = Vec::new();
+    let mut rest = binder_text.trim();
+    let mut ctx = build_probe_eval_context(probe_state, definitions, instances);
+    {
+        let locals_mut = std::rc::Rc::make_mut(&mut ctx.locals);
+        for (name, value) in locals {
+            locals_mut.insert(name.clone(), value.clone());
+        }
+    }
+
+    while !rest.is_empty() {
+        let in_idx = find_probe_top_level_keyword(rest, "\\in")?;
+        let vars_text = rest[..in_idx].trim();
+        let after_in = rest[in_idx + "\\in".len()..].trim_start();
+
+        let mut split_idx = None;
+        let mut search_from = 0usize;
+        while let Some(comma_idx) = find_probe_top_level_char_from(after_in, ',', search_from) {
+            let tail = after_in[comma_idx + 1..].trim_start();
+            if find_probe_top_level_keyword(tail, "\\in").is_some() {
+                split_idx = Some(comma_idx);
+                break;
+            }
+            search_from = comma_idx + 1;
+        }
+
+        let (domain_text, next_rest) = match split_idx {
+            Some(idx) => (&after_in[..idx], &after_in[idx + 1..]),
+            None => (after_in, ""),
+        };
+
+        let sample = representative_value_from_set_expr(domain_text.trim(), &ctx)?;
+
+        for var in split_top_level(vars_text, ",") {
+            let name = var.trim();
+            if name.is_empty() {
+                continue;
+            }
+            bound.push((name.to_string(), sample.clone()));
+            std::rc::Rc::make_mut(&mut ctx.locals).insert(name.to_string(), sample.clone());
+        }
+
+        rest = next_rest.trim_start();
+    }
+
+    Some(bound)
+}
+
+fn parse_probe_action_call(expr: &str) -> Option<(String, Vec<String>)> {
+    let (name, rest) = parse_probe_identifier_prefix(expr)?;
+    let rest = rest.trim_start();
+    if rest.is_empty() {
+        return Some((name, Vec::new()));
+    }
+    if !rest.starts_with('(') {
+        return None;
+    }
+
+    let (args_text, tail) = take_probe_group(rest, '(', ')')?;
+    if !tail.trim().is_empty() {
+        return None;
+    }
+
+    let args = if args_text.trim().is_empty() {
+        Vec::new()
+    } else {
+        split_top_level(args_text, ",")
+            .into_iter()
+            .map(|arg| arg.trim().to_string())
+            .filter(|arg| !arg.is_empty())
+            .collect()
+    };
+
+    Some((name, args))
+}
+
+fn parse_probe_action_if(expr: &str) -> Option<(&str, &str, &str)> {
+    let trimmed = expr.trim();
+    let rest = trimmed.strip_prefix("IF")?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let rest = rest.trim_start();
+
+    let then_idx = find_probe_outer_then(rest)?;
+    let condition = rest[..then_idx].trim();
+    let after_then = rest[then_idx + "THEN".len()..].trim();
+
+    let else_idx = find_probe_outer_else(after_then)?;
+    let then_branch = after_then[..else_idx].trim();
+    let else_branch = after_then[else_idx + "ELSE".len()..].trim();
+
+    Some((condition, then_branch, else_branch))
+}
+
+fn next_probe_word(input: &str, from: usize) -> Option<(&str, usize, usize)> {
+    let mut i = from;
+    while i < input.len() {
+        let ch = input[i..].chars().next()?;
+        let len = ch.len_utf8();
+        if ch.is_ascii_alphabetic() || ch == '_' {
+            break;
+        }
+        i += len;
+    }
+
+    if i >= input.len() {
+        return None;
+    }
+
+    let start = i;
+    while i < input.len() {
+        let ch = input[i..].chars().next()?;
+        let len = ch.len_utf8();
+        if !(ch.is_ascii_alphanumeric() || ch == '_') {
+            break;
+        }
+        i += len;
+    }
+
+    Some((&input[start..i], start, i))
+}
+
+fn find_probe_outer_then(input: &str) -> Option<usize> {
+    let mut nested_if = 0usize;
+    let mut i = 0usize;
+    while let Some((word, start, end)) = next_probe_word(input, i) {
+        match word {
+            "IF" => nested_if += 1,
+            "THEN" if nested_if == 0 => return Some(start),
+            "ELSE" if nested_if > 0 => nested_if = nested_if.saturating_sub(1),
+            _ => {}
+        }
+        i = end;
+    }
+    None
+}
+
+fn find_probe_outer_else(input: &str) -> Option<usize> {
+    let mut nested_if = 0usize;
+    let mut i = 0usize;
+    while let Some((word, start, end)) = next_probe_word(input, i) {
+        match word {
+            "IF" => nested_if += 1,
+            "ELSE" if nested_if == 0 => return Some(start),
+            "ELSE" => nested_if = nested_if.saturating_sub(1),
+            _ => {}
+        }
+        i = end;
+    }
+    None
+}
+
+fn parse_probe_identifier_prefix(expr: &str) -> Option<(String, &str)> {
+    let trimmed = expr.trim_start();
+    let mut chars = trimmed.char_indices();
+    let (_, first) = chars.next()?;
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return None;
+    }
+
+    let mut end = first.len_utf8();
+    for (idx, ch) in chars {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '!' {
+            end = idx + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    Some((trimmed[..end].to_string(), &trimmed[end..]))
+}
+
+fn take_probe_group(expr: &str, open: char, close: char) -> Option<(&str, &str)> {
+    let mut chars = expr.char_indices();
+    let (_, first) = chars.next()?;
+    if first != open {
+        return None;
+    }
+
+    let mut depth = 1usize;
+    for (idx, ch) in chars {
+        if ch == open {
+            depth += 1;
+        } else if ch == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some((&expr[1..idx], &expr[idx + ch.len_utf8()..]));
+            }
+        }
+    }
+
+    None
+}
+
+fn strip_probe_outer_parens(expr: &str) -> &str {
+    let mut current = expr.trim();
+    while current.starts_with('(') && current.ends_with(')') {
+        let Some(idx) = find_probe_matching_paren(current) else {
+            break;
+        };
+        if idx != current.len() - 1 {
+            break;
+        }
+        current = current[1..current.len() - 1].trim();
+    }
+    current
+}
+
+fn strip_probe_comments(expr: &str) -> String {
+    expr.lines()
+        .filter(|line| !line.trim_start().starts_with("\\*"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn normalize_probe_clause_expr(expr: &str) -> String {
+    let mut normalized = strip_probe_comments(expr);
+    loop {
+        let trimmed = normalized.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("/\\") {
+            normalized = rest.trim_start().to_string();
+            continue;
+        }
+        return normalized;
+    }
+}
+
+fn find_probe_matching_paren(expr: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    for (idx, ch) in expr.char_indices() {
+        if ch == '(' {
+            depth += 1;
+        } else if ch == ')' {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+fn find_probe_top_level_char(expr: &str, target: char) -> Option<usize> {
+    find_probe_top_level_char_from(expr, target, 0)
+}
+
+fn find_probe_top_level_char_from(expr: &str, target: char, start: usize) -> Option<usize> {
+    let mut paren = 0usize;
+    let mut bracket = 0usize;
+    let mut brace = 0usize;
+    let mut angle = 0usize;
+    let mut i = 0usize;
+
+    while i < expr.len() {
+        let ch = expr[i..].chars().next()?;
+        let len = ch.len_utf8();
+        let next = expr[i + len..].chars().next();
+
+        if i < start {
+            if ch == '<' && next == Some('<') {
+                i += 2;
+            } else if ch == '>' && next == Some('>') {
+                i += 2;
+            } else {
+                i += len;
+            }
+            continue;
+        }
+
+        if ch == '<' && next == Some('<') {
+            angle += 1;
+            i += 2;
+            continue;
+        }
+        if ch == '>' && next == Some('>') {
+            angle = angle.saturating_sub(1);
+            i += 2;
+            continue;
+        }
+
+        match ch {
+            '(' => paren += 1,
+            ')' => paren = paren.saturating_sub(1),
+            '[' => bracket += 1,
+            ']' => bracket = bracket.saturating_sub(1),
+            '{' => brace += 1,
+            '}' => brace = brace.saturating_sub(1),
+            _ => {}
+        }
+
+        if paren == 0 && bracket == 0 && brace == 0 && angle == 0 && ch == target {
+            return Some(i);
+        }
+
+        i += len;
+    }
+
+    None
+}
+
+fn find_probe_top_level_keyword(expr: &str, keyword: &str) -> Option<usize> {
+    let keyword_len = keyword.len();
+    let mut paren = 0usize;
+    let mut bracket = 0usize;
+    let mut brace = 0usize;
+    let mut angle = 0usize;
+    let mut i = 0usize;
+
+    while i < expr.len() {
+        let ch = expr[i..].chars().next()?;
+        let len = ch.len_utf8();
+        let next = expr[i + len..].chars().next();
+
+        if ch == '<' && next == Some('<') {
+            angle += 1;
+            i += 2;
+            continue;
+        }
+        if ch == '>' && next == Some('>') {
+            angle = angle.saturating_sub(1);
+            i += 2;
+            continue;
+        }
+
+        match ch {
+            '(' => paren += 1,
+            ')' => paren = paren.saturating_sub(1),
+            '[' => bracket += 1,
+            ']' => bracket = bracket.saturating_sub(1),
+            '{' => brace += 1,
+            '}' => brace = brace.saturating_sub(1),
+            _ => {}
+        }
+
+        if paren == 0 && bracket == 0 && brace == 0 && angle == 0 && expr[i..].starts_with(keyword)
+        {
+            return Some(i);
+        }
+
+        i += len;
+        if i + keyword_len > expr.len() && i >= expr.len() {
+            break;
+        }
+    }
+
+    None
+}
+
+fn build_action_expr_probe_context<'a>(
+    probe_state: &'a TlaState,
+    definitions: &'a BTreeMap<String, TlaDefinition>,
+    instances: &'a BTreeMap<String, TlaModuleInstance>,
+    params: &[String],
+    clauses: &[ActionClause],
+    inferred_param_samples: Option<&BTreeMap<String, TlaValue>>,
+) -> EvalContext<'a> {
+    let mut ctx = build_probe_eval_context(probe_state, definitions, instances);
+    let guard_samples = infer_action_param_samples_from_guards(
+        params,
+        clauses,
+        probe_state,
+        definitions,
+        instances,
+    );
+    let locals_mut = std::rc::Rc::make_mut(&mut ctx.locals);
+
+    for (var, value) in probe_state {
+        locals_mut.insert(format!("{var}'"), value.clone());
+    }
+
+    for param in params {
+        let normalized = normalize_param_name(param);
+        let sample = guard_samples
+            .get(normalized)
+            .cloned()
+            .or_else(|| {
+                inferred_param_samples
+                    .and_then(|samples| samples.get(normalized))
+                    .cloned()
+            })
+            .or_else(|| {
+                inferred_param_samples
+                    .and_then(|samples| samples.get(param))
+                    .cloned()
+            })
+            .unwrap_or_else(|| {
+                sample_param_value_with_context(param, probe_state, definitions, instances)
+            });
+        locals_mut.insert(normalized.to_string(), sample.clone());
+        locals_mut.insert(param.clone(), sample);
+    }
+
+    // Treat UNCHANGED x as an available x' = x binding during probing.
+    for clause in clauses {
+        if let ActionClause::Unchanged { vars } = clause {
+            for var in vars {
+                if let Some(value) = probe_state.get(var) {
+                    locals_mut.insert(format!("{var}'"), value.clone());
                 }
             }
         }
     }
 
-    TlaValue::ModelValue(param.to_string())
+    ctx
+}
+
+fn infer_action_param_samples_from_guards(
+    params: &[String],
+    clauses: &[ActionClause],
+    probe_state: &TlaState,
+    definitions: &BTreeMap<String, TlaDefinition>,
+    instances: &BTreeMap<String, TlaModuleInstance>,
+) -> BTreeMap<String, TlaValue> {
+    let param_names: BTreeSet<String> = params
+        .iter()
+        .map(|param| normalize_param_name(param).to_string())
+        .collect();
+    if param_names.is_empty() {
+        return BTreeMap::new();
+    }
+
+    let ctx = build_probe_eval_context(probe_state, definitions, instances);
+    let mut samples = BTreeMap::new();
+    for clause in clauses {
+        let ActionClause::Guard { expr } = clause else {
+            continue;
+        };
+        let expr = normalize_probe_clause_expr(expr);
+        for conjunct in split_top_level(&expr, "/\\") {
+            match classify_clause(&conjunct) {
+                ClauseKind::UnprimedMembership { var, set_expr } if param_names.contains(&var) => {
+                    if let Some(value) = representative_value_from_set_expr(&set_expr, &ctx) {
+                        samples.entry(var).or_insert(value);
+                    }
+                }
+                ClauseKind::UnprimedEquality { var, expr } if param_names.contains(&var) => {
+                    if expr.trim() == var {
+                        continue;
+                    }
+                    if let Ok(value) = eval_expr(&expr, &ctx) {
+                        samples.entry(var).or_insert(value);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    samples
+}
+
+fn should_skip_action_expr_probe(expr: &str) -> bool {
+    let trimmed = strip_probe_outer_parens(expr.trim());
+    if trimmed.is_empty() {
+        return true;
+    }
+    if trimmed.starts_with("[]")
+        || trimmed.starts_with("<>")
+        || trimmed.starts_with("WF_")
+        || trimmed.starts_with("SF_")
+        || trimmed.contains("~>")
+    {
+        return true;
+    }
+
+    if trimmed.contains('\'') {
+        let disjuncts = split_action_body_disjuncts(trimmed);
+        if disjuncts.len() > 1 || trimmed.starts_with("\\/") {
+            return true;
+        }
+
+        let conjuncts = split_top_level(trimmed, "/\\");
+        if conjuncts.len() > 1 || trimmed.starts_with("/\\") {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn merge_staged_prime_locals(from: &EvalContext<'_>, into: &mut EvalContext<'_>) {
+    let locals_mut = std::rc::Rc::make_mut(&mut into.locals);
+    for (name, value) in from.locals.iter() {
+        if name.ends_with('\'') {
+            locals_mut.insert(name.clone(), value.clone());
+        }
+    }
+}
+
+fn probe_action_body_into_ctx(body: &str, ctx: &mut EvalContext<'_>) -> anyhow::Result<()> {
+    let normalized = strip_probe_comments(body);
+    let trimmed = normalized.trim();
+    if !trimmed.is_empty() && trimmed.contains('\'') {
+        let mut runtime_ctx = ctx.clone();
+        if let Some(Ok(())) = probe_action_body_via_runtime_eval(trimmed, &mut runtime_ctx) {
+            merge_staged_prime_locals(&runtime_ctx, ctx);
+            return Ok(());
+        }
+    }
+
+    let def = TlaDefinition {
+        name: "__probe_body".to_string(),
+        params: vec![],
+        body: trimmed.to_string(),
+        is_recursive: false,
+    };
+    let ir = compile_action_ir(&def);
+    for clause in &ir.clauses {
+        if let ActionClause::Guard { expr } = clause
+            && let Ok(value) = eval_expr(expr, ctx)
+            && matches!(value.as_bool(), Ok(false))
+        {
+            return Ok(());
+        }
+        if let Some(result) = probe_action_clause_expr(clause, ctx) {
+            result?;
+        }
+    }
+    Ok(())
+}
+
+fn probe_action_body_via_runtime_eval(
+    body: &str,
+    ctx: &mut EvalContext<'_>,
+) -> Option<anyhow::Result<()>> {
+    let normalized = strip_probe_comments(body);
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() || !trimmed.contains('\'') {
+        return None;
+    }
+    if !(trimmed.contains("\\/") || trimmed.starts_with("IF ") || trimmed.starts_with("IF\n")) {
+        return None;
+    }
+
+    let staged = current_probe_staged_primes(ctx);
+    Some(
+        eval_action_body_multi(trimmed, ctx, &staged).map(|branches| {
+            let Some((next_staged, _)) = branches.into_iter().max_by_key(|(candidate, _)| {
+                candidate
+                    .iter()
+                    .filter(|(var, value)| {
+                        staged
+                            .get(*var)
+                            .or_else(|| ctx.state.get(*var))
+                            .is_none_or(|baseline| baseline != *value)
+                    })
+                    .count()
+            }) else {
+                return;
+            };
+            let locals_mut = std::rc::Rc::make_mut(&mut ctx.locals);
+            for (var, value) in next_staged {
+                locals_mut.insert(format!("{var}'"), value);
+            }
+        }),
+    )
+}
+
+fn probe_disjunctive_action_body(
+    expr: &str,
+    ctx: &mut EvalContext<'_>,
+) -> Option<anyhow::Result<()>> {
+    let trimmed = strip_probe_outer_parens(expr.trim());
+    let disjuncts = split_action_body_disjuncts(trimmed);
+    if disjuncts.len() <= 1 && !trimmed.starts_with("\\/") {
+        return None;
+    }
+
+    let mut first_err = None;
+    for disjunct in disjuncts {
+        let mut branch_ctx = ctx.clone();
+        let attempt = match probe_action_body_via_runtime_eval(&disjunct, &mut branch_ctx) {
+            Some(Ok(())) => Ok(()),
+            Some(Err(_)) | None => probe_action_body_into_ctx(&disjunct, &mut branch_ctx),
+        };
+        match attempt {
+            Ok(()) => {
+                merge_staged_prime_locals(&branch_ctx, ctx);
+                return Some(Ok(()));
+            }
+            Err(err) => {
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+            }
+        }
+    }
+
+    Some(Err(first_err.unwrap_or_else(|| {
+        anyhow::anyhow!("no disjunctive action branch was probeable")
+    })))
+}
+
+fn seed_probe_instance_constant_bindings(
+    instance: &TlaModuleInstance,
+    module: &TlaModule,
+    parent_ctx: &EvalContext<'_>,
+    child_ctx: &mut EvalContext<'_>,
+) {
+    let locals_mut = std::rc::Rc::make_mut(&mut child_ctx.locals);
+    let defs_mut = std::rc::Rc::make_mut(&mut child_ctx.local_definitions);
+
+    for constant in &module.constants {
+        if instance.substitutions.contains_key(constant) {
+            continue;
+        }
+        if let Some(def) = parent_ctx
+            .local_definitions
+            .get(constant)
+            .cloned()
+            .or_else(|| {
+                parent_ctx
+                    .definitions
+                    .and_then(|defs| defs.get(constant).cloned())
+            })
+        {
+            defs_mut.insert(constant.clone(), def);
+            continue;
+        }
+        if let Ok(value) = eval_expr(constant, parent_ctx) {
+            locals_mut.insert(constant.clone(), value);
+        }
+    }
+}
+
+fn expand_probe_action_call(expr: &str, ctx: &mut EvalContext<'_>) -> Option<anyhow::Result<()>> {
+    let trimmed = strip_probe_outer_parens(expr.trim());
+    let (name, arg_exprs) = parse_probe_action_call(trimmed)?;
+
+    let (def, mut child_ctx) = if let Some((alias, operator_name)) = name.split_once('!') {
+        let instances = ctx.instances?;
+        let instance = instances.get(alias)?;
+        let module = instance.module.as_ref()?;
+        let def = module.definitions.get(operator_name)?.clone();
+        if !looks_like_action(&def) {
+            return None;
+        }
+        if def.params.len() != arg_exprs.len() {
+            return Some(Err(anyhow::anyhow!(
+                "operator '{alias}!{operator_name}' arity mismatch: expected {}, got {}",
+                def.params.len(),
+                arg_exprs.len()
+            )));
+        }
+
+        let mut instance_ctx = ctx.clone();
+        instance_ctx.definitions = Some(&module.definitions);
+        instance_ctx.instances = Some(&module.instances);
+        seed_probe_instance_constant_bindings(instance, module, ctx, &mut instance_ctx);
+        {
+            let locals_mut = std::rc::Rc::make_mut(&mut instance_ctx.locals);
+            for (param, value_expr) in &instance.substitutions {
+                let value = match eval_expr(value_expr, ctx) {
+                    Ok(value) => value,
+                    Err(err) => return Some(Err(err)),
+                };
+                locals_mut.insert(param.clone(), value);
+            }
+            for (param, arg_expr) in def.params.iter().zip(arg_exprs.iter()) {
+                let value = match eval_expr(arg_expr, ctx) {
+                    Ok(value) => value,
+                    Err(err) => return Some(Err(err)),
+                };
+                locals_mut.insert(normalize_param_name(param).to_string(), value);
+            }
+        }
+
+        (def, instance_ctx)
+    } else {
+        let def = ctx
+            .local_definitions
+            .get(&name)
+            .cloned()
+            .or_else(|| ctx.definitions.and_then(|defs| defs.get(&name).cloned()))?;
+        if !looks_like_action(&def) {
+            return None;
+        }
+        if def.params.len() != arg_exprs.len() {
+            return Some(Err(anyhow::anyhow!(
+                "operator '{name}' arity mismatch: expected {}, got {}",
+                def.params.len(),
+                arg_exprs.len()
+            )));
+        }
+
+        let mut child_ctx = ctx.clone();
+        {
+            let locals_mut = std::rc::Rc::make_mut(&mut child_ctx.locals);
+            for (param, arg_expr) in def.params.iter().zip(arg_exprs.iter()) {
+                let value = match eval_expr(arg_expr, ctx) {
+                    Ok(value) => value,
+                    Err(err) => return Some(Err(err)),
+                };
+                locals_mut.insert(normalize_param_name(param).to_string(), value);
+            }
+        }
+
+        (def, child_ctx)
+    };
+
+    Some(
+        probe_action_body_into_ctx(&def.body, &mut child_ctx).map(|_| {
+            merge_staged_prime_locals(&child_ctx, ctx);
+        }),
+    )
+}
+
+fn current_probe_staged_primes(ctx: &EvalContext<'_>) -> BTreeMap<String, TlaValue> {
+    ctx.locals
+        .iter()
+        .filter_map(|(name, value)| {
+            name.strip_suffix('\'')
+                .map(|var| (var.to_string(), value.clone()))
+        })
+        .collect()
+}
+
+const PROBE_BRANCH_DISABLED_LOCAL: &str = "__probe_branch_disabled";
+
+fn mark_probe_branch_disabled(ctx: &mut EvalContext<'_>) {
+    std::rc::Rc::make_mut(&mut ctx.locals).insert(
+        PROBE_BRANCH_DISABLED_LOCAL.to_string(),
+        TlaValue::Bool(true),
+    );
+}
+
+fn probe_branch_is_disabled(ctx: &EvalContext<'_>) -> bool {
+    matches!(
+        ctx.locals.get(PROBE_BRANCH_DISABLED_LOCAL),
+        Some(TlaValue::Bool(true))
+    )
+}
+
+fn probe_let_action_expr(expr: &str, ctx: &mut EvalContext<'_>) -> anyhow::Result<()> {
+    let staged = current_probe_staged_primes(ctx);
+    let mut branches = eval_let_action_multi(expr, ctx, &staged, &[])?.into_iter();
+    let Some((next_staged, _)) = branches.next() else {
+        return Ok(());
+    };
+
+    let locals_mut = std::rc::Rc::make_mut(&mut ctx.locals);
+    for (var, value) in next_staged {
+        locals_mut.insert(format!("{var}'"), value);
+    }
+    Ok(())
+}
+
+fn probe_action_clause_expr(
+    clause: &ActionClause,
+    ctx: &mut EvalContext<'_>,
+) -> Option<anyhow::Result<()>> {
+    if probe_branch_is_disabled(ctx) {
+        return None;
+    }
+
+    match clause {
+        ActionClause::LetWithPrimes { expr } => {
+            let expr = strip_probe_comments(expr);
+            Some(probe_let_action_expr(&expr, ctx))
+        }
+        ActionClause::Guard { expr } => {
+            let expr = normalize_probe_clause_expr(expr);
+            if let Some((condition, then_branch, else_branch)) = parse_probe_action_if(&expr) {
+                let mut branch_ctx = ctx.clone();
+                return Some(
+                    eval_expr(condition, ctx)
+                        .and_then(|value| value.as_bool())
+                        .and_then(|take_then| {
+                            let branch = if take_then { then_branch } else { else_branch };
+                            match probe_action_body_via_runtime_eval(branch, &mut branch_ctx) {
+                                Some(Ok(())) => Ok(()),
+                                Some(Err(_)) | None => {
+                                    probe_action_body_into_ctx(branch, &mut branch_ctx)
+                                }
+                            }
+                        })
+                        .map(|_| {
+                            merge_staged_prime_locals(&branch_ctx, ctx);
+                        }),
+                );
+            }
+            if let Some(expanded) = probe_disjunctive_action_body(&expr, ctx) {
+                return Some(expanded);
+            }
+            if let Some(expanded) = expand_probe_action_call(&expr, ctx) {
+                return Some(expanded);
+            }
+            if should_skip_action_expr_probe(&expr) {
+                return None;
+            }
+            Some(eval_expr(&expr, ctx).and_then(|value| {
+                if !value.as_bool()? {
+                    mark_probe_branch_disabled(ctx);
+                }
+                Ok(())
+            }))
+        }
+        ActionClause::PrimedAssignment { var, expr } => Some(eval_expr(expr, ctx).map(|value| {
+            std::rc::Rc::make_mut(&mut ctx.locals).insert(format!("{var}'"), value);
+        })),
+        ActionClause::Unchanged { vars } => {
+            let locals_mut = std::rc::Rc::make_mut(&mut ctx.locals);
+            for var in vars {
+                if let Some(value) = ctx.state.get(var) {
+                    locals_mut.insert(format!("{var}'"), value.clone());
+                }
+            }
+            None
+        }
+        ActionClause::Exists { binders, body } => {
+            let local_bindings = (*ctx.locals).clone();
+            let definitions = ctx.definitions.unwrap_or(ctx.local_definitions.as_ref());
+            let bound = if let Some(instances) = ctx.instances {
+                sample_exists_quantifier_binders(
+                    binders,
+                    &local_bindings,
+                    ctx.state,
+                    definitions,
+                    instances,
+                )?
+            } else {
+                sample_exists_quantifier_binders(
+                    binders,
+                    &local_bindings,
+                    ctx.state,
+                    definitions,
+                    &BTreeMap::new(),
+                )?
+            };
+
+            let mut child_ctx = ctx.clone();
+            {
+                let locals_mut = std::rc::Rc::make_mut(&mut child_ctx.locals);
+                for (name, value) in bound {
+                    locals_mut.insert(name, value);
+                }
+            }
+
+            Some(probe_action_body_into_ctx(body, &mut child_ctx).map(|_| {
+                merge_staged_prime_locals(&child_ctx, ctx);
+            }))
+        }
+    }
 }
 
 /// Picks a representative value from a set for probing purposes.
@@ -1916,10 +3613,10 @@ fn sample_param_value(param: &str, probe_state: &TlaState) -> TlaValue {
 /// checking in evaluate_init_states handles full enumeration.
 fn pick_representative_from_set(set_val: &TlaValue) -> Option<TlaValue> {
     match set_val {
-        TlaValue::Set(values) => {
-            // Pick the first element from the set
-            values.iter().next().cloned()
-        }
+        TlaValue::Set(values) => values
+            .iter()
+            .max_by_key(|value| probe_value_score(value))
+            .cloned(),
         _ => None,
     }
 }
@@ -1929,31 +3626,22 @@ fn pick_representative_from_set(set_val: &TlaValue) -> Option<TlaValue> {
 /// Instead of enumerating all possible functions, we create a single representative
 /// function that maps each domain element to the first element of the range.
 fn try_create_representative_function(set_expr: &str, ctx: &EvalContext<'_>) -> Option<TlaValue> {
-    // Compile the expression to see if it's a function set
-    let compiled = compile_expr(set_expr);
+    let trimmed = strip_probe_outer_parens(set_expr.trim());
+    let inner = trimmed.strip_prefix('[')?.strip_suffix(']')?;
+    let arrow_idx = find_probe_top_level_keyword(inner, "->")?;
+    let domain_expr = inner[..arrow_idx].trim();
+    let range_expr = inner[arrow_idx + 2..].trim();
 
-    match compiled {
-        CompiledExpr::FunctionSet { domain, range } => {
-            // Evaluate the domain and range sets
-            let domain_val = eval_compiled(&domain, ctx).ok()?;
-            let range_val = eval_compiled(&range, ctx).ok()?;
+    let domain_val = eval_expr(domain_expr, ctx).ok()?;
+    let domain_set = domain_val.as_set().ok()?;
+    let repr_val = representative_member_from_domain_expr(range_expr, ctx)?;
 
-            let domain_set = domain_val.as_set().ok()?;
-            let range_set = range_val.as_set().ok()?;
-
-            // Pick the first element from the range as the representative value
-            let repr_val = range_set.iter().next()?.clone();
-
-            // Build a function mapping each domain element to the representative value
-            let mut func = std::collections::BTreeMap::new();
-            for elem in domain_set.iter() {
-                func.insert(elem.clone(), repr_val.clone());
-            }
-
-            Some(TlaValue::Function(Arc::new(func)))
-        }
-        _ => None,
+    let mut func = std::collections::BTreeMap::new();
+    for elem in domain_set.iter() {
+        func.insert(elem.clone(), repr_val.clone());
     }
+
+    Some(TlaValue::Function(Arc::new(func)))
 }
 
 #[cfg(test)]
@@ -2072,6 +3760,1420 @@ mod tests {
     }
 
     #[test]
+    fn seeds_probe_state_from_type_invariants() {
+        let mut probe_state = TlaState::new();
+        probe_state.insert(
+            "Readers".to_string(),
+            TlaValue::Set(Arc::new(
+                [
+                    TlaValue::ModelValue("r1".to_string()),
+                    TlaValue::ModelValue("r2".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            )),
+        );
+
+        let module = TlaModule {
+            variables: vec![
+                "read".to_string(),
+                "chan".to_string(),
+                "pending".to_string(),
+            ],
+            definitions: BTreeMap::from([(
+                "TypeOK".to_string(),
+                TlaDefinition {
+                    name: "TypeOK".to_string(),
+                    params: vec![],
+                    body: r#"
+                        /\ read \in [Readers -> Seq(Nat)]
+                        /\ chan \in [ack : BOOLEAN, payload : Nat]
+                        /\ pending \in SUBSET Readers
+                    "#
+                    .to_string(),
+                    is_recursive: false,
+                },
+            )]),
+            ..TlaModule::default()
+        };
+
+        let seeded = seed_probe_state_from_type_invariants(&mut probe_state, &module, None);
+
+        assert_eq!(seeded, 3);
+        match probe_state.get("read") {
+            Some(TlaValue::Function(map)) => assert_eq!(map.len(), 2),
+            other => panic!("expected function representative for read, got {other:?}"),
+        }
+        match probe_state.get("chan") {
+            Some(TlaValue::Record(fields)) => {
+                assert_eq!(fields.get("ack"), Some(&TlaValue::Bool(false)));
+                assert_eq!(fields.get("payload"), Some(&TlaValue::Int(0)));
+            }
+            other => panic!("expected record representative for chan, got {other:?}"),
+        }
+        assert_eq!(
+            probe_state.get("pending"),
+            Some(&TlaValue::Set(Arc::new(BTreeSet::new())))
+        );
+    }
+
+    #[test]
+    fn seeds_probe_state_from_subset_type_invariants() {
+        let mut probe_state =
+            TlaState::from([("msgs".to_string(), TlaValue::Set(Arc::new(BTreeSet::new())))]);
+        let module = TlaModule {
+            name: "SubsetSeed".to_string(),
+            path: String::new(),
+            extends: Vec::new(),
+            constants: Vec::new(),
+            variables: vec!["msgs".to_string()],
+            definitions: BTreeMap::from([
+                (
+                    "Message".to_string(),
+                    TlaDefinition {
+                        name: "Message".to_string(),
+                        params: vec![],
+                        body: "[type: {\"1a\"}, bal: {0}]".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+                (
+                    "TypeOK".to_string(),
+                    TlaDefinition {
+                        name: "TypeOK".to_string(),
+                        params: vec![],
+                        body: "msgs \\subseteq Message".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+            ]),
+            instances: BTreeMap::new(),
+            unnamed_instances: Vec::new(),
+            is_pluscal: false,
+            recursive_declarations: BTreeSet::new(),
+        };
+
+        let seeded = seed_probe_state_from_type_invariants(&mut probe_state, &module, None);
+        assert_eq!(seeded, 1);
+        match probe_state.get("msgs") {
+            Some(TlaValue::Set(values)) => {
+                let elem = values
+                    .iter()
+                    .next()
+                    .expect("subset seed should be non-empty");
+                assert!(matches!(elem, TlaValue::Record(_)));
+            }
+            other => panic!("expected seeded msgs set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn seeds_probe_state_prefers_structured_function_values_from_type_invariants() {
+        let proc_id = TlaValue::ModelValue("p1".to_string());
+        let no_val = TlaValue::ModelValue("NoVal".to_string());
+        let mut probe_state = TlaState::from([(
+            "buf".to_string(),
+            TlaValue::Function(Arc::new(BTreeMap::from([(
+                proc_id.clone(),
+                no_val.clone(),
+            )]))),
+        )]);
+        let module = TlaModule {
+            name: "BufSeed".to_string(),
+            path: String::new(),
+            extends: Vec::new(),
+            constants: Vec::new(),
+            variables: vec!["buf".to_string()],
+            definitions: BTreeMap::from([
+                (
+                    "Proc".to_string(),
+                    TlaDefinition {
+                        name: "Proc".to_string(),
+                        params: vec![],
+                        body: "{p1}".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+                (
+                    "MReq".to_string(),
+                    TlaDefinition {
+                        name: "MReq".to_string(),
+                        params: vec![],
+                        body: "[op: {\"Wr\"}, adr: {a1}, val: {v1}]".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+                (
+                    "Val".to_string(),
+                    TlaDefinition {
+                        name: "Val".to_string(),
+                        params: vec![],
+                        body: "{v1}".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+                (
+                    "TypeOK".to_string(),
+                    TlaDefinition {
+                        name: "TypeOK".to_string(),
+                        params: vec![],
+                        body: "buf \\in [Proc -> MReq \\cup Val \\cup {NoVal}]".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+            ]),
+            instances: BTreeMap::new(),
+            unnamed_instances: Vec::new(),
+            is_pluscal: false,
+            recursive_declarations: BTreeSet::new(),
+        };
+
+        let seeded = seed_probe_state_from_type_invariants(&mut probe_state, &module, None);
+        assert_eq!(seeded, 1);
+        match probe_state.get("buf") {
+            Some(TlaValue::Function(values)) => {
+                let value = values.get(&proc_id).expect("buf should contain p1");
+                assert!(matches!(value, TlaValue::Record(_)));
+            }
+            other => panic!("expected refined buf function, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn seeds_probe_state_refines_placeholder_functions_even_when_placeholders_typecheck() {
+        let proc_id = TlaValue::ModelValue("p1".to_string());
+        let no_val = TlaValue::ModelValue("NoVal".to_string());
+        let mut probe_state = TlaState::from([
+            (
+                "buf".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([(
+                    proc_id.clone(),
+                    no_val.clone(),
+                )]))),
+            ),
+            ("NoVal".to_string(), no_val),
+        ]);
+        let module = TlaModule {
+            name: "BufSeed".to_string(),
+            path: String::new(),
+            extends: Vec::new(),
+            constants: Vec::new(),
+            variables: vec!["buf".to_string()],
+            definitions: BTreeMap::from([
+                (
+                    "Proc".to_string(),
+                    TlaDefinition {
+                        name: "Proc".to_string(),
+                        params: vec![],
+                        body: "{p1}".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+                (
+                    "MReq".to_string(),
+                    TlaDefinition {
+                        name: "MReq".to_string(),
+                        params: vec![],
+                        body: "[op: {\"Wr\"}, adr: {a1}, val: {v1}]".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+                (
+                    "Val".to_string(),
+                    TlaDefinition {
+                        name: "Val".to_string(),
+                        params: vec![],
+                        body: "{v1}".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+                (
+                    "TypeOK".to_string(),
+                    TlaDefinition {
+                        name: "TypeOK".to_string(),
+                        params: vec![],
+                        body: "buf \\in [Proc -> MReq \\cup Val \\cup {NoVal}]".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+            ]),
+            instances: BTreeMap::new(),
+            unnamed_instances: Vec::new(),
+            is_pluscal: false,
+            recursive_declarations: BTreeSet::new(),
+        };
+
+        let seeded = seed_probe_state_from_type_invariants(&mut probe_state, &module, None);
+        assert_eq!(seeded, 1);
+        match probe_state.get("buf") {
+            Some(TlaValue::Function(values)) => {
+                let value = values.get(&proc_id).expect("buf should contain p1");
+                assert!(matches!(value, TlaValue::Record(_)));
+            }
+            other => panic!("expected refined buf function, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn representative_value_from_function_set_prefers_structured_range_members() {
+        let probe_state = TlaState::new();
+        let definitions = BTreeMap::from([
+            (
+                "Proc".to_string(),
+                TlaDefinition {
+                    name: "Proc".to_string(),
+                    params: vec![],
+                    body: "{p1}".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "MReq".to_string(),
+                TlaDefinition {
+                    name: "MReq".to_string(),
+                    params: vec![],
+                    body: "[op: {\"Wr\"}, adr: {a1}, val: {v1}]".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Val".to_string(),
+                TlaDefinition {
+                    name: "Val".to_string(),
+                    params: vec![],
+                    body: "{v1}".to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+        let instances = BTreeMap::new();
+        let ctx = build_probe_eval_context(&probe_state, &definitions, &instances);
+
+        let repr =
+            representative_value_from_set_expr("[Proc -> MReq \\cup Val \\cup {NoVal}]", &ctx)
+                .expect("function-set representative");
+        let TlaValue::Function(values) = repr else {
+            panic!("expected function representative, got {repr:?}");
+        };
+        let value = values
+            .get(&TlaValue::ModelValue("p1".to_string()))
+            .expect("buf should contain p1");
+        assert!(matches!(value, TlaValue::Record(_)));
+    }
+
+    #[test]
+    fn representative_member_from_domain_expr_uses_union_definition_bodies() {
+        let probe_state = TlaState::new();
+        let definitions = BTreeMap::from([
+            (
+                "Ballot".to_string(),
+                TlaDefinition {
+                    name: "Ballot".to_string(),
+                    params: vec![],
+                    body: "Nat".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Value".to_string(),
+                TlaDefinition {
+                    name: "Value".to_string(),
+                    params: vec![],
+                    body: "{v1}".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Message".to_string(),
+                TlaDefinition {
+                    name: "Message".to_string(),
+                    params: vec![],
+                    body: r#"
+                        [type : {"1a"}, bal : Ballot]
+                    \cup [type : {"2a"}, bal : Ballot, val : Value]
+                    "#
+                    .to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+        let instances = BTreeMap::new();
+        let ctx = build_probe_eval_context(&probe_state, &definitions, &instances);
+
+        let repr = representative_member_from_domain_expr("Message", &ctx)
+            .expect("subset domain representative");
+        let TlaValue::Record(fields) = repr else {
+            panic!("expected representative record, got {repr:?}");
+        };
+        assert_eq!(
+            fields.get("type"),
+            Some(&TlaValue::String("2a".to_string()))
+        );
+        assert_eq!(fields.get("bal"), Some(&TlaValue::Int(0)));
+        assert_eq!(
+            fields.get("val"),
+            Some(&TlaValue::ModelValue("v1".to_string()))
+        );
+    }
+
+    #[test]
+    fn structured_function_replacements_outrank_placeholder_values() {
+        let current = TlaValue::Function(Arc::new(BTreeMap::from([(
+            TlaValue::ModelValue("p1".to_string()),
+            TlaValue::ModelValue("NoVal".to_string()),
+        )])));
+        let replacement = TlaValue::Function(Arc::new(BTreeMap::from([(
+            TlaValue::ModelValue("p1".to_string()),
+            TlaValue::Record(Arc::new(BTreeMap::from([(
+                "op".to_string(),
+                TlaValue::String("Wr".to_string()),
+            )]))),
+        )])));
+
+        assert!(should_refine_probe_value(&current, &replacement));
+    }
+
+    #[test]
+    fn smaller_type_representatives_do_not_replace_initialized_functions() {
+        let current = TlaValue::Function(Arc::new(BTreeMap::from([
+            (
+                TlaValue::ModelValue("h1".to_string()),
+                TlaValue::ModelValue("[Nano]NoBlockVal".to_string()),
+            ),
+            (
+                TlaValue::ModelValue("h2".to_string()),
+                TlaValue::ModelValue("[Nano]NoBlockVal".to_string()),
+            ),
+            (
+                TlaValue::ModelValue("h3".to_string()),
+                TlaValue::ModelValue("[Nano]NoBlockVal".to_string()),
+            ),
+        ])));
+        let replacement = TlaValue::Function(Arc::new(BTreeMap::from([(
+            TlaValue::ModelValue("h1".to_string()),
+            TlaValue::Record(Arc::new(BTreeMap::from([(
+                "source".to_string(),
+                TlaValue::ModelValue("n1".to_string()),
+            )]))),
+        )])));
+
+        assert!(!should_refine_probe_value(&current, &replacement));
+    }
+
+    #[test]
+    fn type_invariant_seeding_preserves_initialized_functions_that_already_typecheck() {
+        let mut probe_state = TlaState::from([
+            (
+                "Hash".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([
+                    TlaValue::ModelValue("h1".to_string()),
+                    TlaValue::ModelValue("h2".to_string()),
+                    TlaValue::ModelValue("h3".to_string()),
+                ]))),
+            ),
+            (
+                "NoBlock".to_string(),
+                TlaValue::ModelValue("NoBlockVal".to_string()),
+            ),
+            (
+                "hashFunction".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([
+                    (
+                        TlaValue::ModelValue("h1".to_string()),
+                        TlaValue::ModelValue("NoBlockVal".to_string()),
+                    ),
+                    (
+                        TlaValue::ModelValue("h2".to_string()),
+                        TlaValue::ModelValue("NoBlockVal".to_string()),
+                    ),
+                    (
+                        TlaValue::ModelValue("h3".to_string()),
+                        TlaValue::ModelValue("NoBlockVal".to_string()),
+                    ),
+                ]))),
+            ),
+        ]);
+        let expected = probe_state
+            .get("hashFunction")
+            .cloned()
+            .expect("hashFunction should exist");
+        let module = TlaModule {
+            name: "NanoLike".to_string(),
+            path: String::new(),
+            extends: Vec::new(),
+            constants: Vec::new(),
+            variables: vec!["hashFunction".to_string()],
+            definitions: BTreeMap::from([
+                (
+                    "Block".to_string(),
+                    TlaDefinition {
+                        name: "Block".to_string(),
+                        params: vec![],
+                        body: "[type : {\"send\"}, source : {n1}]".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+                (
+                    "TypeInvariant".to_string(),
+                    TlaDefinition {
+                        name: "TypeInvariant".to_string(),
+                        params: vec![],
+                        body: "hashFunction \\in [Hash -> Block \\cup {NoBlock}]".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+            ]),
+            instances: BTreeMap::new(),
+            unnamed_instances: Vec::new(),
+            is_pluscal: false,
+            recursive_declarations: BTreeSet::new(),
+        };
+
+        let seeded = seed_probe_state_from_type_invariants(&mut probe_state, &module, None);
+
+        assert_eq!(seeded, 0);
+        assert_eq!(probe_state.get("hashFunction"), Some(&expected));
+    }
+
+    #[test]
+    fn expands_instance_init_references_for_probe_seeding() {
+        let instance_module = TlaModule {
+            name: "Nano".to_string(),
+            path: String::new(),
+            extends: Vec::new(),
+            constants: Vec::new(),
+            variables: vec!["x".to_string(), "y".to_string()],
+            definitions: BTreeMap::from([(
+                "Init".to_string(),
+                TlaDefinition {
+                    name: "Init".to_string(),
+                    params: vec![],
+                    body: "/\\ x = 1 /\\ y = 2".to_string(),
+                    is_recursive: false,
+                },
+            )]),
+            instances: BTreeMap::new(),
+            unnamed_instances: Vec::new(),
+            is_pluscal: false,
+            recursive_declarations: BTreeSet::new(),
+        };
+        let module = TlaModule {
+            name: "MC".to_string(),
+            path: String::new(),
+            extends: Vec::new(),
+            constants: Vec::new(),
+            variables: vec!["x".to_string(), "y".to_string(), "z".to_string()],
+            definitions: BTreeMap::from([(
+                "Init".to_string(),
+                TlaDefinition {
+                    name: "Init".to_string(),
+                    params: vec![],
+                    body: "/\\ z = 0 /\\ N!Init".to_string(),
+                    is_recursive: false,
+                },
+            )]),
+            instances: BTreeMap::from([(
+                "N".to_string(),
+                TlaModuleInstance {
+                    alias: "N".to_string(),
+                    module_name: "Nano".to_string(),
+                    substitutions: BTreeMap::new(),
+                    is_local: false,
+                    module: Some(Box::new(instance_module)),
+                },
+            )]),
+            unnamed_instances: Vec::new(),
+            is_pluscal: false,
+            recursive_declarations: BTreeSet::new(),
+        };
+
+        let clauses = expand_state_predicate_clauses(
+            &module.definitions["Init"].body,
+            &module.definitions,
+            &module.instances,
+        );
+
+        assert_eq!(clauses, vec!["z = 0", "x = 1", "y = 2"]);
+    }
+
+    #[test]
+    fn infers_action_params_from_quantified_next_calls() {
+        let acceptor = TlaValue::ModelValue("a1".to_string());
+        let msg = TlaValue::Record(Arc::new(BTreeMap::from([
+            ("type".to_string(), TlaValue::String("2a".to_string())),
+            ("bal".to_string(), TlaValue::Int(1)),
+            ("val".to_string(), TlaValue::ModelValue("v1".to_string())),
+        ])));
+        let probe_state = TlaState::from([
+            (
+                "maxBal".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([(
+                    acceptor.clone(),
+                    TlaValue::Int(0),
+                )]))),
+            ),
+            (
+                "maxVBal".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([(
+                    acceptor.clone(),
+                    TlaValue::Int(0),
+                )]))),
+            ),
+            (
+                "maxVal".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([(
+                    acceptor.clone(),
+                    TlaValue::ModelValue("None".to_string()),
+                )]))),
+            ),
+            (
+                "msgs".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([msg]))),
+            ),
+        ]);
+        let definitions = BTreeMap::from([
+            (
+                "Acceptor".to_string(),
+                TlaDefinition {
+                    name: "Acceptor".to_string(),
+                    params: vec![],
+                    body: "{a1}".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Send".to_string(),
+                TlaDefinition {
+                    name: "Send".to_string(),
+                    params: vec!["m".to_string()],
+                    body: "msgs' = msgs \\cup {m}".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Phase2b".to_string(),
+                TlaDefinition {
+                    name: "Phase2b".to_string(),
+                    params: vec!["a".to_string()],
+                    body: r#"
+  \E m \in msgs :
+      /\ m.type = "2a"
+      /\ m.bal >= maxBal[a]
+      /\ maxBal' = [maxBal EXCEPT ![a] = m.bal]
+      /\ maxVBal' = [maxVBal EXCEPT ![a] = m.bal]
+      /\ maxVal' = [maxVal EXCEPT ![a] = m.val]
+      /\ Send([type |-> "2b", acc |-> a, bal |-> m.bal, val |-> m.val])
+"#
+                    .to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Next".to_string(),
+                TlaDefinition {
+                    name: "Next".to_string(),
+                    params: vec![],
+                    body: r#"\E a \in Acceptor : Phase2b(a)"#.to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+
+        let samples = infer_action_param_samples_from_next(
+            &definitions.get("Next").unwrap().body,
+            &probe_state,
+            &definitions,
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            samples
+                .get("Phase2b")
+                .and_then(|params| params.get("a"))
+                .cloned(),
+            Some(acceptor)
+        );
+    }
+
+    #[test]
+    fn infers_action_params_from_quantified_disjunctions() {
+        let acceptor = TlaValue::ModelValue("a1".to_string());
+        let probe_state = TlaState::new();
+        let definitions = BTreeMap::from([
+            (
+                "Acceptor".to_string(),
+                TlaDefinition {
+                    name: "Acceptor".to_string(),
+                    params: vec![],
+                    body: "{a1}".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Phase1b".to_string(),
+                TlaDefinition {
+                    name: "Phase1b".to_string(),
+                    params: vec!["a".to_string()],
+                    body: "TRUE".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Phase2b".to_string(),
+                TlaDefinition {
+                    name: "Phase2b".to_string(),
+                    params: vec!["a".to_string()],
+                    body: "TRUE".to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+
+        let samples = infer_action_param_samples_from_next(
+            r#"\E a \in Acceptor : Phase1b(a) \/ Phase2b(a)"#,
+            &probe_state,
+            &definitions,
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(
+            samples
+                .get("Phase1b")
+                .and_then(|params| params.get("a"))
+                .cloned(),
+            Some(acceptor.clone())
+        );
+        assert_eq!(
+            samples
+                .get("Phase2b")
+                .and_then(|params| params.get("a"))
+                .cloned(),
+            Some(acceptor)
+        );
+    }
+
+    #[test]
+    fn analyze_tla_path_infers_phase2b_acceptor_samples() {
+        use std::fs;
+
+        let tmp = std::env::temp_dir().join("tlapp-paxos-phase2b-sample");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should exist");
+
+        let module_path = tmp.join("MCPaxosMini.tla");
+        fs::write(
+            &module_path,
+            r#"
+---- MODULE MCPaxosMini ----
+EXTENDS Integers
+
+CONSTANTS Acceptor, Value
+CONSTANTS a1, v1
+
+const_acceptor == {a1}
+const_value == {v1}
+
+Ballot == Nat
+Message ==
+       [type : {"1a"}, bal : Ballot]
+  \cup [type : {"2a"}, bal : Ballot, val : Value]
+  \cup [type : {"2b"}, acc : Acceptor, bal : Ballot, val : Value]
+
+VARIABLES maxBal, maxVBal, maxVal, msgs
+
+TypeOK == /\ maxBal  \in [Acceptor -> Ballot \cup {-1}]
+          /\ maxVBal \in [Acceptor -> Ballot \cup {-1}]
+          /\ maxVal  \in [Acceptor -> Value]
+          /\ msgs \subseteq Message
+
+Init == /\ maxBal  = [a \in Acceptor |-> -1]
+        /\ maxVBal = [a \in Acceptor |-> -1]
+        /\ maxVal  = [a \in Acceptor |-> v1]
+        /\ msgs = {}
+
+Send(m) == msgs' = msgs \cup {m}
+
+Phase1b(a) ==
+  /\ \E m \in msgs :
+        /\ m.type = "1a"
+        /\ m.bal > maxBal[a]
+  /\ UNCHANGED <<maxVBal, maxVal>>
+
+Phase2b(a) ==
+  \E m \in msgs :
+      /\ m.type = "2a"
+      /\ m.bal >= maxBal[a]
+      /\ maxBal' = [maxBal EXCEPT ![a] = m.bal]
+      /\ maxVBal' = [maxVBal EXCEPT ![a] = m.bal]
+      /\ maxVal' = [maxVal EXCEPT ![a] = m.val]
+      /\ Send([type |-> "2b", acc |-> a, bal |-> m.bal, val |-> m.val])
+
+Next == \E a \in Acceptor : Phase1b(a) \/ Phase2b(a)
+Spec == Init /\ [][Next]_<<maxBal, maxVBal, maxVal, msgs>>
+====
+"#,
+        )
+        .expect("module should be written");
+
+        let cfg_path = tmp.join("MCPaxosMini.cfg");
+        fs::write(
+            &cfg_path,
+            r#"
+CONSTANTS
+a1 = a1
+v1 = v1
+CONSTANT
+Acceptor <- const_acceptor
+CONSTANT
+Value <- const_value
+SPECIFICATION
+Spec
+"#,
+        )
+        .expect("cfg should be written");
+
+        let model = TlaModel::from_files(&module_path, Some(&cfg_path), None, None).expect("model");
+        let probe_state = model
+            .initial_states_vec
+            .first()
+            .cloned()
+            .expect("initial state");
+        let next_def = model
+            .module
+            .definitions
+            .get(&model.next_name)
+            .expect("Next definition");
+
+        let samples = infer_action_param_samples_from_next(
+            &next_def.body,
+            &probe_state,
+            &model.module.definitions,
+            &model.module.instances,
+        );
+        assert_eq!(
+            samples
+                .get("Phase2b")
+                .and_then(|params| params.get("a"))
+                .cloned(),
+            Some(TlaValue::ModelValue("a1".to_string()))
+        );
+
+        let phase2b = model
+            .module
+            .definitions
+            .get("Phase2b")
+            .expect("Phase2b definition");
+        let ir = compile_action_ir_branches(phase2b);
+        let ctx = build_action_expr_probe_context(
+            &probe_state,
+            &model.module.definitions,
+            &model.module.instances,
+            &ir[0].params,
+            &ir[0].clauses,
+            samples.get("Phase2b"),
+        );
+        assert_eq!(
+            eval_expr("maxBal[a]", &ctx).expect("Phase2b param should index maxBal"),
+            TlaValue::Int(-1)
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn analyze_tla_path_infers_phase2b_acceptor_samples_through_extends() {
+        use std::fs;
+
+        let tmp = std::env::temp_dir().join("tlapp-paxos-phase2b-extends");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should exist");
+
+        let base_module_path = tmp.join("PaxosBase.tla");
+        fs::write(
+            &base_module_path,
+            r#"
+---- MODULE PaxosBase ----
+EXTENDS Integers
+
+CONSTANTS Acceptor, Value, DefaultValue
+
+Ballot == Nat
+Message ==
+       [type : {"1a"}, bal : Ballot]
+  \cup [type : {"2a"}, bal : Ballot, val : Value]
+  \cup [type : {"2b"}, acc : Acceptor, bal : Ballot, val : Value]
+
+VARIABLES maxBal, maxVBal, maxVal, msgs
+
+TypeOK == /\ maxBal  \in [Acceptor -> Ballot \cup {-1}]
+          /\ maxVBal \in [Acceptor -> Ballot \cup {-1}]
+          /\ maxVal  \in [Acceptor -> Value]
+          /\ msgs \subseteq Message
+
+Init == /\ maxBal  = [a \in Acceptor |-> -1]
+        /\ maxVBal = [a \in Acceptor |-> -1]
+        /\ maxVal  = [a \in Acceptor |-> DefaultValue]
+        /\ msgs = {}
+
+Send(m) == msgs' = msgs \cup {m}
+
+Phase1b(a) ==
+  /\ \E m \in msgs :
+        /\ m.type = "1a"
+        /\ m.bal > maxBal[a]
+  /\ UNCHANGED <<maxVBal, maxVal>>
+
+Phase2b(a) ==
+  \E m \in msgs :
+      /\ m.type = "2a"
+      /\ m.bal >= maxBal[a]
+      /\ maxBal' = [maxBal EXCEPT ![a] = m.bal]
+      /\ maxVBal' = [maxVBal EXCEPT ![a] = m.bal]
+      /\ maxVal' = [maxVal EXCEPT ![a] = m.val]
+      /\ Send([type |-> "2b", acc |-> a, bal |-> m.bal, val |-> m.val])
+
+Next == \E a \in Acceptor : Phase1b(a) \/ Phase2b(a)
+Spec == Init /\ [][Next]_<<maxBal, maxVBal, maxVal, msgs>>
+====
+"#,
+        )
+        .expect("base module should be written");
+
+        let module_path = tmp.join("MCPaxosMiniExtends.tla");
+        fs::write(
+            &module_path,
+            r#"
+---- MODULE MCPaxosMiniExtends ----
+EXTENDS PaxosBase
+
+CONSTANTS a1, v1
+
+const_acceptor == {a1}
+const_value == {v1}
+default_value == v1
+====
+"#,
+        )
+        .expect("module should be written");
+
+        let cfg_path = tmp.join("MCPaxosMiniExtends.cfg");
+        fs::write(
+            &cfg_path,
+            r#"
+CONSTANTS
+a1 = a1
+v1 = v1
+CONSTANT
+Acceptor <- const_acceptor
+CONSTANT
+Value <- const_value
+CONSTANT
+DefaultValue <- default_value
+SPECIFICATION
+Spec
+"#,
+        )
+        .expect("cfg should be written");
+
+        let model = TlaModel::from_files(&module_path, Some(&cfg_path), None, None).expect("model");
+        let probe_state = model
+            .initial_states_vec
+            .first()
+            .cloned()
+            .expect("initial state");
+        let next_def = model
+            .module
+            .definitions
+            .get(&model.next_name)
+            .expect("Next definition");
+
+        let samples = infer_action_param_samples_from_next(
+            &next_def.body,
+            &probe_state,
+            &model.module.definitions,
+            &model.module.instances,
+        );
+        assert_eq!(
+            samples
+                .get("Phase2b")
+                .and_then(|params| params.get("a"))
+                .cloned(),
+            Some(TlaValue::ModelValue("a1".to_string()))
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn action_probe_resolves_zero_arg_aliases_in_index_and_except_expressions() {
+        let proc_id = TlaValue::ModelValue("p1".to_string());
+        let adr = TlaValue::ModelValue("a1".to_string());
+        let val = TlaValue::ModelValue("v1".to_string());
+        let probe_state = TlaState::from([(
+            "ctl".to_string(),
+            TlaValue::Function(Arc::new(BTreeMap::from([(
+                proc_id.clone(),
+                TlaValue::String("busy".to_string()),
+            )]))),
+        )]);
+        let definitions = BTreeMap::from([
+            (
+                "Proc".to_string(),
+                TlaDefinition {
+                    name: "Proc".to_string(),
+                    params: vec![],
+                    body: "{p1}".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Adr".to_string(),
+                TlaDefinition {
+                    name: "Adr".to_string(),
+                    params: vec![],
+                    body: "{a1}".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "omem".to_string(),
+                TlaDefinition {
+                    name: "omem".to_string(),
+                    params: vec![],
+                    body: "[a \\in Adr |-> v1]".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "obuf".to_string(),
+                TlaDefinition {
+                    name: "obuf".to_string(),
+                    params: vec![],
+                    body: r#"[p \in Proc |-> [op |-> "Wr", adr |-> a1, val |-> v1]]"#.to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "octl".to_string(),
+                TlaDefinition {
+                    name: "octl".to_string(),
+                    params: vec![],
+                    body: r#"[p \in Proc |-> IF ctl[p] = "waiting" THEN "busy" ELSE ctl[p]]"#
+                        .to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "LM_Inner_Do".to_string(),
+                TlaDefinition {
+                    name: "LM_Inner_Do".to_string(),
+                    params: vec!["p".to_string()],
+                    body: r#"
+  /\ octl[p] = "busy"
+  /\ omem' = IF obuf[p].op = "Wr"
+              THEN [omem EXCEPT ![obuf[p].adr] = obuf[p].val]
+              ELSE omem
+  /\ obuf' = [obuf EXCEPT ![p] = IF obuf[p].op = "Wr"
+                                  THEN NoVal
+                                  ELSE omem[obuf[p].adr]]
+  /\ octl' = [octl EXCEPT ![p] = "done"]
+"#
+                    .to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+        let inferred = BTreeMap::from([("p".to_string(), proc_id.clone())]);
+        let def = definitions.get("LM_Inner_Do").unwrap();
+        let ir = compile_action_ir(def);
+        let instances = BTreeMap::new();
+        let mut ctx = build_action_expr_probe_context(
+            &probe_state,
+            &definitions,
+            &instances,
+            &ir.params,
+            &ir.clauses,
+            Some(&inferred),
+        );
+
+        for clause in &ir.clauses {
+            let Some(result) = probe_action_clause_expr(clause, &mut ctx) else {
+                continue;
+            };
+            result.expect("cache-style action probe should succeed");
+        }
+
+        let locals = &ctx.locals;
+        assert_eq!(locals.get("p"), Some(&proc_id));
+        assert_eq!(
+            locals.get("octl'"),
+            Some(&TlaValue::Function(Arc::new(BTreeMap::from([(
+                proc_id.clone(),
+                TlaValue::String("done".to_string()),
+            )]))))
+        );
+        assert_eq!(
+            locals.get("omem'"),
+            Some(&TlaValue::Function(Arc::new(BTreeMap::from([(adr, val)]))))
+        );
+    }
+
+    #[test]
+    fn cache_style_type_invariants_refine_alias_backed_buffers_for_action_probing() {
+        let proc_id = TlaValue::ModelValue("p1".to_string());
+        let no_val = TlaValue::ModelValue("NoVal".to_string());
+        let mut probe_state = TlaState::from([
+            (
+                "wmem".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([(
+                    TlaValue::ModelValue("a1".to_string()),
+                    TlaValue::ModelValue("v1".to_string()),
+                )]))),
+            ),
+            (
+                "ctl".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([(
+                    proc_id.clone(),
+                    TlaValue::String("waiting".to_string()),
+                )]))),
+            ),
+            (
+                "buf".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([(
+                    proc_id.clone(),
+                    no_val.clone(),
+                )]))),
+            ),
+            (
+                "memInt".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::new())),
+            ),
+            ("NoVal".to_string(), no_val),
+        ]);
+        let module = TlaModule {
+            name: "CacheProbe".to_string(),
+            path: String::new(),
+            extends: Vec::new(),
+            constants: Vec::new(),
+            variables: vec![
+                "wmem".to_string(),
+                "ctl".to_string(),
+                "buf".to_string(),
+                "memInt".to_string(),
+            ],
+            definitions: BTreeMap::from([
+                (
+                    "Proc".to_string(),
+                    TlaDefinition {
+                        name: "Proc".to_string(),
+                        params: vec![],
+                        body: "{p1}".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+                (
+                    "Adr".to_string(),
+                    TlaDefinition {
+                        name: "Adr".to_string(),
+                        params: vec![],
+                        body: "{a1}".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+                (
+                    "Val".to_string(),
+                    TlaDefinition {
+                        name: "Val".to_string(),
+                        params: vec![],
+                        body: "{v1}".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+                (
+                    "MReq".to_string(),
+                    TlaDefinition {
+                        name: "MReq".to_string(),
+                        params: vec![],
+                        body: "[op: {\"Wr\"}, adr: {a1}, val: {v1}]".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+                (
+                    "TypeInvariant".to_string(),
+                    TlaDefinition {
+                        name: "TypeInvariant".to_string(),
+                        params: vec![],
+                        body: r#"
+                            /\ wmem \in [Adr -> Val]
+                            /\ ctl \in [Proc -> {"rdy", "busy", "waiting", "done"}]
+                            /\ buf \in [Proc -> MReq \cup Val \cup {NoVal}]
+                        "#
+                        .to_string(),
+                        is_recursive: false,
+                    },
+                ),
+                (
+                    "omem".to_string(),
+                    TlaDefinition {
+                        name: "omem".to_string(),
+                        params: vec![],
+                        body: "wmem".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+                (
+                    "obuf".to_string(),
+                    TlaDefinition {
+                        name: "obuf".to_string(),
+                        params: vec![],
+                        body: "buf".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+                (
+                    "octl".to_string(),
+                    TlaDefinition {
+                        name: "octl".to_string(),
+                        params: vec![],
+                        body: r#"[p \in Proc |-> IF ctl[p] = "waiting" THEN "busy" ELSE ctl[p]]"#
+                            .to_string(),
+                        is_recursive: false,
+                    },
+                ),
+                (
+                    "LM_Inner_Do".to_string(),
+                    TlaDefinition {
+                        name: "LM_Inner_Do".to_string(),
+                        params: vec!["p".to_string()],
+                        body: r#"
+  /\ octl[p] = "busy"
+  /\ omem' = IF obuf[p].op = "Wr"
+              THEN [omem EXCEPT ![obuf[p].adr] = obuf[p].val]
+              ELSE omem
+  /\ obuf' = [obuf EXCEPT ![p] = IF obuf[p].op = "Wr"
+                                  THEN NoVal
+                                  ELSE omem[obuf[p].adr]]
+  /\ octl' = [octl EXCEPT ![p] = "done"]
+"#
+                        .to_string(),
+                        is_recursive: false,
+                    },
+                ),
+            ]),
+            instances: BTreeMap::new(),
+            unnamed_instances: Vec::new(),
+            is_pluscal: false,
+            recursive_declarations: BTreeSet::new(),
+        };
+
+        let seeded = seed_probe_state_from_type_invariants(&mut probe_state, &module, None);
+        assert!(seeded >= 1);
+        let def = module.definitions.get("LM_Inner_Do").unwrap();
+        let ir = compile_action_ir(def);
+        let inferred = BTreeMap::from([("p".to_string(), proc_id.clone())]);
+        let mut ctx = build_action_expr_probe_context(
+            &probe_state,
+            &module.definitions,
+            &module.instances,
+            &ir.params,
+            &ir.clauses,
+            Some(&inferred),
+        );
+
+        for clause in &ir.clauses {
+            let Some(result) = probe_action_clause_expr(clause, &mut ctx) else {
+                continue;
+            };
+            result.expect("cache-style alias action should be probeable after refinement");
+        }
+    }
+
+    #[test]
+    fn paxos_style_type_invariants_seed_messages_for_phase2b_probe() {
+        let acceptor = TlaValue::ModelValue("a1".to_string());
+        let mut probe_state = TlaState::from([
+            (
+                "maxBal".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([(
+                    acceptor.clone(),
+                    TlaValue::Int(-1),
+                )]))),
+            ),
+            (
+                "maxVBal".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([(
+                    acceptor.clone(),
+                    TlaValue::Int(-1),
+                )]))),
+            ),
+            (
+                "maxVal".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([(
+                    acceptor.clone(),
+                    TlaValue::ModelValue("None".to_string()),
+                )]))),
+            ),
+            ("msgs".to_string(), TlaValue::Set(Arc::new(BTreeSet::new()))),
+        ]);
+        let module = TlaModule {
+            name: "PaxosProbe".to_string(),
+            path: String::new(),
+            extends: Vec::new(),
+            constants: Vec::new(),
+            variables: vec![
+                "maxBal".to_string(),
+                "maxVBal".to_string(),
+                "maxVal".to_string(),
+                "msgs".to_string(),
+            ],
+            definitions: BTreeMap::from([
+                (
+                    "Ballot".to_string(),
+                    TlaDefinition {
+                        name: "Ballot".to_string(),
+                        params: vec![],
+                        body: "{0, 1, 2}".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+                (
+                    "Value".to_string(),
+                    TlaDefinition {
+                        name: "Value".to_string(),
+                        params: vec![],
+                        body: "{v1}".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+                (
+                    "Acceptor".to_string(),
+                    TlaDefinition {
+                        name: "Acceptor".to_string(),
+                        params: vec![],
+                        body: "{a1}".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+                (
+                    "None".to_string(),
+                    TlaDefinition {
+                        name: "None".to_string(),
+                        params: vec![],
+                        body: "None".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+                (
+                    "Message".to_string(),
+                    TlaDefinition {
+                        name: "Message".to_string(),
+                        params: vec![],
+                        body: r#"
+                               [type : {"1a"}, bal : Ballot]
+                          \cup [type : {"2a"}, bal : Ballot, val : Value]
+                          \cup [type : {"2b"}, acc : Acceptor, bal : Ballot, val : Value]
+                        "#
+                        .to_string(),
+                        is_recursive: false,
+                    },
+                ),
+                (
+                    "TypeOK".to_string(),
+                    TlaDefinition {
+                        name: "TypeOK".to_string(),
+                        params: vec![],
+                        body: r#"
+                          /\ maxBal  \in [Acceptor -> Ballot \cup {-1}]
+                          /\ maxVBal \in [Acceptor -> Ballot \cup {-1}]
+                          /\ maxVal  \in [Acceptor -> Value \cup {None}]
+                          /\ msgs \subseteq Message
+                        "#
+                        .to_string(),
+                        is_recursive: false,
+                    },
+                ),
+                (
+                    "Send".to_string(),
+                    TlaDefinition {
+                        name: "Send".to_string(),
+                        params: vec!["m".to_string()],
+                        body: "msgs' = msgs \\cup {m}".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+                (
+                    "Phase2b".to_string(),
+                    TlaDefinition {
+                        name: "Phase2b".to_string(),
+                        params: vec!["a".to_string()],
+                        body: r#"
+  \E m \in msgs :
+      /\ m.type = "2a"
+      /\ m.bal >= maxBal[a]
+      /\ maxBal' = [maxBal EXCEPT ![a] = m.bal]
+      /\ maxVBal' = [maxVBal EXCEPT ![a] = m.bal]
+      /\ maxVal' = [maxVal EXCEPT ![a] = m.val]
+      /\ Send([type |-> "2b", acc |-> a, bal |-> m.bal, val |-> m.val])
+"#
+                        .to_string(),
+                        is_recursive: false,
+                    },
+                ),
+                (
+                    "Next".to_string(),
+                    TlaDefinition {
+                        name: "Next".to_string(),
+                        params: vec![],
+                        body: r#"\E a \in Acceptor : Phase2b(a)"#.to_string(),
+                        is_recursive: false,
+                    },
+                ),
+            ]),
+            instances: BTreeMap::new(),
+            unnamed_instances: Vec::new(),
+            is_pluscal: false,
+            recursive_declarations: BTreeSet::new(),
+        };
+
+        let seeded = seed_probe_state_from_type_invariants(&mut probe_state, &module, None);
+        assert!(seeded >= 1);
+        match probe_state.get("msgs") {
+            Some(TlaValue::Set(values)) => assert!(!values.is_empty()),
+            other => panic!("expected seeded msgs set, got {other:?}"),
+        }
+
+        let samples = infer_action_param_samples_from_next(
+            &module.definitions.get("Next").unwrap().body,
+            &probe_state,
+            &module.definitions,
+            &module.instances,
+        );
+        assert_eq!(
+            samples
+                .get("Phase2b")
+                .and_then(|params| params.get("a"))
+                .cloned(),
+            Some(acceptor.clone())
+        );
+
+        let def = module.definitions.get("Phase2b").unwrap();
+        let ir = compile_action_ir(def);
+        let mut ctx = build_action_expr_probe_context(
+            &probe_state,
+            &module.definitions,
+            &module.instances,
+            &ir.params,
+            &ir.clauses,
+            samples.get("Phase2b"),
+        );
+        for clause in &ir.clauses {
+            let Some(result) = probe_action_clause_expr(clause, &mut ctx) else {
+                continue;
+            };
+            result.expect("Phase2b should be probeable after type-based seeding");
+        }
+    }
+
+    #[test]
     fn parses_skip_system_checks_flag() {
         let cli = Cli::try_parse_from(["tlaplusplus", "run-counter-grid", "--skip-system-checks"])
             .expect("cli should parse");
@@ -2080,5 +5182,1398 @@ mod tests {
             Command::RunCounterGrid { runtime, .. } => assert!(runtime.skip_system_checks),
             other => panic!("unexpected command: {:?}", other),
         }
+    }
+
+    #[test]
+    fn expr_probe_stages_primed_assignments_between_action_clauses() {
+        let mut state = TlaState::new();
+        state.insert("big".to_string(), TlaValue::Int(2));
+        state.insert("small".to_string(), TlaValue::Int(3));
+
+        let defs = BTreeMap::new();
+        let def = TlaDefinition {
+            name: "SmallToBig".to_string(),
+            params: vec![],
+            body: r#"
+                /\ big' = big + small
+                /\ small' = small - (big' - big)
+            "#
+            .to_string(),
+            is_recursive: false,
+        };
+        let ir = compile_action_ir(&def);
+
+        let instances = BTreeMap::new();
+        let mut ctx = build_action_expr_probe_context(
+            &state,
+            &defs,
+            &instances,
+            &ir.params,
+            &ir.clauses,
+            None,
+        );
+        for clause in &ir.clauses {
+            if let Some(result) = probe_action_clause_expr(clause, &mut ctx) {
+                result.expect("probe should resolve staged prime references");
+            }
+        }
+
+        assert_eq!(
+            ctx.locals.get("big'"),
+            Some(&TlaValue::Int(5)),
+            "first primed assignment should be staged for later clauses"
+        );
+        assert_eq!(
+            ctx.locals.get("small'"),
+            Some(&TlaValue::Int(0)),
+            "later clauses should evaluate against staged prime bindings"
+        );
+    }
+
+    #[test]
+    fn expr_probe_seeds_unchanged_vars_as_primed_bindings() {
+        let mut state = TlaState::new();
+        state.insert("x".to_string(), TlaValue::Int(7));
+        state.insert("y".to_string(), TlaValue::Int(0));
+
+        let defs = BTreeMap::new();
+        let def = TlaDefinition {
+            name: "KeepX".to_string(),
+            params: vec![],
+            body: r#"
+                /\ UNCHANGED <<x>>
+                /\ y' = x'
+            "#
+            .to_string(),
+            is_recursive: false,
+        };
+        let ir = compile_action_ir(&def);
+
+        let instances = BTreeMap::new();
+        let mut ctx = build_action_expr_probe_context(
+            &state,
+            &defs,
+            &instances,
+            &ir.params,
+            &ir.clauses,
+            None,
+        );
+        for clause in &ir.clauses {
+            if let Some(result) = probe_action_clause_expr(clause, &mut ctx) {
+                result.expect("probe should treat UNCHANGED variables as x' = x");
+            }
+        }
+
+        assert_eq!(ctx.locals.get("x'"), Some(&TlaValue::Int(7)));
+        assert_eq!(ctx.locals.get("y'"), Some(&TlaValue::Int(7)));
+    }
+
+    #[test]
+    fn expr_probe_stages_primes_from_nested_if_action_bodies() {
+        let mut state = TlaState::new();
+        state.insert("flag".to_string(), TlaValue::Bool(true));
+        state.insert("count".to_string(), TlaValue::Int(1));
+        state.insert("announced".to_string(), TlaValue::Bool(false));
+
+        let defs = BTreeMap::from([(
+            "VictoryThreshold".to_string(),
+            TlaDefinition {
+                name: "VictoryThreshold".to_string(),
+                params: vec![],
+                body: "2".to_string(),
+                is_recursive: false,
+            },
+        )]);
+        let def = TlaDefinition {
+            name: "CounterAction".to_string(),
+            params: vec![],
+            body: r#"
+                /\ IF flag
+                   THEN /\ count' = count + 1
+                   ELSE UNCHANGED <<count>>
+                /\ announced' = (count' >= VictoryThreshold)
+            "#
+            .to_string(),
+            is_recursive: false,
+        };
+        let ir = compile_action_ir(&def);
+        let instances = BTreeMap::new();
+        let mut ctx = build_action_expr_probe_context(
+            &state,
+            &defs,
+            &instances,
+            &ir.params,
+            &ir.clauses,
+            None,
+        );
+
+        for clause in &ir.clauses {
+            if let Some(result) = probe_action_clause_expr(clause, &mut ctx) {
+                result.expect("nested IF action body should stage primed values");
+            }
+        }
+
+        assert_eq!(ctx.locals.get("count'"), Some(&TlaValue::Int(2)));
+        assert_eq!(ctx.locals.get("announced'"), Some(&TlaValue::Bool(true)));
+    }
+
+    #[test]
+    fn expr_probe_evaluates_primed_zero_arg_operators_from_staged_bindings() {
+        let state = TlaState::from([
+            ("x".to_string(), TlaValue::Int(1)),
+            ("y".to_string(), TlaValue::Int(2)),
+        ]);
+        let defs = BTreeMap::from([
+            (
+                "PairSum".to_string(),
+                TlaDefinition {
+                    name: "PairSum".to_string(),
+                    params: vec![],
+                    body: "x + y".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "PairSumPositive".to_string(),
+                TlaDefinition {
+                    name: "PairSumPositive".to_string(),
+                    params: vec![],
+                    body: "PairSum > 0".to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+        let def = TlaDefinition {
+            name: "Advance".to_string(),
+            params: vec![],
+            body: r#"
+                /\ x' = 10
+                /\ y' = -3
+                /\ PairSumPositive'
+            "#
+            .to_string(),
+            is_recursive: false,
+        };
+        let ir = compile_action_ir(&def);
+        let instances = BTreeMap::new();
+        let mut ctx = build_action_expr_probe_context(
+            &state,
+            &defs,
+            &instances,
+            &ir.params,
+            &ir.clauses,
+            None,
+        );
+
+        for clause in &ir.clauses {
+            if let Some(result) = probe_action_clause_expr(clause, &mut ctx) {
+                result.expect("primed derived operators should probe against staged state");
+            }
+        }
+
+        assert_eq!(ctx.locals.get("x'"), Some(&TlaValue::Int(10)));
+        assert_eq!(ctx.locals.get("y'"), Some(&TlaValue::Int(-3)));
+    }
+
+    #[test]
+    fn expr_probe_expands_nested_action_operator_calls() {
+        let mut state = TlaState::new();
+        state.insert("x".to_string(), TlaValue::Int(1));
+        state.insert("y".to_string(), TlaValue::Int(0));
+
+        let defs = BTreeMap::from([
+            (
+                "Inc".to_string(),
+                TlaDefinition {
+                    name: "Inc".to_string(),
+                    params: vec![],
+                    body: "x' = x + 1".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Outer".to_string(),
+                TlaDefinition {
+                    name: "Outer".to_string(),
+                    params: vec![],
+                    body: "/\\ Inc() /\\ y' = x'".to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+        let ir = compile_action_ir(defs.get("Outer").unwrap());
+        let instances = BTreeMap::new();
+        let mut ctx = build_action_expr_probe_context(
+            &state,
+            &defs,
+            &instances,
+            &ir.params,
+            &ir.clauses,
+            None,
+        );
+
+        for clause in &ir.clauses {
+            if let Some(result) = probe_action_clause_expr(clause, &mut ctx) {
+                result.expect("nested action operator call should stage primed values");
+            }
+        }
+
+        assert_eq!(ctx.locals.get("x'"), Some(&TlaValue::Int(2)));
+        assert_eq!(ctx.locals.get("y'"), Some(&TlaValue::Int(2)));
+    }
+
+    #[test]
+    fn expr_probe_short_circuits_let_actions_before_invalid_local_defs() {
+        let state = TlaState::from([
+            (
+                "store".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([(
+                    TlaValue::ModelValue("node1".to_string()),
+                    TlaValue::Int(7),
+                )]))),
+            ),
+            (
+                "missing".to_string(),
+                TlaValue::ModelValue("NoNode".to_string()),
+            ),
+            ("x".to_string(), TlaValue::Int(0)),
+        ]);
+        let def = TlaDefinition {
+            name: "Disabled".to_string(),
+            params: vec![],
+            body: r#"
+                LET bad == store[missing] IN
+                /\ FALSE
+                /\ x' = bad
+            "#
+            .to_string(),
+            is_recursive: false,
+        };
+        let ir = compile_action_ir(&def);
+        let defs = BTreeMap::new();
+        let instances = BTreeMap::new();
+        let mut ctx = build_action_expr_probe_context(
+            &state,
+            &defs,
+            &instances,
+            &ir.params,
+            &ir.clauses,
+            None,
+        );
+
+        for clause in &ir.clauses {
+            if let Some(result) = probe_action_clause_expr(clause, &mut ctx) {
+                result.expect("disabled LET action should not force invalid local defs");
+            }
+        }
+
+        assert_eq!(ctx.locals.get("x'"), Some(&TlaValue::Int(0)));
+    }
+
+    #[test]
+    fn expr_probe_skips_remaining_clauses_after_false_guard() {
+        let state = TlaState::from([
+            (
+                "signalled".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::<TlaValue, TlaValue>::new())),
+            ),
+            ("light".to_string(), TlaValue::String("off".to_string())),
+        ]);
+        let defs = BTreeMap::from([(
+            "NormalPrisoner".to_string(),
+            TlaDefinition {
+                name: "NormalPrisoner".to_string(),
+                params: vec![],
+                body: "{}".to_string(),
+                is_recursive: false,
+            },
+        )]);
+        let instances = BTreeMap::new();
+        let def = TlaDefinition {
+            name: "StandardAction".to_string(),
+            params: vec!["p".to_string()],
+            body: r#"
+                /\ p \in NormalPrisoner
+                /\ IF light = "off" /\ signalled[p] < 1
+                   THEN /\ light' = "on"
+                        /\ signalled' = [signalled EXCEPT ![p] = @ + 1]
+                   ELSE UNCHANGED <<light, signalled>>
+            "#
+            .to_string(),
+            is_recursive: false,
+        };
+        let ir = compile_action_ir(&def);
+        let inferred = BTreeMap::from([("p".to_string(), TlaValue::String("Alice".to_string()))]);
+        let mut ctx = build_action_expr_probe_context(
+            &state,
+            &defs,
+            &instances,
+            &ir.params,
+            &ir.clauses,
+            Some(&inferred),
+        );
+
+        for clause in &ir.clauses {
+            if let Some(result) = probe_action_clause_expr(clause, &mut ctx) {
+                result.expect("false guard should skip the rest of the branch");
+            }
+        }
+
+        assert_eq!(
+            ctx.locals.get("light'"),
+            Some(&TlaValue::String("off".to_string()))
+        );
+        assert_eq!(
+            ctx.locals.get("signalled'"),
+            Some(&TlaValue::Function(Arc::new(BTreeMap::new())))
+        );
+    }
+
+    #[test]
+    fn expr_probe_handles_move_elevator_style_let_actions() {
+        let elevator_1 = TlaValue::ModelValue("e1".to_string());
+        let elevator_2 = TlaValue::ModelValue("e2".to_string());
+        let e1_state = TlaValue::Record(Arc::new(BTreeMap::from([
+            ("floor".to_string(), TlaValue::Int(1)),
+            ("direction".to_string(), TlaValue::String("Up".to_string())),
+            ("doorsOpen".to_string(), TlaValue::Bool(false)),
+            (
+                "buttonsPressed".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::new())),
+            ),
+        ])));
+        let e2_state = TlaValue::Record(Arc::new(BTreeMap::from([
+            ("floor".to_string(), TlaValue::Int(2)),
+            (
+                "direction".to_string(),
+                TlaValue::String("Down".to_string()),
+            ),
+            ("doorsOpen".to_string(), TlaValue::Bool(false)),
+            (
+                "buttonsPressed".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::new())),
+            ),
+        ])));
+
+        let state = TlaState::from([
+            (
+                "Elevator".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([
+                    elevator_1.clone(),
+                    elevator_2.clone(),
+                ]))),
+            ),
+            (
+                "Floor".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([
+                    TlaValue::Int(1),
+                    TlaValue::Int(2),
+                ]))),
+            ),
+            (
+                "ElevatorState".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([
+                    (elevator_1.clone(), e1_state),
+                    (elevator_2, e2_state),
+                ]))),
+            ),
+            (
+                "ActiveElevatorCalls".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::new())),
+            ),
+            (
+                "PersonState".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::new())),
+            ),
+        ]);
+        let defs = BTreeMap::from([(
+            "CanServiceCall".to_string(),
+            TlaDefinition {
+                name: "CanServiceCall".to_string(),
+                params: vec!["e".to_string(), "c".to_string()],
+                body: r#"
+                    LET eState == ElevatorState[e] IN
+                    /\ c.floor = eState.floor
+                    /\ c.direction = eState.direction
+                "#
+                .to_string(),
+                is_recursive: false,
+            },
+        )]);
+        let def = TlaDefinition {
+            name: "MoveElevator".to_string(),
+            params: vec!["e".to_string()],
+            body: r#"
+                LET
+                  eState == ElevatorState[e]
+                  nextFloor == IF eState.direction = "Up" THEN eState.floor + 1 ELSE eState.floor - 1
+                IN
+                /\ eState.direction /= "Stationary"
+                /\ ~eState.doorsOpen
+                /\ eState.floor \notin eState.buttonsPressed
+                /\ \A call \in ActiveElevatorCalls :
+                    /\ CanServiceCall[e, call] =>
+                        /\ \E e2 \in Elevator :
+                            /\ e /= e2
+                            /\ CanServiceCall[e2, call]
+                /\ nextFloor \in Floor
+                /\ ElevatorState' = [ElevatorState EXCEPT ![e] = [@ EXCEPT !.floor = nextFloor]]
+                /\ UNCHANGED <<PersonState, ActiveElevatorCalls>>
+            "#
+            .to_string(),
+            is_recursive: false,
+        };
+        let instances = BTreeMap::new();
+        let inferred = BTreeMap::from([("e".to_string(), elevator_1.clone())]);
+        let guard_ctx = build_action_expr_probe_context(
+            &state,
+            &defs,
+            &instances,
+            &["e".to_string()],
+            &[],
+            Some(&inferred),
+        );
+        assert_eq!(
+            eval_expr(
+                r#"
+                    \A call \in ActiveElevatorCalls :
+                        /\ CanServiceCall[e, call] =>
+                            /\ \E e2 \in Elevator :
+                                /\ e /= e2
+                                /\ CanServiceCall[e2, call]
+                "#,
+                &guard_ctx,
+            )
+            .expect("quantified MoveElevator guard should evaluate"),
+            TlaValue::Bool(true)
+        );
+
+        let ir = compile_action_ir(&def);
+        let mut ctx = build_action_expr_probe_context(
+            &state,
+            &defs,
+            &instances,
+            &ir.params,
+            &ir.clauses,
+            Some(&inferred),
+        );
+
+        for clause in &ir.clauses {
+            if let Some(result) = probe_action_clause_expr(clause, &mut ctx) {
+                result.expect("MoveElevator LET body should probe without leaking `call`");
+            }
+        }
+
+        let Some(TlaValue::Function(map)) = ctx.locals.get("ElevatorState'") else {
+            panic!("expected staged ElevatorState'");
+        };
+        let Some(TlaValue::Record(fields)) = map.get(&elevator_1) else {
+            panic!("expected updated elevator record");
+        };
+        assert_eq!(fields.get("floor"), Some(&TlaValue::Int(2)));
+    }
+
+    #[test]
+    fn infer_action_param_samples_from_next_exists_quantifiers() {
+        let mut state = TlaState::new();
+        state.insert(
+            "Boats".to_string(),
+            TlaValue::Set(Arc::new(
+                [
+                    TlaValue::ModelValue("leftBoat".to_string()),
+                    TlaValue::ModelValue("rightBoat".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            )),
+        );
+        state.insert(
+            "Sides".to_string(),
+            TlaValue::Set(Arc::new(
+                [
+                    TlaValue::String("left".to_string()),
+                    TlaValue::String("right".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            )),
+        );
+
+        let mut defs = BTreeMap::new();
+        defs.insert(
+            "Cross".to_string(),
+            TlaDefinition {
+                name: "Cross".to_string(),
+                params: vec!["boat".to_string(), "side".to_string()],
+                body: "/\\ done' = done".to_string(),
+                is_recursive: false,
+            },
+        );
+
+        let samples = infer_action_param_samples_from_next(
+            r"\E b \in Boats, s \in Sides : Cross(b, s)",
+            &state,
+            &defs,
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(
+            samples.get("Cross").and_then(|params| params.get("boat")),
+            Some(&TlaValue::ModelValue("leftBoat".to_string()))
+        );
+        assert_eq!(
+            samples.get("Cross").and_then(|params| params.get("side")),
+            Some(&TlaValue::String("left".to_string()))
+        );
+    }
+
+    #[test]
+    fn infer_action_param_samples_handles_nested_line_leading_disjunctions() {
+        let state = TlaState::new();
+        let defs = BTreeMap::from([
+            (
+                "Acceptor".to_string(),
+                TlaDefinition {
+                    name: "Acceptor".to_string(),
+                    params: vec![],
+                    body: "{a1}".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Ballot".to_string(),
+                TlaDefinition {
+                    name: "Ballot".to_string(),
+                    params: vec![],
+                    body: "0..1".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Value".to_string(),
+                TlaDefinition {
+                    name: "Value".to_string(),
+                    params: vec![],
+                    body: "{v1}".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "IncreaseMaxBal".to_string(),
+                TlaDefinition {
+                    name: "IncreaseMaxBal".to_string(),
+                    params: vec!["a".to_string(), "b".to_string()],
+                    body: "TRUE".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "VoteFor".to_string(),
+                TlaDefinition {
+                    name: "VoteFor".to_string(),
+                    params: vec!["a".to_string(), "b".to_string(), "v".to_string()],
+                    body: "TRUE".to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+
+        let samples = infer_action_param_samples_from_next(
+            r#"\E a \in Acceptor, b \in Ballot :
+                  \/ IncreaseMaxBal(a, b)
+                  \/ \E v \in Value : VoteFor(a, b, v)"#,
+            &state,
+            &defs,
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(
+            samples
+                .get("IncreaseMaxBal")
+                .and_then(|params| params.get("a")),
+            Some(&TlaValue::ModelValue("a1".to_string()))
+        );
+        let increase_ballot = samples
+            .get("IncreaseMaxBal")
+            .and_then(|params| params.get("b"))
+            .and_then(|value| value.as_int().ok())
+            .expect("IncreaseMaxBal should sample a ballot");
+        assert!((0..=1).contains(&increase_ballot));
+        assert_eq!(
+            samples.get("VoteFor").and_then(|params| params.get("a")),
+            Some(&TlaValue::ModelValue("a1".to_string()))
+        );
+        let vote_ballot = samples
+            .get("VoteFor")
+            .and_then(|params| params.get("b"))
+            .and_then(|value| value.as_int().ok())
+            .expect("VoteFor should sample a ballot");
+        assert!((0..=1).contains(&vote_ballot));
+        assert_eq!(
+            samples.get("VoteFor").and_then(|params| params.get("v")),
+            Some(&TlaValue::ModelValue("v1".to_string()))
+        );
+    }
+
+    #[test]
+    fn infer_action_param_samples_propagates_into_nested_action_calls() {
+        let mut state = TlaState::new();
+        state.insert(
+            "Workers".to_string(),
+            TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::ModelValue(
+                "w1".to_string(),
+            )]))),
+        );
+
+        let defs = BTreeMap::from([
+            (
+                "Outer".to_string(),
+                TlaDefinition {
+                    name: "Outer".to_string(),
+                    params: vec!["self".to_string()],
+                    body: "Step(self) \\/ Idle(self)".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Step".to_string(),
+                TlaDefinition {
+                    name: "Step".to_string(),
+                    params: vec!["self".to_string()],
+                    body: "pc' = pc".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Idle".to_string(),
+                TlaDefinition {
+                    name: "Idle".to_string(),
+                    params: vec!["self".to_string()],
+                    body: "UNCHANGED <<pc>>".to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+
+        let samples = infer_action_param_samples_from_next(
+            r"\E self \in Workers : Outer(self)",
+            &state,
+            &defs,
+            &BTreeMap::new(),
+        );
+
+        let expected = TlaValue::ModelValue("w1".to_string());
+        assert_eq!(
+            samples.get("Outer").and_then(|params| params.get("self")),
+            Some(&expected)
+        );
+        assert_eq!(
+            samples.get("Step").and_then(|params| params.get("self")),
+            Some(&expected)
+        );
+        assert_eq!(
+            samples.get("Idle").and_then(|params| params.get("self")),
+            Some(&expected)
+        );
+    }
+
+    #[test]
+    fn infer_action_param_samples_handles_nat_backed_binders() {
+        let state = TlaState::new();
+        let defs = BTreeMap::from([
+            (
+                "Ballot".to_string(),
+                TlaDefinition {
+                    name: "Ballot".to_string(),
+                    params: vec![],
+                    body: "Nat".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Phase2a".to_string(),
+                TlaDefinition {
+                    name: "Phase2a".to_string(),
+                    params: vec!["b".to_string()],
+                    body: "pc' = pc".to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+
+        let samples = infer_action_param_samples_from_next(
+            r"\E b \in Ballot : Phase2a(b)",
+            &state,
+            &defs,
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(
+            samples.get("Phase2a").and_then(|params| params.get("b")),
+            Some(&TlaValue::Int(0))
+        );
+    }
+
+    #[test]
+    fn build_action_expr_probe_context_prefers_inferred_param_samples() {
+        let state = TlaState::new();
+        let defs = BTreeMap::new();
+        let instances = BTreeMap::new();
+        let clauses = vec![ActionClause::Guard {
+            expr: "self = self".to_string(),
+        }];
+        let inferred = BTreeMap::from([(
+            "self".to_string(),
+            TlaValue::ModelValue("worker-1".to_string()),
+        )]);
+
+        let ctx = build_action_expr_probe_context(
+            &state,
+            &defs,
+            &instances,
+            &["self".to_string()],
+            &clauses,
+            Some(&inferred),
+        );
+
+        assert_eq!(
+            ctx.locals.get("self"),
+            Some(&TlaValue::ModelValue("worker-1".to_string()))
+        );
+    }
+
+    #[test]
+    fn build_action_expr_probe_context_binds_normalized_param_names() {
+        let state = TlaState::new();
+        let defs = BTreeMap::new();
+        let instances = BTreeMap::new();
+        let inferred = BTreeMap::from([(
+            "leader".to_string(),
+            TlaValue::ModelValue("node-1".to_string()),
+        )]);
+
+        let ctx = build_action_expr_probe_context(
+            &state,
+            &defs,
+            &instances,
+            &[r"leader \in Node".to_string()],
+            &[],
+            Some(&inferred),
+        );
+
+        assert_eq!(
+            eval_expr("leader", &ctx).expect("normalized param should resolve"),
+            TlaValue::ModelValue("node-1".to_string())
+        );
+    }
+
+    #[test]
+    fn build_action_expr_probe_context_refines_samples_from_guard_domains() {
+        let state = TlaState::new();
+        let defs = BTreeMap::from([(
+            "NormalPrisoner".to_string(),
+            TlaDefinition {
+                name: "NormalPrisoner".to_string(),
+                params: vec![],
+                body: "{\"Bob\"}".to_string(),
+                is_recursive: false,
+            },
+        )]);
+        let instances = BTreeMap::new();
+        let clauses = vec![ActionClause::Guard {
+            expr: "p \\in NormalPrisoner".to_string(),
+        }];
+        let inferred = BTreeMap::from([("p".to_string(), TlaValue::String("Alice".to_string()))]);
+
+        let ctx = build_action_expr_probe_context(
+            &state,
+            &defs,
+            &instances,
+            &["p".to_string()],
+            &clauses,
+            Some(&inferred),
+        );
+
+        assert_eq!(
+            ctx.locals.get("p"),
+            Some(&TlaValue::String("Bob".to_string()))
+        );
+    }
+
+    #[test]
+    fn build_action_expr_probe_context_seeds_default_primed_state_bindings() {
+        let mut state = TlaState::new();
+        state.insert(
+            "rcvd".to_string(),
+            TlaValue::Function(Arc::new(BTreeMap::from([(
+                TlaValue::Int(1),
+                TlaValue::Set(Arc::new(BTreeSet::new())),
+            )]))),
+        );
+        let defs = BTreeMap::new();
+        let instances = BTreeMap::new();
+
+        let ctx = build_action_expr_probe_context(&state, &defs, &instances, &[], &[], None);
+
+        assert_eq!(ctx.locals.get("rcvd'"), state.get("rcvd"));
+    }
+
+    #[test]
+    fn sample_param_value_prefers_function_domains_and_integer_hints() {
+        let mut state = TlaState::new();
+        state.insert(
+            "Key".to_string(),
+            TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::ModelValue(
+                "k1".to_string(),
+            )]))),
+        );
+        state.insert(
+            "TxId".to_string(),
+            TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::ModelValue(
+                "t1".to_string(),
+            )]))),
+        );
+        state.insert(
+            "Val".to_string(),
+            TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::ModelValue(
+                "v1".to_string(),
+            )]))),
+        );
+        state.insert(
+            "signalled".to_string(),
+            TlaValue::Function(Arc::new(BTreeMap::from([(
+                TlaValue::String("Bob".to_string()),
+                TlaValue::Int(0),
+            )]))),
+        );
+        state.insert(
+            "pc".to_string(),
+            TlaValue::Function(Arc::new(BTreeMap::from([(
+                TlaValue::ModelValue("writer-1".to_string()),
+                TlaValue::String("Advance".to_string()),
+            )]))),
+        );
+
+        assert_eq!(
+            sample_param_value("p", &state),
+            TlaValue::String("Bob".to_string())
+        );
+        assert_eq!(
+            sample_param_value("t", &state),
+            TlaValue::ModelValue("t1".to_string())
+        );
+        assert_eq!(
+            sample_param_value("k", &state),
+            TlaValue::ModelValue("k1".to_string())
+        );
+        assert_eq!(
+            sample_param_value("v", &state),
+            TlaValue::ModelValue("v1".to_string())
+        );
+        assert_eq!(sample_param_value("sequence", &state), TlaValue::Int(0));
+    }
+
+    #[test]
+    fn sample_param_value_with_context_uses_named_type_sets() {
+        let state = TlaState::new();
+        let defs = BTreeMap::from([(
+            "Ballot".to_string(),
+            TlaDefinition {
+                name: "Ballot".to_string(),
+                params: vec![],
+                body: "Nat".to_string(),
+                is_recursive: false,
+            },
+        )]);
+
+        assert_eq!(
+            sample_param_value_with_context("ballot", &state, &defs, &BTreeMap::new()),
+            TlaValue::Int(0)
+        );
+    }
+
+    #[test]
+    fn sample_param_value_with_context_prefers_proc_sets_for_generic_p() {
+        let state = TlaState::from([(
+            "wmem".to_string(),
+            TlaValue::Function(Arc::new(BTreeMap::from([(
+                TlaValue::ModelValue("a1".to_string()),
+                TlaValue::ModelValue("v1".to_string()),
+            )]))),
+        )]);
+        let defs = BTreeMap::from([(
+            "Proc".to_string(),
+            TlaDefinition {
+                name: "Proc".to_string(),
+                params: vec![],
+                body: "{p1}".to_string(),
+                is_recursive: false,
+            },
+        )]);
+
+        assert_eq!(
+            sample_param_value_with_context("p", &state, &defs, &BTreeMap::new()),
+            TlaValue::ModelValue("p1".to_string())
+        );
+    }
+
+    #[test]
+    fn sample_param_value_with_context_uses_definition_backed_record_sets() {
+        let state = TlaState::new();
+        let defs = BTreeMap::from([(
+            "ElevatorCall".to_string(),
+            TlaDefinition {
+                name: "ElevatorCall".to_string(),
+                params: vec![],
+                body: r#"[floor : {1}, direction : {"Up"}]"#.to_string(),
+                is_recursive: false,
+            },
+        )]);
+
+        let sample = sample_param_value_with_context("call", &state, &defs, &BTreeMap::new());
+
+        let TlaValue::Record(fields) = sample else {
+            panic!("expected representative record sample");
+        };
+        assert_eq!(fields.get("floor"), Some(&TlaValue::Int(1)));
+        assert_eq!(
+            fields.get("direction"),
+            Some(&TlaValue::String("Up".to_string()))
+        );
+    }
+
+    #[test]
+    fn action_expr_probe_context_preserves_module_instances() {
+        let state = TlaState::new();
+        let defs = BTreeMap::new();
+        let helper_module = TlaModule {
+            definitions: BTreeMap::from([(
+                "Echo".to_string(),
+                TlaDefinition {
+                    name: "Echo".to_string(),
+                    params: vec!["value".to_string()],
+                    body: "value".to_string(),
+                    is_recursive: false,
+                },
+            )]),
+            ..TlaModule::default()
+        };
+        let instances = BTreeMap::from([(
+            "H".to_string(),
+            TlaModuleInstance {
+                alias: "H".to_string(),
+                module_name: "Helper".to_string(),
+                substitutions: BTreeMap::new(),
+                is_local: false,
+                module: Some(Box::new(helper_module)),
+            },
+        )]);
+        let clauses = vec![ActionClause::Guard {
+            expr: "H!Echo(self) = self".to_string(),
+        }];
+
+        let mut ctx = build_action_expr_probe_context(
+            &state,
+            &defs,
+            &instances,
+            &["self".to_string()],
+            &clauses,
+            Some(&BTreeMap::from([(
+                "self".to_string(),
+                TlaValue::ModelValue("p1".to_string()),
+            )])),
+        );
+
+        for clause in &clauses {
+            if let Some(result) = probe_action_clause_expr(clause, &mut ctx) {
+                result.expect("probe should evaluate instance-qualified operator calls");
+            }
+        }
+    }
+
+    #[test]
+    fn skips_temporal_formulas_in_action_expr_probe() {
+        assert!(should_skip_action_expr_probe("[][x = x']_vars"));
+        assert!(should_skip_action_expr_probe("<> done"));
+        assert!(!should_skip_action_expr_probe("x' = x + 1"));
+    }
+
+    #[test]
+    fn skips_nested_action_bodies_in_action_expr_probe() {
+        let expr = r#"
+            ( \/ /\ fd'[self] = TRUE
+                /\ pc' = [pc EXCEPT ![self] = "ABORT"]
+              \/ /\ fd'[self] = FALSE
+                /\ pc' = [pc EXCEPT ![self] = "COMMIT"] )
+        "#;
+
+        assert!(should_skip_action_expr_probe(expr));
+        assert!(!should_skip_action_expr_probe("fd'[self] = TRUE"));
+    }
+
+    #[test]
+    fn expr_probe_expands_exists_action_clauses() {
+        let mut state = TlaState::new();
+        state.insert("x".to_string(), TlaValue::Int(0));
+        state.insert("y".to_string(), TlaValue::Int(0));
+
+        let defs = BTreeMap::from([
+            (
+                "Choice".to_string(),
+                TlaDefinition {
+                    name: "Choice".to_string(),
+                    params: vec![],
+                    body: r#"\E v \in {1, 2} : x' = v"#.to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Outer".to_string(),
+                TlaDefinition {
+                    name: "Outer".to_string(),
+                    params: vec![],
+                    body: "/\\ Choice() /\\ y' = x'".to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+        let ir = compile_action_ir(defs.get("Outer").unwrap());
+        let instances = BTreeMap::new();
+        let mut ctx = build_action_expr_probe_context(
+            &state,
+            &defs,
+            &instances,
+            &ir.params,
+            &ir.clauses,
+            None,
+        );
+
+        for clause in &ir.clauses {
+            if let Some(result) = probe_action_clause_expr(clause, &mut ctx) {
+                result.expect("exists binders should be sampled during nested action probing");
+            }
+        }
+
+        assert_eq!(ctx.locals.get("x'"), Some(&TlaValue::Int(1)));
+        assert_eq!(ctx.locals.get("y'"), Some(&TlaValue::Int(1)));
+    }
+
+    #[test]
+    fn expr_probe_expands_exists_action_clauses_with_disjunctions() {
+        let mut state = TlaState::new();
+        state.insert("x".to_string(), TlaValue::Int(0));
+        state.insert("y".to_string(), TlaValue::Int(0));
+
+        let defs = BTreeMap::from([(
+            "Choice".to_string(),
+            TlaDefinition {
+                name: "Choice".to_string(),
+                params: vec![],
+                body: r#"\E v \in {1, 2} :
+                    \/
+                      /\ x' = v
+                      /\ y' = v
+                    \/
+                      /\ x' = 0
+                      /\ y' = 0"#
+                    .to_string(),
+                is_recursive: false,
+            },
+        )]);
+        let ir = compile_action_ir(defs.get("Choice").unwrap());
+        let instances = BTreeMap::new();
+        let mut ctx = build_action_expr_probe_context(
+            &state,
+            &defs,
+            &instances,
+            &ir.params,
+            &ir.clauses,
+            None,
+        );
+
+        for clause in &ir.clauses {
+            if let Some(result) = probe_action_clause_expr(clause, &mut ctx) {
+                result.expect("exists disjunctive bodies should be probeable");
+            }
+        }
+
+        let x_prime = ctx.locals.get("x'").expect("x' should be staged");
+        let y_prime = ctx.locals.get("y'").expect("y' should be staged");
+        assert_eq!(x_prime, y_prime);
+        assert!(matches!(
+            x_prime,
+            TlaValue::Int(0) | TlaValue::Int(1) | TlaValue::Int(2)
+        ));
+    }
+
+    #[test]
+    fn expr_probe_normalizes_commented_disjunctive_action_bodies() {
+        let normalized = normalize_probe_clause_expr(
+            r#"
+                \* Pick the matching action branch for this mode.
+                /\ \/ CounterPath(mode)
+                   \/ StandardPath(mode)
+            "#,
+        );
+
+        assert!(!normalized.contains("\\*"));
+        assert!(normalized.trim_start().starts_with("\\/ CounterPath(mode)"));
+        assert!(normalized.contains("StandardPath(mode)"));
+    }
+
+    #[test]
+    fn parse_probe_action_if_handles_nested_if_then_branch() {
+        let expr = r#"
+            IF meetingPlace = MeetingPlaceEmpty
+            THEN IF numMeetings < N
+                    THEN /\ meetingPlace' = cid
+                         /\ UNCHANGED <<chameneoses, numMeetings>>
+                    ELSE /\ chameneoses' = [chameneoses EXCEPT ![cid] = <<Faded, @[2]>>]
+                         /\ UNCHANGED <<meetingPlace, numMeetings>>
+            ELSE /\ meetingPlace' = MeetingPlaceEmpty
+        "#;
+
+        let (_, then_branch, else_branch) =
+            parse_probe_action_if(expr).expect("nested IF should parse");
+        assert!(then_branch.starts_with("IF numMeetings < N"));
+        assert!(then_branch.contains("ELSE /\\ chameneoses'"));
+        assert_eq!(else_branch, "/\\ meetingPlace' = MeetingPlaceEmpty");
+    }
+
+    #[test]
+    fn expr_probe_handles_pluscal_style_disjunctive_if_action_branches() {
+        let rm1 = TlaValue::ModelValue("rm1".to_string());
+        let rm2 = TlaValue::ModelValue("rm2".to_string());
+        let rm3 = TlaValue::ModelValue("rm3".to_string());
+        let state = TlaState::from([
+            (
+                "rmState".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([
+                    (rm1.clone(), TlaValue::String("working".to_string())),
+                    (rm2.clone(), TlaValue::String("working".to_string())),
+                    (rm3.clone(), TlaValue::String("prepared".to_string())),
+                ]))),
+            ),
+            (
+                "tmState".to_string(),
+                TlaValue::String("commit".to_string()),
+            ),
+            (
+                "pc".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([
+                    (rm1.clone(), TlaValue::String("RS".to_string())),
+                    (rm2.clone(), TlaValue::String("RS".to_string())),
+                    (rm3.clone(), TlaValue::String("RS".to_string())),
+                ]))),
+            ),
+        ]);
+        let defs = BTreeMap::from([
+            (
+                "RM".to_string(),
+                TlaDefinition {
+                    name: "RM".to_string(),
+                    params: vec![],
+                    body: "{rm1, rm2, rm3}".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "RMMAYFAIL".to_string(),
+                TlaDefinition {
+                    name: "RMMAYFAIL".to_string(),
+                    params: vec![],
+                    body: "TRUE".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "RS".to_string(),
+                TlaDefinition {
+                    name: "RS".to_string(),
+                    params: vec!["self".to_string()],
+                    body: r#"
+                        /\ pc[self] = "RS"
+                        /\ IF rmState[self] \in {"working", "prepared"}
+                              THEN /\ \/ /\ rmState[self] = "working"
+                                         /\ rmState' = [rmState EXCEPT ![self] = "prepared"]
+                                      \/ /\ \/ /\ tmState="commit"
+                                               /\ rmState' = [rmState EXCEPT ![self] = "committed"]
+                                            \/ /\ rmState[self]="working" \/ tmState="abort"
+                                               /\ rmState' = [rmState EXCEPT ![self] = "aborted"]
+                                      \/ /\ IF RMMAYFAIL /\ ~\E rm \in RM:rmState[rm]="failed"
+                                               THEN /\ rmState' = [rmState EXCEPT ![self] = "failed"]
+                                               ELSE /\ TRUE
+                                                    /\ UNCHANGED rmState
+                                   /\ pc' = [pc EXCEPT ![self] = "RS"]
+                              ELSE /\ pc' = [pc EXCEPT ![self] = "Done"]
+                                   /\ UNCHANGED rmState
+                        /\ UNCHANGED tmState
+                    "#
+                    .to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+
+        let def = defs.get("RS").unwrap();
+        let ir = compile_action_ir(def);
+        let samples = BTreeMap::from([("self".to_string(), rm3.clone())]);
+        let instances = BTreeMap::new();
+        let mut ctx = build_action_expr_probe_context(
+            &state,
+            &defs,
+            &instances,
+            &ir.params,
+            &ir.clauses,
+            Some(&samples),
+        );
+
+        for clause in &ir.clauses {
+            if let Some(result) = probe_action_clause_expr(clause, &mut ctx) {
+                result.expect("PlusCal-style IF branch should be probeable");
+            }
+        }
+
+        assert_eq!(ctx.locals.get("pc'"), state.get("pc"));
+        let rm_state_prime = ctx
+            .locals
+            .get("rmState'")
+            .expect("rmState' should be staged");
+        assert_ne!(Some(rm_state_prime), state.get("rmState"));
+        let TlaValue::Function(map) = rm_state_prime else {
+            panic!("expected function-valued rmState', got {rm_state_prime:?}");
+        };
+        assert_ne!(
+            map.get(&rm3),
+            Some(&TlaValue::String("prepared".to_string())),
+            "probe should pick a branch that changes rmState[self]"
+        );
+        assert_eq!(ctx.locals.get("tmState'"), state.get("tmState"));
+    }
+
+    #[test]
+    fn injects_operator_ref_constants_with_target_arity() {
+        let mut module = TlaModule {
+            name: "MCWriteThroughCache".to_string(),
+            path: String::new(),
+            extends: Vec::new(),
+            constants: vec![],
+            variables: vec![],
+            definitions: BTreeMap::from([(
+                "MCSend".to_string(),
+                TlaDefinition {
+                    name: "MCSend".to_string(),
+                    params: vec![
+                        "p".to_string(),
+                        "d".to_string(),
+                        "oldMemInt".to_string(),
+                        "newMemInt".to_string(),
+                    ],
+                    body: "newMemInt = <<p, d>>".to_string(),
+                    is_recursive: false,
+                },
+            )]),
+            recursive_declarations: BTreeSet::new(),
+            instances: BTreeMap::new(),
+            unnamed_instances: Vec::new(),
+            is_pluscal: false,
+        };
+        let config = TlaConfig {
+            constants: BTreeMap::from([(
+                "Send".to_string(),
+                ConfigValue::OperatorRef("MCSend".to_string()),
+            )]),
+            ..TlaConfig::default()
+        };
+
+        inject_constants_into_definitions(&mut module, &config);
+        let send = module
+            .definitions
+            .get("Send")
+            .expect("Send alias should be injected");
+        assert_eq!(send.params, vec!["p", "d", "oldMemInt", "newMemInt"]);
+        assert_eq!(send.body, "MCSend(p, d, oldMemInt, newMemInt)");
+    }
+
+    #[test]
+    fn injects_matching_constants_into_loaded_instance_modules() {
+        let instance_module = TlaModule {
+            name: "Nano".to_string(),
+            path: String::new(),
+            extends: Vec::new(),
+            constants: Vec::new(),
+            variables: vec![],
+            definitions: BTreeMap::from([
+                (
+                    "NoBlock".to_string(),
+                    TlaDefinition {
+                        name: "NoBlock".to_string(),
+                        params: vec![],
+                        body: "CHOOSE b : b \\notin SignedBlock".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+                (
+                    "NoBlockVal".to_string(),
+                    TlaDefinition {
+                        name: "NoBlockVal".to_string(),
+                        params: vec![],
+                        body: "NoBlockVal".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+            ]),
+            recursive_declarations: BTreeSet::new(),
+            instances: BTreeMap::new(),
+            unnamed_instances: Vec::new(),
+            is_pluscal: false,
+        };
+        let mut module = TlaModule {
+            name: "MCNano".to_string(),
+            path: String::new(),
+            extends: Vec::new(),
+            constants: Vec::new(),
+            variables: vec![],
+            definitions: BTreeMap::new(),
+            recursive_declarations: BTreeSet::new(),
+            instances: BTreeMap::from([(
+                "N".to_string(),
+                TlaModuleInstance {
+                    alias: "N".to_string(),
+                    module_name: "Nano".to_string(),
+                    substitutions: BTreeMap::new(),
+                    is_local: false,
+                    module: Some(Box::new(instance_module)),
+                },
+            )]),
+            unnamed_instances: Vec::new(),
+            is_pluscal: false,
+        };
+        let config = TlaConfig {
+            constants: BTreeMap::from([
+                (
+                    "NoBlock".to_string(),
+                    ConfigValue::OperatorRef("[Nano]NoBlockVal".to_string()),
+                ),
+                (
+                    "NoBlockVal".to_string(),
+                    ConfigValue::ModelValue("NoBlockVal".to_string()),
+                ),
+            ]),
+            ..TlaConfig::default()
+        };
+
+        inject_constants_into_definitions(&mut module, &config);
+
+        let instance = module.instances.get("N").expect("instance should exist");
+        let instance_module = instance
+            .module
+            .as_ref()
+            .expect("instance module should be loaded");
+        let no_block = instance_module
+            .definitions
+            .get("NoBlock")
+            .expect("instance constant override should be injected");
+        assert_eq!(no_block.body, "NoBlockVal");
     }
 }

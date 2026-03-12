@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -368,13 +368,15 @@ fn replace_identifier(expr: &str, from: &str, to: &str) -> String {
 
 pub fn parse_tla_module_text(input: &str) -> Result<TlaModule> {
     let cleaned = strip_comments(input);
+    let mut pending_lines: VecDeque<String> =
+        cleaned.lines().map(|line| line.to_string()).collect();
     let mut module = TlaModule::default();
 
     let mut current_def: Option<TlaDefinition> = None;
     let mut current_def_indent = 0usize;
     let mut mode = NameListMode::None;
 
-    for line in cleaned.lines() {
+    while let Some(line) = pending_lines.pop_front() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             if let Some(def) = current_def.as_mut() {
@@ -395,6 +397,13 @@ pub fn parse_tla_module_text(input: &str) -> Result<TlaModule> {
         }
 
         if trimmed.starts_with("====") {
+            flush_definition(&mut module, &mut current_def);
+            current_def_indent = 0;
+            mode = NameListMode::None;
+            continue;
+        }
+
+        if trimmed.starts_with("ASSUME") || trimmed.starts_with("AXIOM") {
             flush_definition(&mut module, &mut current_def);
             current_def_indent = 0;
             mode = NameListMode::None;
@@ -491,8 +500,14 @@ pub fn parse_tla_module_text(input: &str) -> Result<TlaModule> {
         }
 
         let line_indent = line.chars().take_while(|c| c.is_whitespace()).count();
-        let can_start_definition = current_def.is_none() || line_indent <= current_def_indent;
-        if can_start_definition && let Some((lhs, rhs)) = split_definition_line(trimmed) {
+        let can_start_definition = current_def.is_none()
+            || line_indent <= current_def_indent
+            || current_def
+                .as_ref()
+                .is_some_and(|def| can_start_indented_definition_after_gap(def, trimmed));
+        if can_start_definition
+            && let Some((lhs, rhs, remainder)) = split_definition_line_with_remainder(trimmed)
+        {
             flush_definition(&mut module, &mut current_def);
             current_def_indent = line_indent;
             mode = NameListMode::None;
@@ -503,6 +518,11 @@ pub fn parse_tla_module_text(input: &str) -> Result<TlaModule> {
                 body: rhs.trim().to_string(),
                 is_recursive: false, // Will be set by flush_definition
             });
+            if let Some(remainder) = remainder {
+                let indent_width = line.len() - line.trim_start().len();
+                let indent = &line[..indent_width];
+                pending_lines.push_front(format!("{indent}{remainder}"));
+            }
             continue;
         }
 
@@ -525,10 +545,10 @@ pub fn parse_tla_module_text(input: &str) -> Result<TlaModule> {
         }
 
         match mode {
-            NameListMode::Constants if is_pure_name_list(trimmed) => {
+            NameListMode::Constants if is_name_list_continuation(trimmed, true) => {
                 push_names(trimmed, &mut module.constants);
             }
-            NameListMode::Variables if is_pure_name_list(trimmed) => {
+            NameListMode::Variables if is_name_list_continuation(trimmed, false) => {
                 push_names(trimmed, &mut module.variables);
             }
             _ => {
@@ -545,6 +565,48 @@ pub fn parse_tla_module_text(input: &str) -> Result<TlaModule> {
     module.variables.dedup();
 
     Ok(module)
+}
+
+fn split_definition_line_with_remainder(line: &str) -> Option<(&str, &str, Option<&str>)> {
+    let (lhs, rhs) = split_definition_line(line)?;
+    let remainder_start = find_inline_definition_start(rhs);
+    let (body, remainder) = match remainder_start {
+        Some(idx) => (rhs[..idx].trim_end(), Some(rhs[idx..].trim_start())),
+        None => (rhs, None),
+    };
+    Some((lhs, body, remainder.filter(|rest| !rest.is_empty())))
+}
+
+fn can_start_indented_definition_after_gap(current_def: &TlaDefinition, line: &str) -> bool {
+    if !current_def.body.ends_with("\n\n") {
+        return false;
+    }
+
+    let last_non_empty_line = current_def
+        .body
+        .trim_end_matches('\n')
+        .rsplit('\n')
+        .find(|segment| !segment.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    if definition_body_requires_continuation(last_non_empty_line) {
+        return false;
+    }
+
+    split_definition_line(line)
+        .map(|(lhs, _)| is_plausible_inline_definition_head(lhs))
+        .unwrap_or(false)
+}
+
+fn definition_body_requires_continuation(line: &str) -> bool {
+    let line = line.trim_end();
+    line.ends_with("LET")
+        || line.ends_with("IN")
+        || line.ends_with("THEN")
+        || line.ends_with("ELSE")
+        || line.ends_with(':')
+        || line.ends_with("/\\")
+        || line.ends_with("\\/")
 }
 
 fn flush_definition(module: &mut TlaModule, current: &mut Option<TlaDefinition>) {
@@ -581,6 +643,75 @@ fn split_definition_line(line: &str) -> Option<(&str, &str)> {
     Some((lhs, rhs))
 }
 
+fn find_inline_definition_start(rhs: &str) -> Option<usize> {
+    let trimmed = rhs.trim_start();
+    if trimmed.starts_with("LET ")
+        || trimmed.starts_with("LET\n")
+        || trimmed.starts_with("IF ")
+        || trimmed.starts_with("CASE ")
+    {
+        return None;
+    }
+
+    let chars: Vec<(usize, char)> = rhs.char_indices().collect();
+    let mut paren = 0usize;
+    let mut bracket = 0usize;
+    let mut brace = 0usize;
+    let mut angle = 0usize;
+
+    let mut i = 0usize;
+    while i < chars.len() {
+        let (byte_idx, ch) = chars[i];
+        match ch {
+            '(' => paren += 1,
+            ')' => paren = paren.saturating_sub(1),
+            '[' => bracket += 1,
+            ']' => bracket = bracket.saturating_sub(1),
+            '{' => brace += 1,
+            '}' => brace = brace.saturating_sub(1),
+            '<' => {
+                if i + 1 < chars.len() && chars[i + 1].1 == '<' {
+                    angle += 1;
+                    i += 1;
+                }
+            }
+            '>' => {
+                if i + 1 < chars.len() && chars[i + 1].1 == '>' {
+                    angle = angle.saturating_sub(1);
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+
+        if paren == 0 && bracket == 0 && brace == 0 && angle == 0 && ch.is_whitespace() {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].1.is_whitespace() {
+                j += 1;
+            }
+            if j < chars.len() {
+                let candidate = &rhs[chars[j].0..];
+                if let Some((lhs, _)) = split_definition_line(candidate)
+                    && is_plausible_inline_definition_head(lhs)
+                {
+                    return Some(chars[j].0);
+                }
+            }
+        }
+
+        let _ = byte_idx;
+        i += 1;
+    }
+
+    None
+}
+
+fn is_plausible_inline_definition_head(lhs: &str) -> bool {
+    let lhs = lhs.trim();
+    let lhs = lhs.strip_prefix("LOCAL ").unwrap_or(lhs).trim();
+    matches!(lhs.chars().next(), Some(c) if c.is_alphabetic() || c == '_')
+}
+
 fn parse_def_head(lhs: &str) -> (String, Vec<String>) {
     // Strip LOCAL prefix if present
     let lhs = if let Some(rest) = lhs.strip_prefix("LOCAL ") {
@@ -589,17 +720,13 @@ fn parse_def_head(lhs: &str) -> (String, Vec<String>) {
         lhs
     };
 
-    if let Some(open) = lhs.find('(')
-        && let Some(close) = lhs.rfind(')')
-        && close > open
+    if let Some((open_delim, close_delim)) = first_param_delims(lhs)
+        && let Some((name, params)) = parse_def_head_with_delims(lhs, open_delim, close_delim)
     {
-        let name = lhs[..open].trim().to_string();
-        let params = lhs[open + 1..close]
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
+        return (name, params);
+    }
+
+    if let Some((name, params)) = parse_infix_def_head(lhs) {
         return (name, params);
     }
 
@@ -611,39 +738,252 @@ fn parse_def_head(lhs: &str) -> (String, Vec<String>) {
     (name, Vec::new())
 }
 
-fn push_names(text: &str, out: &mut Vec<String>) {
-    for token in text.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let mut name = String::new();
-        for c in token.chars() {
-            if c.is_alphanumeric() || c == '_' {
-                name.push(c);
-            } else {
-                break;
+fn parse_infix_def_head(lhs: &str) -> Option<(String, Vec<String>)> {
+    if lhs.contains('(') || lhs.contains('[') || lhs.contains(',') {
+        return None;
+    }
+
+    let parts: Vec<&str> = lhs.split_whitespace().collect();
+    if parts.len() != 3 {
+        return None;
+    }
+
+    let left = normalize_operator_param(parts[0]);
+    let op = parts[1].trim();
+    let right = normalize_operator_param(parts[2]);
+    if left.is_empty() || right.is_empty() || !is_symbolic_operator_name(op) {
+        return None;
+    }
+
+    Some((op.to_string(), vec![left, right]))
+}
+
+fn is_symbolic_operator_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .any(|ch| !(ch.is_ascii_alphanumeric() || ch == '_'))
+}
+
+fn parse_def_head_with_delims(
+    lhs: &str,
+    open_delim: char,
+    close_delim: char,
+) -> Option<(String, Vec<String>)> {
+    let open = lhs.find(open_delim)?;
+    let close = lhs.rfind(close_delim)?;
+    if close <= open {
+        return None;
+    }
+
+    let name = lhs[..open].trim().to_string();
+    let params = split_operator_params(&lhs[open + 1..close]);
+    Some((name, params))
+}
+
+fn first_param_delims(lhs: &str) -> Option<(char, char)> {
+    match (lhs.find('('), lhs.find('[')) {
+        (Some(paren), Some(bracket)) if bracket < paren => Some(('[', ']')),
+        (Some(_), Some(_)) => Some(('(', ')')),
+        (Some(_), None) => Some(('(', ')')),
+        (None, Some(_)) => Some(('[', ']')),
+        (None, None) => None,
+    }
+}
+
+fn split_operator_params(params_text: &str) -> Vec<String> {
+    split_top_level_commas(params_text)
+        .into_iter()
+        .flat_map(|part| {
+            let lhs = top_level_in_pos(part)
+                .map(|pos| &part[..pos])
+                .unwrap_or(part);
+            split_top_level_commas(lhs)
+                .into_iter()
+                .map(normalize_operator_param)
+                .filter(|param| !param.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn normalize_operator_param(param: &str) -> String {
+    let param = param.trim();
+    if let Some(paren_pos) = param.find('(') {
+        return param[..paren_pos].trim().to_string();
+    }
+    param.to_string()
+}
+
+fn split_top_level_commas(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut paren = 0usize;
+    let mut bracket = 0usize;
+    let mut brace = 0usize;
+    let mut angle = 0usize;
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+
+    let mut i = 0usize;
+    while i < chars.len() {
+        let (byte_idx, ch) = chars[i];
+        match ch {
+            '(' => paren += 1,
+            ')' => paren = paren.saturating_sub(1),
+            '[' => bracket += 1,
+            ']' => bracket = bracket.saturating_sub(1),
+            '{' => brace += 1,
+            '}' => brace = brace.saturating_sub(1),
+            '<' => {
+                if i + 1 < chars.len() && chars[i + 1].1 == '<' {
+                    angle += 1;
+                    i += 1;
+                }
             }
+            '>' => {
+                if i + 1 < chars.len() && chars[i + 1].1 == '>' {
+                    angle = angle.saturating_sub(1);
+                    i += 1;
+                }
+            }
+            ',' if paren == 0 && bracket == 0 && brace == 0 && angle == 0 => {
+                parts.push(text[start..byte_idx].trim());
+                start = byte_idx + ch.len_utf8();
+            }
+            _ => {}
         }
-        if !name.is_empty() {
+        i += 1;
+    }
+
+    parts.push(text[start..].trim());
+    parts
+}
+
+fn top_level_in_pos(text: &str) -> Option<usize> {
+    let mut paren = 0usize;
+    let mut bracket = 0usize;
+    let mut brace = 0usize;
+    let mut angle = 0usize;
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+
+    let mut i = 0usize;
+    while i < chars.len() {
+        let (byte_idx, ch) = chars[i];
+        match ch {
+            '(' => paren += 1,
+            ')' => paren = paren.saturating_sub(1),
+            '[' => bracket += 1,
+            ']' => bracket = bracket.saturating_sub(1),
+            '{' => brace += 1,
+            '}' => brace = brace.saturating_sub(1),
+            '<' => {
+                if i + 1 < chars.len() && chars[i + 1].1 == '<' {
+                    angle += 1;
+                    i += 1;
+                }
+            }
+            '>' => {
+                if i + 1 < chars.len() && chars[i + 1].1 == '>' {
+                    angle = angle.saturating_sub(1);
+                    i += 1;
+                }
+            }
+            '\\' if paren == 0
+                && bracket == 0
+                && brace == 0
+                && angle == 0
+                && text[byte_idx..].starts_with("\\in") =>
+            {
+                return Some(byte_idx);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    None
+}
+
+fn push_names(text: &str, out: &mut Vec<String>) {
+    for token in split_top_level_commas(text)
+        .into_iter()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if let Some((name, _)) = split_declared_name(token) {
             out.push(name);
         }
     }
 }
 
-fn is_pure_name_list(line: &str) -> bool {
-    line.split(',')
+fn is_name_list_continuation(line: &str, allow_operator_params: bool) -> bool {
+    let mut saw_entry = false;
+    for entry in split_top_level_commas(line)
+        .into_iter()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .all(|name| {
-            let mut chars = name.chars();
-            match chars.next() {
-                Some(c) if c.is_alphabetic() || c == '_' => {}
-                _ => return false,
-            }
-            chars.all(|c| c.is_alphanumeric() || c == '_')
-        })
+    {
+        saw_entry = true;
+        if !is_name_list_entry(entry, allow_operator_params) {
+            return false;
+        }
+    }
+    saw_entry
+}
+
+fn is_name_list_entry(entry: &str, allow_operator_params: bool) -> bool {
+    let Some((_, suffix)) = split_declared_name(entry) else {
+        return false;
+    };
+    if suffix.is_empty() {
+        return true;
+    }
+
+    if suffix.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return true;
+    }
+
+    if !allow_operator_params {
+        return false;
+    }
+
+    let Some(rest) = suffix.strip_prefix('(') else {
+        return false;
+    };
+    let Some(args) = rest.strip_suffix(')') else {
+        return false;
+    };
+    if args.trim().is_empty() {
+        return true;
+    }
+    args.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .all(|arg| arg == "_")
+}
+
+fn split_declared_name(entry: &str) -> Option<(String, &str)> {
+    let mut chars = entry.char_indices();
+    match chars.next() {
+        Some((_, c)) if c.is_alphabetic() || c == '_' => {}
+        _ => return None,
+    }
+
+    let mut end = 1usize;
+    for (idx, c) in entry.char_indices().skip(1) {
+        if c.is_alphanumeric() || c == '_' {
+            end = idx + c.len_utf8();
+        } else {
+            end = idx;
+            return Some((entry[..end].to_string(), entry[end..].trim()));
+        }
+    }
+    Some((entry[..end].to_string(), entry[end..].trim()))
 }
 
 fn is_section_separator(line: &str) -> bool {
     let trimmed = line.trim();
-    trimmed.len() >= 5 && trimmed.chars().all(|c| c == '-')
+    trimmed.len() >= 4 && trimmed.chars().all(|c| c == '-')
 }
 
 fn strip_comments(input: &str) -> String {
@@ -997,6 +1337,59 @@ mod tests {
         assert!(m.definitions.contains_key("Init"));
         assert!(m.definitions.contains_key("Next"));
         assert_eq!(m.definitions["Next"].params, vec!["a"]);
+    }
+
+    #[test]
+    fn parses_bracketed_operator_parameters() {
+        let src = r#"
+        ---- MODULE Demo ----
+        EXTENDS Naturals
+
+        HaveQuorumFrom[leader \in Node] == leader
+        GetDirection[current, destination \in Floor] == <<current, destination>>
+        HigherOrder[Op(_), value \in Values] == Op(value)
+        ====
+        "#;
+
+        let m = parse_tla_module_text(src).expect("parse should work");
+        assert_eq!(m.definitions["HaveQuorumFrom"].params, vec!["leader"]);
+        assert_eq!(
+            m.definitions["GetDirection"].params,
+            vec!["current", "destination"]
+        );
+        assert_eq!(m.definitions["HigherOrder"].params, vec!["Op", "value"]);
+    }
+
+    #[test]
+    fn parses_parenthesized_operator_parameters_with_internal_spaces() {
+        let src = r#"
+        ---- MODULE Demo ----
+        Add(t, k, v) == <<t, k, v>>
+        Update(tx, key, value) == <<tx, key, value>>
+        ====
+        "#;
+
+        let m = parse_tla_module_text(src).expect("parse should work");
+        assert!(m.definitions.contains_key("Add"));
+        assert!(m.definitions.contains_key("Update"));
+        assert_eq!(m.definitions["Add"].params, vec!["t", "k", "v"]);
+        assert_eq!(m.definitions["Update"].params, vec!["tx", "key", "value"]);
+    }
+
+    #[test]
+    fn parses_infix_symbolic_operator_definitions() {
+        let src = r#"
+        ---- MODULE Demo ----
+        EXTENDS Naturals
+
+        a \prec b == a < b
+        left ^^ right == left + right
+        ====
+        "#;
+
+        let m = parse_tla_module_text(src).expect("parse should work");
+        assert_eq!(m.definitions[r"\prec"].params, vec!["a", "b"]);
+        assert_eq!(m.definitions["^^"].params, vec!["left", "right"]);
     }
 
     #[test]
@@ -1715,5 +2108,175 @@ Next == x' = BaseHelper(x)
 
         // Clean up
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn parses_multiple_simple_definitions_on_one_line() {
+        let src = r#"
+---- MODULE SlidingLike ----
+EXTENDS Integers
+
+W == 4 H == 5
+Pos == 0 .. W + H
+====
+"#;
+
+        let module = parse_tla_module_text(src).expect("parse should work");
+        assert_eq!(
+            module.definitions.get("W").map(|def| def.body.as_str()),
+            Some("4")
+        );
+        assert_eq!(
+            module.definitions.get("H").map(|def| def.body.as_str()),
+            Some("5")
+        );
+        assert_eq!(
+            module.definitions.get("Pos").map(|def| def.body.as_str()),
+            Some("0 .. W + H")
+        );
+    }
+
+    #[test]
+    fn parses_indented_top_level_definitions_after_comment_gap() {
+        let src = r#"
+---- MODULE IndentedDefs ----
+Base == 1
+
+\* A comment block between top-level definitions.
+   omem == vmem
+   octl == ctl
+   obuf == buf
+====
+"#;
+
+        let module = parse_tla_module_text(src).expect("parse should work");
+        assert_eq!(
+            module
+                .definitions
+                .get("Base")
+                .map(|def| def.body.trim())
+                .as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            module.definitions.get("omem").map(|def| def.body.as_str()),
+            Some("vmem")
+        );
+        assert_eq!(
+            module.definitions.get("octl").map(|def| def.body.as_str()),
+            Some("ctl")
+        );
+        assert_eq!(
+            module.definitions.get("obuf").map(|def| def.body.as_str()),
+            Some("buf")
+        );
+    }
+
+    #[test]
+    fn does_not_split_let_bodies_into_top_level_definitions() {
+        let src = r#"
+---- MODULE SlidingLike ----
+EXTENDS Integers
+
+VARIABLES board
+Next == LET empty == Pos \ UNION board
+        IN  \E e \in empty : board' \in update(e, empty)
+====
+"#;
+
+        let module = parse_tla_module_text(src).expect("parse should work");
+        assert!(module.definitions.contains_key("Next"));
+        assert!(!module.definitions.contains_key("empty"));
+        assert!(
+            module
+                .definitions
+                .get("Next")
+                .unwrap()
+                .body
+                .starts_with("LET empty ==")
+        );
+    }
+
+    #[test]
+    fn strips_tlc_generated_definition_separators() {
+        let src = r#"
+---- MODULE GeneratedModel ----
+CONSTANTS a1, a2
+
+const_vals ==
+{a1, a2}
+----
+
+def_ov ==
+0..2
+----
+====
+"#;
+
+        let module = parse_tla_module_text(src).expect("parse should work");
+        assert_eq!(
+            module
+                .definitions
+                .get("const_vals")
+                .map(|def| def.body.trim_end()),
+            Some("{a1, a2}")
+        );
+        assert_eq!(
+            module
+                .definitions
+                .get("def_ov")
+                .map(|def| def.body.trim_end()),
+            Some("0..2")
+        );
+    }
+
+    #[test]
+    fn top_level_assume_does_not_extend_previous_definition() {
+        let src = r#"
+---- MODULE SpanTreeRandomLike ----
+Edges ==
+  UNION {{1}, {2}}
+
+ASSUME TRUE
+====
+"#;
+
+        let module = parse_tla_module_text(src).expect("parse should work");
+        let edges = module
+            .definitions
+            .get("Edges")
+            .expect("Edges should be defined");
+        assert_eq!(edges.body.trim(), "UNION {{1}, {2}}");
+    }
+
+    #[test]
+    fn parses_multiline_constants_with_operator_entries() {
+        let src = r#"
+---- MODULE NanoLike ----
+CONSTANTS
+    Hash,
+    CalculateHash(_,_,_),
+    PrivateKey,
+    PublicKey
+VARIABLES
+    lastHash,
+    received
+====
+"#;
+
+        let module = parse_tla_module_text(src).expect("parse should work");
+        assert_eq!(
+            module.constants,
+            vec![
+                "CalculateHash".to_string(),
+                "Hash".to_string(),
+                "PrivateKey".to_string(),
+                "PublicKey".to_string()
+            ]
+        );
+        assert_eq!(
+            module.variables,
+            vec!["lastHash".to_string(), "received".to_string()]
+        );
     }
 }
