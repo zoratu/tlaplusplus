@@ -1674,6 +1674,10 @@ fn parse_multiple_bindings(s: &str) -> Option<Vec<(String, String)>> {
     }
 }
 
+fn contains_tuple_binder(binding: &str) -> bool {
+    binding.contains("<<") && binding.contains(">>")
+}
+
 /// Split quantifier bindings by comma, respecting nesting
 /// "x \in S, y \in T" -> ["x \in S", "y \in T"]
 /// "x \in {1,2}, y \in T" -> ["x \in {1,2}", "y \in T"]
@@ -1811,8 +1815,8 @@ fn try_parse_let(expr: &str) -> Option<CompiledExpr> {
             defs_str.len()
         };
 
-        let name = defs_str[name_start..*eq_pos].trim();
-        let value = defs_str[*eq_pos + 2..body_end].trim();
+        let name = trim_let_edge_comments(&defs_str[name_start..*eq_pos]);
+        let value = trim_let_edge_comments(&defs_str[*eq_pos + 2..body_end]);
 
         // Skip comments (lines starting with \*)
         let name = name.lines().last().unwrap_or("").trim();
@@ -1883,6 +1887,10 @@ fn try_parse_exists(expr: &str) -> Option<CompiledExpr> {
     let binding = rest[..colon_idx].trim();
     let body = rest[colon_idx + 1..].trim();
 
+    if contains_tuple_binder(binding) {
+        return Some(CompiledExpr::Unparsed(expr.to_string()));
+    }
+
     // Try to parse multiple separate bindings: "x \in S, y \in T"
     if let Some(bindings) = parse_multiple_bindings(binding) {
         // Convert to nested exists
@@ -1935,6 +1943,10 @@ fn try_parse_forall(expr: &str) -> Option<CompiledExpr> {
     let binding = rest[..colon_idx].trim();
     let body = rest[colon_idx + 1..].trim();
 
+    if contains_tuple_binder(binding) {
+        return Some(CompiledExpr::Unparsed(expr.to_string()));
+    }
+
     // Try to parse multiple separate bindings: "x \in S, y \in T"
     if let Some(bindings) = parse_multiple_bindings(binding) {
         // Convert to nested forall
@@ -1985,6 +1997,10 @@ fn try_parse_choose(expr: &str) -> Option<CompiledExpr> {
     let colon_idx = find_top_level_colon(rest)?;
     let binding = rest[..colon_idx].trim();
     let body = rest[colon_idx + 1..].trim();
+
+    if contains_tuple_binder(binding) {
+        return Some(CompiledExpr::Unparsed(expr.to_string()));
+    }
 
     let (var, domain) = parse_in_binding(binding)?;
 
@@ -2308,8 +2324,8 @@ fn parse_let_bindings(defs_text: &str) -> Option<Vec<(String, String)>> {
             defs_text.len()
         };
 
-        let name = defs_text[name_start..*eq_pos].trim();
-        let body = defs_text[*eq_pos + 2..body_end].trim();
+        let name = trim_let_edge_comments(&defs_text[name_start..*eq_pos]);
+        let body = trim_let_edge_comments(&defs_text[*eq_pos + 2..body_end]);
 
         // Name should be a simple identifier (possibly with params, but we ignore those for now)
         let name = if let Some(_paren) = name.find('(') {
@@ -2383,6 +2399,32 @@ fn find_definition_equals(text: &str) -> Vec<usize> {
     }
 
     positions
+}
+
+fn trim_let_edge_comments(text: &str) -> &str {
+    let mut start = 0usize;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("\\*") {
+            start += line.len();
+            continue;
+        }
+        break;
+    }
+
+    let trimmed = &text[start..];
+    let mut end = trimmed.len();
+    let lines: Vec<&str> = trimmed.split_inclusive('\n').collect();
+    for line in lines.into_iter().rev() {
+        let line_trimmed = line.trim();
+        if line_trimmed.is_empty() || line_trimmed.starts_with("\\*") {
+            end = end.saturating_sub(line.len());
+            continue;
+        }
+        break;
+    }
+
+    trimmed[..end].trim()
 }
 
 /// Find the start of the line before a given position
@@ -2551,6 +2593,59 @@ mod tests {
         assert_eq!(bindings.len(), 2);
         assert_eq!(bindings[0].0, "x");
         assert_eq!(bindings[1].0, "y");
+    }
+
+    #[test]
+    fn test_parse_let_bindings_ignores_interstitial_comment_lines() {
+        let defs = r#"priceDiff == referencePrice[f.asset] - f.price
+\* For each participant, calculate their P&L
+settlementPayments == { <<p, positions[p] * priceDiff>> : p \in Participants }
+\* Check that all participants can cover their losses
+canSettle == \A <<p, pnl>> \in settlementPayments : pnl >= 0"#;
+
+        let bindings = parse_let_bindings(defs).expect("bindings should parse");
+        assert_eq!(bindings.len(), 3);
+        assert_eq!(bindings[0].0, "priceDiff");
+        assert_eq!(bindings[0].1, "referencePrice[f.asset] - f.price");
+        assert_eq!(bindings[1].0, "settlementPayments");
+        assert_eq!(
+            bindings[1].1,
+            "{ <<p, positions[p] * priceDiff>> : p \\in Participants }"
+        );
+        assert_eq!(bindings[2].0, "canSettle");
+    }
+
+    #[test]
+    fn test_compile_let_with_comments_between_bindings() {
+        let expr = compile_expr(
+            r#"LET
+    priceDiff == referencePrice[f.asset] - f.price
+    \* For each participant, calculate their P&L
+    settlementPayments == { <<p, positions[p] * priceDiff>> : p \in Participants }
+    \* Check that all participants can cover their losses
+    canSettle == \A <<p, pnl>> \in settlementPayments : pnl >= 0
+IN
+    IF canSettle THEN priceDiff ELSE 0"#,
+        );
+
+        let CompiledExpr::Let { bindings, body } = expr else {
+            panic!("expected LET expression");
+        };
+        assert_eq!(bindings.len(), 3);
+        assert_eq!(bindings[0].0, "priceDiff");
+        assert_eq!(bindings[1].0, "settlementPayments");
+        assert_eq!(bindings[2].0, "canSettle");
+        assert!(matches!(*body, CompiledExpr::If { .. }));
+    }
+
+    #[test]
+    fn test_tuple_pattern_quantifier_falls_back_to_unparsed() {
+        let expr = compile_expr(r#"\A <<p, pnl>> \in settlementPayments : pnl >= 0"#);
+        assert!(
+            matches!(expr, CompiledExpr::Unparsed(_)),
+            "tuple-pattern quantifier should preserve the original expression for interpreted fallback: {:?}",
+            expr
+        );
     }
 
     #[test]

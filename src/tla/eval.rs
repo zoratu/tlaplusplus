@@ -2849,8 +2849,8 @@ fn parse_let_definitions(defs_text: &str) -> Result<BTreeMap<String, TlaDefiniti
             defs_text.len()
         };
 
-        let head = defs_text[cursor..*eq_pos].trim();
-        let body = defs_text[*eq_pos + 2..next_head_start].trim();
+        let head = trim_let_edge_comments(&defs_text[cursor..*eq_pos]);
+        let body = trim_let_edge_comments(&defs_text[*eq_pos + 2..next_head_start]);
         let (name, params) = parse_local_def_head(head);
 
         if !name.is_empty() {
@@ -2869,6 +2869,32 @@ fn parse_let_definitions(defs_text: &str) -> Result<BTreeMap<String, TlaDefiniti
     }
 
     Ok(defs)
+}
+
+fn trim_let_edge_comments(text: &str) -> &str {
+    let mut start = 0usize;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("\\*") {
+            start += line.len();
+            continue;
+        }
+        break;
+    }
+
+    let trimmed = &text[start..];
+    let mut end = trimmed.len();
+    let lines: Vec<&str> = trimmed.split_inclusive('\n').collect();
+    for line in lines.into_iter().rev() {
+        let line_trimmed = line.trim();
+        if line_trimmed.is_empty() || line_trimmed.starts_with("\\*") {
+            end = end.saturating_sub(line.len());
+            continue;
+        }
+        break;
+    }
+
+    trimmed[..end].trim()
 }
 
 fn parse_local_def_head(head: &str) -> (String, Vec<String>) {
@@ -5725,6 +5751,187 @@ mod tests {
             map.get(&TlaValue::ModelValue("bot1".to_string())),
             Some(&TlaValue::Int(2))
         );
+    }
+
+    #[test]
+    fn evaluates_let_with_comment_separated_bindings_and_nested_inner_let() {
+        let asset = TlaValue::ModelValue("asset1".to_string());
+        let alice = TlaValue::ModelValue("alice".to_string());
+        let bob = TlaValue::ModelValue("bob".to_string());
+        let state = TlaState::from([
+            (
+                "Participants".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([alice.clone(), bob.clone()]))),
+            ),
+            (
+                "referencePrice".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([(
+                    asset.clone(),
+                    TlaValue::Int(15),
+                )]))),
+            ),
+            (
+                "positions".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([
+                    (alice.clone(), TlaValue::Int(1)),
+                    (bob.clone(), TlaValue::Int(-1)),
+                ]))),
+            ),
+            (
+                "balances".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([
+                    (alice.clone(), TlaValue::Int(100)),
+                    (bob.clone(), TlaValue::Int(100)),
+                ]))),
+            ),
+        ]);
+        let future = TlaValue::Record(Arc::new(BTreeMap::from([
+            ("asset".to_string(), asset),
+            ("price".to_string(), TlaValue::Int(10)),
+        ])));
+        let ctx = EvalContext::new(&state).with_local_value("f", future);
+
+        let expr = r#"LET
+    priceDiff == referencePrice[f.asset] - f.price
+    \* For each participant, calculate their P&L
+    settlementPayments == { <<p, positions[p] * priceDiff>> : p \in Participants }
+    \* Check that all participants can cover their losses
+    canSettle == \A <<p, pnl>> \in settlementPayments : pnl >= 0 \/ balances[p] >= -pnl
+IN
+    IF canSettle
+    THEN [p \in Participants |-> LET pnl == positions[p] * priceDiff IN balances[p] + pnl]
+    ELSE balances"#;
+
+        let result = eval_expr(expr, &ctx).expect("comment-separated LET should evaluate");
+        let TlaValue::Function(map) = result else {
+            panic!("expected function value");
+        };
+        assert_eq!(map.get(&alice), Some(&TlaValue::Int(105)));
+        assert_eq!(map.get(&bob), Some(&TlaValue::Int(95)));
+    }
+
+    #[test]
+    fn action_let_preserves_quantified_scope_in_nested_except_updates() {
+        let bot = TlaValue::ModelValue("bot1".to_string());
+        let seller = TlaValue::ModelValue("seller1".to_string());
+        let asset = TlaValue::ModelValue("asset1".to_string());
+        let state = TlaState::from([
+            (
+                "Sellers".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([seller.clone()]))),
+            ),
+            (
+                "Assets".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([asset.clone()]))),
+            ),
+            (
+                "ccpTrades".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::new())),
+            ),
+            (
+                "ccpPositions".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([
+                    (
+                        bot.clone(),
+                        TlaValue::Function(Arc::new(BTreeMap::from([(
+                            asset.clone(),
+                            TlaValue::Int(0),
+                        )]))),
+                    ),
+                    (
+                        seller.clone(),
+                        TlaValue::Function(Arc::new(BTreeMap::from([(
+                            asset.clone(),
+                            TlaValue::Int(3),
+                        )]))),
+                    ),
+                ]))),
+            ),
+            (
+                "deployments".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::new())),
+            ),
+            (
+                "actionCount".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([(
+                    bot.clone(),
+                    TlaValue::Int(0),
+                )]))),
+            ),
+        ]);
+        let ctx = EvalContext::new(&state).with_local_value("bot", bot.clone());
+        let action = ActionIr {
+            name: "BotNovateSpotTrade".to_string(),
+            params: vec![],
+            clauses: vec![ActionClause::Guard {
+                expr: r#"\E s \in Sellers, aa \in Assets :
+    /\ \E price \in {10} :
+        /\ LET reqMargin == price
+           IN
+           /\ reqMargin = price
+           /\ LET newTrade == [buyer |-> bot, seller |-> s, asset |-> aa, price |-> price]
+                  newDeploy == [owner |-> bot, seller |-> s, asset |-> aa, price |-> price]
+              IN
+              /\ ccpTrades' = ccpTrades \union {newTrade}
+              /\ ccpPositions' = [ccpPositions EXCEPT ![bot][aa] = @ + 1, ![s][aa] = @ - 1]
+              /\ deployments' = deployments \union {newDeploy}
+              /\ actionCount' = [actionCount EXCEPT ![bot] = @ + 1]"#
+                    .to_string(),
+            }],
+        };
+
+        let next_states = apply_action_ir_with_context_multi(&action, &state, &ctx)
+            .expect("nested LET action should evaluate");
+        assert_eq!(next_states.len(), 1);
+        let next = &next_states[0];
+
+        let TlaValue::Function(ccp_positions) = next
+            .get("ccpPositions")
+            .cloned()
+            .expect("next state should include ccpPositions")
+        else {
+            panic!("expected nested function value");
+        };
+        let TlaValue::Function(bot_positions) = ccp_positions
+            .get(&bot)
+            .cloned()
+            .expect("bot position should exist")
+        else {
+            panic!("expected bot sub-function");
+        };
+        let TlaValue::Function(seller_positions) = ccp_positions
+            .get(&seller)
+            .cloned()
+            .expect("seller position should exist")
+        else {
+            panic!("expected seller sub-function");
+        };
+        assert_eq!(bot_positions.get(&asset), Some(&TlaValue::Int(1)));
+        assert_eq!(seller_positions.get(&asset), Some(&TlaValue::Int(2)));
+
+        let TlaValue::Function(action_count) = next
+            .get("actionCount")
+            .cloned()
+            .expect("next state should include actionCount")
+        else {
+            panic!("expected function value");
+        };
+        assert_eq!(action_count.get(&bot), Some(&TlaValue::Int(1)));
+
+        let TlaValue::Set(ccp_trades) = next
+            .get("ccpTrades")
+            .cloned()
+            .expect("next state should include ccpTrades")
+        else {
+            panic!("expected set value");
+        };
+        let trade = ccp_trades.iter().next().expect("trade should be inserted");
+        let TlaValue::Record(trade) = trade else {
+            panic!("expected record trade");
+        };
+        assert_eq!(trade.get("buyer"), Some(&bot));
+        assert_eq!(trade.get("seller"), Some(&seller));
+        assert_eq!(trade.get("asset"), Some(&asset));
     }
 
     #[test]

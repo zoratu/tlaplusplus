@@ -2306,6 +2306,184 @@ mod tests {
     }
 
     #[test]
+    fn test_compiled_eval_handles_comment_separated_let_bindings() {
+        let asset = TlaValue::ModelValue("asset1".to_string());
+        let alice = TlaValue::ModelValue("alice".to_string());
+        let bob = TlaValue::ModelValue("bob".to_string());
+        let state = TlaState::from([
+            (
+                "Participants".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([alice.clone(), bob.clone()]))),
+            ),
+            (
+                "referencePrice".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([(
+                    asset.clone(),
+                    TlaValue::Int(15),
+                )]))),
+            ),
+            (
+                "positions".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([
+                    (alice.clone(), TlaValue::Int(1)),
+                    (bob.clone(), TlaValue::Int(-1)),
+                ]))),
+            ),
+            (
+                "balances".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([
+                    (alice.clone(), TlaValue::Int(100)),
+                    (bob.clone(), TlaValue::Int(100)),
+                ]))),
+            ),
+        ]);
+        let future = TlaValue::Record(Arc::new(BTreeMap::from([
+            ("asset".to_string(), asset),
+            ("price".to_string(), TlaValue::Int(10)),
+        ])));
+        let ctx = EvalContext::new(&state).with_local_value("f", future);
+
+        let expr = compile_expr(
+            r#"LET
+    priceDiff == referencePrice[f.asset] - f.price
+    \* For each participant, calculate their P&L
+    settlementPayments == { <<p, positions[p] * priceDiff>> : p \in Participants }
+    \* Check that all participants can cover their losses
+    canSettle == \A <<p, pnl>> \in settlementPayments : pnl >= 0 \/ balances[p] >= -pnl
+IN
+    IF canSettle
+    THEN [p \in Participants |-> LET pnl == positions[p] * priceDiff IN balances[p] + pnl]
+    ELSE balances"#,
+        );
+
+        let result = eval_compiled(&expr, &ctx).expect("compiled LET should evaluate");
+        let TlaValue::Function(map) = result else {
+            panic!("expected function value");
+        };
+        assert_eq!(map.get(&alice), Some(&TlaValue::Int(105)));
+        assert_eq!(map.get(&bob), Some(&TlaValue::Int(95)));
+    }
+
+    #[test]
+    fn test_compiled_nested_let_action_preserves_quantified_scope_in_except_updates() {
+        use crate::tla::compiled_expr::CompiledActionIr;
+        use crate::tla::{ActionClause, ActionIr};
+
+        let bot = TlaValue::ModelValue("bot1".to_string());
+        let seller = TlaValue::ModelValue("seller1".to_string());
+        let asset = TlaValue::ModelValue("asset1".to_string());
+        let state = TlaState::from([
+            (
+                "Sellers".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([seller.clone()]))),
+            ),
+            (
+                "Assets".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([asset.clone()]))),
+            ),
+            (
+                "ccpTrades".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::new())),
+            ),
+            (
+                "ccpPositions".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([
+                    (
+                        bot.clone(),
+                        TlaValue::Function(Arc::new(BTreeMap::from([(
+                            asset.clone(),
+                            TlaValue::Int(0),
+                        )]))),
+                    ),
+                    (
+                        seller.clone(),
+                        TlaValue::Function(Arc::new(BTreeMap::from([(
+                            asset.clone(),
+                            TlaValue::Int(3),
+                        )]))),
+                    ),
+                ]))),
+            ),
+            (
+                "deployments".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::new())),
+            ),
+            (
+                "actionCount".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([(
+                    bot.clone(),
+                    TlaValue::Int(0),
+                )]))),
+            ),
+        ]);
+        let ctx = EvalContext::new(&state).with_local_value("bot", bot.clone());
+        let action_ir = ActionIr {
+            name: "BotNovateSpotTrade".to_string(),
+            params: vec![],
+            clauses: vec![ActionClause::Guard {
+                expr: r#"\E s \in Sellers, aa \in Assets :
+    /\ \E price \in {10} :
+        /\ LET reqMargin == price
+           IN
+           /\ reqMargin = price
+           /\ LET newTrade == [buyer |-> bot, seller |-> s, asset |-> aa, price |-> price]
+                  newDeploy == [owner |-> bot, seller |-> s, asset |-> aa, price |-> price]
+              IN
+              /\ ccpTrades' = ccpTrades \union {newTrade}
+              /\ ccpPositions' = [ccpPositions EXCEPT ![bot][aa] = @ + 1, ![s][aa] = @ - 1]
+              /\ deployments' = deployments \union {newDeploy}
+              /\ actionCount' = [actionCount EXCEPT ![bot] = @ + 1]"#
+                    .to_string(),
+            }],
+        };
+
+        let compiled = CompiledActionIr::from_ir(&action_ir);
+        let next_states = apply_compiled_action_ir_multi(&compiled, &state, &ctx)
+            .expect("compiled nested LET action should evaluate");
+        assert_eq!(next_states.len(), 1);
+        let next = &next_states[0];
+
+        let TlaValue::Function(ccp_positions) = next
+            .get("ccpPositions")
+            .cloned()
+            .expect("next state should include ccpPositions")
+        else {
+            panic!("expected nested function value");
+        };
+        let TlaValue::Function(bot_positions) = ccp_positions
+            .get(&bot)
+            .cloned()
+            .expect("bot position should exist")
+        else {
+            panic!("expected bot sub-function");
+        };
+        let TlaValue::Function(seller_positions) = ccp_positions
+            .get(&seller)
+            .cloned()
+            .expect("seller position should exist")
+        else {
+            panic!("expected seller sub-function");
+        };
+        assert_eq!(bot_positions.get(&asset), Some(&TlaValue::Int(1)));
+        assert_eq!(seller_positions.get(&asset), Some(&TlaValue::Int(2)));
+
+        let TlaValue::Set(ccp_trades) = next
+            .get("ccpTrades")
+            .cloned()
+            .expect("next state should include ccpTrades")
+        else {
+            panic!("expected set value");
+        };
+        let trade = ccp_trades.iter().next().expect("trade should be inserted");
+        let TlaValue::Record(trade) = trade else {
+            panic!("expected record trade");
+        };
+        assert_eq!(trade.get("buyer"), Some(&bot));
+        assert_eq!(trade.get("seller"), Some(&seller));
+        assert_eq!(trade.get("asset"), Some(&asset));
+    }
+
+    #[test]
     fn test_except_with_self_ref_arithmetic() {
         // Test @ + 1 pattern used in [table EXCEPT ![k] = @ + 1]
         let ctx = empty_ctx();
