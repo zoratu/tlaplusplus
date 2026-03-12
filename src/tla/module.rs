@@ -1055,21 +1055,26 @@ fn is_name_list_entry(entry: &str, allow_operator_params: bool) -> bool {
 
 fn split_declared_name(entry: &str) -> Option<(String, &str)> {
     let mut chars = entry.char_indices();
-    match chars.next() {
-        Some((_, c)) if c.is_alphabetic() || c == '_' => {}
-        _ => return None,
+    let Some((_, first)) = chars.next() else {
+        return None;
+    };
+    if !(first.is_ascii_alphanumeric() || first == '_') {
+        return None;
     }
 
-    let mut end = 1usize;
+    let mut end = first.len_utf8();
+    let mut saw_identifier_marker = first.is_ascii_alphabetic() || first == '_';
     for (idx, c) in entry.char_indices().skip(1) {
         if c.is_alphanumeric() || c == '_' {
             end = idx + c.len_utf8();
+            saw_identifier_marker |= c.is_ascii_alphabetic() || c == '_';
         } else {
             end = idx;
-            return Some((entry[..end].to_string(), entry[end..].trim()));
+            return saw_identifier_marker
+                .then(|| (entry[..end].to_string(), entry[end..].trim()));
         }
     }
-    Some((entry[..end].to_string(), entry[end..].trim()))
+    saw_identifier_marker.then(|| (entry[..end].to_string(), entry[end..].trim()))
 }
 
 fn is_section_separator(line: &str) -> bool {
@@ -2224,6 +2229,31 @@ Pos == 0 .. W + H
         assert_eq!(
             module.definitions.get("Pos").map(|def| def.body.as_str()),
             Some("0 .. W + H")
+        );
+    }
+
+    #[test]
+    fn parses_numeric_prefixed_variable_and_constant_names() {
+        let src = r#"
+---- MODULE NumericNames ----
+EXTENDS Integers
+
+CONSTANTS 1bMessage, Value
+VARIABLES maxBal, 2avSent, knowsSent
+
+TypeOK == /\ 2avSent \in [Value -> Int]
+          /\ knowsSent \subseteq 1bMessage
+====
+"#;
+
+        let module = parse_tla_module_text(src).expect("parse should work");
+        assert!(module.constants.contains(&"1bMessage".to_string()));
+        assert!(module.constants.contains(&"Value".to_string()));
+        assert!(module.variables.contains(&"2avSent".to_string()));
+        assert!(module.variables.contains(&"knowsSent".to_string()));
+        assert_eq!(
+            module.definitions.get("TypeOK").map(|def| def.body.trim()),
+            Some("/\\ 2avSent \\in [Value -> Int]\n/\\ knowsSent \\subseteq 1bMessage")
         );
     }
 
