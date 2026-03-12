@@ -85,6 +85,10 @@ pub fn split_action_body_disjuncts(expr: &str) -> Vec<String> {
         return Vec::new();
     }
 
+    if parse_action_if(trimmed).is_some() {
+        return vec![trimmed.to_string()];
+    }
+
     if let Some(rest) = trimmed.strip_prefix("/\\").map(str::trim_start)
         && rest.starts_with("\\/")
     {
@@ -203,7 +207,17 @@ fn split_indented_action_disjuncts(expr: &str) -> Option<Vec<String>> {
                     if let Some(prefix) = shared_prefix.as_ref() {
                         current.push_str(prefix);
                     } else if !prefix.is_empty() {
-                        current.push_str(&prefix);
+                        let inline_prefix_disjuncts = split_top_level(&prefix, "\\/");
+                        if inline_prefix_disjuncts.len() > 1 || prefix.starts_with("\\/") {
+                            for disjunct in inline_prefix_disjuncts {
+                                let disjunct = disjunct.trim();
+                                if !disjunct.is_empty() {
+                                    clauses.push(disjunct.to_string());
+                                }
+                            }
+                        } else {
+                            clauses.push(prefix);
+                        }
                     }
                 } else if !current.trim().is_empty() {
                     clauses.push(current.trim().to_string());
@@ -806,6 +820,34 @@ mod tests {
     }
 
     #[test]
+    fn split_action_body_clauses_keeps_parser_shaped_if_then_else_together() {
+        let clauses = split_action_body_clauses(
+            r#"/\ pc[self] = "RS"
+            /\ IF rmState[self] \in {"working", "prepared"}
+                  THEN /\ \/ /\ rmState[self] = "working"
+                             /\ rmState' = [rmState EXCEPT ![self] = "prepared"]
+                          \/ /\ \/ /\ tmState="commit"
+                                   /\ rmState' = [rmState EXCEPT ![self] = "committed"]
+                                \/ /\ rmState[self]="working" \/ tmState="abort"
+                                   /\ rmState' = [rmState EXCEPT ![self] = "aborted"]
+                          \/ /\ IF RMMAYFAIL /\ ~\E rm \in RM:rmState[rm]="failed"
+                                   THEN /\ rmState' = [rmState EXCEPT ![self] = "failed"]
+                                   ELSE /\ TRUE
+                                        /\ UNCHANGED rmState
+                       /\ pc' = [pc EXCEPT ![self] = "RS"]
+                  ELSE /\ pc' = [pc EXCEPT ![self] = "Done"]
+                       /\ UNCHANGED rmState
+            /\ UNCHANGED tmState"#,
+        );
+
+        assert_eq!(clauses.len(), 3, "{clauses:#?}");
+        assert_eq!(clauses[0], r#"pc[self] = "RS""#);
+        assert!(clauses[1].starts_with(r#"IF rmState[self] \in {"working", "prepared"}"#));
+        assert!(clauses[1].contains(r#"ELSE /\ pc' = [pc EXCEPT ![self] = "Done"]"#));
+        assert_eq!(clauses[2], r#"UNCHANGED tmState"#);
+    }
+
+    #[test]
     fn split_action_body_clauses_separates_let_assignment_from_unchanged() {
         let clauses = split_action_body_clauses(
             r#"
@@ -909,6 +951,23 @@ mod tests {
             disjuncts[1],
             "\\E a \\in Acceptor, b \\in Ballot :\n\\E v \\in Value : VoteFor(a, b, v)"
         );
+    }
+
+    #[test]
+    fn split_action_body_disjuncts_keeps_if_then_else_clause_intact() {
+        let disjuncts = split_action_body_disjuncts(
+            r#"IF rmState[self] \in {"working", "prepared"}
+               THEN /\ \/ /\ rmState[self] = "working"
+                          /\ rmState' = [rmState EXCEPT ![self] = "prepared"]
+                       \/ /\ tmState = "commit"
+                          /\ rmState' = [rmState EXCEPT ![self] = "committed"]
+               ELSE /\ pc' = [pc EXCEPT ![self] = "Done"]
+                    /\ UNCHANGED rmState"#,
+        );
+
+        assert_eq!(disjuncts.len(), 1, "{disjuncts:?}");
+        assert!(disjuncts[0].starts_with("IF rmState[self] \\in"));
+        assert!(disjuncts[0].contains("ELSE /\\ pc' = [pc EXCEPT ![self] = \"Done\"]"));
     }
 
     #[test]

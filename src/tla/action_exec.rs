@@ -214,7 +214,10 @@ fn execute_branch(
     // We only handle this if split_top_level actually produces multiple parts.
     // If it returns just one part (e.g., when the disjunction is inside a quantifier),
     // we should proceed with other handling (like \E processing).
-    if trimmed.starts_with("\\/") || contains_top_level_disjunction(trimmed) {
+    let clause_count = crate::tla::action_ir::split_action_body_clauses(trimmed).len();
+    let should_split_disjunction =
+        trimmed.starts_with("\\/") || (contains_top_level_disjunction(trimmed) && clause_count <= 1);
+    if should_split_disjunction {
         let disjuncts = split_action_disjuncts(trimmed);
         // Only handle as disjunction if we actually split into multiple parts
         if disjuncts.len() > 1 || (disjuncts.len() == 1 && disjuncts[0].trim() != trimmed) {
@@ -900,6 +903,7 @@ fn is_word_char(c: char) -> bool {
 mod tests {
     use super::*;
     use crate::models::tla_native::TlaModel;
+    use crate::tla::parse_tla_module_text;
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -913,6 +917,85 @@ mod tests {
             "tlapp-action-exec-{prefix}-{nanos}-{}",
             std::process::id()
         ))
+    }
+
+    fn parsed_two_pc_with_btm_defs() -> BTreeMap<String, TlaDefinition> {
+        parse_tla_module_text(
+            r#"---- MODULE TwoPCwithBTMProbe ----
+CONSTANTS RM, RMMAYFAIL, TMMAYFAIL
+VARIABLES rmState, tmState, pc
+
+vars == << rmState, tmState, pc >>
+ProcSet == (RM) \cup {0} \cup {10}
+
+RS(self) == /\ pc[self] = "RS"
+            /\ IF rmState[self] \in {"working", "prepared"}
+                  THEN /\ \/ /\ rmState[self] = "working"
+                             /\ rmState' = [rmState EXCEPT ![self] = "prepared"]
+                          \/ /\ \/ /\ tmState="commit"
+                                   /\ rmState' = [rmState EXCEPT ![self] = "committed"]
+                                \/ /\ rmState[self]="working" \/ tmState="abort"
+                                   /\ rmState' = [rmState EXCEPT ![self] = "aborted"]
+                          \/ /\ IF RMMAYFAIL /\ ~\E rm \in RM:rmState[rm]="failed"
+                                   THEN /\ rmState' = [rmState EXCEPT ![self] = "failed"]
+                                   ELSE /\ TRUE
+                                        /\ UNCHANGED rmState
+                       /\ pc' = [pc EXCEPT ![self] = "RS"]
+                  ELSE /\ pc' = [pc EXCEPT ![self] = "Done"]
+                       /\ UNCHANGED rmState
+            /\ UNCHANGED tmState
+
+RManager(self) == RS(self)
+
+TS == /\ pc[0] = "TS"
+      /\ \/ /\ tmState = "commit"
+            /\ pc' = [pc EXCEPT ![0] = "TC"]
+         \/ /\ tmState = "abort"
+            /\ pc' = [pc EXCEPT ![0] = "TA"]
+      /\ UNCHANGED << rmState, tmState >>
+
+TC == /\ pc[0] = "TC"
+      /\ tmState' = "commit"
+      /\ pc' = [pc EXCEPT ![0] = "Done"]
+      /\ UNCHANGED rmState
+
+TA == /\ pc[0] = "TA"
+      /\ tmState' = "abort"
+      /\ pc' = [pc EXCEPT ![0] = "Done"]
+      /\ UNCHANGED rmState
+
+TManager == TS \/ TC \/ TA
+
+BTS == /\ pc[10] = "BTS"
+       /\ \/ /\ tmState = "commit"
+             /\ pc' = [pc EXCEPT ![10] = "BTC"]
+          \/ /\ tmState = "abort"
+             /\ pc' = [pc EXCEPT ![10] = "BTA"]
+       /\ UNCHANGED << rmState, tmState >>
+
+BTC == /\ pc[10] = "BTC"
+       /\ tmState' = "commit"
+       /\ pc' = [pc EXCEPT ![10] = "Done"]
+       /\ UNCHANGED rmState
+
+BTA == /\ pc[10] = "BTA"
+       /\ tmState' = "abort"
+       /\ pc' = [pc EXCEPT ![10] = "Done"]
+       /\ UNCHANGED rmState
+
+BTManager == BTS \/ BTC \/ BTA
+
+Terminating == /\ \A self \in ProcSet: pc[self] = "Done"
+               /\ UNCHANGED vars
+
+Next == TManager \/ BTManager
+           \/ (\E self \in RM: RManager(self))
+           \/ Terminating
+====
+"#,
+        )
+        .expect("2PCwithBTM probe module should parse")
+        .definitions
     }
 
     #[test]
@@ -1555,6 +1638,139 @@ CONSTANTS
         assert_eq!(probe.supported_disjuncts, 2, "{probe:?}");
         assert_eq!(probe.generated_successors, 5, "{probe:?}");
         assert!(probe.failures.is_empty(), "{probe:?}");
+    }
+
+    #[test]
+    fn probes_next_with_mixed_zero_arg_and_quantified_branches() {
+        let defs = BTreeMap::from([
+            (
+                "TManager".to_string(),
+                TlaDefinition {
+                    name: "TManager".to_string(),
+                    params: vec![],
+                    body: "/\\ tm' = tm + 1 /\\ UNCHANGED <<pc>>".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "BTManager".to_string(),
+                TlaDefinition {
+                    name: "BTManager".to_string(),
+                    params: vec![],
+                    body: "/\\ pc' = [pc EXCEPT ![10] = \"Done\"] /\\ UNCHANGED <<tm>>"
+                        .to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "RManager".to_string(),
+                TlaDefinition {
+                    name: "RManager".to_string(),
+                    params: vec!["self".to_string()],
+                    body: "/\\ pc' = [pc EXCEPT ![self] = \"Done\"] /\\ UNCHANGED <<tm>>"
+                        .to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Terminating".to_string(),
+                TlaDefinition {
+                    name: "Terminating".to_string(),
+                    params: vec![],
+                    body: "/\\ UNCHANGED <<pc, tm>>".to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+
+        let state = TlaState::from([
+            ("tm".to_string(), TlaValue::Int(0)),
+            (
+                "pc".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([
+                    (TlaValue::Int(1), TlaValue::String("Run".to_string())),
+                    (TlaValue::Int(10), TlaValue::String("Run".to_string())),
+                ]))),
+            ),
+            (
+                "RM".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(1)]))),
+            ),
+        ]);
+
+        let next_body = r#"
+            TManager \/ BTManager
+                     \/ (\E self \in RM: RManager(self))
+                     \/ Terminating
+        "#;
+
+        let probe = probe_next_disjuncts(next_body, &defs, &state);
+        assert_eq!(probe.total_disjuncts, 4, "{probe:?}");
+        assert_eq!(probe.supported_disjuncts, 4, "{probe:?}");
+        assert_eq!(probe.generated_successors, 4, "{probe:?}");
+        assert!(probe.failures.is_empty(), "{probe:?}");
+    }
+
+    #[test]
+    fn probes_parsed_two_pc_with_btm_next_disjuncts() {
+        let defs = parsed_two_pc_with_btm_defs();
+        let rm1 = TlaValue::ModelValue("rm1".to_string());
+        let rm2 = TlaValue::ModelValue("rm2".to_string());
+        let rm3 = TlaValue::ModelValue("rm3".to_string());
+        let state = TlaState::from([
+            (
+                "RM".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([
+                    rm1.clone(),
+                    rm2.clone(),
+                    rm3.clone(),
+                ]))),
+            ),
+            ("RMMAYFAIL".to_string(), TlaValue::Bool(true)),
+            ("TMMAYFAIL".to_string(), TlaValue::Bool(false)),
+            (
+                "rmState".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([
+                    (rm1.clone(), TlaValue::String("working".to_string())),
+                    (rm2.clone(), TlaValue::String("working".to_string())),
+                    (rm3.clone(), TlaValue::String("prepared".to_string())),
+                ]))),
+            ),
+            (
+                "tmState".to_string(),
+                TlaValue::String("commit".to_string()),
+            ),
+            (
+                "pc".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([
+                    (TlaValue::Int(0), TlaValue::String("TS".to_string())),
+                    (TlaValue::Int(10), TlaValue::String("BTS".to_string())),
+                    (rm1.clone(), TlaValue::String("RS".to_string())),
+                    (rm2.clone(), TlaValue::String("RS".to_string())),
+                    (rm3.clone(), TlaValue::String("RS".to_string())),
+                ]))),
+            ),
+        ]);
+
+        let next_def = defs.get("Next").expect("Next definition should exist");
+        let probe = probe_next_disjuncts(&next_def.body, &defs, &state);
+        assert_eq!(probe.total_disjuncts, 4, "body={:?} probe={probe:?}", next_def.body);
+        assert_eq!(
+            probe.supported_disjuncts,
+            4,
+            "body={:?} probe={probe:?}",
+            next_def.body
+        );
+        assert!(
+            probe.generated_successors >= 4,
+            "body={:?} probe={probe:?}",
+            next_def.body
+        );
+        assert!(
+            probe.failures.is_empty(),
+            "body={:?} probe={probe:?}",
+            next_def.body
+        );
     }
 
     #[test]
