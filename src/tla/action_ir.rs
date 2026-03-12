@@ -31,7 +31,8 @@ pub struct ActionIr {
 }
 
 pub(crate) fn split_action_body_clauses(expr: &str) -> Vec<String> {
-    let normalized = normalize_multiline_action_indentation(expr);
+    let original = expr.trim();
+    let normalized = normalize_multiline_action_indentation(original);
     let trimmed = normalized.trim();
     if trimmed.is_empty() {
         return Vec::new();
@@ -41,11 +42,13 @@ pub(crate) fn split_action_body_clauses(expr: &str) -> Vec<String> {
     }
 
     let raw =
-        split_indented_action_conjuncts(trimmed).unwrap_or_else(|| split_top_level(trimmed, "/\\"));
+        split_indented_action_conjuncts(original).unwrap_or_else(|| split_top_level(trimmed, "/\\"));
     let mut merged = Vec::with_capacity(raw.len().max(1));
     let mut idx = 0usize;
     while idx < raw.len() {
-        let part = raw[idx].trim().to_string();
+        let part = normalize_multiline_action_indentation(raw[idx].trim())
+            .trim()
+            .to_string();
         if part.is_empty() {
             idx += 1;
             continue;
@@ -56,11 +59,14 @@ pub(crate) fn split_action_body_clauses(expr: &str) -> Vec<String> {
         if open_quant_or_let {
             let mut combined = part;
             for rest in raw.iter().skip(idx + 1) {
-                if rest.trim().is_empty() {
+                let rest = normalize_multiline_action_indentation(rest.trim())
+                    .trim()
+                    .to_string();
+                if rest.is_empty() {
                     continue;
                 }
                 combined.push_str(" /\\ ");
-                combined.push_str(rest.trim());
+                combined.push_str(&rest);
             }
             merged.push(combined);
             break;
@@ -103,13 +109,12 @@ fn split_indented_action_conjuncts(expr: &str) -> Option<Vec<String>> {
         return None;
     }
 
-    let normalized = normalize_multiline_action_indentation(expr);
     let mut clauses = Vec::new();
     let mut current = String::new();
     let mut base_indent = None;
     let mut saw_top_level = false;
 
-    for raw_line in normalized.lines() {
+    for raw_line in expr.lines() {
         let line = raw_line.trim_end();
         let trimmed = line.trim_start();
         if trimmed.is_empty() {
@@ -137,7 +142,7 @@ fn split_indented_action_conjuncts(expr: &str) -> Option<Vec<String>> {
         if !current.is_empty() {
             current.push('\n');
         }
-        current.push_str(trimmed);
+        current.push_str(line);
     }
 
     if !current.trim().is_empty() {
@@ -156,13 +161,12 @@ fn split_indented_action_disjuncts(expr: &str) -> Option<Vec<String>> {
         return None;
     }
 
-    let normalized = normalize_multiline_action_indentation(expr);
     let mut clauses = Vec::new();
     let mut current = String::new();
     let mut prefix_lines = Vec::new();
     let mut candidate_indents = Vec::new();
 
-    for raw_line in normalized.lines() {
+    for raw_line in expr.lines() {
         let line = raw_line.trim_end();
         let trimmed = line.trim_start();
         if trimmed.is_empty() {
@@ -180,7 +184,7 @@ fn split_indented_action_disjuncts(expr: &str) -> Option<Vec<String>> {
     let mut saw_top_level = false;
     let mut shared_prefix: Option<String> = None;
 
-    for raw_line in normalized.lines() {
+    for raw_line in expr.lines() {
         let line = raw_line.trim_end();
         let trimmed = line.trim_start();
         if trimmed.is_empty() {
@@ -218,14 +222,14 @@ fn split_indented_action_disjuncts(expr: &str) -> Option<Vec<String>> {
         }
 
         if !saw_top_level {
-            prefix_lines.push(trimmed.to_string());
+            prefix_lines.push(line.to_string());
             continue;
         }
 
         if !current.is_empty() {
             current.push('\n');
         }
-        current.push_str(trimmed);
+        current.push_str(line);
     }
 
     if !current.trim().is_empty() {
@@ -431,7 +435,7 @@ pub fn compile_action_ir_branches(def: &TlaDefinition) -> Vec<ActionIr> {
                 clauses
                     .into_iter()
                     .filter(|clause| !clause.trim().is_empty())
-                    .map(|clause| format!("/\\ {}", clause.trim()))
+                    .map(|clause| format_branch_clause(&clause))
                     .collect::<Vec<_>>()
                     .join("\n")
             }
@@ -459,6 +463,29 @@ fn normalize_branch_clause(clause: &str) -> String {
         .map(str::trim_start)
         .unwrap_or_else(|| clause.trim())
         .to_string()
+}
+
+fn format_branch_clause(clause: &str) -> String {
+    let mut lines = clause
+        .trim()
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty());
+    let Some(first) = lines.next() else {
+        return String::new();
+    };
+
+    let mut formatted = String::new();
+    formatted.push_str("/\\ ");
+    formatted.push_str(first.trim_start());
+
+    for line in lines {
+        formatted.push('\n');
+        formatted.push_str("   ");
+        formatted.push_str(line);
+    }
+
+    formatted
 }
 
 pub fn looks_like_action(def: &TlaDefinition) -> bool {
@@ -804,6 +831,25 @@ mod tests {
     }
 
     #[test]
+    fn split_action_body_clauses_keeps_top_level_let_body_conjuncts_together() {
+        let clauses = split_action_body_clauses(
+            r#"
+                /\ x < 5
+                /\ y >= -950
+                /\ y <= 950
+                /\ LET newX == x + 1
+                   IN /\ x' = newX
+                      /\ y' = y + newX
+            "#,
+        );
+
+        assert_eq!(clauses.len(), 4, "{clauses:?}");
+        assert!(clauses[3].starts_with("LET newX == x + 1"));
+        assert!(clauses[3].contains("x' = newX"));
+        assert!(clauses[3].contains("y' = y + newX"));
+    }
+
+    #[test]
     fn split_action_body_disjuncts_preserves_boolean_or_inside_branch_guards() {
         let disjuncts = split_action_body_disjuncts(
             r#"/\ \/ /\ tmState="commit"
@@ -901,6 +947,77 @@ mod tests {
                     .iter()
                     .any(|expr| expr.contains(r#"pc EXCEPT ![self]"#))
             );
+        }
+    }
+
+    #[test]
+    fn compile_action_ir_branches_reindents_multiline_let_clauses() {
+        let def = TlaDefinition {
+            name: "Increment".to_string(),
+            params: vec![],
+            body: r#"
+                /\ x < 5
+                /\ y >= -950
+                /\ y <= 950
+                /\ LET newX == x + 1
+                   IN /\ x' = newX
+                      /\ y' = y + newX
+            "#
+            .to_string(),
+            is_recursive: false,
+        };
+
+        let branches = compile_action_ir_branches(&def);
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0].clauses.len(), 4);
+        match &branches[0].clauses[3] {
+            ActionClause::LetWithPrimes { expr } => {
+                assert!(expr.contains("LET newX == x + 1"));
+                assert!(expr.contains("x' = newX"));
+                assert!(expr.contains("y' = y + newX"));
+            }
+            other => panic!("expected LET action clause, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compile_action_ir_branches_keeps_multiline_if_clause_and_following_siblings_separate() {
+        let def = TlaDefinition {
+            name: "CounterAction".to_string(),
+            params: vec!["p".to_string()],
+            body: r#"
+              /\ p = DesignatedCounter
+              /\ IF light = "on"
+                 THEN
+                   /\ light' = "off"
+                   /\ count' = count + 1
+                 ELSE
+                   UNCHANGED <<light, count>>
+              /\ announced' = (count' >= VictoryThreshold)
+              /\ UNCHANGED <<signalled>>
+            "#
+            .to_string(),
+            is_recursive: false,
+        };
+
+        let branches = compile_action_ir_branches(&def);
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0].clauses.len(), 4);
+        match &branches[0].clauses[1] {
+            ActionClause::Guard { expr } => {
+                assert!(expr.contains(r#"IF light = "on""#));
+                assert!(expr.contains(r#"count' = count + 1"#));
+                assert!(expr.contains(r#"UNCHANGED <<light, count>>"#));
+                assert!(!expr.contains(r#"announced' = (count' >= VictoryThreshold)"#));
+            }
+            other => panic!("expected IF guard clause, got {other:?}"),
+        }
+        match &branches[0].clauses[2] {
+            ActionClause::PrimedAssignment { var, expr } => {
+                assert_eq!(var, "announced");
+                assert_eq!(expr, "(count' >= VictoryThreshold)");
+            }
+            other => panic!("expected announced assignment, got {other:?}"),
         }
     }
 }
