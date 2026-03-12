@@ -344,14 +344,23 @@ fn is_identifier(s: &str) -> bool {
 
     // Allow primed identifiers (x')
     let base = s.strip_suffix('\'').unwrap_or(s);
-
     let mut chars = base.chars();
-    match chars.next() {
-        Some(c) if c.is_alphabetic() || c == '_' => {}
-        _ => return false,
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_alphanumeric() || first == '_') {
+        return false;
     }
 
-    chars.all(|c| c.is_alphanumeric() || c == '_')
+    let mut saw_identifier_marker = first.is_alphabetic() || first == '_';
+    for c in chars {
+        if !(c.is_alphanumeric() || c == '_') {
+            return false;
+        }
+        saw_identifier_marker |= c.is_alphabetic() || c == '_';
+    }
+
+    saw_identifier_marker
 }
 
 fn parse_simple_comparison(expr: &str) -> Option<(&str, &str, &str)> {
@@ -1425,6 +1434,18 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
         };
     }
 
+    if let Some((lhs, rhs)) = split_once_top_level(expr, "^") {
+        let left = eval_expr_inner(lhs, ctx, depth + 1)?.as_int()?;
+        let right = eval_expr_inner(rhs, ctx, depth + 1)?.as_int()?;
+        if right < 0 {
+            return Err(anyhow!("exponent must be non-negative, got {right}"));
+        }
+        let value = left
+            .checked_pow(right as u32)
+            .ok_or_else(|| anyhow!("integer exponent overflow: {left}^{right}"))?;
+        return Ok(TlaValue::Int(value));
+    }
+
     // Handle UNCHANGED in expression/guard context.
     // When UNCHANGED appears inside a disjunction that is evaluated as a guard
     // (e.g., \/ Action1(self) \/ Action2(self) \/ UNCHANGED vars), the action
@@ -2444,12 +2465,27 @@ pub(crate) fn eval_operator_call(
         return Err(anyhow!("operator recursion depth exceeded at {name}"));
     }
 
+    let user_defined_shadow = matches!(name, "BoundedSeq" | "Max" | "Min")
+        && ctx
+            .definition(name)
+            .is_some_and(|def| def.params.len() == args.len());
+
     match name {
         "Cardinality" => {
             if args.len() != 1 {
                 return Err(anyhow!("Cardinality expects 1 argument"));
             }
             return Ok(TlaValue::Int(args[0].len()? as i64));
+        }
+        "Max" if args.len() == 1 && !user_defined_shadow => {
+            return eval_builtin_extremum(name, &args[0], true);
+        }
+        "Min" if args.len() == 1 && !user_defined_shadow => {
+            return eval_builtin_extremum(name, &args[0], false);
+        }
+        "BoundedSeq" if args.len() == 2 && !user_defined_shadow => {
+            let max_len = args[1].as_int()?;
+            return eval_builtin_bounded_seq(&args[0], max_len);
         }
         "ToString" => {
             if args.len() != 1 {
@@ -2689,6 +2725,81 @@ pub(crate) fn eval_operator_call(
     }
     let child = ctx.with_local_values(&bound);
     eval_expr_inner(&def.body, &child, depth + 1)
+}
+
+fn eval_builtin_extremum(name: &str, value: &TlaValue, want_max: bool) -> Result<TlaValue> {
+    let mut ints = match value {
+        TlaValue::Set(set) => set
+            .iter()
+            .map(TlaValue::as_int)
+            .collect::<Result<Vec<_>, _>>()?,
+        TlaValue::Seq(seq) => seq
+            .iter()
+            .map(TlaValue::as_int)
+            .collect::<Result<Vec<_>, _>>()?,
+        other => {
+            return Err(anyhow!(
+                "{name} expects a set or sequence of integers, got {:?}",
+                other
+            ));
+        }
+    };
+
+    let first = ints
+        .pop()
+        .ok_or_else(|| anyhow!("{name} expects a non-empty set or sequence"))?;
+    let extremum = ints.into_iter().fold(first, |current, item| {
+        if (want_max && item > current) || (!want_max && item < current) {
+            item
+        } else {
+            current
+        }
+    });
+    Ok(TlaValue::Int(extremum))
+}
+
+fn eval_builtin_bounded_seq(domain: &TlaValue, max_len: i64) -> Result<TlaValue> {
+    if max_len < 0 {
+        return Err(anyhow!("BoundedSeq expects a non-negative bound, got {max_len}"));
+    }
+
+    let elements = domain.as_set()?.iter().cloned().collect::<Vec<_>>();
+    let max_len = max_len as usize;
+    let max_sequences = 100_000u128;
+
+    let mut total = 1u128;
+    let base = elements.len() as u128;
+    for len in 1..=max_len {
+        total = total.saturating_add(base.saturating_pow(len as u32));
+        if total > max_sequences {
+            return Err(anyhow!(
+                "BoundedSeq too large: |S|={} and n={} would generate {} sequences (max {})",
+                elements.len(),
+                max_len,
+                total,
+                max_sequences
+            ));
+        }
+    }
+
+    let mut out = BTreeSet::new();
+    let mut current = vec![Vec::<TlaValue>::new()];
+    out.insert(TlaValue::Seq(Arc::new(Vec::new())));
+
+    for _ in 0..max_len {
+        let mut next = Vec::new();
+        for prefix in &current {
+            for value in &elements {
+                let mut seq = prefix.clone();
+                seq.push(value.clone());
+                out.insert(TlaValue::Seq(Arc::new(seq.clone())));
+                next.push(seq);
+            }
+        }
+        current = next;
+    }
+
+    Ok(TlaValue::Set(Arc::new(out)))
 }
 
 fn split_outer_let(expr: &str) -> Option<(&str, &str)> {
@@ -4895,17 +5006,23 @@ fn parse_identifier_prefix(expr: &str) -> Option<(String, &str)> {
     if first_idx != 0 {
         return None;
     }
-    if !(first.is_alphabetic() || first == '_') {
+    if !(first.is_alphanumeric() || first == '_') {
         return None;
     }
 
     let mut end = first.len_utf8();
+    let mut saw_identifier_marker = first.is_alphabetic() || first == '_';
     for (idx, c) in chars {
         if c.is_alphanumeric() || c == '_' || c == '\'' {
             end = idx + c.len_utf8();
+            saw_identifier_marker |= c.is_alphabetic() || c == '_';
         } else {
             break;
         }
+    }
+
+    if !saw_identifier_marker {
+        return None;
     }
 
     Some((expr[..end].to_string(), &expr[end..]))
@@ -4962,8 +5079,17 @@ fn parse_int_prefix(expr: &str) -> Option<(i64, &str)> {
         return None;
     }
 
+    let rest = &expr[end..];
+    if rest
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '\'')
+    {
+        return None;
+    }
+
     let value = expr[..end].parse::<i64>().ok()?;
-    Some((value, &expr[end..]))
+    Some((value, rest))
 }
 
 fn has_word_boundaries(expr: &str, start: usize, end: usize) -> bool {
@@ -7702,6 +7828,79 @@ mod tests {
 
         let disabled = eval_expr("ENABLED Step(2)", &ctx).expect("ENABLED Step(2)");
         assert_eq!(disabled, TlaValue::Bool(false));
+    }
+
+    #[test]
+    fn numeric_prefixed_identifiers_evaluate_as_identifiers() {
+        let state = TlaState::from([
+            (
+                "1bMessage".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(1)]))),
+            ),
+            (
+                "2bMessage".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(2)]))),
+            ),
+        ]);
+        let defs = BTreeMap::new();
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        assert_eq!(
+            eval_expr("1bMessage \\cup 2bMessage", &ctx).expect("numeric-prefixed names"),
+            TlaValue::Set(Arc::new(BTreeSet::from([
+                TlaValue::Int(1),
+                TlaValue::Int(2),
+            ])))
+        );
+    }
+
+    #[test]
+    fn max_min_and_power_builtins_work() {
+        let state = TlaState::new();
+        let defs = BTreeMap::new();
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        assert_eq!(
+            eval_expr("Max({1, 4, 2})", &ctx).expect("Max should work"),
+            TlaValue::Int(4)
+        );
+        assert_eq!(
+            eval_expr("Min({1, 4, 2})", &ctx).expect("Min should work"),
+            TlaValue::Int(1)
+        );
+        assert_eq!(
+            eval_expr("2^5", &ctx).expect("power should work"),
+            TlaValue::Int(32)
+        );
+        assert_eq!(
+            eval_expr("2^5 - 1", &ctx).expect("power precedence should work"),
+            TlaValue::Int(31)
+        );
+        assert_eq!(
+            eval_expr("Cardinality(BoundedSeq({1, 2}, 2))", &ctx)
+                .expect("BoundedSeq should work"),
+            TlaValue::Int(7)
+        );
+    }
+
+    #[test]
+    fn user_defined_max_can_shadow_builtin_max() {
+        let defs = BTreeMap::from([(
+            "Max".to_string(),
+            TlaDefinition {
+                name: "Max".to_string(),
+                params: vec!["S".to_string()],
+                body: "42".to_string(),
+                is_recursive: false,
+            },
+        )]);
+        let state = TlaState::new();
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        assert_eq!(
+            eval_expr("Max({1, 4, 2})", &ctx).expect("user-defined Max should win"),
+            TlaValue::Int(42)
+        );
     }
 
     #[test]

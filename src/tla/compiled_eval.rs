@@ -252,6 +252,17 @@ fn eval_compiled_inner(
             let right = eval_compiled_inner(b, ctx, depth + 1)?.as_int()?;
             Ok(TlaValue::Int(left * right))
         }
+        CompiledExpr::Pow(a, b) => {
+            let left = eval_compiled_inner(a, ctx, depth + 1)?.as_int()?;
+            let right = eval_compiled_inner(b, ctx, depth + 1)?.as_int()?;
+            if right < 0 {
+                return Err(anyhow!("exponent must be non-negative, got {}", right));
+            }
+            let value = left
+                .checked_pow(right as u32)
+                .ok_or_else(|| anyhow!("integer exponent overflow: {}^{}", left, right))?;
+            Ok(TlaValue::Int(value))
+        }
         CompiledExpr::Div(a, b) => {
             let left = eval_compiled_inner(a, ctx, depth + 1)?.as_int()?;
             let right = eval_compiled_inner(b, ctx, depth + 1)?.as_int()?;
@@ -1256,6 +1267,10 @@ fn eval_compiled_opcall(
         .iter()
         .map(|a| eval_compiled_inner(a, ctx, depth + 1))
         .collect::<Result<_>>()?;
+    let user_defined_shadow = matches!(name, "BoundedSeq" | "Max" | "Min")
+        && ctx
+            .definition(name)
+            .is_some_and(|def| def.params.len() == arg_values.len());
 
     // Handle built-in operators
     match name {
@@ -1264,6 +1279,16 @@ fn eval_compiled_opcall(
                 return Err(anyhow!("Cardinality expects 1 argument"));
             }
             return Ok(TlaValue::Int(arg_values[0].len()? as i64));
+        }
+        "Max" if arg_values.len() == 1 && !user_defined_shadow => {
+            return eval_builtin_extremum(name, &arg_values[0], true);
+        }
+        "Min" if arg_values.len() == 1 && !user_defined_shadow => {
+            return eval_builtin_extremum(name, &arg_values[0], false);
+        }
+        "BoundedSeq" if arg_values.len() == 2 && !user_defined_shadow => {
+            let max_len = arg_values[1].as_int()?;
+            return eval_builtin_bounded_seq(&arg_values[0], max_len);
         }
         "Len" => {
             if arg_values.len() != 1 {
@@ -1492,6 +1517,81 @@ fn eval_compiled_opcall(
 
     // Evaluate the compiled body
     eval_compiled_inner(&compiled_body, &new_ctx, depth + 1)
+}
+
+fn eval_builtin_extremum(name: &str, value: &TlaValue, want_max: bool) -> Result<TlaValue> {
+    let mut ints = match value {
+        TlaValue::Set(set) => set
+            .iter()
+            .map(TlaValue::as_int)
+            .collect::<Result<Vec<_>, _>>()?,
+        TlaValue::Seq(seq) => seq
+            .iter()
+            .map(TlaValue::as_int)
+            .collect::<Result<Vec<_>, _>>()?,
+        other => {
+            return Err(anyhow!(
+                "{name} expects a set or sequence of integers, got {:?}",
+                other
+            ));
+        }
+    };
+
+    let first = ints
+        .pop()
+        .ok_or_else(|| anyhow!("{name} expects a non-empty set or sequence"))?;
+    let extremum = ints.into_iter().fold(first, |current, item| {
+        if (want_max && item > current) || (!want_max && item < current) {
+            item
+        } else {
+            current
+        }
+    });
+    Ok(TlaValue::Int(extremum))
+}
+
+fn eval_builtin_bounded_seq(domain: &TlaValue, max_len: i64) -> Result<TlaValue> {
+    if max_len < 0 {
+        return Err(anyhow!("BoundedSeq expects a non-negative bound, got {}", max_len));
+    }
+
+    let elements = domain.as_set()?.iter().cloned().collect::<Vec<_>>();
+    let max_len = max_len as usize;
+    let max_sequences = 100_000u128;
+
+    let mut total = 1u128;
+    let base = elements.len() as u128;
+    for len in 1..=max_len {
+        total = total.saturating_add(base.saturating_pow(len as u32));
+        if total > max_sequences {
+            return Err(anyhow!(
+                "BoundedSeq too large: |S|={} and n={} would generate {} sequences (max {})",
+                elements.len(),
+                max_len,
+                total,
+                max_sequences
+            ));
+        }
+    }
+
+    let mut out = BTreeSet::new();
+    let mut current = vec![Vec::<TlaValue>::new()];
+    out.insert(TlaValue::Seq(Arc::new(Vec::new())));
+
+    for _ in 0..max_len {
+        let mut next = Vec::new();
+        for prefix in &current {
+            for value in &elements {
+                let mut seq = prefix.clone();
+                seq.push(value.clone());
+                out.insert(TlaValue::Seq(Arc::new(seq.clone())));
+                next.push(seq);
+            }
+        }
+        current = next;
+    }
+
+    Ok(TlaValue::Set(Arc::new(out)))
 }
 
 /// Look up a definition from the context
@@ -1865,6 +1965,49 @@ mod tests {
         let result = eval_compiled(&compile_expr("Tail(<<5, 6, 7>>)"), &ctx).unwrap();
         let expected: Vec<TlaValue> = vec![TlaValue::Int(6), TlaValue::Int(7)];
         assert_eq!(result, TlaValue::Seq(Arc::new(expected)));
+
+        assert_eq!(
+            eval_compiled(&compile_expr("Max({1, 4, 2})"), &ctx).unwrap(),
+            TlaValue::Int(4)
+        );
+        assert_eq!(
+            eval_compiled(&compile_expr("Min({1, 4, 2})"), &ctx).unwrap(),
+            TlaValue::Int(1)
+        );
+        assert_eq!(
+            eval_compiled(&compile_expr("2^5"), &ctx).unwrap(),
+            TlaValue::Int(32)
+        );
+        assert_eq!(
+            eval_compiled(&compile_expr("2^5 - 1"), &ctx).unwrap(),
+            TlaValue::Int(31)
+        );
+        assert_eq!(
+            eval_compiled(&compile_expr("Cardinality(BoundedSeq({1, 2}, 2))"), &ctx).unwrap(),
+            TlaValue::Int(7)
+        );
+    }
+
+    #[test]
+    fn test_compiled_eval_supports_numeric_prefixed_identifiers() {
+        let mut state = TlaState::new();
+        state.insert(
+            "1bMessage".to_string(),
+            TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(1)]))),
+        );
+        state.insert(
+            "2bMessage".to_string(),
+            TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(2)]))),
+        );
+        let ctx = EvalContext::new(&state);
+
+        assert_eq!(
+            eval_compiled(&compile_expr("1bMessage \\cup 2bMessage"), &ctx).unwrap(),
+            TlaValue::Set(Arc::new(BTreeSet::from([
+                TlaValue::Int(1),
+                TlaValue::Int(2),
+            ])))
+        );
     }
 
     #[test]

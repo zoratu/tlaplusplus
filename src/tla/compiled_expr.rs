@@ -51,6 +51,7 @@ pub enum CompiledExpr {
     Add(Box<CompiledExpr>, Box<CompiledExpr>),
     Sub(Box<CompiledExpr>, Box<CompiledExpr>),
     Mul(Box<CompiledExpr>, Box<CompiledExpr>),
+    Pow(Box<CompiledExpr>, Box<CompiledExpr>),
     Div(Box<CompiledExpr>, Box<CompiledExpr>),
     Mod(Box<CompiledExpr>, Box<CompiledExpr>),
     Neg(Box<CompiledExpr>),
@@ -189,6 +190,7 @@ impl CompiledExpr {
             | CompiledExpr::Add(a, b)
             | CompiledExpr::Sub(a, b)
             | CompiledExpr::Mul(a, b)
+            | CompiledExpr::Pow(a, b)
             | CompiledExpr::Div(a, b)
             | CompiledExpr::Mod(a, b)
             | CompiledExpr::Union(a, b)
@@ -570,6 +572,9 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
     if let Some((left, right)) = split_binary_op(expr, "%") {
         return CompiledExpr::Mod(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
     }
+    if let Some((left, right)) = split_binary_op(expr, "^") {
+        return CompiledExpr::Pow(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
+    }
 
     // TLC module: Function override operator @@
     // f @@ g merges two functions, with g taking precedence on overlapping keys
@@ -813,11 +818,22 @@ fn is_identifier(s: &str) -> bool {
         return false;
     }
     let mut chars = s.chars();
-    match chars.next() {
-        Some(c) if c.is_alphabetic() || c == '_' => {}
-        _ => return false,
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_alphanumeric() || first == '_') {
+        return false;
     }
-    chars.all(|c| c.is_alphanumeric() || c == '_')
+
+    let mut saw_identifier_marker = first.is_alphabetic() || first == '_';
+    for c in chars {
+        if !(c.is_alphanumeric() || c == '_') {
+            return false;
+        }
+        saw_identifier_marker |= c.is_alphabetic() || c == '_';
+    }
+
+    saw_identifier_marker
 }
 
 fn split_top_level(expr: &str, delim: &str) -> Vec<String> {

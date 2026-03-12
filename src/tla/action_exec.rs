@@ -682,17 +682,23 @@ fn parse_identifier_prefix(expr: &str) -> Option<(String, &str)> {
     if first_idx != 0 {
         return None;
     }
-    if !(first.is_alphabetic() || first == '_') {
+    if !(first.is_alphanumeric() || first == '_') {
         return None;
     }
 
     let mut end = first.len_utf8();
+    let mut saw_identifier_marker = first.is_alphabetic() || first == '_';
     for (idx, c) in chars {
         if c.is_alphanumeric() || c == '_' || c == '\'' || c == '!' {
             end = idx + c.len_utf8();
+            saw_identifier_marker |= c.is_alphabetic() || c == '_';
         } else {
             break;
         }
+    }
+
+    if !saw_identifier_marker {
+        return None;
     }
 
     Some((expr[..end].to_string(), &expr[end..]))

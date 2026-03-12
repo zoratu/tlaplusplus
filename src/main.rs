@@ -2310,11 +2310,22 @@ fn representative_value_from_definition_body(
 
 fn is_probe_simple_identifier(expr: &str) -> bool {
     let mut chars = expr.chars();
-    match chars.next() {
-        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
-        _ => return false,
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphanumeric() || first == '_') {
+        return false;
     }
-    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+
+    let mut saw_identifier_marker = first.is_ascii_alphabetic() || first == '_';
+    for ch in chars {
+        if !(ch.is_ascii_alphanumeric() || ch == '_') {
+            return false;
+        }
+        saw_identifier_marker |= ch.is_ascii_alphabetic() || ch == '_';
+    }
+
+    saw_identifier_marker
 }
 
 fn representative_member_from_domain_expr(expr: &str, ctx: &EvalContext<'_>) -> Option<TlaValue> {
@@ -2922,17 +2933,23 @@ fn parse_probe_identifier_prefix(expr: &str) -> Option<(String, &str)> {
     let trimmed = expr.trim_start();
     let mut chars = trimmed.char_indices();
     let (_, first) = chars.next()?;
-    if !(first.is_ascii_alphabetic() || first == '_') {
+    if !(first.is_ascii_alphanumeric() || first == '_') {
         return None;
     }
 
     let mut end = first.len_utf8();
+    let mut saw_identifier_marker = first.is_ascii_alphabetic() || first == '_';
     for (idx, ch) in chars {
         if ch.is_ascii_alphanumeric() || ch == '_' || ch == '!' {
             end = idx + ch.len_utf8();
+            saw_identifier_marker |= ch.is_ascii_alphabetic() || ch == '_';
         } else {
             break;
         }
+    }
+
+    if !saw_identifier_marker {
+        return None;
     }
 
     Some((trimmed[..end].to_string(), &trimmed[end..]))
@@ -3226,6 +3243,10 @@ fn should_skip_action_expr_probe(expr: &str) -> bool {
         || trimmed.starts_with("<>")
         || trimmed.starts_with("WF_")
         || trimmed.starts_with("SF_")
+        || trimmed.contains("[]")
+        || trimmed.contains("<>")
+        || trimmed.contains("WF_")
+        || trimmed.contains("SF_")
         || trimmed.contains("~>")
     {
         return true;
@@ -6403,7 +6424,17 @@ Spec
     fn skips_temporal_formulas_in_action_expr_probe() {
         assert!(should_skip_action_expr_probe("[][x = x']_vars"));
         assert!(should_skip_action_expr_probe("<> done"));
+        assert!(should_skip_action_expr_probe(r"\A s \in Servers : []<>(InSync(s))"));
         assert!(!should_skip_action_expr_probe("x' = x + 1"));
+    }
+
+    #[test]
+    fn probe_identifier_helpers_accept_numeric_prefixed_names() {
+        assert!(is_probe_simple_identifier("1bMessage"));
+        let (name, rest) =
+            parse_probe_identifier_prefix("1bMessage \\cup 2bMessage").expect("identifier");
+        assert_eq!(name, "1bMessage");
+        assert_eq!(rest.trim_start(), "\\cup 2bMessage");
     }
 
     #[test]
