@@ -1500,6 +1500,64 @@ CONSTANTS
     }
 
     #[test]
+    fn probes_top_level_disjunction_with_quantified_multiline_branch() {
+        let defs = BTreeMap::from([
+            (
+                "ActionA".to_string(),
+                TlaDefinition {
+                    name: "ActionA".to_string(),
+                    params: vec!["op".to_string()],
+                    body: "/\\ x' = op /\\ y' = y".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "ActionB".to_string(),
+                TlaDefinition {
+                    name: "ActionB".to_string(),
+                    params: vec!["op".to_string()],
+                    body: "/\\ x' = x /\\ y' = op".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Idle".to_string(),
+                TlaDefinition {
+                    name: "Idle".to_string(),
+                    params: vec![],
+                    body: "/\\ UNCHANGED <<x, y>>".to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+
+        let state = TlaState::from([
+            ("x".to_string(), TlaValue::Int(0)),
+            ("y".to_string(), TlaValue::Int(0)),
+            (
+                "pendingOps".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([
+                    TlaValue::Int(1),
+                    TlaValue::Int(2),
+                ]))),
+            ),
+        ]);
+
+        let next_body = r#"
+            \/ \E op \in pendingOps :
+                \/ ActionA(op)
+                \/ ActionB(op)
+            \/ Idle()
+        "#;
+
+        let probe = probe_next_disjuncts(next_body, &defs, &state);
+        assert_eq!(probe.total_disjuncts, 2, "{probe:?}");
+        assert_eq!(probe.supported_disjuncts, 2, "{probe:?}");
+        assert_eq!(probe.generated_successors, 5, "{probe:?}");
+        assert!(probe.failures.is_empty(), "{probe:?}");
+    }
+
+    #[test]
     fn falls_back_for_nested_action_calls_with_later_prime_references() {
         let defs = BTreeMap::from([
             (

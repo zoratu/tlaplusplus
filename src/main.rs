@@ -1256,7 +1256,7 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             }
-            let expr_eval_ready = expr_total > 0 && expr_ok == expr_total;
+            let expr_eval_ready = expr_probe_is_ready(expr_total, expr_ok);
             println!("native_frontend.expr_eval={expr_eval_ready}");
             println!("native_frontend.action_eval={action_eval_ready}");
             println!(
@@ -2633,6 +2633,10 @@ fn infer_action_param_samples_from_next(
         &mut active_calls,
     );
     samples
+}
+
+fn expr_probe_is_ready(expr_total: usize, expr_ok: usize) -> bool {
+    expr_total == 0 || expr_ok == expr_total
 }
 
 fn collect_action_param_samples_from_expr(
@@ -6334,6 +6338,13 @@ Spec
 
         assert!(should_skip_action_expr_probe(expr));
         assert!(!should_skip_action_expr_probe("fd'[self] = TRUE"));
+    }
+
+    #[test]
+    fn expr_probe_is_ready_when_no_probeable_clauses_exist() {
+        assert!(expr_probe_is_ready(0, 0));
+        assert!(expr_probe_is_ready(3, 3));
+        assert!(!expr_probe_is_ready(3, 2));
     }
 
     #[test]
