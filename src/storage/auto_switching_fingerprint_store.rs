@@ -163,14 +163,19 @@ fn should_bail_out_try_read(attempts: u32) -> bool {
 
 impl AutoSwitchingFingerprintStore {
     /// Create a new auto-switching fingerprint store
-    pub fn new(config: AutoSwitchConfig, assigned_cpus: &[Option<usize>], backing_dir: Option<&Path>) -> Result<Self> {
+    pub fn new(
+        config: AutoSwitchConfig,
+        assigned_cpus: &[Option<usize>],
+        backing_dir: Option<&Path>,
+    ) -> Result<Self> {
         let pa_config = PageAlignedConfig {
             shard_count: config.shard_count,
             expected_items: config.bloom_expected_items / 10, // Start with 10% capacity
             shard_size_mb: config.shard_size_mb,
         };
 
-        let exact_store = PageAlignedFingerprintStore::new_with_backing(pa_config, assigned_cpus, backing_dir)?;
+        let exact_store =
+            PageAlignedFingerprintStore::new_with_backing(pa_config, assigned_cpus, backing_dir)?;
 
         eprintln!(
             "Auto-switching fingerprint store initialized (auto-switch: {})",
