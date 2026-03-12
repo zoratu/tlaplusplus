@@ -584,6 +584,9 @@ fn can_start_indented_definition_after_gap(current_def: &TlaDefinition, line: &s
     if !current_def.body.ends_with("\n\n") {
         return false;
     }
+    if definition_body_has_open_let_scope(&current_def.body) {
+        return false;
+    }
 
     let last_non_empty_line = current_def
         .body
@@ -610,6 +613,82 @@ fn definition_body_requires_continuation(line: &str) -> bool {
         || line.ends_with(':')
         || line.ends_with("/\\")
         || line.ends_with("\\/")
+}
+
+fn definition_body_has_open_let_scope(body: &str) -> bool {
+    let chars: Vec<char> = body.chars().collect();
+    let mut paren = 0usize;
+    let mut bracket = 0usize;
+    let mut brace = 0usize;
+    let mut angle = 0usize;
+    let mut let_depth = 0usize;
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+
+        if c == '<' && next == Some('<') {
+            angle += 1;
+            i += 2;
+            continue;
+        }
+        if c == '>' && next == Some('>') {
+            angle = angle.saturating_sub(1);
+            i += 2;
+            continue;
+        }
+
+        match c {
+            '(' => paren += 1,
+            ')' => paren = paren.saturating_sub(1),
+            '[' => bracket += 1,
+            ']' => bracket = bracket.saturating_sub(1),
+            '{' => brace += 1,
+            '}' => brace = brace.saturating_sub(1),
+            _ => {}
+        }
+
+        if paren == 0 && bracket == 0 && brace == 0 && angle == 0 {
+            if matches_module_keyword_at(&chars, i, "LET") {
+                let_depth += 1;
+                i += 3;
+                continue;
+            }
+            if let_depth > 0 && matches_module_keyword_at(&chars, i, "IN") {
+                let_depth = let_depth.saturating_sub(1);
+                i += 2;
+                continue;
+            }
+        }
+
+        i += 1;
+    }
+
+    let_depth > 0
+}
+
+fn matches_module_keyword_at(chars: &[char], i: usize, keyword: &str) -> bool {
+    let kw_chars: Vec<char> = keyword.chars().collect();
+    if i + kw_chars.len() > chars.len() {
+        return false;
+    }
+    for (j, expected) in kw_chars.iter().enumerate() {
+        if chars[i + j] != *expected {
+            return false;
+        }
+    }
+
+    if i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_') {
+        return false;
+    }
+
+    let after = i + kw_chars.len();
+    if after < chars.len() && (chars[after].is_alphanumeric() || chars[after] == '_') {
+        return false;
+    }
+
+    true
 }
 
 fn flush_definition(module: &mut TlaModule, current: &mut Option<TlaDefinition>) {
@@ -2207,6 +2286,45 @@ Next == LET empty == Pos \ UNION board
                 .body
                 .starts_with("LET empty ==")
         );
+    }
+
+    #[test]
+    fn does_not_split_comment_separated_let_bindings_into_top_level_definitions() {
+        let src = r#"
+---- MODULE MarkToMarketLike ----
+EXTENDS Integers, FiniteSets
+
+VARIABLES futures, referencePrice, balances
+
+MarkToMarket(futureId) ==
+    \E f \in futures :
+        /\ f.id = futureId
+        /\ LET
+               priceDiff == referencePrice[f.asset] - f.price
+               \* For each participant, calculate their P&L
+               settlementPayments == {
+                   <<p, priceDiff>> : p \in Participants
+               }
+               \* Check that all participants can cover their losses
+               canSettle == \A <<p, pnl>> \in settlementPayments :
+                   pnl >= 0 \/ balances[p] >= -pnl
+           IN
+           /\ canSettle
+           /\ balances' = [p \in Participants |->
+                  LET pnl == priceDiff
+                  IN balances[p] + pnl]
+====
+"#;
+
+        let module = parse_tla_module_text(src).expect("parse should work");
+        assert!(module.definitions.contains_key("MarkToMarket"));
+        assert!(!module.definitions.contains_key("priceDiff"));
+        assert!(!module.definitions.contains_key("settlementPayments"));
+        assert!(!module.definitions.contains_key("canSettle"));
+        let body = &module.definitions["MarkToMarket"].body;
+        assert!(body.contains("priceDiff == referencePrice[f.asset] - f.price"));
+        assert!(body.contains("settlementPayments == {"));
+        assert!(body.contains("canSettle == \\A <<p, pnl>> \\in settlementPayments"));
     }
 
     #[test]

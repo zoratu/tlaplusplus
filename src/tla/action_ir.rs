@@ -43,10 +43,14 @@ pub(crate) fn split_action_body_clauses(expr: &str) -> Vec<String> {
 
     let raw =
         split_indented_action_conjuncts(original).unwrap_or_else(|| split_top_level(trimmed, "/\\"));
-    let mut merged = Vec::with_capacity(raw.len().max(1));
+    let expanded = raw
+        .into_iter()
+        .flat_map(|part| split_inline_action_conjuncts(&part))
+        .collect::<Vec<_>>();
+    let mut merged = Vec::with_capacity(expanded.len().max(1));
     let mut idx = 0usize;
-    while idx < raw.len() {
-        let part = normalize_multiline_action_indentation(raw[idx].trim())
+    while idx < expanded.len() {
+        let part = normalize_multiline_action_indentation(expanded[idx].trim())
             .trim()
             .to_string();
         if part.is_empty() {
@@ -58,7 +62,7 @@ pub(crate) fn split_action_body_clauses(expr: &str) -> Vec<String> {
             || (part.starts_with("LET") && part.ends_with("IN"));
         if open_quant_or_let {
             let mut combined = part;
-            for rest in raw.iter().skip(idx + 1) {
+            for rest in expanded.iter().skip(idx + 1) {
                 let rest = normalize_multiline_action_indentation(rest.trim())
                     .trim()
                     .to_string();
@@ -77,6 +81,31 @@ pub(crate) fn split_action_body_clauses(expr: &str) -> Vec<String> {
     }
 
     merged
+}
+
+fn split_inline_action_conjuncts(part: &str) -> Vec<String> {
+    let normalized = normalize_multiline_action_indentation(part.trim());
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    if trimmed.starts_with("LET")
+        || trimmed.starts_with("\\E")
+        || trimmed.starts_with("\\A")
+        || trimmed.starts_with("IF")
+        || trimmed.starts_with("CASE")
+        || trimmed.starts_with("\\/")
+    {
+        return vec![trimmed.to_string()];
+    }
+
+    let split = split_top_level(trimmed, "/\\");
+    if split.len() <= 1 {
+        vec![trimmed.to_string()]
+    } else {
+        split
+    }
 }
 
 pub fn split_action_body_disjuncts(expr: &str) -> Vec<String> {
@@ -891,6 +920,28 @@ mod tests {
         assert!(clauses[3].starts_with("LET newX == x + 1"));
         assert!(clauses[3].contains("x' = newX"));
         assert!(clauses[3].contains("y' = y + newX"));
+    }
+
+    #[test]
+    fn split_action_body_clauses_splits_guard_before_nested_inline_let() {
+        let clauses = split_action_body_clauses(
+            r#"
+                /\ reqMargin = price
+                /\ LET newTrade == [buyer |-> bot, seller |-> s, asset |-> aa, price |-> price]
+                       newDeploy == [owner |-> bot, seller |-> s, asset |-> aa, price |-> price]
+                   IN
+                   /\ ccpTrades' = ccpTrades \union {newTrade}
+                   /\ ccpPositions' = [ccpPositions EXCEPT ![bot][aa] = @ + 1, ![s][aa] = @ - 1]
+                   /\ deployments' = deployments \union {newDeploy}
+                   /\ actionCount' = [actionCount EXCEPT ![bot] = @ + 1]
+            "#,
+        );
+
+        assert_eq!(clauses.len(), 2, "{clauses:#?}");
+        assert_eq!(clauses[0], "reqMargin = price");
+        assert!(clauses[1].starts_with("LET newTrade =="), "{clauses:#?}");
+        assert!(clauses[1].contains("ccpTrades' = ccpTrades \\union {newTrade}"));
+        assert!(clauses[1].contains("actionCount' = [actionCount EXCEPT ![bot] = @ + 1]"));
     }
 
     #[test]
