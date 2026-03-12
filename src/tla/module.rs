@@ -403,7 +403,10 @@ pub fn parse_tla_module_text(input: &str) -> Result<TlaModule> {
             continue;
         }
 
-        if trimmed.starts_with("ASSUME") || trimmed.starts_with("AXIOM") {
+        if trimmed.starts_with("ASSUME")
+            || trimmed.starts_with("AXIOM")
+            || is_top_level_proof_header(trimmed)
+        {
             flush_definition(&mut module, &mut current_def);
             current_def_indent = 0;
             mode = NameListMode::None;
@@ -615,6 +618,15 @@ fn flush_definition(module: &mut TlaModule, current: &mut Option<TlaDefinition>)
         def.is_recursive = module.recursive_declarations.contains(&def.name);
         module.definitions.insert(def.name.clone(), def);
     }
+}
+
+fn is_top_level_proof_header(line: &str) -> bool {
+    let line = line.trim_start();
+    let line = line.strip_prefix("LOCAL ").unwrap_or(line);
+    line.starts_with("THEOREM")
+        || line.starts_with("LEMMA")
+        || line.starts_with("COROLLARY")
+        || line.starts_with("PROPOSITION")
 }
 
 fn split_definition_line(line: &str) -> Option<(&str, &str)> {
@@ -2247,6 +2259,28 @@ ASSUME TRUE
             .get("Edges")
             .expect("Edges should be defined");
         assert_eq!(edges.body.trim(), "UNION {{1}, {2}}");
+    }
+
+    #[test]
+    fn top_level_theorem_does_not_extend_previous_definition() {
+        let src = r#"
+---- MODULE DistributedReplicatedLogLike ----
+AllExtending ==
+  \A s \in Servers: []<><<IsStrictPrefix(cLogs[s], cLogs'[s])>>_cLogs
+
+THEOREM Spec => AllExtending
+====
+"#;
+
+        let module = parse_tla_module_text(src).expect("parse should work");
+        let all_extending = module
+            .definitions
+            .get("AllExtending")
+            .expect("AllExtending should be defined");
+        assert_eq!(
+            all_extending.body.trim(),
+            r"\A s \in Servers: []<><<IsStrictPrefix(cLogs[s], cLogs'[s])>>_cLogs"
+        );
     }
 
     #[test]
