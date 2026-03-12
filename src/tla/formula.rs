@@ -316,11 +316,22 @@ fn find_top_level_pattern(s: &str, pattern: &str) -> Option<usize> {
 
 fn is_simple_name(text: &str) -> bool {
     let mut chars = text.chars();
-    match chars.next() {
-        Some(c) if c.is_alphabetic() || c == '_' => {}
-        _ => return false,
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphanumeric() || first == '_') {
+        return false;
     }
-    chars.all(|c| c.is_alphanumeric() || c == '_')
+
+    let mut saw_identifier_marker = first.is_ascii_alphabetic() || first == '_';
+    for c in chars {
+        if !(c.is_ascii_alphanumeric() || c == '_') {
+            return false;
+        }
+        saw_identifier_marker |= c.is_ascii_alphabetic() || c == '_';
+    }
+
+    saw_identifier_marker
 }
 
 fn parse_unchanged_list(rest: &str) -> Vec<String> {
@@ -429,6 +440,24 @@ mod tests {
             ClauseKind::PrimedAssignment {
                 var: "x".to_string(),
                 expr: "x + 1".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn classifies_numeric_prefixed_identifiers_in_membership_and_assignment() {
+        assert_eq!(
+            classify_clause("2avSent \\in [Acceptor -> SUBSET Msg]"),
+            ClauseKind::UnprimedMembership {
+                var: "2avSent".to_string(),
+                set_expr: "[Acceptor -> SUBSET Msg]".to_string()
+            }
+        );
+        assert_eq!(
+            classify_clause("1bCount = 0"),
+            ClauseKind::UnprimedEquality {
+                var: "1bCount".to_string(),
+                expr: "0".to_string()
             }
         );
     }

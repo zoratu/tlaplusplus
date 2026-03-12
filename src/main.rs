@@ -3171,6 +3171,14 @@ fn build_action_expr_probe_context<'a>(
             .unwrap_or_else(|| {
                 sample_param_value_with_context(param, probe_state, definitions, instances)
             });
+        let sample = refine_param_sample_from_clause_domains(
+            param,
+            &sample,
+            clauses,
+            probe_state,
+            definitions,
+            instances,
+        );
         locals_mut.insert(normalized.to_string(), sample.clone());
         locals_mut.insert(param.clone(), sample);
     }
@@ -3232,6 +3240,101 @@ fn infer_action_param_samples_from_guards(
     }
 
     samples
+}
+
+fn refine_param_sample_from_clause_domains(
+    param: &str,
+    current: &TlaValue,
+    clauses: &[ActionClause],
+    probe_state: &TlaState,
+    definitions: &BTreeMap<String, TlaDefinition>,
+    instances: &BTreeMap<String, TlaModuleInstance>,
+) -> TlaValue {
+    let normalized = normalize_param_name(param);
+    let param_names = [param, normalized];
+    let ctx = build_probe_eval_context(probe_state, definitions, instances);
+
+    let mut saw_incompatible_domain = false;
+    let mut replacement = None;
+    for clause in clauses {
+        let expr = match clause {
+            ActionClause::Guard { expr }
+            | ActionClause::PrimedAssignment { expr, .. }
+            | ActionClause::LetWithPrimes { expr } => expr.as_str(),
+            ActionClause::Exists { body, .. } => body.as_str(),
+            ActionClause::Unchanged { .. } => continue,
+        };
+
+        for function_name in find_clause_function_domains_for_params(expr, &param_names) {
+            let Ok(value) = eval_expr(&function_name, &ctx) else {
+                continue;
+            };
+            let TlaValue::Function(entries) = value else {
+                continue;
+            };
+            if entries.contains_key(current) {
+                continue;
+            }
+            saw_incompatible_domain = true;
+            if replacement.is_none() {
+                replacement = entries.keys().next().cloned();
+            }
+        }
+    }
+
+    if saw_incompatible_domain {
+        replacement.unwrap_or_else(|| current.clone())
+    } else {
+        current.clone()
+    }
+}
+
+fn find_clause_function_domains_for_params(expr: &str, param_names: &[&str]) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    let mut i = 0usize;
+    while i < expr.len() {
+        let Some(ch) = expr[i..].chars().next() else {
+            break;
+        };
+        let len = ch.len_utf8();
+        if ch != '[' {
+            i += len;
+            continue;
+        }
+
+        let Some((inner, tail)) = take_probe_group(&expr[i..], '[', ']') else {
+            i += len;
+            continue;
+        };
+        let inner = inner.trim();
+        if param_names.iter().any(|name| inner == *name)
+            && let Some(function_name) = find_indexed_function_name(&expr[..i])
+        {
+            names.insert(function_name);
+        }
+        let _ = tail;
+        i += len;
+    }
+
+    names
+}
+
+fn find_indexed_function_name(prefix: &str) -> Option<String> {
+    let trimmed = prefix.trim_end();
+    let mut start = trimmed.len();
+    for (idx, ch) in trimmed.char_indices().rev() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '!' {
+            start = idx;
+            continue;
+        }
+        break;
+    }
+    if start >= trimmed.len() {
+        return None;
+    }
+
+    let candidate = &trimmed[start..];
+    is_probe_simple_identifier(candidate).then(|| candidate.to_string())
 }
 
 fn should_skip_action_expr_probe(expr: &str) -> bool {
@@ -6227,6 +6330,40 @@ Spec
             ctx.locals.get("p"),
             Some(&TlaValue::String("Bob".to_string()))
         );
+    }
+
+    #[test]
+    fn build_action_expr_probe_context_refines_samples_from_function_domains() {
+        let good = TlaValue::ModelValue("a1".to_string());
+        let fake = TlaValue::ModelValue("fa1".to_string());
+        let state = TlaState::from([(
+            "knowsSent".to_string(),
+            TlaValue::Function(Arc::new(BTreeMap::from([(
+                good.clone(),
+                TlaValue::Set(Arc::new(BTreeSet::new())),
+            )]))),
+        )]);
+        let defs = BTreeMap::new();
+        let instances = BTreeMap::new();
+        let clauses = vec![ActionClause::Guard {
+            expr: r#"\E S \in SUBSET sentMsgs("1b", b): knowsSent' = [knowsSent EXCEPT ![self] = knowsSent[self] \cup S]"#
+                .to_string(),
+        }];
+        let inferred = BTreeMap::from([
+            ("self".to_string(), fake),
+            ("b".to_string(), TlaValue::Int(0)),
+        ]);
+
+        let ctx = build_action_expr_probe_context(
+            &state,
+            &defs,
+            &instances,
+            &["self".to_string(), "b".to_string()],
+            &clauses,
+            Some(&inferred),
+        );
+
+        assert_eq!(ctx.locals.get("self"), Some(&good));
     }
 
     #[test]
