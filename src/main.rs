@@ -5530,6 +5530,131 @@ Spec
     }
 
     #[test]
+    fn expr_probe_handles_top_level_let_action_with_multiple_assignments() {
+        let state = TlaState::from([
+            ("x".to_string(), TlaValue::Int(1)),
+            ("y".to_string(), TlaValue::Int(10)),
+        ]);
+        let def = TlaDefinition {
+            name: "Increment".to_string(),
+            params: vec![],
+            body: r#"
+                /\ x < 5
+                /\ y >= -950
+                /\ y <= 950
+                /\ LET newX == x + 1
+                   IN /\ x' = newX
+                      /\ y' = y + newX
+            "#
+            .to_string(),
+            is_recursive: false,
+        };
+        let direct_ir = compile_action_ir(&def);
+        assert_eq!(direct_ir.clauses.len(), 4, "{:?}", direct_ir.clauses);
+        let defs = BTreeMap::new();
+        let instances = BTreeMap::new();
+        let branch = compile_action_ir_branches(&def)
+            .into_iter()
+            .next()
+            .expect("single branch");
+        assert_eq!(branch.clauses.len(), 4, "{:?}", branch.clauses);
+        match &branch.clauses[3] {
+            ActionClause::LetWithPrimes { expr } => {
+                assert!(expr.contains("LET newX == x + 1"));
+                assert!(expr.contains("x' = newX"));
+                assert!(expr.contains("y' = y + newX"));
+            }
+            other => panic!("expected LET clause, got {other:?}"),
+        }
+        let mut ctx = build_action_expr_probe_context(
+            &state,
+            &defs,
+            &instances,
+            &branch.params,
+            &branch.clauses,
+            None,
+        );
+
+        for clause in &branch.clauses {
+            if let Some(result) = probe_action_clause_expr(clause, &mut ctx) {
+                result.expect("LET action should keep its local bindings across body clauses");
+            }
+        }
+
+        assert_eq!(ctx.locals.get("x'"), Some(&TlaValue::Int(2)));
+        assert_eq!(ctx.locals.get("y'"), Some(&TlaValue::Int(12)));
+    }
+
+    #[test]
+    fn expr_probe_handles_counter_action_style_multiline_if() {
+        let state = TlaState::from([
+            ("light".to_string(), TlaValue::String("on".to_string())),
+            ("count".to_string(), TlaValue::Int(2)),
+            ("VictoryThreshold".to_string(), TlaValue::Int(3)),
+            (
+                "signalled".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::<TlaValue, TlaValue>::new())),
+            ),
+            (
+                "DesignatedCounter".to_string(),
+                TlaValue::ModelValue("p1".to_string()),
+            ),
+        ]);
+        let def = TlaDefinition {
+            name: "CounterAction".to_string(),
+            params: vec!["p".to_string()],
+            body: r#"
+              /\ p = DesignatedCounter
+              /\ IF light = "on"
+                 THEN
+                   /\ light' = "off"
+                   /\ count' = count + 1
+                 ELSE
+                   UNCHANGED <<light, count>>
+              /\ announced' = (count' >= VictoryThreshold)
+              /\ UNCHANGED <<signalled>>
+            "#
+            .to_string(),
+            is_recursive: false,
+        };
+        let defs = BTreeMap::new();
+        let instances = BTreeMap::new();
+        let inferred = BTreeMap::from([(
+            "p".to_string(),
+            TlaValue::ModelValue("p1".to_string()),
+        )]);
+        let branch = compile_action_ir_branches(&def)
+            .into_iter()
+            .next()
+            .expect("single branch");
+        let mut ctx = build_action_expr_probe_context(
+            &state,
+            &defs,
+            &instances,
+            &branch.params,
+            &branch.clauses,
+            Some(&inferred),
+        );
+
+        for clause in &branch.clauses {
+            if let Some(result) = probe_action_clause_expr(clause, &mut ctx) {
+                result.expect("multiline IF should stay intact during probing");
+            }
+        }
+
+        assert_eq!(
+            ctx.locals.get("light'"),
+            Some(&TlaValue::String("off".to_string()))
+        );
+        assert_eq!(ctx.locals.get("count'"), Some(&TlaValue::Int(3)));
+        assert_eq!(ctx.locals.get("announced'"), Some(&TlaValue::Bool(true)));
+        assert_eq!(
+            ctx.locals.get("signalled'"),
+            Some(&TlaValue::Function(Arc::new(BTreeMap::new())))
+        );
+    }
+
+    #[test]
     fn expr_probe_handles_move_elevator_style_let_actions() {
         let elevator_1 = TlaValue::ModelValue("e1".to_string());
         let elevator_2 = TlaValue::ModelValue("e2".to_string());
