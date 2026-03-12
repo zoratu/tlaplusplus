@@ -1,16 +1,17 @@
 use crate::fairness::{FairnessConstraint, LabeledTransition};
 use crate::model::Model;
 use crate::symmetry::{SymmetrySpec, canonicalize_tla_state};
+use crate::tla::module::TlaModuleInstance;
 use crate::tla::{
     ClauseKind, CompiledActionIr, CompiledExpr, ConfigValue, EvalContext, TemporalFormula,
     TlaConfig, TlaDefinition, TlaModule, TlaState, TlaValue, classify_clause, compile_action_ir,
     compile_expr, eval_action_constraint, eval_compiled, eval_expr,
     evaluate_next_states_labeled_with_instances, evaluate_next_states_with_instances,
-    insert_compiled_action, looks_like_action, parse_tla_config, parse_tla_module_file,
-    split_top_level,
+    insert_compiled_action, looks_like_action, normalize_operator_ref_name, parse_tla_config,
+    parse_tla_module_file, split_top_level,
 };
 use anyhow::{Context, Result, anyhow};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -868,6 +869,107 @@ fn parse_simple_identifier(text: &str) -> Option<String> {
     }
 }
 
+fn parse_zero_arg_state_operator_ref(text: &str) -> Option<(Option<String>, String)> {
+    let trimmed = text.trim();
+    if let Some(name) = parse_simple_identifier(trimmed) {
+        return Some((None, name));
+    }
+
+    let (alias, operator) = trimmed.split_once('!')?;
+    let alias = alias.trim();
+    let operator = operator.trim();
+    if parse_simple_identifier(alias).is_some() && parse_simple_identifier(operator).is_some() {
+        Some((Some(alias.to_string()), operator.to_string()))
+    } else {
+        None
+    }
+}
+
+fn resolve_zero_arg_state_definition<'a>(
+    expr: &str,
+    definitions: &'a BTreeMap<String, TlaDefinition>,
+    instances: &'a BTreeMap<String, TlaModuleInstance>,
+) -> Option<(
+    String,
+    &'a TlaDefinition,
+    &'a BTreeMap<String, TlaDefinition>,
+    &'a BTreeMap<String, TlaModuleInstance>,
+)> {
+    let (alias, name) = parse_zero_arg_state_operator_ref(expr)?;
+    match alias {
+        Some(alias) => {
+            let instance = instances.get(alias.as_str())?;
+            let module = instance.module.as_ref()?;
+            let def = module.definitions.get(name.as_str())?;
+            if !def.params.is_empty() || def.body.trim() == expr.trim() {
+                return None;
+            }
+            Some((
+                format!("{alias}!{name}"),
+                def,
+                &module.definitions,
+                &module.instances,
+            ))
+        }
+        None => {
+            let def = definitions.get(name.as_str())?;
+            if !def.params.is_empty() || def.body.trim() == expr.trim() {
+                return None;
+            }
+            Some((name.to_string(), def, definitions, instances))
+        }
+    }
+}
+
+fn expand_state_predicate_clauses(
+    body: &str,
+    definitions: &BTreeMap<String, TlaDefinition>,
+    instances: &BTreeMap<String, TlaModuleInstance>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut visiting = BTreeSet::new();
+    append_expanded_state_predicate_clause(body, definitions, instances, &mut visiting, &mut out);
+    out
+}
+
+fn append_expanded_state_predicate_clause(
+    clause: &str,
+    definitions: &BTreeMap<String, TlaDefinition>,
+    instances: &BTreeMap<String, TlaModuleInstance>,
+    visiting: &mut BTreeSet<String>,
+    out: &mut Vec<String>,
+) {
+    let trimmed = clause.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    let parts = split_top_level(trimmed, "/\\");
+    if parts.len() > 1 || trimmed.starts_with("/\\") {
+        for part in parts {
+            append_expanded_state_predicate_clause(&part, definitions, instances, visiting, out);
+        }
+        return;
+    }
+
+    if let Some((key, def, child_definitions, child_instances)) =
+        resolve_zero_arg_state_definition(trimmed, definitions, instances)
+        && visiting.insert(key.clone())
+    {
+        append_expanded_state_predicate_clause(
+            &def.body,
+            child_definitions,
+            child_instances,
+            visiting,
+            out,
+        );
+        visiting.remove(&key);
+        return;
+    }
+
+    out.push(trimmed.to_string());
+}
+
 /// Evaluate Init predicate and return all possible initial states.
 /// Handles:
 /// - Equality assignments: var = expr (deterministic)
@@ -895,10 +997,46 @@ fn evaluate_init_states(
 
     // Start with constants from config
     let mut base_state = BTreeMap::new();
+    let mut deferred_operator_refs = Vec::new();
     for (k, v) in &cfg.constants {
-        if let Some(tv) = config_value_to_tla(v) {
-            base_state.insert(k.clone(), tv);
+        match v {
+            ConfigValue::OperatorRef(name) => {
+                deferred_operator_refs
+                    .push((k.clone(), normalize_operator_ref_name(name).to_string()));
+            }
+            _ => {
+                if let Some(tv) = config_value_to_tla(v) {
+                    base_state.insert(k.clone(), tv);
+                }
+            }
         }
+    }
+    for _ in 0..deferred_operator_refs.len().saturating_add(1) {
+        if deferred_operator_refs.is_empty() {
+            break;
+        }
+
+        let mut progress = false;
+        let mut next_deferred = Vec::new();
+        for (name, ref_name) in deferred_operator_refs {
+            let ctx = EvalContext::with_definitions_and_instances(
+                &base_state,
+                &module.definitions,
+                &module.instances,
+            );
+            match eval_expr(&ref_name, &ctx) {
+                Ok(value) => {
+                    base_state.insert(name, value);
+                    progress = true;
+                }
+                Err(_) => next_deferred.push((name, ref_name)),
+            }
+        }
+
+        if !progress {
+            break;
+        }
+        deferred_operator_refs = next_deferred;
     }
 
     // Classify all clauses
@@ -906,7 +1044,9 @@ fn evaluate_init_states(
     let mut membership_assignments: Vec<(String, String)> = Vec::new();
     let mut guards: Vec<String> = Vec::new();
 
-    for clause in split_top_level(&init_def.body, "/\\") {
+    for clause in
+        expand_state_predicate_clauses(&init_def.body, &module.definitions, &module.instances)
+    {
         match classify_clause(&clause) {
             ClauseKind::UnprimedEquality { var, expr } if module.variables.contains(&var) => {
                 equality_assignments.push((var, expr));
@@ -1151,20 +1291,55 @@ fn extract_fairness_from_formula(
 /// This makes constants available during action evaluation by creating
 /// zero-parameter operator definitions for each constant.
 fn inject_constants_into_definitions(module: &mut TlaModule, config: &TlaConfig) {
-    for (name, value) in &config.constants {
-        // Convert ConfigValue to a TLA+ expression string
-        let body = config_value_to_expr(value);
+    inject_constants_into_module_tree(module, config, true);
+}
 
-        // Add as a zero-parameter definition
+fn inject_constants_into_module_tree(
+    module: &mut TlaModule,
+    config: &TlaConfig,
+    include_all_constants: bool,
+) {
+    for (name, value) in &config.constants {
+        if !include_all_constants
+            && !module.constants.iter().any(|constant| constant == name)
+            && !module.definitions.contains_key(name)
+        {
+            continue;
+        }
+
+        let (params, body) = match value {
+            ConfigValue::OperatorRef(target_name) => {
+                let target_name = normalize_operator_ref_name(target_name);
+                if let Some(target_def) = module.definitions.get(target_name) {
+                    let params = target_def.params.clone();
+                    let body = if params.is_empty() {
+                        target_name.to_string()
+                    } else {
+                        format!("{target_name}({})", params.join(", "))
+                    };
+                    (params, body)
+                } else {
+                    (Vec::new(), target_name.to_string())
+                }
+            }
+            _ => (Vec::new(), config_value_to_expr(value)),
+        };
+
         module.definitions.insert(
             name.clone(),
             TlaDefinition {
                 name: name.clone(),
-                params: vec![],
+                params,
                 body,
                 is_recursive: false,
             },
         );
+    }
+
+    for instance in module.instances.values_mut() {
+        if let Some(instance_module) = instance.module.as_mut() {
+            inject_constants_into_module_tree(instance_module, config, false);
+        }
     }
 }
 
@@ -1189,7 +1364,7 @@ fn config_value_to_expr(value: &ConfigValue) -> String {
             let items: Vec<String> = values.iter().map(config_value_to_expr).collect();
             format!("<<{}>>", items.join(", "))
         }
-        ConfigValue::OperatorRef(name) => name.clone(),
+        ConfigValue::OperatorRef(name) => normalize_operator_ref_name(name).to_string(),
     }
 }
 
@@ -2058,6 +2233,167 @@ NEXT Next
         }
 
         // Clean up
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn generated_model_separators_do_not_break_operator_ref_init_resolution() {
+        let tmp = std::env::temp_dir().join("tlapp-generated-model-separators");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should be created");
+
+        let consensus = tmp.join("Consensus.tla");
+        fs::write(
+            &consensus,
+            r#"
+---- MODULE Consensus ----
+VARIABLE chosen
+Init == chosen = {}
+Next == UNCHANGED chosen
+Spec == Init /\ [][Next]_<<chosen>>
+====
+"#,
+        )
+        .expect("consensus module should be written");
+
+        let voting = tmp.join("Voting.tla");
+        fs::write(
+            &voting,
+            r#"
+---- MODULE Voting ----
+EXTENDS Integers
+CONSTANTS Value, Acceptor, Quorum
+Ballot == Nat
+VARIABLES votes, maxBal
+Init == /\ votes  = [a \in Acceptor |-> {}]
+        /\ maxBal = [a \in Acceptor |-> -1]
+IncreaseMaxBal(a, b) ==
+    /\ b > maxBal[a]
+    /\ maxBal' = [maxBal EXCEPT ![a] = b]
+    /\ UNCHANGED votes
+VoteFor(a, b, v) ==
+    /\ maxBal[a] =< b
+    /\ votes' = [votes EXCEPT ![a] = votes[a] \cup {<<b, v>>}]
+    /\ maxBal' = [maxBal EXCEPT ![a] = b]
+Next == \E a \in Acceptor, b \in Ballot :
+            \/ IncreaseMaxBal(a, b)
+            \/ \E v \in Value : VoteFor(a, b, v)
+chosen == {}
+C == INSTANCE Consensus WITH chosen <- chosen
+Spec == Init /\ [][Next]_<<votes, maxBal>>
+====
+"#,
+        )
+        .expect("voting module should be written");
+
+        let model = tmp.join("GeneratedVoting.tla");
+        fs::write(
+            &model,
+            r#"
+---- MODULE GeneratedVoting ----
+EXTENDS Voting, TLC
+CONSTANTS a1, a2, v1, v2
+
+const_acceptor ==
+{a1, a2}
+----
+
+const_value ==
+{v1, v2}
+----
+
+const_quorum ==
+{{a1, a2}}
+----
+
+def_ballot ==
+0..2
+----
+
+====
+"#,
+        )
+        .expect("generated model should be written");
+
+        let cfg = tmp.join("GeneratedVoting.cfg");
+        fs::write(
+            &cfg,
+            r#"
+CONSTANT Acceptor <- const_acceptor
+CONSTANT Value <- const_value
+CONSTANT Quorum <- const_quorum
+CONSTANT Ballot <- def_ballot
+SPECIFICATION Spec
+"#,
+        )
+        .expect("cfg should be written");
+
+        let model = TlaModel::from_files(&model, Some(&cfg), None, None)
+            .expect("generated model should build");
+        let init = model.initial_states();
+
+        assert_eq!(init.len(), 1);
+        let votes = init[0].get("votes").expect("votes should be defined");
+        let max_bal = init[0].get("maxBal").expect("maxBal should be defined");
+        assert!(matches!(votes, TlaValue::Function(_)));
+        assert!(matches!(max_bal, TlaValue::Function(_)));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn initial_states_expand_instance_init_references() {
+        let tmp = std::env::temp_dir().join("tlapp-instance-init-test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should be created");
+
+        let nano = tmp.join("Nano.tla");
+        fs::write(
+            &nano,
+            r#"
+---- MODULE Nano ----
+VARIABLES x, y
+Init == /\ x = 1
+        /\ y = 2
+Next == /\ UNCHANGED <<x, y>>
+====
+"#,
+        )
+        .expect("nano module should be written");
+
+        let mc = tmp.join("MC.tla");
+        fs::write(
+            &mc,
+            r#"
+---- MODULE MC ----
+VARIABLES x, y, z
+N == INSTANCE Nano
+Init == /\ z = 0
+        /\ N!Init
+Next == /\ UNCHANGED <<x, y, z>>
+Spec == Init /\ [][Next]_<<x, y, z>>
+====
+"#,
+        )
+        .expect("mc module should be written");
+
+        let cfg = tmp.join("MC.cfg");
+        fs::write(
+            &cfg,
+            r#"
+SPECIFICATION Spec
+"#,
+        )
+        .expect("cfg should be written");
+
+        let model = TlaModel::from_files(&mc, Some(&cfg), None, None).expect("model should build");
+        let init = model.initial_states();
+
+        assert_eq!(init.len(), 1);
+        assert_eq!(init[0].get("x"), Some(&TlaValue::Int(1)));
+        assert_eq!(init[0].get("y"), Some(&TlaValue::Int(2)));
+        assert_eq!(init[0].get("z"), Some(&TlaValue::Int(0)));
+
         let _ = fs::remove_dir_all(&tmp);
     }
 }

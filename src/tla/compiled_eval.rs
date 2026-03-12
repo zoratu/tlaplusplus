@@ -4,7 +4,7 @@
 //! the overhead of string parsing on every evaluation.
 
 use crate::tla::compiled_expr::{CompiledExpr, compile_expr, find_top_level_colon};
-use crate::tla::eval::{EvalContext, eval_expr, normalize_param_name};
+use crate::tla::eval::{EvalContext, eval_expr, eval_operator_call, normalize_param_name};
 use crate::tla::formula::split_top_level;
 use crate::tla::value::TlaValue;
 use anyhow::{Result, anyhow};
@@ -577,6 +577,25 @@ fn eval_compiled_inner(
                         .cloned()
                         .ok_or_else(|| anyhow!("record field not found: {}", field))
                 }
+                TlaValue::ModelValue(name) => {
+                    if let Some(def) = ctx.definition(name)
+                        && def.params.len() == args.len()
+                    {
+                        let arg_values = args
+                            .iter()
+                            .map(|a| eval_compiled_inner(a, ctx, depth + 1))
+                            .collect::<Result<Vec<_>>>()?;
+                        return eval_operator_call(name, arg_values, ctx, depth + 1);
+                    }
+
+                    let func_str = tla_value_to_string(&func);
+                    let args_str: Vec<String> = args.iter().map(|a| format!("{:?}", a)).collect();
+                    Err(anyhow!(
+                        "cannot index {} with [{}] - only functions/sequences/records can be indexed",
+                        func_str,
+                        args_str.join(", ")
+                    ))
+                }
                 _ => {
                     // Include the expression being indexed for better debugging
                     let func_str = tla_value_to_string(&func);
@@ -936,6 +955,10 @@ fn membership_matches_text(
         "Int" => Ok(value.as_int().is_ok()),
         "BOOLEAN" => Ok(matches!(value, TlaValue::Bool(_))),
         _ => {
+            if let Some(runtime_value) = ctx.runtime_value(rhs_trimmed) {
+                return runtime_value.contains(value);
+            }
+
             if let Some(def) = ctx.definition(rhs_trimmed)
                 && def.params.is_empty()
             {
@@ -1617,7 +1640,15 @@ fn eval_compiled_clause_to_branch<'a>(
         }
         CompiledActionClause::Unchanged { vars } => {
             let mut branch = branch;
-            branch.unchanged_vars.extend(vars.iter().cloned());
+            for var in vars {
+                branch.unchanged_vars.push(var.clone());
+                if let Some(value) = branch.ctx.state.get(var) {
+                    branch
+                        .staged
+                        .entry(var.clone())
+                        .or_insert_with(|| value.clone());
+                }
+            }
             Ok(vec![branch])
         }
         CompiledActionClause::CompiledLetWithPrimes {
@@ -2040,6 +2071,63 @@ mod tests {
         let next_state = result.expect("conditional branch should succeed");
         assert_eq!(next_state.get("x"), Some(&TlaValue::Int(7)));
         assert_eq!(next_state.get("y"), Some(&TlaValue::Int(10)));
+    }
+
+    #[test]
+    fn test_compiled_conditional_unchanged_primes_flow_to_later_clauses() {
+        use crate::tla::compiled_expr::CompiledActionIr;
+        use crate::tla::{ActionClause, ActionIr};
+
+        let state = TlaState::from([
+            ("flag".to_string(), TlaValue::Bool(false)),
+            ("count".to_string(), TlaValue::Int(7)),
+            ("announced".to_string(), TlaValue::Bool(false)),
+        ]);
+        let ctx = EvalContext::new(&state);
+
+        let action_ir = ActionIr {
+            name: "ConditionalCounter".to_string(),
+            params: vec![],
+            clauses: vec![
+                ActionClause::Guard {
+                    expr: "IF flag THEN /\\ count' = count + 1 ELSE /\\ UNCHANGED count"
+                        .to_string(),
+                },
+                ActionClause::PrimedAssignment {
+                    var: "announced".to_string(),
+                    expr: "count' >= 7".to_string(),
+                },
+            ],
+        };
+
+        let compiled = CompiledActionIr::from_ir(&action_ir);
+        let result = apply_compiled_action_ir(&compiled, &state, &ctx).unwrap();
+        let next_state = result.expect("conditional branch should succeed");
+        assert_eq!(next_state.get("count"), Some(&TlaValue::Int(7)));
+        assert_eq!(next_state.get("announced"), Some(&TlaValue::Bool(true)));
+    }
+
+    #[test]
+    fn test_compiled_bracket_operator_calls_use_operator_definitions() {
+        let defs = BTreeMap::from([(
+            "F".to_string(),
+            crate::tla::TlaDefinition {
+                name: "F".to_string(),
+                params: vec!["x".to_string(), "y".to_string()],
+                body: "x + y".to_string(),
+                is_recursive: false,
+            },
+        )]);
+        let state = TlaState::from([
+            ("a".to_string(), TlaValue::Int(2)),
+            ("b".to_string(), TlaValue::Int(3)),
+        ]);
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        assert_eq!(
+            eval_compiled(&compile_expr("F[a, b]"), &ctx).expect("operator call should evaluate"),
+            TlaValue::Int(5)
+        );
     }
 
     #[test]
