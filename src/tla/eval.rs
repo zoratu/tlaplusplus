@@ -1,4 +1,6 @@
-use crate::tla::action_ir::{parse_action_exists, parse_action_if, split_action_body_clauses};
+use crate::tla::action_ir::{
+    parse_action_exists, parse_action_if, split_action_body_clauses, split_action_body_disjuncts,
+};
 use crate::tla::{
     ActionClause, ActionIr, ClauseKind, TlaDefinition, TlaState, TlaValue, classify_clause,
     looks_like_action,
@@ -585,12 +587,8 @@ fn eval_disjunctive_action_body_multi(
     branch: ActionEvalBranch,
 ) -> Option<Result<Vec<ActionEvalBranch>>> {
     let trimmed = expr.trim();
-    let normalized = trimmed
-        .strip_prefix("\\/")
-        .map(str::trim_start)
-        .unwrap_or(trimmed);
-    let disjuncts = split_top_level_symbol(normalized, "\\/");
-    if disjuncts.len() <= 1 && normalized == trimmed {
+    let disjuncts = split_action_body_disjuncts(trimmed);
+    if disjuncts.len() <= 1 {
         return None;
     }
 

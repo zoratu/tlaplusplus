@@ -3651,6 +3651,85 @@ fn try_create_representative_function(set_expr: &str, ctx: &EvalContext<'_>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tlaplusplus::tla::parse_tla_module_text;
+
+    fn parsed_two_pc_with_btm_probe_module() -> TlaModule {
+        parse_tla_module_text(
+            r#"---- MODULE TwoPCwithBTMProbe ----
+CONSTANTS RM, RMMAYFAIL, TMMAYFAIL
+VARIABLES rmState, tmState, pc
+
+vars == << rmState, tmState, pc >>
+ProcSet == (RM) \cup {0} \cup {10}
+
+RS(self) == /\ pc[self] = "RS"
+            /\ IF rmState[self] \in {"working", "prepared"}
+                  THEN /\ \/ /\ rmState[self] = "working"
+                             /\ rmState' = [rmState EXCEPT ![self] = "prepared"]
+                          \/ /\ \/ /\ tmState="commit"
+                                   /\ rmState' = [rmState EXCEPT ![self] = "committed"]
+                                \/ /\ rmState[self]="working" \/ tmState="abort"
+                                   /\ rmState' = [rmState EXCEPT ![self] = "aborted"]
+                          \/ /\ IF RMMAYFAIL /\ ~\E rm \in RM:rmState[rm]="failed"
+                                   THEN /\ rmState' = [rmState EXCEPT ![self] = "failed"]
+                                   ELSE /\ TRUE
+                                        /\ UNCHANGED rmState
+                       /\ pc' = [pc EXCEPT ![self] = "RS"]
+                  ELSE /\ pc' = [pc EXCEPT ![self] = "Done"]
+                       /\ UNCHANGED rmState
+            /\ UNCHANGED tmState
+
+RManager(self) == RS(self)
+
+TS == /\ pc[0] = "TS"
+      /\ \/ /\ tmState = "commit"
+            /\ pc' = [pc EXCEPT ![0] = "TC"]
+         \/ /\ tmState = "abort"
+            /\ pc' = [pc EXCEPT ![0] = "TA"]
+      /\ UNCHANGED << rmState, tmState >>
+
+TC == /\ pc[0] = "TC"
+      /\ tmState' = "commit"
+      /\ pc' = [pc EXCEPT ![0] = "Done"]
+      /\ UNCHANGED rmState
+
+TA == /\ pc[0] = "TA"
+      /\ tmState' = "abort"
+      /\ pc' = [pc EXCEPT ![0] = "Done"]
+      /\ UNCHANGED rmState
+
+TManager == TS \/ TC \/ TA
+
+BTS == /\ pc[10] = "BTS"
+       /\ \/ /\ tmState = "commit"
+             /\ pc' = [pc EXCEPT ![10] = "BTC"]
+          \/ /\ tmState = "abort"
+             /\ pc' = [pc EXCEPT ![10] = "BTA"]
+       /\ UNCHANGED << rmState, tmState >>
+
+BTC == /\ pc[10] = "BTC"
+       /\ tmState' = "commit"
+       /\ pc' = [pc EXCEPT ![10] = "Done"]
+       /\ UNCHANGED rmState
+
+BTA == /\ pc[10] = "BTA"
+       /\ tmState' = "abort"
+       /\ pc' = [pc EXCEPT ![10] = "Done"]
+       /\ UNCHANGED rmState
+
+BTManager == BTS \/ BTC \/ BTA
+
+Terminating == /\ \A self \in ProcSet: pc[self] = "Done"
+               /\ UNCHANGED vars
+
+Next == TManager \/ BTManager
+           \/ (\E self \in RM: RManager(self))
+           \/ Terminating
+====
+"#,
+        )
+        .expect("2PCwithBTM probe module should parse")
+    }
 
     #[test]
     fn test_try_create_representative_function_basic() {
@@ -6585,6 +6664,76 @@ Spec
             "probe should pick a branch that changes rmState[self]"
         );
         assert_eq!(ctx.locals.get("tmState'"), state.get("tmState"));
+    }
+
+    #[test]
+    fn expr_probe_handles_parsed_two_pc_with_btm_rs_action() {
+        let module = parsed_two_pc_with_btm_probe_module();
+        let defs = module.definitions.clone();
+        let rm1 = TlaValue::ModelValue("rm1".to_string());
+        let rm2 = TlaValue::ModelValue("rm2".to_string());
+        let rm3 = TlaValue::ModelValue("rm3".to_string());
+        let state = TlaState::from([
+            (
+                "RM".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([
+                    rm1.clone(),
+                    rm2.clone(),
+                    rm3.clone(),
+                ]))),
+            ),
+            ("RMMAYFAIL".to_string(), TlaValue::Bool(true)),
+            ("TMMAYFAIL".to_string(), TlaValue::Bool(false)),
+            (
+                "rmState".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([
+                    (rm1.clone(), TlaValue::String("working".to_string())),
+                    (rm2.clone(), TlaValue::String("working".to_string())),
+                    (rm3.clone(), TlaValue::String("prepared".to_string())),
+                ]))),
+            ),
+            (
+                "tmState".to_string(),
+                TlaValue::String("commit".to_string()),
+            ),
+            (
+                "pc".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([
+                    (TlaValue::Int(0), TlaValue::String("TS".to_string())),
+                    (TlaValue::Int(10), TlaValue::String("BTS".to_string())),
+                    (rm1.clone(), TlaValue::String("RS".to_string())),
+                    (rm2.clone(), TlaValue::String("RS".to_string())),
+                    (rm3.clone(), TlaValue::String("RS".to_string())),
+                ]))),
+            ),
+        ]);
+        let def = defs.get("RS").expect("RS definition should exist");
+        let branches = compile_action_ir_branches(def);
+        assert_eq!(branches.len(), 1, "body={:?} branches={branches:?}", def.body);
+        let samples = BTreeMap::from([("self".to_string(), rm3.clone())]);
+        let instances = BTreeMap::new();
+        let mut ctx = build_action_expr_probe_context(
+            &state,
+            &defs,
+            &instances,
+            &branches[0].params,
+            &branches[0].clauses,
+            Some(&samples),
+        );
+
+        for clause in &branches[0].clauses {
+            if let Some(result) = probe_action_clause_expr(clause, &mut ctx) {
+                result.expect("parsed 2PCwithBTM RS branch should be probeable");
+            }
+        }
+
+        assert_eq!(ctx.locals.get("pc'"), state.get("pc"));
+        assert_eq!(ctx.locals.get("tmState'"), state.get("tmState"));
+        let rm_state_prime = ctx
+            .locals
+            .get("rmState'")
+            .expect("rmState' should be staged for parsed RS action");
+        assert_ne!(Some(rm_state_prime), state.get("rmState"));
     }
 
     #[test]
