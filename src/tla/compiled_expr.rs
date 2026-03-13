@@ -2164,10 +2164,12 @@ fn compile_action_clause(clause: &ActionClause) -> CompiledActionClause {
             var: var.clone(),
             expr: compile_expr(expr),
         },
-        ActionClause::PrimedMembership { var, set_expr } => CompiledActionClause::PrimedMembership {
-            var: var.clone(),
-            set_expr: compile_expr(set_expr),
-        },
+        ActionClause::PrimedMembership { var, set_expr } => {
+            CompiledActionClause::PrimedMembership {
+                var: var.clone(),
+                set_expr: compile_expr(set_expr),
+            }
+        }
         ActionClause::Unchanged { vars } => CompiledActionClause::Unchanged { vars: vars.clone() },
         ActionClause::Guard { expr } => compile_action_clause_text(expr),
         ActionClause::Exists { binders, body } => CompiledActionClause::Exists {

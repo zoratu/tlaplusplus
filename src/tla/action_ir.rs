@@ -50,8 +50,8 @@ pub(crate) fn split_action_body_clauses(expr: &str) -> Vec<String> {
         return vec![trimmed.to_string()];
     }
 
-    let raw =
-        split_indented_action_conjuncts(original).unwrap_or_else(|| split_top_level(trimmed, "/\\"));
+    let raw = split_indented_action_conjuncts(original)
+        .unwrap_or_else(|| split_top_level(trimmed, "/\\"));
     let expanded = raw
         .into_iter()
         .flat_map(|part| split_inline_action_conjuncts(&part))
@@ -67,7 +67,9 @@ pub(crate) fn split_action_body_clauses(expr: &str) -> Vec<String> {
             continue;
         }
         let starts_quant = part.starts_with("\\E") || part.starts_with("\\A");
-        let open_quant_or_let = (starts_quant && (part.ends_with(':') || part.ends_with("IN")))
+        let incomplete_quantifier = starts_quant && !has_complete_quantifier_body(&part);
+        let open_quant_or_let = incomplete_quantifier
+            || (starts_quant && (part.ends_with(':') || part.ends_with("IN")))
             || (part.starts_with("LET") && part.ends_with("IN"));
         if open_quant_or_let {
             let mut combined = part;
@@ -90,6 +92,25 @@ pub(crate) fn split_action_body_clauses(expr: &str) -> Vec<String> {
     }
 
     merged
+}
+
+fn has_complete_quantifier_body(expr: &str) -> bool {
+    let trimmed = expr.trim();
+    let rest = if let Some(rest) = trimmed.strip_prefix("\\E") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("\\A") {
+        rest
+    } else {
+        return false;
+    };
+    if !rest.starts_with(char::is_whitespace) && !rest.starts_with('(') {
+        return false;
+    }
+    let rest = rest.trim_start();
+    let Some(colon_idx) = find_action_char(rest, ':') else {
+        return false;
+    };
+    !rest[colon_idx + 1..].trim().is_empty()
 }
 
 fn split_inline_action_conjuncts(part: &str) -> Vec<String> {
@@ -735,7 +756,37 @@ pub fn looks_like_action(def: &TlaDefinition) -> bool {
     {
         return false;
     }
-    def.body.contains('\'') || def.body.contains("UNCHANGED")
+    let body = strip_double_quoted_strings(&def.body);
+    body.contains('\'') || body.contains("UNCHANGED")
+}
+
+fn strip_double_quoted_strings(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for ch in text.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        if ch == '"' {
+            in_string = true;
+            continue;
+        }
+        out.push(ch);
+    }
+
+    out
 }
 
 fn find_action_keyword(expr: &str, keyword: &str) -> Option<usize> {
@@ -988,6 +1039,38 @@ mod tests {
         assert!(clauses[0].contains(r#"max' = [max EXCEPT ![self] = num[i]]"#));
         assert!(clauses[0].contains(r#"max' = max"#));
         assert!(clauses[0].contains(r#"pc' = [pc EXCEPT ![self] = "e2"]"#));
+    }
+
+    #[test]
+    fn split_action_body_clauses_keeps_set_filter_quantifier_bodies_together() {
+        let body = r#"
+            /\ maxBal[self] =< b
+            /\ \E v \in {vv \in Value :
+                          \E Q \in ByzQuorum :
+                             \A aa \in Q :
+                                \E m \in sentMsgs("2av", b) : /\ m.val = vv
+                                                              /\ m.acc = aa}:
+                    /\ bmsgs' = (bmsgs \cup {([type |-> "2b", acc |-> self, bal |-> b, val |-> v])})
+                    /\ maxVVal' = [maxVVal EXCEPT ![self] = v]
+            /\ maxBal' = [maxBal EXCEPT ![self] = b]
+        "#;
+
+        let clauses = split_action_body_clauses(body);
+        assert_eq!(clauses.len(), 3, "{clauses:#?}");
+        assert_eq!(clauses[0], "maxBal[self] =< b");
+        assert!(clauses[1].starts_with(r#"\E v \in {vv \in Value :"#));
+        assert!(clauses[1].contains(r#"/\ m.acc = aa}:"#));
+        assert!(clauses[1].contains(r#"maxVVal' = [maxVVal EXCEPT ![self] = v]"#));
+        assert_eq!(clauses[2], r#"maxBal' = [maxBal EXCEPT ![self] = b]"#);
+
+        let def = TlaDefinition {
+            name: "Phase2b".to_string(),
+            params: vec!["self".to_string(), "b".to_string()],
+            body: body.to_string(),
+            is_recursive: false,
+        };
+        let ir = compile_action_ir(&def);
+        assert!(matches!(ir.clauses[1], ActionClause::Exists { .. }), "{ir:?}");
     }
 
     #[test]
@@ -1451,5 +1534,29 @@ mod tests {
             }
             other => panic!("expected announced assignment, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn looks_like_action_ignores_apostrophes_inside_strings() {
+        let def = TlaDefinition {
+            name: "Defs".to_string(),
+            params: vec![],
+            body: "\"<defs><marker id='arrow'></marker></defs>\"".to_string(),
+            is_recursive: false,
+        };
+
+        assert!(!looks_like_action(&def));
+    }
+
+    #[test]
+    fn looks_like_action_still_detects_real_primes_outside_strings() {
+        let def = TlaDefinition {
+            name: "NowNext".to_string(),
+            params: vec![],
+            body: "/\\ now' \\in 0..10 /\\ UNCHANGED hr".to_string(),
+            is_recursive: false,
+        };
+
+        assert!(looks_like_action(&def));
     }
 }

@@ -97,9 +97,7 @@ pub fn scan_module_closure(entry_module: &Path) -> Result<ScanAggregate> {
 
         for scan in &file_scans {
             for name in scan.extends.iter().chain(scan.instances.iter()) {
-                if BUILTIN_EXTENDS.iter().any(|m| m == name)
-                    || same_file_modules.contains(name)
-                {
+                if BUILTIN_EXTENDS.iter().any(|m| m == name) || same_file_modules.contains(name) {
                     continue;
                 }
                 let local_path = module_dir.join(format!("{name}.tla"));
@@ -114,7 +112,11 @@ pub fn scan_module_closure(entry_module: &Path) -> Result<ScanAggregate> {
         scans.extend(file_scans);
     }
 
-    scans.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.module_name.cmp(&b.module_name)));
+    scans.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then_with(|| a.module_name.cmp(&b.module_name))
+    });
 
     let mut combined = BTreeMap::new();
     let mut operators = BTreeSet::new();

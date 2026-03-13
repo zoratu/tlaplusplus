@@ -215,8 +215,8 @@ fn execute_branch(
     // If it returns just one part (e.g., when the disjunction is inside a quantifier),
     // we should proceed with other handling (like \E processing).
     let clause_count = crate::tla::action_ir::split_action_body_clauses(trimmed).len();
-    let should_split_disjunction =
-        trimmed.starts_with("\\/") || (contains_top_level_disjunction(trimmed) && clause_count <= 1);
+    let should_split_disjunction = trimmed.starts_with("\\/")
+        || (contains_top_level_disjunction(trimmed) && clause_count <= 1);
     if should_split_disjunction {
         let disjuncts = split_action_disjuncts(trimmed);
         // Only handle as disjunction if we actually split into multiple parts
@@ -318,9 +318,7 @@ fn execute_branch(
             seed_instance_constant_bindings(instance, module, &outer_ctx, &mut ctx);
             {
                 let locals_mut = std::rc::Rc::make_mut(&mut ctx.locals);
-                for (param, value_expr) in &instance.substitutions {
-                    locals_mut.insert(param.clone(), eval_expr(value_expr, &outer_ctx)?);
-                }
+                bind_instance_substitutions(instance, &outer_ctx, locals_mut)?;
             }
 
             let mut args = Vec::with_capacity(arg_exprs.len());
@@ -399,7 +397,9 @@ fn execute_branch(
                 let interpreted_ir = compile_action_ir(def);
                 match apply_action_ir_with_context_multi(&interpreted_ir, state, &ctx) {
                     Ok(successors) => Ok(successors),
-                    Err(_) => execute_branch(&def.body, &bound_locals, definitions, instances, state),
+                    Err(_) => {
+                        execute_branch(&def.body, &bound_locals, definitions, instances, state)
+                    }
                 }
             }
         };
@@ -730,6 +730,37 @@ fn seed_instance_constant_bindings(
         if let Ok(value) = eval_expr(constant, parent_ctx) {
             locals_mut.insert(constant.clone(), value);
         }
+    }
+}
+
+fn bind_instance_substitutions(
+    instance: &TlaModuleInstance,
+    parent_ctx: &EvalContext<'_>,
+    locals_mut: &mut BTreeMap<String, TlaValue>,
+) -> Result<()> {
+    for (param, value_expr) in &instance.substitutions {
+        let trimmed = value_expr.trim();
+        let value = eval_expr(trimmed, parent_ctx)?;
+        locals_mut.insert(param.clone(), value);
+
+        if let Some(primed_value) = resolved_instance_primed_substitution_value(trimmed, parent_ctx)
+        {
+            locals_mut.insert(format!("{param}'"), primed_value);
+        }
+    }
+
+    Ok(())
+}
+
+fn resolved_instance_primed_substitution_value(
+    trimmed: &str,
+    parent_ctx: &EvalContext<'_>,
+) -> Option<TlaValue> {
+    let primed_expr = format!("{trimmed}'");
+    let primed_value = eval_expr(&primed_expr, parent_ctx).ok()?;
+    match &primed_value {
+        TlaValue::ModelValue(name) if name == &primed_expr => None,
+        _ => Some(primed_value),
     }
 }
 
@@ -1312,6 +1343,64 @@ CONSTANTS
     }
 
     #[test]
+    fn executes_module_instance_actions_with_primed_substitutions() {
+        use crate::tla::module::{TlaModule, TlaModuleInstance};
+
+        let mut helper_module = TlaModule::default();
+        helper_module.name = "Helper".to_string();
+        helper_module.constants = vec!["contents".to_string()];
+        helper_module.definitions.insert(
+            "Next".to_string(),
+            TlaDefinition {
+                name: "Next".to_string(),
+                params: vec![],
+                body: "/\\ x' = contents'[1]".to_string(),
+                is_recursive: false,
+            },
+        );
+
+        let instances = BTreeMap::from([(
+            "D".to_string(),
+            TlaModuleInstance {
+                alias: "D".to_string(),
+                module_name: "Helper".to_string(),
+                substitutions: BTreeMap::from([("contents".to_string(), "c1".to_string())]),
+                is_local: false,
+                module: Some(Box::new(helper_module)),
+            },
+        )]);
+        let state = TlaState::from([
+            ("x".to_string(), TlaValue::Int(0)),
+            (
+                "c1".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([(
+                    TlaValue::Int(1),
+                    TlaValue::Int(0),
+                )]))),
+            ),
+        ]);
+        let locals = BTreeMap::from([(
+            "c1'".to_string(),
+            TlaValue::Function(Arc::new(BTreeMap::from([(
+                TlaValue::Int(1),
+                TlaValue::Int(7),
+            )]))),
+        )]);
+
+        let successors = execute_branch(
+            "D!Next",
+            &locals,
+            &BTreeMap::new(),
+            Some(&instances),
+            &state,
+        )
+        .expect("instance action should evaluate against primed substitution");
+
+        assert_eq!(successors.len(), 1);
+        assert_eq!(successors[0].get("x"), Some(&TlaValue::Int(7)));
+    }
+
+    #[test]
     fn probes_inline_if_with_module_instance_action_branch() {
         use crate::tla::module::{TlaModule, TlaModuleInstance};
 
@@ -1668,8 +1757,7 @@ CONSTANTS
                 TlaDefinition {
                     name: "BTManager".to_string(),
                     params: vec![],
-                    body: "/\\ pc' = [pc EXCEPT ![10] = \"Done\"] /\\ UNCHANGED <<tm>>"
-                        .to_string(),
+                    body: "/\\ pc' = [pc EXCEPT ![10] = \"Done\"] /\\ UNCHANGED <<tm>>".to_string(),
                     is_recursive: false,
                 },
             ),
@@ -1765,10 +1853,13 @@ CONSTANTS
 
         let next_def = defs.get("Next").expect("Next definition should exist");
         let probe = probe_next_disjuncts(&next_def.body, &defs, &state);
-        assert_eq!(probe.total_disjuncts, 4, "body={:?} probe={probe:?}", next_def.body);
         assert_eq!(
-            probe.supported_disjuncts,
-            4,
+            probe.total_disjuncts, 4,
+            "body={:?} probe={probe:?}",
+            next_def.body
+        );
+        assert_eq!(
+            probe.supported_disjuncts, 4,
             "body={:?} probe={probe:?}",
             next_def.body
         );

@@ -4566,6 +4566,9 @@ fn probe_action_clause_expr(
             if let Some(expanded) = probe_disjunctive_action_body(&expr, ctx) {
                 return Some(expanded);
             }
+            if let Some(expanded) = probe_guard_exists_action_call(&expr, ctx) {
+                return Some(expanded);
+            }
             if let Some(expanded) = expand_probe_action_call(&expr, ctx) {
                 return Some(expanded);
             }
@@ -4615,43 +4618,72 @@ fn probe_action_clause_expr(
             None
         }
         ActionClause::Exists { binders, body } => {
-            let local_bindings = (*ctx.locals).clone();
-            let definitions = ctx.definitions.unwrap_or(ctx.local_definitions.as_ref());
-            let bound = if let Some(instances) = ctx.instances {
-                sample_exists_quantifier_binders(
-                    binders,
-                    &local_bindings,
-                    ctx.state,
-                    definitions,
-                    instances,
-                )
-            } else {
-                sample_exists_quantifier_binders(
-                    binders,
-                    &local_bindings,
-                    ctx.state,
-                    definitions,
-                    &BTreeMap::new(),
-                )
-            };
-            let Some(bound) = bound else {
-                mark_probe_branch_disabled(ctx);
-                return Some(Ok(()));
-            };
-
-            let mut child_ctx = ctx.clone();
-            {
-                let locals_mut = std::rc::Rc::make_mut(&mut child_ctx.locals);
-                for (name, value) in bound {
-                    locals_mut.insert(name, value);
-                }
-            }
-
-            Some(probe_action_body_into_ctx(body, &mut child_ctx).map(|_| {
-                merge_staged_prime_locals(&child_ctx, ctx);
-            }))
+            Some(probe_exists_action_body(binders, body, ctx))
         }
     }
+}
+
+fn parse_guard_exists_action_call(expr: &str) -> Option<(String, String)> {
+    let trimmed = strip_probe_outer_parens(expr.trim());
+    let rest = trimmed.strip_prefix("\\E")?;
+    if !rest.starts_with(char::is_whitespace) && !rest.starts_with('(') {
+        return None;
+    }
+    let rest = rest.trim_start();
+    let colon_idx = find_probe_top_level_char(rest, ':')?;
+    let binders = rest[..colon_idx].trim();
+    let body = rest[colon_idx + 1..].trim();
+    if binders.is_empty() || body.is_empty() {
+        return None;
+    }
+    if parse_probe_action_call(strip_probe_outer_parens(body)).is_none() {
+        return None;
+    }
+    Some((binders.to_string(), body.to_string()))
+}
+
+fn probe_guard_exists_action_call(
+    expr: &str,
+    ctx: &mut EvalContext<'_>,
+) -> Option<anyhow::Result<()>> {
+    let (binders, body) = parse_guard_exists_action_call(expr)?;
+    Some(probe_exists_action_body(&binders, &body, ctx))
+}
+
+fn probe_exists_action_body(
+    binders: &str,
+    body: &str,
+    ctx: &mut EvalContext<'_>,
+) -> anyhow::Result<()> {
+    let local_bindings = (*ctx.locals).clone();
+    let definitions = ctx.definitions.unwrap_or(ctx.local_definitions.as_ref());
+    let bound = if let Some(instances) = ctx.instances {
+        sample_exists_quantifier_binders(binders, &local_bindings, ctx.state, definitions, instances)
+    } else {
+        sample_exists_quantifier_binders(
+            binders,
+            &local_bindings,
+            ctx.state,
+            definitions,
+            &BTreeMap::new(),
+        )
+    };
+    let Some(bound) = bound else {
+        mark_probe_branch_disabled(ctx);
+        return Ok(());
+    };
+
+    let mut child_ctx = ctx.clone();
+    {
+        let locals_mut = std::rc::Rc::make_mut(&mut child_ctx.locals);
+        for (name, value) in bound {
+            locals_mut.insert(name, value);
+        }
+    }
+
+    probe_action_body_into_ctx(body, &mut child_ctx)?;
+    merge_staged_prime_locals(&child_ctx, ctx);
+    Ok(())
 }
 
 fn probe_stuttering_action_expr(
@@ -10144,6 +10176,85 @@ INVARIANTS TypeInvariant
             .get("rmState'")
             .expect("rmState' should be staged for parsed RS action");
         assert_ne!(Some(rm_state_prime), state.get("rmState"));
+    }
+
+    #[test]
+    fn expr_probe_handles_parsed_two_pc_with_btm_next_exists_from_init_state() {
+        let module = parsed_two_pc_with_btm_probe_module();
+        let defs = module.definitions.clone();
+        let rm1 = TlaValue::ModelValue("rm1".to_string());
+        let rm2 = TlaValue::ModelValue("rm2".to_string());
+        let rm3 = TlaValue::ModelValue("rm3".to_string());
+        let state = TlaState::from([
+            (
+                "RM".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([
+                    rm1.clone(),
+                    rm2.clone(),
+                    rm3.clone(),
+                ]))),
+            ),
+            ("RMMAYFAIL".to_string(), TlaValue::Bool(true)),
+            ("TMMAYFAIL".to_string(), TlaValue::Bool(true)),
+            (
+                "rmState".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([
+                    (rm1.clone(), TlaValue::String("working".to_string())),
+                    (rm2.clone(), TlaValue::String("working".to_string())),
+                    (rm3.clone(), TlaValue::String("working".to_string())),
+                ]))),
+            ),
+            ("tmState".to_string(), TlaValue::String("init".to_string())),
+            (
+                "pc".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([
+                    (TlaValue::Int(0), TlaValue::String("TS".to_string())),
+                    (TlaValue::Int(10), TlaValue::String("BTS".to_string())),
+                    (rm1.clone(), TlaValue::String("RS".to_string())),
+                    (rm2.clone(), TlaValue::String("RS".to_string())),
+                    (rm3.clone(), TlaValue::String("RS".to_string())),
+                ]))),
+            ),
+        ]);
+
+        let next_def = defs.get("Next").expect("Next definition should exist");
+        let branches = compile_action_ir_branches(next_def);
+        let rm_branch = branches
+            .iter()
+            .find(|branch| {
+                branch.clauses.iter().any(|clause| {
+                    matches!(
+                        clause,
+                        ActionClause::Guard { expr }
+                            if strip_probe_outer_parens(expr.trim()) == "\\E self \\in RM: RManager(self)"
+                    )
+                })
+            })
+            .expect("Next should include the RM existential branch");
+
+        let instances = BTreeMap::new();
+        let mut ctx = build_action_expr_probe_context(
+            &state,
+            &defs,
+            &instances,
+            &rm_branch.params,
+            &rm_branch.clauses,
+            None,
+        );
+
+        for clause in &rm_branch.clauses {
+            if let Some(result) = probe_action_clause_expr(clause, &mut ctx) {
+                result.expect("parsed Next RM branch should be probeable from Init");
+            }
+        }
+
+        let rm_state_prime = ctx
+            .locals
+            .get("rmState'")
+            .expect("rmState' should be staged for the RM branch");
+        assert_ne!(Some(rm_state_prime), state.get("rmState"));
+        assert_eq!(ctx.locals.get("tmState'"), state.get("tmState"));
+        assert_eq!(ctx.locals.get("pc'"), state.get("pc"));
     }
 
     #[test]
