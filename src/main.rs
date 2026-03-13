@@ -3319,7 +3319,179 @@ fn build_action_expr_probe_context<'a>(
         }
     }
 
+    seed_nonempty_sequence_probe_locals(probe_state, definitions, instances, clauses, locals_mut);
+
     ctx
+}
+
+fn seed_nonempty_sequence_probe_locals(
+    probe_state: &TlaState,
+    definitions: &BTreeMap<String, TlaDefinition>,
+    instances: &BTreeMap<String, TlaModuleInstance>,
+    clauses: &[ActionClause],
+    locals: &mut BTreeMap<String, TlaValue>,
+) {
+    let element_hints = infer_sequence_element_probe_values(
+        probe_state,
+        definitions,
+        instances,
+        clauses,
+        locals,
+    );
+    for var in find_sequence_accessed_vars(clauses) {
+        if locals
+            .get(&var)
+            .or_else(|| probe_state.get(&var))
+            .is_some_and(|value| matches!(value, TlaValue::Seq(values) if !values.is_empty()))
+        {
+            continue;
+        }
+
+        let Some(TlaValue::Seq(values)) = probe_state.get(&var) else {
+            continue;
+        };
+        if !values.is_empty() {
+            continue;
+        }
+
+        let element = element_hints.get(&var).cloned().unwrap_or(TlaValue::Int(0));
+        locals.insert(var, TlaValue::Seq(Arc::new(vec![element])));
+    }
+}
+
+fn find_sequence_accessed_vars(clauses: &[ActionClause]) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for clause in clauses {
+        let expr = match clause {
+            ActionClause::Guard { expr }
+            | ActionClause::PrimedAssignment { expr, .. }
+            | ActionClause::LetWithPrimes { expr } => expr.as_str(),
+            ActionClause::Exists { body, .. } => body.as_str(),
+            ActionClause::Unchanged { .. } => continue,
+        };
+        collect_sequence_access_vars(expr, &mut names);
+    }
+    names
+}
+
+fn infer_sequence_element_probe_values(
+    probe_state: &TlaState,
+    definitions: &BTreeMap<String, TlaDefinition>,
+    instances: &BTreeMap<String, TlaModuleInstance>,
+    clauses: &[ActionClause],
+    locals: &BTreeMap<String, TlaValue>,
+) -> BTreeMap<String, TlaValue> {
+    let mut fields_by_var: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for clause in clauses {
+        let expr = match clause {
+            ActionClause::Guard { expr }
+            | ActionClause::PrimedAssignment { expr, .. }
+            | ActionClause::LetWithPrimes { expr } => expr.as_str(),
+            ActionClause::Exists { body, .. } => body.as_str(),
+            ActionClause::Unchanged { .. } => continue,
+        };
+        collect_sequence_accessed_record_fields(expr, &mut fields_by_var);
+    }
+
+    let mut out = BTreeMap::new();
+    let mut ctx = build_probe_eval_context(probe_state, definitions, instances);
+    {
+        let locals_mut = std::rc::Rc::make_mut(&mut ctx.locals);
+        for (name, value) in locals {
+            locals_mut.insert(name.clone(), value.clone());
+        }
+    }
+    for (var, fields) in fields_by_var {
+        let mut record = BTreeMap::new();
+        for field in fields {
+            record.insert(field.clone(), guess_probe_field_value(&field, &ctx));
+        }
+        if !record.is_empty() {
+            out.insert(var, TlaValue::Record(Arc::new(record)));
+        }
+    }
+    out
+}
+
+fn guess_probe_field_value(field: &str, ctx: &EvalContext<'_>) -> TlaValue {
+    let lower = field.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "op" | "msgid" | "action" | "type" | "state" | "protocol" | "flg"
+    ) {
+        return TlaValue::String("sample".to_string());
+    }
+    if lower.ends_with("ip")
+        || lower.ends_with("port")
+        || lower.ends_with("count")
+        || lower.ends_with("stamp")
+        || lower == "key"
+    {
+        return TlaValue::Int(0);
+    }
+    if lower.ends_with("id") {
+        return TlaValue::String(format!("{field}_0"));
+    }
+    if let Some(def) = ctx
+        .local_definitions
+        .get(field)
+        .or_else(|| ctx.definitions.and_then(|defs| defs.get(field)))
+        && def.params.is_empty()
+        && let Ok(value) = eval_expr(&def.body, ctx)
+    {
+        return value;
+    }
+    TlaValue::Int(0)
+}
+
+fn collect_sequence_access_vars(expr: &str, out: &mut BTreeSet<String>) {
+    for prefix in ["Head(", "Tail("] {
+        let mut rest = expr;
+        while let Some(idx) = rest.find(prefix) {
+            let after = &rest[idx + prefix.len() - 1..];
+            let Some((candidate, tail)) = take_probe_group(after, '(', ')') else {
+                break;
+            };
+            if is_probe_simple_identifier(candidate) {
+                out.insert(candidate.to_string());
+            }
+            rest = tail;
+        }
+    }
+}
+
+fn collect_sequence_accessed_record_fields(
+    expr: &str,
+    out: &mut BTreeMap<String, BTreeSet<String>>,
+) {
+    for prefix in ["Head(", "Tail("] {
+        let mut rest = expr;
+        while let Some(idx) = rest.find(prefix) {
+            let after = &rest[idx + prefix.len() - 1..];
+            let Some((candidate, tail)) = take_probe_group(after, '(', ')') else {
+                break;
+            };
+            if is_probe_simple_identifier(candidate) {
+                let trimmed_tail = tail.trim_start();
+                if let Some(field_tail) = trimmed_tail.strip_prefix('.') {
+                    let mut end = 0usize;
+                    for (idx, ch) in field_tail.char_indices() {
+                        if ch.is_ascii_alphanumeric() || ch == '_' {
+                            end = idx + ch.len_utf8();
+                        } else {
+                            break;
+                        }
+                    }
+                    if end > 0 {
+                        out.entry(candidate.to_string())
+                            .or_default()
+                            .insert(field_tail[..end].to_string());
+                    }
+                }
+            }
+            rest = tail;
+        }
+    }
 }
 
 fn infer_action_param_samples_from_guards(
@@ -3467,12 +3639,12 @@ fn should_skip_action_expr_probe(expr: &str) -> bool {
     if trimmed.is_empty() {
         return true;
     }
-    if trimmed.starts_with("[]")
-        || trimmed.starts_with("<>")
+    if starts_with_temporal_box(trimmed)
+        || starts_with_temporal_diamond(trimmed)
         || trimmed.starts_with("WF_")
         || trimmed.starts_with("SF_")
-        || trimmed.contains("[]")
-        || trimmed.contains("<>")
+        || contains_temporal_box(trimmed)
+        || contains_temporal_diamond(trimmed)
         || trimmed.contains("WF_")
         || trimmed.contains("SF_")
         || trimmed.contains("~>")
@@ -3492,6 +3664,36 @@ fn should_skip_action_expr_probe(expr: &str) -> bool {
         }
     }
 
+    false
+}
+
+fn starts_with_temporal_box(expr: &str) -> bool {
+    expr.starts_with("[]")
+}
+
+fn starts_with_temporal_diamond(expr: &str) -> bool {
+    expr.starts_with("<>") && !expr.starts_with("<<")
+}
+
+fn contains_temporal_box(expr: &str) -> bool {
+    expr.contains("[]")
+}
+
+fn contains_temporal_diamond(expr: &str) -> bool {
+    let bytes = expr.as_bytes();
+    if bytes.len() < 2 {
+        return false;
+    }
+    for i in 0..bytes.len() - 1 {
+        if bytes[i] == b'<' && bytes[i + 1] == b'>' {
+            let prev_is_angle = i > 0 && (bytes[i - 1] == b'<' || bytes[i - 1] == b'>');
+            let next_is_angle =
+                i + 2 < bytes.len() && (bytes[i + 2] == b'<' || bytes[i + 2] == b'>');
+            if !prev_is_angle && !next_is_angle {
+                return true;
+            }
+        }
+    }
     false
 }
 
@@ -3834,7 +4036,7 @@ fn probe_action_clause_expr(
                     ctx.state,
                     definitions,
                     instances,
-                )?
+                )
             } else {
                 sample_exists_quantifier_binders(
                     binders,
@@ -3842,7 +4044,11 @@ fn probe_action_clause_expr(
                     ctx.state,
                     definitions,
                     &BTreeMap::new(),
-                )?
+                )
+            };
+            let Some(bound) = bound else {
+                mark_probe_branch_disabled(ctx);
+                return Some(Ok(()));
             };
 
             let mut child_ctx = ctx.clone();
@@ -5490,7 +5696,6 @@ INVARIANTS TypeInvariant
         let _ = fs::remove_dir_all(&tmp);
     }
 
-
     #[test]
     fn action_probe_resolves_zero_arg_aliases_in_index_and_except_expressions() {
         let proc_id = TlaValue::ModelValue("p1".to_string());
@@ -6966,6 +7171,57 @@ INVARIANTS TypeInvariant
     }
 
     #[test]
+    fn build_action_expr_probe_context_seeds_empty_sequences_used_by_head_or_tail() {
+        let state = TlaState::from([(
+            "AuthChannel".to_string(),
+            TlaValue::Seq(Arc::new(vec![])),
+        )]);
+        let defs = BTreeMap::new();
+        let instances = BTreeMap::new();
+        let clauses = vec![
+            ActionClause::PrimedAssignment {
+                var: "AuthChannel".to_string(),
+                expr: "Tail(AuthChannel)".to_string(),
+            },
+            ActionClause::Guard {
+                expr: "Head(AuthChannel) = 0".to_string(),
+            },
+        ];
+
+        let ctx =
+            build_action_expr_probe_context(&state, &defs, &instances, &[], &clauses, None);
+
+        assert_eq!(
+            ctx.locals.get("AuthChannel"),
+            Some(&TlaValue::Seq(Arc::new(vec![TlaValue::Int(0)])))
+        );
+    }
+
+    #[test]
+    fn build_action_expr_probe_context_seeds_record_elements_for_head_field_access() {
+        let state = TlaState::from([(
+            "FwCtlChannel".to_string(),
+            TlaValue::Seq(Arc::new(vec![])),
+        )]);
+        let defs = BTreeMap::new();
+        let instances = BTreeMap::new();
+        let clauses = vec![ActionClause::Guard {
+            expr: r#"Head(FwCtlChannel).op = "Add""#.to_string(),
+        }];
+
+        let ctx =
+            build_action_expr_probe_context(&state, &defs, &instances, &[], &clauses, None);
+
+        let Some(TlaValue::Seq(items)) = ctx.locals.get("FwCtlChannel") else {
+            panic!("expected a seeded non-empty sequence");
+        };
+        let Some(TlaValue::Record(fields)) = items.first() else {
+            panic!("expected the seeded element to be a record");
+        };
+        assert!(fields.contains_key("op"));
+    }
+
+    #[test]
     fn sample_param_value_prefers_function_domains_and_integer_hints() {
         let mut state = TlaState::new();
         state.insert(
@@ -7139,11 +7395,88 @@ INVARIANTS TypeInvariant
     }
 
     #[test]
+    fn existential_guard_without_witness_disables_following_clauses() {
+        let state = TlaState::from([
+            ("aCounter".to_string(), TlaValue::Int(0)),
+            (
+                "aSession".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::new())),
+            ),
+        ]);
+        let defs = BTreeMap::new();
+        let instances = BTreeMap::new();
+        let clauses = vec![
+            ActionClause::Exists {
+                binders: "x \\in aSession".to_string(),
+                body: "TRUE".to_string(),
+            },
+            ActionClause::PrimedAssignment {
+                var: "aCounter".to_string(),
+                expr: "aCounter + 1".to_string(),
+            },
+        ];
+
+        let mut ctx =
+            build_action_expr_probe_context(&state, &defs, &instances, &[], &clauses, None);
+        let result = probe_action_clause_expr(&clauses[0], &mut ctx)
+            .expect("exists guard should return a probe result");
+        result.expect("missing witness should disable the branch, not error");
+        assert!(probe_branch_is_disabled(&ctx));
+        assert!(probe_action_clause_expr(&clauses[1], &mut ctx).is_none());
+    }
+
+    #[test]
+    fn helper_action_with_empty_sequence_precondition_gap_is_probeable() {
+        let state = TlaState::from([
+            (
+                "AuthChannel".to_string(),
+                TlaValue::Seq(Arc::new(vec![])),
+            ),
+            (
+                "ReplaySession".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::new())),
+            ),
+            ("ReplayCount".to_string(), TlaValue::Int(0)),
+        ]);
+        let defs = BTreeMap::from([(
+            "SDPSvrAntiReplayAtk".to_string(),
+            TlaDefinition {
+                name: "SDPSvrAntiReplayAtk".to_string(),
+                params: vec![],
+                body: r#"
+                    /\ AuthChannel' = Tail(AuthChannel)
+                    /\ ReplayCount' = ReplayCount + 1
+                    /\ ReplaySession' = ReplaySession \cup {Head(AuthChannel)}
+                "#
+                .to_string(),
+                is_recursive: false,
+            },
+        )]);
+        let def = defs
+            .get("SDPSvrAntiReplayAtk")
+            .expect("helper action should exist");
+        let ir = compile_action_ir(def);
+        let instances = BTreeMap::new();
+        let mut ctx =
+            build_action_expr_probe_context(&state, &defs, &instances, &[], &ir.clauses, None);
+
+        for clause in &ir.clauses {
+            if let Some(result) = probe_action_clause_expr(clause, &mut ctx) {
+                result.expect("empty-sequence helper action should use seeded probe values");
+            }
+        }
+
+        assert_eq!(ctx.locals.get("ReplayCount'"), Some(&TlaValue::Int(1)));
+    }
+
+    #[test]
     fn skips_temporal_formulas_in_action_expr_probe() {
         assert!(should_skip_action_expr_probe("[][x = x']_vars"));
         assert!(should_skip_action_expr_probe("<> done"));
         assert!(should_skip_action_expr_probe(r"\A s \in Servers : []<>(InSync(s))"));
         assert!(!should_skip_action_expr_probe("x' = x + 1"));
+        assert!(!should_skip_action_expr_probe("FwCtlChannel # <<>>"));
+        assert!(!should_skip_action_expr_probe("Head(FwCtlChannel) # <<>>"));
     }
 
     #[test]
