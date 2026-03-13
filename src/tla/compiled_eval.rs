@@ -88,6 +88,24 @@ fn tla_value_to_string(value: &TlaValue) -> String {
     }
 }
 
+fn sequence_like_values(value: &TlaValue) -> Option<Vec<TlaValue>> {
+    match value {
+        TlaValue::Seq(seq) => Some((**seq).clone()),
+        TlaValue::Function(map) => {
+            let mut out = Vec::with_capacity(map.len());
+            for (idx, (key, value)) in map.iter().enumerate() {
+                let expected = (idx as i64) + 1;
+                match key {
+                    TlaValue::Int(actual) if *actual == expected => out.push(value.clone()),
+                    _ => return None,
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
 const MAX_DEPTH: usize = 256;
 
 /// Evaluate a compiled expression
@@ -387,7 +405,8 @@ fn eval_compiled_inner(
         }
         CompiledExpr::Head(e) => {
             let seq = eval_compiled_inner(e, ctx, depth + 1)?;
-            let seq = seq.as_seq()?;
+            let seq = sequence_like_values(&seq)
+                .ok_or_else(|| anyhow!("expected Seq, got {seq:?}"))?;
             if seq.is_empty() {
                 return Err(anyhow!("Head of empty sequence"));
             }
@@ -395,7 +414,8 @@ fn eval_compiled_inner(
         }
         CompiledExpr::Tail(e) => {
             let seq = eval_compiled_inner(e, ctx, depth + 1)?;
-            let seq = seq.as_seq()?;
+            let seq = sequence_like_values(&seq)
+                .ok_or_else(|| anyhow!("expected Seq, got {seq:?}"))?;
             if seq.is_empty() {
                 return Err(anyhow!("Tail of empty sequence"));
             }
@@ -404,7 +424,8 @@ fn eval_compiled_inner(
         CompiledExpr::Append(a, b) => {
             let seq = eval_compiled_inner(a, ctx, depth + 1)?;
             let elem = eval_compiled_inner(b, ctx, depth + 1)?;
-            let mut seq = seq.as_seq()?.to_vec();
+            let mut seq = sequence_like_values(&seq)
+                .ok_or_else(|| anyhow!("expected Seq, got {seq:?}"))?;
             seq.push(elem);
             Ok(TlaValue::Seq(Arc::new(seq)))
         }
@@ -417,28 +438,38 @@ fn eval_compiled_inner(
                     a.push_str(&b);
                     Ok(TlaValue::String(a))
                 }
-                (TlaValue::Seq(a), TlaValue::Seq(b)) => {
-                    let mut result = (*a).clone();
-                    result.extend(b.iter().cloned());
-                    Ok(TlaValue::Seq(Arc::new(result)))
+                (a, b) => {
+                    let Some(mut lhs_seq) = sequence_like_values(&a) else {
+                        return Err(anyhow!(
+                            "\\o expects String or Seq operands, got {:?} and {:?}",
+                            a,
+                            b
+                        ));
+                    };
+                    let Some(rhs_seq) = sequence_like_values(&b) else {
+                        return Err(anyhow!(
+                            "\\o expects String or Seq operands, got {:?} and {:?}",
+                            a,
+                            b
+                        ));
+                    };
+                    lhs_seq.extend(rhs_seq);
+                    Ok(TlaValue::Seq(Arc::new(lhs_seq)))
                 }
-                (a, b) => Err(anyhow!(
-                    "\\o expects String or Seq operands, got {:?} and {:?}",
-                    a,
-                    b
-                )),
             }
         }
         CompiledExpr::Len(e) => {
             let seq = eval_compiled_inner(e, ctx, depth + 1)?;
-            let seq = seq.as_seq()?;
+            let seq = sequence_like_values(&seq)
+                .ok_or_else(|| anyhow!("expected Seq, got {seq:?}"))?;
             Ok(TlaValue::Int(seq.len() as i64))
         }
         CompiledExpr::SubSeq(s, a, b) => {
             let seq = eval_compiled_inner(s, ctx, depth + 1)?;
             let start = eval_compiled_inner(a, ctx, depth + 1)?.as_int()? as usize;
             let end = eval_compiled_inner(b, ctx, depth + 1)?.as_int()? as usize;
-            let seq = seq.as_seq()?;
+            let seq = sequence_like_values(&seq)
+                .ok_or_else(|| anyhow!("expected Seq, got {seq:?}"))?;
             // TLA+ uses 1-based indexing
             let start = start.saturating_sub(1);
             let end = end.min(seq.len());
@@ -1317,7 +1348,8 @@ fn eval_compiled_opcall(
             if arg_values.len() != 1 {
                 return Err(anyhow!("Head expects 1 argument"));
             }
-            let seq = arg_values[0].as_seq()?;
+            let seq = sequence_like_values(&arg_values[0])
+                .ok_or_else(|| anyhow!("expected Seq, got {:?}", arg_values[0]))?;
             if seq.is_empty() {
                 return Err(anyhow!("Head of empty sequence"));
             }
@@ -1327,7 +1359,8 @@ fn eval_compiled_opcall(
             if arg_values.len() != 1 {
                 return Err(anyhow!("Tail expects 1 argument"));
             }
-            let seq = arg_values[0].as_seq()?;
+            let seq = sequence_like_values(&arg_values[0])
+                .ok_or_else(|| anyhow!("expected Seq, got {:?}", arg_values[0]))?;
             if seq.is_empty() {
                 return Err(anyhow!("Tail of empty sequence"));
             }
@@ -1337,7 +1370,8 @@ fn eval_compiled_opcall(
             if arg_values.len() != 2 {
                 return Err(anyhow!("Append expects 2 arguments"));
             }
-            let mut seq = arg_values[0].as_seq()?.to_vec();
+            let mut seq = sequence_like_values(&arg_values[0])
+                .ok_or_else(|| anyhow!("expected Seq, got {:?}", arg_values[0]))?;
             seq.push(arg_values[1].clone());
             return Ok(TlaValue::Seq(Arc::new(seq)));
         }
@@ -1345,7 +1379,8 @@ fn eval_compiled_opcall(
             if arg_values.len() != 3 {
                 return Err(anyhow!("SubSeq expects 3 arguments"));
             }
-            let seq = arg_values[0].as_seq()?;
+            let seq = sequence_like_values(&arg_values[0])
+                .ok_or_else(|| anyhow!("expected Seq, got {:?}", arg_values[0]))?;
             let m = arg_values[1].as_int()?;
             let n = arg_values[2].as_int()?;
 
@@ -3012,4 +3047,58 @@ fn test_compiled_cartesian_product_times() {
         TlaValue::Seq(Arc::new(vec![TlaValue::Int(2), TlaValue::Int(3)])),
     ])));
     assert_eq!(result_times, expected);
+}
+
+#[test]
+fn test_compiled_sequence_builtins_accept_sequence_like_functions() {
+    let state = TlaState::from([
+        (
+            "seq_like".to_string(),
+            TlaValue::Function(Arc::new(BTreeMap::from([
+                (TlaValue::Int(1), TlaValue::Int(1)),
+                (TlaValue::Int(2), TlaValue::Int(2)),
+            ]))),
+        ),
+        (
+            "other".to_string(),
+            TlaValue::Function(Arc::new(BTreeMap::from([(
+                TlaValue::Int(1),
+                TlaValue::Int(3),
+            )]))),
+        ),
+    ]);
+    let ctx = EvalContext::new(&state);
+
+    assert_eq!(
+        eval_compiled(&compile_expr("Len(seq_like)"), &ctx).unwrap(),
+        TlaValue::Int(2)
+    );
+    assert_eq!(
+        eval_compiled(&compile_expr("Head(seq_like)"), &ctx).unwrap(),
+        TlaValue::Int(1)
+    );
+    assert_eq!(
+        eval_compiled(&compile_expr("Tail(seq_like)"), &ctx).unwrap(),
+        TlaValue::Seq(Arc::new(vec![TlaValue::Int(2)]))
+    );
+    assert_eq!(
+        eval_compiled(&compile_expr("Append(seq_like, 4)"), &ctx).unwrap(),
+        TlaValue::Seq(Arc::new(vec![
+            TlaValue::Int(1),
+            TlaValue::Int(2),
+            TlaValue::Int(4),
+        ]))
+    );
+    assert_eq!(
+        eval_compiled(&compile_expr("SubSeq(seq_like, 1, 2)"), &ctx).unwrap(),
+        TlaValue::Seq(Arc::new(vec![TlaValue::Int(1), TlaValue::Int(2)]))
+    );
+    assert_eq!(
+        eval_compiled(&compile_expr("seq_like \\o other"), &ctx).unwrap(),
+        TlaValue::Seq(Arc::new(vec![
+            TlaValue::Int(1),
+            TlaValue::Int(2),
+            TlaValue::Int(3),
+        ]))
+    );
 }
