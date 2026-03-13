@@ -340,17 +340,16 @@ fn execute_branch(
             }
 
             let interpreted_ir = compile_action_ir(def);
-            return apply_action_ir_with_context_multi(&interpreted_ir, state, &ctx).or_else(
-                |_| {
-                    execute_branch(
-                        &def.body,
-                        &bound_locals,
-                        &module.definitions,
-                        effective_instance_scope(&module.instances, Some(instance_map)),
-                        state,
-                    )
-                },
-            );
+            return match apply_action_ir_with_context_multi(&interpreted_ir, state, &ctx) {
+                Ok(successors) => Ok(successors),
+                Err(_) => execute_branch(
+                    &def.body,
+                    &bound_locals,
+                    &module.definitions,
+                    effective_instance_scope(&module.instances, Some(instance_map)),
+                    state,
+                ),
+            };
         }
 
         let def = definitions
@@ -396,7 +395,13 @@ fn execute_branch(
         let compiled_ir = get_or_compile_action(def);
         return match apply_compiled_action_ir_multi(&compiled_ir, state, &ctx) {
             Ok(successors) if !successors.is_empty() => Ok(successors),
-            _ => execute_branch(&def.body, &bound_locals, definitions, instances, state),
+            _ => {
+                let interpreted_ir = compile_action_ir(def);
+                match apply_action_ir_with_context_multi(&interpreted_ir, state, &ctx) {
+                    Ok(successors) => Ok(successors),
+                    Err(_) => execute_branch(&def.body, &bound_locals, definitions, instances, state),
+                }
+            }
         };
     }
 
@@ -1933,5 +1938,104 @@ CONSTANTS
         assert_eq!(probe.supported_disjuncts, 1);
         assert_eq!(probe.generated_successors, 1);
         assert!(probe.failures.is_empty());
+    }
+
+    #[test]
+    fn evaluates_next_disjuncts_with_phase2a_style_let_guards() {
+        let a1 = TlaValue::ModelValue("a1".to_string());
+        let a2 = TlaValue::ModelValue("a2".to_string());
+        let v1 = TlaValue::ModelValue("v1".to_string());
+        let quorum = TlaValue::Set(Arc::new(BTreeSet::from([a1.clone(), a2.clone()])));
+        let msg_a1 = TlaValue::Record(Arc::new(BTreeMap::from([
+            ("type".to_string(), TlaValue::String("1b".to_string())),
+            ("acc".to_string(), a1.clone()),
+            ("bal".to_string(), TlaValue::Int(1)),
+            ("mbal".to_string(), TlaValue::Int(1)),
+            ("mval".to_string(), v1.clone()),
+        ])));
+        let msg_a2 = TlaValue::Record(Arc::new(BTreeMap::from([
+            ("type".to_string(), TlaValue::String("1b".to_string())),
+            ("acc".to_string(), a2.clone()),
+            ("bal".to_string(), TlaValue::Int(1)),
+            ("mbal".to_string(), TlaValue::Int(0)),
+            ("mval".to_string(), v1.clone()),
+        ])));
+
+        let defs = BTreeMap::from([
+            (
+                "Ballot".to_string(),
+                TlaDefinition {
+                    name: "Ballot".to_string(),
+                    params: vec![],
+                    body: "{1}".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Value".to_string(),
+                TlaDefinition {
+                    name: "Value".to_string(),
+                    params: vec![],
+                    body: "{v1}".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Phase1a".to_string(),
+                TlaDefinition {
+                    name: "Phase1a".to_string(),
+                    params: vec!["b".to_string()],
+                    body: "FALSE".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Phase2a".to_string(),
+                TlaDefinition {
+                    name: "Phase2a".to_string(),
+                    params: vec!["b".to_string(), "v".to_string()],
+                    body: r#"
+                        /\ \E Q \in Quorum :
+                              LET Q1b == {m \in msgs : /\ m.type = "1b"
+                                                       /\ m.acc \in Q
+                                                       /\ m.bal = b}
+                                  Q1bv == {m \in Q1b : m.mbal >= 0}
+                              IN  /\ \A a \in Q : \E m \in Q1b : m.acc = a
+                                  /\ \/ Q1bv = {}
+                                     \/ \E m \in Q1bv :
+                                          /\ m.mval = v
+                                          /\ \A mm \in Q1bv : m.mbal >= mm.mbal
+                        /\ sent' = TRUE
+                        /\ UNCHANGED <<msgs, Quorum>>
+                    "#
+                    .to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+
+        let state = TlaState::from([
+            (
+                "msgs".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([msg_a1, msg_a2]))),
+            ),
+            (
+                "Quorum".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([quorum]))),
+            ),
+            ("sent".to_string(), TlaValue::Bool(false)),
+            ("v1".to_string(), v1),
+        ]);
+
+        let probe = probe_next_disjuncts(
+            r#"\E b \in Ballot :
+                  \/ Phase1a(b)
+                  \/ \E v \in Value : Phase2a(b, v)"#,
+            &defs,
+            &state,
+        );
+        assert_eq!(probe.supported_disjuncts, 2, "{probe:?}");
+        assert_eq!(probe.generated_successors, 1, "{probe:?}");
+        assert!(probe.failures.is_empty(), "{probe:?}");
     }
 }

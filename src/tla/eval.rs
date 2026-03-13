@@ -837,7 +837,7 @@ fn eval_action_clause_text_multi(
         ClauseKind::UnprimedEquality { .. }
         | ClauseKind::UnprimedMembership { .. }
         | ClauseKind::Other => {
-            if trimmed.starts_with("LET") && trimmed.contains('\'') {
+            if trimmed.starts_with("LET") {
                 eval_let_action_multi_branch(trimmed, ctx, branch)
             } else if eval_guard(trimmed, &eval_ctx)? {
                 Ok(vec![branch])
@@ -5932,6 +5932,141 @@ IN
         assert_eq!(trade.get("buyer"), Some(&bot));
         assert_eq!(trade.get("seller"), Some(&seller));
         assert_eq!(trade.get("asset"), Some(&asset));
+    }
+
+    #[test]
+    fn action_let_guard_keeps_local_sets_available_in_disjunctive_bodies() {
+        let a1 = TlaValue::ModelValue("a1".to_string());
+        let a2 = TlaValue::ModelValue("a2".to_string());
+        let v1 = TlaValue::ModelValue("v1".to_string());
+        let quorum = TlaValue::Set(Arc::new(BTreeSet::from([a1.clone(), a2.clone()])));
+        let msg_a1 = TlaValue::Record(Arc::new(BTreeMap::from([
+            ("type".to_string(), TlaValue::String("1b".to_string())),
+            ("acc".to_string(), a1.clone()),
+            ("bal".to_string(), TlaValue::Int(1)),
+            ("mbal".to_string(), TlaValue::Int(1)),
+            ("mval".to_string(), v1.clone()),
+        ])));
+        let msg_a2 = TlaValue::Record(Arc::new(BTreeMap::from([
+            ("type".to_string(), TlaValue::String("1b".to_string())),
+            ("acc".to_string(), a2.clone()),
+            ("bal".to_string(), TlaValue::Int(1)),
+            ("mbal".to_string(), TlaValue::Int(0)),
+            ("mval".to_string(), v1.clone()),
+        ])));
+        let state = TlaState::from([
+            (
+                "msgs".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([msg_a1, msg_a2]))),
+            ),
+            (
+                "Quorum".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([quorum]))),
+            ),
+            ("sent".to_string(), TlaValue::Bool(false)),
+        ]);
+        let ctx = EvalContext::new(&state).with_local_values(&[
+            ("b", TlaValue::Int(1)),
+            ("v", v1.clone()),
+        ]);
+        let action = ActionIr {
+            name: "Phase2a".to_string(),
+            params: vec![],
+            clauses: vec![
+                ActionClause::Guard {
+                    expr: r#"\E Q \in Quorum :
+        LET Q1b == {m \in msgs : /\ m.type = "1b"
+                                 /\ m.acc \in Q
+                                 /\ m.bal = b}
+            Q1bv == {m \in Q1b : m.mbal >= 0}
+        IN  /\ \A a \in Q : \E m \in Q1b : m.acc = a
+            /\ \/ Q1bv = {}
+               \/ \E m \in Q1bv :
+                    /\ m.mval = v
+                    /\ \A mm \in Q1bv : m.mbal >= mm.mbal"#
+                        .to_string(),
+                },
+                ActionClause::PrimedAssignment {
+                    var: "sent".to_string(),
+                    expr: "TRUE".to_string(),
+                },
+                ActionClause::Unchanged {
+                    vars: vec!["msgs".to_string()],
+                },
+            ],
+        };
+
+        let next_states = apply_action_ir_with_context_multi(&action, &state, &ctx)
+            .expect("LET guard with local quantified set should evaluate");
+        assert_eq!(next_states.len(), 1);
+        let next = &next_states[0];
+        assert_eq!(next.get("sent"), Some(&TlaValue::Bool(true)));
+        assert_eq!(next.get("msgs"), state.get("msgs"));
+    }
+
+    #[test]
+    fn compiled_action_ir_handles_phase2a_style_let_disjunctions() {
+        let a1 = TlaValue::ModelValue("a1".to_string());
+        let a2 = TlaValue::ModelValue("a2".to_string());
+        let v1 = TlaValue::ModelValue("v1".to_string());
+        let quorum = TlaValue::Set(Arc::new(BTreeSet::from([a1.clone(), a2.clone()])));
+        let msg_a1 = TlaValue::Record(Arc::new(BTreeMap::from([
+            ("type".to_string(), TlaValue::String("1b".to_string())),
+            ("acc".to_string(), a1.clone()),
+            ("bal".to_string(), TlaValue::Int(1)),
+            ("mbal".to_string(), TlaValue::Int(1)),
+            ("mval".to_string(), v1.clone()),
+        ])));
+        let msg_a2 = TlaValue::Record(Arc::new(BTreeMap::from([
+            ("type".to_string(), TlaValue::String("1b".to_string())),
+            ("acc".to_string(), a2.clone()),
+            ("bal".to_string(), TlaValue::Int(1)),
+            ("mbal".to_string(), TlaValue::Int(0)),
+            ("mval".to_string(), v1.clone()),
+        ])));
+        let state = TlaState::from([
+            (
+                "msgs".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([msg_a1, msg_a2]))),
+            ),
+            (
+                "Quorum".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([quorum]))),
+            ),
+            ("sent".to_string(), TlaValue::Bool(false)),
+        ]);
+        let ctx = EvalContext::new(&state).with_local_values(&[
+            ("b", TlaValue::Int(1)),
+            ("v", v1),
+        ]);
+        let def = TlaDefinition {
+            name: "Phase2a".to_string(),
+            params: vec![],
+            body: r#"
+                /\ \E Q \in Quorum :
+                      LET Q1b == {m \in msgs : /\ m.type = "1b"
+                                               /\ m.acc \in Q
+                                               /\ m.bal = b}
+                          Q1bv == {m \in Q1b : m.mbal >= 0}
+                      IN  /\ \A a \in Q : \E m \in Q1b : m.acc = a
+                          /\ \/ Q1bv = {}
+                             \/ \E m \in Q1bv :
+                                  /\ m.mval = v
+                                  /\ \A mm \in Q1bv : m.mbal >= mm.mbal
+                /\ sent' = TRUE
+                /\ UNCHANGED <<msgs>>
+            "#
+            .to_string(),
+            is_recursive: false,
+        };
+        let action = crate::tla::compile_action_ir(&def);
+
+        let next_states = apply_action_ir_with_context_multi(&action, &state, &ctx)
+            .expect("compiled action IR should preserve LET-local quantified sets");
+        assert_eq!(next_states.len(), 1);
+        let next = &next_states[0];
+        assert_eq!(next.get("sent"), Some(&TlaValue::Bool(true)));
+        assert_eq!(next.get("msgs"), state.get("msgs"));
     }
 
     #[test]
