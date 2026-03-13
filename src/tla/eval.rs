@@ -3,7 +3,7 @@ use crate::tla::action_ir::{
 };
 use crate::tla::{
     ActionClause, ActionIr, ClauseKind, TlaDefinition, TlaState, TlaValue, classify_clause,
-    looks_like_action,
+    parse_stuttering_action_expr, looks_like_action,
 };
 use anyhow::{Context, Result, anyhow};
 use std::collections::{BTreeMap, BTreeSet};
@@ -572,6 +572,9 @@ fn eval_action_body_text_multi(
     ctx: &EvalContext<'_>,
     branch: ActionEvalBranch,
 ) -> Result<Vec<ActionEvalBranch>> {
+    if let Some((action, vars)) = parse_stuttering_action_expr(body) {
+        return eval_stuttering_action_multi(&action, &vars, ctx, branch);
+    }
     if let Some(result) = eval_disjunctive_action_body_multi(body, ctx, branch.clone()) {
         return result;
     }
@@ -630,6 +633,31 @@ fn eval_disjunctive_action_body_multi(
             anyhow!("no disjunctive action branch produced a successor")
         })))
     }
+}
+
+fn eval_stuttering_action_multi(
+    action: &str,
+    vars: &[String],
+    ctx: &EvalContext<'_>,
+    branch: ActionEvalBranch,
+) -> Result<Vec<ActionEvalBranch>> {
+    let mut out = match eval_action_body_text_multi(action, ctx, branch.clone()) {
+        Ok(branches) => branches,
+        Err(_) => Vec::new(),
+    };
+
+    let mut stutter = branch;
+    for var in vars {
+        stutter.unchanged_vars.push(var.clone());
+        if let Some(value) = ctx.state.get(var) {
+            stutter
+                .staged
+                .entry(var.clone())
+                .or_insert_with(|| value.clone());
+        }
+    }
+    out.push(stutter);
+    Ok(out)
 }
 
 fn parse_action_call_expr(expr: &str) -> Option<(String, Vec<String>)> {
@@ -823,6 +851,9 @@ fn eval_action_clause_text_multi(
     }
     if let Some((binders, body)) = parse_action_exists(trimmed) {
         return eval_exists_action_multi(binders, body, ctx, branch);
+    }
+    if let Some((action, vars)) = parse_stuttering_action_expr(trimmed) {
+        return eval_stuttering_action_multi(&action, &vars, ctx, branch);
     }
     if let Some(result) = eval_disjunctive_action_body_multi(trimmed, ctx, branch.clone()) {
         return result;
@@ -8440,6 +8471,19 @@ Buffer == INSTANCE RingBuffer
 
         let disabled = eval_expr("ENABLED Step(2)", &ctx).expect("ENABLED Step(2)");
         assert_eq!(disabled, TlaValue::Bool(false));
+    }
+
+    #[test]
+    fn eval_action_body_supports_box_stuttering_formulas() {
+        let state = TlaState::from([("x".to_string(), TlaValue::Int(0))]);
+        let defs = BTreeMap::new();
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        let branches =
+            eval_action_body_multi("[x' = x + 1]_x", &ctx, &BTreeMap::new()).expect("box action");
+        assert_eq!(branches.len(), 2);
+        assert!(branches.iter().any(|(staged, _)| staged.get("x") == Some(&TlaValue::Int(1))));
+        assert!(branches.iter().any(|(staged, _)| staged.get("x") == Some(&TlaValue::Int(0))));
     }
 
     #[test]
