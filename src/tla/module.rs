@@ -556,18 +556,21 @@ pub fn parse_tla_module_text(input: &str) -> Result<TlaModule> {
                 }
             }
         }
-        if can_start_definition && instance_declaration_needs_continuation(raw_trimmed) {
-            while let Some(next_line) = pending_lines.front() {
+        if can_start_definition && instance_declaration_needs_continuation(definition_line.trim()) {
+            while instance_declaration_needs_continuation(definition_line.trim()) {
+                let Some(next_line) = pending_lines.front() else {
+                    break;
+                };
                 if !is_instance_substitution_continuation(next_line, line_indent) {
                     break;
                 }
-                definition_line.push(' ');
-                definition_line.push_str(next_line.trim());
-                let keep_reading = next_line.trim_end().ends_with(',');
-                pending_lines.pop_front();
-                if !keep_reading {
-                    break;
+                let next_line = pending_lines.pop_front().expect("front line should exist");
+                let next_trimmed = next_line.trim();
+                if next_trimmed.is_empty() {
+                    continue;
                 }
+                definition_line.push(' ');
+                definition_line.push_str(next_trimmed);
             }
         }
 
@@ -805,17 +808,92 @@ fn definition_head_needs_continuation(line: &str) -> bool {
 }
 
 fn instance_declaration_needs_continuation(line: &str) -> bool {
-    let trimmed = line.trim();
-    trimmed.contains("INSTANCE") && trimmed.ends_with("WITH")
+    let Some(with_clause) = extract_instance_with_clause(line) else {
+        return false;
+    };
+    instance_with_clause_is_incomplete(with_clause)
 }
 
 fn is_instance_substitution_continuation(line: &str, base_indent: usize) -> bool {
     let trimmed = line.trim();
     if trimmed.is_empty() {
-        return false;
+        return true;
     }
     let indent = line.chars().take_while(|c| c.is_whitespace()).count();
-    indent > base_indent && trimmed.contains("<-")
+    indent > base_indent
+}
+
+fn extract_instance_with_clause(line: &str) -> Option<&str> {
+    let line = line.trim();
+    let line = line.strip_prefix("LOCAL ").unwrap_or(line).trim();
+    let rhs = line
+        .split_once("==")
+        .map(|(_, rhs)| rhs.trim())
+        .unwrap_or(line);
+    let after_instance = rhs.strip_prefix("INSTANCE")?.trim();
+    if let Some(idx) = after_instance.find(" WITH ") {
+        return Some(after_instance[idx + " WITH ".len()..].trim());
+    }
+    after_instance.strip_suffix(" WITH").map(str::trim)
+}
+
+fn instance_with_clause_is_incomplete(with_clause: &str) -> bool {
+    let with_clause = with_clause.trim();
+    if with_clause.is_empty() {
+        return true;
+    }
+
+    let mut depth: usize = 0;
+    let mut start = 0usize;
+    let chars: Vec<char> = with_clause.chars().collect();
+    let n = chars.len();
+    let mut i = 0usize;
+
+    while i < n {
+        match chars[i] {
+            '{' | '[' | '(' => depth += 1,
+            '}' | ']' | ')' => depth = depth.saturating_sub(1),
+            '<' => {
+                if i + 1 < n && chars[i + 1] == '<' {
+                    depth += 1;
+                    i += 1;
+                }
+            }
+            '>' => {
+                if i + 1 < n && chars[i + 1] == '>' {
+                    depth = depth.saturating_sub(1);
+                    i += 1;
+                }
+            }
+            ',' if depth == 0 => {
+                let segment = with_clause[start..i].trim();
+                if instance_substitution_segment_incomplete(segment) {
+                    return true;
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    if depth > 0 {
+        return true;
+    }
+
+    let tail = with_clause[start..].trim();
+    if tail.is_empty() {
+        return true;
+    }
+
+    instance_substitution_segment_incomplete(tail)
+}
+
+fn instance_substitution_segment_incomplete(segment: &str) -> bool {
+    let Some((param, value)) = segment.split_once("<-") else {
+        return true;
+    };
+    param.trim().is_empty() || value.trim().is_empty()
 }
 
 fn can_start_indented_definition_after_gap(current_def: &TlaDefinition, line: &str) -> bool {
@@ -2701,6 +2779,69 @@ Init == x = 0
     }
 
     #[test]
+    fn parses_named_instance_with_first_substitution_inline_and_more_on_following_lines() {
+        let src = r#"
+---- MODULE TestInlineThenMultilineNamedInstance ----
+EXTENDS Naturals
+
+Helper == INSTANCE CoverageHelper WITH Node <- {1, 2, 3},
+                               Mode <- "safe",
+                               Limit <- 4
+
+VARIABLES x
+Init == x = 0
+====
+"#;
+        let m = parse_tla_module_text(src).expect("parse should work");
+        let helper = m
+            .instances
+            .get("Helper")
+            .expect("Helper instance should exist");
+        assert_eq!(helper.module_name, "CoverageHelper");
+        assert_eq!(
+            helper.substitutions.get("Node"),
+            Some(&"{1, 2, 3}".to_string())
+        );
+        assert_eq!(
+            helper.substitutions.get("Mode"),
+            Some(&"\"safe\"".to_string())
+        );
+        assert_eq!(helper.substitutions.get("Limit"), Some(&"4".to_string()));
+    }
+
+    #[test]
+    fn parses_named_instance_with_multiline_substitution_values_and_comments() {
+        let src = r#"
+---- MODULE TestNestedInstanceValue ----
+EXTENDS Naturals
+
+Helper == INSTANCE CoverageHelper WITH Node <-
+    [n \in Nodes |-> 0],
+    \* stripped comments should not terminate the WITH clause
+    Mode <- [kind |-> "safe",
+             enabled |-> TRUE]
+
+VARIABLES x
+Init == x = 0
+====
+"#;
+        let m = parse_tla_module_text(src).expect("parse should work");
+        let helper = m
+            .instances
+            .get("Helper")
+            .expect("Helper instance should exist");
+        assert_eq!(helper.module_name, "CoverageHelper");
+        assert_eq!(
+            helper.substitutions.get("Node"),
+            Some(&"[n \\in Nodes |-> 0]".to_string())
+        );
+        assert_eq!(
+            helper.substitutions.get("Mode"),
+            Some(&"[kind |-> \"safe\", enabled |-> TRUE]".to_string())
+        );
+    }
+
+    #[test]
     fn parses_unnamed_instance_declaration() {
         let src = r#"
 ---- MODULE TestUnnamedInstance ----
@@ -2787,6 +2928,35 @@ Init == x = 0
             Some(&"Servers".to_string())
         );
         assert_eq!(instance.substitutions.get("F"), Some(&"Faulty".to_string()));
+    }
+
+    #[test]
+    fn parses_unnamed_instance_with_inline_then_multiline_substitutions() {
+        let src = r#"
+---- MODULE TestInlineThenMultilineUnnamedInstance ----
+EXTENDS Naturals
+
+INSTANCE Sailfish WITH Node <- Servers,
+                      F <- Faulty,
+                      Mode <- [kind |-> "safe"]
+
+VARIABLES x
+Init == x = 0
+====
+"#;
+        let m = parse_tla_module_text(src).expect("parse should work");
+        assert_eq!(m.unnamed_instances.len(), 1);
+        let instance = &m.unnamed_instances[0];
+        assert_eq!(instance.module_name, "Sailfish");
+        assert_eq!(
+            instance.substitutions.get("Node"),
+            Some(&"Servers".to_string())
+        );
+        assert_eq!(instance.substitutions.get("F"), Some(&"Faulty".to_string()));
+        assert_eq!(
+            instance.substitutions.get("Mode"),
+            Some(&"[kind |-> \"safe\"]".to_string())
+        );
     }
 
     #[test]

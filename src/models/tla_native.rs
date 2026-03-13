@@ -894,6 +894,7 @@ fn resolve_zero_arg_state_definition<'a>(
     &'a TlaDefinition,
     &'a BTreeMap<String, TlaDefinition>,
     &'a BTreeMap<String, TlaModuleInstance>,
+    Option<&'a TlaModuleInstance>,
 )> {
     let (alias, name) = parse_zero_arg_state_operator_ref(expr)?;
     match alias {
@@ -909,6 +910,7 @@ fn resolve_zero_arg_state_definition<'a>(
                 def,
                 &module.definitions,
                 &module.instances,
+                Some(instance),
             ))
         }
         None => {
@@ -916,7 +918,7 @@ fn resolve_zero_arg_state_definition<'a>(
             if !def.params.is_empty() || def.body.trim() == expr.trim() {
                 return None;
             }
-            Some((name.to_string(), def, definitions, instances))
+            Some((name.to_string(), def, definitions, instances, None))
         }
     }
 }
@@ -928,7 +930,14 @@ fn expand_state_predicate_clauses(
 ) -> Vec<String> {
     let mut out = Vec::new();
     let mut visiting = BTreeSet::new();
-    append_expanded_state_predicate_clause(body, definitions, instances, &mut visiting, &mut out);
+    append_expanded_state_predicate_clause(
+        body,
+        definitions,
+        instances,
+        None,
+        &mut visiting,
+        &mut out,
+    );
     out
 }
 
@@ -936,6 +945,7 @@ fn append_expanded_state_predicate_clause(
     clause: &str,
     definitions: &BTreeMap<String, TlaDefinition>,
     instances: &BTreeMap<String, TlaModuleInstance>,
+    active_instance: Option<&TlaModuleInstance>,
     visiting: &mut BTreeSet<String>,
     out: &mut Vec<String>,
 ) {
@@ -947,19 +957,28 @@ fn append_expanded_state_predicate_clause(
     let parts = split_top_level(trimmed, "/\\");
     if parts.len() > 1 || trimmed.starts_with("/\\") {
         for part in parts {
-            append_expanded_state_predicate_clause(&part, definitions, instances, visiting, out);
+            append_expanded_state_predicate_clause(
+                &part,
+                definitions,
+                instances,
+                active_instance,
+                visiting,
+                out,
+            );
         }
         return;
     }
 
-    if let Some((key, def, child_definitions, child_instances)) =
+    if let Some((key, def, child_definitions, child_instances, instance_override)) =
         resolve_zero_arg_state_definition(trimmed, definitions, instances)
         && visiting.insert(key.clone())
     {
+        let next_instance = instance_override.or(active_instance);
         append_expanded_state_predicate_clause(
             &def.body,
             child_definitions,
             child_instances,
+            next_instance,
             visiting,
             out,
         );
@@ -967,7 +986,70 @@ fn append_expanded_state_predicate_clause(
         return;
     }
 
-    out.push(trimmed.to_string());
+    if let Some(instance) = active_instance {
+        out.push(apply_instance_substitutions_to_text(trimmed, instance));
+    } else {
+        out.push(trimmed.to_string());
+    }
+}
+
+fn apply_instance_substitutions_to_text(expr: &str, instance: &TlaModuleInstance) -> String {
+    if instance.substitutions.is_empty() {
+        return expr.to_string();
+    }
+
+    let chars: Vec<char> = expr.chars().collect();
+    let mut substitutions: Vec<(&str, &str)> = instance
+        .substitutions
+        .iter()
+        .map(|(param, value_expr)| (param.as_str(), value_expr.as_str()))
+        .collect();
+    substitutions.sort_by_key(|(param, _)| std::cmp::Reverse(param.len()));
+
+    let mut out = String::with_capacity(expr.len());
+    let mut i = 0usize;
+    let mut in_string = false;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '"' {
+            in_string = !in_string;
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+        if in_string {
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+
+        let is_ident_start = ch.is_alphabetic() || ch == '_';
+        if !is_ident_start {
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+
+        let start = i;
+        i += 1;
+        while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+            i += 1;
+        }
+        let ident: String = chars[start..i].iter().collect();
+        let mut replaced = false;
+        for (param, value_expr) in &substitutions {
+            if ident == *param {
+                out.push_str(value_expr);
+                replaced = true;
+                break;
+            }
+        }
+        if !replaced {
+            out.push_str(&ident);
+        }
+    }
+
+    out
 }
 
 /// Evaluate Init predicate and return all possible initial states.
@@ -1229,7 +1311,9 @@ fn add_instance_definition_fallbacks(
             continue;
         };
         for (name, def) in &module.definitions {
-            definitions.entry(name.clone()).or_insert_with(|| def.clone());
+            definitions
+                .entry(name.clone())
+                .or_insert_with(|| def.clone());
         }
         add_instance_definition_fallbacks(&module.instances, definitions);
     }
@@ -2420,6 +2504,75 @@ SPECIFICATION Spec
     }
 
     #[test]
+    fn initial_states_apply_instance_substitutions_from_multiline_with_clauses() {
+        let tmp = std::env::temp_dir().join("tlapp-instance-init-substitution-test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should be created");
+
+        let child = tmp.join("Child.tla");
+        fs::write(
+            &child,
+            r#"
+---- MODULE Child ----
+CONSTANT Jug
+VARIABLE contents
+Init == /\ contents = [j \in Jug |-> 0]
+Next == /\ UNCHANGED contents
+====
+"#,
+        )
+        .expect("child module should be written");
+
+        let model = tmp.join("MC.tla");
+        fs::write(
+            &model,
+            r#"
+---- MODULE MC ----
+VARIABLES c1, z
+D == INSTANCE Child WITH contents <- c1,
+                           Jug <- {"j1", "j2"}
+Init == /\ z = 0
+        /\ D!Init
+Next == /\ UNCHANGED <<c1, z>>
+Spec == Init /\ [][Next]_<<c1, z>>
+====
+"#,
+        )
+        .expect("mc module should be written");
+
+        let cfg = tmp.join("MC.cfg");
+        fs::write(
+            &cfg,
+            r#"
+SPECIFICATION Spec
+"#,
+        )
+        .expect("cfg should be written");
+
+        let model =
+            TlaModel::from_files(&model, Some(&cfg), None, None).expect("model should build");
+        let init = model.initial_states();
+
+        assert_eq!(init.len(), 1);
+        assert_eq!(init[0].get("z"), Some(&TlaValue::Int(0)));
+        let c1 = init[0].get("c1").expect("c1 should be defined");
+        let TlaValue::Function(entries) = c1 else {
+            panic!("c1 should be a function");
+        };
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries.get(&TlaValue::String("j1".to_string())),
+            Some(&TlaValue::Int(0))
+        );
+        assert_eq!(
+            entries.get(&TlaValue::String("j2".to_string())),
+            Some(&TlaValue::Int(0))
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn initial_states_resolve_helper_defs_from_instance_inits() {
         let tmp = std::env::temp_dir().join("tlapp-instance-init-helper-test");
         let _ = fs::remove_dir_all(&tmp);
@@ -2464,7 +2617,8 @@ SPECIFICATION Spec
         )
         .expect("cfg should be written");
 
-        let model = TlaModel::from_files(&model, Some(&cfg), None, None).expect("model should build");
+        let model =
+            TlaModel::from_files(&model, Some(&cfg), None, None).expect("model should build");
         let init = model.initial_states();
 
         assert_eq!(init.len(), 1);
