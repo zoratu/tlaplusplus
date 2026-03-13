@@ -572,6 +572,12 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
     if let Some((left, right)) = split_binary_op(expr, "%") {
         return CompiledExpr::Mod(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
     }
+    if let Some((left, right)) = split_binary_op(expr, "^^") {
+        return CompiledExpr::OpCall {
+            name: "^^".to_string(),
+            args: vec![compile_expr(left), compile_expr(right)],
+        };
+    }
     if let Some((left, right)) = split_binary_op(expr, "^") {
         return CompiledExpr::Pow(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
     }

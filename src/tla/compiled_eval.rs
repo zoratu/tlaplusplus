@@ -1482,6 +1482,14 @@ fn eval_compiled_opcall(
             let s = tla_value_to_string(&arg_values[0]);
             return Ok(TlaValue::String(s));
         }
+        "^^" => {
+            if arg_values.len() != 2 {
+                return Err(anyhow!("^^ expects 2 arguments"));
+            }
+            let left = arg_values[0].as_int()?;
+            let right = arg_values[1].as_int()?;
+            return Ok(TlaValue::Int(left ^ right));
+        }
         // TLC module: FunAsSeq(f, a, b) - converts a function to a sequence
         // FunAsSeq(f, a, b) == [i \in 1..b |-> f[a + i - 1]]
         // This creates a sequence of length b by extracting values from f
@@ -1994,6 +2002,10 @@ mod tests {
         assert_eq!(
             eval_compiled(&compile_expr("2^5"), &ctx).unwrap(),
             TlaValue::Int(32)
+        );
+        assert_eq!(
+            eval_compiled(&compile_expr("6 ^^ 3"), &ctx).unwrap(),
+            TlaValue::Int(5)
         );
         assert_eq!(
             eval_compiled(&compile_expr("2^5 - 1"), &ctx).unwrap(),
