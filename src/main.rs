@@ -2119,15 +2119,17 @@ fn seed_probe_state_from_membership_body(
         let mut next_pending = Vec::new();
         for (var, constraint) in pending {
             let ctx = build_probe_eval_context(probe_state, &module.definitions, &module.instances);
-            let current_satisfies = probe_state.contains_key(&var)
-                && current_probe_value_satisfies_type_constraint(&var, &constraint, &ctx)
-                    .unwrap_or(false);
+            let current_constraint_status = probe_state
+                .get(&var)
+                .and_then(|_| current_probe_value_satisfies_type_constraint(&var, &constraint, &ctx));
             if let Some(repr) = representative_value_from_type_constraint(&constraint, &ctx) {
                 let should_update = match probe_state.get(&var) {
                     None => true,
-                    Some(current) => {
-                        !current_satisfies || should_refine_probe_value(current, &repr)
-                    }
+                    Some(current) => match current_constraint_status {
+                        Some(true) => should_refine_probe_value(current, &repr),
+                        Some(false) => true,
+                        None => should_refine_indeterminate_probe_value(current, &repr),
+                    },
                 };
                 if should_update {
                     probe_state.insert(var, repr);
@@ -2246,6 +2248,25 @@ fn should_refine_probe_value(current: &TlaValue, replacement: &TlaValue) -> bool
             values.is_empty() && !replacement_values.is_empty()
         }
         _ => false,
+    }
+}
+
+fn should_refine_indeterminate_probe_value(current: &TlaValue, replacement: &TlaValue) -> bool {
+    if !should_refine_probe_value(current, replacement) {
+        return false;
+    }
+
+    match current {
+        TlaValue::Undefined => true,
+        TlaValue::Int(_) | TlaValue::Bool(_) => true,
+        TlaValue::String(_) | TlaValue::ModelValue(_) => {
+            !matches!(replacement, TlaValue::String(_) | TlaValue::ModelValue(_))
+        }
+        TlaValue::Set(values) => values.is_empty(),
+        TlaValue::Seq(values) => values.is_empty(),
+        TlaValue::Record(fields) => fields.is_empty(),
+        TlaValue::Function(values) => values.is_empty(),
+        TlaValue::Lambda { .. } => false,
     }
 }
 
@@ -4443,6 +4464,110 @@ Next == TManager \/ BTManager
     }
 
     #[test]
+    fn indeterminate_type_constraints_do_not_replace_initialized_functions() {
+        let expected = TlaValue::Function(Arc::new(BTreeMap::from([
+            (
+                TlaValue::ModelValue("h1".to_string()),
+                TlaValue::ModelValue("NoBlockVal".to_string()),
+            ),
+            (
+                TlaValue::ModelValue("h2".to_string()),
+                TlaValue::ModelValue("NoBlockVal".to_string()),
+            ),
+        ])));
+        let mut probe_state =
+            TlaState::from([("hashFunction".to_string(), expected.clone())]);
+        let module = TlaModule {
+            name: "IndeterminateNanoLike".to_string(),
+            path: String::new(),
+            extends: Vec::new(),
+            constants: Vec::new(),
+            variables: vec!["hashFunction".to_string()],
+            definitions: BTreeMap::from([
+                (
+                    "Hash".to_string(),
+                    TlaDefinition {
+                        name: "Hash".to_string(),
+                        params: vec![],
+                        body: "{h1, h2}".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+                (
+                    "Block".to_string(),
+                    TlaDefinition {
+                        name: "Block".to_string(),
+                        params: vec![],
+                        body: r#"[source : {n1}]"#.to_string(),
+                        is_recursive: false,
+                    },
+                ),
+            ]),
+            instances: BTreeMap::new(),
+            unnamed_instances: Vec::new(),
+            is_pluscal: false,
+            recursive_declarations: BTreeSet::new(),
+        };
+
+        let seeded = seed_probe_state_from_membership_body(
+            &mut probe_state,
+            r#"hashFunction \in [Hash -> Block \cup {NoBlock}]"#,
+            &module,
+        );
+
+        assert_eq!(seeded, 0);
+        assert_eq!(probe_state.get("hashFunction"), Some(&expected));
+    }
+
+    #[test]
+    fn indeterminate_type_constraints_can_upgrade_placeholder_values() {
+        let mut probe_state = TlaState::from([("hashFunction".to_string(), TlaValue::Int(0))]);
+        let module = TlaModule {
+            name: "IndeterminateNanoLike".to_string(),
+            path: String::new(),
+            extends: Vec::new(),
+            constants: Vec::new(),
+            variables: vec!["hashFunction".to_string()],
+            definitions: BTreeMap::from([
+                (
+                    "Hash".to_string(),
+                    TlaDefinition {
+                        name: "Hash".to_string(),
+                        params: vec![],
+                        body: "{h1, h2}".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+                (
+                    "Block".to_string(),
+                    TlaDefinition {
+                        name: "Block".to_string(),
+                        params: vec![],
+                        body: r#"[source : {n1}]"#.to_string(),
+                        is_recursive: false,
+                    },
+                ),
+            ]),
+            instances: BTreeMap::new(),
+            unnamed_instances: Vec::new(),
+            is_pluscal: false,
+            recursive_declarations: BTreeSet::new(),
+        };
+
+        let seeded = seed_probe_state_from_membership_body(
+            &mut probe_state,
+            r#"hashFunction \in [Hash -> Block \cup {NoBlock}]"#,
+            &module,
+        );
+
+        assert_eq!(seeded, 1);
+        assert!(matches!(
+            probe_state.get("hashFunction"),
+            Some(TlaValue::Function(values)) if values.len() == 2
+        ));
+    }
+
+    #[test]
     fn expands_instance_init_references_for_probe_seeding() {
         let instance_module = TlaModule {
             name: "Nano".to_string(),
@@ -4909,6 +5034,139 @@ Spec
 
         let _ = fs::remove_dir_all(&tmp);
     }
+
+    #[test]
+    fn analyze_tla_path_keeps_instance_operator_override_in_choose_probe() {
+        use std::fs;
+
+        let tmp = std::env::temp_dir().join("tlapp-mcnano-choose-probe");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should exist");
+
+        let nano = tmp.join("Nano.tla");
+        fs::write(
+            &nano,
+            r#"
+---- MODULE Nano ----
+CONSTANTS Hash, NoBlockVal
+
+Block == {"used"}
+SignedBlock == [block : Block]
+NoBlock == CHOOSE b : b \notin SignedBlock
+====
+"#,
+        )
+        .expect("nano module should be written");
+
+        let mc = tmp.join("MCNanoMini.tla");
+        fs::write(
+            &mc,
+            r#"
+---- MODULE MCNanoMini ----
+N == INSTANCE Nano
+
+VARIABLES hashFunction
+
+HashOf(block) ==
+  IF \E hash \in Hash : hashFunction[hash] = block
+  THEN CHOOSE hash \in Hash : hashFunction[hash] = block
+  ELSE CHOOSE hash \in Hash : hashFunction[hash] = N!NoBlock
+
+CalculateHashImpl(block, oldLastHash, newLastHash) ==
+  LET hash == HashOf(block) IN
+  /\ newLastHash = hash
+  /\ hashFunction' = [hashFunction EXCEPT ![hash] = block]
+
+TypeInvariant == hashFunction \in [Hash -> N!SignedBlock \cup {N!NoBlock}]
+
+Init == /\ hashFunction = [hash \in Hash |-> N!NoBlock]
+Next == /\ UNCHANGED <<hashFunction>>
+Spec == Init /\ [][Next]_<<hashFunction>>
+====
+"#,
+        )
+        .expect("mc module should be written");
+
+        let cfg = tmp.join("MCNanoMini.cfg");
+        fs::write(
+            &cfg,
+            r#"
+CONSTANTS
+Hash = {h1, h2, h3}
+NoBlockVal = NoBlockVal
+
+CONSTANTS
+NoBlock = [Nano]NoBlockVal
+
+SPECIFICATION Spec
+INVARIANTS TypeInvariant
+"#,
+        )
+        .expect("cfg should be written");
+
+        let model = TlaModel::from_files(&mc, Some(&cfg), None, None).expect("model should build");
+        let probe_state = model
+            .initial_states_vec
+            .first()
+            .cloned()
+            .expect("initial state should exist");
+        assert_eq!(
+            probe_state.get("NoBlock"),
+            Some(&TlaValue::ModelValue("NoBlockVal".to_string()))
+        );
+
+        let def = model
+            .module
+            .definitions
+            .get("CalculateHashImpl")
+            .expect("action should exist");
+        let ir = compile_action_ir(def);
+        let inferred = BTreeMap::from([
+            (
+                "block".to_string(),
+                TlaValue::ModelValue("targetBlock".to_string()),
+            ),
+            (
+                "oldLastHash".to_string(),
+                TlaValue::ModelValue("oldHash".to_string()),
+            ),
+            (
+                "newLastHash".to_string(),
+                TlaValue::ModelValue("freshHash".to_string()),
+            ),
+        ]);
+        let mut ctx = build_action_expr_probe_context(
+            &probe_state,
+            &model.module.definitions,
+            &model.module.instances,
+            &ir.params,
+            &ir.clauses,
+            Some(&inferred),
+        );
+
+        assert_eq!(
+            eval_expr("N!NoBlock", &ctx).expect("instance override should resolve"),
+            TlaValue::ModelValue("NoBlockVal".to_string())
+        );
+        let chosen = eval_expr("HashOf(block)", &ctx).expect("HashOf should choose a free hash");
+        assert!(
+            matches!(chosen, TlaValue::ModelValue(ref name) if name == "h1" || name == "h2" || name == "h3"),
+            "unexpected chosen hash {chosen:?}"
+        );
+
+        let result = probe_action_clause_expr(
+            ir.clauses
+                .first()
+                .expect("CalculateHashImpl should compile to one clause"),
+            &mut ctx,
+        )
+        .expect("LET action clause should be probeable");
+        result.expect("LET action probe should not error");
+        assert!(ctx.locals.contains_key("hashFunction'"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
 
     #[test]
     fn action_probe_resolves_zero_arg_aliases_in_index_and_except_expressions() {
