@@ -3560,14 +3560,20 @@ fn seq_or_string_concat(lhs: TlaValue, rhs: TlaValue) -> Result<TlaValue> {
             a.push_str(&b);
             Ok(TlaValue::String(a))
         }
-        (TlaValue::Seq(a), TlaValue::Seq(b)) => {
-            let mut result = (*a).clone();
-            result.extend(b.iter().cloned());
-            Ok(TlaValue::Seq(Arc::new(result)))
+        (a, b) => {
+            let Some(mut lhs_seq) = sequence_like_values(&a) else {
+                return Err(anyhow!(
+                    "\\o expects String or Seq operands, got {a:?} and {b:?}"
+                ));
+            };
+            let Some(rhs_seq) = sequence_like_values(&b) else {
+                return Err(anyhow!(
+                    "\\o expects String or Seq operands, got {a:?} and {b:?}"
+                ));
+            };
+            lhs_seq.extend(rhs_seq);
+            Ok(TlaValue::Seq(Arc::new(lhs_seq)))
         }
-        (a, b) => Err(anyhow!(
-            "\\o expects String or Seq operands, got {a:?} and {b:?}"
-        )),
     }
 }
 
@@ -7008,6 +7014,39 @@ IN
             TlaValue::Seq(Arc::new(vec![
                 TlaValue::String("a".to_string()),
                 TlaValue::String("b".to_string()),
+            ]))
+        );
+    }
+
+    #[test]
+    fn concat_accepts_sequence_like_functions() {
+        let state = TlaState::from([
+            (
+                "lhs".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([
+                    (TlaValue::Int(1), TlaValue::Int(1)),
+                    (TlaValue::Int(2), TlaValue::Int(2)),
+                ]))),
+            ),
+            (
+                "rhs".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([(
+                    TlaValue::Int(1),
+                    TlaValue::Int(3),
+                )]))),
+            ),
+        ]);
+        let ctx = EvalContext::new(&state);
+
+        let result =
+            eval_expr("lhs \\o rhs", &ctx).expect("function-backed sequences should concat");
+
+        assert_eq!(
+            result,
+            TlaValue::Seq(Arc::new(vec![
+                TlaValue::Int(1),
+                TlaValue::Int(2),
+                TlaValue::Int(3),
             ]))
         );
     }

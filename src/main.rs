@@ -2422,6 +2422,9 @@ fn representative_value_from_set_expr(set_expr: &str, ctx: &EvalContext<'_>) -> 
     {
         return Some(repr);
     }
+    if let Some(repr) = representative_value_from_operator_call_expr(trimmed, ctx) {
+        return Some(repr);
+    }
     try_create_representative_value_from_type_expr(set_expr, ctx)
 }
 
@@ -2477,6 +2480,9 @@ fn representative_member_from_domain_expr(expr: &str, ctx: &EvalContext<'_>) -> 
         && def.body.trim() != trimmed
         && let Some(repr) = representative_value_from_definition_body(&def.body, ctx)
     {
+        return Some(repr);
+    }
+    if let Some(repr) = representative_value_from_operator_call_expr(trimmed, ctx) {
         return Some(repr);
     }
 
@@ -2543,6 +2549,66 @@ fn representative_value_from_union_parts(expr: &str, ctx: &EvalContext<'_>) -> O
         }
     }
     None
+}
+
+fn representative_value_from_operator_call_expr(
+    expr: &str,
+    ctx: &EvalContext<'_>,
+) -> Option<TlaValue> {
+    let (name, arg_exprs) = parse_probe_action_call(expr)?;
+    let (def, child_definitions, child_instances) =
+        resolve_probe_operator_call_definition(&name, ctx)?;
+    if def.params.len() != arg_exprs.len() {
+        return None;
+    }
+
+    let mut child_ctx = ctx.clone();
+    child_ctx.definitions = Some(child_definitions);
+    child_ctx.instances = child_instances;
+    let child_locals = std::rc::Rc::make_mut(&mut child_ctx.locals);
+
+    let mut bound_names = BTreeSet::new();
+    for (param, arg_expr) in def.params.iter().zip(arg_exprs) {
+        let value = eval_expr(&arg_expr, ctx).ok()?;
+        let normalized = normalize_param_name(param).to_string();
+        if bound_names.insert(normalized.clone()) {
+            child_locals.insert(normalized, value.clone());
+        }
+        if bound_names.insert(param.clone()) {
+            child_locals.insert(param.clone(), value);
+        }
+    }
+
+    representative_value_from_definition_body(&def.body, &child_ctx)
+}
+
+fn resolve_probe_operator_call_definition<'a>(
+    name: &str,
+    ctx: &'a EvalContext<'a>,
+) -> Option<(
+    &'a TlaDefinition,
+    &'a BTreeMap<String, TlaDefinition>,
+    Option<&'a BTreeMap<String, TlaModuleInstance>>,
+)> {
+    let (alias, operator) = match name.split_once('!') {
+        Some((alias, operator)) => (Some(alias.trim()), operator.trim()),
+        None => (None, name.trim()),
+    };
+
+    match alias {
+        Some(alias) => {
+            let instances = ctx.instances?;
+            let instance = instances.get(alias)?;
+            let module = instance.module.as_ref()?;
+            let def = module.definitions.get(operator)?;
+            Some((def, &module.definitions, Some(&module.instances)))
+        }
+        None => {
+            let definitions = ctx.definitions?;
+            let def = definitions.get(operator)?;
+            Some((def, definitions, ctx.instances))
+        }
+    }
 }
 
 fn try_create_representative_record(set_expr: &str, ctx: &EvalContext<'_>) -> Option<TlaValue> {
@@ -7392,6 +7458,215 @@ INVARIANTS TypeInvariant
             fields.get("direction"),
             Some(&TlaValue::String("Up".to_string()))
         );
+    }
+
+    #[test]
+    fn representative_value_from_set_expr_handles_definition_backed_operator_calls() {
+        let state = TlaState::from([
+            (
+                "Symbols".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([
+                    TlaValue::ModelValue("A".to_string()),
+                    TlaValue::ModelValue("B".to_string()),
+                ]))),
+            ),
+            (
+                "ArbitrarySymbol".to_string(),
+                TlaValue::ModelValue("ArbitrarySymbol".to_string()),
+            ),
+            ("BuffSz".to_string(), TlaValue::Int(2)),
+        ]);
+        let defs = BTreeMap::from([
+            (
+                "SymbolOrArbitrary".to_string(),
+                TlaDefinition {
+                    name: "SymbolOrArbitrary".to_string(),
+                    params: vec![],
+                    body: "Symbols \\union {ArbitrarySymbol}".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Array".to_string(),
+                TlaDefinition {
+                    name: "Array".to_string(),
+                    params: vec!["T".to_string(), "len".to_string()],
+                    body: "[elems: [1..len -> T]]".to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+        let instances = BTreeMap::new();
+        let ctx = build_probe_eval_context(&state, &defs, &instances);
+
+        let repr = representative_value_from_set_expr("Array(SymbolOrArbitrary, BuffSz)", &ctx)
+            .expect("parameterized type operator should produce a representative");
+        let TlaValue::Record(fields) = repr else {
+            panic!("expected array record representative");
+        };
+        let Some(TlaValue::Function(elems)) = fields.get("elems") else {
+            panic!("expected elems function field");
+        };
+        assert_eq!(elems.len(), 2);
+    }
+
+    #[test]
+    fn infer_action_param_samples_handles_definition_backed_operator_call_domains() {
+        let state = TlaState::from([
+            (
+                "Symbols".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([
+                    TlaValue::ModelValue("A".to_string()),
+                    TlaValue::ModelValue("B".to_string()),
+                ]))),
+            ),
+            (
+                "ArbitrarySymbol".to_string(),
+                TlaValue::ModelValue("ArbitrarySymbol".to_string()),
+            ),
+            ("MaxOffset".to_string(), TlaValue::Int(3)),
+        ]);
+        let defs = BTreeMap::from([
+            (
+                "SymbolOrArbitrary".to_string(),
+                TlaDefinition {
+                    name: "SymbolOrArbitrary".to_string(),
+                    params: vec![],
+                    body: "Symbols \\union {ArbitrarySymbol}".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Array".to_string(),
+                TlaDefinition {
+                    name: "Array".to_string(),
+                    params: vec!["T".to_string(), "len".to_string()],
+                    body: "[elems: [1..len -> T]]".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "WriteAtMost".to_string(),
+                TlaDefinition {
+                    name: "WriteAtMost".to_string(),
+                    params: vec!["data".to_string()],
+                    body: "TRUE".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Next".to_string(),
+                TlaDefinition {
+                    name: "Next".to_string(),
+                    params: vec![],
+                    body: r#"\E len \in 1..MaxOffset: \E data \in Array(SymbolOrArbitrary, len): WriteAtMost(data)"#
+                        .to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+
+        let samples = infer_action_param_samples_from_next(
+            &defs.get("Next").unwrap().body,
+            &state,
+            &defs,
+            &BTreeMap::new(),
+        );
+
+        let sample = samples
+            .get("WriteAtMost")
+            .and_then(|params| params.get("data"))
+            .expect("data sample should be inferred");
+        let TlaValue::Record(fields) = sample else {
+            panic!("expected array-like record sample");
+        };
+        assert!(matches!(fields.get("elems"), Some(TlaValue::Function(_))));
+    }
+
+    #[test]
+    fn braf_style_type_invariants_seed_booleans_and_array_records() {
+        let mut probe_state = TlaState::from([
+            (
+                "Symbols".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([
+                    TlaValue::ModelValue("A".to_string()),
+                    TlaValue::ModelValue("B".to_string()),
+                ]))),
+            ),
+            (
+                "ArbitrarySymbol".to_string(),
+                TlaValue::ModelValue("ArbitrarySymbol".to_string()),
+            ),
+            ("BuffSz".to_string(), TlaValue::Int(2)),
+        ]);
+        let module = TlaModule {
+            name: "BrafProbe".to_string(),
+            path: String::new(),
+            extends: Vec::new(),
+            constants: Vec::new(),
+            variables: vec![
+                "dirty".to_string(),
+                "buff".to_string(),
+                "file_content".to_string(),
+            ],
+            definitions: BTreeMap::from([
+                (
+                    "SymbolOrArbitrary".to_string(),
+                    TlaDefinition {
+                        name: "SymbolOrArbitrary".to_string(),
+                        params: vec![],
+                        body: "Symbols \\union {ArbitrarySymbol}".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+                (
+                    "Array".to_string(),
+                    TlaDefinition {
+                        name: "Array".to_string(),
+                        params: vec!["T".to_string(), "len".to_string()],
+                        body: "[elems: [1..len -> T]]".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+                (
+                    "ArrayOfAnyLength".to_string(),
+                    TlaDefinition {
+                        name: "ArrayOfAnyLength".to_string(),
+                        params: vec!["T".to_string()],
+                        body: "[elems: Seq(T)]".to_string(),
+                        is_recursive: false,
+                    },
+                ),
+                (
+                    "TypeOK".to_string(),
+                    TlaDefinition {
+                        name: "TypeOK".to_string(),
+                        params: vec![],
+                        body: r#"
+                            /\ dirty \in BOOLEAN
+                            /\ buff \in Array(SymbolOrArbitrary, BuffSz)
+                            /\ file_content \in ArrayOfAnyLength(SymbolOrArbitrary)
+                        "#
+                        .to_string(),
+                        is_recursive: false,
+                    },
+                ),
+            ]),
+            instances: BTreeMap::new(),
+            unnamed_instances: Vec::new(),
+            is_pluscal: false,
+            recursive_declarations: BTreeSet::new(),
+        };
+
+        let seeded = seed_probe_state_from_type_invariants(&mut probe_state, &module, None);
+
+        assert_eq!(seeded, 3);
+        assert!(matches!(probe_state.get("dirty"), Some(TlaValue::Bool(_))));
+        assert!(matches!(probe_state.get("buff"), Some(TlaValue::Record(_))));
+        assert!(matches!(
+            probe_state.get("file_content"),
+            Some(TlaValue::Record(_))
+        ));
     }
 
     #[test]
