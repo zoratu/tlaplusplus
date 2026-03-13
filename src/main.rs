@@ -933,7 +933,8 @@ fn main() -> anyhow::Result<()> {
                     max_conjuncts = max_conjuncts.max(conjuncts.len());
                     for clause in conjuncts {
                         match classify_clause(&clause) {
-                            ClauseKind::PrimedAssignment { .. } => {
+                            ClauseKind::PrimedAssignment { .. }
+                            | ClauseKind::PrimedMembership { .. } => {
                                 total_primed_assignments += 1;
                             }
                             ClauseKind::Unchanged { .. } => {
@@ -968,7 +969,8 @@ fn main() -> anyhow::Result<()> {
                 action_conjunct_max = action_conjunct_max.max(ir.clauses.len());
                 for clause in ir.clauses {
                     match clause {
-                        ActionClause::PrimedAssignment { .. } => action_primed_assignments += 1,
+                        ActionClause::PrimedAssignment { .. }
+                        | ActionClause::PrimedMembership { .. } => action_primed_assignments += 1,
                         ActionClause::Unchanged { .. } => action_unchanged_clauses += 1,
                         ActionClause::Guard { .. } => action_guard_clauses += 1,
                         ActionClause::Exists { .. } => action_guard_clauses += 1,
@@ -1239,6 +1241,7 @@ fn main() -> anyhow::Result<()> {
                                         let expr = match clause {
                                             ActionClause::Guard { expr }
                                             | ActionClause::PrimedAssignment { expr, .. }
+                                            | ActionClause::PrimedMembership { set_expr: expr, .. }
                                             | ActionClause::LetWithPrimes { expr } => expr,
                                             ActionClause::Exists { binders, body } => {
                                                 return format!(
@@ -3366,6 +3369,7 @@ fn find_sequence_accessed_vars(clauses: &[ActionClause]) -> BTreeSet<String> {
         let expr = match clause {
             ActionClause::Guard { expr }
             | ActionClause::PrimedAssignment { expr, .. }
+            | ActionClause::PrimedMembership { set_expr: expr, .. }
             | ActionClause::LetWithPrimes { expr } => expr.as_str(),
             ActionClause::Exists { body, .. } => body.as_str(),
             ActionClause::Unchanged { .. } => continue,
@@ -3387,6 +3391,7 @@ fn infer_sequence_element_probe_values(
         let expr = match clause {
             ActionClause::Guard { expr }
             | ActionClause::PrimedAssignment { expr, .. }
+            | ActionClause::PrimedMembership { set_expr: expr, .. }
             | ActionClause::LetWithPrimes { expr } => expr.as_str(),
             ActionClause::Exists { body, .. } => body.as_str(),
             ActionClause::Unchanged { .. } => continue,
@@ -3558,6 +3563,7 @@ fn refine_param_sample_from_clause_domains(
         let expr = match clause {
             ActionClause::Guard { expr }
             | ActionClause::PrimedAssignment { expr, .. }
+            | ActionClause::PrimedMembership { set_expr: expr, .. }
             | ActionClause::LetWithPrimes { expr } => expr.as_str(),
             ActionClause::Exists { body, .. } => body.as_str(),
             ActionClause::Unchanged { .. } => continue,
@@ -4021,6 +4027,14 @@ fn probe_action_clause_expr(
         ActionClause::PrimedAssignment { var, expr } => Some(eval_expr(expr, ctx).map(|value| {
             std::rc::Rc::make_mut(&mut ctx.locals).insert(format!("{var}'"), value);
         })),
+        ActionClause::PrimedMembership { var, set_expr } => {
+            Some(eval_expr(set_expr, ctx).and_then(|set_val| {
+                let repr = pick_representative_from_set(&set_val)
+                    .ok_or_else(|| anyhow::anyhow!("empty or non-set primed membership: {set_expr}"))?;
+                std::rc::Rc::make_mut(&mut ctx.locals).insert(format!("{var}'"), repr);
+                Ok(())
+            }))
+        }
         ActionClause::Unchanged { vars } => {
             let locals_mut = std::rc::Rc::make_mut(&mut ctx.locals);
             for var in vars {

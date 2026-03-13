@@ -6,6 +6,10 @@ pub enum ClauseKind {
         var: String,
         expr: String,
     },
+    PrimedMembership {
+        var: String,
+        set_expr: String,
+    },
     UnprimedEquality {
         var: String,
         expr: String,
@@ -267,6 +271,15 @@ pub fn classify_clause(clause: &str) -> ClauseKind {
 
     // Check for membership: var \in set (used in Init to pick from set)
     if let Some((var, set_expr)) = split_membership(trimmed) {
+        if let Some(var) = var.strip_suffix('\'') {
+            let var = var.trim();
+            if is_simple_name(var) && !set_expr.is_empty() {
+                return ClauseKind::PrimedMembership {
+                    var: var.to_string(),
+                    set_expr,
+                };
+            }
+        }
         if is_simple_name(&var) && !set_expr.is_empty() {
             return ClauseKind::UnprimedMembership { var, set_expr };
         }
@@ -500,6 +513,13 @@ mod tests {
             ClauseKind::PrimedAssignment {
                 var: "x".to_string(),
                 expr: "x + 1".to_string()
+            }
+        );
+        assert_eq!(
+            classify_clause("x' \\in 1..3"),
+            ClauseKind::PrimedMembership {
+                var: "x".to_string(),
+                set_expr: "1..3".to_string()
             }
         );
     }

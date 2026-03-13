@@ -547,6 +547,17 @@ fn eval_action_clause_to_branch(
                 .insert(var.clone(), eval_expr(expr, &eval_ctx)?);
             Ok(vec![branch])
         }
+        ActionClause::PrimedMembership { var, set_expr } => {
+            let domain = eval_expr(set_expr, &eval_ctx)?;
+            let values = domain.as_set()?.iter().cloned().collect::<Vec<_>>();
+            let mut out = Vec::with_capacity(values.len());
+            for value in values {
+                let mut branch = branch.clone();
+                branch.staged.insert(var.clone(), value);
+                out.push(branch);
+            }
+            Ok(out)
+        }
         ActionClause::Unchanged { vars } => {
             let mut branch = branch;
             for var in vars {
@@ -867,6 +878,17 @@ fn eval_action_clause_text_multi(
             let mut branch = branch;
             branch.staged.insert(var, eval_expr(&rhs, &eval_ctx)?);
             Ok(vec![branch])
+        }
+        ClauseKind::PrimedMembership { var, set_expr } => {
+            let domain = eval_expr(&set_expr, &eval_ctx)?;
+            let values = domain.as_set()?.iter().cloned().collect::<Vec<_>>();
+            let mut out = Vec::with_capacity(values.len());
+            for value in values {
+                let mut branch = branch.clone();
+                branch.staged.insert(var.clone(), value);
+                out.push(branch);
+            }
+            Ok(out)
         }
         ClauseKind::Unchanged { vars } => {
             let mut branch = branch;
@@ -5654,6 +5676,25 @@ mod tests {
             next.get("direction"),
             Some(&TlaValue::String("right".to_string()))
         );
+    }
+
+    #[test]
+    fn applies_action_ir_with_primed_membership_generates_all_choices() {
+        let state = TlaState::from([("flip".to_string(), TlaValue::String("H".to_string()))]);
+        let action = ActionIr {
+            name: "TossCoin".to_string(),
+            params: vec![],
+            clauses: vec![ActionClause::PrimedMembership {
+                var: "flip".to_string(),
+                set_expr: "{\"H\", \"T\"}".to_string(),
+            }],
+        };
+
+        let next = apply_action_ir_with_context_multi(&action, &state, &EvalContext::new(&state))
+            .expect("primed membership should enumerate successors");
+        assert_eq!(next.len(), 2, "{next:?}");
+        assert!(next.iter().any(|st| st.get("flip") == Some(&TlaValue::String("H".to_string()))));
+        assert!(next.iter().any(|st| st.get("flip") == Some(&TlaValue::String("T".to_string()))));
     }
 
     #[test]
