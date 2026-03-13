@@ -4,7 +4,7 @@
 //! the overhead of string parsing on every evaluation.
 
 use crate::tla::compiled_expr::{CompiledExpr, compile_expr, find_top_level_colon};
-use crate::tla::eval::{EvalContext, eval_expr, eval_operator_call, normalize_param_name};
+use crate::tla::eval::{EvalContext, apply_value, eval_expr, eval_operator_call, normalize_param_name};
 use crate::tla::formula::split_top_level;
 use crate::tla::value::TlaValue;
 use anyhow::{Result, anyhow};
@@ -132,6 +132,16 @@ fn eval_compiled_inner(
                     }
                     return result.map_err(|e| anyhow!("failed to resolve {}: {}", name, e));
                 }
+
+                let value = TlaValue::Lambda {
+                    params: Arc::new(def.params.clone()),
+                    body: def.body.clone(),
+                    captured_locals: Arc::new((*ctx.locals).clone()),
+                };
+                if std::env::var("TLAPP_TRACE_VAR").is_ok() {
+                    eprintln!("VAR {} (operator value) -> Ok({:?})", name, value);
+                }
+                return Ok(value);
             }
 
             // Fall back to model value for undefined identifiers
@@ -534,6 +544,13 @@ fn eval_compiled_inner(
             }
 
             match &func {
+                TlaValue::Lambda { .. } => {
+                    let arg_values = args
+                        .iter()
+                        .map(|a| eval_compiled_inner(a, ctx, depth + 1))
+                        .collect::<Result<Vec<_>>>()?;
+                    apply_value(&func, arg_values, ctx, depth + 1)
+                }
                 TlaValue::Function(map) => {
                     // Single argument or tuple
                     let key = if args.len() == 1 {
@@ -1845,7 +1862,7 @@ fn ctx_with_staged_primes<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tla::TlaState;
+    use crate::tla::{TlaDefinition, TlaState};
     use crate::tla::compiled_expr::compile_expr;
 
     fn empty_ctx() -> EvalContext<'static> {
@@ -2007,6 +2024,42 @@ mod tests {
                 TlaValue::Int(1),
                 TlaValue::Int(2),
             ])))
+        );
+    }
+
+    #[test]
+    fn test_compiled_eval_can_pass_operator_values_to_recursive_operators() {
+        let defs = BTreeMap::from([
+            (
+                "Sum".to_string(),
+                TlaDefinition {
+                    name: "Sum".to_string(),
+                    params: vec!["f".to_string(), "S".to_string()],
+                    body: r#"IF S = {} THEN 0
+                             ELSE LET x == CHOOSE x \in S : TRUE
+                                  IN f[x] + Sum(f, S \ {x})"#
+                        .to_string(),
+                    is_recursive: true,
+                },
+            ),
+            (
+                "sc".to_string(),
+                TlaDefinition {
+                    name: "sc".to_string(),
+                    params: vec!["<<x, y>>".to_string()],
+                    body: "x + y".to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+
+        let state = TlaState::new();
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        assert_eq!(
+            eval_compiled(&compile_expr("Sum(sc, {<<1, 2>>, <<3, 4>>})"), &ctx)
+                .expect("compiled higher-order recursion should work"),
+            TlaValue::Int(10)
         );
     }
 

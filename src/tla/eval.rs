@@ -760,7 +760,9 @@ fn expand_action_call_multi(
                     Ok(value) => value,
                     Err(err) => return Some(Err(err)),
                 };
-                locals_mut.insert(normalize_param_name(param).to_string(), value);
+                if let Err(err) = bind_param_value(locals_mut, param, value) {
+                    return Some(Err(err));
+                }
             }
         }
 
@@ -791,7 +793,9 @@ fn expand_action_call_multi(
                 Ok(value) => value,
                 Err(err) => return Some(Err(err)),
             };
-            locals_mut.insert(normalize_param_name(param).to_string(), value);
+            if let Err(err) = bind_param_value(locals_mut, param, value) {
+                return Some(Err(err));
+            }
         }
     }
 
@@ -2251,7 +2255,7 @@ fn eval_except_expression(
     Ok(current)
 }
 
-fn apply_value(
+pub(crate) fn apply_value(
     func: &TlaValue,
     args: Vec<TlaValue>,
     ctx: &EvalContext<'_>,
@@ -2279,7 +2283,7 @@ fn apply_value(
             {
                 let locals_mut = Rc::make_mut(&mut lambda_ctx.locals);
                 for (param, arg) in params.iter().zip(args.into_iter()) {
-                    locals_mut.insert(param.clone(), arg);
+                    bind_param_value(locals_mut, param, arg)?;
                 }
             }
 
@@ -2376,13 +2380,13 @@ fn eval_module_instance_call(
         }
     }
 
-    // Bind operator parameters
-    let mut bound = Vec::with_capacity(operator_def.params.len());
-    for (param, arg) in operator_def.params.iter().zip(args.into_iter()) {
-        bound.push((normalize_param_name(param), arg));
+    let mut child_ctx = instance_ctx;
+    {
+        let locals_mut = std::rc::Rc::make_mut(&mut child_ctx.locals);
+        for (param, arg) in operator_def.params.iter().zip(args.into_iter()) {
+            bind_param_value(locals_mut, param, arg)?;
+        }
     }
-
-    let child_ctx = instance_ctx.with_local_values(&bound);
 
     // Evaluate the operator body
     eval_expr_inner(&operator_def.body, &child_ctx, depth + 1)
@@ -2445,7 +2449,7 @@ fn eval_enabled(
     if !args.is_empty() {
         let locals_mut = Rc::make_mut(&mut enabled_ctx.locals);
         for (param, arg) in action_def.params.iter().zip(args.into_iter()) {
-            locals_mut.insert(normalize_param_name(param).to_string(), arg);
+            bind_param_value(locals_mut, param, arg)?;
         }
     }
 
@@ -2728,11 +2732,13 @@ pub(crate) fn eval_operator_call(
         ));
     }
 
-    let mut bound = Vec::with_capacity(def.params.len());
-    for (param, arg) in def.params.iter().zip(args.into_iter()) {
-        bound.push((normalize_param_name(param), arg));
+    let mut child = ctx.clone();
+    {
+        let locals_mut = Rc::make_mut(&mut child.locals);
+        for (param, arg) in def.params.iter().zip(args.into_iter()) {
+            bind_param_value(locals_mut, param, arg)?;
+        }
     }
-    let child = ctx.with_local_values(&bound);
     eval_expr_inner(&def.body, &child, depth + 1)
 }
 
@@ -3084,6 +3090,24 @@ fn remove_binder_assignments(assignments: &mut BTreeMap<String, TlaValue>, binde
     for name in &binder.vars {
         assignments.remove(name);
     }
+}
+
+fn bind_param_value(
+    assignments: &mut BTreeMap<String, TlaValue>,
+    param: &str,
+    value: TlaValue,
+) -> Result<()> {
+    let pattern = param.trim();
+    if pattern.starts_with("<<") && pattern.ends_with(">>") {
+        let binder = BinderSpec {
+            vars: parse_binder_pattern_vars(pattern)?,
+            domain: Vec::new(),
+        };
+        return assign_binder_value(assignments, &binder, &value);
+    }
+
+    assignments.insert(normalize_param_name(pattern).to_string(), value);
+    Ok(())
 }
 
 fn evaluate_exists(
@@ -6522,6 +6546,41 @@ IN
     }
 
     #[test]
+    fn higher_order_operator_values_preserve_tuple_binder_params() {
+        let defs = BTreeMap::from([
+            (
+                "Sum".to_string(),
+                TlaDefinition {
+                    name: "Sum".to_string(),
+                    params: vec!["f".to_string(), "S".to_string()],
+                    body: r#"IF S = {} THEN 0
+                             ELSE LET x == CHOOSE x \in S : TRUE
+                                  IN f[x] + Sum(f, S \ {x})"#
+                        .to_string(),
+                    is_recursive: true,
+                },
+            ),
+            (
+                "Score".to_string(),
+                TlaDefinition {
+                    name: "Score".to_string(),
+                    params: vec!["<<x, y>>".to_string()],
+                    body: "x + y".to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+        let state = TlaState::new();
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        assert_eq!(
+            eval_expr("Sum(Score, {<<1, 2>>, <<3, 4>>})", &ctx)
+                .expect("higher-order tuple-binder operator should work"),
+            TlaValue::Int(10)
+        );
+    }
+
+    #[test]
     fn membership_prefers_runtime_value_over_shadowed_local_definition() {
         let state = TlaState::new();
         let ctx = EvalContext::new(&state);
@@ -8178,6 +8237,63 @@ IN
         let result = eval_expr("H!UseHasher(5)", &ctx)
             .expect("instance should retain outer instances for helper calls");
         assert_eq!(result, TlaValue::Int(10));
+    }
+
+    #[test]
+    fn parsed_module_instances_can_invoke_child_operators_from_loaded_files() {
+        use crate::tla::module::parse_tla_module_file;
+        use std::fs;
+
+        let tmp = std::env::temp_dir().join("tlapp-instance-operator-file-test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should be created");
+
+        let child = tmp.join("RingBuffer.tla");
+        fs::write(
+            &child,
+            r#"
+---- MODULE RingBuffer ----
+LOCAL INSTANCE Naturals
+CONSTANT Size
+IndexOf(sequence) == sequence % Size
+====
+"#,
+        )
+        .expect("child module should be written");
+
+        let parent = tmp.join("MC.tla");
+        fs::write(
+            &parent,
+            r#"
+---- MODULE MC ----
+EXTENDS Integers
+CONSTANT Size
+Buffer == INSTANCE RingBuffer
+====
+"#,
+        )
+        .expect("parent module should be written");
+
+        let module = parse_tla_module_file(&parent).expect("parent should parse");
+        let buffer = module.instances.get("Buffer").expect("instance should load");
+        let buffer_module = buffer
+            .module
+            .as_ref()
+            .expect("child module should be available");
+        assert!(
+            buffer_module.definitions.contains_key("IndexOf"),
+            "instance child should retain IndexOf"
+        );
+
+        let state = TlaState::from([("Size".to_string(), TlaValue::Int(3))]);
+        let ctx =
+            EvalContext::with_definitions_and_instances(&state, &module.definitions, &module.instances);
+        assert_eq!(
+            eval_expr("Buffer!IndexOf(4)", &ctx).expect("instance operator should evaluate"),
+            TlaValue::Int(1)
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]

@@ -980,6 +980,7 @@ fn evaluate_init_states(
     cfg: &TlaConfig,
     init_name: &str,
 ) -> Result<Vec<TlaState>> {
+    let definition_scope = merged_definition_scope(module);
     let init_def = module
         .definitions
         .get(init_name)
@@ -1021,7 +1022,7 @@ fn evaluate_init_states(
         for (name, ref_name) in deferred_operator_refs {
             let ctx = EvalContext::with_definitions_and_instances(
                 &base_state,
-                &module.definitions,
+                &definition_scope,
                 &module.instances,
             );
             match eval_expr(&ref_name, &ctx) {
@@ -1070,7 +1071,7 @@ fn evaluate_init_states(
         for (var, expr) in pending {
             let ctx = EvalContext::with_definitions_and_instances(
                 &base_state,
-                &module.definitions,
+                &definition_scope,
                 &module.instances,
             );
             match eval_expr(&expr, &ctx) {
@@ -1101,7 +1102,7 @@ fn evaluate_init_states(
     for (var, set_expr) in membership_assignments {
         let ctx = EvalContext::with_definitions_and_instances(
             &base_state,
-            &module.definitions,
+            &definition_scope,
             &module.instances,
         );
         let set_val = eval_expr(&set_expr, &ctx)
@@ -1152,7 +1153,7 @@ fn evaluate_init_states(
     for state in states {
         let ctx = EvalContext::with_definitions_and_instances(
             &state,
-            &module.definitions,
+            &definition_scope,
             &module.instances,
         );
 
@@ -1211,6 +1212,27 @@ fn evaluate_init_states(
     }
 
     Ok(valid_states)
+}
+
+fn merged_definition_scope(module: &TlaModule) -> BTreeMap<String, TlaDefinition> {
+    let mut definitions = module.definitions.clone();
+    add_instance_definition_fallbacks(&module.instances, &mut definitions);
+    definitions
+}
+
+fn add_instance_definition_fallbacks(
+    instances: &BTreeMap<String, TlaModuleInstance>,
+    definitions: &mut BTreeMap<String, TlaDefinition>,
+) {
+    for instance in instances.values() {
+        let Some(module) = instance.module.as_ref() else {
+            continue;
+        };
+        for (name, def) in &module.definitions {
+            definitions.entry(name.clone()).or_insert_with(|| def.clone());
+        }
+        add_instance_definition_fallbacks(&module.instances, definitions);
+    }
 }
 
 fn config_value_to_tla(value: &ConfigValue) -> Option<TlaValue> {
@@ -2393,6 +2415,67 @@ SPECIFICATION Spec
         assert_eq!(init[0].get("x"), Some(&TlaValue::Int(1)));
         assert_eq!(init[0].get("y"), Some(&TlaValue::Int(2)));
         assert_eq!(init[0].get("z"), Some(&TlaValue::Int(0)));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn initial_states_resolve_helper_defs_from_instance_inits() {
+        let tmp = std::env::temp_dir().join("tlapp-instance-init-helper-test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should be created");
+
+        let child = tmp.join("Child.tla");
+        fs::write(
+            &child,
+            r#"
+---- MODULE Child ----
+VARIABLE x
+LastX == 2
+Init == /\ x = [i \in 0..LastX |-> i]
+Next == /\ UNCHANGED x
+====
+"#,
+        )
+        .expect("child module should be written");
+
+        let model = tmp.join("MC.tla");
+        fs::write(
+            &model,
+            r#"
+---- MODULE MC ----
+VARIABLES x, z
+C == INSTANCE Child
+Init == /\ z = 0
+        /\ C!Init
+Next == /\ UNCHANGED <<x, z>>
+Spec == Init /\ [][Next]_<<x, z>>
+====
+"#,
+        )
+        .expect("mc module should be written");
+
+        let cfg = tmp.join("MC.cfg");
+        fs::write(
+            &cfg,
+            r#"
+SPECIFICATION Spec
+"#,
+        )
+        .expect("cfg should be written");
+
+        let model = TlaModel::from_files(&model, Some(&cfg), None, None).expect("model should build");
+        let init = model.initial_states();
+
+        assert_eq!(init.len(), 1);
+        assert_eq!(init[0].get("z"), Some(&TlaValue::Int(0)));
+        let x = init[0].get("x").expect("x should be defined");
+        let TlaValue::Function(entries) = x else {
+            panic!("x should be a function");
+        };
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.get(&TlaValue::Int(0)), Some(&TlaValue::Int(0)));
+        assert_eq!(entries.get(&TlaValue::Int(2)), Some(&TlaValue::Int(2)));
 
         let _ = fs::remove_dir_all(&tmp);
     }

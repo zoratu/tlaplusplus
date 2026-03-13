@@ -377,7 +377,26 @@ pub fn parse_tla_module_text(input: &str) -> Result<TlaModule> {
     let mut mode = NameListMode::None;
 
     while let Some(line) = pending_lines.pop_front() {
-        let trimmed = line.trim();
+        let mut definition_line = line.clone();
+        let line_indent = line.chars().take_while(|c| c.is_whitespace()).count();
+        let raw_trimmed = line.trim();
+        let can_start_definition = current_def.is_none()
+            || line_indent <= current_def_indent
+            || current_def
+                .as_ref()
+                .is_some_and(|def| can_start_indented_definition_after_gap(def, raw_trimmed));
+        if can_start_definition && definition_head_needs_continuation(raw_trimmed) {
+            while let Some(next_line) = pending_lines.front() {
+                definition_line.push('\n');
+                definition_line.push_str(next_line.trim_end());
+                pending_lines.pop_front();
+                if split_definition_line_with_remainder(definition_line.trim()).is_some() {
+                    break;
+                }
+            }
+        }
+
+        let trimmed = definition_line.trim();
         if trimmed.is_empty() {
             if let Some(def) = current_def.as_mut() {
                 def.body.push('\n');
@@ -502,12 +521,6 @@ pub fn parse_tla_module_text(input: &str) -> Result<TlaModule> {
             continue;
         }
 
-        let line_indent = line.chars().take_while(|c| c.is_whitespace()).count();
-        let can_start_definition = current_def.is_none()
-            || line_indent <= current_def_indent
-            || current_def
-                .as_ref()
-                .is_some_and(|def| can_start_indented_definition_after_gap(def, trimmed));
         if can_start_definition
             && let Some((lhs, rhs, remainder)) = split_definition_line_with_remainder(trimmed)
         {
@@ -522,8 +535,8 @@ pub fn parse_tla_module_text(input: &str) -> Result<TlaModule> {
                 is_recursive: false, // Will be set by flush_definition
             });
             if let Some(remainder) = remainder {
-                let indent_width = line.len() - line.trim_start().len();
-                let indent = &line[..indent_width];
+                let indent_width = definition_line.len() - definition_line.trim_start().len();
+                let indent = &definition_line[..indent_width];
                 pending_lines.push_front(format!("{indent}{remainder}"));
             }
             continue;
@@ -578,6 +591,39 @@ fn split_definition_line_with_remainder(line: &str) -> Option<(&str, &str, Optio
         None => (rhs, None),
     };
     Some((lhs, body, remainder.filter(|rest| !rest.is_empty())))
+}
+
+fn definition_head_needs_continuation(line: &str) -> bool {
+    if split_definition_line(line).is_some() {
+        return false;
+    }
+
+    let head = line.trim_start().strip_prefix("LOCAL ").unwrap_or(line.trim_start());
+    let Some(first) = head.chars().next() else {
+        return false;
+    };
+    if !(first.is_alphabetic() || first == '_') {
+        return false;
+    }
+
+    let mut paren = 0usize;
+    let mut bracket = 0usize;
+    let chars: Vec<char> = head.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        match chars[i] {
+            '(' => paren += 1,
+            ')' => paren = paren.saturating_sub(1),
+            '[' => bracket += 1,
+            ']' => bracket = bracket.saturating_sub(1),
+            '<' if i + 1 < chars.len() && chars[i + 1] == '<' => i += 1,
+            '>' if i + 1 < chars.len() && chars[i + 1] == '>' => i += 1,
+            _ => {}
+        }
+        i += 1;
+    }
+
+    paren > 0 || bracket > 0
 }
 
 fn can_start_indented_definition_after_gap(current_def: &TlaDefinition, line: &str) -> bool {
@@ -1454,6 +1500,24 @@ mod tests {
             vec!["current", "destination"]
         );
         assert_eq!(m.definitions["HigherOrder"].params, vec!["Op", "value"]);
+    }
+
+    #[test]
+    fn parses_multiline_bracketed_operator_definition_heads() {
+        let src = r#"
+        ---- MODULE Demo ----
+        sc[<<x, y>> \in (0 .. N + 1) \X
+                        (0 .. N + 1)] == CASE \/ x = 0
+                                               \/ y = 0
+                                            [] OTHER -> 1
+        ====
+        "#;
+
+        let m = parse_tla_module_text(src).expect("parse should work");
+        assert!(m.definitions.contains_key("sc"));
+        assert_eq!(m.definitions["sc"].params, vec!["<<x, y>>"]);
+        assert!(m.definitions["sc"].body.contains("CASE"));
+        assert!(m.definitions["sc"].body.contains("OTHER -> 1"));
     }
 
     #[test]
