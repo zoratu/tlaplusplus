@@ -72,6 +72,44 @@ pub fn parse_tla_module_file(path: &Path) -> Result<TlaModule> {
     parse_tla_module_file_with_visited(path, &mut HashSet::new())
 }
 
+fn is_module_terminator(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.len() >= 4 && trimmed.chars().all(|c| c == '=')
+}
+
+fn extract_named_module_text(input: &str, module_name: &str) -> Option<String> {
+    let mut in_target = false;
+    let mut buffer = String::new();
+
+    for line in input.lines() {
+        let trimmed = line.trim();
+        let header_name = trimmed
+            .find("MODULE ")
+            .and_then(|idx| trimmed[idx + "MODULE ".len()..].split_whitespace().next());
+
+        if let Some(name) = header_name {
+            if name == module_name {
+                in_target = true;
+            } else if in_target {
+                break;
+            }
+        }
+
+        if !in_target {
+            continue;
+        }
+
+        buffer.push_str(line);
+        buffer.push('\n');
+
+        if is_module_terminator(trimmed) {
+            return Some(buffer);
+        }
+    }
+
+    None
+}
+
 fn library_search_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
 
@@ -120,7 +158,15 @@ fn parse_tla_module_file_with_visited(
 ) -> Result<TlaModule> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("failed reading module {}", path.display()))?;
-    let mut module = parse_tla_module_text(&raw)?;
+    parse_tla_module_raw_with_visited(path, &raw, visited)
+}
+
+fn parse_tla_module_raw_with_visited(
+    path: &Path,
+    raw: &str,
+    visited: &mut HashSet<String>,
+) -> Result<TlaModule> {
+    let mut module = parse_tla_module_text(raw)?;
     module.path = path.display().to_string();
 
     // Detect PlusCal by looking for --algorithm or --fair algorithm marker in the raw text
@@ -128,18 +174,15 @@ fn parse_tla_module_file_with_visited(
     module.is_pluscal = detect_pluscal(&raw);
 
     // Check for circular EXTENDS
-    let canonical_path = path
-        .canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf())
-        .display()
-        .to_string();
-    if visited.contains(&canonical_path) {
+    let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let visited_key = format!("{}::{}", canonical_path.display(), module.name);
+    if visited.contains(&visited_key) {
         return Err(anyhow!(
             "Circular EXTENDS detected: module '{}' has already been loaded",
             module.name
         ));
     }
-    visited.insert(canonical_path.clone());
+    visited.insert(visited_key.clone());
 
     let result = (|| {
         // Load extended modules and merge their definitions
@@ -151,8 +194,25 @@ fn parse_tla_module_file_with_visited(
         Ok(module)
     })();
 
-    visited.remove(&canonical_path);
+    visited.remove(&visited_key);
     result
+}
+
+fn parse_embedded_module_from_file_with_visited(
+    path: &Path,
+    module_name: &str,
+    visited: &mut HashSet<String>,
+) -> Result<Option<TlaModule>> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed reading module {}", path.display()))?;
+    let Some(module_text) = extract_named_module_text(&raw, module_name) else {
+        return Ok(None);
+    };
+    Ok(Some(parse_tla_module_raw_with_visited(
+        path,
+        &module_text,
+        visited,
+    )?))
 }
 
 /// Load modules referenced by EXTENDS declarations and merge their definitions
@@ -171,8 +231,43 @@ fn load_extended_modules(
             continue;
         }
 
-        // Try to find the extended module file
-        if let Some(extended_path) = resolve_module_path(base_path, &extended_name) {
+        if let Some(extended_module) =
+            parse_embedded_module_from_file_with_visited(base_path, &extended_name, visited)?
+        {
+            // Merge definitions from extended module into current module
+            // Extended module definitions come first, current module definitions override them
+            for (name, def) in extended_module.definitions {
+                if !module.definitions.contains_key(&name) {
+                    module.definitions.insert(name, def);
+                }
+            }
+
+            for constant in extended_module.constants {
+                if !module.constants.contains(&constant) {
+                    module.constants.push(constant);
+                }
+            }
+
+            for variable in extended_module.variables {
+                if !module.variables.contains(&variable) {
+                    module.variables.push(variable);
+                }
+            }
+
+            for rec_decl in extended_module.recursive_declarations {
+                module.recursive_declarations.insert(rec_decl);
+            }
+
+            for (alias, instance) in extended_module.instances {
+                if !module.instances.contains_key(&alias) {
+                    module.instances.insert(alias, instance);
+                }
+            }
+
+            if extended_module.is_pluscal {
+                module.is_pluscal = true;
+            }
+        } else if let Some(extended_path) = resolve_module_path(base_path, &extended_name) {
             // Load the extended module recursively
             let extended_module = parse_tla_module_file_with_visited(&extended_path, visited)
                 .with_context(|| {
@@ -249,8 +344,11 @@ fn detect_pluscal(raw: &str) -> bool {
 fn load_module_instances(module: &mut TlaModule, base_path: &Path) -> Result<()> {
     // Load named instances (Alias == INSTANCE M)
     for (alias, instance) in module.instances.iter_mut() {
-        // Try to find the module file
-        if let Some(instance_path) = resolve_module_path(base_path, &instance.module_name) {
+        if let Some(instance_module) =
+            parse_embedded_module_from_file_with_visited(base_path, &instance.module_name, &mut HashSet::new())?
+        {
+            instance.module = Some(Box::new(instance_module));
+        } else if let Some(instance_path) = resolve_module_path(base_path, &instance.module_name) {
             // Load the module
             let instance_module = parse_tla_module_file(&instance_path).with_context(|| {
                 format!(
@@ -284,7 +382,13 @@ fn load_module_instances(module: &mut TlaModule, base_path: &Path) -> Result<()>
             continue;
         }
 
-        if let Some(instance_path) = resolve_module_path(base_path, &instance.module_name) {
+        if let Some(instance_module) = parse_embedded_module_from_file_with_visited(
+            base_path,
+            &instance.module_name,
+            &mut HashSet::new(),
+        )? {
+            modules_to_merge.push((idx, instance_module, instance.substitutions.clone()));
+        } else if let Some(instance_path) = resolve_module_path(base_path, &instance.module_name) {
             let instance_module = parse_tla_module_file(&instance_path).with_context(|| {
                 format!(
                     "failed to load unnamed instance module '{}'",
@@ -471,7 +575,7 @@ pub fn parse_tla_module_text(input: &str) -> Result<TlaModule> {
             continue;
         }
 
-        if trimmed.starts_with("====") {
+        if is_module_terminator(trimmed) {
             flush_definition(&mut module, &mut current_def);
             current_def_indent = 0;
             mode = NameListMode::None;
@@ -2166,6 +2270,134 @@ RootOp == LeftOp + RightOp
         assert!(module.definitions.contains_key("LeftOp"));
         assert!(module.definitions.contains_key("RightOp"));
         assert!(module.definitions.contains_key("RootOp"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn extends_can_load_embedded_module_from_same_file() {
+        use std::fs;
+
+        let tmp = std::env::temp_dir().join("tlapp-embedded-extends-test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should be created");
+
+        let root = tmp.join("Embedded.tla");
+        fs::write(
+            &root,
+            r#"
+---- MODULE Root ----
+EXTENDS Helper
+Init == x = Value
+===============================================================================
+
+---- MODULE Helper ----
+Value == 42
+===============================================================================
+"#,
+        )
+        .expect("embedded module file should be written");
+
+        let module = parse_tla_module_file(&root).expect("embedded extends should parse");
+        assert_eq!(module.definitions.get("Value").unwrap().body.trim(), "42");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn instances_can_load_embedded_module_from_same_file() {
+        use std::fs;
+
+        let tmp = std::env::temp_dir().join("tlapp-embedded-instance-test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should be created");
+
+        let root = tmp.join("Embedded.tla");
+        fs::write(
+            &root,
+            r#"
+---- MODULE Root ----
+Alias == INSTANCE Helper
+===============================================================================
+
+---- MODULE Helper ----
+Value == 42
+===============================================================================
+"#,
+        )
+        .expect("embedded module file should be written");
+
+        let module = parse_tla_module_file(&root).expect("embedded instance should parse");
+        let alias = module.instances.get("Alias").expect("instance should exist");
+        assert_eq!(alias.module_name, "Helper");
+        assert!(alias.module.is_some(), "embedded instance module should load");
+        assert_eq!(
+            alias.module
+                .as_ref()
+                .unwrap()
+                .definitions
+                .get("Value")
+                .unwrap()
+                .body
+                .trim(),
+            "42"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn embedded_instances_can_chain_embedded_extends_from_same_file() {
+        use std::fs;
+
+        let tmp = std::env::temp_dir().join("tlapp-embedded-instance-extends-test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should be created");
+
+        let root = tmp.join("Embedded.tla");
+        fs::write(
+            &root,
+            r#"
+---- MODULE Root ----
+Alias == INSTANCE Helper
+===============================================================================
+
+---- MODULE Helper ----
+EXTENDS Common
+Value == SharedValue
+===============================================================================
+
+---- MODULE Common ----
+SharedValue == 42
+===============================================================================
+"#,
+        )
+        .expect("embedded module file should be written");
+
+        let module = parse_tla_module_file(&root).expect("embedded modules should parse");
+        let alias = module.instances.get("Alias").expect("instance should exist");
+        let helper = alias
+            .module
+            .as_ref()
+            .expect("embedded instance module should load");
+        assert_eq!(
+            helper
+                .definitions
+                .get("Value")
+                .expect("helper value should be present")
+                .body
+                .trim(),
+            "SharedValue"
+        );
+        assert_eq!(
+            helper
+                .definitions
+                .get("SharedValue")
+                .expect("extended embedded definition should be merged")
+                .body
+                .trim(),
+            "42"
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }
