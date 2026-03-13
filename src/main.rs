@@ -1205,18 +1205,12 @@ fn main() -> anyhow::Result<()> {
             let mut expr_ok = 0usize;
             let mut expr_errors: BTreeMap<String, u64> = BTreeMap::new();
             let mut expr_error_examples: BTreeMap<String, String> = BTreeMap::new();
-            let action_param_samples = parsed_module
-                .definitions
-                .get(&resolved_next_name)
-                .map(|next_def| {
-                    infer_action_param_samples_from_next(
-                        &next_def.body,
-                        &probe_state,
-                        &parsed_module.definitions,
-                        &parsed_module.instances,
-                    )
-                })
-                .unwrap_or_default();
+            let action_param_samples = infer_action_param_samples_from_module_contexts(
+                &resolved_next_name,
+                &parsed_module.definitions,
+                &parsed_module.instances,
+                &probe_state,
+            );
             for def in parsed_module.definitions.values() {
                 if !definition_is_contextually_probeable_action(
                     def,
@@ -2938,6 +2932,52 @@ fn infer_action_param_samples_from_next(
         &mut samples,
         &mut active_calls,
     );
+    samples
+}
+
+fn merge_action_param_samples(
+    into: &mut BTreeMap<String, BTreeMap<String, TlaValue>>,
+    from: BTreeMap<String, BTreeMap<String, TlaValue>>,
+) {
+    for (action, params) in from {
+        let entry = into.entry(action).or_default();
+        for (param, value) in params {
+            entry.entry(param).or_insert(value);
+        }
+    }
+}
+
+fn infer_action_param_samples_from_module_contexts(
+    resolved_next_name: &str,
+    definitions: &BTreeMap<String, TlaDefinition>,
+    instances: &BTreeMap<String, TlaModuleInstance>,
+    probe_state: &TlaState,
+) -> BTreeMap<String, BTreeMap<String, TlaValue>> {
+    let mut samples = definitions
+        .get(resolved_next_name)
+        .map(|next_def| {
+            infer_action_param_samples_from_next(
+                &next_def.body,
+                probe_state,
+                definitions,
+                instances,
+            )
+        })
+        .unwrap_or_default();
+
+    for def in definitions.values() {
+        if def.name == resolved_next_name || !def.params.is_empty() {
+            continue;
+        }
+        if !body_contains_probeable_action_call(&def.body) {
+            continue;
+        }
+        merge_action_param_samples(
+            &mut samples,
+            infer_action_param_samples_from_next(&def.body, probe_state, definitions, instances),
+        );
+    }
+
     samples
 }
 
@@ -7840,6 +7880,72 @@ INVARIANTS TypeInvariant
                 .and_then(|params| params.get("includeByz")),
             Some(&TlaValue::Bool(true))
         );
+    }
+
+    #[test]
+    fn infer_action_param_samples_from_module_contexts_uses_helper_definitions() {
+        let state = TlaState::new();
+        let defs = BTreeMap::from([
+            (
+                "Next".to_string(),
+                TlaDefinition {
+                    name: "Next".to_string(),
+                    params: vec![],
+                    body: "UNCHANGED vars".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Value".to_string(),
+                TlaDefinition {
+                    name: "Value".to_string(),
+                    params: vec![],
+                    body: "{v1, v2}".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "TLANext".to_string(),
+                TlaDefinition {
+                    name: "TLANext".to_string(),
+                    params: vec![],
+                    body: r"\E self \in {0} :
+                              \/ \E S \in SUBSET Value : Phase1c(self, S)"
+                        .to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Phase1c".to_string(),
+                TlaDefinition {
+                    name: "Phase1c".to_string(),
+                    params: vec!["self".to_string(), "S".to_string()],
+                    body: r"/\ \A v \in S : TRUE
+                           /\ UNCHANGED vars"
+                        .to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+
+        let samples = infer_action_param_samples_from_module_contexts(
+            "Next",
+            &defs,
+            &BTreeMap::new(),
+            &state,
+        );
+
+        assert_eq!(
+            samples
+                .get("Phase1c")
+                .and_then(|params| params.get("self")),
+            Some(&TlaValue::Int(0))
+        );
+        let sample = samples
+            .get("Phase1c")
+            .and_then(|params| params.get("S"))
+            .expect("Phase1c should infer a set-valued sample for S");
+        assert!(matches!(sample, TlaValue::Set(_)));
     }
 
     #[test]
