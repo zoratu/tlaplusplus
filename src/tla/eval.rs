@@ -8297,6 +8297,77 @@ Buffer == INSTANCE RingBuffer
     }
 
     #[test]
+    fn choose_can_match_instance_defined_sentinel_values_in_functions() {
+        use crate::tla::module::{TlaModule, TlaModuleInstance};
+
+        let mut nano_module = TlaModule::default();
+        nano_module.name = "Nano".to_string();
+        nano_module.constants = vec!["SignedBlock".to_string()];
+        nano_module.definitions.insert(
+            "NoBlock".to_string(),
+            TlaDefinition {
+                name: "NoBlock".to_string(),
+                params: vec![],
+                body: "CHOOSE b : b \\notin SignedBlock".to_string(),
+                is_recursive: false,
+            },
+        );
+
+        let instances = BTreeMap::from([(
+            "N".to_string(),
+            TlaModuleInstance {
+                alias: "N".to_string(),
+                module_name: "Nano".to_string(),
+                substitutions: BTreeMap::new(),
+                is_local: false,
+                module: Some(Box::new(nano_module)),
+            },
+        )]);
+
+        let signed_block = TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::ModelValue(
+            "signed".to_string(),
+        )])));
+        let seed_state = TlaState::from([("SignedBlock".to_string(), signed_block.clone())]);
+        let seed_defs = BTreeMap::new();
+        let seed_ctx =
+            EvalContext::with_definitions_and_instances(&seed_state, &seed_defs, &instances);
+        let no_block = eval_expr("N!NoBlock", &seed_ctx).expect("sentinel should resolve");
+
+        let hash_1 = TlaValue::ModelValue("h1".to_string());
+        let hash_2 = TlaValue::ModelValue("h2".to_string());
+        let state = TlaState::from([
+            ("SignedBlock".to_string(), signed_block),
+            (
+                "Hash".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([hash_1.clone(), hash_2.clone()]))),
+            ),
+            (
+                "hashFunction".to_string(),
+                TlaValue::Function(Arc::new(BTreeMap::from([
+                    (hash_1.clone(), no_block.clone()),
+                    (hash_2.clone(), no_block.clone()),
+                ]))),
+            ),
+        ]);
+        let defs = BTreeMap::from([(
+            "HashOf".to_string(),
+            TlaDefinition {
+                name: "HashOf".to_string(),
+                params: vec!["block".to_string()],
+                body: r#"IF \E hash \in Hash : hashFunction[hash] = block
+                         THEN CHOOSE hash \in Hash : hashFunction[hash] = block
+                         ELSE CHOOSE hash \in Hash : hashFunction[hash] = N!NoBlock"#
+                    .to_string(),
+                is_recursive: false,
+            },
+        )]);
+        let ctx = EvalContext::with_definitions_and_instances(&state, &defs, &instances);
+
+        let chosen = eval_expr("HashOf(targetBlock)", &ctx).expect("HashOf should choose an unused hash");
+        assert!(chosen == hash_1 || chosen == hash_2, "unexpected hash {chosen:?}");
+    }
+
+    #[test]
     fn test_unchanged_in_expression_context() {
         // UNCHANGED in expression/guard context should evaluate to TRUE.
         // This handles cases like: \/ Action1(self) \/ UNCHANGED vars
