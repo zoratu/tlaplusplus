@@ -359,6 +359,9 @@ fn split_indented_action_disjuncts(expr: &str) -> Option<Vec<String>> {
                 if !saw_top_level {
                     let prefix = prefix_lines.join("\n").trim().to_string();
                     shared_prefix = repeated_disjunct_prefix(&prefix);
+                    if shared_prefix.is_none() && !prefix.is_empty() {
+                        return None;
+                    }
                     if let Some(prefix) = shared_prefix.as_ref() {
                         current.push_str(prefix);
                     } else if !prefix.is_empty() {
@@ -1198,6 +1201,21 @@ mod tests {
         assert_eq!(disjuncts.len(), 1, "{disjuncts:?}");
         assert!(disjuncts[0].starts_with("IF rmState[self] \\in"));
         assert!(disjuncts[0].contains("ELSE /\\ pc' = [pc EXCEPT ![self] = \"Done\"]"));
+    }
+
+    #[test]
+    fn split_action_body_disjuncts_does_not_split_function_constructor_if_bodies() {
+        let disjuncts = split_action_body_disjuncts(
+            r#"grid' = [p \in Pos |-> IF \/  (grid[p] /\ score(p) \in {2, 3})
+                                  \/ (~grid[p] /\ score(p) = 3)
+                                THEN TRUE
+                                ELSE FALSE]"#,
+        );
+
+        assert_eq!(disjuncts.len(), 1, "{disjuncts:?}");
+        assert!(disjuncts[0].starts_with("grid' = [p \\in Pos |-> IF"));
+        assert!(disjuncts[0].contains(r#"(~grid[p] /\ score(p) = 3)"#));
+        assert!(disjuncts[0].ends_with("ELSE FALSE]"));
     }
 
     #[test]
