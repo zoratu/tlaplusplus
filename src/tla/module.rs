@@ -155,7 +155,76 @@ fn resolve_module_path_with_roots(
             .map(|root| root.join(format!("{module_name}.tla"))),
     );
 
-    candidates.into_iter().find(|candidate| candidate.exists())
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.exists())
+        .or_else(|| resolve_unique_module_path_in_ancestor_tree(base_path, module_name))
+}
+
+fn resolve_unique_module_path_in_ancestor_tree(base_path: &Path, module_name: &str) -> Option<PathBuf> {
+    let module_dir = base_path.parent().unwrap_or_else(|| Path::new("."));
+    let repo_root = module_dir
+        .ancestors()
+        .find(|ancestor| ancestor.join(".git").exists());
+    let specs_root = module_dir.ancestors().find(|ancestor| {
+        ancestor
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| matches!(name, "specifications" | "examples" | "models"))
+    });
+
+    let mut roots = Vec::new();
+    if let Some(root) = repo_root {
+        roots.push(root.to_path_buf());
+    }
+    if let Some(root) = specs_root
+        && !roots.iter().any(|existing| existing == root)
+    {
+        roots.push(root.to_path_buf());
+    }
+
+    for root in roots {
+        if let Some(path) = find_unique_module_in_tree(&root, module_name) {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+fn find_unique_module_in_tree(root: &Path, module_name: &str) -> Option<PathBuf> {
+    let target = format!("{module_name}.tla");
+    let mut queue = VecDeque::from([root.to_path_buf()]);
+    let mut matches = Vec::new();
+
+    while let Some(dir) = queue.pop_front() {
+        let entries = std::fs::read_dir(&dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let skip = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with('.') || matches!(name, "target" | "node_modules"));
+                if !skip {
+                    queue.push_back(path);
+                }
+                continue;
+            }
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == target)
+            {
+                matches.push(path);
+                if matches.len() > 1 {
+                    return None;
+                }
+            }
+        }
+    }
+
+    matches.into_iter().next()
 }
 
 /// Internal function that tracks visited modules to detect circular EXTENDS.
@@ -2110,6 +2179,92 @@ Init == x = One
                 std::env::remove_var("TLA_LIBRARY_PATH");
             }
         }
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn extends_can_load_unique_modules_from_repo_tree() {
+        use std::fs;
+
+        let tmp = std::env::temp_dir().join("tlapp-extends-ancestor-search-test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join(".git")).expect("git dir should exist");
+        fs::create_dir_all(tmp.join("specifications/spec_a")).expect("spec dir should exist");
+        fs::create_dir_all(tmp.join("specifications/shared")).expect("shared dir should exist");
+
+        let entry = tmp.join("specifications/spec_a/Entry.tla");
+        fs::write(
+            &entry,
+            r#"
+---- MODULE Entry ----
+EXTENDS Shared
+
+Init == SharedDef
+====
+"#,
+        )
+        .expect("entry module should be written");
+        fs::write(
+            tmp.join("specifications/shared/Shared.tla"),
+            r#"
+---- MODULE Shared ----
+SharedDef == TRUE
+====
+"#,
+        )
+        .expect("shared module should be written");
+
+        let parsed = parse_tla_module_file(&entry).expect("parse should load unique shared module");
+        assert!(parsed.definitions.contains_key("SharedDef"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn extends_does_not_guess_between_multiple_repo_tree_matches() {
+        use std::fs;
+
+        let tmp = std::env::temp_dir().join("tlapp-extends-ancestor-ambiguous-test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join(".git")).expect("git dir should exist");
+        fs::create_dir_all(tmp.join("specifications/spec_a")).expect("spec dir should exist");
+        fs::create_dir_all(tmp.join("specifications/one")).expect("first candidate dir should exist");
+        fs::create_dir_all(tmp.join("specifications/two")).expect("second candidate dir should exist");
+
+        let entry = tmp.join("specifications/spec_a/Entry.tla");
+        fs::write(
+            &entry,
+            r#"
+---- MODULE Entry ----
+EXTENDS Shared
+
+Init == TRUE
+====
+"#,
+        )
+        .expect("entry module should be written");
+        fs::write(
+            tmp.join("specifications/one/Shared.tla"),
+            r#"
+---- MODULE Shared ----
+SharedDef == 1
+====
+"#,
+        )
+        .expect("first shared module should be written");
+        fs::write(
+            tmp.join("specifications/two/Shared.tla"),
+            r#"
+---- MODULE Shared ----
+SharedDef == 2
+====
+"#,
+        )
+        .expect("second shared module should be written");
+
+        let parsed = parse_tla_module_file(&entry).expect("entry module should still parse");
+        assert!(!parsed.definitions.contains_key("SharedDef"));
+
         let _ = fs::remove_dir_all(&tmp);
     }
 
