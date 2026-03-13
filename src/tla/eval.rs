@@ -603,9 +603,16 @@ fn eval_disjunctive_action_body_multi(
 
     let mut out = Vec::new();
     let mut first_err = None;
+    let mut saw_clean_empty = false;
     for disjunct in disjuncts {
         match eval_action_body_text_multi(&disjunct, ctx, branch.clone()) {
-            Ok(mut branches) => out.append(&mut branches),
+            Ok(mut branches) => {
+                if branches.is_empty() {
+                    saw_clean_empty = true;
+                } else {
+                    out.append(&mut branches);
+                }
+            }
             Err(err) => {
                 if first_err.is_none() {
                     first_err = Some(err);
@@ -616,6 +623,8 @@ fn eval_disjunctive_action_body_multi(
 
     if !out.is_empty() {
         Some(Ok(out))
+    } else if first_err.is_none() && saw_clean_empty {
+        Some(Ok(Vec::new()))
     } else {
         Some(Err(first_err.unwrap_or_else(|| {
             anyhow!("no disjunctive action branch produced a successor")
@@ -6002,6 +6011,59 @@ IN
         let next = &next_states[0];
         assert_eq!(next.get("sent"), Some(&TlaValue::Bool(true)));
         assert_eq!(next.get("msgs"), state.get("msgs"));
+    }
+
+    #[test]
+    fn disjunctive_action_guard_can_be_cleanly_disabled() {
+        let a1 = TlaValue::ModelValue("a1".to_string());
+        let a2 = TlaValue::ModelValue("a2".to_string());
+        let v1 = TlaValue::ModelValue("v1".to_string());
+        let quorum = TlaValue::Set(Arc::new(BTreeSet::from([a1.clone(), a2.clone()])));
+        let state = TlaState::from([
+            (
+                "msgs".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::new())),
+            ),
+            (
+                "Quorum".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([quorum]))),
+            ),
+            ("sent".to_string(), TlaValue::Bool(false)),
+        ]);
+        let ctx = EvalContext::new(&state).with_local_values(&[
+            ("b", TlaValue::Int(0)),
+            ("v", v1),
+        ]);
+        let action = ActionIr {
+            name: "Phase2a".to_string(),
+            params: vec![],
+            clauses: vec![
+                ActionClause::Guard {
+                    expr: r#"\E Q \in Quorum :
+        LET Q1b == {m \in msgs : /\ m.type = "1b"
+                                 /\ m.acc \in Q
+                                 /\ m.bal = b}
+            Q1bv == {m \in Q1b : m.mbal >= 0}
+        IN  /\ \A a \in Q : \E m \in Q1b : m.acc = a
+            /\ \/ Q1bv = {}
+               \/ \E m \in Q1bv :
+                    /\ m.mval = v
+                    /\ \A mm \in Q1bv : m.mbal >= mm.mbal"#
+                        .to_string(),
+                },
+                ActionClause::PrimedAssignment {
+                    var: "sent".to_string(),
+                    expr: "TRUE".to_string(),
+                },
+                ActionClause::Unchanged {
+                    vars: vec!["msgs".to_string()],
+                },
+            ],
+        };
+
+        let next_states = apply_action_ir_with_context_multi(&action, &state, &ctx)
+            .expect("disabled disjunctive guard should not error");
+        assert!(next_states.is_empty());
     }
 
     #[test]

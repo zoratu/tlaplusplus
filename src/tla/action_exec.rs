@@ -914,7 +914,7 @@ fn is_word_char(c: char) -> bool {
 mod tests {
     use super::*;
     use crate::models::tla_native::TlaModel;
-    use crate::tla::parse_tla_module_text;
+    use crate::tla::{parse_tla_module_file, parse_tla_module_text};
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2037,5 +2037,326 @@ CONSTANTS
         assert_eq!(probe.supported_disjuncts, 2, "{probe:?}");
         assert_eq!(probe.generated_successors, 1, "{probe:?}");
         assert!(probe.failures.is_empty(), "{probe:?}");
+    }
+
+    #[test]
+    fn parsed_module_probe_matches_model_state_for_phase2a_let_guards() {
+        let tmp = temp_dir("phase2a-parsed-model");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should exist");
+
+        let paxos_base = tmp.join("PaxosBase.tla");
+        fs::write(
+            &paxos_base,
+            r#"
+---- MODULE PaxosBase ----
+EXTENDS Integers
+
+CONSTANTS Acceptor, Value, Quorum, Ballot
+
+Message ==
+       [type : {"1b"}, acc : Acceptor, bal : Ballot, mbal : Ballot, mval : Value]
+  \cup [type : {"2a"}, bal : Ballot, val : Value]
+
+VARIABLE msgs
+
+Init ==
+  /\ msgs = { [type |-> "1b", acc |-> a, bal |-> 1, mbal |-> 1, mval |-> CHOOSE v \in Value : TRUE]
+            : a \in Acceptor }
+
+Send(m) == msgs' = msgs \cup {m}
+
+Phase1a(b) == FALSE
+
+Phase2a(b, v) ==
+  /\ ~ \E m \in msgs : m.type = "2a" /\ m.bal = b
+  /\ \E Q \in Quorum :
+        LET Q1b == {m \in msgs : /\ m.type = "1b"
+                                 /\ m.acc \in Q
+                                 /\ m.bal = b}
+            Q1bv == {m \in Q1b : m.mbal >= 0}
+        IN  /\ \A a \in Q : \E m \in Q1b : m.acc = a
+            /\ \/ Q1bv = {}
+               \/ \E m \in Q1bv :
+                    /\ m.mval = v
+                    /\ \A mm \in Q1bv : m.mbal >= mm.mbal
+  /\ Send([type |-> "2a", bal |-> b, val |-> v])
+
+Next == \E b \in Ballot :
+            \/ Phase1a(b)
+            \/ \E v \in Value : Phase2a(b, v)
+
+Spec == Init /\ [][Next]_<<msgs>>
+====
+"#,
+        )
+        .expect("base module should be written");
+
+        let mc = tmp.join("MCPaxosMini.tla");
+        fs::write(
+            &mc,
+            r#"
+---- MODULE MCPaxosMini ----
+EXTENDS PaxosBase, TLC
+
+CONSTANTS a1, a2, v1
+
+MCAcceptor == {a1, a2}
+MCValue == {v1}
+MCQuorum == {{a1, a2}}
+MCBallot == {1}
+====
+"#,
+        )
+        .expect("wrapper module should be written");
+
+        let cfg = tmp.join("MCPaxosMini.cfg");
+        fs::write(
+            &cfg,
+            r#"
+CONSTANTS
+  a1 = a1
+  a2 = a2
+  v1 = v1
+CONSTANT
+  Acceptor <- MCAcceptor
+CONSTANT
+  Value <- MCValue
+CONSTANT
+  Quorum <- MCQuorum
+CONSTANT
+  Ballot <- MCBallot
+SPECIFICATION
+  Spec
+"#,
+        )
+        .expect("cfg should be written");
+
+        let parsed_module = parse_tla_module_file(&mc).expect("parsed module should load");
+        let model = TlaModel::from_files(&mc, Some(&cfg), None, None).expect("model");
+        let probe_state = model
+            .initial_states_vec
+            .first()
+            .cloned()
+            .expect("initial state");
+        let next_def = parsed_module
+            .definitions
+            .get("Next")
+            .expect("Next definition should exist");
+
+        let probe = probe_next_disjuncts_with_instances(
+            &next_def.body,
+            &parsed_module.definitions,
+            Some(&parsed_module.instances),
+            &probe_state,
+        );
+
+        assert_eq!(probe.supported_disjuncts, 2, "{probe:?}");
+        assert_eq!(probe.generated_successors, 2, "{probe:?}");
+        assert!(probe.failures.is_empty(), "{probe:?}");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn parsed_paxos_style_probe_keeps_let_locals_in_scope_with_operator_overrides() {
+        let tmp = temp_dir("phase2a-paxos-style");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should exist");
+
+        let voting = tmp.join("Voting.tla");
+        fs::write(
+            &voting,
+            r#"
+---- MODULE Voting ----
+EXTENDS Naturals
+
+Ballot == Nat
+Spec == TRUE
+====
+"#,
+        )
+        .expect("voting module should be written");
+
+        let paxos = tmp.join("Paxos.tla");
+        fs::write(
+            &paxos,
+            r#"
+---- MODULE Paxos ----
+EXTENDS Integers
+
+CONSTANTS Value, Acceptor, Quorum
+
+Ballot == Nat
+None == CHOOSE v : v \notin Ballot
+
+Message ==
+       [type : {"1a"}, bal : Ballot]
+  \cup [type : {"1b"}, acc : Acceptor, bal : Ballot,
+        mbal : Ballot \cup {-1}, mval : Value \cup {None}]
+  \cup [type : {"2a"}, bal : Ballot, val : Value]
+  \cup [type : {"2b"}, acc : Acceptor, bal : Ballot, val : Value]
+
+VARIABLES maxBal, maxVBal, maxVal, msgs
+vars == <<maxBal, maxVBal, maxVal, msgs>>
+
+Init == /\ maxBal  = [a \in Acceptor |-> -1]
+        /\ maxVBal = [a \in Acceptor |-> -1]
+        /\ maxVal  = [a \in Acceptor |-> None]
+        /\ msgs = {}
+
+Send(m) == msgs' = msgs \cup {m}
+
+Phase1a(b) == /\ Send([type |-> "1a", bal |-> b])
+              /\ UNCHANGED <<maxBal, maxVBal, maxVal>>
+
+Phase1b(a) ==
+  /\ \E m \in msgs :
+        /\ m.type = "1a"
+        /\ m.bal > maxBal[a]
+        /\ maxBal' = [maxBal EXCEPT ![a] = m.bal]
+        /\ Send([type |-> "1b", acc |-> a, bal |-> m.bal,
+                  mbal |-> maxVBal[a], mval |-> maxVal[a]])
+  /\ UNCHANGED <<maxVBal, maxVal>>
+
+Phase2a(b, v) ==
+  /\ ~ \E m \in msgs : m.type = "2a" /\ m.bal = b
+  /\ \E Q \in Quorum :
+        LET Q1b == {m \in msgs : /\ m.type = "1b"
+                                 /\ m.acc \in Q
+                                 /\ m.bal = b}
+            Q1bv == {m \in Q1b : m.mbal >= 0}
+        IN  /\ \A a \in Q : \E m \in Q1b : m.acc = a
+            /\ \/ Q1bv = {}
+               \/ \E m \in Q1bv :
+                    /\ m.mval = v
+                    /\ \A mm \in Q1bv : m.mbal >= mm.mbal
+  /\ Send([type |-> "2a", bal |-> b, val |-> v])
+  /\ UNCHANGED <<maxBal, maxVBal, maxVal>>
+
+Phase2b(a) ==
+  \E m \in msgs :
+      /\ m.type = "2a"
+      /\ m.bal >= maxBal[a]
+      /\ maxBal' = [maxBal EXCEPT ![a] = m.bal]
+      /\ maxVBal' = [maxVBal EXCEPT ![a] = m.bal]
+      /\ maxVal' = [maxVal EXCEPT ![a] = m.val]
+      /\ Send([type |-> "2b", acc |-> a,
+              bal |-> m.bal, val |-> m.val])
+
+Next == \/ \E b \in Ballot : \/ Phase1a(b)
+                             \/ \E v \in Value : Phase2a(b, v)
+        \/ \E a \in Acceptor : Phase1b(a) \/ Phase2b(a)
+
+V == INSTANCE Voting
+
+Spec == Init /\ [][Next]_vars
+====
+"#,
+        )
+        .expect("paxos module should be written");
+
+        let mc = tmp.join("MCPaxosMini.tla");
+        fs::write(
+            &mc,
+            r#"
+---- MODULE MCPaxosMini ----
+EXTENDS Paxos, TLC
+
+CONSTANT MaxBallot
+CONSTANTS a1, a2, a3
+CONSTANTS v1, v2
+
+MCAcceptor == {a1, a2, a3}
+MCValue == {v1, v2}
+MCQuorum == {{a1, a2}, {a1, a3}, {a2, a3}}
+MCBallot == 0..MaxBallot
+MCBallotVoting == 0..MaxBallot
+
+====
+"#,
+        )
+        .expect("wrapper module should be written");
+
+        let cfg = tmp.join("MCPaxosMini.cfg");
+        fs::write(
+            &cfg,
+            r#"
+CONSTANT
+  MaxBallot = 2
+CONSTANTS
+  a1 = a1
+  a2 = a2
+  a3 = a3
+CONSTANTS
+  v1 = v1
+  v2 = v2
+CONSTANT
+  Acceptor <- MCAcceptor
+CONSTANT
+  Value <- MCValue
+CONSTANT
+  Quorum <- MCQuorum
+CONSTANT
+  None = None
+  Ballot <- MCBallot
+  Ballot <- [Voting]MCBallotVoting
+SPECIFICATION
+  Spec
+"#,
+        )
+        .expect("cfg should be written");
+
+        let parsed_module = parse_tla_module_file(&mc).expect("parsed module should load");
+        let model = TlaModel::from_files(&mc, Some(&cfg), None, None).expect("model");
+        let probe_state = model
+            .initial_states_vec
+            .first()
+            .cloned()
+            .expect("initial state");
+        let next_def = parsed_module
+            .definitions
+            .get("Next")
+            .expect("Next definition should exist");
+
+        let probe = probe_next_disjuncts_with_instances(
+            &next_def.body,
+            &parsed_module.definitions,
+            Some(&parsed_module.instances),
+            &probe_state,
+        );
+
+        let phase2a_def = parsed_module
+            .definitions
+            .get("Phase2a")
+            .expect("Phase2a definition should exist");
+        let phase2a_ir = compile_action_ir(phase2a_def);
+        let mut ctx = crate::tla::EvalContext::with_definitions_and_instances(
+            &probe_state,
+            &parsed_module.definitions,
+            &parsed_module.instances,
+        );
+        {
+            let locals_mut = std::rc::Rc::make_mut(&mut ctx.locals);
+            locals_mut.insert("b".to_string(), TlaValue::Int(0));
+            locals_mut.insert("v".to_string(), TlaValue::ModelValue("v1".to_string()));
+        }
+        let phase2a_ir_result = apply_action_ir_with_context_multi(&phase2a_ir, &probe_state, &ctx);
+        assert!(phase2a_ir_result.is_ok(), "{phase2a_ir_result:?}");
+
+        let phase2a = execute_branch(
+            "Phase2a(0, v1)",
+            &BTreeMap::new(),
+            &parsed_module.definitions,
+            Some(&parsed_module.instances),
+            &probe_state,
+        );
+        assert!(phase2a.is_ok(), "{phase2a:?}");
+
+        assert_eq!(probe.supported_disjuncts, 2, "{probe:?}");
+        assert_eq!(probe.generated_successors, 3, "{probe:?}");
+        assert!(probe.failures.is_empty(), "{probe:?}");
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }
