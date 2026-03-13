@@ -2103,6 +2103,10 @@ pub enum CompiledActionClause {
         var: String,
         expr: CompiledExpr,
     },
+    PrimedMembership {
+        var: String,
+        set_expr: CompiledExpr,
+    },
     Unchanged {
         vars: Vec<String>,
     },
@@ -2160,6 +2164,10 @@ fn compile_action_clause(clause: &ActionClause) -> CompiledActionClause {
             var: var.clone(),
             expr: compile_expr(expr),
         },
+        ActionClause::PrimedMembership { var, set_expr } => CompiledActionClause::PrimedMembership {
+            var: var.clone(),
+            set_expr: compile_expr(set_expr),
+        },
         ActionClause::Unchanged { vars } => CompiledActionClause::Unchanged { vars: vars.clone() },
         ActionClause::Guard { expr } => compile_action_clause_text(expr),
         ActionClause::Exists { binders, body } => CompiledActionClause::Exists {
@@ -2202,6 +2210,10 @@ fn compile_action_clause_text(expr: &str) -> CompiledActionClause {
         ClauseKind::PrimedAssignment { var, expr } => CompiledActionClause::PrimedAssignment {
             var,
             expr: compile_expr(&expr),
+        },
+        ClauseKind::PrimedMembership { var, set_expr } => CompiledActionClause::PrimedMembership {
+            var,
+            set_expr: compile_expr(&set_expr),
         },
         ClauseKind::Unchanged { vars } => CompiledActionClause::Unchanged { vars },
         ClauseKind::UnprimedEquality { .. }

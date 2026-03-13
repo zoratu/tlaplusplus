@@ -7,6 +7,10 @@ pub enum ActionClause {
         var: String,
         expr: String,
     },
+    PrimedMembership {
+        var: String,
+        set_expr: String,
+    },
     Unchanged {
         vars: Vec<String>,
     },
@@ -36,6 +40,11 @@ pub(crate) fn split_action_body_clauses(expr: &str) -> Vec<String> {
     let trimmed = normalized.trim();
     if trimmed.is_empty() {
         return Vec::new();
+    }
+    if let Some(body) = strip_leading_comment_only_lines(trimmed)
+        && body.starts_with("\\/")
+    {
+        return vec![trimmed.to_string()];
     }
     if trimmed.starts_with("\\E") || trimmed.starts_with("\\A") {
         return vec![trimmed.to_string()];
@@ -358,13 +367,14 @@ fn split_indented_action_disjuncts(expr: &str) -> Option<Vec<String>> {
                 let branch_head = trimmed.trim_start_matches("\\/").trim_start();
                 if !saw_top_level {
                     let prefix = prefix_lines.join("\n").trim().to_string();
+                    let prefix_is_comment_only = is_comment_only_text(&prefix);
                     shared_prefix = repeated_disjunct_prefix(&prefix);
-                    if shared_prefix.is_none() && !prefix.is_empty() {
+                    if shared_prefix.is_none() && !prefix.is_empty() && !prefix_is_comment_only {
                         return None;
                     }
                     if let Some(prefix) = shared_prefix.as_ref() {
                         current.push_str(prefix);
-                    } else if !prefix.is_empty() {
+                    } else if !prefix.is_empty() && !prefix_is_comment_only {
                         let inline_prefix_disjuncts = split_top_level(&prefix, "\\/");
                         if inline_prefix_disjuncts.len() > 1 || prefix.starts_with("\\/") {
                             for disjunct in inline_prefix_disjuncts {
@@ -415,6 +425,47 @@ fn split_indented_action_disjuncts(expr: &str) -> Option<Vec<String>> {
     } else {
         None
     }
+}
+
+fn is_comment_only_text(text: &str) -> bool {
+    let mut saw_nonempty = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        saw_nonempty = true;
+        if !trimmed.starts_with("\\*") {
+            return false;
+        }
+    }
+    saw_nonempty
+}
+
+fn strip_leading_comment_only_lines(text: &str) -> Option<&str> {
+    let mut offset = 0usize;
+    let mut saw_comment = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let next_offset = offset + line.len() + 1;
+        if trimmed.is_empty() {
+            offset = next_offset;
+            continue;
+        }
+        if trimmed.starts_with("\\*") {
+            saw_comment = true;
+            offset = next_offset;
+            continue;
+        }
+        return if saw_comment {
+            Some(text[offset..].trim_start())
+        } else {
+            Some(text.trim_start())
+        };
+    }
+
+    None
 }
 
 fn repeated_disjunct_prefix(prefix: &str) -> Option<String> {
@@ -532,6 +583,9 @@ pub fn compile_action_ir(def: &TlaDefinition) -> ActionIr {
             match classify_clause(&part) {
                 ClauseKind::PrimedAssignment { var, expr } => {
                     clauses.push(ActionClause::PrimedAssignment { var, expr });
+                }
+                ClauseKind::PrimedMembership { var, set_expr } => {
+                    clauses.push(ActionClause::PrimedMembership { var, set_expr });
                 }
                 ClauseKind::Unchanged { vars } => {
                     clauses.push(ActionClause::Unchanged { vars });
@@ -1052,6 +1106,24 @@ mod tests {
     }
 
     #[test]
+    fn split_action_body_clauses_keeps_comment_prefixed_top_level_disjunction_intact() {
+        let clauses = split_action_body_clauses(
+            r#"
+                \* Need an artificial initial state.
+                \* Otherwise the first flip will always be fair.
+                \/ /\ state = "init"
+                   /\ state' = "s0"
+                \/ /\ state # "init"
+                   /\ state' = Transition[state][flip]
+            "#,
+        );
+
+        assert_eq!(clauses.len(), 1, "{clauses:#?}");
+        assert!(clauses[0].contains(r#"\/ /\ state = "init""#));
+        assert!(clauses[0].contains(r#"\/ /\ state # "init""#));
+    }
+
+    #[test]
     fn split_action_body_clauses_splits_guard_before_nested_inline_let() {
         let clauses = split_action_body_clauses(
             r#"
@@ -1165,6 +1237,24 @@ mod tests {
     }
 
     #[test]
+    fn split_action_body_disjuncts_ignores_comment_only_prefix_lines() {
+        let disjuncts = split_action_body_disjuncts(
+            r#"
+                \* Need an artificial initial state.
+                \* The first flip would otherwise always be fair.
+                \/ /\ state = "init"
+                   /\ state' = "s0"
+                \/ /\ state # "init"
+                   /\ state' = Transition[state][flip]
+            "#,
+        );
+
+        assert_eq!(disjuncts.len(), 2, "{disjuncts:#?}");
+        assert!(disjuncts[0].starts_with(r#"/\ state = "init""#));
+        assert!(disjuncts[1].starts_with(r#"/\ state # "init""#));
+    }
+
+    #[test]
     fn split_action_body_disjuncts_does_not_split_disjunctions_inside_let_definitions() {
         let disjuncts = split_action_body_disjuncts(
             r#"
@@ -1245,6 +1335,7 @@ mod tests {
                 .map(|clause| match clause {
                     ActionClause::Guard { expr }
                     | ActionClause::PrimedAssignment { expr, .. }
+                    | ActionClause::PrimedMembership { set_expr: expr, .. }
                     | ActionClause::LetWithPrimes { expr } => expr,
                     ActionClause::Exists { body, .. } => body,
                     ActionClause::Unchanged { vars } => vars.join(","),
@@ -1255,6 +1346,38 @@ mod tests {
                 texts
                     .iter()
                     .any(|expr| expr.contains(r#"pc EXCEPT ![self]"#))
+            );
+        }
+    }
+
+    #[test]
+    fn compile_action_ir_branches_ignores_comment_only_lines_before_top_level_disjuncts() {
+        let def = TlaDefinition {
+            name: "SimNext".to_string(),
+            params: vec![],
+            body: r#"
+                \* Need an artificial initial state to be able to model a crooked coin.
+                \* Otherwise the first flip will always be fair.
+                \/ /\ state = "init"
+                   /\ state' = "s0"
+                   /\ UNCHANGED p
+                \/ /\ state # "init"
+                   /\ state' = Transition[state][flip]
+                   /\ p' = Half(p)
+            "#
+            .to_string(),
+            is_recursive: false,
+        };
+
+        let branches = compile_action_ir_branches(&def);
+        assert_eq!(branches.len(), 2, "{branches:#?}");
+        for branch in branches {
+            assert!(
+                branch.clauses.iter().all(|clause| match clause {
+                    ActionClause::Guard { expr } => !expr.trim().starts_with("\\*"),
+                    _ => true,
+                }),
+                "{branch:#?}"
             );
         }
     }

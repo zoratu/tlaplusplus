@@ -1763,6 +1763,17 @@ fn eval_compiled_clause_to_branch<'a>(
             branch.staged.insert(var.clone(), value);
             Ok(vec![branch])
         }
+        CompiledActionClause::PrimedMembership { var, set_expr } => {
+            let domain = eval_compiled(set_expr, &eval_ctx)?;
+            let values = domain.as_set()?.iter().cloned().collect::<Vec<_>>();
+            let mut out = Vec::with_capacity(values.len());
+            for value in values {
+                let mut branch = branch.clone();
+                branch.staged.insert(var.clone(), value);
+                out.push(branch);
+            }
+            Ok(out)
+        }
         CompiledActionClause::Unchanged { vars } => {
             let mut branch = branch;
             for var in vars {
@@ -2321,6 +2332,34 @@ mod tests {
         let next_state = result.expect("conditional branch should succeed");
         assert_eq!(next_state.get("count"), Some(&TlaValue::Int(7)));
         assert_eq!(next_state.get("announced"), Some(&TlaValue::Bool(true)));
+    }
+
+    #[test]
+    fn test_compiled_primed_membership_generates_all_choices() {
+        use crate::tla::compiled_expr::CompiledActionIr;
+        use crate::tla::{ActionClause, ActionIr};
+
+        let state = TlaState::from([("flip".to_string(), TlaValue::String("H".to_string()))]);
+        let ctx = EvalContext::new(&state);
+
+        let action_ir = ActionIr {
+            name: "TossCoin".to_string(),
+            params: vec![],
+            clauses: vec![ActionClause::PrimedMembership {
+                var: "flip".to_string(),
+                set_expr: "{\"H\", \"T\"}".to_string(),
+            }],
+        };
+
+        let compiled = CompiledActionIr::from_ir(&action_ir);
+        let next_states = apply_compiled_action_ir_multi(&compiled, &state, &ctx).unwrap();
+        assert_eq!(next_states.len(), 2, "{next_states:?}");
+        assert!(next_states
+            .iter()
+            .any(|st| st.get("flip") == Some(&TlaValue::String("H".to_string()))));
+        assert!(next_states
+            .iter()
+            .any(|st| st.get("flip") == Some(&TlaValue::String("T".to_string()))));
     }
 
     #[test]
