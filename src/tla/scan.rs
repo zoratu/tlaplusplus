@@ -67,6 +67,11 @@ const BUILTIN_EXTENDS: &[&str] = &[
     "TLCExt",
 ];
 
+fn is_module_terminator(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.len() >= 4 && trimmed.chars().all(|c| c == '=')
+}
+
 pub fn scan_module_closure(entry_module: &Path) -> Result<ScanAggregate> {
     let entry_module = entry_module
         .canonicalize()
@@ -82,26 +87,34 @@ pub fn scan_module_closure(entry_module: &Path) -> Result<ScanAggregate> {
         if !visited.insert(path.clone()) {
             continue;
         }
-        let scan = scan_single_module(&path)?;
+        let file_scans = scan_single_file(&path)?;
+        let same_file_modules: BTreeSet<_> = file_scans
+            .iter()
+            .map(|scan| scan.module_name.clone())
+            .collect();
 
         let module_dir = path.parent().unwrap_or_else(|| Path::new("."));
 
-        for name in scan.extends.iter().chain(scan.instances.iter()) {
-            if BUILTIN_EXTENDS.iter().any(|m| m == name) {
-                continue;
-            }
-            let local_path = module_dir.join(format!("{name}.tla"));
-            if local_path.exists() {
-                queue.push_back(local_path.canonicalize().with_context(|| {
-                    format!("cannot resolve local module {}", local_path.display())
-                })?);
+        for scan in &file_scans {
+            for name in scan.extends.iter().chain(scan.instances.iter()) {
+                if BUILTIN_EXTENDS.iter().any(|m| m == name)
+                    || same_file_modules.contains(name)
+                {
+                    continue;
+                }
+                let local_path = module_dir.join(format!("{name}.tla"));
+                if local_path.exists() {
+                    queue.push_back(local_path.canonicalize().with_context(|| {
+                        format!("cannot resolve local module {}", local_path.display())
+                    })?);
+                }
             }
         }
 
-        scans.push(scan);
+        scans.extend(file_scans);
     }
 
-    scans.sort_by(|a, b| a.path.cmp(&b.path));
+    scans.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.module_name.cmp(&b.module_name)));
 
     let mut combined = BTreeMap::new();
     let mut operators = BTreeSet::new();
@@ -121,9 +134,61 @@ pub fn scan_module_closure(entry_module: &Path) -> Result<ScanAggregate> {
     })
 }
 
-fn scan_single_module(path: &Path) -> Result<ModuleScan> {
+fn scan_single_file(path: &Path) -> Result<Vec<ModuleScan>> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("failed reading module {}", path.display()))?;
+    let module_chunks = split_embedded_modules(&raw);
+    if module_chunks.is_empty() {
+        return Ok(vec![scan_single_module_text(path, &raw)]);
+    }
+
+    Ok(module_chunks
+        .iter()
+        .map(|chunk| scan_single_module_text(path, chunk))
+        .collect())
+}
+
+fn split_embedded_modules(input: &str) -> Vec<String> {
+    let mut modules = Vec::new();
+    let mut current = Vec::new();
+    let mut in_module = false;
+
+    for line in input.lines() {
+        let trimmed = line.trim();
+        let is_header = trimmed.starts_with("----")
+            && trimmed.contains("MODULE")
+            && trimmed.ends_with("----")
+            && extract_module_name(trimmed).is_some();
+
+        if is_header {
+            if in_module && !current.is_empty() {
+                modules.push(current.join("\n"));
+                current.clear();
+            }
+            in_module = true;
+        }
+
+        if !in_module {
+            continue;
+        }
+
+        current.push(line.to_string());
+
+        if is_module_terminator(trimmed) {
+            modules.push(current.join("\n"));
+            current.clear();
+            in_module = false;
+        }
+    }
+
+    if in_module && !current.is_empty() {
+        modules.push(current.join("\n"));
+    }
+
+    modules
+}
+
+fn scan_single_module_text(path: &Path, raw: &str) -> ModuleScan {
     let cleaned = strip_comments(&raw);
 
     let mut module_name = String::new();
@@ -173,14 +238,14 @@ fn scan_single_module(path: &Path) -> Result<ModuleScan> {
         features.insert("set_minus".to_string(), set_minus_count);
     }
 
-    Ok(ModuleScan {
+    ModuleScan {
         module_name,
         path: path.to_path_buf(),
         extends,
         instances,
         operators,
         features,
-    })
+    }
 }
 
 fn strip_comments(input: &str) -> String {
@@ -367,5 +432,67 @@ mod tests {
         C == y \union T
         "#;
         assert_eq!(count_set_minus(src), 1);
+    }
+
+    #[test]
+    fn split_embedded_modules_handles_long_terminators() {
+        let src = r#"
+---- MODULE Root ----
+EXTENDS Helper
+===============================================================================
+
+---- MODULE Helper ----
+EXTENDS Common
+Value == SharedValue
+===============================================================================
+
+---- MODULE Common ----
+SharedValue == 42
+===============================================================================
+"#;
+
+        let modules = split_embedded_modules(src);
+        assert_eq!(modules.len(), 3);
+        assert!(modules[0].contains("MODULE Root"));
+        assert!(modules[1].contains("MODULE Helper"));
+        assert!(modules[2].contains("MODULE Common"));
+    }
+
+    #[test]
+    fn scan_module_closure_includes_embedded_modules_in_shared_file() {
+        use std::fs;
+
+        let tmp = std::env::temp_dir().join("tlapp-scan-embedded-modules");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should be created");
+
+        let root = tmp.join("Embedded.tla");
+        fs::write(
+            &root,
+            r#"
+---- MODULE Root ----
+EXTENDS Helper
+Alias == INSTANCE Common
+===============================================================================
+
+---- MODULE Helper ----
+EXTENDS Common
+Value == SharedValue
+===============================================================================
+
+---- MODULE Common ----
+SharedValue == 42
+===============================================================================
+"#,
+        )
+        .expect("embedded module file should be written");
+
+        let scan = scan_module_closure(&root).expect("scan should include embedded modules");
+        assert_eq!(scan.modules.len(), 3);
+        assert!(scan.modules.iter().any(|m| m.module_name == "Root"));
+        assert!(scan.modules.iter().any(|m| m.module_name == "Helper"));
+        assert!(scan.modules.iter().any(|m| m.module_name == "Common"));
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }
