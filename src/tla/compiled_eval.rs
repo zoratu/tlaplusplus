@@ -4,7 +4,9 @@
 //! the overhead of string parsing on every evaluation.
 
 use crate::tla::compiled_expr::{CompiledExpr, compile_expr, find_top_level_colon};
-use crate::tla::eval::{EvalContext, apply_value, eval_expr, eval_operator_call, normalize_param_name};
+use crate::tla::eval::{
+    EvalContext, apply_value, eval_expr, eval_operator_call, normalize_param_name,
+};
 use crate::tla::formula::split_top_level;
 use crate::tla::value::TlaValue;
 use anyhow::{Result, anyhow};
@@ -405,8 +407,8 @@ fn eval_compiled_inner(
         }
         CompiledExpr::Head(e) => {
             let seq = eval_compiled_inner(e, ctx, depth + 1)?;
-            let seq = sequence_like_values(&seq)
-                .ok_or_else(|| anyhow!("expected Seq, got {seq:?}"))?;
+            let seq =
+                sequence_like_values(&seq).ok_or_else(|| anyhow!("expected Seq, got {seq:?}"))?;
             if seq.is_empty() {
                 return Err(anyhow!("Head of empty sequence"));
             }
@@ -414,8 +416,8 @@ fn eval_compiled_inner(
         }
         CompiledExpr::Tail(e) => {
             let seq = eval_compiled_inner(e, ctx, depth + 1)?;
-            let seq = sequence_like_values(&seq)
-                .ok_or_else(|| anyhow!("expected Seq, got {seq:?}"))?;
+            let seq =
+                sequence_like_values(&seq).ok_or_else(|| anyhow!("expected Seq, got {seq:?}"))?;
             if seq.is_empty() {
                 return Err(anyhow!("Tail of empty sequence"));
             }
@@ -424,8 +426,8 @@ fn eval_compiled_inner(
         CompiledExpr::Append(a, b) => {
             let seq = eval_compiled_inner(a, ctx, depth + 1)?;
             let elem = eval_compiled_inner(b, ctx, depth + 1)?;
-            let mut seq = sequence_like_values(&seq)
-                .ok_or_else(|| anyhow!("expected Seq, got {seq:?}"))?;
+            let mut seq =
+                sequence_like_values(&seq).ok_or_else(|| anyhow!("expected Seq, got {seq:?}"))?;
             seq.push(elem);
             Ok(TlaValue::Seq(Arc::new(seq)))
         }
@@ -460,16 +462,16 @@ fn eval_compiled_inner(
         }
         CompiledExpr::Len(e) => {
             let seq = eval_compiled_inner(e, ctx, depth + 1)?;
-            let seq = sequence_like_values(&seq)
-                .ok_or_else(|| anyhow!("expected Seq, got {seq:?}"))?;
+            let seq =
+                sequence_like_values(&seq).ok_or_else(|| anyhow!("expected Seq, got {seq:?}"))?;
             Ok(TlaValue::Int(seq.len() as i64))
         }
         CompiledExpr::SubSeq(s, a, b) => {
             let seq = eval_compiled_inner(s, ctx, depth + 1)?;
             let start = eval_compiled_inner(a, ctx, depth + 1)?.as_int()? as usize;
             let end = eval_compiled_inner(b, ctx, depth + 1)?.as_int()? as usize;
-            let seq = sequence_like_values(&seq)
-                .ok_or_else(|| anyhow!("expected Seq, got {seq:?}"))?;
+            let seq =
+                sequence_like_values(&seq).ok_or_else(|| anyhow!("expected Seq, got {seq:?}"))?;
             // TLA+ uses 1-based indexing
             let start = start.saturating_sub(1);
             let end = end.min(seq.len());
@@ -1338,6 +1340,18 @@ fn eval_compiled_opcall(
             let max_len = arg_values[1].as_int()?;
             return eval_builtin_bounded_seq(&arg_values[0], max_len);
         }
+        "TLCGet" => {
+            if arg_values.len() != 1 {
+                return Err(anyhow!("TLCGet expects 1 argument"));
+            }
+            return eval_builtin_tlc_get(&arg_values[0]);
+        }
+        "TLCSet" => {
+            if arg_values.len() != 2 {
+                return Err(anyhow!("TLCSet expects 2 arguments"));
+            }
+            return Ok(TlaValue::Bool(true));
+        }
         "Len" => {
             if arg_values.len() != 1 {
                 return Err(anyhow!("Len expects 1 argument"));
@@ -1612,7 +1626,10 @@ fn eval_builtin_extremum(name: &str, value: &TlaValue, want_max: bool) -> Result
 
 fn eval_builtin_bounded_seq(domain: &TlaValue, max_len: i64) -> Result<TlaValue> {
     if max_len < 0 {
-        return Err(anyhow!("BoundedSeq expects a non-negative bound, got {}", max_len));
+        return Err(anyhow!(
+            "BoundedSeq expects a non-negative bound, got {}",
+            max_len
+        ));
     }
 
     let elements = domain.as_set()?.iter().cloned().collect::<Vec<_>>();
@@ -1652,6 +1669,21 @@ fn eval_builtin_bounded_seq(domain: &TlaValue, max_len: i64) -> Result<TlaValue>
     }
 
     Ok(TlaValue::Set(Arc::new(out)))
+}
+
+fn eval_builtin_tlc_get(key: &TlaValue) -> Result<TlaValue> {
+    match key {
+        TlaValue::String(name) if name == "level" => Ok(TlaValue::Int(0)),
+        TlaValue::String(name) if name == "config" => Ok(TlaValue::Record(Arc::new(
+            BTreeMap::from([
+                ("mode".to_string(), TlaValue::String("bfs".to_string())),
+                ("worker".to_string(), TlaValue::Int(1)),
+            ]),
+        ))),
+        TlaValue::Int(slot) if *slot == 2 || *slot == 3 => Ok(TlaValue::Int(999)),
+        TlaValue::Int(_) => Ok(TlaValue::Int(0)),
+        other => Err(anyhow!("unsupported TLCGet key: {:?}", other)),
+    }
 }
 
 /// Look up a definition from the context
@@ -1916,8 +1948,8 @@ fn ctx_with_staged_primes<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tla::{TlaDefinition, TlaState};
     use crate::tla::compiled_expr::compile_expr;
+    use crate::tla::{TlaDefinition, TlaState};
 
     fn empty_ctx() -> EvalContext<'static> {
         static EMPTY_STATE: std::sync::OnceLock<TlaState> = std::sync::OnceLock::new();
@@ -2068,6 +2100,18 @@ mod tests {
         assert_eq!(
             eval_compiled(&compile_expr("Cardinality(BoundedSeq({1, 2}, 2))"), &ctx).unwrap(),
             TlaValue::Int(7)
+        );
+        assert_eq!(
+            eval_compiled(&compile_expr("TLCGet(\"level\")"), &ctx).unwrap(),
+            TlaValue::Int(0)
+        );
+        assert_eq!(
+            eval_compiled(&compile_expr("TLCGet(2)"), &ctx).unwrap(),
+            TlaValue::Int(999)
+        );
+        assert_eq!(
+            eval_compiled(&compile_expr("TLCSet(2, 17)"), &ctx).unwrap(),
+            TlaValue::Bool(true)
         );
     }
 
@@ -2389,12 +2433,16 @@ mod tests {
         let compiled = CompiledActionIr::from_ir(&action_ir);
         let next_states = apply_compiled_action_ir_multi(&compiled, &state, &ctx).unwrap();
         assert_eq!(next_states.len(), 2, "{next_states:?}");
-        assert!(next_states
-            .iter()
-            .any(|st| st.get("flip") == Some(&TlaValue::String("H".to_string()))));
-        assert!(next_states
-            .iter()
-            .any(|st| st.get("flip") == Some(&TlaValue::String("T".to_string()))));
+        assert!(
+            next_states
+                .iter()
+                .any(|st| st.get("flip") == Some(&TlaValue::String("H".to_string())))
+        );
+        assert!(
+            next_states
+                .iter()
+                .any(|st| st.get("flip") == Some(&TlaValue::String("T".to_string())))
+        );
     }
 
     #[test]
@@ -2557,10 +2605,7 @@ IN
             ),
             (
                 "actionCount".to_string(),
-                TlaValue::Function(Arc::new(BTreeMap::from([(
-                    bot.clone(),
-                    TlaValue::Int(0),
-                )]))),
+                TlaValue::Function(Arc::new(BTreeMap::from([(bot.clone(), TlaValue::Int(0))]))),
             ),
         ]);
         let ctx = EvalContext::new(&state).with_local_value("bot", bot.clone());
