@@ -12,8 +12,9 @@ use tlaplusplus::tla::{
     ActionClause, ClauseKind, ConfigValue, EvalContext, TlaConfig, TlaDefinition, TlaModule,
     TlaState, TlaValue, classify_clause, compile_action_ir, compile_action_ir_branches,
     eval_action_body_multi, eval_expr, eval_let_action_multi, looks_like_action,
-    normalize_operator_ref_name, normalize_param_name, parse_tla_config, parse_tla_module_file,
-    scan_module_closure, split_action_body_disjuncts, split_top_level,
+    normalize_operator_ref_name, normalize_param_name, parse_stuttering_action_expr,
+    parse_tla_config, parse_tla_module_file, scan_module_closure, split_action_body_disjuncts,
+    split_top_level,
 };
 use tlaplusplus::{EngineConfig, run_model};
 
@@ -3998,6 +3999,9 @@ fn probe_action_clause_expr(
                         }),
                 );
             }
+            if let Some((action, vars)) = parse_stuttering_action_expr(&expr) {
+                return Some(probe_stuttering_action_expr(&action, &vars, ctx));
+            }
             if let Some(expanded) = probe_disjunctive_action_body(&expr, ctx) {
                 return Some(expanded);
             }
@@ -4064,6 +4068,37 @@ fn probe_action_clause_expr(
             }))
         }
     }
+}
+
+fn probe_stuttering_action_expr(
+    action: &str,
+    vars: &[String],
+    ctx: &mut EvalContext<'_>,
+) -> anyhow::Result<()> {
+    let mut branch_ctx = ctx.clone();
+    let attempt = match probe_action_body_via_runtime_eval(action, &mut branch_ctx) {
+        Some(Ok(())) => Ok(()),
+        Some(Err(_)) | None => probe_action_body_into_ctx(action, &mut branch_ctx),
+    };
+    if attempt.is_ok() {
+        merge_staged_prime_locals(&branch_ctx, ctx);
+        return Ok(());
+    }
+
+    let stuttered = vars
+        .iter()
+        .filter_map(|var| {
+            ctx.state
+                .get(var)
+                .cloned()
+                .map(|value| (format!("{var}'"), value))
+        })
+        .collect::<Vec<_>>();
+    let locals_mut = std::rc::Rc::make_mut(&mut ctx.locals);
+    for (name, value) in stuttered {
+        locals_mut.insert(name, value);
+    }
+    Ok(())
 }
 
 /// Picks a representative value from a set for probing purposes.
@@ -7467,6 +7502,23 @@ INVARIANTS TypeInvariant
         }
 
         assert_eq!(ctx.locals.get("ReplayCount'"), Some(&TlaValue::Int(1)));
+    }
+
+    #[test]
+    fn probe_action_clause_expr_supports_box_stuttering_formulas() {
+        let state = TlaState::from([("x".to_string(), TlaValue::Int(0))]);
+        let defs = BTreeMap::new();
+        let instances = BTreeMap::new();
+        let clauses = vec![ActionClause::Guard {
+            expr: "[x' = x + 1]_x".to_string(),
+        }];
+
+        let mut ctx =
+            build_action_expr_probe_context(&state, &defs, &instances, &[], &clauses, None);
+        let result = probe_action_clause_expr(&clauses[0], &mut ctx)
+            .expect("box action should produce a probe result");
+        result.expect("box action should be probeable");
+        assert_eq!(ctx.locals.get("x'"), Some(&TlaValue::Int(1)));
     }
 
     #[test]

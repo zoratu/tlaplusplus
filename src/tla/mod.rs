@@ -29,7 +29,10 @@ pub use eval::{
     eval_action_body_multi, eval_action_constraint, eval_expr, eval_guard, eval_let_action_multi,
     normalize_param_name,
 };
-pub use formula::{ClauseKind, classify_clause, split_top_level};
+pub use formula::{
+    ClauseKind, classify_clause, expand_stuttering_action_expr, parse_stuttering_action_expr,
+    split_top_level,
+};
 pub use module::{TlaDefinition, TlaModule, parse_tla_module_file, parse_tla_module_text};
 pub use scan::{ModuleScan, ScanAggregate, scan_module_closure};
 pub use temporal::TemporalFormula;

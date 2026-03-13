@@ -334,6 +334,44 @@ fn is_simple_name(text: &str) -> bool {
     saw_identifier_marker
 }
 
+pub fn parse_stuttering_action_expr(expr: &str) -> Option<(String, Vec<String>)> {
+    let trimmed = expr.trim();
+    let (action, tail) = take_top_level_group(trimmed, '[', ']')?;
+    let tail = tail.trim_start();
+    let subscript = tail.strip_prefix('_')?.trim();
+    if subscript.is_empty() {
+        return None;
+    }
+    if !tail[1..].trim().eq(subscript) {
+        return None;
+    }
+
+    let vars = parse_unchanged_list(subscript);
+    if vars.is_empty() || !vars.iter().all(|var| is_simple_name(var)) {
+        return None;
+    }
+
+    let action = action.trim();
+    if action.is_empty() {
+        return None;
+    }
+
+    Some((action.to_string(), vars))
+}
+
+pub fn expand_stuttering_action_expr(expr: &str) -> Option<String> {
+    let (action, vars) = parse_stuttering_action_expr(expr)?;
+    Some(format!("{action} \\/ {}", format_unchanged_clause(&vars)))
+}
+
+pub fn format_unchanged_clause(vars: &[String]) -> String {
+    match vars {
+        [] => "UNCHANGED <<>>".to_string(),
+        [single] => format!("UNCHANGED {single}"),
+        _ => format!("UNCHANGED <<{}>>", vars.join(", ")),
+    }
+}
+
 fn parse_unchanged_list(rest: &str) -> Vec<String> {
     let trimmed = rest.trim();
     if let Some(inner) = trimmed
@@ -353,6 +391,28 @@ fn parse_unchanged_list(rest: &str) -> Vec<String> {
     } else {
         vec![trimmed.to_string()]
     }
+}
+
+fn take_top_level_group<'a>(expr: &'a str, open: char, close: char) -> Option<(&'a str, &'a str)> {
+    let mut chars = expr.char_indices();
+    let (_, first) = chars.next()?;
+    if first != open {
+        return None;
+    }
+
+    let mut depth = 1usize;
+    for (idx, ch) in chars {
+        if ch == open {
+            depth += 1;
+        } else if ch == close {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Some((&expr[1..idx], &expr[idx + ch.len_utf8()..]));
+            }
+        }
+    }
+
+    None
 }
 
 fn matches_at(chars: &[char], idx: usize, needle: &[char]) -> bool {
@@ -442,6 +502,20 @@ mod tests {
                 expr: "x + 1".to_string()
             }
         );
+    }
+
+    #[test]
+    fn expands_box_action_formulas_into_disjunctions() {
+        assert_eq!(
+            expand_stuttering_action_expr("[NowNext]_now"),
+            Some("NowNext \\/ UNCHANGED now".to_string())
+        );
+        assert_eq!(
+            expand_stuttering_action_expr("[HCnxt]_<<hr, now>>"),
+            Some("HCnxt \\/ UNCHANGED <<hr, now>>".to_string())
+        );
+        assert_eq!(expand_stuttering_action_expr("[][Next]_vars"), None);
+        assert_eq!(expand_stuttering_action_expr("[A]_[x + 1]"), None);
     }
 
     #[test]
