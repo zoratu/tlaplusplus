@@ -2008,6 +2008,14 @@ mod tests {
             TlaValue::Int(5)
         );
         assert_eq!(
+            eval_compiled(&compile_expr("<<1, 2>> \\circ <<3>>"), &ctx).unwrap(),
+            TlaValue::Seq(Arc::new(vec![
+                TlaValue::Int(1),
+                TlaValue::Int(2),
+                TlaValue::Int(3),
+            ]))
+        );
+        assert_eq!(
             eval_compiled(&compile_expr("2^5 - 1"), &ctx).unwrap(),
             TlaValue::Int(31)
         );

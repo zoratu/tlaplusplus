@@ -615,6 +615,9 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
     if let Some((left, right)) = split_binary_op(expr, "\\o") {
         return CompiledExpr::Concat(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
     }
+    if let Some((left, right)) = split_binary_op(expr, "\\circ") {
+        return CompiledExpr::Concat(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
+    }
     // Handle cartesian product: \X and \times are synonyms
     // Must be before \ (set minus) since \ would match \X or \times
     if let Some((left, right)) = split_binary_op(expr, "\\X") {

@@ -1346,7 +1346,10 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
         return Ok(out);
     }
 
-    let concat_parts = split_top_level_keyword(expr, "\\o");
+    let mut concat_parts = split_top_level_keyword(expr, "\\o");
+    if concat_parts.len() == 1 {
+        concat_parts = split_top_level_keyword(expr, "\\circ");
+    }
     if concat_parts.len() > 1 {
         let mut out = eval_expr_inner(&concat_parts[0], ctx, depth + 1)?;
         for part in &concat_parts[1..] {
@@ -4200,6 +4203,7 @@ fn starts_with_tla_backslash_operator(expr: &str) -> bool {
         "\\X",
         "\\times",
         "\\o",
+        "\\circ",
         "\\/",
         "\\*",
         "\\leq",
@@ -4766,6 +4770,7 @@ fn is_user_defined_infix_operator(name: &str) -> bool {
             | "\\intersect"
             | "\\cap"
             | "\\o"
+            | "\\circ"
             | "\\X"
             | "\\times"
             | "@@"
@@ -5499,6 +5504,22 @@ mod tests {
         assert_eq!(
             eval_expr("<<1, 2>> \\prec <<2, 1>>", &ctx).expect("infix operator should evaluate"),
             TlaValue::Bool(true)
+        );
+    }
+
+    #[test]
+    fn evaluates_circ_as_sequence_concatenation_alias() {
+        let state = TlaState::new();
+        let ctx = EvalContext::new(&state);
+
+        assert_eq!(
+            eval_expr("<<1, 2>> \\circ <<3, 4>>", &ctx).expect("circ alias should evaluate"),
+            TlaValue::Seq(Arc::new(vec![
+                TlaValue::Int(1),
+                TlaValue::Int(2),
+                TlaValue::Int(3),
+                TlaValue::Int(4),
+            ]))
         );
     }
 
