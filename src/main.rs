@@ -2127,7 +2127,7 @@ fn seed_probe_state_from_membership_body(
                     None => true,
                     Some(current) => match current_constraint_status {
                         Some(true) => should_refine_probe_value(current, &repr),
-                        Some(false) => true,
+                        Some(false) => should_replace_probe_value_after_type_mismatch(current),
                         None => should_refine_indeterminate_probe_value(current, &repr),
                     },
                 };
@@ -2267,6 +2267,17 @@ fn should_refine_indeterminate_probe_value(current: &TlaValue, replacement: &Tla
         TlaValue::Record(fields) => fields.is_empty(),
         TlaValue::Function(values) => values.is_empty(),
         TlaValue::Lambda { .. } => false,
+    }
+}
+
+fn should_replace_probe_value_after_type_mismatch(current: &TlaValue) -> bool {
+    match current {
+        TlaValue::Set(values) => values.is_empty(),
+        TlaValue::Seq(values) => values.is_empty(),
+        TlaValue::Record(fields) => fields.is_empty(),
+        TlaValue::Function(values) => values.is_empty(),
+        TlaValue::Lambda { .. } => false,
+        _ => true,
     }
 }
 
