@@ -2126,7 +2126,9 @@ fn seed_probe_state_from_membership_body(
                 let should_update = match probe_state.get(&var) {
                     None => true,
                     Some(current) => match current_constraint_status {
-                        Some(true) => should_refine_probe_value(current, &repr),
+                        Some(true) => {
+                            should_refine_satisfied_probe_value(current, &repr, &constraint, &ctx)
+                        }
                         Some(false) => should_replace_probe_value_after_type_mismatch(current),
                         None => should_refine_indeterminate_probe_value(current, &repr),
                     },
@@ -2249,6 +2251,97 @@ fn should_refine_probe_value(current: &TlaValue, replacement: &TlaValue) -> bool
         }
         _ => false,
     }
+}
+
+fn should_refine_satisfied_probe_value(
+    current: &TlaValue,
+    replacement: &TlaValue,
+    constraint: &(TypeInvariantConstraintKind, String),
+    ctx: &EvalContext<'_>,
+) -> bool {
+    if current_matches_definition_backed_singleton_member(current, &constraint.1, ctx) {
+        return false;
+    }
+    should_refine_probe_value(current, replacement)
+}
+
+fn current_matches_definition_backed_singleton_member(
+    current: &TlaValue,
+    constraint_expr: &str,
+    ctx: &EvalContext<'_>,
+) -> bool {
+    semantic_constraint_parts(constraint_expr).into_iter().any(|part| {
+        let trimmed = strip_probe_outer_parens(part.trim());
+        let Some(inner) = trimmed.strip_prefix('{').and_then(|rest| rest.strip_suffix('}')) else {
+            return false;
+        };
+        let members = split_top_level(inner, ",");
+        if members.len() != 1 {
+            return false;
+        }
+        let member_expr = members[0].trim();
+        if !is_definition_backed_probe_expr(member_expr, ctx) {
+            return false;
+        }
+        matches!(eval_expr(member_expr, ctx), Ok(value) if current == &value || function_range_is_uniformly(current, &value))
+    })
+}
+
+fn semantic_constraint_parts(expr: &str) -> Vec<String> {
+    if let Some(range_expr) = function_set_range_expr(expr) {
+        return union_constraint_parts(range_expr);
+    }
+    union_constraint_parts(expr)
+}
+
+fn union_constraint_parts(expr: &str) -> Vec<String> {
+    let trimmed = strip_probe_outer_parens(expr.trim());
+    for delim in ["\\cup", "\\union"] {
+        let parts = split_top_level(trimmed, delim);
+        if parts.len() > 1 {
+            let mut out = Vec::new();
+            for part in parts {
+                out.extend(union_constraint_parts(&part));
+            }
+            return out;
+        }
+    }
+    vec![trimmed.to_string()]
+}
+
+fn function_set_range_expr(expr: &str) -> Option<&str> {
+    let trimmed = strip_probe_outer_parens(expr.trim());
+    let inner = trimmed.strip_prefix('[')?.strip_suffix(']')?;
+    let arrow_idx = find_probe_top_level_keyword(inner, "->")?;
+    Some(inner[arrow_idx + 2..].trim())
+}
+
+fn function_range_is_uniformly(current: &TlaValue, expected: &TlaValue) -> bool {
+    match current {
+        TlaValue::Function(entries) => entries.values().all(|value| value == expected),
+        _ => false,
+    }
+}
+
+fn is_definition_backed_probe_expr(expr: &str, ctx: &EvalContext<'_>) -> bool {
+    let definitions = ctx.definitions.unwrap_or(ctx.local_definitions.as_ref());
+    if resolve_zero_arg_state_definition(expr, definitions, ctx.instances.unwrap_or(&BTreeMap::new()))
+        .is_some()
+    {
+        return true;
+    }
+
+    let trimmed = expr.trim();
+    let Some((alias, name)) = parse_zero_arg_state_operator_ref(trimmed) else {
+        return false;
+    };
+    if alias.is_some() {
+        return false;
+    }
+    ctx.local_definitions.contains_key(&name)
+        || ctx
+            .definitions
+            .is_some_and(|defs| defs.contains_key(name.as_str()))
 }
 
 fn should_refine_indeterminate_probe_value(current: &TlaValue, replacement: &TlaValue) -> bool {
@@ -5174,6 +5267,225 @@ INVARIANTS TypeInvariant
         .expect("LET action clause should be probeable");
         result.expect("LET action probe should not error");
         assert!(ctx.locals.contains_key("hashFunction'"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn analyze_tla_path_handles_mcnano_style_calculate_hash_probe() {
+        use std::fs;
+
+        let tmp = std::env::temp_dir().join("tlapp-mcnano-style-calculate-hash");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should exist");
+
+        let nano = tmp.join("Nano.tla");
+        fs::write(
+            &nano,
+            r#"
+---- MODULE Nano ----
+CONSTANTS Hash, CalculateHash(_,_,_)
+VARIABLES lastHash, distributedLedger, received
+
+Block == [type : {"receive"}, previous : Hash, source : Hash]
+SignedBlock == [block : Block]
+NoBlock == CHOOSE b : b \notin SignedBlock
+NoHash == CHOOSE h : h \notin Hash
+Ledger == [Hash -> SignedBlock \cup {NoBlock}]
+
+TypeInvariant ==
+  /\ lastHash \in Hash \cup {NoHash}
+  /\ distributedLedger \in Ledger
+  /\ received \in SUBSET SignedBlock
+
+Init ==
+  /\ lastHash = NoHash
+  /\ distributedLedger = [h \in Hash |-> NoBlock]
+  /\ received = {}
+
+Next ==
+  LET block == "used" IN
+  /\ CalculateHash(block, lastHash, lastHash')
+  /\ UNCHANGED <<distributedLedger, received>>
+====
+"#,
+        )
+        .expect("nano module should be written");
+
+        let mc = tmp.join("MCNanoStyle.tla");
+        fs::write(
+            &mc,
+            r#"
+---- MODULE MCNanoStyle ----
+N == INSTANCE Nano
+
+CONSTANTS CalculateHash(_,_,_), Hash, NoBlockVal
+VARIABLES hashFunction, lastHash, distributedLedger, received
+
+Vars == <<hashFunction, lastHash, distributedLedger, received>>
+
+UndefinedHashesExist ==
+  \E hash \in Hash : hashFunction[hash] = N!NoBlock
+
+HashOf(block) ==
+  IF \E hash \in Hash : hashFunction[hash] = block
+  THEN CHOOSE hash \in Hash : hashFunction[hash] = block
+  ELSE CHOOSE hash \in Hash : hashFunction[hash] = N!NoBlock
+
+CalculateHashImpl(block, oldLastHash, newLastHash) ==
+  LET hash == HashOf(block) IN
+  /\ newLastHash = hash
+  /\ hashFunction' = [hashFunction EXCEPT ![hash] = block]
+
+TypeInvariant ==
+  /\ hashFunction \in [Hash -> N!Block \cup {N!NoBlock}]
+  /\ N!TypeInvariant
+
+Init ==
+  /\ hashFunction = [hash \in Hash |-> N!NoBlock]
+  /\ N!Init
+
+StutterWhenHashesDepleted ==
+  /\ UNCHANGED hashFunction
+  /\ UNCHANGED lastHash
+  /\ UNCHANGED distributedLedger
+  /\ UNCHANGED received
+
+Next ==
+  IF UndefinedHashesExist
+  THEN N!Next
+  ELSE StutterWhenHashesDepleted
+
+Spec == Init /\ [][Next]_Vars
+====
+"#,
+        )
+        .expect("mc module should be written");
+
+        let cfg = tmp.join("MCNanoStyle.cfg");
+        fs::write(
+            &cfg,
+            r#"
+CONSTANTS
+  CalculateHash <- CalculateHashImpl
+  Hash = {h1, h2, h3}
+  NoBlockVal = NoBlockVal
+
+CONSTANTS
+  NoBlock = [Nano]NoBlockVal
+
+SPECIFICATION Spec
+INVARIANTS TypeInvariant
+"#,
+        )
+        .expect("cfg should be written");
+
+        let raw_cfg = fs::read_to_string(&cfg).expect("cfg should be readable");
+        let parsed_cfg = parse_tla_config(&raw_cfg).expect("cfg should parse");
+
+        let mut parsed_module = parse_tla_module_file(&mc).expect("module should parse");
+        inject_constants_into_definitions(&mut parsed_module, &parsed_cfg);
+        let model = TlaModel::from_files(&mc, Some(&cfg), None, None).expect("model should build");
+        parsed_module = model.module.clone();
+
+        let mut probe_state = model
+            .initial_states_vec
+            .first()
+            .cloned()
+            .expect("initial state should exist");
+        for (name, value) in &parsed_cfg.constants {
+            if let Some(tv) = config_value_to_tla(value) {
+                probe_state.insert(name.clone(), tv);
+            }
+        }
+        for _ in 0..4 {
+            let mut progress = false;
+            for (name, value) in &parsed_cfg.constants {
+                let ConfigValue::OperatorRef(target_name) = value else {
+                    continue;
+                };
+                if probe_state.contains_key(name) {
+                    continue;
+                }
+                let ctx = build_probe_eval_context(
+                    &probe_state,
+                    &parsed_module.definitions,
+                    &parsed_module.instances,
+                );
+                let target_name = normalize_operator_ref_name(target_name);
+                if let Ok(resolved) = eval_expr(target_name, &ctx) {
+                    probe_state.insert(name.clone(), resolved);
+                    progress = true;
+                }
+            }
+            if !progress {
+                break;
+            }
+        }
+
+        seed_probe_state_from_type_invariants(&mut probe_state, &parsed_module, Some(&parsed_cfg));
+
+        let expected_sentinel = TlaValue::ModelValue("NoBlockVal".to_string());
+        let hash_function = probe_state
+            .get("hashFunction")
+            .expect("hashFunction should be present");
+        let TlaValue::Function(entries) = hash_function else {
+            panic!("hashFunction should remain a function, got {hash_function:?}");
+        };
+        for key in [
+            TlaValue::ModelValue("h1".to_string()),
+            TlaValue::ModelValue("h2".to_string()),
+            TlaValue::ModelValue("h3".to_string()),
+        ] {
+            assert_eq!(
+                entries.get(&key),
+                Some(&expected_sentinel),
+                "seeded probe state should preserve free-hash sentinels"
+            );
+        }
+
+        let next_def = parsed_module
+            .definitions
+            .get(&model.next_name)
+            .expect("Next definition should exist");
+        let samples = infer_action_param_samples_from_next(
+            &next_def.body,
+            &probe_state,
+            &parsed_module.definitions,
+            &parsed_module.instances,
+        );
+        let def = parsed_module
+            .definitions
+            .get("CalculateHashImpl")
+            .expect("CalculateHashImpl should exist");
+        let ir = compile_action_ir_branches(def);
+        let mut ctx = build_action_expr_probe_context(
+            &probe_state,
+            &parsed_module.definitions,
+            &parsed_module.instances,
+            &ir[0].params,
+            &ir[0].clauses,
+            samples.get("CalculateHashImpl"),
+        );
+
+        assert_eq!(
+            eval_expr("N!NoBlock", &ctx).expect("instance override should resolve"),
+            expected_sentinel
+        );
+        let chosen = eval_expr("HashOf(block)", &ctx).expect("HashOf should choose a free hash");
+        assert!(
+            matches!(chosen, TlaValue::ModelValue(ref name) if name == "h1" || name == "h2" || name == "h3"),
+            "unexpected chosen hash {chosen:?}"
+        );
+
+        let result = probe_action_clause_expr(
+            ir[0].clauses
+                .first()
+                .expect("CalculateHashImpl should have one clause"),
+            &mut ctx,
+        )
+        .expect("LET action clause should be probeable");
+        result.expect("MCNano-style CalculateHashImpl probe should succeed");
 
         let _ = fs::remove_dir_all(&tmp);
     }
