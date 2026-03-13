@@ -114,6 +114,13 @@ pub fn split_action_body_disjuncts(expr: &str) -> Vec<String> {
         return Vec::new();
     }
 
+    if split_outer_let(trimmed).is_some() {
+        if let Some(disjuncts) = split_outer_let_body_disjuncts(trimmed) {
+            return disjuncts;
+        }
+        return vec![trimmed.to_string()];
+    }
+
     if parse_action_if(trimmed).is_some() {
         return vec![trimmed.to_string()];
     }
@@ -135,6 +142,125 @@ pub fn split_action_body_disjuncts(expr: &str) -> Vec<String> {
             if part.is_empty() { None } else { Some(part) }
         })
         .collect()
+}
+
+fn split_outer_let_body_disjuncts(expr: &str) -> Option<Vec<String>> {
+    let (defs, body) = split_outer_let(expr)?;
+    let body_clauses = split_action_body_clauses(body);
+    let clauses = if body_clauses.is_empty() {
+        vec![body.trim().to_string()]
+    } else {
+        body_clauses
+    };
+
+    let mut clause_options = Vec::with_capacity(clauses.len());
+    let mut has_branching = false;
+    for clause in &clauses {
+        let options = split_nested_action_disjuncts(clause);
+        has_branching |= options.len() > 1;
+        clause_options.push(options);
+    }
+    if !has_branching {
+        return None;
+    }
+
+    let mut branch_bodies = vec![Vec::<String>::new()];
+    for options in clause_options {
+        let mut next = Vec::new();
+        for existing in &branch_bodies {
+            for option in &options {
+                let mut branch = existing.clone();
+                branch.push(option.clone());
+                next.push(branch);
+            }
+        }
+        branch_bodies = next;
+    }
+
+    Some(
+        branch_bodies
+            .into_iter()
+            .map(|clauses| {
+                let body = format_action_clause_sequence(&clauses);
+                format!("LET {defs} IN\n{body}")
+            })
+            .collect(),
+    )
+}
+
+fn split_nested_action_disjuncts(expr: &str) -> Vec<String> {
+    let trimmed = expr.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    if let Some(rest) = trimmed.strip_prefix("/\\").map(str::trim_start)
+        && rest.starts_with("\\/")
+    {
+        return split_action_body_disjuncts(rest);
+    }
+    let disjuncts = split_action_body_disjuncts(trimmed);
+    if disjuncts.len() > 1 || trimmed.starts_with("\\/") {
+        disjuncts
+    } else {
+        vec![trimmed.to_string()]
+    }
+}
+
+fn format_action_clause_sequence(clauses: &[String]) -> String {
+    match clauses {
+        [] => String::new(),
+        [single] => single.trim().to_string(),
+        _ => clauses
+            .iter()
+            .filter(|clause| !clause.trim().is_empty())
+            .map(|clause| format_branch_clause(clause))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+fn split_outer_let(expr: &str) -> Option<(&str, &str)> {
+    let trimmed = expr.trim();
+    let rest = trimmed.strip_prefix("LET")?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let rest = rest.trim_start();
+
+    let mut depth = 1usize;
+    let mut i = 0usize;
+    while let Some((word, start, end)) = next_word(rest, i) {
+        match word {
+            "LET" => depth += 1,
+            "IN" => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    let defs = rest[..start].trim();
+                    let body = rest[end..].trim();
+                    if !defs.is_empty() && !body.is_empty() {
+                        return Some((defs, body));
+                    }
+                    return None;
+                }
+            }
+            _ => {}
+        }
+        i = end;
+    }
+
+    None
+}
+
+fn next_word(text: &str, start: usize) -> Option<(&str, usize, usize)> {
+    let mut word_start = None;
+    for (idx, ch) in text.char_indices().skip_while(|(idx, _)| *idx < start) {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            word_start.get_or_insert(idx);
+        } else if let Some(begin) = word_start {
+            return Some((&text[begin..idx], begin, idx));
+        }
+    }
+    word_start.map(|begin| (&text[begin..], begin, text.len()))
 }
 
 fn split_indented_action_conjuncts(expr: &str) -> Option<Vec<String>> {
@@ -1002,6 +1128,59 @@ mod tests {
             disjuncts[1],
             "\\E a \\in Acceptor, b \\in Ballot :\n\\E v \\in Value : VoteFor(a, b, v)"
         );
+    }
+
+    #[test]
+    fn split_action_body_disjuncts_repeats_outer_let_bindings_for_guard_branches() {
+        let disjuncts = split_action_body_disjuncts(
+            r#"
+                LET eState == ElevatorState[e] IN
+                /\ ~eState.doorsOpen
+                /\  \/ \E call \in ActiveElevatorCalls : CanServiceCall[e, call]
+                    \/ eState.floor \in eState.buttonsPressed
+                /\ ElevatorState' = [ElevatorState EXCEPT ![e] = [@ EXCEPT !.doorsOpen = TRUE]]
+                /\ UNCHANGED <<PersonState>>
+            "#,
+        );
+
+        assert_eq!(disjuncts.len(), 2, "{disjuncts:#?}");
+        for disjunct in &disjuncts {
+            assert!(disjunct.starts_with("LET eState == ElevatorState[e] IN"));
+            assert!(disjunct.contains("~eState.doorsOpen"));
+            assert!(disjunct.contains("ElevatorState' = [ElevatorState EXCEPT ![e]"));
+        }
+        assert!(
+            disjuncts
+                .iter()
+                .any(|disjunct| disjunct.contains(r#"\E call \in ActiveElevatorCalls"#))
+        );
+        assert!(
+            disjuncts
+                .iter()
+                .any(|disjunct| disjunct.contains(r#"eState.floor \in eState.buttonsPressed"#))
+        );
+    }
+
+    #[test]
+    fn split_action_body_disjuncts_does_not_split_disjunctions_inside_let_definitions() {
+        let disjuncts = split_action_body_disjuncts(
+            r#"
+                LET
+                  stationary == {e \in Elevator : ElevatorState[e].direction = "Stationary"}
+                  approaching == {e \in Elevator :
+                    /\ ElevatorState[e].direction = c.direction
+                    /\  \/ ElevatorState[e].floor = c.floor
+                        \/ GetDirection[ElevatorState[e].floor, c.floor] = c.direction }
+                IN
+                /\ c \in ActiveElevatorCalls
+                /\ stationary \cup approaching /= {}
+                /\ UNCHANGED <<PersonState>>
+            "#,
+        );
+
+        assert_eq!(disjuncts.len(), 1, "{disjuncts:#?}");
+        assert!(disjuncts[0].contains(r#"approaching == {e \in Elevator :"#));
+        assert!(disjuncts[0].contains(r#"GetDirection[ElevatorState[e].floor, c.floor]"#));
     }
 
     #[test]
