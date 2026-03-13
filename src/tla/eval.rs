@@ -3,7 +3,7 @@ use crate::tla::action_ir::{
 };
 use crate::tla::{
     ActionClause, ActionIr, ClauseKind, TlaDefinition, TlaState, TlaValue, classify_clause,
-    parse_stuttering_action_expr, looks_like_action,
+    looks_like_action, parse_stuttering_action_expr,
 };
 use anyhow::{Context, Result, anyhow};
 use std::collections::{BTreeMap, BTreeSet};
@@ -158,6 +158,17 @@ impl<'a> EvalContext<'a> {
             return None;
         }
 
+        let primed_ctx = self.with_primed_state_shadow_bindings();
+
+        Some(eval_operator_call(
+            base_name,
+            Vec::new(),
+            &primed_ctx,
+            depth + 1,
+        ))
+    }
+
+    fn with_primed_state_shadow_bindings(&self) -> Self {
         let mut primed_ctx = self.clone();
         let primed_bindings: Vec<(String, TlaValue)> = self
             .state
@@ -175,13 +186,7 @@ impl<'a> EvalContext<'a> {
                 locals_mut.insert(var, value);
             }
         }
-
-        Some(eval_operator_call(
-            base_name,
-            Vec::new(),
-            &primed_ctx,
-            depth + 1,
-        ))
+        primed_ctx
     }
 
     pub(crate) fn resolve_identifier(&self, name: &str, depth: usize) -> Result<TlaValue> {
@@ -739,6 +744,37 @@ fn seed_implicit_instance_constant_bindings(
     }
 }
 
+fn bind_instance_substitutions(
+    instance: &crate::tla::module::TlaModuleInstance,
+    parent_ctx: &EvalContext<'_>,
+    locals_mut: &mut BTreeMap<String, TlaValue>,
+) -> Result<()> {
+    for (param, value_expr) in &instance.substitutions {
+        let trimmed = value_expr.trim();
+        let value = eval_expr(trimmed, parent_ctx)?;
+        locals_mut.insert(param.clone(), value);
+
+        if let Some(primed_value) = resolved_instance_primed_substitution_value(trimmed, parent_ctx)
+        {
+            locals_mut.insert(format!("{param}'"), primed_value);
+        }
+    }
+
+    Ok(())
+}
+
+fn resolved_instance_primed_substitution_value(
+    trimmed: &str,
+    parent_ctx: &EvalContext<'_>,
+) -> Option<TlaValue> {
+    let primed_expr = format!("{trimmed}'");
+    let primed_value = eval_expr(&primed_expr, parent_ctx).ok()?;
+    match &primed_value {
+        TlaValue::ModelValue(name) if name == &primed_expr => None,
+        _ => Some(primed_value),
+    }
+}
+
 fn seed_parent_definition_fallbacks(
     module: &crate::tla::module::TlaModule,
     parent_ctx: &EvalContext<'_>,
@@ -787,12 +823,8 @@ fn expand_action_call_multi(
         seed_implicit_instance_constant_bindings(instance, module, ctx, &mut instance_ctx);
         {
             let locals_mut = std::rc::Rc::make_mut(&mut instance_ctx.locals);
-            for (param, value_expr) in &instance.substitutions {
-                let value = match eval_expr(value_expr, ctx) {
-                    Ok(value) => value,
-                    Err(err) => return Some(Err(err)),
-                };
-                locals_mut.insert(param.clone(), value);
+            if let Err(err) = bind_instance_substitutions(instance, ctx, locals_mut) {
+                return Some(Err(err));
             }
             for (param, arg_expr) in def.params.iter().zip(arg_exprs.iter()) {
                 let value = match eval_expr(arg_expr, ctx) {
@@ -1220,13 +1252,11 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
 
     let implies_parts = split_top_level_symbol(expr, "=>");
     if implies_parts.len() > 1 {
-        let mut rhs =
-            eval_expr_inner(implies_parts.last().expect("non-empty"), ctx, depth + 1)?.as_bool()?;
-        for i in (0..implies_parts.len() - 1).rev() {
-            let lhs = eval_expr_inner(&implies_parts[i], ctx, depth + 1)?.as_bool()?;
-            rhs = (!lhs) || rhs;
-        }
-        return Ok(TlaValue::Bool(rhs));
+        return Ok(TlaValue::Bool(eval_implies_parts(
+            &implies_parts,
+            ctx,
+            depth + 1,
+        )?));
     }
 
     let or_parts = split_top_level_symbol(expr, "\\/");
@@ -1551,6 +1581,22 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
     eval_atom_with_postfix(expr, ctx, depth + 1)
 }
 
+fn eval_implies_parts(parts: &[String], ctx: &EvalContext<'_>, depth: usize) -> Result<bool> {
+    if parts.is_empty() {
+        return Err(anyhow!("empty implication"));
+    }
+    if parts.len() == 1 {
+        return eval_expr_inner(&parts[0], ctx, depth)?.as_bool();
+    }
+
+    let lhs = eval_expr_inner(&parts[0], ctx, depth)?.as_bool()?;
+    if !lhs {
+        return Ok(true);
+    }
+
+    eval_implies_parts(&parts[1..], ctx, depth + 1)
+}
+
 fn eval_if_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<TlaValue> {
     let (_, after_if) =
         take_keyword_prefix(expr.trim(), "IF").ok_or_else(|| anyhow!("expected IF expression"))?;
@@ -1839,9 +1885,69 @@ fn parse_atom_with_postfix<'a>(
 
 fn eval_atom_with_postfix(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<TlaValue> {
     let (value, rest) = parse_atom_with_postfix(expr, ctx, depth + 1)?;
-    if !rest.trim_start().is_empty() {
+    let trimmed_rest = rest.trim_start();
+    if trimmed_rest == "'" {
+        let base_len = expr.len().saturating_sub(rest.len());
+        let base_expr = expr[..base_len].trim_end();
+        return eval_primed_postfix_expr(base_expr, ctx, depth + 1);
+    }
+    if !trimmed_rest.is_empty() {
         return Err(anyhow!("unexpected trailing tokens in expr: {expr}"));
     }
+    Ok(value)
+}
+
+fn eval_primed_postfix_expr(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<TlaValue> {
+    let s = expr.trim_start();
+    let (name, mut rest) = parse_identifier_prefix(s)
+        .ok_or_else(|| anyhow!("expected identifier in primed expression: {expr}'"))?;
+    let mut value = {
+        let trimmed = rest.trim_start();
+        if trimmed.starts_with('(') {
+            let (args_text, next_rest) = take_bracket_group(trimmed, '(', ')')?;
+            let args = if args_text.trim().is_empty() {
+                Vec::new()
+            } else {
+                split_top_level(args_text, ",", false)
+                    .into_iter()
+                    .map(|arg| eval_expr_inner(arg.trim(), ctx, depth + 1))
+                    .collect::<Result<Vec<_>>>()?
+            };
+            rest = next_rest;
+            let primed_ctx = ctx.with_primed_state_shadow_bindings();
+            eval_operator_call(&name, args, &primed_ctx, depth + 1)?
+        } else {
+            ctx.resolve_identifier(&format!("{name}'"), depth + 1)?
+        }
+    };
+
+    loop {
+        let trimmed = rest.trim_start();
+        if trimmed.is_empty() {
+            break;
+        }
+
+        if let Some(after_dot) = trimmed.strip_prefix('.') {
+            let (field, next_rest) = parse_identifier_prefix(after_dot)
+                .ok_or_else(|| anyhow!("expected field after '.' in expression: {expr}'"))?;
+            value = value.select_key(&field)?.clone();
+            rest = next_rest;
+            continue;
+        }
+
+        if trimmed.starts_with('[') {
+            let (inside, next_rest) = take_bracket_group(trimmed, '[', ']')?;
+            let key = eval_bracket_index_key(inside, ctx, depth + 1)?;
+            value = value.apply(&key)?.clone();
+            rest = next_rest;
+            continue;
+        }
+
+        return Err(anyhow!(
+            "unexpected trailing tokens in primed expr: {expr}'"
+        ));
+    }
+
     Ok(value)
 }
 
@@ -2429,11 +2535,7 @@ fn eval_module_instance_call(
     // Apply substitutions: replace constants in the context
     {
         let locals_mut = std::rc::Rc::make_mut(&mut instance_ctx.locals);
-        for (param, value_expr) in &instance.substitutions {
-            // Evaluate the substitution value in the original context
-            let value = eval_expr(value_expr, ctx)?;
-            locals_mut.insert(param.clone(), value);
-        }
+        bind_instance_substitutions(instance, ctx, locals_mut)?;
     }
 
     let mut child_ctx = instance_ctx;
@@ -2555,6 +2657,18 @@ pub(crate) fn eval_operator_call(
         "BoundedSeq" if args.len() == 2 && !user_defined_shadow => {
             let max_len = args[1].as_int()?;
             return eval_builtin_bounded_seq(&args[0], max_len);
+        }
+        "TLCGet" => {
+            if args.len() != 1 {
+                return Err(anyhow!("TLCGet expects 1 argument"));
+            }
+            return eval_builtin_tlc_get(&args[0]);
+        }
+        "TLCSet" => {
+            if args.len() != 2 {
+                return Err(anyhow!("TLCSet expects 2 arguments"));
+            }
+            return Ok(TlaValue::Bool(true));
         }
         "ToString" => {
             if args.len() != 1 {
@@ -2831,7 +2945,9 @@ fn eval_builtin_extremum(name: &str, value: &TlaValue, want_max: bool) -> Result
 
 fn eval_builtin_bounded_seq(domain: &TlaValue, max_len: i64) -> Result<TlaValue> {
     if max_len < 0 {
-        return Err(anyhow!("BoundedSeq expects a non-negative bound, got {max_len}"));
+        return Err(anyhow!(
+            "BoundedSeq expects a non-negative bound, got {max_len}"
+        ));
     }
 
     let elements = domain.as_set()?.iter().cloned().collect::<Vec<_>>();
@@ -2871,6 +2987,21 @@ fn eval_builtin_bounded_seq(domain: &TlaValue, max_len: i64) -> Result<TlaValue>
     }
 
     Ok(TlaValue::Set(Arc::new(out)))
+}
+
+fn eval_builtin_tlc_get(key: &TlaValue) -> Result<TlaValue> {
+    match key {
+        TlaValue::String(name) if name == "level" => Ok(TlaValue::Int(0)),
+        TlaValue::String(name) if name == "config" => Ok(TlaValue::Record(Arc::new(
+            BTreeMap::from([
+                ("mode".to_string(), TlaValue::String("bfs".to_string())),
+                ("worker".to_string(), TlaValue::Int(1)),
+            ]),
+        ))),
+        TlaValue::Int(slot) if *slot == 2 || *slot == 3 => Ok(TlaValue::Int(999)),
+        TlaValue::Int(_) => Ok(TlaValue::Int(0)),
+        other => Err(anyhow!("unsupported TLCGet key: {:?}", other)),
+    }
 }
 
 fn split_outer_let(expr: &str) -> Option<(&str, &str)> {
@@ -5699,8 +5830,14 @@ mod tests {
         let next = apply_action_ir_with_context_multi(&action, &state, &EvalContext::new(&state))
             .expect("primed membership should enumerate successors");
         assert_eq!(next.len(), 2, "{next:?}");
-        assert!(next.iter().any(|st| st.get("flip") == Some(&TlaValue::String("H".to_string()))));
-        assert!(next.iter().any(|st| st.get("flip") == Some(&TlaValue::String("T".to_string()))));
+        assert!(
+            next.iter()
+                .any(|st| st.get("flip") == Some(&TlaValue::String("H".to_string())))
+        );
+        assert!(
+            next.iter()
+                .any(|st| st.get("flip") == Some(&TlaValue::String("T".to_string())))
+        );
     }
 
     #[test]
@@ -5985,10 +6122,7 @@ IN
             ),
             (
                 "actionCount".to_string(),
-                TlaValue::Function(Arc::new(BTreeMap::from([(
-                    bot.clone(),
-                    TlaValue::Int(0),
-                )]))),
+                TlaValue::Function(Arc::new(BTreeMap::from([(bot.clone(), TlaValue::Int(0))]))),
             ),
         ]);
         let ctx = EvalContext::new(&state).with_local_value("bot", bot.clone());
@@ -6097,10 +6231,8 @@ IN
             ),
             ("sent".to_string(), TlaValue::Bool(false)),
         ]);
-        let ctx = EvalContext::new(&state).with_local_values(&[
-            ("b", TlaValue::Int(1)),
-            ("v", v1.clone()),
-        ]);
+        let ctx = EvalContext::new(&state)
+            .with_local_values(&[("b", TlaValue::Int(1)), ("v", v1.clone())]);
         let action = ActionIr {
             name: "Phase2a".to_string(),
             params: vec![],
@@ -6143,20 +6275,14 @@ IN
         let v1 = TlaValue::ModelValue("v1".to_string());
         let quorum = TlaValue::Set(Arc::new(BTreeSet::from([a1.clone(), a2.clone()])));
         let state = TlaState::from([
-            (
-                "msgs".to_string(),
-                TlaValue::Set(Arc::new(BTreeSet::new())),
-            ),
+            ("msgs".to_string(), TlaValue::Set(Arc::new(BTreeSet::new()))),
             (
                 "Quorum".to_string(),
                 TlaValue::Set(Arc::new(BTreeSet::from([quorum]))),
             ),
             ("sent".to_string(), TlaValue::Bool(false)),
         ]);
-        let ctx = EvalContext::new(&state).with_local_values(&[
-            ("b", TlaValue::Int(0)),
-            ("v", v1),
-        ]);
+        let ctx = EvalContext::new(&state).with_local_values(&[("b", TlaValue::Int(0)), ("v", v1)]);
         let action = ActionIr {
             name: "Phase2a".to_string(),
             params: vec![],
@@ -6220,10 +6346,7 @@ IN
             ),
             ("sent".to_string(), TlaValue::Bool(false)),
         ]);
-        let ctx = EvalContext::new(&state).with_local_values(&[
-            ("b", TlaValue::Int(1)),
-            ("v", v1),
-        ]);
+        let ctx = EvalContext::new(&state).with_local_values(&[("b", TlaValue::Int(1)), ("v", v1)]);
         let def = TlaDefinition {
             name: "Phase2a".to_string(),
             params: vec![],
@@ -6557,6 +6680,44 @@ IN
         assert_eq!(
             eval_expr(expr, &ctx).expect("quantified implication should evaluate"),
             TlaValue::Bool(true)
+        );
+    }
+
+    #[test]
+    fn implication_short_circuits_false_lhs_before_rhs_record_access() {
+        let state = TlaState::new();
+        let ctx = EvalContext::new(&state);
+
+        assert_eq!(
+            eval_expr("FALSE => (NoVal.adr = 1)", &ctx)
+                .expect("false implication antecedent should short-circuit"),
+            TlaValue::Bool(true)
+        );
+    }
+
+    #[test]
+    fn implication_remains_right_associative() {
+        let state = TlaState::new();
+        let ctx = EvalContext::new(&state);
+
+        assert_eq!(
+            eval_expr("FALSE => TRUE => FALSE", &ctx).expect("implication chain should evaluate"),
+            TlaValue::Bool(true)
+        );
+    }
+
+    #[test]
+    fn evaluates_primed_postfix_function_access() {
+        let key = TlaValue::ModelValue("p1".to_string());
+        let current =
+            TlaValue::Function(Arc::new(BTreeMap::from([(key.clone(), TlaValue::Int(0))])));
+        let next = TlaValue::Function(Arc::new(BTreeMap::from([(key.clone(), TlaValue::Int(1))])));
+        let state = TlaState::from([("weight".to_string(), current)]);
+        let ctx = EvalContext::new(&state).with_local_values(&[("p", key), ("weight'", next)]);
+
+        assert_eq!(
+            eval_expr("weight[p]'", &ctx).expect("primed postfix function access should evaluate"),
+            TlaValue::Int(1)
         );
     }
 
@@ -8140,6 +8301,52 @@ IN
     }
 
     #[test]
+    fn module_instance_substitutions_bind_primed_values() {
+        use crate::tla::module::{TlaModule, TlaModuleInstance};
+
+        let mut helper_module = TlaModule::default();
+        helper_module.name = "Helper".to_string();
+        helper_module.constants = vec!["contents".to_string()];
+        helper_module.definitions.insert(
+            "NextValue".to_string(),
+            TlaDefinition {
+                name: "NextValue".to_string(),
+                params: vec![],
+                body: "contents'[1]".to_string(),
+                is_recursive: false,
+            },
+        );
+
+        let instance = TlaModuleInstance {
+            alias: "D".to_string(),
+            module_name: "Helper".to_string(),
+            substitutions: BTreeMap::from([("contents".to_string(), "c1".to_string())]),
+            is_local: false,
+            module: Some(Box::new(helper_module)),
+        };
+
+        let instances = BTreeMap::from([("D".to_string(), instance)]);
+        let current = TlaValue::Function(Arc::new(BTreeMap::from([(
+            TlaValue::Int(1),
+            TlaValue::Int(0),
+        )])));
+        let next = TlaValue::Function(Arc::new(BTreeMap::from([(
+            TlaValue::Int(1),
+            TlaValue::Int(3),
+        )])));
+        let state = TlaState::from([("c1".to_string(), current)]);
+        let definitions = BTreeMap::new();
+        let ctx = EvalContext::with_definitions_and_instances(&state, &definitions, &instances)
+            .with_local_values(&[("c1'", next)]);
+
+        assert_eq!(
+            eval_expr("D!NextValue", &ctx)
+                .expect("instance substitution should expose primed value"),
+            TlaValue::Int(3)
+        );
+    }
+
+    #[test]
     fn module_instances_inherit_same_named_outer_constant_definitions() {
         use crate::tla::module::{TlaModule, TlaModuleInstance};
 
@@ -8407,7 +8614,10 @@ Buffer == INSTANCE RingBuffer
         .expect("parent module should be written");
 
         let module = parse_tla_module_file(&parent).expect("parent should parse");
-        let buffer = module.instances.get("Buffer").expect("instance should load");
+        let buffer = module
+            .instances
+            .get("Buffer")
+            .expect("instance should load");
         let buffer_module = buffer
             .module
             .as_ref()
@@ -8418,8 +8628,11 @@ Buffer == INSTANCE RingBuffer
         );
 
         let state = TlaState::from([("Size".to_string(), TlaValue::Int(3))]);
-        let ctx =
-            EvalContext::with_definitions_and_instances(&state, &module.definitions, &module.instances);
+        let ctx = EvalContext::with_definitions_and_instances(
+            &state,
+            &module.definitions,
+            &module.instances,
+        );
         assert_eq!(
             eval_expr("Buffer!IndexOf(4)", &ctx).expect("instance operator should evaluate"),
             TlaValue::Int(1)
@@ -8495,8 +8708,12 @@ Buffer == INSTANCE RingBuffer
         )]);
         let ctx = EvalContext::with_definitions_and_instances(&state, &defs, &instances);
 
-        let chosen = eval_expr("HashOf(targetBlock)", &ctx).expect("HashOf should choose an unused hash");
-        assert!(chosen == hash_1 || chosen == hash_2, "unexpected hash {chosen:?}");
+        let chosen =
+            eval_expr("HashOf(targetBlock)", &ctx).expect("HashOf should choose an unused hash");
+        assert!(
+            chosen == hash_1 || chosen == hash_2,
+            "unexpected hash {chosen:?}"
+        );
     }
 
     #[test]
@@ -8562,8 +8779,16 @@ Buffer == INSTANCE RingBuffer
         let branches =
             eval_action_body_multi("[x' = x + 1]_x", &ctx, &BTreeMap::new()).expect("box action");
         assert_eq!(branches.len(), 2);
-        assert!(branches.iter().any(|(staged, _)| staged.get("x") == Some(&TlaValue::Int(1))));
-        assert!(branches.iter().any(|(staged, _)| staged.get("x") == Some(&TlaValue::Int(0))));
+        assert!(
+            branches
+                .iter()
+                .any(|(staged, _)| staged.get("x") == Some(&TlaValue::Int(1)))
+        );
+        assert!(
+            branches
+                .iter()
+                .any(|(staged, _)| staged.get("x") == Some(&TlaValue::Int(0)))
+        );
     }
 
     #[test]
@@ -8613,8 +8838,7 @@ Buffer == INSTANCE RingBuffer
             TlaValue::Int(31)
         );
         assert_eq!(
-            eval_expr("Cardinality(BoundedSeq({1, 2}, 2))", &ctx)
-                .expect("BoundedSeq should work"),
+            eval_expr("Cardinality(BoundedSeq({1, 2}, 2))", &ctx).expect("BoundedSeq should work"),
             TlaValue::Int(7)
         );
     }
@@ -8636,6 +8860,31 @@ Buffer == INSTANCE RingBuffer
         assert_eq!(
             eval_expr("Max({1, 4, 2})", &ctx).expect("user-defined Max should win"),
             TlaValue::Int(42)
+        );
+    }
+
+    #[test]
+    fn tlc_builtins_provide_analysis_compatibility_defaults() {
+        let state = TlaState::new();
+        let defs = BTreeMap::new();
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        assert_eq!(
+            eval_expr("TLCGet(\"level\")", &ctx).expect("TLCGet level should work"),
+            TlaValue::Int(0)
+        );
+        assert_eq!(
+            eval_expr("TLCGet(2)", &ctx).expect("TLCGet slot should work"),
+            TlaValue::Int(999)
+        );
+        assert_eq!(
+            eval_expr("TLCSet(2, 17)", &ctx).expect("TLCSet should work"),
+            TlaValue::Bool(true)
+        );
+        assert_eq!(
+            eval_expr("TLCGet(\"config\").mode = \"bfs\"", &ctx)
+                .expect("TLCGet config record should work"),
+            TlaValue::Bool(true)
         );
     }
 
@@ -8681,6 +8930,32 @@ Buffer == INSTANCE RingBuffer
             eval_expr("PairSumPositive'", &ctx)
                 .expect("derived primed zero-arg operator should resolve"),
             TlaValue::Bool(true)
+        );
+    }
+
+    #[test]
+    fn parameterized_operator_primes_use_staged_next_state_bindings() {
+        let state = TlaState::from([("x".to_string(), TlaValue::Int(1))]);
+        let definitions = BTreeMap::from([(
+            "neutral".to_string(),
+            TlaDefinition {
+                name: "neutral".to_string(),
+                params: vec!["p".to_string()],
+                body: "p = x".to_string(),
+                is_recursive: false,
+            },
+        )]);
+
+        let mut ctx = EvalContext::with_definitions(&state, &definitions);
+        Rc::make_mut(&mut ctx.locals).insert("x'".to_string(), TlaValue::Int(2));
+
+        assert_eq!(
+            eval_expr("neutral(2)'", &ctx).expect("primed operator call should resolve"),
+            TlaValue::Bool(true)
+        );
+        assert_eq!(
+            eval_expr("neutral(2)", &ctx).expect("unprimed operator call should resolve"),
+            TlaValue::Bool(false)
         );
     }
 

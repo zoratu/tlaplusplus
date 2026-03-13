@@ -241,7 +241,7 @@ fn matches_keyword_at(chars: &[char], i: usize, keyword: &str) -> bool {
 }
 
 pub fn classify_clause(clause: &str) -> ClauseKind {
-    let trimmed = clause.trim();
+    let trimmed = strip_leading_action_labels(clause.trim());
 
     if let Some(rest) = trimmed.strip_prefix("UNCHANGED") {
         let vars = parse_unchanged_list(rest);
@@ -348,7 +348,7 @@ fn is_simple_name(text: &str) -> bool {
 }
 
 pub fn parse_stuttering_action_expr(expr: &str) -> Option<(String, Vec<String>)> {
-    let trimmed = expr.trim();
+    let trimmed = strip_leading_action_labels(expr.trim());
     let (action, tail) = take_top_level_group(trimmed, '[', ']')?;
     let tail = tail.trim_start();
     let subscript = tail.strip_prefix('_')?.trim();
@@ -403,6 +403,19 @@ fn parse_unchanged_list(rest: &str) -> Vec<String> {
         Vec::new()
     } else {
         vec![trimmed.to_string()]
+    }
+}
+
+fn strip_leading_action_labels(mut expr: &str) -> &str {
+    loop {
+        let trimmed = expr.trim_start();
+        let Some((label, rest)) = trimmed.split_once("::") else {
+            return trimmed;
+        };
+        if !is_simple_name(label.trim()) {
+            return trimmed;
+        }
+        expr = rest;
     }
 }
 
@@ -553,6 +566,28 @@ mod tests {
                 var: "1bCount".to_string(),
                 expr: "0".to_string()
             }
+        );
+    }
+
+    #[test]
+    fn classifies_pluscal_labeled_assignments() {
+        assert_eq!(
+            classify_clause("UP:: upEdge' = [upEdge EXCEPT ![p] = NotAnEdge]"),
+            ClauseKind::PrimedAssignment {
+                var: "upEdge".to_string(),
+                expr: "[upEdge EXCEPT ![p] = NotAnEdge]".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_pluscal_labeled_stuttering_actions() {
+        assert_eq!(
+            parse_stuttering_action_expr("N:: [HCnxt]_<<hr, now>>"),
+            Some((
+                "HCnxt".to_string(),
+                vec!["hr".to_string(), "now".to_string()]
+            ))
         );
     }
 
