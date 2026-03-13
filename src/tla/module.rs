@@ -110,6 +110,13 @@ fn extract_named_module_text(input: &str, module_name: &str) -> Option<String> {
     None
 }
 
+fn extract_first_module_text(input: &str) -> Option<String> {
+    let module_name = input
+        .lines()
+        .find_map(|line| extract_module_name(line.trim()))?;
+    extract_named_module_text(input, &module_name)
+}
+
 fn library_search_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
 
@@ -158,7 +165,13 @@ fn parse_tla_module_file_with_visited(
 ) -> Result<TlaModule> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("failed reading module {}", path.display()))?;
-    parse_tla_module_raw_with_visited(path, &raw, visited)
+    let module_text = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| extract_named_module_text(&raw, stem))
+        .or_else(|| extract_first_module_text(&raw))
+        .unwrap_or(raw);
+    parse_tla_module_raw_with_visited(path, &module_text, visited)
 }
 
 fn parse_tla_module_raw_with_visited(
@@ -344,9 +357,11 @@ fn detect_pluscal(raw: &str) -> bool {
 fn load_module_instances(module: &mut TlaModule, base_path: &Path) -> Result<()> {
     // Load named instances (Alias == INSTANCE M)
     for (alias, instance) in module.instances.iter_mut() {
-        if let Some(instance_module) =
-            parse_embedded_module_from_file_with_visited(base_path, &instance.module_name, &mut HashSet::new())?
-        {
+        if let Some(instance_module) = parse_embedded_module_from_file_with_visited(
+            base_path,
+            &instance.module_name,
+            &mut HashSet::new(),
+        )? {
             instance.module = Some(Box::new(instance_module));
         } else if let Some(instance_path) = resolve_module_path(base_path, &instance.module_name) {
             // Load the module
@@ -758,7 +773,10 @@ fn definition_head_needs_continuation(line: &str) -> bool {
         return false;
     }
 
-    let head = line.trim_start().strip_prefix("LOCAL ").unwrap_or(line.trim_start());
+    let head = line
+        .trim_start()
+        .strip_prefix("LOCAL ")
+        .unwrap_or(line.trim_start());
     let Some(first) = head.chars().next() else {
         return false;
     };
@@ -1290,8 +1308,7 @@ fn split_declared_name(entry: &str) -> Option<(String, &str)> {
             saw_identifier_marker |= c.is_ascii_alphabetic() || c == '_';
         } else {
             end = idx;
-            return saw_identifier_marker
-                .then(|| (entry[..end].to_string(), entry[end..].trim()));
+            return saw_identifier_marker.then(|| (entry[..end].to_string(), entry[end..].trim()));
         }
     }
     saw_identifier_marker.then(|| (entry[..end].to_string(), entry[end..].trim()))
@@ -2057,7 +2074,10 @@ Alias == INSTANCE Helper
             std::env::set_var("TLA_LIBRARY_PATH", &lib_dir);
         }
         let parsed = parse_tla_module_file(&entry).expect("parse should load instance module");
-        let alias = parsed.instances.get("Alias").expect("instance should be present");
+        let alias = parsed
+            .instances
+            .get("Alias")
+            .expect("instance should be present");
         assert_eq!(alias.module_name, "Helper");
         assert!(alias.module.is_some(), "instance module should be loaded");
 
@@ -2305,6 +2325,66 @@ Value == 42
     }
 
     #[test]
+    fn parse_tla_module_file_keeps_entry_module_definitions_when_siblings_overlap() {
+        use std::fs;
+
+        let tmp = std::env::temp_dir().join("tlapp-embedded-entry-module-precedence");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should be created");
+
+        let root = tmp.join("BufferedRandomAccessFile.tla");
+        fs::write(
+            &root,
+            r#"
+---- MODULE BufferedRandomAccessFile ----
+EXTENDS Common
+
+Init ==
+    /\ dirty = FALSE
+    /\ length = 0
+
+TypeOK ==
+    /\ dirty \in BOOLEAN
+    /\ length \in Offset
+===============================================================================
+
+---- MODULE RandomAccessFile ----
+EXTENDS Common
+
+Init ==
+    /\ file_content = EmptyArray
+    /\ file_pointer = 0
+
+TypeOK ==
+    /\ file_content \in ArrayOfAnyLength(SymbolOrArbitrary)
+    /\ file_pointer \in Offset
+===============================================================================
+
+---- MODULE Common ----
+CONSTANTS MaxOffset, Symbols, ArbitrarySymbol
+Offset == 0..MaxOffset
+SymbolOrArbitrary == Symbols \union {ArbitrarySymbol}
+ArrayOfAnyLength(T) == [elems: Seq(T)]
+EmptyArray == [elems |-> <<>>]
+===============================================================================
+"#,
+        )
+        .expect("embedded module file should be written");
+
+        let module = parse_tla_module_file(&root).expect("entry module should parse");
+        assert_eq!(
+            module.definitions.get("Init").unwrap().body.trim(),
+            "/\\ dirty = FALSE\n    /\\ length = 0"
+        );
+        assert_eq!(
+            module.definitions.get("TypeOK").unwrap().body.trim(),
+            "/\\ dirty \\in BOOLEAN\n    /\\ length \\in Offset"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn instances_can_load_embedded_module_from_same_file() {
         use std::fs;
 
@@ -2328,11 +2408,18 @@ Value == 42
         .expect("embedded module file should be written");
 
         let module = parse_tla_module_file(&root).expect("embedded instance should parse");
-        let alias = module.instances.get("Alias").expect("instance should exist");
+        let alias = module
+            .instances
+            .get("Alias")
+            .expect("instance should exist");
         assert_eq!(alias.module_name, "Helper");
-        assert!(alias.module.is_some(), "embedded instance module should load");
+        assert!(
+            alias.module.is_some(),
+            "embedded instance module should load"
+        );
         assert_eq!(
-            alias.module
+            alias
+                .module
                 .as_ref()
                 .unwrap()
                 .definitions
@@ -2375,7 +2462,10 @@ SharedValue == 42
         .expect("embedded module file should be written");
 
         let module = parse_tla_module_file(&root).expect("embedded modules should parse");
-        let alias = module.instances.get("Alias").expect("instance should exist");
+        let alias = module
+            .instances
+            .get("Alias")
+            .expect("instance should exist");
         let helper = alias
             .module
             .as_ref()
@@ -2595,10 +2685,19 @@ Init == x = 0
 ====
 "#;
         let m = parse_tla_module_text(src).expect("parse should work");
-        let helper = m.instances.get("Helper").expect("Helper instance should exist");
+        let helper = m
+            .instances
+            .get("Helper")
+            .expect("Helper instance should exist");
         assert_eq!(helper.module_name, "CoverageHelper");
-        assert_eq!(helper.substitutions.get("Node"), Some(&"{1, 2, 3}".to_string()));
-        assert_eq!(helper.substitutions.get("Mode"), Some(&"\"safe\"".to_string()));
+        assert_eq!(
+            helper.substitutions.get("Node"),
+            Some(&"{1, 2, 3}".to_string())
+        );
+        assert_eq!(
+            helper.substitutions.get("Mode"),
+            Some(&"\"safe\"".to_string())
+        );
     }
 
     #[test]
@@ -2683,7 +2782,10 @@ Init == x = 0
         assert_eq!(m.unnamed_instances.len(), 1);
         let instance = &m.unnamed_instances[0];
         assert_eq!(instance.module_name, "Sailfish");
-        assert_eq!(instance.substitutions.get("Node"), Some(&"Servers".to_string()));
+        assert_eq!(
+            instance.substitutions.get("Node"),
+            Some(&"Servers".to_string())
+        );
         assert_eq!(instance.substitutions.get("F"), Some(&"Faulty".to_string()));
     }
 
@@ -2788,6 +2890,10 @@ Next == x' = BaseHelper(x)
         let base_helper = module.definitions.get("BaseHelper").unwrap();
         // The body should have Param replaced with 42
         // (Note: substitution is text-based, so this should work)
+        assert!(
+            base_helper.body.contains("42"),
+            "BaseHelper body should reflect the WITH substitution"
+        );
 
         // Clean up
         let _ = fs::remove_dir_all(&tmp);

@@ -1110,7 +1110,7 @@ fn main() -> anyhow::Result<()> {
                             }
                             Err(_) => {
                                 if let Some(repr) =
-                                    try_create_representative_value_from_type_expr(&set_expr, &ctx)
+                                    representative_value_from_set_expr(&set_expr, &ctx)
                                 {
                                     probe_state.insert(var, repr);
                                     probe_init_seeded += 1;
@@ -1241,7 +1241,10 @@ fn main() -> anyhow::Result<()> {
                                         let expr = match clause {
                                             ActionClause::Guard { expr }
                                             | ActionClause::PrimedAssignment { expr, .. }
-                                            | ActionClause::PrimedMembership { set_expr: expr, .. }
+                                            | ActionClause::PrimedMembership {
+                                                set_expr: expr,
+                                                ..
+                                            }
                                             | ActionClause::LetWithPrimes { expr } => expr,
                                             ActionClause::Exists { binders, body } => {
                                                 return format!(
@@ -2123,9 +2126,9 @@ fn seed_probe_state_from_membership_body(
         let mut next_pending = Vec::new();
         for (var, constraint) in pending {
             let ctx = build_probe_eval_context(probe_state, &module.definitions, &module.instances);
-            let current_constraint_status = probe_state
-                .get(&var)
-                .and_then(|_| current_probe_value_satisfies_type_constraint(&var, &constraint, &ctx));
+            let current_constraint_status = probe_state.get(&var).and_then(|_| {
+                current_probe_value_satisfies_type_constraint(&var, &constraint, &ctx)
+            });
             if let Some(repr) = representative_value_from_type_constraint(&constraint, &ctx) {
                 let should_update = match probe_state.get(&var) {
                     None => true,
@@ -2329,8 +2332,12 @@ fn function_range_is_uniformly(current: &TlaValue, expected: &TlaValue) -> bool 
 
 fn is_definition_backed_probe_expr(expr: &str, ctx: &EvalContext<'_>) -> bool {
     let definitions = ctx.definitions.unwrap_or(ctx.local_definitions.as_ref());
-    if resolve_zero_arg_state_definition(expr, definitions, ctx.instances.unwrap_or(&BTreeMap::new()))
-        .is_some()
+    if resolve_zero_arg_state_definition(
+        expr,
+        definitions,
+        ctx.instances.unwrap_or(&BTreeMap::new()),
+    )
+    .is_some()
     {
         return true;
     }
@@ -3401,13 +3408,8 @@ fn seed_nonempty_sequence_probe_locals(
     clauses: &[ActionClause],
     locals: &mut BTreeMap<String, TlaValue>,
 ) {
-    let element_hints = infer_sequence_element_probe_values(
-        probe_state,
-        definitions,
-        instances,
-        clauses,
-        locals,
-    );
+    let element_hints =
+        infer_sequence_element_probe_values(probe_state, definitions, instances, clauses, locals);
     for var in find_sequence_accessed_vars(clauses) {
         if locals
             .get(&var)
@@ -4095,8 +4097,9 @@ fn probe_action_clause_expr(
         })),
         ActionClause::PrimedMembership { var, set_expr } => {
             Some(eval_expr(set_expr, ctx).and_then(|set_val| {
-                let repr = pick_representative_from_set(&set_val)
-                    .ok_or_else(|| anyhow::anyhow!("empty or non-set primed membership: {set_expr}"))?;
+                let repr = pick_representative_from_set(&set_val).ok_or_else(|| {
+                    anyhow::anyhow!("empty or non-set primed membership: {set_expr}")
+                })?;
                 std::rc::Rc::make_mut(&mut ctx.locals).insert(format!("{var}'"), repr);
                 Ok(())
             }))
@@ -4221,7 +4224,8 @@ fn try_create_representative_function(set_expr: &str, ctx: &EvalContext<'_>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tlaplusplus::tla::parse_tla_module_text;
+    use std::fs;
+    use tlaplusplus::tla::{parse_tla_module_file, parse_tla_module_text};
 
     fn parsed_two_pc_with_btm_probe_module() -> TlaModule {
         parse_tla_module_text(
@@ -4299,6 +4303,354 @@ Next == TManager \/ BTManager
 "#,
         )
         .expect("2PCwithBTM probe module should parse")
+    }
+
+    fn parsed_braf_probe_module() -> TlaModule {
+        parse_tla_module_text(
+            r#"---- MODULE BrafProbe ----
+CONSTANTS Symbols, ArbitrarySymbol, BuffSz, MaxOffset
+VARIABLES dirty, length, curr, lo, buff, diskPos, file_content, file_pointer
+
+vars == <<dirty, length, curr, lo, buff, diskPos, file_content, file_pointer>>
+Offset == 0..MaxOffset
+SymbolOrArbitrary == Symbols \union {ArbitrarySymbol}
+Min(a, b) == IF a <= b THEN a ELSE b
+Max(a, b) == IF a <= b THEN b ELSE a
+ArrayOfAnyLength(T) == [elems: Seq(T)]
+Array(T, len) == [elems: [1..len -> T]]
+EmptyArray == [elems |-> <<>>]
+ArrayLen(a) == Len(a.elems)
+ArrayGet(a, i) == a.elems[i + 1]
+ArraySet(a, i, x) == [a EXCEPT !.elems[i + 1] = x]
+ArraySlice(a, startInclusive, endExclusive) == [elems |-> SubSeq(a.elems, startInclusive + 1, endExclusive)]
+ArrayConcat(a1, a2) == [elems |-> a1.elems \o a2.elems]
+Inv2 == /\ lo <= curr
+        /\ curr < lo + BuffSz
+
+TypeOK ==
+    /\ dirty \in BOOLEAN
+    /\ length \in Offset
+    /\ curr \in Offset
+    /\ lo \in Offset
+    /\ buff \in Array(SymbolOrArbitrary, BuffSz)
+    /\ diskPos \in Offset
+    /\ file_content \in ArrayOfAnyLength(SymbolOrArbitrary)
+    /\ file_pointer \in Offset
+
+Init ==
+    /\ dirty = FALSE
+    /\ length = 0
+    /\ curr = 0
+    /\ lo = 0
+    /\ buff \in Array({ArbitrarySymbol}, BuffSz)
+    /\ diskPos = 0
+    /\ file_pointer = 0
+    /\ file_content = EmptyArray
+
+FlushBuffer ==
+    /\ dirty
+    /\ dirty' = FALSE
+    /\ UNCHANGED <<length, curr, lo, buff, diskPos, file_content, file_pointer>>
+
+Write1(byte) ==
+    /\ curr + 1 <= MaxOffset
+    /\ Inv2
+    /\ buff' = ArraySet(buff, curr - lo, byte)
+    /\ curr' = curr + 1
+    /\ dirty' = TRUE
+    /\ length' = Max(length, curr')
+    /\ UNCHANGED <<lo, diskPos, file_pointer, file_content>>
+
+WriteAtMost(data) ==
+    LET
+        numWriteableWithoutSeeking == Min(ArrayLen(data), lo + BuffSz - curr)
+        buffOff == curr - lo
+    IN
+    /\ Inv2
+    /\ curr + numWriteableWithoutSeeking <= MaxOffset
+    /\ buff' = ArrayConcat(ArrayConcat(
+            ArraySlice(buff, 0, buffOff),
+            ArraySlice(data, 0, numWriteableWithoutSeeking)),
+            ArraySlice(buff, buffOff + numWriteableWithoutSeeking, ArrayLen(buff)))
+    /\ dirty' = TRUE
+    /\ curr' = curr + numWriteableWithoutSeeking
+    /\ length' = Max(length, curr')
+    /\ UNCHANGED <<lo, diskPos, file_content, file_pointer>>
+
+Next ==
+    \/ \E symbol \in SymbolOrArbitrary:
+        \/ Write1(symbol)
+    \/ \E len \in 1..MaxOffset: \E data \in Array(SymbolOrArbitrary, len):
+        \/ WriteAtMost(data)
+====
+"#,
+        )
+        .expect("BRAF probe module should parse")
+    }
+
+    fn seed_braf_probe_state(module: &TlaModule) -> TlaState {
+        let mut probe_state = TlaState::from([
+            (
+                "Symbols".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([
+                    TlaValue::ModelValue("A".to_string()),
+                    TlaValue::ModelValue("B".to_string()),
+                ]))),
+            ),
+            (
+                "ArbitrarySymbol".to_string(),
+                TlaValue::ModelValue("ArbitrarySymbol".to_string()),
+            ),
+            ("BuffSz".to_string(), TlaValue::Int(2)),
+            ("MaxOffset".to_string(), TlaValue::Int(3)),
+        ]);
+        let init_def = module.definitions.get("Init").expect("Init should exist");
+        let mut pending_eq = Vec::new();
+        let mut pending_mem = Vec::new();
+        for clause in
+            expand_state_predicate_clauses(&init_def.body, &module.definitions, &module.instances)
+        {
+            match classify_clause(&clause) {
+                ClauseKind::UnprimedEquality { var, expr } => pending_eq.push((var, expr)),
+                ClauseKind::UnprimedMembership { var, set_expr } => {
+                    pending_mem.push((var, set_expr))
+                }
+                _ => {}
+            }
+        }
+
+        let total_pending = pending_eq.len() + pending_mem.len();
+        for _ in 0..total_pending.saturating_add(1) {
+            if pending_eq.is_empty() && pending_mem.is_empty() {
+                break;
+            }
+
+            let mut progress = false;
+            let mut next_pending_eq = Vec::new();
+            for (var, expr) in pending_eq {
+                let ctx =
+                    build_probe_eval_context(&probe_state, &module.definitions, &module.instances);
+                match eval_expr(&expr, &ctx) {
+                    Ok(value) => {
+                        probe_state.insert(var, value);
+                        progress = true;
+                    }
+                    Err(_) => next_pending_eq.push((var, expr)),
+                }
+            }
+
+            let mut next_pending_mem = Vec::new();
+            for (var, set_expr) in pending_mem {
+                let ctx =
+                    build_probe_eval_context(&probe_state, &module.definitions, &module.instances);
+                match eval_expr(&set_expr, &ctx) {
+                    Ok(set_val) => {
+                        if let Some(repr) = pick_representative_from_set(&set_val) {
+                            probe_state.insert(var, repr);
+                            progress = true;
+                        } else {
+                            next_pending_mem.push((var, set_expr));
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(repr) = representative_value_from_set_expr(&set_expr, &ctx) {
+                            probe_state.insert(var, repr);
+                            progress = true;
+                        } else {
+                            next_pending_mem.push((var, set_expr));
+                        }
+                    }
+                }
+            }
+
+            if !progress {
+                break;
+            }
+            pending_eq = next_pending_eq;
+            pending_mem = next_pending_mem;
+        }
+
+        let _ = seed_probe_state_from_type_invariants(&mut probe_state, module, None);
+        probe_state
+    }
+
+    fn parsed_braf_embedded_file_probe_module() -> TlaModule {
+        let unique = format!(
+            "braf-probe-{}-{}.tla",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after epoch")
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(unique);
+        fs::write(
+            &path,
+            r#"---- MODULE BrafProbe ----
+EXTENDS Common
+
+CONSTANT BuffSz
+VARIABLES dirty, length, curr, lo, buff, diskPos, file_content, file_pointer
+
+TypeOK ==
+    /\ dirty \in BOOLEAN
+    /\ length \in Offset
+    /\ curr \in Offset
+    /\ lo \in Offset
+    /\ buff \in Array(SymbolOrArbitrary, BuffSz)
+    /\ diskPos \in Offset
+    /\ file_content \in ArrayOfAnyLength(SymbolOrArbitrary)
+    /\ file_pointer \in Offset
+
+Init ==
+    /\ dirty = FALSE
+    /\ length = 0
+    /\ curr = 0
+    /\ lo = 0
+    /\ buff \in Array({ArbitrarySymbol}, BuffSz)
+    /\ diskPos = 0
+    /\ file_pointer = 0
+    /\ file_content = EmptyArray
+===============================================================================
+
+-------------------------------- MODULE Common --------------------------------
+EXTENDS Naturals, Sequences
+
+CONSTANTS Symbols, ArbitrarySymbol, MaxOffset
+Offset == 0..MaxOffset
+SymbolOrArbitrary == Symbols \union {ArbitrarySymbol}
+ArrayOfAnyLength(T) == [elems: Seq(T)]
+Array(T, len) == [elems: [1..len -> T]]
+EmptyArray == [elems |-> <<>>]
+===============================================================================
+"#,
+        )
+        .expect("embedded BRAF probe file should be written");
+        let module = parse_tla_module_file(&path).expect("embedded BRAF file should parse");
+        let _ = fs::remove_file(path);
+        module
+    }
+
+    fn write_braf_analyze_probe_files()
+    -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let unique = format!(
+            "braf-analyze-probe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after epoch")
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        let module_path = dir.join("BrafProbe.tla");
+        let cfg_path = dir.join("BrafProbe.cfg");
+        fs::write(
+            &module_path,
+            r#"---- MODULE BrafProbe ----
+EXTENDS Common
+
+CONSTANT BuffSz
+VARIABLES dirty, length, curr, lo, buff, diskPos, file_content, file_pointer
+
+vars == <<dirty, length, curr, lo, buff, diskPos, file_content, file_pointer>>
+
+TypeOK ==
+    /\ dirty \in BOOLEAN
+    /\ length \in Offset
+    /\ curr \in Offset
+    /\ lo \in Offset
+    /\ buff \in Array(SymbolOrArbitrary, BuffSz)
+    /\ diskPos \in Offset
+    /\ file_content \in ArrayOfAnyLength(SymbolOrArbitrary)
+    /\ file_pointer \in Offset
+
+Init ==
+    /\ dirty = FALSE
+    /\ length = 0
+    /\ curr = 0
+    /\ lo = 0
+    /\ buff \in Array({ArbitrarySymbol}, BuffSz)
+    /\ diskPos = 0
+    /\ file_pointer = 0
+    /\ file_content = EmptyArray
+
+FlushBuffer ==
+    /\ dirty
+    /\ dirty' = FALSE
+    /\ UNCHANGED <<length, curr, lo, buff, diskPos, file_content, file_pointer>>
+
+Write1(byte) ==
+    /\ curr + 1 <= MaxOffset
+    /\ Inv2
+    /\ buff' = ArraySet(buff, curr - lo, byte)
+    /\ curr' = curr + 1
+    /\ dirty' = TRUE
+    /\ length' = Max(length, curr')
+    /\ UNCHANGED <<lo, diskPos, file_pointer, file_content>>
+
+WriteAtMost(data) ==
+    LET
+        numWriteableWithoutSeeking == Min(ArrayLen(data), lo + BuffSz - curr)
+        buffOff == curr - lo
+    IN
+    /\ Inv2
+    /\ curr + numWriteableWithoutSeeking <= MaxOffset
+    /\ buff' = ArrayConcat(ArrayConcat(
+            ArraySlice(buff, 0, buffOff),
+            ArraySlice(data, 0, numWriteableWithoutSeeking)),
+            ArraySlice(buff, buffOff + numWriteableWithoutSeeking, ArrayLen(buff)))
+    /\ dirty' = TRUE
+    /\ curr' = curr + numWriteableWithoutSeeking
+    /\ length' = Max(length, curr')
+    /\ UNCHANGED <<lo, diskPos, file_content, file_pointer>>
+
+Next ==
+    \/ FlushBuffer
+    \/ \E symbol \in SymbolOrArbitrary:
+        \/ Write1(symbol)
+    \/ \E len \in 1..MaxOffset: \E data \in Array(SymbolOrArbitrary, len):
+        \/ WriteAtMost(data)
+
+Spec == Init /\ [][Next]_vars
+===============================================================================
+
+-------------------------------- MODULE Common --------------------------------
+EXTENDS Naturals, Sequences
+
+CONSTANTS Symbols, ArbitrarySymbol, MaxOffset
+Offset == 0..MaxOffset
+SymbolOrArbitrary == Symbols \union {ArbitrarySymbol}
+Min(a, b) == IF a <= b THEN a ELSE b
+Max(a, b) == IF a <= b THEN b ELSE a
+ArrayOfAnyLength(T) == [elems: Seq(T)]
+Array(T, len) == [elems: [1..len -> T]]
+EmptyArray == [elems |-> <<>>]
+ArrayLen(a) == Len(a.elems)
+ArrayGet(a, i) == a.elems[i + 1]
+ArraySet(a, i, x) == [a EXCEPT !.elems[i + 1] = x]
+ArraySlice(a, startInclusive, endExclusive) == [elems |-> SubSeq(a.elems, startInclusive + 1, endExclusive)]
+ArrayConcat(a1, a2) == [elems |-> a1.elems \o a2.elems]
+Inv2 == /\ lo <= curr
+        /\ curr < lo + BuffSz
+===============================================================================
+"#,
+        )
+        .expect("probe module file should be written");
+        fs::write(
+            &cfg_path,
+            r#"CONSTANTS
+  Symbols = {A, B}
+  ArbitrarySymbol = ArbitrarySymbol
+  BuffSz = 2
+  MaxOffset = 3
+
+SPECIFICATION Spec
+INVARIANTS TypeOK
+"#,
+        )
+        .expect("probe cfg file should be written");
+        (dir, module_path, cfg_path)
     }
 
     #[test]
@@ -4900,8 +5252,7 @@ Next == TManager \/ BTManager
                 TlaValue::ModelValue("NoBlockVal".to_string()),
             ),
         ])));
-        let mut probe_state =
-            TlaState::from([("hashFunction".to_string(), expected.clone())]);
+        let mut probe_state = TlaState::from([("hashFunction".to_string(), expected.clone())]);
         let module = TlaModule {
             name: "IndeterminateNanoLike".to_string(),
             path: String::new(),
@@ -5800,7 +6151,8 @@ INVARIANTS TypeInvariant
         );
 
         let result = probe_action_clause_expr(
-            ir[0].clauses
+            ir[0]
+                .clauses
                 .first()
                 .expect("CalculateHashImpl should have one clause"),
             &mut ctx,
@@ -6727,10 +7079,7 @@ INVARIANTS TypeInvariant
         };
         let defs = BTreeMap::new();
         let instances = BTreeMap::new();
-        let inferred = BTreeMap::from([(
-            "p".to_string(),
-            TlaValue::ModelValue("p1".to_string()),
-        )]);
+        let inferred = BTreeMap::from([("p".to_string(), TlaValue::ModelValue("p1".to_string()))]);
         let branch = compile_action_ir_branches(&def)
             .into_iter()
             .next()
@@ -7287,10 +7636,7 @@ INVARIANTS TypeInvariant
 
     #[test]
     fn build_action_expr_probe_context_seeds_empty_sequences_used_by_head_or_tail() {
-        let state = TlaState::from([(
-            "AuthChannel".to_string(),
-            TlaValue::Seq(Arc::new(vec![])),
-        )]);
+        let state = TlaState::from([("AuthChannel".to_string(), TlaValue::Seq(Arc::new(vec![])))]);
         let defs = BTreeMap::new();
         let instances = BTreeMap::new();
         let clauses = vec![
@@ -7303,8 +7649,7 @@ INVARIANTS TypeInvariant
             },
         ];
 
-        let ctx =
-            build_action_expr_probe_context(&state, &defs, &instances, &[], &clauses, None);
+        let ctx = build_action_expr_probe_context(&state, &defs, &instances, &[], &clauses, None);
 
         assert_eq!(
             ctx.locals.get("AuthChannel"),
@@ -7314,18 +7659,14 @@ INVARIANTS TypeInvariant
 
     #[test]
     fn build_action_expr_probe_context_seeds_record_elements_for_head_field_access() {
-        let state = TlaState::from([(
-            "FwCtlChannel".to_string(),
-            TlaValue::Seq(Arc::new(vec![])),
-        )]);
+        let state = TlaState::from([("FwCtlChannel".to_string(), TlaValue::Seq(Arc::new(vec![])))]);
         let defs = BTreeMap::new();
         let instances = BTreeMap::new();
         let clauses = vec![ActionClause::Guard {
             expr: r#"Head(FwCtlChannel).op = "Add""#.to_string(),
         }];
 
-        let ctx =
-            build_action_expr_probe_context(&state, &defs, &instances, &[], &clauses, None);
+        let ctx = build_action_expr_probe_context(&state, &defs, &instances, &[], &clauses, None);
 
         let Some(TlaValue::Seq(items)) = ctx.locals.get("FwCtlChannel") else {
             panic!("expected a seeded non-empty sequence");
@@ -7670,6 +8011,370 @@ INVARIANTS TypeInvariant
     }
 
     #[test]
+    fn parsed_braf_init_and_typeok_seed_probe_state() {
+        let module = parsed_braf_probe_module();
+        let mut probe_state = seed_braf_probe_state(&module);
+        let init_def = module.definitions.get("Init").expect("Init should exist");
+        let expanded_init =
+            expand_state_predicate_clauses(&init_def.body, &module.definitions, &module.instances);
+        let mut pending_eq = Vec::new();
+        let mut pending_mem = Vec::new();
+        for clause in &expanded_init {
+            match classify_clause(&clause) {
+                ClauseKind::UnprimedEquality { var, expr } => pending_eq.push((var, expr)),
+                ClauseKind::UnprimedMembership { var, set_expr } => {
+                    pending_mem.push((var, set_expr))
+                }
+                _ => {}
+            }
+        }
+        let initial_pending_eq = pending_eq.clone();
+        let initial_pending_mem = pending_mem.clone();
+        let seeded = seed_probe_state_from_type_invariants(&mut probe_state, &module, None);
+
+        assert!(
+            seeded == 0,
+            "expanded_init={expanded_init:?} pending_eq={initial_pending_eq:?} pending_mem={initial_pending_mem:?} probe_state={probe_state:?} typeok={:?}",
+            module.definitions.get("TypeOK").map(|def| def.body.clone())
+        );
+        assert_eq!(probe_state.get("dirty"), Some(&TlaValue::Bool(false)));
+        assert_eq!(probe_state.get("length"), Some(&TlaValue::Int(0)));
+        assert!(matches!(probe_state.get("buff"), Some(TlaValue::Record(_))));
+        assert!(matches!(
+            probe_state.get("file_content"),
+            Some(TlaValue::Record(_))
+        ));
+    }
+
+    #[test]
+    fn parsed_braf_write_at_most_context_uses_array_param_samples() {
+        let module = parsed_braf_probe_module();
+        let probe_state = seed_braf_probe_state(&module);
+        let next_def = module.definitions.get("Next").expect("Next should exist");
+        let samples = infer_action_param_samples_from_next(
+            &next_def.body,
+            &probe_state,
+            &module.definitions,
+            &module.instances,
+        );
+        let write_def = module
+            .definitions
+            .get("WriteAtMost")
+            .expect("WriteAtMost should exist");
+        let branches = compile_action_ir_branches(write_def);
+        let inferred = samples
+            .get("WriteAtMost")
+            .expect("WriteAtMost param samples should be inferred");
+        let ctx = build_action_expr_probe_context(
+            &probe_state,
+            &module.definitions,
+            &module.instances,
+            &branches[0].params,
+            &branches[0].clauses,
+            Some(inferred),
+        );
+
+        assert!(matches!(ctx.locals.get("data"), Some(TlaValue::Record(_))));
+    }
+
+    #[test]
+    fn parsed_braf_flush_buffer_guard_reads_seeded_bool() {
+        let module = parsed_braf_probe_module();
+        let probe_state = seed_braf_probe_state(&module);
+        let def = module
+            .definitions
+            .get("FlushBuffer")
+            .expect("FlushBuffer should exist");
+        let ir = compile_action_ir(def);
+        let mut ctx = build_action_expr_probe_context(
+            &probe_state,
+            &module.definitions,
+            &module.instances,
+            &ir.params,
+            &ir.clauses,
+            None,
+        );
+
+        let result = probe_action_clause_expr(&ir.clauses[0], &mut ctx)
+            .expect("dirty guard should be probeable");
+        result.expect("dirty guard should evaluate with seeded boolean state");
+    }
+
+    #[test]
+    fn parsed_braf_write1_reads_seeded_array_state() {
+        let module = parsed_braf_probe_module();
+        let probe_state = seed_braf_probe_state(&module);
+        let def = module
+            .definitions
+            .get("Write1")
+            .expect("Write1 should exist");
+        let ir = compile_action_ir(def);
+        let samples = BTreeMap::from([(
+            "byte".to_string(),
+            TlaValue::ModelValue("ArbitrarySymbol".to_string()),
+        )]);
+        let mut ctx = build_action_expr_probe_context(
+            &probe_state,
+            &module.definitions,
+            &module.instances,
+            &ir.params,
+            &ir.clauses,
+            Some(&samples),
+        );
+
+        for clause in &ir.clauses {
+            if let Some(result) = probe_action_clause_expr(clause, &mut ctx) {
+                result.expect("Write1 should probe cleanly against seeded array state");
+            }
+        }
+
+        assert!(matches!(ctx.locals.get("buff'"), Some(TlaValue::Record(_))));
+    }
+
+    #[test]
+    fn embedded_braf_file_init_and_typeok_seed_probe_state() {
+        let module = parsed_braf_embedded_file_probe_module();
+        let mut probe_state = TlaState::from([
+            (
+                "Symbols".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([
+                    TlaValue::ModelValue("A".to_string()),
+                    TlaValue::ModelValue("B".to_string()),
+                ]))),
+            ),
+            (
+                "ArbitrarySymbol".to_string(),
+                TlaValue::ModelValue("ArbitrarySymbol".to_string()),
+            ),
+            ("BuffSz".to_string(), TlaValue::Int(2)),
+            ("MaxOffset".to_string(), TlaValue::Int(3)),
+        ]);
+        let init_def = module.definitions.get("Init").expect("Init should exist");
+        let mut pending_eq = Vec::new();
+        let mut pending_mem = Vec::new();
+        for clause in
+            expand_state_predicate_clauses(&init_def.body, &module.definitions, &module.instances)
+        {
+            match classify_clause(&clause) {
+                ClauseKind::UnprimedEquality { var, expr } => pending_eq.push((var, expr)),
+                ClauseKind::UnprimedMembership { var, set_expr } => {
+                    pending_mem.push((var, set_expr))
+                }
+                _ => {}
+            }
+        }
+
+        let total_pending = pending_eq.len() + pending_mem.len();
+        for _ in 0..total_pending.saturating_add(1) {
+            if pending_eq.is_empty() && pending_mem.is_empty() {
+                break;
+            }
+
+            let mut progress = false;
+            let mut next_pending_eq = Vec::new();
+            for (var, expr) in pending_eq {
+                let ctx =
+                    build_probe_eval_context(&probe_state, &module.definitions, &module.instances);
+                match eval_expr(&expr, &ctx) {
+                    Ok(value) => {
+                        probe_state.insert(var, value);
+                        progress = true;
+                    }
+                    Err(_) => next_pending_eq.push((var, expr)),
+                }
+            }
+
+            let mut next_pending_mem = Vec::new();
+            for (var, set_expr) in pending_mem {
+                let ctx =
+                    build_probe_eval_context(&probe_state, &module.definitions, &module.instances);
+                match eval_expr(&set_expr, &ctx) {
+                    Ok(set_val) => {
+                        if let Some(repr) = pick_representative_from_set(&set_val) {
+                            probe_state.insert(var, repr);
+                            progress = true;
+                        } else {
+                            next_pending_mem.push((var, set_expr));
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(repr) = representative_value_from_set_expr(&set_expr, &ctx) {
+                            probe_state.insert(var, repr);
+                            progress = true;
+                        } else {
+                            next_pending_mem.push((var, set_expr));
+                        }
+                    }
+                }
+            }
+
+            if !progress {
+                break;
+            }
+            pending_eq = next_pending_eq;
+            pending_mem = next_pending_mem;
+        }
+
+        let seeded = seed_probe_state_from_type_invariants(&mut probe_state, &module, None);
+        assert_eq!(seeded, 0);
+        assert_eq!(probe_state.get("dirty"), Some(&TlaValue::Bool(false)));
+        assert!(matches!(probe_state.get("buff"), Some(TlaValue::Record(_))));
+        assert!(matches!(
+            probe_state.get("file_content"),
+            Some(TlaValue::Record(_))
+        ));
+    }
+
+    #[test]
+    fn analyze_style_probe_state_seeds_embedded_braf_file() {
+        let (dir, module_path, cfg_path) = write_braf_analyze_probe_files();
+        let raw_cfg = fs::read_to_string(&cfg_path).expect("cfg should be readable");
+        let parsed_cfg = parse_tla_config(&raw_cfg).expect("cfg should parse");
+
+        let mut parsed_module = parse_tla_module_file(&module_path).expect("module should parse");
+        inject_constants_into_definitions(&mut parsed_module, &parsed_cfg);
+        let model = TlaModel::from_files(&module_path, Some(&cfg_path), None, None)
+            .expect("model should build");
+        parsed_module = model.module.clone();
+
+        let mut probe_state = model
+            .initial_states_vec
+            .first()
+            .cloned()
+            .unwrap_or_default();
+        for (name, value) in &parsed_cfg.constants {
+            if let Some(tv) = config_value_to_tla(value) {
+                probe_state.insert(name.clone(), tv);
+            }
+        }
+
+        let mut probe_init_seeded = 0usize;
+        if let Some(init_def) = parsed_module.definitions.get("Init") {
+            let mut pending_eq = Vec::new();
+            let mut pending_mem = Vec::new();
+            for clause in expand_state_predicate_clauses(
+                &init_def.body,
+                &parsed_module.definitions,
+                &parsed_module.instances,
+            ) {
+                match classify_clause(&clause) {
+                    ClauseKind::UnprimedEquality { var, expr } => pending_eq.push((var, expr)),
+                    ClauseKind::UnprimedMembership { var, set_expr } => {
+                        pending_mem.push((var, set_expr))
+                    }
+                    _ => {}
+                }
+            }
+
+            let total_pending = pending_eq.len() + pending_mem.len();
+            for _ in 0..total_pending.saturating_add(1) {
+                if pending_eq.is_empty() && pending_mem.is_empty() {
+                    break;
+                }
+                let mut progress = false;
+
+                let mut next_pending_eq = Vec::new();
+                for (var, expr) in pending_eq {
+                    let ctx = build_probe_eval_context(
+                        &probe_state,
+                        &parsed_module.definitions,
+                        &parsed_module.instances,
+                    );
+                    match eval_expr(&expr, &ctx) {
+                        Ok(value) => {
+                            probe_state.insert(var, value);
+                            probe_init_seeded += 1;
+                            progress = true;
+                        }
+                        Err(_) => next_pending_eq.push((var, expr)),
+                    }
+                }
+
+                let mut next_pending_mem = Vec::new();
+                for (var, set_expr) in pending_mem {
+                    let ctx = build_probe_eval_context(
+                        &probe_state,
+                        &parsed_module.definitions,
+                        &parsed_module.instances,
+                    );
+                    match eval_expr(&set_expr, &ctx) {
+                        Ok(set_val) => {
+                            if let Some(repr) = pick_representative_from_set(&set_val) {
+                                probe_state.insert(var, repr);
+                                probe_init_seeded += 1;
+                                progress = true;
+                            } else {
+                                next_pending_mem.push((var, set_expr));
+                            }
+                        }
+                        Err(_) => {
+                            if let Some(repr) = representative_value_from_set_expr(&set_expr, &ctx)
+                            {
+                                probe_state.insert(var, repr);
+                                probe_init_seeded += 1;
+                                progress = true;
+                            } else {
+                                next_pending_mem.push((var, set_expr));
+                            }
+                        }
+                    }
+                }
+
+                if !progress {
+                    break;
+                }
+                pending_eq = next_pending_eq;
+                pending_mem = next_pending_mem;
+            }
+        }
+        probe_init_seeded += seed_probe_state_from_type_invariants(
+            &mut probe_state,
+            &parsed_module,
+            Some(&parsed_cfg),
+        );
+
+        let _ = fs::remove_dir_all(dir);
+        assert!(
+            probe_init_seeded >= 8,
+            "expected analyze-style init seeding to populate probe state, got {probe_init_seeded} with probe_state={probe_state:?}"
+        );
+        assert_eq!(probe_state.get("dirty"), Some(&TlaValue::Bool(false)));
+        assert!(matches!(probe_state.get("buff"), Some(TlaValue::Record(_))));
+        assert!(matches!(
+            probe_state.get("file_content"),
+            Some(TlaValue::Record(_))
+        ));
+    }
+
+    #[test]
+    fn init_membership_seeding_handles_definition_backed_operator_calls() {
+        let mut probe_state = TlaState::from([
+            (
+                "ArbitrarySymbol".to_string(),
+                TlaValue::ModelValue("ArbitrarySymbol".to_string()),
+            ),
+            ("BuffSz".to_string(), TlaValue::Int(2)),
+        ]);
+        let defs = BTreeMap::from([(
+            "Array".to_string(),
+            TlaDefinition {
+                name: "Array".to_string(),
+                params: vec!["T".to_string(), "len".to_string()],
+                body: "[elems: [1..len -> T]]".to_string(),
+                is_recursive: false,
+            },
+        )]);
+        let instances = BTreeMap::new();
+        let ctx = build_probe_eval_context(&probe_state, &defs, &instances);
+
+        let repr = representative_value_from_set_expr("Array({ArbitrarySymbol}, BuffSz)", &ctx)
+            .expect("init membership representative should be synthesized");
+        probe_state.insert("buff".to_string(), repr);
+
+        assert!(matches!(probe_state.get("buff"), Some(TlaValue::Record(_))));
+    }
+
+    #[test]
     fn action_expr_probe_context_preserves_module_instances() {
         let state = TlaState::new();
         let defs = BTreeMap::new();
@@ -7752,10 +8457,7 @@ INVARIANTS TypeInvariant
     #[test]
     fn helper_action_with_empty_sequence_precondition_gap_is_probeable() {
         let state = TlaState::from([
-            (
-                "AuthChannel".to_string(),
-                TlaValue::Seq(Arc::new(vec![])),
-            ),
+            ("AuthChannel".to_string(), TlaValue::Seq(Arc::new(vec![]))),
             (
                 "ReplaySession".to_string(),
                 TlaValue::Set(Arc::new(BTreeSet::new())),
@@ -7814,7 +8516,9 @@ INVARIANTS TypeInvariant
     fn skips_temporal_formulas_in_action_expr_probe() {
         assert!(should_skip_action_expr_probe("[][x = x']_vars"));
         assert!(should_skip_action_expr_probe("<> done"));
-        assert!(should_skip_action_expr_probe(r"\A s \in Servers : []<>(InSync(s))"));
+        assert!(should_skip_action_expr_probe(
+            r"\A s \in Servers : []<>(InSync(s))"
+        ));
         assert!(!should_skip_action_expr_probe("x' = x + 1"));
         assert!(!should_skip_action_expr_probe("FwCtlChannel # <<>>"));
         assert!(!should_skip_action_expr_probe("Head(FwCtlChannel) # <<>>"));
@@ -8132,7 +8836,12 @@ INVARIANTS TypeInvariant
         ]);
         let def = defs.get("RS").expect("RS definition should exist");
         let branches = compile_action_ir_branches(def);
-        assert_eq!(branches.len(), 1, "body={:?} branches={branches:?}", def.body);
+        assert_eq!(
+            branches.len(),
+            1,
+            "body={:?} branches={branches:?}",
+            def.body
+        );
         let samples = BTreeMap::from([("self".to_string(), rm3.clone())]);
         let instances = BTreeMap::new();
         let mut ctx = build_action_expr_probe_context(
