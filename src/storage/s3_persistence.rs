@@ -23,6 +23,7 @@ use aws_config::BehaviorVersion;
 use aws_config::Region;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -32,8 +33,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
-use tokio::sync::Notify;
-use tokio::task::JoinHandle;
+use tokio::sync::{Notify, Semaphore};
+use tokio::task::{JoinHandle, JoinSet};
+
+const DEFAULT_S3_DOWNLOAD_CONCURRENCY: usize = 16;
+const DEFAULT_S3_UPLOAD_CONCURRENCY: usize = 8;
+const DEFAULT_S3_MULTIPART_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_S3_MULTIPART_PART_SIZE_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_S3_MULTIPART_UPLOAD_CONCURRENCY: usize = 4;
+const S3_MIN_MULTIPART_PART_SIZE_BYTES: usize = 5 * 1024 * 1024;
+const S3_MAX_MULTIPART_PARTS: usize = 10_000;
 
 /// Manifest file tracking what's been uploaded to S3
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +82,148 @@ pub struct CheckpointState {
     /// Segments with ID < min_segment_id can be safely pruned.
     #[serde(default)]
     pub min_segment_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct S3TransferTuning {
+    download_concurrency: usize,
+    upload_concurrency: usize,
+    multipart_threshold_bytes: u64,
+    multipart_part_size_bytes: usize,
+    multipart_upload_concurrency: usize,
+}
+
+impl Default for S3TransferTuning {
+    fn default() -> Self {
+        Self {
+            download_concurrency: DEFAULT_S3_DOWNLOAD_CONCURRENCY,
+            upload_concurrency: DEFAULT_S3_UPLOAD_CONCURRENCY,
+            multipart_threshold_bytes: DEFAULT_S3_MULTIPART_THRESHOLD_BYTES,
+            multipart_part_size_bytes: DEFAULT_S3_MULTIPART_PART_SIZE_BYTES,
+            multipart_upload_concurrency: DEFAULT_S3_MULTIPART_UPLOAD_CONCURRENCY,
+        }
+    }
+}
+
+impl S3TransferTuning {
+    fn from_env() -> Self {
+        let default = Self::default();
+        Self {
+            download_concurrency: parse_env_usize(
+                "TLAPP_S3_DOWNLOAD_CONCURRENCY",
+                default.download_concurrency,
+                1,
+                256,
+            ),
+            upload_concurrency: parse_env_usize(
+                "TLAPP_S3_UPLOAD_CONCURRENCY",
+                default.upload_concurrency,
+                1,
+                256,
+            ),
+            multipart_threshold_bytes: parse_env_u64(
+                "TLAPP_S3_MULTIPART_THRESHOLD_MB",
+                default.multipart_threshold_bytes / 1_048_576,
+                8,
+                16 * 1024,
+            ) * 1_048_576,
+            multipart_part_size_bytes: parse_env_usize(
+                "TLAPP_S3_MULTIPART_PART_SIZE_MB",
+                default.multipart_part_size_bytes / 1_048_576,
+                S3_MIN_MULTIPART_PART_SIZE_BYTES / 1_048_576,
+                512,
+            ) * 1_048_576,
+            multipart_upload_concurrency: parse_env_usize(
+                "TLAPP_S3_MULTIPART_UPLOAD_CONCURRENCY",
+                default.multipart_upload_concurrency,
+                1,
+                64,
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UploadMode {
+    SinglePut,
+    Multipart {
+        part_size_bytes: usize,
+        part_count: usize,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct PendingUpload {
+    entry_path: PathBuf,
+    rel_path: String,
+    s3_key: String,
+    current_size: u64,
+    bytes_to_upload: u64,
+    is_queue_spill: bool,
+}
+
+#[derive(Debug)]
+struct CompletedUpload {
+    rel_path: String,
+    current_size: u64,
+    bytes_to_upload: u64,
+    is_queue_spill: bool,
+}
+
+fn parse_env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|value| value.clamp(min, max))
+        .unwrap_or(default)
+}
+
+fn parse_env_u64(name: &str, default: u64, min: u64, max: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| value.clamp(min, max))
+        .unwrap_or(default)
+}
+
+fn compute_multipart_part_size(file_size: u64, preferred_part_size: usize) -> usize {
+    let preferred = preferred_part_size.max(S3_MIN_MULTIPART_PART_SIZE_BYTES);
+    let min_needed = ((file_size.saturating_add(S3_MAX_MULTIPART_PARTS as u64 - 1))
+        / S3_MAX_MULTIPART_PARTS as u64) as usize;
+    preferred.max(min_needed)
+}
+
+fn plan_multipart_ranges(file_size: u64, preferred_part_size: usize) -> Vec<(i32, u64, usize)> {
+    if file_size == 0 {
+        return Vec::new();
+    }
+
+    let part_size = compute_multipart_part_size(file_size, preferred_part_size);
+    let mut ranges = Vec::new();
+    let mut offset = 0u64;
+    let mut part_number = 1i32;
+
+    while offset < file_size {
+        let remaining = file_size - offset;
+        let len = remaining.min(part_size as u64) as usize;
+        ranges.push((part_number, offset, len));
+        offset += len as u64;
+        part_number += 1;
+    }
+
+    ranges
+}
+
+fn choose_upload_mode(file_size: u64, tuning: S3TransferTuning) -> UploadMode {
+    if file_size < tuning.multipart_threshold_bytes {
+        return UploadMode::SinglePut;
+    }
+
+    let ranges = plan_multipart_ranges(file_size, tuning.multipart_part_size_bytes);
+    UploadMode::Multipart {
+        part_size_bytes: compute_multipart_part_size(file_size, tuning.multipart_part_size_bytes),
+        part_count: ranges.len(),
+    }
 }
 
 /// S3 persistence manager
@@ -163,6 +314,7 @@ impl S3Persistence {
 
     /// Download existing state from S3 for resume
     pub async fn download_state(&self) -> Result<DownloadResult> {
+        let tuning = S3TransferTuning::from_env();
         let manifest_key = format!("{}/manifest.json", self.prefix);
 
         // Try to get manifest
@@ -193,52 +345,71 @@ impl S3Persistence {
         eprintln!("S3: Found existing state from run {}", manifest.run_id);
         let total_files = manifest.files.len();
         eprintln!(
-            "S3: [DOWNLOAD] Starting download of {} files...",
-            total_files
+            "S3: [DOWNLOAD] Starting download of {} files with concurrency {}...",
+            total_files, tuning.download_concurrency
         );
 
         // Create local directory
         tokio::fs::create_dir_all(&self.local_dir).await?;
 
-        // Download all files
+        // Download files concurrently to better use available network bandwidth.
         let mut downloaded_bytes = 0u64;
         let mut downloaded_files = 0u64;
         let start_time = std::time::Instant::now();
         let mut last_progress_time = start_time;
 
-        for (rel_path, file_state) in &manifest.files {
-            let local_path = self.local_dir.join(rel_path);
+        let semaphore = Arc::new(Semaphore::new(
+            tuning.download_concurrency.max(1).min(total_files.max(1)),
+        ));
+        let mut join_set = JoinSet::new();
+        let download_jobs: Vec<(String, FileState)> = manifest
+            .files
+            .iter()
+            .map(|(rel_path, file_state)| (rel_path.clone(), file_state.clone()))
+            .collect();
 
-            // Create parent directories
-            if let Some(parent) = local_path.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-
-            // Download file
-            let response = self
-                .client
-                .get_object()
-                .bucket(&self.bucket)
-                .key(&file_state.s3_key)
-                .send()
+        for (rel_path, file_state) in download_jobs {
+            let permit = semaphore
+                .clone()
+                .acquire_owned()
                 .await
-                .context(format!("Failed to download {}", file_state.s3_key))?;
+                .context("S3 download semaphore closed unexpectedly")?;
+            let client = self.client.clone();
+            let bucket = self.bucket.clone();
+            let local_dir = self.local_dir.clone();
+            let uploaded_offsets = Arc::clone(&self.uploaded_offsets);
 
-            let bytes = response.body.collect().await?.into_bytes();
-            tokio::fs::write(&local_path, &bytes).await?;
+            join_set.spawn(async move {
+                let _permit = permit;
+                let local_path = local_dir.join(&rel_path);
+                if let Some(parent) = local_path.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
 
-            downloaded_bytes += bytes.len() as u64;
+                let response = client
+                    .get_object()
+                    .bucket(&bucket)
+                    .key(&file_state.s3_key)
+                    .send()
+                    .await
+                    .context(format!("Failed to download {}", file_state.s3_key))?;
+
+                let bytes = response.body.collect().await?.into_bytes();
+                tokio::fs::write(&local_path, &bytes).await?;
+                uploaded_offsets.insert(rel_path, file_state.uploaded_bytes);
+                Ok::<u64, anyhow::Error>(bytes.len() as u64)
+            });
+        }
+
+        while let Some(result) = join_set.join_next().await {
+            let bytes = result.context("S3 download task panicked")??;
+            downloaded_bytes += bytes;
             downloaded_files += 1;
 
-            // Track as already uploaded
-            self.uploaded_offsets
-                .insert(rel_path.clone(), file_state.uploaded_bytes);
-
-            // Show progress every 2 seconds or every 100 files
             let now = std::time::Instant::now();
             if now.duration_since(last_progress_time).as_secs() >= 2 || downloaded_files % 100 == 0
             {
-                let pct = (downloaded_files as f64 / total_files as f64) * 100.0;
+                let pct = (downloaded_files as f64 / total_files.max(1) as f64) * 100.0;
                 let elapsed = now.duration_since(start_time).as_secs_f64();
                 let rate_mbps = if elapsed > 0.0 {
                     (downloaded_bytes as f64 / 1_048_576.0) / elapsed
@@ -744,91 +915,47 @@ async fn upload_changed_files(
     total_bytes: &AtomicU64,
     total_files: &AtomicU64,
 ) -> Result<UploadScanResult> {
+    let tuning = S3TransferTuning::from_env();
     let mut files_uploaded = 0u64;
     let mut bytes_uploaded = 0u64;
     let mut queue_files_uploaded = 0u64;
     let mut queue_bytes_uploaded = 0u64;
 
-    // Recursively scan local directory
-    let entries = collect_files(local_dir).await?;
+    let pending_uploads = collect_pending_uploads(local_dir, prefix, uploaded_offsets).await?;
+    let semaphore = Arc::new(Semaphore::new(
+        tuning
+            .upload_concurrency
+            .max(1)
+            .min(pending_uploads.len().max(1)),
+    ));
+    let mut join_set = JoinSet::new();
 
-    for entry_path in entries {
-        let rel_path = entry_path
-            .strip_prefix(local_dir)
-            .unwrap_or(&entry_path)
-            .to_string_lossy()
-            .to_string();
+    for upload in pending_uploads {
+        let permit = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .context("S3 upload semaphore closed unexpectedly")?;
+        let client = client.clone();
+        let bucket = bucket.to_string();
 
-        // Skip manifest (we manage it separately)
-        if rel_path == "manifest.json" {
-            continue;
-        }
+        join_set.spawn(async move {
+            let _permit = permit;
+            upload_file(client, bucket, upload, tuning).await
+        });
+    }
 
-        // Get current file size
-        let metadata = match tokio::fs::metadata(&entry_path).await {
-            Ok(m) => m,
-            Err(_) => continue, // File may have been deleted
-        };
-        let current_size = metadata.len();
-
-        // Get previously uploaded offset
-        let uploaded_offset = uploaded_offsets.get(&rel_path).map(|v| *v).unwrap_or(0);
-
-        // Skip if nothing new
-        if current_size <= uploaded_offset {
-            continue;
-        }
-
-        // Calculate bytes to upload
-        let bytes_to_upload = current_size - uploaded_offset;
-
-        // Read the new bytes
-        let mut file = File::open(&entry_path).await?;
-
-        let s3_key = format!("{}/{}", prefix, rel_path);
-
-        if uploaded_offset == 0 {
-            // Fresh upload - upload entire file
-            let mut contents = Vec::with_capacity(current_size as usize);
-            file.read_to_end(&mut contents).await?;
-
-            client
-                .put_object()
-                .bucket(bucket)
-                .key(&s3_key)
-                .body(ByteStream::from(contents))
-                .send()
-                .await
-                .context(format!("Failed to upload {}", s3_key))?;
-        } else {
-            // Incremental upload - we need to re-upload the whole file
-            // S3 doesn't support appending, so we replace the object
-            // This is still efficient because we only upload when there are changes
-            let mut contents = Vec::with_capacity(current_size as usize);
-            file.read_to_end(&mut contents).await?;
-
-            client
-                .put_object()
-                .bucket(bucket)
-                .key(&s3_key)
-                .body(ByteStream::from(contents))
-                .send()
-                .await
-                .context(format!("Failed to upload {}", s3_key))?;
-        }
-
-        // Track queue-spill files separately
-        let is_queue_spill = rel_path.contains("queue-spill") || rel_path.contains("queue/");
-        if is_queue_spill {
+    while let Some(result) = join_set.join_next().await {
+        let completed = result.context("S3 upload task panicked")??;
+        if completed.is_queue_spill {
             queue_files_uploaded += 1;
-            queue_bytes_uploaded += bytes_to_upload;
+            queue_bytes_uploaded += completed.bytes_to_upload;
         }
 
-        // Update tracking
-        uploaded_offsets.insert(rel_path, current_size);
-        bytes_uploaded += bytes_to_upload;
+        uploaded_offsets.insert(completed.rel_path, completed.current_size);
+        bytes_uploaded += completed.bytes_to_upload;
         files_uploaded += 1;
-        total_bytes.fetch_add(bytes_to_upload, Ordering::Relaxed);
+        total_bytes.fetch_add(completed.bytes_to_upload, Ordering::Relaxed);
         total_files.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -838,6 +965,206 @@ async fn upload_changed_files(
         queue_files_uploaded,
         queue_bytes_uploaded,
     })
+}
+
+async fn collect_pending_uploads(
+    local_dir: &Path,
+    prefix: &str,
+    uploaded_offsets: &DashMap<String, u64>,
+) -> Result<Vec<PendingUpload>> {
+    let mut pending = Vec::new();
+    let entries = collect_files(local_dir).await?;
+
+    for entry_path in entries {
+        let rel_path = entry_path
+            .strip_prefix(local_dir)
+            .unwrap_or(&entry_path)
+            .to_string_lossy()
+            .to_string();
+
+        if rel_path == "manifest.json" {
+            continue;
+        }
+
+        let metadata = match tokio::fs::metadata(&entry_path).await {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let current_size = metadata.len();
+        let uploaded_offset = uploaded_offsets.get(&rel_path).map(|v| *v).unwrap_or(0);
+        if current_size <= uploaded_offset {
+            continue;
+        }
+
+        pending.push(PendingUpload {
+            entry_path,
+            rel_path: rel_path.clone(),
+            s3_key: format!("{}/{}", prefix, rel_path),
+            current_size,
+            bytes_to_upload: current_size - uploaded_offset,
+            is_queue_spill: rel_path.contains("queue-spill") || rel_path.contains("queue/"),
+        });
+    }
+
+    Ok(pending)
+}
+
+async fn upload_file(
+    client: Client,
+    bucket: String,
+    upload: PendingUpload,
+    tuning: S3TransferTuning,
+) -> Result<CompletedUpload> {
+    match choose_upload_mode(upload.current_size, tuning) {
+        UploadMode::SinglePut => {
+            let contents = tokio::fs::read(&upload.entry_path).await?;
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(&upload.s3_key)
+                .body(ByteStream::from(contents))
+                .send()
+                .await
+                .context(format!("Failed to upload {}", upload.s3_key))?;
+        }
+        UploadMode::Multipart {
+            part_size_bytes, ..
+        } => {
+            multipart_upload_file(
+                &client,
+                &bucket,
+                &upload.s3_key,
+                &upload.entry_path,
+                upload.current_size,
+                part_size_bytes,
+                tuning.multipart_upload_concurrency,
+            )
+            .await
+            .context(format!("Failed multipart upload for {}", upload.s3_key))?;
+        }
+    }
+
+    Ok(CompletedUpload {
+        rel_path: upload.rel_path,
+        current_size: upload.current_size,
+        bytes_to_upload: upload.bytes_to_upload,
+        is_queue_spill: upload.is_queue_spill,
+    })
+}
+
+async fn multipart_upload_file(
+    client: &Client,
+    bucket: &str,
+    s3_key: &str,
+    entry_path: &Path,
+    file_size: u64,
+    part_size_bytes: usize,
+    multipart_upload_concurrency: usize,
+) -> Result<()> {
+    let create = client
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key(s3_key)
+        .send()
+        .await
+        .context(format!("Failed to start multipart upload for {}", s3_key))?;
+    let upload_id = create
+        .upload_id()
+        .context(format!(
+            "Multipart upload for {} did not return upload_id",
+            s3_key
+        ))?
+        .to_string();
+
+    let ranges = plan_multipart_ranges(file_size, part_size_bytes);
+    let semaphore = Arc::new(Semaphore::new(
+        multipart_upload_concurrency.max(1).min(ranges.len().max(1)),
+    ));
+    let mut join_set = JoinSet::new();
+    let mut file = File::open(entry_path).await?;
+
+    for (part_number, _offset, len) in ranges {
+        let mut chunk = vec![0u8; len];
+        file.read_exact(&mut chunk).await?;
+        let permit = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .context("S3 multipart semaphore closed unexpectedly")?;
+        let client = client.clone();
+        let bucket = bucket.to_string();
+        let s3_key = s3_key.to_string();
+        let upload_id = upload_id.clone();
+
+        join_set.spawn(async move {
+            let _permit = permit;
+            let response = client
+                .upload_part()
+                .bucket(bucket)
+                .key(s3_key)
+                .upload_id(upload_id)
+                .part_number(part_number)
+                .content_length(len as i64)
+                .body(ByteStream::from(chunk))
+                .send()
+                .await?;
+            Ok::<CompletedPart, anyhow::Error>(
+                CompletedPart::builder()
+                    .part_number(part_number)
+                    .set_e_tag(response.e_tag().map(|etag| etag.to_string()))
+                    .build(),
+            )
+        });
+    }
+
+    let mut completed_parts = Vec::new();
+    let mut upload_error = None;
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(Ok(part)) => completed_parts.push(part),
+            Ok(Err(err)) => {
+                upload_error = Some(err);
+                break;
+            }
+            Err(join_err) => {
+                upload_error = Some(anyhow!("S3 multipart task panicked: {}", join_err));
+                break;
+            }
+        }
+    }
+
+    if let Some(err) = upload_error {
+        join_set.abort_all();
+        while join_set.join_next().await.is_some() {}
+        let _ = client
+            .abort_multipart_upload()
+            .bucket(bucket)
+            .key(s3_key)
+            .upload_id(&upload_id)
+            .send()
+            .await;
+        return Err(err);
+    }
+
+    completed_parts.sort_by_key(|part| part.part_number.unwrap_or_default());
+    client
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key(s3_key)
+        .upload_id(&upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .set_parts(Some(completed_parts))
+                .build(),
+        )
+        .send()
+        .await
+        .context(format!(
+            "Failed to complete multipart upload for {}",
+            s3_key
+        ))?;
+
+    Ok(())
 }
 
 /// Recursively collect all files in a directory
@@ -1097,6 +1424,7 @@ async fn prune_deleted_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn test_manifest_serialization() {
@@ -1190,5 +1518,71 @@ mod tests {
         let json = serde_json::to_string(&checkpoint_none).unwrap();
         let parsed: CheckpointState = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.min_segment_id, None);
+    }
+
+    #[test]
+    fn chooses_single_put_below_threshold_and_multipart_above_it() {
+        let tuning = S3TransferTuning {
+            multipart_threshold_bytes: 64 * 1024 * 1024,
+            ..S3TransferTuning::default()
+        };
+
+        assert_eq!(
+            choose_upload_mode(63 * 1024 * 1024, tuning),
+            UploadMode::SinglePut
+        );
+
+        match choose_upload_mode(96 * 1024 * 1024, tuning) {
+            UploadMode::Multipart {
+                part_size_bytes,
+                part_count,
+            } => {
+                assert!(part_size_bytes >= S3_MIN_MULTIPART_PART_SIZE_BYTES);
+                assert!(part_count >= 2);
+            }
+            UploadMode::SinglePut => panic!("expected multipart upload for large object"),
+        }
+    }
+
+    #[test]
+    fn multipart_ranges_expand_part_size_to_stay_under_s3_limit() {
+        let file_size =
+            (S3_MAX_MULTIPART_PARTS as u64 * S3_MIN_MULTIPART_PART_SIZE_BYTES as u64) + 1;
+        let part_size = compute_multipart_part_size(file_size, S3_MIN_MULTIPART_PART_SIZE_BYTES);
+        let ranges = plan_multipart_ranges(file_size, S3_MIN_MULTIPART_PART_SIZE_BYTES);
+
+        assert!(part_size > S3_MIN_MULTIPART_PART_SIZE_BYTES);
+        assert!(ranges.len() <= S3_MAX_MULTIPART_PARTS);
+        assert_eq!(ranges.first().unwrap().1, 0);
+        let total_len: u64 = ranges.iter().map(|(_, _, len)| *len as u64).sum();
+        assert_eq!(total_len, file_size);
+    }
+
+    proptest! {
+        #[test]
+        fn multipart_ranges_cover_the_object_without_gaps(
+            file_size in 1u64..(512 * 1024 * 1024u64),
+            preferred_mb in 1usize..64usize,
+        ) {
+            let preferred_part_size = preferred_mb * 1024 * 1024;
+            let ranges = plan_multipart_ranges(file_size, preferred_part_size);
+            prop_assert!(!ranges.is_empty());
+            prop_assert!(ranges.len() <= S3_MAX_MULTIPART_PARTS);
+
+            let computed_part_size = compute_multipart_part_size(file_size, preferred_part_size);
+            let mut expected_offset = 0u64;
+            for (idx, (part_number, offset, len)) in ranges.iter().enumerate() {
+                prop_assert_eq!(*part_number as usize, idx + 1);
+                prop_assert_eq!(*offset, expected_offset);
+                prop_assert!(*len > 0);
+                if idx + 1 < ranges.len() {
+                    prop_assert_eq!(*len, computed_part_size);
+                } else {
+                    prop_assert!(*len <= computed_part_size);
+                }
+                expected_offset += *len as u64;
+            }
+            prop_assert_eq!(expected_offset, file_size);
+        }
     }
 }
