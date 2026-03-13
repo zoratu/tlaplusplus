@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TlaDefinition {
@@ -72,6 +72,47 @@ pub fn parse_tla_module_file(path: &Path) -> Result<TlaModule> {
     parse_tla_module_file_with_visited(path, &mut HashSet::new())
 }
 
+fn library_search_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    if let Ok(paths) = std::env::var("TLA_LIBRARY_PATH") {
+        for path in std::env::split_paths(&paths) {
+            roots.push(path);
+        }
+    }
+
+    if let Ok(home) = std::env::var("HOME") {
+        let home = PathBuf::from(home);
+        roots.push(home.join("src/CommunityModules/modules"));
+        roots.push(home.join("src/communitymodules/modules"));
+        roots.push(home.join("src/tlaplus-community-modules/modules"));
+        roots.push(home.join("src/tlaplus/CommunityModules/modules"));
+    }
+
+    roots
+}
+
+fn resolve_module_path(base_path: &Path, module_name: &str) -> Option<PathBuf> {
+    resolve_module_path_with_roots(base_path, module_name, &library_search_roots())
+}
+
+fn resolve_module_path_with_roots(
+    base_path: &Path,
+    module_name: &str,
+    library_roots: &[PathBuf],
+) -> Option<PathBuf> {
+    let module_dir = base_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut candidates = Vec::with_capacity(1 + library_roots.len());
+    candidates.push(module_dir.join(format!("{module_name}.tla")));
+    candidates.extend(
+        library_roots
+            .iter()
+            .map(|root| root.join(format!("{module_name}.tla"))),
+    );
+
+    candidates.into_iter().find(|candidate| candidate.exists())
+}
+
 /// Internal function that tracks visited modules to detect circular EXTENDS.
 fn parse_tla_module_file_with_visited(
     path: &Path,
@@ -98,15 +139,20 @@ fn parse_tla_module_file_with_visited(
             module.name
         ));
     }
-    visited.insert(canonical_path);
+    visited.insert(canonical_path.clone());
 
-    // Load extended modules and merge their definitions
-    load_extended_modules(&mut module, path, visited)?;
+    let result = (|| {
+        // Load extended modules and merge their definitions
+        load_extended_modules(&mut module, path, visited)?;
 
-    // Load module instances
-    load_module_instances(&mut module, path)?;
+        // Load module instances
+        load_module_instances(&mut module, path)?;
 
-    Ok(module)
+        Ok(module)
+    })();
+
+    visited.remove(&canonical_path);
+    result
 }
 
 /// Load modules referenced by EXTENDS declarations and merge their definitions
@@ -119,8 +165,6 @@ fn load_extended_modules(
     base_path: &Path,
     visited: &mut HashSet<String>,
 ) -> Result<()> {
-    let module_dir = base_path.parent().unwrap_or_else(|| Path::new("."));
-
     for extended_name in module.extends.clone() {
         // Skip built-in modules - their operators are implemented in the evaluator
         if is_builtin_module(&extended_name) {
@@ -128,9 +172,7 @@ fn load_extended_modules(
         }
 
         // Try to find the extended module file
-        let extended_path = module_dir.join(format!("{}.tla", extended_name));
-
-        if extended_path.exists() {
+        if let Some(extended_path) = resolve_module_path(base_path, &extended_name) {
             // Load the extended module recursively
             let extended_module = parse_tla_module_file_with_visited(&extended_path, visited)
                 .with_context(|| {
@@ -181,6 +223,8 @@ fn load_extended_modules(
                 module.is_pluscal = true;
             }
         } else {
+            let module_dir = base_path.parent().unwrap_or_else(|| Path::new("."));
+            let extended_path = module_dir.join(format!("{}.tla", extended_name));
             // Extended module not found - this might be an error or a missing dependency
             eprintln!(
                 "Warning: Extended module '{}' not found at {}",
@@ -203,14 +247,10 @@ fn detect_pluscal(raw: &str) -> bool {
 
 /// Load modules referenced by INSTANCE declarations
 fn load_module_instances(module: &mut TlaModule, base_path: &Path) -> Result<()> {
-    let module_dir = base_path.parent().unwrap_or_else(|| Path::new("."));
-
     // Load named instances (Alias == INSTANCE M)
     for (alias, instance) in module.instances.iter_mut() {
         // Try to find the module file
-        let instance_path = module_dir.join(format!("{}.tla", instance.module_name));
-
-        if instance_path.exists() {
+        if let Some(instance_path) = resolve_module_path(base_path, &instance.module_name) {
             // Load the module
             let instance_module = parse_tla_module_file(&instance_path).with_context(|| {
                 format!(
@@ -221,6 +261,8 @@ fn load_module_instances(module: &mut TlaModule, base_path: &Path) -> Result<()>
 
             instance.module = Some(Box::new(instance_module));
         } else {
+            let module_dir = base_path.parent().unwrap_or_else(|| Path::new("."));
+            let instance_path = module_dir.join(format!("{}.tla", instance.module_name));
             // Check if it's a built-in module that we can skip
             if !is_builtin_module(&instance.module_name) {
                 eprintln!(
@@ -242,9 +284,7 @@ fn load_module_instances(module: &mut TlaModule, base_path: &Path) -> Result<()>
             continue;
         }
 
-        let instance_path = module_dir.join(format!("{}.tla", instance.module_name));
-
-        if instance_path.exists() {
+        if let Some(instance_path) = resolve_module_path(base_path, &instance.module_name) {
             let instance_module = parse_tla_module_file(&instance_path).with_context(|| {
                 format!(
                     "failed to load unnamed instance module '{}'",
@@ -254,6 +294,8 @@ fn load_module_instances(module: &mut TlaModule, base_path: &Path) -> Result<()>
 
             modules_to_merge.push((idx, instance_module, instance.substitutions.clone()));
         } else {
+            let module_dir = base_path.parent().unwrap_or_else(|| Path::new("."));
+            let instance_path = module_dir.join(format!("{}.tla", instance.module_name));
             eprintln!(
                 "Warning: Unnamed instance module '{}' not found at {}",
                 instance.module_name,
@@ -1484,6 +1526,12 @@ enum NameListMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn tla_library_path_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn parses_basic_module_bits() {
@@ -1811,6 +1859,117 @@ TypeOK == small \in 0..MaxVal /\ big \in 0..MaxVal
     }
 
     #[test]
+    fn extends_can_load_modules_from_tla_library_path() {
+        use std::fs;
+
+        let _guard = tla_library_path_lock().lock().expect("env lock");
+        let original = std::env::var_os("TLA_LIBRARY_PATH");
+
+        let tmp = std::env::temp_dir().join("tlapp-extends-library-path-test");
+        let _ = fs::remove_dir_all(&tmp);
+        let spec_dir = tmp.join("spec");
+        let lib_dir = tmp.join("lib");
+        fs::create_dir_all(&spec_dir).expect("spec dir should exist");
+        fs::create_dir_all(&lib_dir).expect("lib dir should exist");
+
+        fs::write(
+            lib_dir.join("ExtraMath.tla"),
+            r#"
+---- MODULE ExtraMath ----
+One == 1
+====
+"#,
+        )
+        .expect("library module should be written");
+
+        let entry = spec_dir.join("MC.tla");
+        fs::write(
+            &entry,
+            r#"
+---- MODULE MC ----
+EXTENDS ExtraMath
+
+Init == x = One
+====
+"#,
+        )
+        .expect("entry module should be written");
+
+        unsafe {
+            std::env::set_var("TLA_LIBRARY_PATH", &lib_dir);
+        }
+        let parsed = parse_tla_module_file(&entry).expect("parse should load library module");
+        assert!(parsed.definitions.contains_key("One"));
+        assert_eq!(parsed.definitions.get("One").unwrap().body.trim(), "1");
+
+        if let Some(value) = original {
+            unsafe {
+                std::env::set_var("TLA_LIBRARY_PATH", value);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("TLA_LIBRARY_PATH");
+            }
+        }
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn instances_can_load_modules_from_tla_library_path() {
+        use std::fs;
+
+        let _guard = tla_library_path_lock().lock().expect("env lock");
+        let original = std::env::var_os("TLA_LIBRARY_PATH");
+
+        let tmp = std::env::temp_dir().join("tlapp-instance-library-path-test");
+        let _ = fs::remove_dir_all(&tmp);
+        let spec_dir = tmp.join("spec");
+        let lib_dir = tmp.join("lib");
+        fs::create_dir_all(&spec_dir).expect("spec dir should exist");
+        fs::create_dir_all(&lib_dir).expect("lib dir should exist");
+
+        fs::write(
+            lib_dir.join("Helper.tla"),
+            r#"
+---- MODULE Helper ----
+Value == 42
+====
+"#,
+        )
+        .expect("library module should be written");
+
+        let entry = spec_dir.join("MC.tla");
+        fs::write(
+            &entry,
+            r#"
+---- MODULE MC ----
+Alias == INSTANCE Helper
+====
+"#,
+        )
+        .expect("entry module should be written");
+
+        unsafe {
+            std::env::set_var("TLA_LIBRARY_PATH", &lib_dir);
+        }
+        let parsed = parse_tla_module_file(&entry).expect("parse should load instance module");
+        let alias = parsed.instances.get("Alias").expect("instance should be present");
+        assert_eq!(alias.module_name, "Helper");
+        assert!(alias.module.is_some(), "instance module should be loaded");
+
+        if let Some(value) = original {
+            unsafe {
+                std::env::set_var("TLA_LIBRARY_PATH", value);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("TLA_LIBRARY_PATH");
+            }
+        }
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn extends_local_definitions_override_inherited() {
         use std::fs;
 
@@ -1947,6 +2106,67 @@ TopOp == x + 3
         );
 
         // Clean up
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn shared_extends_dependencies_are_not_treated_as_circular() {
+        use std::fs;
+
+        let tmp = std::env::temp_dir().join("tlapp-extends-diamond-test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should be created");
+
+        fs::write(
+            tmp.join("Shared.tla"),
+            r#"
+---- MODULE Shared ----
+SharedOp == 1
+====
+"#,
+        )
+        .expect("shared module should be written");
+
+        fs::write(
+            tmp.join("Left.tla"),
+            r#"
+---- MODULE Left ----
+EXTENDS Shared
+LeftOp == SharedOp + 1
+====
+"#,
+        )
+        .expect("left module should be written");
+
+        fs::write(
+            tmp.join("Right.tla"),
+            r#"
+---- MODULE Right ----
+EXTENDS Shared
+RightOp == SharedOp + 2
+====
+"#,
+        )
+        .expect("right module should be written");
+
+        let root = tmp.join("Root.tla");
+        fs::write(
+            &root,
+            r#"
+---- MODULE Root ----
+EXTENDS Left, Right
+RootOp == LeftOp + RightOp
+====
+"#,
+        )
+        .expect("root module should be written");
+
+        let module = parse_tla_module_file(&root).expect("diamond extends should parse");
+        assert!(module.definitions.contains_key("SharedOp"));
+        assert!(module.definitions.contains_key("LeftOp"));
+        assert!(module.definitions.contains_key("RightOp"));
+        assert!(module.definitions.contains_key("RootOp"));
+
         let _ = fs::remove_dir_all(&tmp);
     }
 
