@@ -18,7 +18,7 @@
 //! s3.emergency_flush().await?;  // On SIGTERM
 //! ```
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use aws_config::BehaviorVersion;
 use aws_config::Region;
 use aws_sdk_s3::Client;
