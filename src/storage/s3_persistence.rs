@@ -182,11 +182,29 @@ impl S3Persistence {
                 manifest
             }
             Err(e) => {
-                // Check if it's a "not found" error
-                if e.to_string().contains("NoSuchKey") || e.to_string().contains("404") {
+                let err_str = e.to_string();
+                // Check if it's a "not found" error - the manifest may not exist yet
+                if err_str.contains("NoSuchKey")
+                    || err_str.contains("404")
+                    || err_str.contains("Not Found")
+                    || err_str.contains("AccessDenied")
+                {
+                    if err_str.contains("AccessDenied") {
+                        eprintln!(
+                            "S3: Warning: AccessDenied reading manifest at s3://{}/{} \
+                             (check IAM permissions for s3:GetObject)",
+                            self.bucket, manifest_key
+                        );
+                    }
                     return Ok(DownloadResult::NoExistingState);
                 }
-                return Err(anyhow!("Failed to get manifest from S3: {}", e));
+                // For service errors (wrong region, network, etc.), warn and start fresh
+                // rather than failing hard - the checkpoint will be created on first write
+                eprintln!(
+                    "S3: Warning: could not read manifest from s3://{}/{}: {}",
+                    self.bucket, manifest_key, err_str
+                );
+                return Ok(DownloadResult::NoExistingState);
             }
         };
 
