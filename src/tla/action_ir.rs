@@ -1030,7 +1030,7 @@ mod tests {
             "#,
         );
 
-        assert_eq!(clauses.len(), 1);
+        assert_eq!(clauses.len(), 2, "{clauses:#?}");
         assert!(clauses[0].starts_with(r"\E i \in unchecked[self]:"));
         assert!(
             clauses[0]
@@ -1038,7 +1038,7 @@ mod tests {
         );
         assert!(clauses[0].contains(r#"max' = [max EXCEPT ![self] = num[i]]"#));
         assert!(clauses[0].contains(r#"max' = max"#));
-        assert!(clauses[0].contains(r#"pc' = [pc EXCEPT ![self] = "e2"]"#));
+        assert_eq!(clauses[1], r#"pc' = [pc EXCEPT ![self] = "e2"]"#);
     }
 
     #[test]

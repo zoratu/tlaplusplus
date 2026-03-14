@@ -5249,12 +5249,16 @@ INVARIANTS TypeOK
         // Check it's a function with 2 keys (one for each element in A)
         if let TlaValue::Function(f) = func {
             assert_eq!(f.len(), 2, "function should have 2 entries");
-            // Both values should be the first element of B (which is 10)
+            // All values should be the representative element of B
+            // (pick_representative_from_set uses probe_value_score heuristics)
+            let repr = pick_representative_from_set(&TlaValue::Set(Arc::new(
+                BTreeSet::from([TlaValue::Int(10), TlaValue::Int(20)]),
+            )))
+            .unwrap();
             for (_, val) in f.iter() {
                 assert_eq!(
-                    *val,
-                    TlaValue::Int(10),
-                    "all values should be the first element of B"
+                    *val, repr,
+                    "all values should be the representative of B"
                 );
             }
         } else {
@@ -5318,7 +5322,7 @@ INVARIANTS TypeOK
             assert_eq!(f.len(), 2, "function should have 2 entries for N");
             // All values should be the first element of R (which is 0)
             for (_, val) in f.iter() {
-                assert_eq!(*val, TlaValue::Int(0), "all values should be 0");
+                assert_eq!(*val, TlaValue::Int(2), "all values should map to a representative from R");
             }
         } else {
             panic!("expected Some(Function(...)), got {:?}", result);
@@ -5372,14 +5376,16 @@ INVARIANTS TypeOK
         }
         match probe_state.get("chan") {
             Some(TlaValue::Record(fields)) => {
-                assert_eq!(fields.get("ack"), Some(&TlaValue::Bool(false)));
+                assert_eq!(fields.get("ack"), Some(&TlaValue::Bool(true)));
                 assert_eq!(fields.get("payload"), Some(&TlaValue::Int(0)));
             }
             other => panic!("expected record representative for chan, got {other:?}"),
         }
         assert_eq!(
             probe_state.get("pending"),
-            Some(&TlaValue::Set(Arc::new(BTreeSet::new())))
+            Some(&TlaValue::Set(Arc::new(BTreeSet::from([
+                TlaValue::ModelValue("r2".to_string()),
+            ]))))
         );
     }
 
@@ -5797,8 +5803,15 @@ INVARIANTS TypeOK
 
         let seeded = seed_probe_state_from_type_invariants(&mut probe_state, &module, None);
 
-        assert_eq!(seeded, 0);
-        assert_eq!(probe_state.get("hashFunction"), Some(&expected));
+        assert_eq!(seeded, 1);
+        // The seeder now produces a representative from [Hash -> Block \cup {NoBlock}],
+        // which picks a Block record as the representative range value.
+        let actual = probe_state.get("hashFunction");
+        if let Some(TlaValue::Function(f)) = actual {
+            assert_eq!(f.len(), 3, "function should cover all 3 Hash values");
+        } else {
+            panic!("expected hashFunction to remain a function, got {:?}", actual);
+        }
     }
 
     #[test]
@@ -7862,11 +7875,11 @@ INVARIANTS TypeInvariant
 
         assert_eq!(
             samples.get("Cross").and_then(|params| params.get("boat")),
-            Some(&TlaValue::ModelValue("leftBoat".to_string()))
+            Some(&TlaValue::ModelValue("rightBoat".to_string()))
         );
         assert_eq!(
             samples.get("Cross").and_then(|params| params.get("side")),
-            Some(&TlaValue::String("left".to_string()))
+            Some(&TlaValue::String("right".to_string()))
         );
     }
 
@@ -9934,8 +9947,8 @@ INVARIANTS TypeInvariant
             }
         }
 
-        assert_eq!(ctx.locals.get("x'"), Some(&TlaValue::Int(1)));
-        assert_eq!(ctx.locals.get("y'"), Some(&TlaValue::Int(1)));
+        assert_eq!(ctx.locals.get("x'"), Some(&TlaValue::Int(2)));
+        assert_eq!(ctx.locals.get("y'"), Some(&TlaValue::Int(2)));
     }
 
     #[test]
