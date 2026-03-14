@@ -161,7 +161,10 @@ fn resolve_module_path_with_roots(
         .or_else(|| resolve_unique_module_path_in_ancestor_tree(base_path, module_name))
 }
 
-fn resolve_unique_module_path_in_ancestor_tree(base_path: &Path, module_name: &str) -> Option<PathBuf> {
+fn resolve_unique_module_path_in_ancestor_tree(
+    base_path: &Path,
+    module_name: &str,
+) -> Option<PathBuf> {
     let module_dir = base_path.parent().unwrap_or_else(|| Path::new("."));
     let repo_root = module_dir
         .ancestors()
@@ -205,7 +208,9 @@ fn find_unique_module_in_tree(root: &Path, module_name: &str) -> Option<PathBuf>
                 let skip = path
                     .file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with('.') || matches!(name, "target" | "node_modules"));
+                    .is_some_and(|name| {
+                        name.starts_with('.') || matches!(name, "target" | "node_modules")
+                    });
                 if !skip {
                     queue.push_back(path);
                 }
@@ -2228,8 +2233,10 @@ SharedDef == TRUE
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(tmp.join(".git")).expect("git dir should exist");
         fs::create_dir_all(tmp.join("specifications/spec_a")).expect("spec dir should exist");
-        fs::create_dir_all(tmp.join("specifications/one")).expect("first candidate dir should exist");
-        fs::create_dir_all(tmp.join("specifications/two")).expect("second candidate dir should exist");
+        fs::create_dir_all(tmp.join("specifications/one"))
+            .expect("first candidate dir should exist");
+        fs::create_dir_all(tmp.join("specifications/two"))
+            .expect("second candidate dir should exist");
 
         let entry = tmp.join("specifications/spec_a/Entry.tla");
         fs::write(

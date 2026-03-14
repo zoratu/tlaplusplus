@@ -1070,7 +1070,10 @@ mod tests {
             is_recursive: false,
         };
         let ir = compile_action_ir(&def);
-        assert!(matches!(ir.clauses[1], ActionClause::Exists { .. }), "{ir:?}");
+        assert!(
+            matches!(ir.clauses[1], ActionClause::Exists { .. }),
+            "{ir:?}"
+        );
     }
 
     #[test]
