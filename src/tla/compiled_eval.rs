@@ -1674,12 +1674,12 @@ fn eval_builtin_bounded_seq(domain: &TlaValue, max_len: i64) -> Result<TlaValue>
 fn eval_builtin_tlc_get(key: &TlaValue) -> Result<TlaValue> {
     match key {
         TlaValue::String(name) if name == "level" => Ok(TlaValue::Int(0)),
-        TlaValue::String(name) if name == "config" => Ok(TlaValue::Record(Arc::new(
-            BTreeMap::from([
+        TlaValue::String(name) if name == "config" => {
+            Ok(TlaValue::Record(Arc::new(BTreeMap::from([
                 ("mode".to_string(), TlaValue::String("bfs".to_string())),
                 ("worker".to_string(), TlaValue::Int(1)),
-            ]),
-        ))),
+            ]))))
+        }
         TlaValue::Int(slot) if *slot == 2 || *slot == 3 => Ok(TlaValue::Int(999)),
         TlaValue::Int(_) => Ok(TlaValue::Int(0)),
         other => Err(anyhow!("unsupported TLCGet key: {:?}", other)),

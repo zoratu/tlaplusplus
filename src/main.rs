@@ -4369,12 +4369,7 @@ fn body_contains_contextual_probeable_action_call(
     let clauses = split_top_level(trimmed, "/\\");
     if clauses.len() > 1 || trimmed.starts_with("/\\") {
         return clauses.into_iter().any(|clause| {
-            body_contains_contextual_probeable_action_call(
-                &clause,
-                definitions,
-                instances,
-                visited,
-            )
+            body_contains_contextual_probeable_action_call(&clause, definitions, instances, visited)
         });
     }
 
@@ -4686,7 +4681,13 @@ fn probe_exists_action_body(
     let local_bindings = (*ctx.locals).clone();
     let definitions = ctx.definitions.unwrap_or(ctx.local_definitions.as_ref());
     let bound = if let Some(instances) = ctx.instances {
-        sample_exists_quantifier_binders(binders, &local_bindings, ctx.state, definitions, instances)
+        sample_exists_quantifier_binders(
+            binders,
+            &local_bindings,
+            ctx.state,
+            definitions,
+            instances,
+        )
     } else {
         sample_exists_quantifier_binders(
             binders,
@@ -5251,15 +5252,13 @@ INVARIANTS TypeOK
             assert_eq!(f.len(), 2, "function should have 2 entries");
             // All values should be the representative element of B
             // (pick_representative_from_set uses probe_value_score heuristics)
-            let repr = pick_representative_from_set(&TlaValue::Set(Arc::new(
-                BTreeSet::from([TlaValue::Int(10), TlaValue::Int(20)]),
-            )))
+            let repr = pick_representative_from_set(&TlaValue::Set(Arc::new(BTreeSet::from([
+                TlaValue::Int(10),
+                TlaValue::Int(20),
+            ]))))
             .unwrap();
             for (_, val) in f.iter() {
-                assert_eq!(
-                    *val, repr,
-                    "all values should be the representative of B"
-                );
+                assert_eq!(*val, repr, "all values should be the representative of B");
             }
         } else {
             panic!("expected Function, got {:?}", func);
@@ -5322,7 +5321,11 @@ INVARIANTS TypeOK
             assert_eq!(f.len(), 2, "function should have 2 entries for N");
             // All values should be the first element of R (which is 0)
             for (_, val) in f.iter() {
-                assert_eq!(*val, TlaValue::Int(2), "all values should map to a representative from R");
+                assert_eq!(
+                    *val,
+                    TlaValue::Int(2),
+                    "all values should map to a representative from R"
+                );
             }
         } else {
             panic!("expected Some(Function(...)), got {:?}", result);
@@ -5810,7 +5813,10 @@ INVARIANTS TypeOK
         if let Some(TlaValue::Function(f)) = actual {
             assert_eq!(f.len(), 3, "function should cover all 3 Hash values");
         } else {
-            panic!("expected hashFunction to remain a function, got {:?}", actual);
+            panic!(
+                "expected hashFunction to remain a function, got {:?}",
+                actual
+            );
         }
     }
 
@@ -8009,9 +8015,7 @@ INVARIANTS TypeInvariant
         );
 
         assert_eq!(
-            samples
-                .get("Phase1c")
-                .and_then(|params| params.get("self")),
+            samples.get("Phase1c").and_then(|params| params.get("self")),
             Some(&TlaValue::Int(0))
         );
         let sample = samples
@@ -9674,7 +9678,9 @@ INVARIANTS TypeInvariant
         for clause in expand_state_predicate_clauses(&init_def.body, &defs, &instances) {
             match classify_clause(&clause) {
                 ClauseKind::UnprimedEquality { var, expr } => pending_eq.push((var, expr)),
-                ClauseKind::UnprimedMembership { var, set_expr } => pending_mem.push((var, set_expr)),
+                ClauseKind::UnprimedMembership { var, set_expr } => {
+                    pending_mem.push((var, set_expr))
+                }
                 _ => {}
             }
         }
@@ -9732,8 +9738,14 @@ INVARIANTS TypeInvariant
             .get("NextParallelFreeze")
             .expect("freeze action should exist");
         let ir = compile_action_ir(freeze_def);
-        let mut action_ctx =
-            build_action_expr_probe_context(&probe_state, &defs, &instances, &[], &ir.clauses, None);
+        let mut action_ctx = build_action_expr_probe_context(
+            &probe_state,
+            &defs,
+            &instances,
+            &[],
+            &ir.clauses,
+            None,
+        );
         for clause in &ir.clauses {
             if let Some(result) = probe_action_clause_expr(clause, &mut action_ctx) {
                 result.expect("seeded DieHard probe action should succeed");
