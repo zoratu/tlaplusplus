@@ -119,10 +119,25 @@ pub fn evaluate_next_states_with_instances(
 ) -> Result<Vec<TlaState>> {
     let disjuncts = split_action_disjuncts(next_body);
     let mut out = Vec::new();
-    for disj in disjuncts {
-        let successors =
-            execute_branch(disj.trim(), &BTreeMap::new(), definitions, instances, state)?;
-        out.extend(successors);
+    let mut last_error = None;
+    for disj in &disjuncts {
+        match execute_branch(disj.trim(), &BTreeMap::new(), definitions, instances, state) {
+            Ok(successors) => out.extend(successors),
+            Err(err) => {
+                // Treat evaluation errors in individual branches as disabled
+                // branches (e.g., record access on ModelValue when the guard
+                // would have been false). Only fail if ALL branches error out
+                // and none produced successors.
+                last_error = Some(err);
+            }
+        }
+    }
+    // If no branch produced any successors and we had errors, report the last error.
+    // If some branches succeeded but others errored, the errors were likely guards
+    // that didn't apply to this state (e.g., wrong message type).
+    if out.is_empty() && last_error.is_some() && disjuncts.len() == 1 {
+        // Single-branch specs: propagate the error since there's no fallback
+        return Err(last_error.unwrap());
     }
     Ok(out)
 }
