@@ -266,6 +266,10 @@ enum Command {
         init: Option<String>,
         #[arg(long)]
         next: Option<String>,
+        /// Allow deadlocked states (no successors) without error.
+        /// Equivalent to TLC's CHECK_DEADLOCK FALSE or -deadlock flag.
+        #[arg(long, default_value_t = false)]
+        allow_deadlock: bool,
         #[command(flatten)]
         runtime: RuntimeArgs,
         #[command(flatten)]
@@ -574,6 +578,24 @@ where
                     eprintln!("   S3 emergency flush failed: {}", e);
                 } else {
                     eprintln!("   S3 emergency flush complete!");
+                }
+                // Upload manifest so the next run can find our checkpoint data.
+                // Without this, the checkpoint files exist in S3 but the resume
+                // logic can't locate them.
+                let checkpoint = tlaplusplus::storage::s3_persistence::CheckpointState {
+                    id: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                    states_generated: 0, // Unknown at signal time
+                    states_distinct: 0,
+                    queue_pending: 0,
+                    min_segment_id: None,
+                };
+                if let Err(e) = persist.upload_manifest(Some(checkpoint)).await {
+                    eprintln!("   S3 manifest upload failed: {}", e);
+                } else {
+                    eprintln!("   S3 manifest uploaded for resume!");
                 }
                 if let Err(e) = persist.stop().await {
                     eprintln!("   S3 stop failed: {}", e);
@@ -1229,6 +1251,7 @@ fn main() -> anyhow::Result<()> {
             config,
             init,
             next,
+            allow_deadlock,
             runtime,
             storage,
             s3,
@@ -1244,7 +1267,7 @@ fn main() -> anyhow::Result<()> {
                 }
             });
 
-            let model = TlaModel::from_files(
+            let mut model = TlaModel::from_files(
                 &module,
                 config_path.as_deref(),
                 init.as_deref(),
@@ -1259,6 +1282,11 @@ fn main() -> anyhow::Result<()> {
                 eprintln!("  Error: {}", e);
                 e
             })?;
+
+            // CLI --allow-deadlock overrides config CHECK_DEADLOCK
+            if allow_deadlock {
+                model.allow_deadlock = true;
+            }
 
             // Print TLC-compatible output
             let start_time = chrono::Local::now();

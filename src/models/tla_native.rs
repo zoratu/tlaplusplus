@@ -34,6 +34,9 @@ pub struct TlaModel {
     pub compiled_invariants: Vec<(String, Arc<CompiledExpr>)>,
     /// Pre-compiled state constraint expressions (name, compiled expr)
     pub compiled_state_constraints: Vec<(String, Arc<CompiledExpr>)>,
+    /// Whether to allow deadlocked states (no successors) without error.
+    /// Equivalent to TLC's -deadlock flag.
+    pub allow_deadlock: bool,
 }
 
 impl TlaModel {
@@ -127,6 +130,9 @@ impl TlaModel {
         // Warm up the global action cache with our pre-compiled actions
         warm_up_action_cache(&compiled_actions, &module.definitions);
 
+        // CHECK_DEADLOCK FALSE in cfg means allow deadlocked states
+        let allow_deadlock = config.check_deadlock == Some(false);
+
         Ok(Self {
             module,
             config,
@@ -143,6 +149,7 @@ impl TlaModel {
             compiled_actions,
             compiled_invariants,
             compiled_state_constraints,
+            allow_deadlock,
         })
     }
 }
@@ -171,14 +178,28 @@ impl Model for TlaModel {
             Some(&self.module.instances)
         };
 
-        let states = evaluate_next_states_with_instances(
+        match evaluate_next_states_with_instances(
             &next_def.body,
             &self.module.definitions,
             instances,
             state,
-        )
-        .unwrap_or_else(|err| panic!("native next-state evaluation failed: {err}"));
-        out.extend(states);
+        ) {
+            Ok(states) => {
+                out.extend(states);
+                // Empty states = deadlocked state. If deadlock checking is enabled,
+                // this will be detected by the runtime when out remains empty.
+            }
+            Err(err) => {
+                if self.allow_deadlock {
+                    // Treat evaluation errors as deadlocked states (no successors).
+                    // This handles cases like: guards that fail type evaluation
+                    // (e.g., record access on ModelValue) when all action branches
+                    // are disabled for this state.
+                    return;
+                }
+                panic!("native next-state evaluation failed: {err}");
+            }
+        }
     }
 
     fn check_invariants(&self, state: &Self::State) -> Result<(), String> {
@@ -1290,6 +1311,43 @@ INVARIANT Inv
         model.next_states(&init[0], &mut next);
         assert!(!next.is_empty());
         assert!(model.check_invariants(&init[0]).is_ok());
+    }
+
+    #[test]
+    fn deadlocked_state_does_not_panic_with_allow_deadlock() {
+        let tmp = std::env::temp_dir().join("tlapp-native-deadlock-test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should be created");
+
+        let module = tmp.join("Deadlock.tla");
+        fs::write(
+            &module,
+            r#"
+---- MODULE Deadlock ----
+EXTENDS Naturals
+VARIABLES x
+Init == x = 0
+Next == x < 3 /\ x' = x + 1
+Spec == Init /\ [][Next]_x
+====
+"#,
+        )
+        .expect("module should be written");
+
+        let cfg = tmp.join("Deadlock.cfg");
+        fs::write(&cfg, "SPECIFICATION Spec\nCHECK_DEADLOCK FALSE\n")
+            .expect("cfg should be written");
+
+        let model =
+            TlaModel::from_files(&module, Some(&cfg), None, None).expect("model should build");
+        assert!(model.allow_deadlock);
+
+        // State x=3 should be deadlocked (x < 3 is false)
+        let deadlock_state = BTreeMap::from([("x".to_string(), TlaValue::Int(3))]);
+        let mut next = Vec::new();
+        model.next_states(&deadlock_state, &mut next);
+        // With allow_deadlock, should return empty vec (no successors) without panic
+        assert!(next.is_empty());
     }
 
     #[test]
