@@ -3147,3 +3147,297 @@ fn test_compiled_sequence_builtins_accept_sequence_like_functions() {
         ]))
     );
 }
+
+#[cfg(test)]
+mod compiled_action_correctness_tests {
+    use super::*;
+    use crate::tla::compiled_expr::CompiledActionIr;
+    use crate::tla::{ActionClause, ActionIr, EvalContext, TlaState, TlaValue};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    fn compile_and_run(
+        clauses: Vec<ActionClause>,
+        state: &TlaState,
+        ctx: &EvalContext<'_>,
+    ) -> Vec<TlaState> {
+        let ir = ActionIr {
+            name: "Test".to_string(),
+            params: vec![],
+            clauses,
+        };
+        let compiled = CompiledActionIr::from_ir(&ir);
+        apply_compiled_action_ir_multi(&compiled, state, ctx)
+            .expect("compiled eval should not error")
+    }
+
+    /// Compiled \A guard must block when quantifier body is false for some element.
+    #[test]
+    fn forall_guard_blocks_when_false() {
+        let state = TlaState::from([(
+            "locked".to_string(),
+            TlaValue::Function(Arc::new(BTreeMap::from([
+                (TlaValue::String("p1".to_string()), TlaValue::Bool(true)),
+                (TlaValue::String("p2".to_string()), TlaValue::Bool(false)),
+            ]))),
+        )]);
+        let mut defs = BTreeMap::new();
+        defs.insert(
+            "Procs".to_string(),
+            crate::tla::TlaDefinition {
+                name: "Procs".to_string(),
+                params: vec![],
+                body: r#"{"p1", "p2"}"#.to_string(),
+                is_recursive: false,
+            },
+        );
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        // \A p \in Procs : ~locked[p]
+        // p1 is locked, so this should be FALSE → no successors
+        let result = compile_and_run(
+            vec![
+                ActionClause::Guard {
+                    expr: r#"\A p \in Procs : ~locked[p]"#.to_string(),
+                },
+                ActionClause::PrimedAssignment {
+                    var: "locked".to_string(),
+                    expr: "locked".to_string(),
+                },
+            ],
+            &state,
+            &ctx,
+        );
+        assert!(result.is_empty(), "\\A guard should block: {result:?}");
+    }
+
+    /// Compiled \A guard must pass when quantifier body is true for all elements.
+    #[test]
+    fn forall_guard_passes_when_true() {
+        let state = TlaState::from([(
+            "locked".to_string(),
+            TlaValue::Function(Arc::new(BTreeMap::from([
+                (TlaValue::String("p1".to_string()), TlaValue::Bool(false)),
+                (TlaValue::String("p2".to_string()), TlaValue::Bool(false)),
+            ]))),
+        )]);
+        let mut defs = BTreeMap::new();
+        defs.insert(
+            "Procs".to_string(),
+            crate::tla::TlaDefinition {
+                name: "Procs".to_string(),
+                params: vec![],
+                body: r#"{"p1", "p2"}"#.to_string(),
+                is_recursive: false,
+            },
+        );
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        let result = compile_and_run(
+            vec![
+                ActionClause::Guard {
+                    expr: r#"\A p \in Procs : ~locked[p]"#.to_string(),
+                },
+                ActionClause::PrimedAssignment {
+                    var: "locked".to_string(),
+                    expr: "locked".to_string(),
+                },
+            ],
+            &state,
+            &ctx,
+        );
+        assert_eq!(result.len(), 1, "\\A guard should pass: {result:?}");
+    }
+
+    /// IF/THEN/ELSE guard: THEN branch blocks, ELSE branch passes.
+    #[test]
+    fn if_guard_selects_correct_branch() {
+        let state = TlaState::from([
+            (
+                "mode".to_string(),
+                TlaValue::String("exclusive".to_string()),
+            ),
+            ("count".to_string(), TlaValue::Int(2)),
+        ]);
+        let ctx = EvalContext::new(&state);
+
+        // IF mode = "exclusive" THEN count = 0 ELSE TRUE
+        // mode IS exclusive and count is 2 (not 0), so guard should BLOCK
+        let result = compile_and_run(
+            vec![
+                ActionClause::Guard {
+                    expr: r#"IF mode = "exclusive" THEN count = 0 ELSE TRUE"#.to_string(),
+                },
+                ActionClause::PrimedAssignment {
+                    var: "count".to_string(),
+                    expr: "count + 1".to_string(),
+                },
+            ],
+            &state,
+            &ctx,
+        );
+        assert!(result.is_empty(), "IF/THEN guard should block: {result:?}");
+
+        // Now with mode = "shared", ELSE branch is TRUE → should pass
+        let state2 = TlaState::from([
+            ("mode".to_string(), TlaValue::String("shared".to_string())),
+            ("count".to_string(), TlaValue::Int(2)),
+        ]);
+        let ctx2 = EvalContext::new(&state2);
+        let result2 = compile_and_run(
+            vec![
+                ActionClause::Guard {
+                    expr: r#"IF mode = "exclusive" THEN count = 0 ELSE TRUE"#.to_string(),
+                },
+                ActionClause::PrimedAssignment {
+                    var: "count".to_string(),
+                    expr: "count + 1".to_string(),
+                },
+            ],
+            &state2,
+            &ctx2,
+        );
+        assert_eq!(result2.len(), 1);
+        assert_eq!(result2[0].get("count"), Some(&TlaValue::Int(3)));
+    }
+
+    /// UNCHANGED must preserve the current value in successors, verified
+    /// by checking the successor state contains the unchanged variable.
+    #[test]
+    fn unchanged_copies_current_value() {
+        let state = TlaState::from([
+            ("x".to_string(), TlaValue::Int(42)),
+            ("y".to_string(), TlaValue::String("keep_me".to_string())),
+        ]);
+        let ctx = EvalContext::new(&state);
+
+        let result = compile_and_run(
+            vec![
+                ActionClause::PrimedAssignment {
+                    var: "x".to_string(),
+                    expr: "x + 1".to_string(),
+                },
+                ActionClause::Unchanged {
+                    vars: vec!["y".to_string()],
+                },
+            ],
+            &state,
+            &ctx,
+        );
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].get("x"), Some(&TlaValue::Int(43)));
+        assert_eq!(
+            result[0].get("y"),
+            Some(&TlaValue::String("keep_me".to_string())),
+            "UNCHANGED must preserve current value"
+        );
+    }
+
+    /// Negation guard: ~active must block when active=TRUE.
+    #[test]
+    fn negation_guard_blocks_and_passes() {
+        let state_active = TlaState::from([("active".to_string(), TlaValue::Bool(true))]);
+        let ctx_active = EvalContext::new(&state_active);
+
+        let result = compile_and_run(
+            vec![ActionClause::Guard {
+                expr: "~active".to_string(),
+            }],
+            &state_active,
+            &ctx_active,
+        );
+        assert!(result.is_empty(), "~active should block when active=TRUE");
+
+        let state_inactive = TlaState::from([("active".to_string(), TlaValue::Bool(false))]);
+        let ctx_inactive = EvalContext::new(&state_inactive);
+
+        let result2 = compile_and_run(
+            vec![ActionClause::Guard {
+                expr: "~active".to_string(),
+            }],
+            &state_inactive,
+            &ctx_inactive,
+        );
+        assert_eq!(result2.len(), 1, "~active should pass when active=FALSE");
+    }
+
+    /// Exists clause must produce one successor per domain element.
+    #[test]
+    fn exists_produces_correct_successor_count() {
+        let state = TlaState::from([("chosen".to_string(), TlaValue::Int(0))]);
+        let mut defs = BTreeMap::new();
+        defs.insert(
+            "Items".to_string(),
+            crate::tla::TlaDefinition {
+                name: "Items".to_string(),
+                params: vec![],
+                body: "{10, 20, 30}".to_string(),
+                is_recursive: false,
+            },
+        );
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        let result = compile_and_run(
+            vec![ActionClause::Exists {
+                binders: "x \\in Items".to_string(),
+                body: "/\\ chosen' = x".to_string(),
+            }],
+            &state,
+            &ctx,
+        );
+        assert_eq!(result.len(), 3, "should produce 3 successors");
+        let values: std::collections::BTreeSet<_> = result
+            .iter()
+            .map(|s| s.get("chosen").cloned().unwrap())
+            .collect();
+        assert!(values.contains(&TlaValue::Int(10)));
+        assert!(values.contains(&TlaValue::Int(20)));
+        assert!(values.contains(&TlaValue::Int(30)));
+    }
+
+    /// Primed assignments from different action IRs applied to the same state
+    /// must not interfere — each IR produces its own independent successors.
+    #[test]
+    fn separate_actions_produce_independent_successors() {
+        let state = TlaState::from([
+            ("x".to_string(), TlaValue::Int(0)),
+            ("y".to_string(), TlaValue::Int(0)),
+        ]);
+        let ctx = EvalContext::new(&state);
+
+        let result_x = compile_and_run(
+            vec![
+                ActionClause::PrimedAssignment {
+                    var: "x".to_string(),
+                    expr: "x + 1".to_string(),
+                },
+                ActionClause::Unchanged {
+                    vars: vec!["y".to_string()],
+                },
+            ],
+            &state,
+            &ctx,
+        );
+        let result_y = compile_and_run(
+            vec![
+                ActionClause::PrimedAssignment {
+                    var: "y".to_string(),
+                    expr: "y + 10".to_string(),
+                },
+                ActionClause::Unchanged {
+                    vars: vec!["x".to_string()],
+                },
+            ],
+            &state,
+            &ctx,
+        );
+
+        assert_eq!(result_x.len(), 1);
+        assert_eq!(result_x[0].get("x"), Some(&TlaValue::Int(1)));
+        assert_eq!(result_x[0].get("y"), Some(&TlaValue::Int(0)));
+
+        assert_eq!(result_y.len(), 1);
+        assert_eq!(result_y[0].get("x"), Some(&TlaValue::Int(0)));
+        assert_eq!(result_y[0].get("y"), Some(&TlaValue::Int(10)));
+    }
+}
