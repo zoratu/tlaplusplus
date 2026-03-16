@@ -1300,7 +1300,13 @@ fn main() -> anyhow::Result<()> {
             }
             let expr_eval_ready = expr_probe_is_ready(expr_total, expr_ok);
             println!("native_frontend.expr_eval={expr_eval_ready}");
-            println!("native_frontend.action_eval={action_eval_ready}");
+            // If the spec has no Next definition, action_eval is not applicable
+            let has_next = parsed_module.definitions.contains_key(&resolved_next_name);
+            if has_next {
+                println!("native_frontend.action_eval={action_eval_ready}");
+            } else {
+                println!("native_frontend.action_eval=na");
+            }
             println!(
                 "native_frontend.unsupported_feature_count={}",
                 scan.combined_features.len()

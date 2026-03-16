@@ -170,6 +170,9 @@ for idx in "${!CFGS[@]}"; do
   elif [[ ${exit_code} -eq 0 ]]; then
     if [[ "${action_eval}" == "true" && "${expr_eval}" == "true" ]]; then
       status="full_pass"
+    elif [[ "${action_eval}" == "na" && "${expr_eval}" == "true" ]]; then
+      # No state machine (no Next definition) but all expressions evaluate
+      status="full_pass"
     elif [[ "${action_eval}" == "true" ]]; then
       status="action_only"
     elif [[ "${expr_eval}" == "true" ]]; then
