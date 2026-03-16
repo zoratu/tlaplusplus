@@ -490,6 +490,13 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
         }
     }
 
+    // CASE expression (must check before logical operators)
+    if expr.starts_with("CASE ") || expr.starts_with("CASE\n") {
+        if let Some(case_expr) = try_compile_case(expr) {
+            return case_expr;
+        }
+    }
+
     // UNCHANGED in expression/guard context.
     // When UNCHANGED appears inside a disjunction evaluated as a guard (e.g.,
     // \/ Action1(self) \/ UNCHANGED vars), the action IR layer handles the
@@ -761,28 +768,41 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
     }
 
     // Operator call: Op(a, b)
+    // For known built-in operators, produce dedicated variants instead of generic OpCall.
     if let Some((name, args)) = parse_op_call(expr) {
-        return CompiledExpr::OpCall {
-            name: name.to_string(),
-            args: args.into_iter().map(|s| compile_expr(&s)).collect(),
-        };
-    }
-
-    // Built-in functions
-    if let Some(inner) = expr
-        .strip_prefix("Cardinality(")
-        .and_then(|s| s.strip_suffix(')'))
-    {
-        return CompiledExpr::Cardinality(Box::new(compile_expr(inner)));
-    }
-    if let Some(inner) = expr.strip_prefix("Head(").and_then(|s| s.strip_suffix(')')) {
-        return CompiledExpr::Head(Box::new(compile_expr(inner)));
-    }
-    if let Some(inner) = expr.strip_prefix("Tail(").and_then(|s| s.strip_suffix(')')) {
-        return CompiledExpr::Tail(Box::new(compile_expr(inner)));
-    }
-    if let Some(inner) = expr.strip_prefix("Len(").and_then(|s| s.strip_suffix(')')) {
-        return CompiledExpr::Len(Box::new(compile_expr(inner)));
+        match name {
+            "Cardinality" if args.len() == 1 => {
+                return CompiledExpr::Cardinality(Box::new(compile_expr(&args[0])));
+            }
+            "Head" if args.len() == 1 => {
+                return CompiledExpr::Head(Box::new(compile_expr(&args[0])));
+            }
+            "Tail" if args.len() == 1 => {
+                return CompiledExpr::Tail(Box::new(compile_expr(&args[0])));
+            }
+            "Len" if args.len() == 1 => {
+                return CompiledExpr::Len(Box::new(compile_expr(&args[0])));
+            }
+            "Append" if args.len() == 2 => {
+                return CompiledExpr::Append(
+                    Box::new(compile_expr(&args[0])),
+                    Box::new(compile_expr(&args[1])),
+                );
+            }
+            "SubSeq" if args.len() == 3 => {
+                return CompiledExpr::SubSeq(
+                    Box::new(compile_expr(&args[0])),
+                    Box::new(compile_expr(&args[1])),
+                    Box::new(compile_expr(&args[2])),
+                );
+            }
+            _ => {
+                return CompiledExpr::OpCall {
+                    name: name.to_string(),
+                    args: args.into_iter().map(|s| compile_expr(&s)).collect(),
+                };
+            }
+        }
     }
 
     // Fallback: unparsed
@@ -1765,6 +1785,119 @@ pub fn find_top_level_colon(expr: &str) -> Option<usize> {
     }
     None
 }
+
+fn try_compile_case(expr: &str) -> Option<CompiledExpr> {
+    // CASE cond1 -> val1 [] cond2 -> val2 [] OTHER -> default
+    let rest = expr.strip_prefix("CASE")?;
+    // Must be followed by whitespace
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let rest = rest.trim_start();
+
+    // Split on [] at top level. We can't use split_top_level("[]") because
+    // that function tracks [ and ] as bracket depth changers. Instead, do a
+    // custom scan that looks for the two-char sequence [] at bracket depth 0.
+    let raw_arms = split_case_arms(rest);
+    let mut arms = Vec::new();
+    let mut other = None;
+
+    for arm_str in &raw_arms {
+        let arm = arm_str.trim();
+        if arm.is_empty() {
+            continue;
+        }
+
+        // Find the first top-level "->" to split condition from value.
+        let arrow_idx = find_top_level_arrow(arm)?;
+        let cond = arm[..arrow_idx].trim();
+        let value = arm[arrow_idx + 2..].trim();
+
+        if cond == "OTHER" {
+            other = Some(Box::new(compile_expr(value)));
+        } else {
+            arms.push((compile_expr(cond), compile_expr(value)));
+        }
+    }
+
+    if arms.is_empty() && other.is_none() {
+        return None;
+    }
+
+    Some(CompiledExpr::Case { arms, other })
+}
+
+/// Split CASE expression body on top-level `[]` separators.
+/// Unlike `split_top_level`, this treats `[]` as an atomic two-character
+/// delimiter and does not adjust bracket depth for it.
+fn split_case_arms(expr: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0i32; // combined bracket depth for ( ) { } [ ] << >>
+    let mut in_string = false;
+    let chars: Vec<char> = expr.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        let c = chars[i];
+
+        if c == '"' && (i == 0 || chars[i - 1] != '\\') {
+            in_string = !in_string;
+            current.push(c);
+            i += 1;
+            continue;
+        }
+        if in_string {
+            current.push(c);
+            i += 1;
+            continue;
+        }
+
+        // Handle << and >>
+        if i + 1 < chars.len() {
+            if c == '<' && chars[i + 1] == '<' {
+                depth += 1;
+                current.push(c);
+                current.push(chars[i + 1]);
+                i += 2;
+                continue;
+            }
+            if c == '>' && chars[i + 1] == '>' {
+                depth -= 1;
+                current.push(c);
+                current.push(chars[i + 1]);
+                i += 2;
+                continue;
+            }
+        }
+
+        // Check for [] delimiter at top level BEFORE adjusting depth
+        if depth == 0 && c == '[' && i + 1 < chars.len() && chars[i + 1] == ']' {
+            // This is the [] arm separator
+            if !current.trim().is_empty() {
+                parts.push(current.trim().to_string());
+            }
+            current = String::new();
+            i += 2;
+            continue;
+        }
+
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            _ => {}
+        }
+
+        current.push(c);
+        i += 1;
+    }
+
+    if !current.trim().is_empty() {
+        parts.push(current.trim().to_string());
+    }
+    parts
+}
+
 
 fn try_parse_if(expr: &str) -> Option<CompiledExpr> {
     // IF cond THEN expr1 ELSE expr2
