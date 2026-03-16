@@ -74,30 +74,25 @@ pub fn probe_next_disjuncts(
     probe_next_disjuncts_with_instances(next_body, definitions, None, state)
 }
 
-/// Maximum total time for probing all Next disjuncts (seconds).
-/// Prevents exponential set operations from blocking the entire analysis.
-const PROBE_TOTAL_TIMEOUT_SECS: u64 = 20;
-
 pub fn probe_next_disjuncts_with_instances(
     next_body: &str,
     definitions: &BTreeMap<String, TlaDefinition>,
     instances: Option<&BTreeMap<String, TlaModuleInstance>>,
     state: &TlaState,
 ) -> NextBranchProbe {
+    use crate::tla::eval::{restore_eval_budget, set_active_eval_budget};
+
     let disjuncts = split_action_disjuncts(next_body);
     let mut probe = NextBranchProbe {
         total_disjuncts: disjuncts.len(),
         ..NextBranchProbe::default()
     };
 
-    let probe_start = std::time::Instant::now();
+    // Set a budget for probing to prevent exponential blowup from
+    // operations like SUBSET, Seq(S), or [D -> R] on large sets.
+    let prev_budget = set_active_eval_budget(100_000);
+
     for disj in disjuncts {
-        // Check total probe timeout before starting each branch
-        if probe_start.elapsed().as_secs() >= PROBE_TOTAL_TIMEOUT_SECS {
-            // Treat remaining branches as supported (timeout is a probe limitation)
-            probe.supported_disjuncts += 1;
-            continue;
-        }
         match execute_branch(disj.trim(), &BTreeMap::new(), definitions, instances, state) {
             Ok(successors) => {
                 probe.supported_disjuncts += 1;
@@ -116,6 +111,7 @@ pub fn probe_next_disjuncts_with_instances(
         }
     }
 
+    restore_eval_budget(prev_budget);
     probe
 }
 
@@ -131,6 +127,7 @@ fn is_probe_sampling_limitation(err: &anyhow::Error) -> bool {
         || msg.contains("got Undefined")
         || msg.contains("DOMAIN expects a function")
         || msg.contains("unsupported for value Int(0)")
+        || msg.contains("evaluation budget exceeded")
 }
 
 pub fn evaluate_next_states(

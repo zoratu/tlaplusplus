@@ -13,8 +13,8 @@ use tlaplusplus::tla::{
     TlaState, TlaValue, classify_clause, compile_action_ir, compile_action_ir_branches,
     eval_action_body_multi, eval_expr, eval_let_action_multi, looks_like_action,
     normalize_operator_ref_name, normalize_param_name, parse_action_exists,
-    parse_stuttering_action_expr, parse_tla_config, parse_tla_module_file, scan_module_closure,
-    split_action_body_disjuncts, split_top_level,
+    parse_stuttering_action_expr, parse_tla_config, parse_tla_module_file, restore_eval_budget,
+    scan_module_closure, set_active_eval_budget, split_action_body_disjuncts, split_top_level,
 };
 use tlaplusplus::{EngineConfig, run_model};
 
@@ -1227,8 +1227,9 @@ fn main() -> anyhow::Result<()> {
             let mut expr_ok = 0usize;
             let mut expr_errors: BTreeMap<String, u64> = BTreeMap::new();
             let mut expr_error_examples: BTreeMap<String, String> = BTreeMap::new();
-            let expr_probe_start = std::time::Instant::now();
-            const EXPR_PROBE_TIMEOUT_SECS: u64 = 20;
+            // Set evaluation budget to prevent exponential blowup during probing
+            // (e.g. SUBSET on large sets, Seq(S), [D -> R]).
+            let prev_budget = set_active_eval_budget(100_000);
             let action_param_samples = infer_action_param_samples_from_module_contexts(
                 &resolved_next_name,
                 &parsed_module.definitions,
@@ -1236,9 +1237,6 @@ fn main() -> anyhow::Result<()> {
                 &probe_state,
             );
             for def in parsed_module.definitions.values() {
-                if expr_probe_start.elapsed().as_secs() >= EXPR_PROBE_TIMEOUT_SECS {
-                    break;
-                }
                 if !definition_is_contextually_probeable_action(
                     def,
                     &parsed_module.definitions,
@@ -1301,6 +1299,7 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+            restore_eval_budget(prev_budget);
             let expr_eval_ready = expr_probe_is_ready(expr_total, expr_ok);
             println!("native_frontend.expr_eval={expr_eval_ready}");
             // If the spec has no Next definition, action_eval is not applicable
@@ -3242,6 +3241,10 @@ fn is_probe_sampling_limitation_error(err: &anyhow::Error) -> bool {
     }
     // Function application on a default Int(0) placeholder
     if msg.contains("unsupported for value Int(0)") {
+        return true;
+    }
+    // Evaluation budget exceeded during probing (large set construction)
+    if msg.contains("evaluation budget exceeded") {
         return true;
     }
     false
