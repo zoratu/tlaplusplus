@@ -1303,6 +1303,18 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
         ));
     }
 
+    // Action composition operator \cdot: A \cdot B
+    // For expression evaluation purposes (probing), treat as conjunction —
+    // both sides must evaluate successfully. Return the result of the last part.
+    let cdot_parts = split_top_level_keyword(expr, "\\cdot");
+    if cdot_parts.len() > 1 {
+        let mut result = TlaValue::Bool(true);
+        for part in &cdot_parts {
+            result = eval_expr_inner(part, ctx, depth + 1)?;
+        }
+        return Ok(result);
+    }
+
     if let Some((lhs, op, rhs)) = split_top_level_comparison(expr) {
         let left = eval_expr_inner(lhs, ctx, depth + 1)?;
 
@@ -1890,6 +1902,18 @@ fn eval_atom_with_postfix(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Re
         let base_len = expr.len().saturating_sub(rest.len());
         let base_expr = expr[..base_len].trim_end();
         return eval_primed_postfix_expr(base_expr, ctx, depth + 1);
+    }
+    // Handle \cdot action composition as trailing operator:
+    // "A \cdot B" parses A as atom, leaving "\cdot B" as rest.
+    if let Some(cdot_rest) = trimmed_rest.strip_prefix("\\cdot") {
+        let rhs = cdot_rest.trim();
+        if !rhs.is_empty() {
+            // Evaluate the right-hand side and return its result.
+            // For probing purposes both sides need to evaluate successfully.
+            let rhs_value = eval_expr_inner(rhs, ctx, depth + 1)?;
+            // Return the rhs value (action composition applies B after A).
+            return Ok(rhs_value);
+        }
     }
     if !trimmed_rest.is_empty() {
         return Err(anyhow!("unexpected trailing tokens in expr: {expr}"));
