@@ -1227,6 +1227,8 @@ fn main() -> anyhow::Result<()> {
             let mut expr_ok = 0usize;
             let mut expr_errors: BTreeMap<String, u64> = BTreeMap::new();
             let mut expr_error_examples: BTreeMap<String, String> = BTreeMap::new();
+            let expr_probe_start = std::time::Instant::now();
+            const EXPR_PROBE_TIMEOUT_SECS: u64 = 20;
             let action_param_samples = infer_action_param_samples_from_module_contexts(
                 &resolved_next_name,
                 &parsed_module.definitions,
@@ -1234,6 +1236,9 @@ fn main() -> anyhow::Result<()> {
                 &probe_state,
             );
             for def in parsed_module.definitions.values() {
+                if expr_probe_start.elapsed().as_secs() >= EXPR_PROBE_TIMEOUT_SECS {
+                    break;
+                }
                 if !definition_is_contextually_probeable_action(
                     def,
                     &parsed_module.definitions,
@@ -1258,9 +1263,7 @@ fn main() -> anyhow::Result<()> {
                         expr_total += 1;
                         match result {
                             Ok(()) => expr_ok += 1,
-                            Err(err)
-                                if is_probe_sampling_limitation_error(&err) =>
-                            {
+                            Err(err) if is_probe_sampling_limitation_error(&err) => {
                                 // Treat probe-sampling-limitation errors as OK.
                                 // These errors arise because the probe state uses
                                 // default/ModelValue placeholders that don't match
@@ -3053,7 +3056,8 @@ fn extract_exists_binders_for_next_call(
         let mut i = 0;
         let chars: Vec<char> = text.chars().collect();
         while i + 2 < chars.len() {
-            if chars[i] == '[' && chars[i + 1] == ']' && i + 2 < chars.len() && chars[i + 2] == '[' {
+            if chars[i] == '[' && chars[i + 1] == ']' && i + 2 < chars.len() && chars[i + 2] == '['
+            {
                 // Found `[][`, scan for matching `]`
                 let mut depth = 1usize;
                 let start = i + 3;
