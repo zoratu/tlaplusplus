@@ -17,7 +17,7 @@ pub use action_exec::{
 };
 pub use action_ir::{
     ActionClause, ActionIr, compile_action_ir, compile_action_ir_branches, looks_like_action,
-    split_action_body_disjuncts,
+    parse_action_exists, split_action_body_disjuncts,
 };
 pub use cfg::{ConfigValue, TlaConfig, normalize_operator_ref_name, parse_tla_config};
 pub use compiled_eval::{
