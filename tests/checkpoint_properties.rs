@@ -975,11 +975,7 @@ fn regression_checkpoint_quiescence_with_terminated_workers() {
 
         // Wait for quiescence with a short timeout.  If the bug were present,
         // this would hang because paused=0 and live>0.
-        let quiesced = pause_ctrl.wait_for_quiescence(
-            &stop,
-            &live_workers,
-            Duration::from_secs(5),
-        );
+        let quiesced = pause_ctrl.wait_for_quiescence(&stop, &live_workers, Duration::from_secs(5));
 
         // Whether we got quiescence via paused workers or via live==0,
         // the checkpoint must not hang.
@@ -1009,11 +1005,10 @@ fn quiescence_succeeds_with_zero_live_workers() {
 
     pause_ctrl.request_pause();
 
-    let quiesced = pause_ctrl.wait_for_quiescence(
-        &stop,
-        &live_workers,
-        Duration::from_millis(100),
-    );
+    let quiesced = pause_ctrl.wait_for_quiescence(&stop, &live_workers, Duration::from_millis(100));
 
-    assert!(quiesced, "Quiescence should succeed immediately when live_workers == 0");
+    assert!(
+        quiesced,
+        "Quiescence should succeed immediately when live_workers == 0"
+    );
 }

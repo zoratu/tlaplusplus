@@ -1066,6 +1066,9 @@ fn main() -> anyhow::Result<()> {
                     deferred_operator_refs = next_deferred;
                 }
             }
+            // Set evaluation budget for all probing (Init seeding, branch probing, expr probing).
+            // This prevents exponential blowup from Seq, SUBSET, [D -> R], etc.
+            let prev_budget = set_active_eval_budget(100_000);
             let mut probe_init_seeded = 0usize;
             let mut probe_init_unresolved = 0usize;
             let mut probe_init_unresolved_vars: Vec<String> = Vec::new();
@@ -1227,9 +1230,6 @@ fn main() -> anyhow::Result<()> {
             let mut expr_ok = 0usize;
             let mut expr_errors: BTreeMap<String, u64> = BTreeMap::new();
             let mut expr_error_examples: BTreeMap<String, String> = BTreeMap::new();
-            // Set evaluation budget to prevent exponential blowup during probing
-            // (e.g. SUBSET on large sets, Seq(S), [D -> R]).
-            let prev_budget = set_active_eval_budget(100_000);
             let action_param_samples = infer_action_param_samples_from_module_contexts(
                 &resolved_next_name,
                 &parsed_module.definitions,
