@@ -12,9 +12,9 @@ use tlaplusplus::tla::{
     ActionClause, ClauseKind, ConfigValue, EvalContext, TlaConfig, TlaDefinition, TlaModule,
     TlaState, TlaValue, classify_clause, compile_action_ir, compile_action_ir_branches,
     eval_action_body_multi, eval_expr, eval_let_action_multi, looks_like_action,
-    normalize_operator_ref_name, normalize_param_name, parse_stuttering_action_expr,
-    parse_tla_config, parse_tla_module_file, scan_module_closure, split_action_body_disjuncts,
-    split_top_level,
+    normalize_operator_ref_name, normalize_param_name, parse_action_exists,
+    parse_stuttering_action_expr, parse_tla_config, parse_tla_module_file, scan_module_closure,
+    split_action_body_disjuncts, split_top_level,
 };
 use tlaplusplus::{EngineConfig, run_model};
 
@@ -2975,21 +2975,191 @@ fn merge_action_param_samples(
     }
 }
 
+/// When the Next operator has parameters (e.g. `Next(n)`), scan all zero-param
+/// definitions for `\E` quantifiers that wrap a call to Next, e.g.
+/// `Spec == Init /\ [][\E n \in Node : Next(n)]_vars`.  Return the bound
+/// variable values so they can seed the Next body traversal.
+fn infer_next_param_locals_from_spec(
+    next_name: &str,
+    next_params: &[String],
+    definitions: &BTreeMap<String, TlaDefinition>,
+    instances: &BTreeMap<String, TlaModuleInstance>,
+    probe_state: &TlaState,
+) -> BTreeMap<String, TlaValue> {
+    if next_params.is_empty() {
+        return BTreeMap::new();
+    }
+    // Scan all zero-param definitions looking for `\E var \in Set : ... Next(var) ...`
+    for def in definitions.values() {
+        if !def.params.is_empty() {
+            continue;
+        }
+        // Quick check: does the body mention the Next operator name?
+        if !def.body.contains(next_name) {
+            continue;
+        }
+        // Try to find `\E ... : ... Next(...)` anywhere in the body.
+        // We search for `\E` patterns and then check if the body calls Next.
+        if let Some(locals) = extract_exists_binders_for_next_call(
+            &def.body,
+            next_name,
+            next_params,
+            probe_state,
+            definitions,
+            instances,
+        ) {
+            if !locals.is_empty() {
+                return locals;
+            }
+        }
+    }
+    BTreeMap::new()
+}
+
+/// Scan `text` for `\E var \in SetExpr : body` where `body` contains a call
+/// `next_name(args)`.  Return the bound variable samples mapped to the
+/// corresponding Next parameter names.
+///
+/// The `\E` may be nested inside temporal operators like `[][...]_vars`, so
+/// we first extract bracketed inner content before trying `parse_action_exists`.
+fn extract_exists_binders_for_next_call(
+    text: &str,
+    next_name: &str,
+    next_params: &[String],
+    probe_state: &TlaState,
+    definitions: &BTreeMap<String, TlaDefinition>,
+    instances: &BTreeMap<String, TlaModuleInstance>,
+) -> Option<BTreeMap<String, TlaValue>> {
+    // Collect candidate fragments: the text itself and any bracket-inner content
+    // that might contain `\E ... : Next(...)`.
+    let mut candidates: Vec<String> = vec![text.to_string()];
+    // Extract content inside `[][...]_vars` patterns (temporal box formulas)
+    {
+        let mut i = 0;
+        let chars: Vec<char> = text.chars().collect();
+        while i + 2 < chars.len() {
+            if chars[i] == '[' && chars[i + 1] == ']' && i + 2 < chars.len() && chars[i + 2] == '[' {
+                // Found `[][`, scan for matching `]`
+                let mut depth = 1usize;
+                let start = i + 3;
+                let mut j = start;
+                while j < chars.len() && depth > 0 {
+                    match chars[j] {
+                        '[' => depth += 1,
+                        ']' => depth -= 1,
+                        _ => {}
+                    }
+                    if depth > 0 {
+                        j += 1;
+                    }
+                }
+                if depth == 0 {
+                    let inner: String = chars[start..j].iter().collect();
+                    candidates.push(inner);
+                }
+                i = j + 1;
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    for candidate in &candidates {
+        let mut search_from = 0;
+        while let Some(pos) = candidate[search_from..].find("\\E") {
+            let abs_pos = search_from + pos;
+            let after = &candidate[abs_pos + 2..];
+            if !after.starts_with(char::is_whitespace) && !after.starts_with('(') {
+                search_from = abs_pos + 2;
+                continue;
+            }
+            let fragment = &candidate[abs_pos..];
+            if let Some((binders, body)) = parse_action_exists(fragment) {
+                if let Some((call_name, call_args)) = parse_probe_action_call(body.trim()) {
+                    if call_name == next_name && call_args.len() == next_params.len() {
+                        if let Some(bound) = sample_exists_quantifier_binders(
+                            binders,
+                            &BTreeMap::new(),
+                            probe_state,
+                            definitions,
+                            instances,
+                        ) {
+                            let binder_map: BTreeMap<String, TlaValue> =
+                                bound.into_iter().collect();
+                            let mut result = BTreeMap::new();
+                            for (param, arg_expr) in next_params.iter().zip(call_args.iter()) {
+                                let arg_name = arg_expr.trim();
+                                if let Some(value) = binder_map.get(arg_name) {
+                                    let normalized = normalize_param_name(param).to_string();
+                                    result.insert(normalized, value.clone());
+                                    result.insert(param.clone(), value.clone());
+                                }
+                            }
+                            if !result.is_empty() {
+                                return Some(result);
+                            }
+                        }
+                    }
+                }
+                // The body might contain Next nested deeper
+                if body.contains(next_name) {
+                    if let Some(inner) = extract_exists_binders_for_next_call(
+                        body,
+                        next_name,
+                        next_params,
+                        probe_state,
+                        definitions,
+                        instances,
+                    ) {
+                        if !inner.is_empty() {
+                            return Some(inner);
+                        }
+                    }
+                }
+            }
+            search_from = abs_pos + 2;
+        }
+    }
+    None
+}
+
 fn infer_action_param_samples_from_module_contexts(
     resolved_next_name: &str,
     definitions: &BTreeMap<String, TlaDefinition>,
     instances: &BTreeMap<String, TlaModuleInstance>,
     probe_state: &TlaState,
 ) -> BTreeMap<String, BTreeMap<String, TlaValue>> {
-    let mut samples = definitions
-        .get(resolved_next_name)
+    let next_def = definitions.get(resolved_next_name);
+
+    // When the Next operator takes parameters, try to extract \E binder values
+    // from the Spec definition so that recursive param inference works.
+    let next_param_locals = next_def
+        .filter(|d| !d.params.is_empty())
+        .map(|d| {
+            infer_next_param_locals_from_spec(
+                resolved_next_name,
+                &d.params,
+                definitions,
+                instances,
+                probe_state,
+            )
+        })
+        .unwrap_or_default();
+
+    let mut samples = next_def
         .map(|next_def| {
-            infer_action_param_samples_from_next(
+            let mut result = BTreeMap::new();
+            let mut active_calls = BTreeSet::new();
+            collect_action_param_samples_from_expr(
                 &next_def.body,
+                &next_param_locals,
                 probe_state,
                 definitions,
                 instances,
-            )
+                &mut result,
+                &mut active_calls,
+            );
+            result
         })
         .unwrap_or_default();
 
