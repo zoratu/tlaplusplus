@@ -358,6 +358,7 @@ fn eval_compiled_inner(
             let right = eval_compiled_inner(b, ctx, depth + 1)?;
             let left_set = left.as_set()?;
             let right_set = right.as_set()?;
+            ctx.check_budget(left_set.len() * right_set.len())?;
             let mut product = BTreeSet::new();
             for lhs_val in left_set {
                 for rhs_val in right_set {
@@ -384,8 +385,13 @@ fn eval_compiled_inner(
             let set = set.as_set()?;
             let elements: Vec<TlaValue> = set.iter().cloned().collect();
             let n = elements.len();
+            if n >= 64 {
+                return Ok(TlaValue::Set(Arc::new(BTreeSet::new())));
+            }
+            let total = 1u64 << n;
+            ctx.check_budget(total as usize)?;
             let mut powerset = BTreeSet::new();
-            for mask in 0..(1u64 << n) {
+            for mask in 0..total {
                 let mut subset = BTreeSet::new();
                 for i in 0..n {
                     if (mask >> i) & 1 == 1 {
@@ -889,6 +895,7 @@ fn eval_compiled_inner(
                     max_functions
                 ));
             }
+            ctx.check_budget(total as usize)?;
 
             // Generate all functions by iterating through all combinations
             // Each function is a mapping from each domain element to some range element
@@ -1452,6 +1459,7 @@ fn eval_compiled_opcall(
                             local_definitions: ctx.local_definitions.clone(),
                             definitions: ctx.definitions,
                             instances: ctx.instances,
+                            eval_budget: ctx.eval_budget.clone(),
                         };
                         eval_expr(body, &lambda_ctx)?
                     }
