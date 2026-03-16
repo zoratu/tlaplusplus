@@ -484,6 +484,16 @@ impl PauseController {
                 );
             }
 
+            // All workers have terminated — quiescence is trivially
+            // achieved (no workers to pause).
+            if live == 0 {
+                eprintln!(
+                    "Checkpoint: all workers terminated (live=0), quiescence trivially achieved, elapsed={:.1}s",
+                    start.elapsed().as_secs_f64()
+                );
+                return Some(true);
+            }
+
             if paused >= live && active == 0 {
                 eprintln!(
                     "Checkpoint: quiescence achieved: paused={}/{}, active={}, elapsed={:.1}s",
@@ -2026,7 +2036,25 @@ where
                             std::thread::sleep(std::time::Duration::from_millis(10));
                             continue;
                         }
-                        // No work available and exploration complete
+                        // Before terminating, do a final pause check to close
+                        // the race window between our has_pending_work() check
+                        // and the checkpoint thread requesting pause.  If a
+                        // checkpoint was requested in that window, this will
+                        // block until the checkpoint completes and then we can
+                        // recheck for new work that may have been loaded.
+                        worker_pause.worker_pause_point(&worker_stop, worker_id);
+                        if worker_stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        // Recheck work availability — checkpoint may have
+                        // loaded items from disk while we were paused.
+                        // Use has_pending_work() rather than pop_for_worker()
+                        // to avoid consuming a state that the outer match
+                        // would not see.
+                        if worker_queue.has_pending_work() {
+                            continue;
+                        }
+                        // No work available and no checkpoint pending — safe to terminate
                         break;
                     }
                 };
