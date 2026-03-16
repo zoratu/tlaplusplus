@@ -3440,4 +3440,390 @@ mod compiled_action_correctness_tests {
         assert_eq!(result_y[0].get("x"), Some(&TlaValue::Int(0)));
         assert_eq!(result_y[0].get("y"), Some(&TlaValue::Int(10)));
     }
+
+    /// CASE expression guard: selects the matching arm based on state.
+    #[test]
+    fn test_compiled_case_expression_guard() {
+        // phase = "prepare" → CASE arm yields TRUE → should produce successor
+        let state_prepare = TlaState::from([
+            ("phase".to_string(), TlaValue::String("prepare".to_string())),
+        ]);
+        let ctx_prepare = EvalContext::new(&state_prepare);
+
+        let result = compile_and_run(
+            vec![
+                ActionClause::Guard {
+                    expr: r#"CASE phase = "prepare" -> TRUE [] phase = "commit" -> FALSE [] OTHER -> FALSE"#
+                        .to_string(),
+                },
+                ActionClause::Unchanged {
+                    vars: vec!["phase".to_string()],
+                },
+            ],
+            &state_prepare,
+            &ctx_prepare,
+        );
+        assert_eq!(
+            result.len(),
+            1,
+            "CASE guard should pass when phase=prepare: {result:?}"
+        );
+
+        // phase = "commit" → CASE arm yields FALSE → should block
+        let state_commit = TlaState::from([
+            ("phase".to_string(), TlaValue::String("commit".to_string())),
+        ]);
+        let ctx_commit = EvalContext::new(&state_commit);
+
+        let result2 = compile_and_run(
+            vec![
+                ActionClause::Guard {
+                    expr: r#"CASE phase = "prepare" -> TRUE [] phase = "commit" -> FALSE [] OTHER -> FALSE"#
+                        .to_string(),
+                },
+                ActionClause::Unchanged {
+                    vars: vec!["phase".to_string()],
+                },
+            ],
+            &state_commit,
+            &ctx_commit,
+        );
+        assert!(
+            result2.is_empty(),
+            "CASE guard should block when phase=commit: {result2:?}"
+        );
+    }
+
+    /// Implication guard: (ready => value >= 0) blocks when TRUE => FALSE.
+    #[test]
+    fn test_compiled_implication_guard() {
+        // ready=TRUE, value=0: TRUE => (0 >= 0) = TRUE => should pass
+        let state_pass = TlaState::from([
+            ("ready".to_string(), TlaValue::Bool(true)),
+            ("value".to_string(), TlaValue::Int(0)),
+        ]);
+        let ctx_pass = EvalContext::new(&state_pass);
+
+        let result = compile_and_run(
+            vec![
+                ActionClause::Guard {
+                    expr: "ready => value >= 0".to_string(),
+                },
+                ActionClause::Unchanged {
+                    vars: vec!["ready".to_string(), "value".to_string()],
+                },
+            ],
+            &state_pass,
+            &ctx_pass,
+        );
+        assert_eq!(
+            result.len(),
+            1,
+            "implication guard should pass (TRUE => TRUE): {result:?}"
+        );
+
+        // ready=TRUE, value=-1: TRUE => (-1 >= 0) = FALSE => should block
+        let state_block = TlaState::from([
+            ("ready".to_string(), TlaValue::Bool(true)),
+            ("value".to_string(), TlaValue::Int(-1)),
+        ]);
+        let ctx_block = EvalContext::new(&state_block);
+
+        let result2 = compile_and_run(
+            vec![
+                ActionClause::Guard {
+                    expr: "ready => value >= 0".to_string(),
+                },
+                ActionClause::Unchanged {
+                    vars: vec!["ready".to_string(), "value".to_string()],
+                },
+            ],
+            &state_block,
+            &ctx_block,
+        );
+        assert!(
+            result2.is_empty(),
+            "implication guard should block (TRUE => FALSE): {result2:?}"
+        );
+    }
+
+    /// Sequence operations: Len guard + Tail assignment.
+    #[test]
+    fn test_compiled_sequence_operations_in_guard() {
+        let state = TlaState::from([(
+            "msgs".to_string(),
+            TlaValue::Seq(Arc::new(vec![
+                TlaValue::String("msg1".to_string()),
+                TlaValue::String("msg2".to_string()),
+                TlaValue::String("msg3".to_string()),
+            ])),
+        )]);
+        let ctx = EvalContext::new(&state);
+
+        let result = compile_and_run(
+            vec![
+                ActionClause::Guard {
+                    expr: "Len(msgs) > 0".to_string(),
+                },
+                ActionClause::PrimedAssignment {
+                    var: "msgs".to_string(),
+                    expr: "Tail(msgs)".to_string(),
+                },
+            ],
+            &state,
+            &ctx,
+        );
+        assert_eq!(result.len(), 1, "Len guard should pass: {result:?}");
+        let succ_msgs = result[0].get("msgs").unwrap();
+        let expected = TlaValue::Seq(Arc::new(vec![
+            TlaValue::String("msg2".to_string()),
+            TlaValue::String("msg3".to_string()),
+        ]));
+        assert_eq!(succ_msgs, &expected, "Tail should remove first element");
+
+        // Empty sequence: Len = 0, guard should block
+        let state_empty = TlaState::from([(
+            "msgs".to_string(),
+            TlaValue::Seq(Arc::new(vec![])),
+        )]);
+        let ctx_empty = EvalContext::new(&state_empty);
+
+        let result2 = compile_and_run(
+            vec![
+                ActionClause::Guard {
+                    expr: "Len(msgs) > 0".to_string(),
+                },
+                ActionClause::PrimedAssignment {
+                    var: "msgs".to_string(),
+                    expr: "Tail(msgs)".to_string(),
+                },
+            ],
+            &state_empty,
+            &ctx_empty,
+        );
+        assert!(
+            result2.is_empty(),
+            "Len guard should block on empty seq: {result2:?}"
+        );
+    }
+
+    /// Function construction: [n \in Nodes |-> f[n] + 1].
+    #[test]
+    fn test_compiled_function_construction_in_assignment() {
+        let state = TlaState::from([(
+            "f".to_string(),
+            TlaValue::Function(Arc::new(BTreeMap::from([
+                (
+                    TlaValue::String("n1".to_string()),
+                    TlaValue::Int(0),
+                ),
+                (
+                    TlaValue::String("n2".to_string()),
+                    TlaValue::Int(0),
+                ),
+            ]))),
+        )]);
+        let mut defs = BTreeMap::new();
+        defs.insert(
+            "Nodes".to_string(),
+            crate::tla::TlaDefinition {
+                name: "Nodes".to_string(),
+                params: vec![],
+                body: r#"{"n1", "n2"}"#.to_string(),
+                is_recursive: false,
+            },
+        );
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        let result = compile_and_run(
+            vec![ActionClause::PrimedAssignment {
+                var: "f".to_string(),
+                expr: r#"[n \in Nodes |-> f[n] + 1]"#.to_string(),
+            }],
+            &state,
+            &ctx,
+        );
+        assert_eq!(result.len(), 1, "should produce one successor: {result:?}");
+        let expected = TlaValue::Function(Arc::new(BTreeMap::from([
+            (TlaValue::String("n1".to_string()), TlaValue::Int(1)),
+            (TlaValue::String("n2".to_string()), TlaValue::Int(1)),
+        ])));
+        assert_eq!(
+            result[0].get("f").unwrap(),
+            &expected,
+            "f should be incremented"
+        );
+    }
+
+    /// Nested EXCEPT: [data EXCEPT !["a"]["x"] = 99].
+    #[test]
+    fn test_compiled_nested_except() {
+        let inner_a = TlaValue::Record(Arc::new(BTreeMap::from([
+            ("x".to_string(), TlaValue::Int(1)),
+            ("y".to_string(), TlaValue::Int(2)),
+        ])));
+        let inner_b = TlaValue::Record(Arc::new(BTreeMap::from([
+            ("x".to_string(), TlaValue::Int(3)),
+            ("y".to_string(), TlaValue::Int(4)),
+        ])));
+        let state = TlaState::from([(
+            "data".to_string(),
+            TlaValue::Function(Arc::new(BTreeMap::from([
+                (TlaValue::String("a".to_string()), inner_a),
+                (TlaValue::String("b".to_string()), inner_b.clone()),
+            ]))),
+        )]);
+        let ctx = EvalContext::new(&state);
+
+        let result = compile_and_run(
+            vec![ActionClause::PrimedAssignment {
+                var: "data".to_string(),
+                expr: r#"[data EXCEPT !["a"]["x"] = 99]"#.to_string(),
+            }],
+            &state,
+            &ctx,
+        );
+        assert_eq!(result.len(), 1, "should produce one successor");
+
+        let data_prime = result[0].get("data").unwrap();
+        // Extract data'["a"]
+        if let TlaValue::Function(f) = data_prime {
+            let a_val = f.get(&TlaValue::String("a".to_string())).unwrap();
+            // a["x"] should be 99
+            if let TlaValue::Record(rec) = a_val {
+                assert_eq!(
+                    rec.get("x"),
+                    Some(&TlaValue::Int(99)),
+                    "data'[\"a\"][\"x\"] should be 99"
+                );
+                assert_eq!(
+                    rec.get("y"),
+                    Some(&TlaValue::Int(2)),
+                    "data'[\"a\"][\"y\"] should be unchanged"
+                );
+            } else if let TlaValue::Function(inner) = a_val {
+                assert_eq!(
+                    inner.get(&TlaValue::String("x".to_string())),
+                    Some(&TlaValue::Int(99)),
+                    "data'[\"a\"][\"x\"] should be 99"
+                );
+                assert_eq!(
+                    inner.get(&TlaValue::String("y".to_string())),
+                    Some(&TlaValue::Int(2)),
+                    "data'[\"a\"][\"y\"] should be unchanged"
+                );
+            } else {
+                panic!("data'[\"a\"] should be a record or function, got: {a_val:?}");
+            }
+            // b should be unchanged
+            let b_val = f.get(&TlaValue::String("b".to_string())).unwrap();
+            assert_eq!(b_val, &inner_b, "data'[\"b\"] should be unchanged");
+        } else {
+            panic!("data' should be a Function, got: {data_prime:?}");
+        }
+    }
+
+    /// Set comprehension guard: Cardinality({x \in vals : x > 3}) >= 2.
+    #[test]
+    fn test_compiled_set_comprehension_guard() {
+        use std::collections::BTreeSet;
+
+        // vals = {1, 2, 3, 4, 5}: 2 elements > 3 → guard passes
+        let state_pass = TlaState::from([(
+            "vals".to_string(),
+            TlaValue::Set(Arc::new(BTreeSet::from([
+                TlaValue::Int(1),
+                TlaValue::Int(2),
+                TlaValue::Int(3),
+                TlaValue::Int(4),
+                TlaValue::Int(5),
+            ]))),
+        )]);
+        let ctx_pass = EvalContext::new(&state_pass);
+
+        let result = compile_and_run(
+            vec![
+                ActionClause::Guard {
+                    expr: "Cardinality({x \\in vals : x > 3}) >= 2".to_string(),
+                },
+                ActionClause::Unchanged {
+                    vars: vec!["vals".to_string()],
+                },
+            ],
+            &state_pass,
+            &ctx_pass,
+        );
+        assert_eq!(
+            result.len(),
+            1,
+            "set comprehension guard should pass: {result:?}"
+        );
+
+        // vals = {1, 2, 3}: 0 elements > 3 → guard blocks
+        let state_block = TlaState::from([(
+            "vals".to_string(),
+            TlaValue::Set(Arc::new(BTreeSet::from([
+                TlaValue::Int(1),
+                TlaValue::Int(2),
+                TlaValue::Int(3),
+            ]))),
+        )]);
+        let ctx_block = EvalContext::new(&state_block);
+
+        let result2 = compile_and_run(
+            vec![
+                ActionClause::Guard {
+                    expr: "Cardinality({x \\in vals : x > 3}) >= 2".to_string(),
+                },
+                ActionClause::Unchanged {
+                    vars: vec!["vals".to_string()],
+                },
+            ],
+            &state_block,
+            &ctx_block,
+        );
+        assert!(
+            result2.is_empty(),
+            "set comprehension guard should block: {result2:?}"
+        );
+    }
+
+    /// CHOOSE in assignment: picked' = CHOOSE x \in items : x > 15.
+    #[test]
+    fn test_compiled_choose_in_assignment() {
+        use std::collections::BTreeSet;
+
+        let state = TlaState::from([
+            (
+                "items".to_string(),
+                TlaValue::Set(Arc::new(BTreeSet::from([
+                    TlaValue::Int(10),
+                    TlaValue::Int(20),
+                    TlaValue::Int(30),
+                ]))),
+            ),
+            ("picked".to_string(), TlaValue::Int(0)),
+        ]);
+        let ctx = EvalContext::new(&state);
+
+        let result = compile_and_run(
+            vec![
+                ActionClause::PrimedAssignment {
+                    var: "picked".to_string(),
+                    expr: "CHOOSE x \\in items : x > 15".to_string(),
+                },
+                ActionClause::Unchanged {
+                    vars: vec!["items".to_string()],
+                },
+            ],
+            &state,
+            &ctx,
+        );
+        assert_eq!(result.len(), 1, "should produce one successor: {result:?}");
+        let picked = result[0].get("picked").unwrap();
+        assert!(
+            *picked == TlaValue::Int(20) || *picked == TlaValue::Int(30),
+            "picked' should be 20 or 30, got: {picked:?}"
+        );
+    }
 }
