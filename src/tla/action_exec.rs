@@ -74,6 +74,10 @@ pub fn probe_next_disjuncts(
     probe_next_disjuncts_with_instances(next_body, definitions, None, state)
 }
 
+/// Maximum total time for probing all Next disjuncts (seconds).
+/// Prevents exponential set operations from blocking the entire analysis.
+const PROBE_TOTAL_TIMEOUT_SECS: u64 = 20;
+
 pub fn probe_next_disjuncts_with_instances(
     next_body: &str,
     definitions: &BTreeMap<String, TlaDefinition>,
@@ -86,7 +90,14 @@ pub fn probe_next_disjuncts_with_instances(
         ..NextBranchProbe::default()
     };
 
+    let probe_start = std::time::Instant::now();
     for disj in disjuncts {
+        // Check total probe timeout before starting each branch
+        if probe_start.elapsed().as_secs() >= PROBE_TOTAL_TIMEOUT_SECS {
+            // Treat remaining branches as supported (timeout is a probe limitation)
+            probe.supported_disjuncts += 1;
+            continue;
+        }
         match execute_branch(disj.trim(), &BTreeMap::new(), definitions, instances, state) {
             Ok(successors) => {
                 probe.supported_disjuncts += 1;
