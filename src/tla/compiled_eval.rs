@@ -3453,9 +3453,8 @@ mod compiled_action_correctness_tests {
     #[test]
     fn test_compiled_case_expression_guard() {
         // phase = "prepare" → CASE arm yields TRUE → should produce successor
-        let state_prepare = TlaState::from([
-            ("phase".to_string(), TlaValue::String("prepare".to_string())),
-        ]);
+        let state_prepare =
+            TlaState::from([("phase".to_string(), TlaValue::String("prepare".to_string()))]);
         let ctx_prepare = EvalContext::new(&state_prepare);
 
         let result = compile_and_run(
@@ -3478,9 +3477,8 @@ mod compiled_action_correctness_tests {
         );
 
         // phase = "commit" → CASE arm yields FALSE → should block
-        let state_commit = TlaState::from([
-            ("phase".to_string(), TlaValue::String("commit".to_string())),
-        ]);
+        let state_commit =
+            TlaState::from([("phase".to_string(), TlaValue::String("commit".to_string()))]);
         let ctx_commit = EvalContext::new(&state_commit);
 
         let result2 = compile_and_run(
@@ -3590,10 +3588,7 @@ mod compiled_action_correctness_tests {
         assert_eq!(succ_msgs, &expected, "Tail should remove first element");
 
         // Empty sequence: Len = 0, guard should block
-        let state_empty = TlaState::from([(
-            "msgs".to_string(),
-            TlaValue::Seq(Arc::new(vec![])),
-        )]);
+        let state_empty = TlaState::from([("msgs".to_string(), TlaValue::Seq(Arc::new(vec![])))]);
         let ctx_empty = EvalContext::new(&state_empty);
 
         let result2 = compile_and_run(
@@ -3621,14 +3616,8 @@ mod compiled_action_correctness_tests {
         let state = TlaState::from([(
             "f".to_string(),
             TlaValue::Function(Arc::new(BTreeMap::from([
-                (
-                    TlaValue::String("n1".to_string()),
-                    TlaValue::Int(0),
-                ),
-                (
-                    TlaValue::String("n2".to_string()),
-                    TlaValue::Int(0),
-                ),
+                (TlaValue::String("n1".to_string()), TlaValue::Int(0)),
+                (TlaValue::String("n2".to_string()), TlaValue::Int(0)),
             ]))),
         )]);
         let mut defs = BTreeMap::new();
