@@ -886,3 +886,134 @@ fn stress_fp_switch_under_load() {
     assert!(total_inserts > 0, "No inserts happened");
     assert!(store.len() > 0, "Store is empty");
 }
+
+// ============================================================================
+// Regression: checkpoint quiescence when workers terminate
+// ============================================================================
+
+/// Regression test for the checkpoint-vs-termination race condition.
+///
+/// Scenario: workers finish exploration (no more successors) and are about
+/// to break out of the main loop.  A checkpoint fires at exactly that
+/// moment.  Without the fix, workers exit before the checkpoint thread can
+/// pause them, leading to a quiescence timeout (paused=0/<N>, active=0).
+///
+/// The fix has two parts:
+///   1) Workers call `worker_pause_point` one final time before breaking,
+///      so a just-requested checkpoint can still pause them.
+///   2) `wait_for_quiescence_attempt` returns success when live==0
+///      (all workers already terminated).
+///
+/// This test exercises BOTH parts by racing a checkpoint request against
+/// worker termination.
+#[test]
+fn regression_checkpoint_quiescence_with_terminated_workers() {
+    // We run multiple iterations to increase the chance of hitting the race.
+    for iteration in 0..20 {
+        let num_workers = 4;
+        let pause_ctrl = Arc::new(TestPauseController::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let live_workers = Arc::new(AtomicUsize::new(num_workers));
+        // Shared flag: when true, workers have "no more work" and should
+        // try to terminate (simulating empty queues).
+        let work_exhausted = Arc::new(AtomicBool::new(false));
+        let barrier = Arc::new(Barrier::new(num_workers + 1));
+
+        let handles: Vec<_> = (0..num_workers)
+            .map(|_worker_id| {
+                let pc = Arc::clone(&pause_ctrl);
+                let st = Arc::clone(&stop);
+                let lw = Arc::clone(&live_workers);
+                let we = Arc::clone(&work_exhausted);
+                let br = Arc::clone(&barrier);
+
+                thread::spawn(move || {
+                    br.wait();
+
+                    loop {
+                        // Pause point at the top of the loop (mirrors runtime)
+                        pc.worker_pause_point(&st);
+                        if st.load(Ordering::Acquire) {
+                            break;
+                        }
+
+                        if we.load(Ordering::Acquire) {
+                            // Work is exhausted.  Before breaking, do the
+                            // final pause check (this is the fix).
+                            pc.worker_pause_point(&st);
+                            if st.load(Ordering::Acquire) {
+                                break;
+                            }
+                            // "Recheck" — still no work
+                            if we.load(Ordering::Acquire) {
+                                break; // Terminate
+                            }
+                            // Work appeared (checkpoint loaded items) — keep going
+                            continue;
+                        }
+
+                        // Simulate doing work
+                        thread::yield_now();
+                    }
+
+                    // Worker exit: decrement live count (mirrors runtime)
+                    lw.fetch_sub(1, Ordering::AcqRel);
+                })
+            })
+            .collect();
+
+        barrier.wait();
+
+        // Let workers run briefly
+        thread::sleep(Duration::from_millis(1));
+
+        // Signal that work is exhausted — workers will try to terminate
+        work_exhausted.store(true, Ordering::Release);
+
+        // Immediately request checkpoint — this races against workers breaking
+        pause_ctrl.request_pause();
+
+        // Wait for quiescence with a short timeout.  If the bug were present,
+        // this would hang because paused=0 and live>0.
+        let quiesced = pause_ctrl.wait_for_quiescence(
+            &stop,
+            &live_workers,
+            Duration::from_secs(5),
+        );
+
+        // Whether we got quiescence via paused workers or via live==0,
+        // the checkpoint must not hang.
+        assert!(
+            quiesced,
+            "iteration {}: quiescence timeout — checkpoint-vs-termination race hit",
+            iteration
+        );
+
+        // Clean up
+        stop.store(true, Ordering::Release);
+        pause_ctrl.resume();
+
+        for handle in handles {
+            handle.join().expect("Worker panicked");
+        }
+    }
+}
+
+/// Test that quiescence succeeds immediately when all workers have
+/// already terminated (live_workers == 0).
+#[test]
+fn quiescence_succeeds_with_zero_live_workers() {
+    let pause_ctrl = Arc::new(TestPauseController::new());
+    let stop = Arc::new(AtomicBool::new(false));
+    let live_workers = Arc::new(AtomicUsize::new(0)); // All workers already gone
+
+    pause_ctrl.request_pause();
+
+    let quiesced = pause_ctrl.wait_for_quiescence(
+        &stop,
+        &live_workers,
+        Duration::from_millis(100),
+    );
+
+    assert!(quiesced, "Quiescence should succeed immediately when live_workers == 0");
+}
