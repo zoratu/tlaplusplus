@@ -165,6 +165,27 @@ pub fn split_action_body_disjuncts(expr: &str) -> Vec<String> {
         return disjuncts;
     }
 
+    // When the expression is a single-line `\E var \in Set : Body1 \/ Body2`,
+    // `split_top_level` would strip the quantifier prefix from disjuncts after
+    // the first.  Detect this case and repeat the `\E ... :` prefix on every
+    // branch so that bound variables remain in scope.
+    if let Some((binders, body)) = parse_action_exists(trimmed) {
+        let body_disjuncts = split_top_level(body, "\\/");
+        if body_disjuncts.len() > 1 || body.trim_start().starts_with("\\/") {
+            return body_disjuncts
+                .into_iter()
+                .filter_map(|part| {
+                    let part = part.trim().to_string();
+                    if part.is_empty() {
+                        None
+                    } else {
+                        Some(format!("\\E {} :\n{}", binders, part))
+                    }
+                })
+                .collect();
+        }
+    }
+
     split_top_level(trimmed, "\\/")
         .into_iter()
         .filter_map(|part| {
@@ -568,7 +589,7 @@ pub(crate) fn parse_action_if(expr: &str) -> Option<(&str, &str, &str)> {
     Some((condition, then_branch, else_branch))
 }
 
-pub(crate) fn parse_action_exists(expr: &str) -> Option<(&str, &str)> {
+pub fn parse_action_exists(expr: &str) -> Option<(&str, &str)> {
     let trimmed = expr.trim();
     let rest = trimmed.strip_prefix("\\E")?;
     if !rest.starts_with(char::is_whitespace) && !rest.starts_with('(') {
