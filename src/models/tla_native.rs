@@ -2691,4 +2691,98 @@ SPECIFICATION Spec
 
         let _ = fs::remove_dir_all(&tmp);
     }
+
+    #[test]
+    fn exclusive_lease_guard_blocks_second_acquisition() {
+        // Reproduces Bug 4: IF/THEN with \A guard must block exclusive lease
+        // when another client already holds one.
+        let tmp = std::env::temp_dir().join("tlapp-exclusive-guard-test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should be created");
+
+        let module = tmp.join("ExclusiveGuard.tla");
+        fs::write(
+            &module,
+            r#"
+---- MODULE ExclusiveGuard ----
+EXTENDS Naturals, FiniteSets
+CONSTANTS Clients
+VARIABLES leases
+
+InitLeaseState == [held |-> FALSE, access |-> "none"]
+
+Init == leases = [c \in Clients |-> InitLeaseState]
+
+AcquireLease(client, accessType) ==
+    /\ ~leases[client].held
+    /\ accessType \in {"read", "write", "exclusive"}
+    /\ IF accessType = "exclusive"
+       THEN \A c \in Clients : ~leases[c].held \/ c = client
+       ELSE TRUE
+    /\ leases' = [leases EXCEPT ![client] = [held |-> TRUE, access |-> accessType]]
+
+Next == \E c \in Clients, a \in {"read", "write", "exclusive"} : AcquireLease(c, a)
+
+ExclusiveUnique ==
+    Cardinality({c \in Clients : leases[c].held /\ leases[c].access = "exclusive"}) <= 1
+
+Spec == Init /\ [][Next]_leases
+====
+"#,
+        )
+        .expect("module should be written");
+
+        let cfg = tmp.join("ExclusiveGuard.cfg");
+        fs::write(
+            &cfg,
+            "SPECIFICATION Spec\nCONSTANTS Clients = {c1, c2}\nINVARIANT ExclusiveUnique\n",
+        )
+        .expect("cfg should be written");
+
+        let model =
+            TlaModel::from_files(&module, Some(&cfg), None, None).expect("model should build");
+        let init = model.initial_states();
+        assert_eq!(init.len(), 1);
+
+        // Get all successors from initial state
+        let mut next = Vec::new();
+        model.next_states(&init[0], &mut next);
+        // Should be able to acquire leases (3 access types x 2 clients = up to 6)
+        assert!(!next.is_empty());
+
+        // Now from a state where c1 holds an exclusive lease, try to get successors
+        // c2 should NOT be able to acquire an exclusive lease
+        let c1_exclusive = next
+            .iter()
+            .find(|s| {
+                if let Some(TlaValue::Function(f)) = s.get("leases") {
+                    f.values().any(|v| {
+                        if let TlaValue::Record(r) = v {
+                            r.get("held") == Some(&TlaValue::Bool(true))
+                                && r.get("access")
+                                    == Some(&TlaValue::String("exclusive".to_string()))
+                        } else {
+                            false
+                        }
+                    })
+                } else {
+                    false
+                }
+            })
+            .expect("should have a state where someone holds exclusive lease");
+
+        let mut next2 = Vec::new();
+        model.next_states(c1_exclusive, &mut next2);
+
+        // Check invariant: no state should have 2 clients with exclusive leases
+        for state in &next2 {
+            let result = model.check_invariants(state);
+            assert!(
+                result.is_ok(),
+                "ExclusiveUnique invariant violated! State: {state:?}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
 }
