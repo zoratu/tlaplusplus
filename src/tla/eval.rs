@@ -3029,6 +3029,332 @@ pub(crate) fn eval_operator_call(
             }
             return Ok(acc);
         }
+        // === Community module: FiniteSetsExt (additional operators) ===
+        "Quantify" if args.len() == 2 && !user_defined_shadow => {
+            let set = args[0].as_set()?;
+            let pred = &args[1];
+            let mut count = 0i64;
+            for elem in set.iter() {
+                if apply_value(pred, vec![elem.clone()], ctx, depth + 1)?.as_bool()? {
+                    count += 1;
+                }
+            }
+            return Ok(TlaValue::Int(count));
+        }
+        "SymDiff" if args.len() == 2 && !user_defined_shadow => {
+            let a = args[0].as_set()?;
+            let b = args[1].as_set()?;
+            let result: BTreeSet<TlaValue> = a.symmetric_difference(&b).cloned().collect();
+            return Ok(TlaValue::Set(Arc::new(result)));
+        }
+        "FlattenSet" if args.len() == 1 && !user_defined_shadow => {
+            let sets = args[0].as_set()?;
+            let mut result = BTreeSet::new();
+            for s in sets.iter() {
+                result.extend(s.as_set()?.iter().cloned());
+            }
+            return Ok(TlaValue::Set(Arc::new(result)));
+        }
+        "kSubset" if args.len() == 2 && !user_defined_shadow => {
+            let k = args[0].as_int()? as usize;
+            let set = args[1].as_set()?;
+            let elements: Vec<TlaValue> = set.iter().cloned().collect();
+            let mut result = BTreeSet::new();
+            // Generate all k-subsets using combinatorial enumeration
+            let n = elements.len();
+            if k <= n {
+                let mut indices: Vec<usize> = (0..k).collect();
+                loop {
+                    let subset: BTreeSet<TlaValue> =
+                        indices.iter().map(|&i| elements[i].clone()).collect();
+                    result.insert(TlaValue::Set(Arc::new(subset)));
+                    // Next combination
+                    let mut i = k;
+                    loop {
+                        if i == 0 {
+                            break;
+                        }
+                        i -= 1;
+                        indices[i] += 1;
+                        if indices[i] <= n - k + i {
+                            break;
+                        }
+                        if i == 0 {
+                            indices[0] = n;
+                            break;
+                        } // signal done
+                    }
+                    if indices[0] > n - k {
+                        break;
+                    }
+                    for j in (i + 1)..k {
+                        indices[j] = indices[j - 1] + 1;
+                    }
+                }
+            }
+            return Ok(TlaValue::Set(Arc::new(result)));
+        }
+        "ChooseUnique" if args.len() == 2 && !user_defined_shadow => {
+            let set = args[0].as_set()?;
+            let pred = &args[1];
+            let mut found = None;
+            for elem in set.iter() {
+                if apply_value(pred, vec![elem.clone()], ctx, depth + 1)?.as_bool()? {
+                    if found.is_some() {
+                        return Err(anyhow!("ChooseUnique: multiple elements satisfy predicate"));
+                    }
+                    found = Some(elem.clone());
+                }
+            }
+            return found.ok_or_else(|| anyhow!("ChooseUnique: no element satisfies predicate"));
+        }
+        "SumSet" if args.len() == 1 && !user_defined_shadow => {
+            let set = args[0].as_set()?;
+            let mut sum = 0i64;
+            for elem in set.iter() {
+                sum += elem.as_int()?;
+            }
+            return Ok(TlaValue::Int(sum));
+        }
+        "ProductSet" if args.len() == 1 && !user_defined_shadow => {
+            let set = args[0].as_set()?;
+            let mut product = 1i64;
+            for elem in set.iter() {
+                product *= elem.as_int()?;
+            }
+            return Ok(TlaValue::Int(product));
+        }
+        "IsInjective" if args.len() == 1 && !user_defined_shadow => {
+            // IsInjective(f) == \A a, b \in DOMAIN f : f[a] = f[b] => a = b
+            let func = &args[0];
+            match func {
+                TlaValue::Function(map) => {
+                    let values: Vec<&TlaValue> = map.values().collect();
+                    for i in 0..values.len() {
+                        for j in (i + 1)..values.len() {
+                            if values[i] == values[j] {
+                                return Ok(TlaValue::Bool(false));
+                            }
+                        }
+                    }
+                    return Ok(TlaValue::Bool(true));
+                }
+                TlaValue::Seq(seq) => {
+                    for i in 0..seq.len() {
+                        for j in (i + 1)..seq.len() {
+                            if seq[i] == seq[j] {
+                                return Ok(TlaValue::Bool(false));
+                            }
+                        }
+                    }
+                    return Ok(TlaValue::Bool(true));
+                }
+                _ => return Err(anyhow!("IsInjective expects a function or sequence")),
+            }
+        }
+        // === Community module: Graphs (directed) ===
+        "IsDirectedGraph" if args.len() == 1 && !user_defined_shadow => {
+            let g = &args[0];
+            if let (Ok(nodes), Ok(edges)) = (g.select_key("node"), g.select_key("edge")) {
+                let node_set = nodes.as_set()?;
+                let edge_set = edges.as_set()?;
+                for e in edge_set.iter() {
+                    // Edges are <<a, b>> tuples (sequences of length 2)
+                    if let TlaValue::Seq(pair) = e {
+                        if pair.len() != 2
+                            || !node_set.contains(&pair[0])
+                            || !node_set.contains(&pair[1])
+                        {
+                            return Ok(TlaValue::Bool(false));
+                        }
+                    } else {
+                        return Ok(TlaValue::Bool(false));
+                    }
+                }
+                return Ok(TlaValue::Bool(true));
+            }
+            return Ok(TlaValue::Bool(false));
+        }
+        "Successors" if args.len() == 2 && !user_defined_shadow => {
+            let g = &args[0];
+            let n = &args[1];
+            let edges = g.select_key("edge")?.as_set()?;
+            let mut result = BTreeSet::new();
+            for e in edges.iter() {
+                if let TlaValue::Seq(pair) = e {
+                    if pair.len() == 2 && &pair[0] == n {
+                        result.insert(pair[1].clone());
+                    }
+                }
+            }
+            return Ok(TlaValue::Set(Arc::new(result)));
+        }
+        "Predecessors" if args.len() == 2 && !user_defined_shadow => {
+            let g = &args[0];
+            let n = &args[1];
+            let edges = g.select_key("edge")?.as_set()?;
+            let mut result = BTreeSet::new();
+            for e in edges.iter() {
+                if let TlaValue::Seq(pair) = e {
+                    if pair.len() == 2 && &pair[1] == n {
+                        result.insert(pair[0].clone());
+                    }
+                }
+            }
+            return Ok(TlaValue::Set(Arc::new(result)));
+        }
+        "InDegree" if args.len() == 2 && !user_defined_shadow => {
+            let preds = eval_operator_call(
+                "Predecessors",
+                vec![args[0].clone(), args[1].clone()],
+                ctx,
+                depth + 1,
+            )?;
+            return Ok(TlaValue::Int(preds.as_set()?.len() as i64));
+        }
+        "OutDegree" if args.len() == 2 && !user_defined_shadow => {
+            let succs = eval_operator_call(
+                "Successors",
+                vec![args[0].clone(), args[1].clone()],
+                ctx,
+                depth + 1,
+            )?;
+            return Ok(TlaValue::Int(succs.as_set()?.len() as i64));
+        }
+        "Roots" if args.len() == 1 && !user_defined_shadow => {
+            let g = &args[0];
+            let nodes = g.select_key("node")?.as_set()?;
+            let edges = g.select_key("edge")?.as_set()?;
+            let mut has_incoming: BTreeSet<TlaValue> = BTreeSet::new();
+            for e in edges.iter() {
+                if let TlaValue::Seq(pair) = e {
+                    if pair.len() == 2 {
+                        has_incoming.insert(pair[1].clone());
+                    }
+                }
+            }
+            let result: BTreeSet<TlaValue> = nodes.difference(&has_incoming).cloned().collect();
+            return Ok(TlaValue::Set(Arc::new(result)));
+        }
+        "Leaves" if args.len() == 1 && !user_defined_shadow => {
+            let g = &args[0];
+            let nodes = g.select_key("node")?.as_set()?;
+            let edges = g.select_key("edge")?.as_set()?;
+            let mut has_outgoing: BTreeSet<TlaValue> = BTreeSet::new();
+            for e in edges.iter() {
+                if let TlaValue::Seq(pair) = e {
+                    if pair.len() == 2 {
+                        has_outgoing.insert(pair[0].clone());
+                    }
+                }
+            }
+            let result: BTreeSet<TlaValue> = nodes.difference(&has_outgoing).cloned().collect();
+            return Ok(TlaValue::Set(Arc::new(result)));
+        }
+        "Transpose" if args.len() == 1 && !user_defined_shadow => {
+            let g = &args[0];
+            let nodes = g.select_key("node")?.clone();
+            let edges = g.select_key("edge")?.as_set()?;
+            let mut reversed = BTreeSet::new();
+            for e in edges.iter() {
+                if let TlaValue::Seq(pair) = e {
+                    if pair.len() == 2 {
+                        reversed.insert(TlaValue::Seq(Arc::new(vec![
+                            pair[1].clone(),
+                            pair[0].clone(),
+                        ])));
+                    }
+                }
+            }
+            return Ok(TlaValue::Record(Arc::new(BTreeMap::from([
+                ("node".to_string(), nodes),
+                ("edge".to_string(), TlaValue::Set(Arc::new(reversed))),
+            ]))));
+        }
+        "IsDag" if args.len() == 1 && !user_defined_shadow => {
+            // Native cycle detection using DFS
+            let g = &args[0];
+            let nodes = g.select_key("node")?.as_set()?;
+            let edges = g.select_key("edge")?.as_set()?;
+            // Build adjacency list
+            let node_list: Vec<TlaValue> = nodes.iter().cloned().collect();
+            let mut adj: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+            for e in edges.iter() {
+                if let TlaValue::Seq(pair) = e {
+                    if pair.len() == 2 {
+                        if let (Some(from), Some(to)) = (
+                            node_list.iter().position(|n| n == &pair[0]),
+                            node_list.iter().position(|n| n == &pair[1]),
+                        ) {
+                            adj.entry(from).or_default().push(to);
+                        }
+                    }
+                }
+            }
+            // DFS cycle detection
+            let n = node_list.len();
+            let mut color = vec![0u8; n]; // 0=white, 1=gray, 2=black
+            fn has_cycle(node: usize, adj: &BTreeMap<usize, Vec<usize>>, color: &mut [u8]) -> bool {
+                color[node] = 1;
+                if let Some(neighbors) = adj.get(&node) {
+                    for &next in neighbors {
+                        if color[next] == 1 {
+                            return true;
+                        } // back edge = cycle
+                        if color[next] == 0 && has_cycle(next, adj, color) {
+                            return true;
+                        }
+                    }
+                }
+                color[node] = 2;
+                false
+            }
+            let mut is_dag = true;
+            for i in 0..n {
+                if color[i] == 0 && has_cycle(i, &adj, &mut color) {
+                    is_dag = false;
+                    break;
+                }
+            }
+            return Ok(TlaValue::Bool(is_dag));
+        }
+        // === Community module: Relation ===
+        "TransitiveClosure" if args.len() == 2 && !user_defined_shadow => {
+            // Floyd-Warshall style transitive closure
+            let rel = &args[0]; // function [node x node -> BOOLEAN]
+            let set = args[1].as_set()?;
+            let nodes: Vec<TlaValue> = set.iter().cloned().collect();
+            let n = nodes.len();
+            // Initialize reachability matrix
+            let mut reach = vec![vec![false; n]; n];
+            for (i, ni) in nodes.iter().enumerate() {
+                for (j, nj) in nodes.iter().enumerate() {
+                    let key = TlaValue::Seq(Arc::new(vec![ni.clone(), nj.clone()]));
+                    if let Ok(val) = rel.apply(&key) {
+                        reach[i][j] = val.as_bool().unwrap_or(false);
+                    }
+                }
+            }
+            // Floyd-Warshall
+            for k in 0..n {
+                for i in 0..n {
+                    for j in 0..n {
+                        if reach[i][k] && reach[k][j] {
+                            reach[i][j] = true;
+                        }
+                    }
+                }
+            }
+            // Build result function
+            let mut result = BTreeMap::new();
+            for (i, ni) in nodes.iter().enumerate() {
+                for (j, nj) in nodes.iter().enumerate() {
+                    let key = TlaValue::Seq(Arc::new(vec![ni.clone(), nj.clone()]));
+                    result.insert(key, TlaValue::Bool(reach[i][j]));
+                }
+            }
+            return Ok(TlaValue::Function(Arc::new(result)));
+        }
         // === Community module: UndirectedGraphs ===
         "IsUndirectedGraph" if args.len() == 1 && !user_defined_shadow => {
             let g = &args[0];
