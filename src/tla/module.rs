@@ -46,6 +46,9 @@ pub struct TlaModule {
     /// Set of operator names declared with RECURSIVE
     #[serde(default)]
     pub recursive_declarations: BTreeSet<String>,
+    /// ASSUME/AXIOM predicates (body expressions)
+    #[serde(default)]
+    pub assumes: Vec<String>,
 }
 
 /// Standard library modules that are built-in and don't need to be loaded from disk.
@@ -801,13 +804,30 @@ pub fn parse_tla_module_text(input: &str) -> Result<TlaModule> {
             continue;
         }
 
-        if trimmed.starts_with("ASSUME")
-            || trimmed.starts_with("AXIOM")
-            || is_top_level_proof_header(trimmed)
-        {
+        if is_top_level_proof_header(trimmed) {
             flush_definition(&mut module, &mut current_def);
             current_def_indent = 0;
             mode = NameListMode::None;
+            continue;
+        }
+
+        if trimmed.starts_with("ASSUME") || trimmed.starts_with("AXIOM") {
+            flush_definition(&mut module, &mut current_def);
+            current_def_indent = 0;
+            mode = NameListMode::None;
+            // Capture the ASSUME/AXIOM body expression
+            let body = if let Some(rest) = trimmed.strip_prefix("ASSUMPTION") {
+                rest.trim().to_string()
+            } else if let Some(rest) = trimmed.strip_prefix("ASSUME") {
+                rest.trim().to_string()
+            } else if let Some(rest) = trimmed.strip_prefix("AXIOM") {
+                rest.trim().to_string()
+            } else {
+                String::new()
+            };
+            if !body.is_empty() {
+                module.assumes.push(body);
+            }
             continue;
         }
 
