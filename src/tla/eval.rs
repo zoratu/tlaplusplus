@@ -2679,7 +2679,16 @@ fn eval_enabled(
         .definition(action_name)
         .ok_or_else(|| anyhow!("action '{}' not found for ENABLED", action_name))?;
 
+    // When arguments are provided but arity mismatches, that's an error.
+    // When no arguments are provided for a parameterized action (bare `ENABLED Send`),
+    // return TRUE as a safe over-approximation — the action *may* be enabled for some
+    // parameter values.  TLC would existentially quantify over the parameter domains,
+    // but discovering those domains is not always possible in the evaluator.
     if action_def.params.len() != args.len() {
+        if args.is_empty() && !action_def.params.is_empty() {
+            // Bare ENABLED on a parameterized action — safe approximation
+            return Ok(TlaValue::Bool(true));
+        }
         return Err(anyhow!(
             "ENABLED action '{}' arity mismatch: expected {}, got {}",
             action_name,

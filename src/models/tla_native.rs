@@ -291,58 +291,25 @@ impl Model for TlaModel {
         Ok(())
     }
 
+    fn canonicalize(&self, state: Self::State) -> Self::State {
+        if let Some(ref symmetry) = self.symmetry {
+            canonicalize_tla_state(&state, symmetry)
+        } else {
+            state
+        }
+    }
+
     fn fingerprint(&self, state: &Self::State) -> u64 {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::Hasher;
 
-        // Apply symmetry reduction if specified
-        let canonical_state = if let Some(ref symmetry) = self.symmetry {
-            let canonical = canonicalize_tla_state(state, symmetry);
-            // Debug: track canonicalization statistics (only in debug builds)
-            #[cfg(debug_assertions)]
-            {
-                static FP_TOTAL: std::sync::atomic::AtomicU64 =
-                    std::sync::atomic::AtomicU64::new(0);
-                static FP_CHANGED: std::sync::atomic::AtomicU64 =
-                    std::sync::atomic::AtomicU64::new(0);
-
-                let total = FP_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if state != &canonical {
-                    FP_CHANGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-
-                // Print first state and periodic summary
-                if total == 0 {
-                    eprintln!(
-                        "DEBUG fingerprint: symmetry.symmetric_values = {:?}",
-                        symmetry.symmetric_values
-                    );
-                    if state != &canonical {
-                        eprintln!("DEBUG fingerprint: state WAS canonicalized (states differ)");
-                    } else {
-                        eprintln!("DEBUG fingerprint: state unchanged by canonicalization");
-                    }
-                }
-                if total > 0 && total % 500_000 == 0 {
-                    let changed = FP_CHANGED.load(std::sync::atomic::Ordering::Relaxed);
-                    eprintln!(
-                        "DEBUG symmetry: {} total fingerprints, {} ({:.1}%) had canonicalization changes",
-                        total,
-                        changed,
-                        (changed as f64 / total as f64) * 100.0
-                    );
-                }
-            }
-            canonical
-        } else {
-            state.clone()
-        };
+        // Symmetry canonicalization is handled by canonicalize() in the
+        // runtime before fingerprinting, so we fingerprint the state directly.
 
         // If view function is defined, fingerprint only the view
         if self.view.is_some() {
-            match self.evaluate_view(&canonical_state) {
+            match self.evaluate_view(state) {
                 Ok(view_value) => {
-                    // Hash the view value
                     if let Ok(bytes) = bincode::serialize(&view_value) {
                         let mut hasher = DefaultHasher::new();
                         hasher.write(&bytes);
@@ -357,7 +324,7 @@ impl Model for TlaModel {
 
         // No view or view failed - hash the full state using serialization
         let mut hasher = DefaultHasher::new();
-        if let Ok(bytes) = bincode::serialize(&canonical_state) {
+        if let Ok(bytes) = bincode::serialize(state) {
             hasher.write(&bytes);
         }
         hasher.finish()
