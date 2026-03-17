@@ -358,6 +358,90 @@ fn load_extended_modules(
                         is_recursive: false,
                     });
             }
+            // Inject theorem definitions as TRUE for proof modules.
+            // TLC treats these as axioms (trusted without proof).
+            if extended_name == "FiniteSetTheorems" {
+                for thm in &[
+                    "FS_CardinalityType",
+                    "FS_EmptySet",
+                    "FS_Singleton",
+                    "FS_Subset",
+                    "FS_Union",
+                    "FS_Intersection",
+                    "FS_Difference",
+                    "FS_UNION",
+                    "FS_SUBSET",
+                    "FS_Product",
+                    "FS_Interval",
+                    "FS_AddElement",
+                    "FS_RemoveElement",
+                    "FS_Surjection",
+                    "FS_Injection",
+                    "FS_Bijection",
+                    "FS_Image",
+                    "FS_PigeonHole",
+                    "FS_Induction",
+                    "FS_WFInduction",
+                    "FS_SameCardinalityBij",
+                    "FS_SurjCardinalityBound",
+                    "FS_SurjSameCardinalityImpliesInj",
+                    "FS_BoundedSetOfNaturals",
+                    "FS_StrictSubsetOrderingWellFounded",
+                    "FS_MajoritiesIntersect",
+                    "FS_NatSurjection",
+                    "FS_NatBijection",
+                    "FS_CountingElements",
+                    "FS_FiniteSubsetsOfFinite",
+                ] {
+                    module
+                        .definitions
+                        .entry(thm.to_string())
+                        .or_insert(TlaDefinition {
+                            name: thm.to_string(),
+                            params: vec![],
+                            body: "TRUE".to_string(),
+                            is_recursive: false,
+                        });
+                }
+            }
+            if extended_name == "NaturalsInduction" {
+                for thm in &[
+                    "NatInduction",
+                    "DownwardNatInduction",
+                    "GeneralNatInduction",
+                    "SmallestNatural",
+                    "RecursiveFcnOfNat",
+                    "NatInductiveDef",
+                    "RecursiveFcnOfNatType",
+                    "NatInductiveDefType",
+                    "RecursiveFcnOfNatUnique",
+                    "NatInductiveUnique",
+                    "FiniteNatInductiveDef",
+                    "FiniteNatInductiveDefType",
+                    "FiniteNatInductiveUnique",
+                ] {
+                    module
+                        .definitions
+                        .entry(thm.to_string())
+                        .or_insert(TlaDefinition {
+                            name: thm.to_string(),
+                            params: vec![],
+                            body: "TRUE".to_string(),
+                            is_recursive: false,
+                        });
+                }
+            }
+            if extended_name == "Graphs" {
+                module
+                    .definitions
+                    .entry("EmptyGraph".to_string())
+                    .or_insert(TlaDefinition {
+                        name: "EmptyGraph".to_string(),
+                        params: vec![],
+                        body: "[node |-> {}, edge |-> {}]".to_string(),
+                        is_recursive: false,
+                    });
+            }
             continue;
         }
 
