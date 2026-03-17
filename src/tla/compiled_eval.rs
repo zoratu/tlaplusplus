@@ -90,6 +90,10 @@ fn tla_value_to_string(value: &TlaValue) -> String {
     }
 }
 
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
 fn sequence_like_values(value: &TlaValue) -> Option<Vec<TlaValue>> {
     match value {
         TlaValue::Seq(seq) => Some((**seq).clone()),
@@ -1570,6 +1574,95 @@ fn eval_compiled_opcall(
                 result.push(val);
             }
             return Ok(TlaValue::Seq(Arc::new(result)));
+        }
+        // === Community module: SequencesExt ===
+        "RemoveAt" if arg_values.len() == 2 && !user_defined_shadow => {
+            let seq = sequence_like_values(&arg_values[0])
+                .ok_or_else(|| anyhow!("RemoveAt expects a sequence, got {:?}", arg_values[0]))?;
+            let i = arg_values[1].as_int()? as usize;
+            if i < 1 || i > seq.len() {
+                return Err(anyhow!(
+                    "RemoveAt index {} out of bounds (len {})",
+                    i,
+                    seq.len()
+                ));
+            }
+            let mut result = seq[..i - 1].to_vec();
+            result.extend_from_slice(&seq[i..]);
+            return Ok(TlaValue::Seq(Arc::new(result)));
+        }
+        // === Community module: Functions ===
+        "FoldFunction" if arg_values.len() == 3 && !user_defined_shadow => {
+            let op = &arg_values[0];
+            let base = arg_values[1].clone();
+            let fun = &arg_values[2];
+            let values: Vec<TlaValue> = match fun {
+                TlaValue::Function(map) => map.values().cloned().collect(),
+                TlaValue::Seq(seq) => seq.iter().cloned().collect(),
+                _ => return Err(anyhow!("FoldFunction: 3rd arg must be function/sequence")),
+            };
+            let mut acc = base;
+            for val in values {
+                acc = apply_value(op, vec![acc, val], ctx, depth + 1)?;
+            }
+            return Ok(acc);
+        }
+        // === Community module: DyadicRationals ===
+        "Half" if arg_values.len() == 1 && !user_defined_shadow => {
+            let p = &arg_values[0];
+            let num = p.select_key("num")?.as_int()?;
+            let den = p.select_key("den")?.as_int()?;
+            let new_den = den * 2;
+            let g = gcd(num.unsigned_abs(), new_den as u64) as i64;
+            return Ok(TlaValue::Record(Arc::new(BTreeMap::from([
+                ("num".to_string(), TlaValue::Int(num / g)),
+                ("den".to_string(), TlaValue::Int(new_den / g)),
+            ]))));
+        }
+        "Add" if arg_values.len() == 2 && !user_defined_shadow => {
+            if arg_values[0].select_key("num").is_ok() && arg_values[1].select_key("num").is_ok() {
+                let pn = arg_values[0].select_key("num")?.as_int()?;
+                let pd = arg_values[0].select_key("den")?.as_int()?;
+                let qn = arg_values[1].select_key("num")?.as_int()?;
+                let qd = arg_values[1].select_key("den")?.as_int()?;
+                if pn == 0 {
+                    return Ok(arg_values[1].clone());
+                }
+                let lcm = pd.max(qd);
+                let new_num = pn * (lcm / pd) + qn * (lcm / qd);
+                let g = gcd(new_num.unsigned_abs(), lcm as u64) as i64;
+                return Ok(TlaValue::Record(Arc::new(BTreeMap::from([
+                    ("num".to_string(), TlaValue::Int(new_num / g)),
+                    ("den".to_string(), TlaValue::Int(lcm / g)),
+                ]))));
+            }
+        }
+        "IsDyadicRational" if arg_values.len() == 1 && !user_defined_shadow => {
+            if let (Ok(den_val), Ok(_)) = (
+                arg_values[0].select_key("den"),
+                arg_values[0].select_key("num"),
+            ) {
+                let den = den_val.as_int()?;
+                return Ok(TlaValue::Bool(den > 0 && (den & (den - 1)) == 0));
+            }
+            return Ok(TlaValue::Bool(false));
+        }
+        "PrettyPrint" if arg_values.len() == 1 && !user_defined_shadow => {
+            if let (Ok(num_val), Ok(den_val)) = (
+                arg_values[0].select_key("num"),
+                arg_values[0].select_key("den"),
+            ) {
+                let num = num_val.as_int()?;
+                let den = den_val.as_int()?;
+                if num == 0 {
+                    return Ok(TlaValue::String("0".to_string()));
+                }
+                if num == 1 && den == 1 {
+                    return Ok(TlaValue::String("1".to_string()));
+                }
+                return Ok(TlaValue::String(format!("{}/{}", num, den)));
+            }
+            return Ok(TlaValue::String(format!("{:?}", arg_values[0])));
         }
         _ => {}
     }
