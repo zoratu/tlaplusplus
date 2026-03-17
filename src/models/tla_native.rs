@@ -408,6 +408,10 @@ impl Model for TlaModel {
     fn has_fairness_constraints(&self) -> bool {
         !self.fairness_constraints.is_empty()
     }
+
+    fn fairness_constraints(&self) -> Vec<FairnessConstraint> {
+        self.fairness_constraints.clone()
+    }
 }
 
 impl TlaModel {

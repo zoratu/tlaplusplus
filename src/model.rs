@@ -1,3 +1,4 @@
+use crate::fairness::FairnessConstraint;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fmt::Debug;
@@ -47,6 +48,14 @@ pub trait Model: Send + Sync + 'static {
     /// Default implementation returns false. Models with fairness should override this.
     fn has_fairness_constraints(&self) -> bool {
         false
+    }
+
+    /// Return the fairness constraints for this model
+    ///
+    /// Default implementation returns an empty list. Models with fairness
+    /// constraints (e.g. TlaModel with WF/SF specifications) should override this.
+    fn fairness_constraints(&self) -> Vec<FairnessConstraint> {
+        Vec::new()
     }
 
     fn check_invariants(&self, state: &Self::State) -> Result<(), String>;
