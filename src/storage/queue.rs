@@ -1198,6 +1198,7 @@ mod tests {
 mod failpoint_tests {
     use super::{DiskBackedQueue, DiskQueueConfig};
     use anyhow::Result;
+    use serial_test::serial;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_path(prefix: &str) -> std::path::PathBuf {
@@ -1210,6 +1211,7 @@ mod failpoint_tests {
 
     /// Test that transient queue spill failures are retried
     #[test]
+    #[serial]
     fn queue_spill_retry() -> Result<()> {
         let scenario = fail::FailScenario::setup();
         let dir = temp_path("queue-spill-retry");
@@ -1256,6 +1258,7 @@ mod failpoint_tests {
     /// Test that queue works correctly without load failpoint
     /// (The actual retry is tested via the retry_with_backoff unit tests)
     #[test]
+    #[serial]
     fn queue_load_works() -> Result<()> {
         let dir = temp_path("queue-load-works");
 
@@ -1309,6 +1312,7 @@ mod failpoint_tests {
     /// Test that queue_load_fail failpoint triggers the error path
     /// This tests that the failpoint mechanism works (the actual retry is in retry_with_backoff)
     #[test]
+    #[serial]
     fn queue_load_failpoint_triggers() -> Result<()> {
         let scenario = fail::FailScenario::setup();
         let dir = temp_path("queue-load-fp");
@@ -1349,6 +1353,7 @@ mod failpoint_tests {
 
     /// Test I/O latency tolerance in queue operations
     #[test]
+    #[serial]
     fn queue_io_latency() -> Result<()> {
         let dir = temp_path("queue-io-latency");
 

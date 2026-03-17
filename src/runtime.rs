@@ -2874,6 +2874,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
+    use serial_test::serial;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     fn temp_work_dir(prefix: &str) -> std::path::PathBuf {
@@ -2888,6 +2889,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn writes_checkpoint_manifest_on_exit() -> Result<()> {
         let work_dir = temp_work_dir("manifest");
         let model = CounterGridModel::new(64, 64, 300);
@@ -3146,6 +3148,7 @@ mod failpoint_tests {
     use crate::chaos;
     use crate::models::counter_grid::CounterGridModel;
     use anyhow::Result;
+    use serial_test::serial;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_work_dir(prefix: &str) -> std::path::PathBuf {
@@ -3161,6 +3164,7 @@ mod failpoint_tests {
 
     /// Test that worker crash is recovered gracefully
     #[test]
+    #[serial]
     fn worker_crash_recovery() -> Result<()> {
         let work_dir = temp_work_dir("worker-crash");
 
@@ -3200,6 +3204,7 @@ mod failpoint_tests {
 
     /// Test that I/O latency doesn't break the system
     #[test]
+    #[serial]
     fn io_latency_tolerance() -> Result<()> {
         let work_dir = temp_work_dir("io-latency");
 
@@ -3236,6 +3241,7 @@ mod failpoint_tests {
 
     /// Test fingerprint store degradation (failpoint returns false instead of panicking)
     #[test]
+    #[serial]
     fn fingerprint_store_degradation() -> Result<()> {
         let scenario = fail::FailScenario::setup();
         let work_dir = temp_work_dir("fp-degrade");
@@ -3273,6 +3279,7 @@ mod failpoint_tests {
 
     /// Test emergency checkpoint functionality
     #[test]
+    #[serial]
     fn emergency_checkpoint_request() {
         // Request emergency checkpoint
         assert!(!chaos::is_emergency_checkpoint_requested());
@@ -3297,6 +3304,7 @@ mod failpoint_tests {
 
     /// Test retry_with_backoff helper
     #[test]
+    #[serial]
     fn retry_with_backoff_success() {
         let mut attempts = 0;
 
@@ -3326,6 +3334,7 @@ mod failpoint_tests {
 
     /// Test retry_with_backoff exhaustion
     #[test]
+    #[serial]
     fn retry_with_backoff_exhaustion() {
         let mut attempts = 0;
 
@@ -3350,6 +3359,7 @@ mod failpoint_tests {
 
     /// Test that multiple workers can crash and run still completes
     #[test]
+    #[serial]
     fn multiple_worker_crashes() -> Result<()> {
         let scenario = fail::FailScenario::setup();
         let work_dir = temp_work_dir("multi-crash");
