@@ -2849,6 +2849,129 @@ pub(crate) fn eval_operator_call(
             }
             return Ok(TlaValue::Seq(Arc::new(result)));
         }
+        // === Community module: SequencesExt ===
+        "RemoveAt" if args.len() == 2 && !user_defined_shadow => {
+            let seq = sequence_like_values(&args[0])
+                .ok_or_else(|| anyhow!("RemoveAt expects a sequence, got {:?}", args[0]))?;
+            let i = args[1].as_int()? as usize;
+            if i < 1 || i > seq.len() {
+                return Err(anyhow!(
+                    "RemoveAt index {} out of bounds for sequence of length {}",
+                    i,
+                    seq.len()
+                ));
+            }
+            let mut result = seq[..i - 1].to_vec();
+            result.extend_from_slice(&seq[i..]);
+            return Ok(TlaValue::Seq(Arc::new(result)));
+        }
+        // === Community module: Functions ===
+        "FoldFunction" if args.len() == 3 && !user_defined_shadow => {
+            let op = &args[0];
+            let base = args[1].clone();
+            let fun = &args[2];
+            let domain_keys: Vec<TlaValue> = match fun {
+                TlaValue::Function(map) => map.values().cloned().collect(),
+                TlaValue::Seq(seq) => seq.iter().cloned().collect(),
+                _ => {
+                    return Err(anyhow!(
+                        "FoldFunction expects a function or sequence as 3rd arg, got {:?}",
+                        fun
+                    ));
+                }
+            };
+            let mut acc = base;
+            for val in domain_keys {
+                acc = apply_value(op, vec![acc, val], ctx, depth + 1)?;
+            }
+            return Ok(acc);
+        }
+        "FoldFunctionOnSet" if args.len() == 4 && !user_defined_shadow => {
+            let op = &args[0];
+            let base = args[1].clone();
+            let fun = &args[2];
+            let indices = args[3].as_set()?;
+            let mut acc = base;
+            for idx in indices.iter() {
+                let val = match fun {
+                    TlaValue::Function(map) => map.get(idx).cloned().ok_or_else(|| {
+                        anyhow!("FoldFunctionOnSet: key {:?} not in function", idx)
+                    })?,
+                    _ => {
+                        return Err(anyhow!(
+                            "FoldFunctionOnSet expects a function as 3rd arg, got {:?}",
+                            fun
+                        ));
+                    }
+                };
+                acc = apply_value(op, vec![acc, val], ctx, depth + 1)?;
+            }
+            return Ok(acc);
+        }
+        // === Community module: DyadicRationals ===
+        // Dyadic rationals are represented as records [num |-> Int, den |-> Int]
+        // where den is a power of 2.
+        "Half" if args.len() == 1 && !user_defined_shadow => {
+            // Half(p) == Reduce([num |-> p.num, den |-> p.den * 2])
+            let p = &args[0];
+            let num = p.select_key("num")?.as_int()?;
+            let den = p.select_key("den")?.as_int()?;
+            let new_den = den * 2;
+            // Reduce: divide by GCD
+            let g = gcd(num.unsigned_abs(), new_den as u64) as i64;
+            return Ok(TlaValue::Record(Arc::new(BTreeMap::from([
+                ("num".to_string(), TlaValue::Int(num / g)),
+                ("den".to_string(), TlaValue::Int(new_den / g)),
+            ]))));
+        }
+        "Add" if args.len() == 2 && !user_defined_shadow => {
+            // Check if both args are records with num/den fields (dyadic rational Add)
+            if args[0].select_key("num").is_ok() && args[1].select_key("num").is_ok() {
+                let p = &args[0];
+                let q = &args[1];
+                let pn = p.select_key("num")?.as_int()?;
+                let pd = p.select_key("den")?.as_int()?;
+                let qn = q.select_key("num")?.as_int()?;
+                let qd = q.select_key("den")?.as_int()?;
+                if pn == 0 {
+                    return Ok(args[1].clone());
+                }
+                // LCM for dyadic rationals is just max(pd, qd)
+                let lcm = pd.max(qd);
+                let new_num = pn * (lcm / pd) + qn * (lcm / qd);
+                let g = gcd(new_num.unsigned_abs(), lcm as u64) as i64;
+                return Ok(TlaValue::Record(Arc::new(BTreeMap::from([
+                    ("num".to_string(), TlaValue::Int(new_num / g)),
+                    ("den".to_string(), TlaValue::Int(lcm / g)),
+                ]))));
+            }
+            // Fall through to user-defined Add
+        }
+        "IsDyadicRational" if args.len() == 1 && !user_defined_shadow => {
+            let r = &args[0];
+            if let (Ok(den_val), Ok(_num_val)) = (r.select_key("den"), r.select_key("num")) {
+                let den = den_val.as_int()?;
+                // Check if den is a power of 2
+                let is_dyadic = den > 0 && (den & (den - 1)) == 0;
+                return Ok(TlaValue::Bool(is_dyadic));
+            }
+            return Ok(TlaValue::Bool(false));
+        }
+        "PrettyPrint" if args.len() == 1 && !user_defined_shadow => {
+            let p = &args[0];
+            if let (Ok(num_val), Ok(den_val)) = (p.select_key("num"), p.select_key("den")) {
+                let num = num_val.as_int()?;
+                let den = den_val.as_int()?;
+                if num == 0 {
+                    return Ok(TlaValue::String("0".to_string()));
+                }
+                if num == 1 && den == 1 {
+                    return Ok(TlaValue::String("1".to_string()));
+                }
+                return Ok(TlaValue::String(format!("{}/{}", num, den)));
+            }
+            return Ok(TlaValue::String(format!("{:?}", p)));
+        }
         "Permutations" => {
             if args.len() != 1 {
                 return Err(anyhow!("Permutations expects 1 argument"));
@@ -3750,6 +3873,11 @@ fn eval_bracket_index_key(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Re
         1 => Ok(args.into_iter().next().expect("single arg exists")),
         _ => Ok(TlaValue::Seq(Arc::new(args))),
     }
+}
+
+/// Greatest common divisor (Euclidean algorithm)
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 { a } else { gcd(b, a % b) }
 }
 
 fn sequence_like_values(value: &TlaValue) -> Option<Vec<TlaValue>> {
