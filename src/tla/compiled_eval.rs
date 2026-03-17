@@ -358,6 +358,7 @@ fn eval_compiled_inner(
             let right = eval_compiled_inner(b, ctx, depth + 1)?;
             let left_set = left.as_set()?;
             let right_set = right.as_set()?;
+            ctx.check_budget(left_set.len() * right_set.len())?;
             let mut product = BTreeSet::new();
             for lhs_val in left_set {
                 for rhs_val in right_set {
@@ -384,8 +385,13 @@ fn eval_compiled_inner(
             let set = set.as_set()?;
             let elements: Vec<TlaValue> = set.iter().cloned().collect();
             let n = elements.len();
+            if n >= 64 {
+                return Ok(TlaValue::Set(Arc::new(BTreeSet::new())));
+            }
+            let total = 1u64 << n;
+            ctx.check_budget(total as usize)?;
             let mut powerset = BTreeSet::new();
-            for mask in 0..(1u64 << n) {
+            for mask in 0..total {
                 let mut subset = BTreeSet::new();
                 for i in 0..n {
                     if (mask >> i) & 1 == 1 {
@@ -889,6 +895,7 @@ fn eval_compiled_inner(
                     max_functions
                 ));
             }
+            ctx.check_budget(total as usize)?;
 
             // Generate all functions by iterating through all combinations
             // Each function is a mapping from each domain element to some range element
@@ -1452,6 +1459,7 @@ fn eval_compiled_opcall(
                             local_definitions: ctx.local_definitions.clone(),
                             definitions: ctx.definitions,
                             instances: ctx.instances,
+                            eval_budget: ctx.eval_budget.clone(),
                         };
                         eval_expr(body, &lambda_ctx)?
                     }
@@ -3445,9 +3453,8 @@ mod compiled_action_correctness_tests {
     #[test]
     fn test_compiled_case_expression_guard() {
         // phase = "prepare" → CASE arm yields TRUE → should produce successor
-        let state_prepare = TlaState::from([
-            ("phase".to_string(), TlaValue::String("prepare".to_string())),
-        ]);
+        let state_prepare =
+            TlaState::from([("phase".to_string(), TlaValue::String("prepare".to_string()))]);
         let ctx_prepare = EvalContext::new(&state_prepare);
 
         let result = compile_and_run(
@@ -3470,9 +3477,8 @@ mod compiled_action_correctness_tests {
         );
 
         // phase = "commit" → CASE arm yields FALSE → should block
-        let state_commit = TlaState::from([
-            ("phase".to_string(), TlaValue::String("commit".to_string())),
-        ]);
+        let state_commit =
+            TlaState::from([("phase".to_string(), TlaValue::String("commit".to_string()))]);
         let ctx_commit = EvalContext::new(&state_commit);
 
         let result2 = compile_and_run(
@@ -3582,10 +3588,7 @@ mod compiled_action_correctness_tests {
         assert_eq!(succ_msgs, &expected, "Tail should remove first element");
 
         // Empty sequence: Len = 0, guard should block
-        let state_empty = TlaState::from([(
-            "msgs".to_string(),
-            TlaValue::Seq(Arc::new(vec![])),
-        )]);
+        let state_empty = TlaState::from([("msgs".to_string(), TlaValue::Seq(Arc::new(vec![])))]);
         let ctx_empty = EvalContext::new(&state_empty);
 
         let result2 = compile_and_run(
@@ -3613,14 +3616,8 @@ mod compiled_action_correctness_tests {
         let state = TlaState::from([(
             "f".to_string(),
             TlaValue::Function(Arc::new(BTreeMap::from([
-                (
-                    TlaValue::String("n1".to_string()),
-                    TlaValue::Int(0),
-                ),
-                (
-                    TlaValue::String("n2".to_string()),
-                    TlaValue::Int(0),
-                ),
+                (TlaValue::String("n1".to_string()), TlaValue::Int(0)),
+                (TlaValue::String("n2".to_string()), TlaValue::Int(0)),
             ]))),
         )]);
         let mut defs = BTreeMap::new();
