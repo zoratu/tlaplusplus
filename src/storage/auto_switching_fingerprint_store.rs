@@ -699,6 +699,7 @@ pub struct AutoSwitchStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn try_read_retry_thresholds_are_stable() {
@@ -710,6 +711,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_basic_operations() {
         let config = AutoSwitchConfig {
             enabled: false, // Disable auto-switch for basic test
@@ -767,6 +769,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_manual_switch_to_hybrid() {
         let config = AutoSwitchConfig {
             enabled: true,

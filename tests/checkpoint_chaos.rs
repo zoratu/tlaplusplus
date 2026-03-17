@@ -31,10 +31,12 @@ fn chaos_test_guard() -> MutexGuard<'static, ()> {
 #[cfg(feature = "failpoints")]
 mod checkpoint_failpoint_tests {
     use super::*;
+    use serial_test::serial;
     use tlaplusplus::{fail_point, fail_point_is_set};
 
     /// Test: checkpoint write fails, recovery works
     #[test]
+    #[serial]
     fn test_checkpoint_write_fail_recovery() {
         let _test_guard = chaos_test_guard();
         let scenario = fail::FailScenario::setup();
@@ -67,6 +69,7 @@ mod checkpoint_failpoint_tests {
 
     /// Test: checkpoint flush fails mid-drain
     #[test]
+    #[serial]
     fn test_checkpoint_flush_fail_mid_drain() {
         let _test_guard = chaos_test_guard();
         let scenario = fail::FailScenario::setup();
@@ -90,6 +93,7 @@ mod checkpoint_failpoint_tests {
 
     /// Test: fingerprint store operation fails during switch
     #[test]
+    #[serial]
     fn test_fp_store_fail_during_switch() {
         let _test_guard = chaos_test_guard();
         let scenario = fail::FailScenario::setup();
@@ -118,6 +122,7 @@ mod checkpoint_failpoint_tests {
 
     /// Test: quiescence timeout failpoint triggers
     #[test]
+    #[serial]
     fn test_quiescence_timeout_failpoint() {
         let _test_guard = chaos_test_guard();
         let scenario = fail::FailScenario::setup();
@@ -139,6 +144,7 @@ mod checkpoint_failpoint_tests {
 
     /// Test: worker pause delay failpoint
     #[test]
+    #[serial]
     fn test_worker_pause_delay_failpoint() {
         let _test_guard = chaos_test_guard();
         let scenario = fail::FailScenario::setup();
@@ -164,6 +170,7 @@ mod checkpoint_failpoint_tests {
 
     /// Test: FP switch slow failpoint
     #[test]
+    #[serial]
     fn test_fp_switch_slow_failpoint() {
         let _test_guard = chaos_test_guard();
         let scenario = fail::FailScenario::setup();
@@ -189,6 +196,7 @@ mod checkpoint_failpoint_tests {
 
     /// Test: multiple failpoints active simultaneously
     #[test]
+    #[serial]
     fn test_multiple_failpoints_active() {
         let _test_guard = chaos_test_guard();
         let scenario = fail::FailScenario::setup();
@@ -213,6 +221,7 @@ mod checkpoint_failpoint_tests {
 
     /// Test: failpoint with probability (for flaky failure simulation)
     #[test]
+    #[serial]
     fn test_probabilistic_failpoint() {
         let _test_guard = chaos_test_guard();
         let scenario = fail::FailScenario::setup();

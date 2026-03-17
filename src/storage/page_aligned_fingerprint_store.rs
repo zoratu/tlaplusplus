@@ -1630,6 +1630,7 @@ unsafe fn allocate_huge_pages(size: usize) -> *mut u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_backing_dir(prefix: &str) -> PathBuf {
@@ -1685,6 +1686,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_store_basic_operations() {
         let config = FingerprintStoreConfig {
             shard_count: 4,
@@ -1737,6 +1739,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_edge_case_fingerprints() {
         // Regression test for fp=0 edge case found by fuzzing
         // fp=0 is normalized to fp=1 internally, but routing must be consistent
@@ -1791,6 +1794,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_concurrent_inserts() {
         use std::sync::Arc;
         use std::thread;
