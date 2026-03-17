@@ -4135,6 +4135,20 @@ fn powerset(input: &BTreeSet<TlaValue>, ctx: &EvalContext<'_>) -> Result<BTreeSe
     let values: Vec<TlaValue> = input.iter().cloned().collect();
     let n = values.len();
 
+    // Hard limit: SUBSET of sets with >20 elements is never practical
+    if n > 20 {
+        return Err(anyhow!(
+            "SUBSET of {}-element set would produce 2^{} = {} elements (too large)",
+            n,
+            n,
+            if n < 64 {
+                format!("{}", 1u64 << n)
+            } else {
+                format!("2^{}", n)
+            }
+        ));
+    }
+
     if n >= usize::BITS as usize {
         return Ok(subsets);
     }
