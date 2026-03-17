@@ -1392,6 +1392,7 @@ where
         let mut dedup = HashSet::with_capacity(initial.len().max(16));
         for state in initial {
             run_stats.states_generated.fetch_add(1, Ordering::Relaxed);
+            let state = model.canonicalize(state);
             let fp = model.fingerprint(&state);
             if dedup.insert(fp) {
                 initial_fps.push(fp);
@@ -2269,6 +2270,11 @@ where
 
                     let mut duplicates_in_batch = 0u64;
                     for candidate in pending_batch.drain(..) {
+                        // Canonicalize under symmetry reduction before fingerprinting.
+                        // Two states that differ only by a permutation of symmetric
+                        // elements will produce the same canonical form and therefore
+                        // the same fingerprint, letting the FP store dedup them.
+                        let candidate = worker_model.canonicalize(candidate);
                         let fp = worker_model.fingerprint(&candidate);
                         // Dedup within this batch first
                         if !local_fp_dedup.insert(fp) {
