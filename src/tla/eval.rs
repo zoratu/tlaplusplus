@@ -2850,6 +2850,45 @@ pub(crate) fn eval_operator_call(
             return Ok(TlaValue::Seq(Arc::new(result)));
         }
         // === Community module: SequencesExt ===
+        "SeqOf" if args.len() == 2 && !user_defined_shadow => {
+            // SeqOf(set, n) == UNION {[1..m -> set] : m \in 0..n}
+            let set = args[0].as_set()?;
+            let n = args[1].as_int()?;
+            if n < 0 {
+                return Ok(TlaValue::Set(Arc::new(BTreeSet::new())));
+            }
+            ctx.check_budget(1)?; // budget check before potentially large construction
+            let elements: Vec<TlaValue> = set.iter().cloned().collect();
+            let mut result = BTreeSet::new();
+            // m=0: empty sequence
+            result.insert(TlaValue::Seq(Arc::new(vec![])));
+            for m in 1..=n as usize {
+                let total = elements.len().checked_pow(m as u32).unwrap_or(usize::MAX);
+                ctx.check_budget(total)?;
+                // Generate all sequences of length m over elements
+                let mut indices = vec![0usize; m];
+                loop {
+                    let seq: Vec<TlaValue> = indices.iter().map(|&i| elements[i].clone()).collect();
+                    result.insert(TlaValue::Seq(Arc::new(seq)));
+                    // Increment indices
+                    let mut carry = true;
+                    for j in (0..m).rev() {
+                        if carry {
+                            indices[j] += 1;
+                            if indices[j] >= elements.len() {
+                                indices[j] = 0;
+                            } else {
+                                carry = false;
+                            }
+                        }
+                    }
+                    if carry {
+                        break;
+                    }
+                }
+            }
+            return Ok(TlaValue::Set(Arc::new(result)));
+        }
         "RemoveAt" if args.len() == 2 && !user_defined_shadow => {
             let seq = sequence_like_values(&args[0])
                 .ok_or_else(|| anyhow!("RemoveAt expects a sequence, got {:?}", args[0]))?;
@@ -2956,6 +2995,143 @@ pub(crate) fn eval_operator_call(
                 return Ok(TlaValue::Bool(is_dyadic));
             }
             return Ok(TlaValue::Bool(false));
+        }
+        // === Community module: Folds ===
+        "MapThenFoldSet" if args.len() == 5 && !user_defined_shadow => {
+            let op = &args[0];
+            let base = args[1].clone();
+            let f = &args[2];
+            let choose_fn = &args[3];
+            let set = args[4].as_set()?;
+            let mut acc = base;
+            let mut remaining = set.clone();
+            while !remaining.is_empty() {
+                let chosen = apply_value(
+                    choose_fn,
+                    vec![TlaValue::Set(Arc::new(remaining.clone()))],
+                    ctx,
+                    depth + 1,
+                )?;
+                let mapped = apply_value(f, vec![chosen.clone()], ctx, depth + 1)?;
+                acc = apply_value(op, vec![mapped, acc], ctx, depth + 1)?;
+                remaining.remove(&chosen);
+            }
+            return Ok(acc);
+        }
+        // === Community module: FiniteSetsExt ===
+        "FoldSet" if args.len() == 3 && !user_defined_shadow => {
+            let op = &args[0];
+            let base = args[1].clone();
+            let set = args[2].as_set()?;
+            let mut acc = base;
+            for elem in set.iter() {
+                acc = apply_value(op, vec![elem.clone(), acc], ctx, depth + 1)?;
+            }
+            return Ok(acc);
+        }
+        // === Community module: UndirectedGraphs ===
+        "IsUndirectedGraph" if args.len() == 1 && !user_defined_shadow => {
+            let g = &args[0];
+            if let (Ok(nodes), Ok(edges)) = (g.select_key("node"), g.select_key("edge")) {
+                let node_set = nodes.as_set()?;
+                let edge_set = edges.as_set()?;
+                for e in edge_set.iter() {
+                    let e_set = e.as_set()?;
+                    if e_set.len() != 2 {
+                        return Ok(TlaValue::Bool(false));
+                    }
+                    for elem in e_set.iter() {
+                        if !node_set.contains(elem) {
+                            return Ok(TlaValue::Bool(false));
+                        }
+                    }
+                }
+                return Ok(TlaValue::Bool(true));
+            }
+            return Ok(TlaValue::Bool(false));
+        }
+        "IsLoopFreeUndirectedGraph" if args.len() == 1 && !user_defined_shadow => {
+            let g = &args[0];
+            if let (Ok(nodes), Ok(edges)) = (g.select_key("node"), g.select_key("edge")) {
+                let node_set = nodes.as_set()?;
+                let edge_set = edges.as_set()?;
+                for e in edge_set.iter() {
+                    let e_set = e.as_set()?;
+                    if e_set.len() != 2 {
+                        return Ok(TlaValue::Bool(false));
+                    }
+                    for elem in e_set.iter() {
+                        if !node_set.contains(elem) {
+                            return Ok(TlaValue::Bool(false));
+                        }
+                    }
+                }
+                return Ok(TlaValue::Bool(true));
+            }
+            return Ok(TlaValue::Bool(false));
+        }
+        "ConnectedComponents" if args.len() == 1 && !user_defined_shadow => {
+            // Native union-find implementation (much faster than the TLA+ definition)
+            let g = &args[0];
+            let nodes = g.select_key("node")?.as_set()?;
+            let edges = g.select_key("edge")?.as_set()?;
+            let node_list: Vec<TlaValue> = nodes.iter().cloned().collect();
+            // Map each node to its component index
+            let mut parent: Vec<usize> = (0..node_list.len()).collect();
+            let find = |parent: &mut Vec<usize>, mut x: usize| -> usize {
+                while parent[x] != x {
+                    parent[x] = parent[parent[x]]; // path compression
+                    x = parent[x];
+                }
+                x
+            };
+            for edge in edges.iter() {
+                let e_set = edge.as_set()?;
+                let edge_nodes: Vec<&TlaValue> = e_set.iter().collect();
+                if edge_nodes.len() == 2 {
+                    if let (Some(a), Some(b)) = (
+                        node_list.iter().position(|n| n == edge_nodes[0]),
+                        node_list.iter().position(|n| n == edge_nodes[1]),
+                    ) {
+                        let ra = find(&mut parent, a);
+                        let rb = find(&mut parent, b);
+                        if ra != rb {
+                            parent[ra] = rb;
+                        }
+                    }
+                }
+            }
+            // Build component sets
+            let mut components: BTreeMap<usize, BTreeSet<TlaValue>> = BTreeMap::new();
+            for (i, node) in node_list.iter().enumerate() {
+                let root = find(&mut parent, i);
+                components.entry(root).or_default().insert(node.clone());
+            }
+            let result: BTreeSet<TlaValue> = components
+                .into_values()
+                .map(|s| TlaValue::Set(Arc::new(s)))
+                .collect();
+            return Ok(TlaValue::Set(Arc::new(result)));
+        }
+        "AreConnectedIn" if args.len() == 3 && !user_defined_shadow => {
+            let m = &args[0];
+            let n = &args[1];
+            let g = &args[2];
+            // Reuse ConnectedComponents
+            let comps = eval_operator_call("ConnectedComponents", vec![g.clone()], ctx, depth + 1)?;
+            for comp in comps.as_set()?.iter() {
+                let comp_set = comp.as_set()?;
+                if comp_set.contains(m) && comp_set.contains(n) {
+                    return Ok(TlaValue::Bool(true));
+                }
+            }
+            return Ok(TlaValue::Bool(false));
+        }
+        "IsStronglyConnected" if args.len() == 1 && !user_defined_shadow => {
+            let comps =
+                eval_operator_call("ConnectedComponents", vec![args[0].clone()], ctx, depth + 1)?;
+            let num_comps = comps.as_set()?.len();
+            return Ok(TlaValue::Bool(num_comps <= 1));
         }
         "PrettyPrint" if args.len() == 1 && !user_defined_shadow => {
             let p = &args[0];
