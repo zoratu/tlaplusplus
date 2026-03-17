@@ -61,6 +61,11 @@ const BUILTIN_MODULES: &[&str] = &[
     "Randomization",
     "Json",
     "TLCExt",
+    "DyadicRationals",
+    "SequencesExt",
+    "Functions",
+    "FiniteSetsExt",
+    "UndirectedGraphs",
 ];
 
 /// Check if a module name is a built-in standard library module.
@@ -315,6 +320,27 @@ fn load_extended_modules(
     for extended_name in module.extends.clone() {
         // Skip built-in modules - their operators are implemented in the evaluator
         if is_builtin_module(&extended_name) {
+            // Inject synthetic definitions for community modules that define constants
+            if extended_name == "DyadicRationals" {
+                module
+                    .definitions
+                    .entry("Zero".to_string())
+                    .or_insert(TlaDefinition {
+                        name: "Zero".to_string(),
+                        params: vec![],
+                        body: "[num |-> 0, den |-> 1]".to_string(),
+                        is_recursive: false,
+                    });
+                module
+                    .definitions
+                    .entry("One".to_string())
+                    .or_insert(TlaDefinition {
+                        name: "One".to_string(),
+                        params: vec![],
+                        body: "[num |-> 1, den |-> 1]".to_string(),
+                        is_recursive: false,
+                    });
+            }
             continue;
         }
 
