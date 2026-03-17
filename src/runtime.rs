@@ -23,7 +23,7 @@ use crate::system::{
 };
 use anyhow::{Context, Result, anyhow};
 use dashmap::DashMap;
-use parking_lot::{Condvar, Mutex};
+// Mutex/Condvar removed: checkpoint pause now uses lock-free thread::park/unpark
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -229,10 +229,11 @@ impl AtomicRunStats {
 struct PauseController {
     requested: AtomicBool,
     paused_workers: AtomicUsize,
-    wait_lock: Mutex<()>,
-    wait_cv: Condvar,
+    /// Per-worker thread handles for lock-free unparking.
+    /// Workers call thread::park() instead of blocking on a shared mutex.
+    /// The checkpoint thread calls unpark() on each handle to resume.
+    worker_threads: parking_lot::RwLock<Vec<std::thread::Thread>>,
     /// Per-worker pause status for debugging (worker_id -> is_paused)
-    /// Only populated when debugging is enabled via TLAPP_DEBUG_PAUSE env var
     worker_pause_status: parking_lot::RwLock<Vec<AtomicBool>>,
     /// Per-worker NUMA node assignment (for diagnostics)
     worker_numa_nodes: parking_lot::RwLock<Vec<usize>>,
@@ -245,8 +246,7 @@ impl Default for PauseController {
         Self {
             requested: AtomicBool::new(false),
             paused_workers: AtomicUsize::new(0),
-            wait_lock: Mutex::new(()),
-            wait_cv: Condvar::new(),
+            worker_threads: parking_lot::RwLock::new(Vec::new()),
             worker_pause_status: parking_lot::RwLock::new(Vec::new()),
             worker_numa_nodes: parking_lot::RwLock::new(Vec::new()),
             numa_diagnostics: parking_lot::RwLock::new(None),
@@ -315,6 +315,11 @@ impl PauseController {
 }
 
 impl PauseController {
+    /// Register a worker thread for lock-free unparking during checkpoint resume.
+    fn register_worker_thread(&self, thread: std::thread::Thread) {
+        self.worker_threads.write().push(thread);
+    }
+
     fn worker_pause_point(&self, stop: &AtomicBool, worker_id: usize) {
         if !self.requested.load(Ordering::Acquire) {
             return;
@@ -329,18 +334,19 @@ impl PauseController {
         }
 
         let paused_count = self.paused_workers.fetch_add(1, Ordering::AcqRel) + 1;
-        // Log when first few workers pause and periodically after
         if paused_count <= 5 || paused_count % 10 == 0 {
             eprintln!(
                 "Worker {} pausing: {} workers now paused",
                 worker_id, paused_count
             );
         }
-        let mut guard = self.wait_lock.lock();
+
+        // Lock-free pause: park this thread instead of blocking on a shared mutex.
+        // Each worker parks independently — zero contention between workers.
         while self.requested.load(Ordering::Acquire) && !stop.load(Ordering::Acquire) {
-            self.wait_cv.wait_for(&mut guard, Duration::from_millis(10));
+            std::thread::park_timeout(Duration::from_millis(50));
         }
-        drop(guard);
+
         self.paused_workers.fetch_sub(1, Ordering::AcqRel);
 
         // Mark this worker as unpaused
@@ -354,7 +360,6 @@ impl PauseController {
 
     fn request_pause(&self) {
         self.requested.store(true, Ordering::Release);
-        self.wait_cv.notify_all();
     }
 
     /// Wait for all workers to pause (quiescence).
@@ -530,7 +535,11 @@ impl PauseController {
 
     fn resume(&self) {
         self.requested.store(false, Ordering::Release);
-        self.wait_cv.notify_all();
+        // Unpark all registered worker threads — lock-free, no contention.
+        let threads = self.worker_threads.read();
+        for t in threads.iter() {
+            t.unpark();
+        }
     }
 }
 
@@ -1977,6 +1986,9 @@ where
             // This reduces cross-NUMA memory access which causes high kernel time
             let _ = set_preferred_node(worker_numa_node);
 
+            // Register this worker's thread handle for lock-free checkpoint unparking
+            worker_pause.register_worker_thread(std::thread::current());
+
             let mut successors: Vec<M::State> = Vec::with_capacity(64);
             let mut pending_batch: Vec<M::State> = Vec::with_capacity(worker_fp_batch_size);
             let mut unique_states: Vec<M::State> = Vec::with_capacity(worker_fp_batch_size);
@@ -2165,10 +2177,9 @@ where
                         property_type: PropertyType::Safety,
                         trace,
                     });
-                    let prev_count =
-                        worker_violation_count.fetch_add(1, Ordering::AcqRel);
-                    let should_stop = worker_stop_on_violation
-                        && (prev_count + 1) >= worker_max_violations;
+                    let prev_count = worker_violation_count.fetch_add(1, Ordering::AcqRel);
+                    let should_stop =
+                        worker_stop_on_violation && (prev_count + 1) >= worker_max_violations;
                     if should_stop {
                         worker_stop.store(true, Ordering::Release);
                     }
@@ -2415,7 +2426,6 @@ where
             worker_queue.flush_worker_counters(&mut worker_state);
 
             worker_live.fetch_sub(1, Ordering::AcqRel);
-            worker_pause.wait_cv.notify_all();
         }));
     }
 
@@ -2555,162 +2565,159 @@ where
     // Check fairness constraints if we collected labeled transitions
     // (only if no safety violation was already found)
     if violation.is_none() {
-    if let Some(transitions_map) = labeled_transitions.as_ref() {
-        eprintln!(
-            "Checking fairness constraints on {} states with transitions...",
-            transitions_map.len()
-        );
+        if let Some(transitions_map) = labeled_transitions.as_ref() {
+            eprintln!(
+                "Checking fairness constraints on {} states with transitions...",
+                transitions_map.len()
+            );
 
-        // Flatten all transitions into a single vector
-        let all_transitions: Vec<LabeledTransition<M::State>> = transitions_map
-            .iter()
-            .flat_map(|entry| entry.value().clone())
-            .collect();
-
-        if !all_transitions.is_empty() {
-            eprintln!("  Total transitions collected: {}", all_transitions.len());
-
-            // Collect all unique states from transitions
-            let mut state_set = HashSet::new();
-            for trans in &all_transitions {
-                state_set.insert(model.fingerprint(&trans.from));
-                state_set.insert(model.fingerprint(&trans.to));
-            }
-            let unique_states: Vec<M::State> = all_transitions
+            // Flatten all transitions into a single vector
+            let all_transitions: Vec<LabeledTransition<M::State>> = transitions_map
                 .iter()
-                .flat_map(|t| vec![t.from.clone(), t.to.clone()])
-                .collect::<Vec<_>>()
-                .into_iter()
-                .filter(|s| {
-                    let fp = model.fingerprint(s);
-                    state_set.remove(&fp)
-                })
+                .flat_map(|entry| entry.value().clone())
                 .collect();
 
-            eprintln!("  Unique states in graph: {}", unique_states.len());
+            if !all_transitions.is_empty() {
+                eprintln!("  Total transitions collected: {}", all_transitions.len());
 
-            // Build adjacency map for SCC detection
-            let mut adjacency: HashMap<M::State, Vec<M::State>> = HashMap::new();
-            for trans in &all_transitions {
-                adjacency
-                    .entry(trans.from.clone())
-                    .or_insert_with(Vec::new)
-                    .push(trans.to.clone());
-            }
+                // Collect all unique states from transitions
+                let mut state_set = HashSet::new();
+                for trans in &all_transitions {
+                    state_set.insert(model.fingerprint(&trans.from));
+                    state_set.insert(model.fingerprint(&trans.to));
+                }
+                let unique_states: Vec<M::State> = all_transitions
+                    .iter()
+                    .flat_map(|t| vec![t.from.clone(), t.to.clone()])
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .filter(|s| {
+                        let fp = model.fingerprint(s);
+                        state_set.remove(&fp)
+                    })
+                    .collect();
 
-            // Find strongly connected components using Tarjan's algorithm
-            let mut tarjan = TarjanSCC::new();
-            let sccs = tarjan.find_sccs(&unique_states, |state| {
-                adjacency.get(state).cloned().unwrap_or_default()
-            });
+                eprintln!("  Unique states in graph: {}", unique_states.len());
 
-            eprintln!("  Found {} strongly connected components", sccs.len());
+                // Build adjacency map for SCC detection
+                let mut adjacency: HashMap<M::State, Vec<M::State>> = HashMap::new();
+                for trans in &all_transitions {
+                    adjacency
+                        .entry(trans.from.clone())
+                        .or_insert_with(Vec::new)
+                        .push(trans.to.clone());
+                }
 
-            // Check fairness constraints on each non-trivial SCC
-            // (Non-trivial = has more than one state, or has a self-loop)
-            let non_trivial_sccs: Vec<_> = sccs
-                .iter()
-                .filter(|scc| {
-                    scc.len() > 1
-                        || (scc.len() == 1 && {
-                            let state = &scc[0];
-                            adjacency
-                                .get(state)
-                                .map(|succs| succs.contains(state))
-                                .unwrap_or(false)
-                        })
-                })
-                .collect();
+                // Find strongly connected components using Tarjan's algorithm
+                let mut tarjan = TarjanSCC::new();
+                let sccs = tarjan.find_sccs(&unique_states, |state| {
+                    adjacency.get(state).cloned().unwrap_or_default()
+                });
 
-            if !non_trivial_sccs.is_empty() {
-                eprintln!(
-                    "  Checking fairness on {} non-trivial SCCs",
-                    non_trivial_sccs.len()
-                );
+                eprintln!("  Found {} strongly connected components", sccs.len());
 
-                let constraints = model.fairness_constraints();
+                // Check fairness constraints on each non-trivial SCC
+                // (Non-trivial = has more than one state, or has a self-loop)
+                let non_trivial_sccs: Vec<_> = sccs
+                    .iter()
+                    .filter(|scc| {
+                        scc.len() > 1
+                            || (scc.len() == 1 && {
+                                let state = &scc[0];
+                                adjacency
+                                    .get(state)
+                                    .map(|succs| succs.contains(state))
+                                    .unwrap_or(false)
+                            })
+                    })
+                    .collect();
 
-                if constraints.is_empty() {
-                    eprintln!("  No fairness constraints to check");
-                } else {
+                if !non_trivial_sccs.is_empty() {
                     eprintln!(
-                        "  Checking {} fairness constraints against SCCs",
-                        constraints.len()
+                        "  Checking fairness on {} non-trivial SCCs",
+                        non_trivial_sccs.len()
                     );
 
-                    // Convert model::LabeledTransition to fairness::LabeledTransition
-                    let fairness_transitions: Vec<FairnessLabeledTransition<M::State>> =
-                        all_transitions
-                            .iter()
-                            .map(|t| FairnessLabeledTransition {
-                                from: t.from.clone(),
-                                to: t.to.clone(),
-                                action: FairnessActionLabel {
-                                    name: t.action.name.clone(),
-                                    disjunct_index: t.action.disjunct_index,
-                                },
-                            })
-                            .collect();
+                    let constraints = model.fairness_constraints();
 
-                    for (scc_idx, scc) in non_trivial_sccs.iter().enumerate() {
-                        let scc_states: Vec<M::State> =
-                            scc.iter().map(|s| (*s).clone()).collect();
+                    if constraints.is_empty() {
+                        eprintln!("  No fairness constraints to check");
+                    } else {
+                        eprintln!(
+                            "  Checking {} fairness constraints against SCCs",
+                            constraints.len()
+                        );
 
-                        for constraint in &constraints {
-                            if let Err(e) = check_fairness_on_scc(
-                                &scc_states,
-                                constraint,
-                                &fairness_transitions,
-                            ) {
-                                eprintln!(
-                                    "  Fairness violation in SCC {} ({} states): {}",
-                                    scc_idx,
-                                    scc_states.len(),
-                                    e
-                                );
+                        // Convert model::LabeledTransition to fairness::LabeledTransition
+                        let fairness_transitions: Vec<FairnessLabeledTransition<M::State>> =
+                            all_transitions
+                                .iter()
+                                .map(|t| FairnessLabeledTransition {
+                                    from: t.from.clone(),
+                                    to: t.to.clone(),
+                                    action: FairnessActionLabel {
+                                        name: t.action.name.clone(),
+                                        disjunct_index: t.action.disjunct_index,
+                                    },
+                                })
+                                .collect();
 
-                                // Pick a representative state from the SCC for the violation
-                                let representative = scc_states
-                                    .first()
-                                    .cloned()
-                                    .expect("non-trivial SCC has at least one state");
+                        for (scc_idx, scc) in non_trivial_sccs.iter().enumerate() {
+                            let scc_states: Vec<M::State> =
+                                scc.iter().map(|s| (*s).clone()).collect();
 
-                                // Build a cycle trace from the SCC states
-                                let mut trace = scc_states.clone();
-                                // Close the cycle by repeating the first state
-                                if let Some(first) = trace.first().cloned() {
-                                    trace.push(first);
-                                }
-
-                                violation = Some(Violation {
-                                    message: format!(
-                                        "Fairness violation: {}",
+                            for constraint in &constraints {
+                                if let Err(e) = check_fairness_on_scc(
+                                    &scc_states,
+                                    constraint,
+                                    &fairness_transitions,
+                                ) {
+                                    eprintln!(
+                                        "  Fairness violation in SCC {} ({} states): {}",
+                                        scc_idx,
+                                        scc_states.len(),
                                         e
-                                    ),
-                                    state: representative,
-                                    property_type: PropertyType::Liveness,
-                                    trace,
-                                });
+                                    );
 
-                                // Stop on first fairness violation
+                                    // Pick a representative state from the SCC for the violation
+                                    let representative = scc_states
+                                        .first()
+                                        .cloned()
+                                        .expect("non-trivial SCC has at least one state");
+
+                                    // Build a cycle trace from the SCC states
+                                    let mut trace = scc_states.clone();
+                                    // Close the cycle by repeating the first state
+                                    if let Some(first) = trace.first().cloned() {
+                                        trace.push(first);
+                                    }
+
+                                    violation = Some(Violation {
+                                        message: format!("Fairness violation: {}", e),
+                                        state: representative,
+                                        property_type: PropertyType::Liveness,
+                                        trace,
+                                    });
+
+                                    // Stop on first fairness violation
+                                    break;
+                                }
+                            }
+
+                            if violation.is_some() {
                                 break;
                             }
                         }
 
-                        if violation.is_some() {
-                            break;
+                        if violation.is_none() {
+                            eprintln!("  All fairness constraints satisfied");
                         }
                     }
-
-                    if violation.is_none() {
-                        eprintln!("  All fairness constraints satisfied");
-                    }
+                } else {
+                    eprintln!("  No cycles detected - fairness constraints trivially satisfied");
                 }
-            } else {
-                eprintln!("  No cycles detected - fairness constraints trivially satisfied");
             }
         }
-    }
     }
 
     let (states_generated, states_processed, states_distinct, duplicates, enqueued, checkpoints) =
@@ -2871,10 +2878,10 @@ mod tests {
     use crate::models::counter_grid::CounterGridModel;
     use crate::storage::work_stealing_queues::WorkStealingQueues;
     use anyhow::Result;
+    use serial_test::serial;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
-    use serial_test::serial;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     fn temp_work_dir(prefix: &str) -> std::path::PathBuf {
