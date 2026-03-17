@@ -6,10 +6,41 @@ use crate::tla::{
     looks_like_action, parse_stuttering_action_expr,
 };
 use anyhow::{Context, Result, anyhow};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::sync::Arc;
+
+thread_local! {
+    /// Thread-local active evaluation budget. When set, newly created EvalContexts
+    /// inherit this budget so that all evaluation on the thread shares a single
+    /// cumulative element limit. This avoids threading a budget parameter through
+    /// every function that creates an EvalContext.
+    static ACTIVE_EVAL_BUDGET: Cell<Option<Rc<Cell<usize>>>> = const { Cell::new(None) };
+}
+
+/// Set a thread-local evaluation budget that all new EvalContexts will inherit.
+/// Returns the previous budget (if any) so it can be restored.
+pub fn set_active_eval_budget(limit: usize) -> Option<Rc<Cell<usize>>> {
+    let budget = Rc::new(Cell::new(limit));
+    let prev = ACTIVE_EVAL_BUDGET.with(|b| b.replace(Some(budget.clone())));
+    prev
+}
+
+/// Clear the thread-local evaluation budget, restoring an optional previous one.
+pub fn restore_eval_budget(prev: Option<Rc<Cell<usize>>>) {
+    ACTIVE_EVAL_BUDGET.with(|b| b.set(prev));
+}
+
+/// Get the currently active thread-local budget (if any).
+fn get_active_eval_budget() -> Option<Rc<Cell<usize>>> {
+    ACTIVE_EVAL_BUDGET.with(|b| {
+        let val = b.take();
+        b.set(val.clone());
+        val
+    })
+}
 
 const MAX_EVAL_DEPTH: usize = 256;
 
@@ -40,6 +71,10 @@ pub struct EvalContext<'a> {
     pub local_definitions: Rc<BTreeMap<String, TlaDefinition>>,
     pub definitions: Option<&'a BTreeMap<String, TlaDefinition>>,
     pub instances: Option<&'a BTreeMap<String, crate::tla::module::TlaModuleInstance>>,
+    /// Budget for set construction. Each element added to a set/sequence
+    /// decrements the budget. When it reaches 0, evaluation returns an error.
+    /// None = unlimited (used during model checking).
+    pub eval_budget: Option<Rc<Cell<usize>>>,
 }
 
 /// Context for evaluating action constraints over two states (current -> next)
@@ -60,6 +95,7 @@ impl<'a> EvalContext<'a> {
             local_definitions: Rc::new(BTreeMap::new()),
             definitions: None,
             instances: None,
+            eval_budget: get_active_eval_budget(),
         }
     }
 
@@ -73,6 +109,7 @@ impl<'a> EvalContext<'a> {
             local_definitions: Rc::new(BTreeMap::new()),
             definitions: Some(definitions),
             instances: None,
+            eval_budget: get_active_eval_budget(),
         }
     }
 
@@ -87,6 +124,7 @@ impl<'a> EvalContext<'a> {
             local_definitions: Rc::new(BTreeMap::new()),
             definitions: Some(definitions),
             instances: Some(instances),
+            eval_budget: get_active_eval_budget(),
         }
     }
 
@@ -100,6 +138,7 @@ impl<'a> EvalContext<'a> {
             local_definitions: Rc::clone(&self.local_definitions),
             definitions: self.definitions,
             instances: self.instances,
+            eval_budget: self.eval_budget.clone(),
         }
     }
 
@@ -115,6 +154,7 @@ impl<'a> EvalContext<'a> {
             local_definitions: Rc::clone(&self.local_definitions),
             definitions: self.definitions,
             instances: self.instances,
+            eval_budget: self.eval_budget.clone(),
         }
     }
 
@@ -130,7 +170,26 @@ impl<'a> EvalContext<'a> {
             local_definitions: Rc::new(new_defs),
             definitions: self.definitions,
             instances: self.instances,
+            eval_budget: self.eval_budget.clone(),
         }
+    }
+
+    /// Charge `cost` elements against the evaluation budget.
+    /// Returns Ok(()) if no budget is set or the budget has sufficient remaining capacity.
+    /// Returns an error if the budget would be exceeded.
+    pub fn check_budget(&self, cost: usize) -> Result<()> {
+        if let Some(ref budget) = self.eval_budget {
+            let remaining = budget.get();
+            if cost > remaining {
+                return Err(anyhow!(
+                    "evaluation budget exceeded ({} elements requested, {} remaining)",
+                    cost,
+                    remaining
+                ));
+            }
+            budget.set(remaining - cost);
+        }
+        Ok(())
     }
 
     pub fn runtime_value(&self, name: &str) -> Option<TlaValue> {
@@ -1466,6 +1525,7 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
             let rhs = eval_expr_inner(part, ctx, depth + 1)?;
             let lhs_set = result.as_set()?;
             let rhs_set = rhs.as_set()?;
+            ctx.check_budget(lhs_set.len() * rhs_set.len())?;
             let mut product = BTreeSet::new();
             for lhs_val in lhs_set {
                 for rhs_val in rhs_set {
@@ -1570,7 +1630,7 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
     if starts_with_keyword(expr, "SUBSET") {
         let rest = expr["SUBSET".len()..].trim();
         let set = eval_expr_inner(rest, ctx, depth + 1)?;
-        return Ok(TlaValue::Set(Arc::new(powerset(set.as_set()?))));
+        return Ok(TlaValue::Set(Arc::new(powerset(set.as_set()?, ctx)?)));
     }
 
     if starts_with_keyword(expr, "UNION") {
@@ -2239,6 +2299,7 @@ fn eval_bracket_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> R
                 max_functions
             ));
         }
+        ctx.check_budget(total as usize)?;
 
         // Generate all functions by iterating through all combinations
         let mut result = BTreeSet::new();
@@ -3765,16 +3826,19 @@ fn record_key_from_value(value: &TlaValue) -> Result<String> {
     }
 }
 
-fn powerset(input: &BTreeSet<TlaValue>) -> BTreeSet<TlaValue> {
+fn powerset(input: &BTreeSet<TlaValue>, ctx: &EvalContext<'_>) -> Result<BTreeSet<TlaValue>> {
     let mut subsets = BTreeSet::new();
     let values: Vec<TlaValue> = input.iter().cloned().collect();
     let n = values.len();
 
     if n >= usize::BITS as usize {
-        return subsets;
+        return Ok(subsets);
     }
 
-    for mask in 0usize..(1usize << n) {
+    let total = 1usize << n;
+    ctx.check_budget(total)?;
+
+    for mask in 0usize..total {
         let mut subset = BTreeSet::new();
         for (idx, value) in values.iter().enumerate() {
             if (mask >> idx) & 1 == 1 {
@@ -3784,7 +3848,7 @@ fn powerset(input: &BTreeSet<TlaValue>) -> BTreeSet<TlaValue> {
         subsets.insert(TlaValue::Set(Arc::new(subset)));
     }
 
-    subsets
+    Ok(subsets)
 }
 
 fn generate_permutations(values: &[TlaValue]) -> Vec<Vec<TlaValue>> {

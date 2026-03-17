@@ -1898,7 +1898,6 @@ fn split_case_arms(expr: &str) -> Vec<String> {
     parts
 }
 
-
 fn try_parse_if(expr: &str) -> Option<CompiledExpr> {
     // IF cond THEN expr1 ELSE expr2
     let rest = expr.strip_prefix("IF ")?.trim();

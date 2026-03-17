@@ -27,7 +27,7 @@ pub use compiled_expr::{CompiledActionClause, CompiledActionIr, CompiledExpr, co
 pub use eval::{
     EvalContext, TransitionContext, apply_action_ir, apply_action_ir_with_context,
     eval_action_body_multi, eval_action_constraint, eval_expr, eval_guard, eval_let_action_multi,
-    normalize_param_name,
+    normalize_param_name, restore_eval_budget, set_active_eval_budget,
 };
 pub use formula::{
     ClauseKind, classify_clause, expand_stuttering_action_expr, parse_stuttering_action_expr,
