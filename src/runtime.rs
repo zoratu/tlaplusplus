@@ -79,6 +79,15 @@ pub struct EngineConfig {
     /// Defer queue segment deletion (for S3 coordination)
     /// When true, consumed segments are retained until S3 confirms upload.
     pub defer_queue_segment_deletion: bool,
+    /// Enable BFS parent tracking for error trace reconstruction.
+    /// When enabled, each newly-discovered state records its parent's fingerprint
+    /// so that violation traces can be reconstructed by walking the parent chain
+    /// instead of re-exploring from initial states.
+    pub trace_parents: bool,
+    /// Maximum number of states to store in the parent/state maps.
+    /// When this limit is reached, parent tracking stops recording new entries
+    /// and falls back to `reconstruct_trace_limited` if a violation occurs.
+    pub max_trace_states: usize,
 }
 
 impl Default for EngineConfig {
@@ -118,6 +127,8 @@ impl Default for EngineConfig {
             bloom_switch_memory_threshold: 0.85, // 85% memory pressure
             bloom_switch_fpr: 0.001,     // 0.1% FPR after switch
             defer_queue_segment_deletion: false, // Only true when S3 is active
+            trace_parents: false,
+            max_trace_states: 10_000_000, // 10M states
         }
     }
 }
@@ -1355,6 +1366,23 @@ where
     let throttle = Arc::new(WorkerThrottle::new(worker_plan.worker_count));
     let auto_tune_enabled = config.auto_tune;
 
+    // BFS parent tracking for error trace reconstruction (TLC-style).
+    // parent_map: fingerprint(child) -> fingerprint(parent)
+    // state_map:  fingerprint(state) -> state (for reconstructing the trace)
+    // trace_count: number of entries recorded (for max_trace_states limit)
+    let parent_map: Option<Arc<DashMap<u64, u64>>> = if config.trace_parents {
+        Some(Arc::new(DashMap::new()))
+    } else {
+        None
+    };
+    let state_map: Option<Arc<DashMap<u64, M::State>>> = if config.trace_parents {
+        Some(Arc::new(DashMap::new()))
+    } else {
+        None
+    };
+    let trace_state_count = Arc::new(AtomicU64::new(0));
+    let max_trace_states = config.max_trace_states as u64;
+
     let started_at = Instant::now();
     let resumed_from_checkpoint = config.resume_from_checkpoint && queue.has_pending_work();
     if !resumed_from_checkpoint {
@@ -1379,6 +1407,12 @@ where
             if seen_flags[idx] {
                 run_stats.duplicates.fetch_add(1, Ordering::Relaxed);
             } else {
+                // Record initial state in state_map (no parent entry needed)
+                if let Some(ref sm) = state_map {
+                    let fp = initial_fps[idx];
+                    sm.insert(fp, state.clone());
+                    trace_state_count.fetch_add(1, Ordering::Relaxed);
+                }
                 run_stats.states_distinct.fetch_add(1, Ordering::Relaxed);
                 queue.push_global(state);
                 run_stats.enqueued.fetch_add(1, Ordering::Relaxed);
@@ -1914,6 +1948,10 @@ where
             .copied()
             .unwrap_or(0);
         let worker_labeled_transitions = labeled_transitions.clone();
+        let worker_parent_map = parent_map.clone();
+        let worker_state_map = state_map.clone();
+        let worker_trace_count = Arc::clone(&trace_state_count);
+        let worker_max_trace_states = max_trace_states;
 
         workers.push(std::thread::spawn(move || {
             // Pin thread to CPU for cache locality
@@ -2083,14 +2121,32 @@ where
                 }
 
                 if let Err(message) = worker_model.check_invariants(&state) {
-                    // Reconstruct trace to violation using post-processing
-                    // This re-explores from init states to find the path
-                    let trace = reconstruct_trace_limited(
-                        worker_model.as_ref(),
-                        &state,
-                        100, // Max depth to search
-                    )
-                    .unwrap_or_else(|| vec![state.clone()]);
+                    // Reconstruct trace to violation
+                    let trace = if let Some(ref pm) = worker_parent_map {
+                        // Use BFS parent tracking: walk parent chain back to initial state
+                        let sm = worker_state_map.as_ref().unwrap();
+                        let mut chain = vec![state.clone()];
+                        let mut fp = worker_model.fingerprint(&state);
+                        while let Some(parent_fp_entry) = pm.get(&fp) {
+                            let parent_fp = *parent_fp_entry;
+                            if let Some(parent_state) = sm.get(&parent_fp) {
+                                chain.push(parent_state.clone());
+                                fp = parent_fp;
+                            } else {
+                                break;
+                            }
+                        }
+                        chain.reverse();
+                        chain
+                    } else {
+                        // Fall back to re-exploration from init states
+                        reconstruct_trace_limited(
+                            worker_model.as_ref(),
+                            &state,
+                            100, // Max depth to search
+                        )
+                        .unwrap_or_else(|| vec![state.clone()])
+                    };
 
                     let _ = worker_violation_tx.try_send(Violation {
                         message,
@@ -2187,6 +2243,13 @@ where
                 let mut fps_to_check: Vec<u64> = Vec::with_capacity(worker_fp_batch_size);
                 let mut states_to_check: Vec<M::State> = Vec::with_capacity(worker_fp_batch_size);
 
+                // Compute parent fingerprint once for parent tracking
+                let current_state_fp = if worker_parent_map.is_some() {
+                    worker_model.fingerprint(&state)
+                } else {
+                    0
+                };
+
                 let mut process_batch = |pending_batch: &mut Vec<M::State>,
                                          local_duplicates: &mut u64,
                                          local_states_distinct: &mut u64,
@@ -2245,6 +2308,18 @@ where
                                 // Add new fingerprint to local cache
                                 if fp_cache.len() < LOCAL_FP_CACHE_SIZE {
                                     fp_cache.insert(fp);
+                                }
+                                // Record parent tracking for trace reconstruction
+                                if let Some(ref pm) = worker_parent_map {
+                                    if worker_trace_count.load(Ordering::Relaxed)
+                                        < worker_max_trace_states
+                                    {
+                                        pm.insert(fp, current_state_fp);
+                                        if let Some(ref sm) = worker_state_map {
+                                            sm.insert(fp, next_state.clone());
+                                        }
+                                        worker_trace_count.fetch_add(1, Ordering::Relaxed);
+                                    }
                                 }
                                 // Get the fingerprint's home NUMA for routing
                                 let home_numa = worker_fp_store.home_numa(fp);
