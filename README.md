@@ -1,24 +1,8 @@
 # TLA++
 
-A Rust implementation of TLA+ model checking, achieving **10.7x faster** state exploration than Java TLC on many-core systems for large models. Validated on 384-core systems with 6 NUMA nodes.
+A Rust implementation of TLA+ model checking with TLC feature parity, achieving **10.7x faster** state exploration than Java TLC on many-core systems. 182/182 (100%) of the [tlaplus/Examples](https://github.com/tlaplus/Examples) corpus passes analysis.
 
 ## Performance
-
-When running complex models on large systems, I noticed a gradual reduction in
-CPU efficiency. TLC writes fingerprints to disk files that grow continuously.
-As files get larger, I/O latency increases. As the heap fills with state data,
-GC runs more frequently, and even with parallel GC there can be long pauses.
-These pauses cause workers to stall, which shows up as reduced CPU utilization.
-Lastlyk, TLC uses memory-mapped files for the fingerprint store, and as working
-set exceeds RAM, page faults trigger blocking I/O. The combination creates a
-negative feedback loop: GC pauses, so workers stall, which makes I/O queue
-builds up, which creates more iowait, which makes less throughput, which makes
-more memory pressure, which creates more GC.
-
-TLA++ avoids this by using lock-free, in-memory fingerprint store (no disk I/O
-on hot path), work-stealing to keep all cores busy even if some workers are
-slow, no GC pauses (because Rust), and batch operations to amortize any
-synchronization cost.
 
 Benchmarked on 128-core AMD EPYC (c6a.metal, 256GB RAM):
 
@@ -35,19 +19,41 @@ Validated on 384-core systems (6 NUMA nodes, 760GB RAM):
 | 380 workers (all NUMA) | 60-70% | 20-38% | 5-9M |
 | 192 workers (auto, 3 NUMA) | **99%+** | **<1%** | **10-22M** |
 
-The NUMA-aware auto-configuration achieves 2-4x better throughput by avoiding cross-NUMA memory access.
+## TLC Feature Parity
 
-## Features
+| Feature | Status |
+|---------|--------|
+| Safety invariant checking | Working |
+| Liveness/temporal properties | Working |
+| Fairness constraints (WF/SF) | Working |
+| Deadlock detection | Working |
+| ENABLED operator | Working (including parameterized actions) |
+| Symmetry reduction | Working |
+| Simulation mode | Working (`--simulate`) |
+| Error traces | Working (BFS parent tracking with `--trace-parents`) |
+| Diff traces | Working (`--difftrace`) |
+| Coverage/profiling | Working (`--coverage`) |
+| Continue after violation | Working (`--continue --max-violations N`) |
+| State graph dump | Working (`--dump FILE`) |
+| ASSUME evaluation | Working |
+| CHECK_DEADLOCK | Working (`--allow-deadlock`) |
+| State/action constraints | Working |
+| S3 checkpoint/resume | Working |
+| Spot instance support | Working (SIGTERM handler) |
 
-- **Automatic NUMA optimization** - detects NUMA topology and distances, auto-selects optimal worker count using only close NUMA nodes (distance ≤20)
-- **NUMA-local memory allocation** - workers bind memory to their NUMA node via `set_mempolicy()`, achieving 99%+ user CPU
-- **Parallel state exploration** with N worker threads (auto-detected from NUMA topology)
-- **Lock-free fingerprint store** with page-aligned memory, NUMA-aware shard placement, and dynamic resize
-- **Work-stealing queues** with batch stealing and per-NUMA idle counters for O(NUMA_nodes) termination detection
-- **NUMA-aware CPU pinning** via `sched_setaffinity`
-- **Cgroup-aware resource limits** - respects cpuset and CPU quota
-- **Checkpoint/resume** for long-running model checks
-- **Native TLA+ frontend** for direct `.tla` file execution
+### Community Modules
+
+| Module | Operators |
+|--------|-----------|
+| DyadicRationals | Zero, One, Add, Half, IsDyadicRational, PrettyPrint |
+| SequencesExt | RemoveAt, SeqOf |
+| Functions | FoldFunction, FoldFunctionOnSet |
+| Folds | MapThenFoldSet |
+| FiniteSetsExt | FoldSet, Quantify, SymDiff, FlattenSet, kSubset, ChooseUnique, SumSet, ProductSet, IsInjective |
+| UndirectedGraphs | IsUndirectedGraph, IsLoopFreeUndirectedGraph, ConnectedComponents, AreConnectedIn, IsStronglyConnected |
+| Graphs | IsDirectedGraph, Successors, Predecessors, InDegree, OutDegree, Roots, Leaves, Transpose, IsDag |
+| Relation | TransitiveClosure |
+| Proof modules | FiniteSetTheorems, NaturalsInduction, SequenceTheorems (theorems evaluate to TRUE) |
 
 ## Build
 
@@ -58,23 +64,34 @@ cargo build --release
 ## Quick Start
 
 ```bash
-# Run synthetic stress test model
-./target/release/tlaplusplus run-counter-grid \
-  --max-x 10000 --max-y 10000 --max-sum 20000
-
-# Analyze a TLA+ spec
-cargo run -- analyze-tla \
+# Model check a TLA+ spec
+./target/release/tlaplusplus run-tla \
   --module /path/to/Spec.tla \
   --config /path/to/Spec.cfg
+
+# Analyze a spec (parse + expression probing, no model checking)
+./target/release/tlaplusplus analyze-tla \
+  --module /path/to/Spec.tla \
+  --config /path/to/Spec.cfg
+
+# Simulation mode (random sampling)
+./target/release/tlaplusplus run-tla \
+  --module /path/to/Spec.tla \
+  --simulate --simulate-depth 100 --simulate-traces 10000
+
+# With full error traces and diff output
+./target/release/tlaplusplus run-tla \
+  --module /path/to/Spec.tla \
+  --trace-parents --difftrace
 ```
 
 ## Testing
 
 ```bash
-# Run all tests (116 tests)
+# Run all tests (577 tests)
 cargo test
 
-# Run with chaos/failpoint testing
+# Run with chaos/failpoint testing (597 tests)
 cargo test --features failpoints
 
 # Run property-based tests
@@ -85,204 +102,76 @@ cargo +nightly fuzz run fuzz_tla_module
 ```
 
 The test suite includes:
-- **103 unit tests** covering runtime, storage, and TLA+ evaluation
-- **Property-based tests** (proptest) verifying set algebra laws
-- **Chaos testing** with failpoints for fault injection
-- **Fuzz targets** for TLA+ parser robustness
-
-## Architecture
-
-### Core Components
-
-```mermaid
-flowchart TB
-    subgraph Model["Model Trait Layer"]
-        M["CounterGrid, TlaModel, custom models implement Model"]
-    end
-
-    subgraph Runtime["Runtime Engine"]
-        R1["Work-stealing scheduler (NUMA-aware)"]
-        R2["Worker crash recovery (N-1 workers)"]
-        R3["Checkpoint coordination"]
-    end
-
-    subgraph FP["Fingerprint Store"]
-        F1["Lock-free CAS ops"]
-        F2["Page-aligned memory"]
-        F3["NUMA shard placement"]
-    end
-
-    subgraph WS["Work-Stealing Queues"]
-        W1["Per-worker local deques"]
-        W2["NUMA-aware stealing"]
-        W3["Global injector queue"]
-    end
-
-    Model --> Runtime
-    Runtime --> FP
-    Runtime --> WS
-```
-
-### Storage Layer
-
-**Lock-Free Fingerprint Store** (`page_aligned_fingerprint_store.rs`):
-- Open-addressed hash table with atomic CAS operations
-- 2MB page-aligned memory allocation for TLB efficiency
-- NUMA-aware shard placement based on worker CPU affinity
-- **Dynamic resize** at 85% load factor using seqlock coordination
-- Graceful degradation under memory pressure
-
-**Work-Stealing Queues** (`work_stealing_queues.rs`):
-- Per-worker lock-free deques (crossbeam-deque)
-- Hierarchical stealing: prefer same-NUMA node, then remote
-- Cache-line padded counters to prevent false sharing
-- Automatic termination detection
-
-### TLA+ Frontend
-
-Native TLA+ parsing and evaluation (in progress):
-- Module parser with EXTENDS resolution
-- Config file parser (CONSTANTS, INIT, NEXT, invariants)
-- Expression evaluator for TLA+ operators
-- Action IR compiler and executor
-
-## Chaos Testing
-
-The project includes fault injection for reliability testing:
-
-```rust
-// Available failpoints (enable with --features failpoints)
-- checkpoint_write_fail    // Fail checkpoint writes
-- fp_store_shard_full      // Simulate fingerprint store pressure
-- worker_panic             // Crash individual workers
-- queue_spill_fail         // Fail queue disk operations
-```
-
-Recovery behaviors:
-- **Worker crashes**: Continue with remaining workers, redistribute work
-- **I/O failures**: Exponential backoff retry (3 attempts, 100ms-2s delays)
-- **Memory pressure**: Graceful degradation, emergency checkpoints
-
-## S3 Persistence for Spot Instances
-
-TLA++ includes built-in S3 support for running on AWS spot instances. When enabled, it automatically:
-- Uploads checkpoints and queue segments to S3 in the background
-- Downloads existing state on resume for seamless spot instance recovery
-- Handles SIGTERM gracefully with emergency checkpoint+flush (spot preemption warning)
-- Prunes old checkpoints to control S3 storage costs
-
-### Basic Usage
-
-```bash
-# Run with S3 persistence (auto-generates run ID)
-./target/release/tlaplusplus run-tla \
-  --module /path/to/Spec.tla \
-  --config /path/to/Spec.cfg \
-  --s3-bucket my-bucket \
-  --s3-region us-west-2
-
-# Resume a specific run after spot termination
-./target/release/tlaplusplus run-tla \
-  --module /path/to/Spec.tla \
-  --config /path/to/Spec.cfg \
-  --s3-bucket my-bucket \
-  --s3-region us-west-2 \
-  --s3-prefix runs/my-run-123 \
-  --resume true
-```
-
-### S3 Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--s3-bucket` | none | S3 bucket name (enables S3 sync when set) |
-| `--s3-region` | auto | AWS region (auto-detects from instance/env if not set) |
-| `--s3-prefix` | auto | Path prefix in bucket (auto-generates timestamp if not set) |
-| `--s3-upload-interval-secs` | 10 | Background upload frequency |
-| `--checkpoint-interval-secs` | 600* | Checkpoint frequency (*defaults to 10 min when S3 enabled) |
-
-### AWS Credentials
-
-S3 access requires standard AWS credentials. Options:
-- Instance profile (recommended for EC2)
-- Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
-- AWS credentials file (`~/.aws/credentials`)
-
-### Spot Instance Workflow
-
-1. Launch spot instance with your model
-2. Model runs, checkpointing to S3 every 10 minutes by default
-3. If spot preempted (SIGTERM), emergency checkpoint + S3 flush (~2 min)
-4. Launch new spot instance, resume with `--resume true --s3-prefix runs/previous-run`
-5. Model continues from last checkpoint with counters preserved
-
-### S3 Storage Structure
-
-```
-s3://bucket/prefix/
-├── manifest.json           # Run metadata and latest checkpoint
-├── checkpoints/
-│   ├── latest.json         # Current checkpoint
-│   └── checkpoint-*.json   # Rolling checkpoint history
-├── fingerprints/           # Seen state hashes (for resume)
-│   └── shard-*.bin
-└── queue-spill/            # Pending states (zstd compressed)
-    └── segment-*.bin
-```
-
-## TLC Corpus Validation
-
-```bash
-# Run language coverage corpus
-scripts/tlc_check.sh
-
-# Run full indexed corpus
-scripts/tlc_corpus.sh
-
-# Run public corpus entries
-scripts/tlc_public_corpus.sh
-```
+- **577 unit/integration tests** covering runtime, storage, TLA+ evaluation, and model checking correctness
+- **19 property-based tests** (proptest) verifying set algebra laws and serialization roundtrips
+- **23 chaos/failpoint tests** for fault injection
+- **8 fuzz targets** for parser robustness
+- **182/182 external corpus specs** (tlaplus/Examples) pass analysis
+- **29/29 internal corpus specs** pass analysis
+- **14 mutation-validated correctness tests** for the compiled action evaluator
 
 ## Configuration
 
-Key parameters for many-core systems:
+### Runtime Parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--workers` | auto | Worker count (0 = auto from NUMA topology) |
 | `--core-ids` | all | CPU list (e.g., "2-127") |
 | `--numa-pinning` | true | Enable NUMA-aware CPU binding |
-| `--fp-shards` | auto | Fingerprint store shard count (0 = auto) |
-| `--fp-expected-items` | 100M | Initial capacity hint (shards auto-resize at 85% load) |
+| `--auto-tune` | true | Dynamically adjust workers based on CPU sys% |
+| `--fp-shards` | auto | Fingerprint store shard count |
+| `--fp-expected-items` | 100M | Initial capacity hint |
 | `--fp-batch-size` | 512 | States per fingerprint batch |
 | `--checkpoint-interval-secs` | 0 | Checkpoint frequency (0 = disabled) |
+| `--queue-max-inmem-items` | 50M | Max items before disk spilling |
 
-### NUMA Auto-Optimization
+### Model Checking Options
 
-With `--workers 0` (default), tlaplusplus automatically:
-1. Detects NUMA topology from `/sys/devices/system/node`
-2. Reads inter-node distances (local=10, remote=15-28 typically)
-3. Selects workers only from NUMA nodes with distance ≤20 to each other
-4. Binds each worker's memory allocations to its local NUMA node
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--allow-deadlock` | false | Allow deadlocked states (like TLC's -deadlock) |
+| `--trace-parents` | false | Enable BFS parent tracking for full error traces |
+| `--max-trace-states` | 10M | Memory limit for parent tracking |
+| `--simulate` | false | Random simulation instead of exhaustive BFS |
+| `--simulate-depth` | 100 | Max steps per simulation trace |
+| `--simulate-traces` | 1000 | Number of random traces |
+| `--coverage` | false | Print action coverage summary |
+| `--continue` | false | Continue exploring after violations |
+| `--max-violations` | 1 | Stop after N violations |
+| `--dump FILE` | none | Write state graph to file |
+| `--difftrace` | false | Show only changed variables in traces |
 
-This eliminates cross-NUMA memory access, which causes 20-38% kernel time on many-core systems.
+### S3 Persistence (Spot Instances)
 
-## Current Status
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--s3-bucket` | none | S3 bucket (enables persistence when set) |
+| `--s3-region` | auto | AWS region |
+| `--s3-prefix` | auto | Path prefix in bucket |
+| `--s3-upload-interval-secs` | 10 | Background upload frequency |
+| `--fresh` | false | Start fresh, ignore existing checkpoints |
 
-**Working**:
-- Parallel runtime with work-stealing
-- Lock-free fingerprint storage
-- NUMA-aware resource management
-- 116 tests, property tests, fuzzing
-- Fault injection testing
+## Architecture
 
-**In progress**:
-- Native TLA+ frontend (direct `.tla` execution)
-- Full TLA+ language coverage
+### Core Components
 
-**Not yet implemented**:
-- Temporal/liveness checking
-- Symmetry reduction
+- **Runtime Engine** (`src/runtime.rs`) — Parallel state exploration with NUMA-aware work-stealing, checkpoint coordination, liveness checking
+- **TLA+ Frontend** (`src/tla/`) — Native parser, expression evaluator (text + compiled paths), action IR compiler
+- **Fingerprint Store** (`src/storage/page_aligned_fingerprint_store.rs`) — Lock-free CAS, page-aligned, dynamic resize at 85% load
+- **Work-Stealing Queues** (`src/storage/work_stealing_queues.rs`) — Per-worker deques, NUMA-aware stealing, disk spilling
+- **Simulation** (`src/simulation.rs`) — Random behavior sampling with xoshiro256** PRNG
+- **Coverage** (`src/coverage.rs`) — Action fire counting and profiling
+
+### Chaos Testing
+
+Available failpoints (`--features failpoints`):
+- `checkpoint_write_fail` — Fail checkpoint writes
+- `fp_store_shard_full` — Simulate fingerprint store pressure
+- `worker_panic` — Crash individual workers
+- `queue_spill_fail` — Fail queue disk operations
+
+Recovery: worker crashes continue with N-1 workers, I/O failures retry with backoff, memory pressure triggers emergency checkpoints.
 
 ## License
 

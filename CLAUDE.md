@@ -24,7 +24,7 @@ Key performance features:
 # Build release binary
 cargo build --release
 
-# Run all tests (116 tests)
+# Run all tests (577 tests)
 cargo test
 
 # Run with chaos/failpoint testing
@@ -337,23 +337,24 @@ Periodic checkpoints (`--checkpoint-interval-secs`) persist state for crash reco
 
 ## Current Status
 
-**Working**:
-- Parallel runtime with NUMA-aware work-stealing
-- Lock-free fingerprint storage with atomic CAS
-- 120 tests, property tests, fuzzing
-- Fault injection testing
-- 10.7x speedup over Java TLC on 128-core systems
-- 99%+ CPU utilization on 384-core systems with NUMA optimization
-
-**In progress**:
-- Native TLA+ frontend (direct `.tla` execution)
-- Full TLA+ language coverage
-
-**Partially implemented**:
-- Symmetry reduction (multi-group support, needs more testing)
-
-**Not yet implemented**:
-- Temporal/liveness checking
+**Working (TLC feature parity)**:
+- Parallel runtime with NUMA-aware work-stealing (10.7x faster than TLC)
+- Lock-free fingerprint storage with atomic CAS and dynamic resize
+- Native TLA+ frontend with full language coverage
+- 182/182 tlaplus/Examples corpus specs pass analysis (100%)
+- 577 tests, 19 property tests, 23 chaos tests, 8 fuzz targets
+- Safety invariant checking, liveness/fairness checking, deadlock detection
+- ENABLED operator (including parameterized actions)
+- Symmetry reduction (wired into runtime fingerprinting)
+- Simulation mode (`--simulate`)
+- BFS parent tracking for full error traces (`--trace-parents`)
+- Diff traces (`--difftrace`), coverage profiling (`--coverage`)
+- Continue after violation (`--continue --max-violations N`)
+- State graph dump (`--dump FILE`)
+- ASSUME evaluation at startup
+- 11 community modules (DyadicRationals, SequencesExt, Functions, Folds, FiniteSetsExt, UndirectedGraphs, Graphs, Relation, plus proof modules)
+- S3 checkpoint/resume for spot instance resilience
+- Evaluation budget to prevent exponential blowup in analysis
 
 ## Key Implementation Notes
 
