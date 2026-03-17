@@ -389,6 +389,13 @@ fn eval_compiled_inner(
             let set = set.as_set()?;
             let elements: Vec<TlaValue> = set.iter().cloned().collect();
             let n = elements.len();
+            if n > 20 {
+                return Err(anyhow!(
+                    "SUBSET of {}-element set would produce 2^{} elements (too large)",
+                    n,
+                    n
+                ));
+            }
             if n >= 64 {
                 return Ok(TlaValue::Set(Arc::new(BTreeSet::new())));
             }
