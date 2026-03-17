@@ -68,6 +68,21 @@ const BUILTIN_MODULES: &[&str] = &[
     "UndirectedGraphs",
     "Folds",
     "Graphs",
+    // Proof modules (no operators, just need to be skipped during loading)
+    "FiniteSetTheorems",
+    "NaturalsInduction",
+    "SequenceTheorems",
+    "SequencesExtTheorems",
+    "FoldsTheorems",
+    "FunctionTheorems",
+    "FiniteSetsExtTheorems",
+    // Other community modules
+    "Relation",
+    "Combinatorics",
+    "BagsExt",
+    "Bitwise",
+    "Statistics",
+    "VectorClocks",
 ];
 
 /// Check if a module name is a built-in standard library module.

@@ -1615,6 +1615,49 @@ fn eval_compiled_opcall(
         "IsStronglyConnected" if arg_values.len() == 1 && !user_defined_shadow => {
             return eval_operator_call("IsStronglyConnected", arg_values.clone(), ctx, depth + 1);
         }
+        // === Community module: FiniteSetsExt (additional) ===
+        "Quantify" if arg_values.len() == 2 && !user_defined_shadow => {
+            return eval_operator_call("Quantify", arg_values.clone(), ctx, depth + 1);
+        }
+        "SymDiff" if arg_values.len() == 2 && !user_defined_shadow => {
+            let a = arg_values[0].as_set()?;
+            let b = arg_values[1].as_set()?;
+            let result: BTreeSet<TlaValue> = a.symmetric_difference(&b).cloned().collect();
+            return Ok(TlaValue::Set(Arc::new(result)));
+        }
+        "FlattenSet" if arg_values.len() == 1 && !user_defined_shadow => {
+            return eval_operator_call("FlattenSet", arg_values.clone(), ctx, depth + 1);
+        }
+        "kSubset" if arg_values.len() == 2 && !user_defined_shadow => {
+            return eval_operator_call("kSubset", arg_values.clone(), ctx, depth + 1);
+        }
+        "ChooseUnique" if arg_values.len() == 2 && !user_defined_shadow => {
+            return eval_operator_call("ChooseUnique", arg_values.clone(), ctx, depth + 1);
+        }
+        "SumSet" if arg_values.len() == 1 && !user_defined_shadow => {
+            let set = arg_values[0].as_set()?;
+            let sum: i64 = set.iter().map(|v| v.as_int().unwrap_or(0)).sum();
+            return Ok(TlaValue::Int(sum));
+        }
+        "ProductSet" if arg_values.len() == 1 && !user_defined_shadow => {
+            let set = arg_values[0].as_set()?;
+            let product: i64 = set.iter().map(|v| v.as_int().unwrap_or(1)).product();
+            return Ok(TlaValue::Int(product));
+        }
+        "IsInjective" if arg_values.len() == 1 && !user_defined_shadow => {
+            return eval_operator_call("IsInjective", arg_values.clone(), ctx, depth + 1);
+        }
+        // === Community module: Graphs (directed) ===
+        "IsDirectedGraph" | "Successors" | "Predecessors" | "InDegree" | "OutDegree" | "Roots"
+        | "Leaves" | "Transpose" | "IsDag"
+            if !user_defined_shadow =>
+        {
+            return eval_operator_call(name, arg_values.clone(), ctx, depth + 1);
+        }
+        // === Community module: Relation ===
+        "TransitiveClosure" if arg_values.len() == 2 && !user_defined_shadow => {
+            return eval_operator_call("TransitiveClosure", arg_values.clone(), ctx, depth + 1);
+        }
         "RemoveAt" if arg_values.len() == 2 && !user_defined_shadow => {
             let seq = sequence_like_values(&arg_values[0])
                 .ok_or_else(|| anyhow!("RemoveAt expects a sequence, got {:?}", arg_values[0]))?;
