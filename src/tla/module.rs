@@ -66,6 +66,8 @@ const BUILTIN_MODULES: &[&str] = &[
     "Functions",
     "FiniteSetsExt",
     "UndirectedGraphs",
+    "Folds",
+    "Graphs",
 ];
 
 /// Check if a module name is a built-in standard library module.

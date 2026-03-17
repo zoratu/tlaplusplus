@@ -1576,6 +1576,38 @@ fn eval_compiled_opcall(
             return Ok(TlaValue::Seq(Arc::new(result)));
         }
         // === Community module: SequencesExt ===
+        "SeqOf" if arg_values.len() == 2 && !user_defined_shadow => {
+            // Delegate to text-based eval (set construction is complex)
+            return eval_operator_call("SeqOf", arg_values.clone(), ctx, depth + 1);
+        }
+        // === Community module: Folds ===
+        "MapThenFoldSet" if arg_values.len() == 5 && !user_defined_shadow => {
+            return eval_operator_call("MapThenFoldSet", arg_values.clone(), ctx, depth + 1);
+        }
+        "FoldSet" if arg_values.len() == 3 && !user_defined_shadow => {
+            return eval_operator_call("FoldSet", arg_values.clone(), ctx, depth + 1);
+        }
+        // === Community module: UndirectedGraphs ===
+        "IsUndirectedGraph" if arg_values.len() == 1 && !user_defined_shadow => {
+            return eval_operator_call("IsUndirectedGraph", arg_values.clone(), ctx, depth + 1);
+        }
+        "IsLoopFreeUndirectedGraph" if arg_values.len() == 1 && !user_defined_shadow => {
+            return eval_operator_call(
+                "IsLoopFreeUndirectedGraph",
+                arg_values.clone(),
+                ctx,
+                depth + 1,
+            );
+        }
+        "ConnectedComponents" if arg_values.len() == 1 && !user_defined_shadow => {
+            return eval_operator_call("ConnectedComponents", arg_values.clone(), ctx, depth + 1);
+        }
+        "AreConnectedIn" if arg_values.len() == 3 && !user_defined_shadow => {
+            return eval_operator_call("AreConnectedIn", arg_values.clone(), ctx, depth + 1);
+        }
+        "IsStronglyConnected" if arg_values.len() == 1 && !user_defined_shadow => {
+            return eval_operator_call("IsStronglyConnected", arg_values.clone(), ctx, depth + 1);
+        }
         "RemoveAt" if arg_values.len() == 2 && !user_defined_shadow => {
             let seq = sequence_like_values(&arg_values[0])
                 .ok_or_else(|| anyhow!("RemoveAt expects a sequence, got {:?}", arg_values[0]))?;
