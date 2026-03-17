@@ -48,6 +48,9 @@ pub struct EngineConfig {
     pub checkpoint_on_exit: bool,
     pub poll_sleep_ms: u64,
     pub stop_on_violation: bool,
+    /// Maximum number of violations to collect before stopping (default 1).
+    /// Only used when `stop_on_violation` is true.
+    pub max_violations: usize,
     pub fp_shards: usize,
     pub fp_expected_items: usize,
     pub fp_false_positive_rate: f64,
@@ -107,6 +110,7 @@ impl Default for EngineConfig {
             checkpoint_on_exit: true,
             poll_sleep_ms: 1,
             stop_on_violation: true,
+            max_violations: 1,
             fp_shards: 64,
             fp_expected_items: 100_000_000,
             fp_false_positive_rate: 0.01,
@@ -155,6 +159,8 @@ pub struct Violation<S> {
 pub struct RunOutcome<S> {
     pub stats: RunStats,
     pub violation: Option<Violation<S>>,
+    /// All collected violations when `max_violations > 1` or `stop_on_violation == false`.
+    pub violations: Vec<Violation<S>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1359,7 +1365,9 @@ where
     let active_workers = Arc::new(AtomicUsize::new(0));
     let live_workers = Arc::new(AtomicUsize::new(worker_plan.worker_count));
     let pause = Arc::new(PauseController::default());
-    let (violation_tx, violation_rx) = crossbeam_channel::bounded(1);
+    let max_violations = config.max_violations.max(1);
+    let (violation_tx, violation_rx) = crossbeam_channel::bounded(max_violations + 1);
+    let violation_count = Arc::new(AtomicUsize::new(0));
     let (error_tx, error_rx) = crossbeam_channel::bounded::<String>(1);
 
     // Auto-tuning: create throttle for dynamic worker count adjustment
@@ -1939,6 +1947,8 @@ where
         let worker_pause = Arc::clone(&pause);
         let worker_throttle = Arc::clone(&throttle);
         let worker_violation_tx = violation_tx.clone();
+        let worker_violation_count = Arc::clone(&violation_count);
+        let worker_max_violations = max_violations;
         let worker_error_tx = error_tx.clone();
         let worker_stop_on_violation = config.stop_on_violation;
         let worker_fp_batch_size = config.fp_batch_size.max(1);
@@ -2155,11 +2165,15 @@ where
                         property_type: PropertyType::Safety,
                         trace,
                     });
-                    if worker_stop_on_violation {
+                    let prev_count =
+                        worker_violation_count.fetch_add(1, Ordering::AcqRel);
+                    let should_stop = worker_stop_on_violation
+                        && (prev_count + 1) >= worker_max_violations;
+                    if should_stop {
                         worker_stop.store(true, Ordering::Release);
                     }
                     worker_queue.worker_idle(worker_state.id());
-                    if worker_stop_on_violation {
+                    if should_stop {
                         break;
                     }
                     continue;
@@ -2527,7 +2541,16 @@ where
         return Err(anyhow!(err));
     }
 
-    let mut violation = violation_rx.try_recv().ok();
+    // Collect all violations from the channel.
+    let mut all_violations: Vec<Violation<M::State>> = Vec::new();
+    while let Ok(v) = violation_rx.try_recv() {
+        all_violations.push(v);
+    }
+    let mut violation = if all_violations.is_empty() {
+        None
+    } else {
+        Some(all_violations.remove(0))
+    };
 
     // Check fairness constraints if we collected labeled transitions
     // (only if no safety violation was already found)
@@ -2725,6 +2748,7 @@ where
             fingerprints: fp_store.stats(),
         },
         violation,
+        violations: all_violations, // Remaining violations (excluding the first, which is in `violation`)
     })
 }
 

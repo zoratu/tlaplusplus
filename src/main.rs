@@ -16,7 +16,7 @@ use tlaplusplus::tla::{
     parse_stuttering_action_expr, parse_tla_config, parse_tla_module_file, restore_eval_budget,
     scan_module_closure, set_active_eval_budget, split_action_body_disjuncts, split_top_level,
 };
-use tlaplusplus::{EngineConfig, run_model};
+use tlaplusplus::{EngineConfig, SimulationConfig, run_model, run_simulation};
 
 /// Parse human-readable byte sizes like "200GB", "10GiB", "512MB"
 fn parse_byte_size(s: &str) -> Result<u64, String> {
@@ -125,15 +125,17 @@ struct RuntimeArgs {
     #[arg(long, default_value_t = false)]
     skip_system_checks: bool,
     /// Enable BFS parent tracking for error trace reconstruction (TLC-style).
-    /// Records parent pointers during exploration so violation traces can be
-    /// reconstructed by walking the parent chain instead of re-exploring.
     #[arg(long, default_value_t = false)]
     trace_parents: bool,
     /// Maximum number of states to record for parent tracking.
-    /// When the limit is reached, new states stop being recorded and trace
-    /// reconstruction falls back to re-exploration if a violation is found.
     #[arg(long, default_value_t = 10_000_000)]
     max_trace_states: usize,
+    /// Continue after invariant violations (do not stop workers)
+    #[arg(long = "continue", default_value_t = false)]
+    continue_on_violation: bool,
+    /// Maximum number of violations to collect before stopping (default 1)
+    #[arg(long, default_value_t = 1)]
+    max_violations: usize,
 }
 
 #[derive(Args, Clone, Debug)]
@@ -284,6 +286,27 @@ enum Command {
         /// Equivalent to TLC's CHECK_DEADLOCK FALSE or -deadlock flag.
         #[arg(long, default_value_t = false)]
         allow_deadlock: bool,
+        /// Run in simulation mode (random trace exploration) instead of BFS
+        #[arg(long, default_value_t = false)]
+        simulate: bool,
+        /// Maximum depth per simulation trace (default 100)
+        #[arg(long, default_value_t = 100)]
+        simulate_depth: usize,
+        /// Number of simulation traces to run (default 1000)
+        #[arg(long, default_value_t = 1000)]
+        simulate_traces: usize,
+        /// Random seed for simulation (0 = system entropy)
+        #[arg(long, default_value_t = 0)]
+        simulate_seed: u64,
+        /// Enable action coverage profiling
+        #[arg(long, default_value_t = false)]
+        coverage: bool,
+        /// Dump state graph to a file after exploration
+        #[arg(long)]
+        dump: Option<std::path::PathBuf>,
+        /// Show only changed variables in error traces (like TLC's -difftrace)
+        #[arg(long, default_value_t = false)]
+        difftrace: bool,
         #[command(flatten)]
         runtime: RuntimeArgs,
         #[command(flatten)]
@@ -348,7 +371,12 @@ fn build_engine_config(
         checkpoint_interval_secs: runtime.checkpoint_interval_secs,
         checkpoint_on_exit: runtime.checkpoint_on_exit,
         poll_sleep_ms: runtime.poll_sleep_ms,
-        stop_on_violation: runtime.stop_on_violation,
+        stop_on_violation: if runtime.continue_on_violation {
+            false
+        } else {
+            runtime.stop_on_violation
+        },
+        max_violations: runtime.max_violations,
         fp_shards: storage.fp_shards,
         fp_expected_items: storage.fp_expected_items,
         fp_false_positive_rate: storage.fp_fpr,
@@ -720,6 +748,245 @@ fn run_system_checks(skip: bool) {
         return;
     }
     check_thp_and_warn();
+}
+
+/// Feature 7: Evaluate ASSUME/AXIOM statements from the TLA+ module.
+/// If any ASSUME evaluates to FALSE, prints an error and exits.
+fn evaluate_assumes(model: &TlaModel) -> anyhow::Result<()> {
+    if model.module.assumes.is_empty() {
+        return Ok(());
+    }
+
+    let empty_state = TlaState::new();
+    let ctx = EvalContext::with_definitions_and_instances(
+        &empty_state,
+        &model.module.definitions,
+        &model.module.instances,
+    );
+
+    for body in &model.module.assumes {
+        match eval_expr(body, &ctx) {
+            Ok(TlaValue::Bool(true)) => {
+                // ASSUME satisfied
+            }
+            Ok(TlaValue::Bool(false)) => {
+                return Err(anyhow::anyhow!("ASSUME failed: {}", body));
+            }
+            Ok(other) => {
+                eprintln!(
+                    "Warning: ASSUME '{}' evaluated to non-boolean: {:?}",
+                    body, other
+                );
+            }
+            Err(e) => {
+                // Don't fail on evaluation errors for ASSUME - some may reference
+                // state variables or complex expressions we can't evaluate yet
+                eprintln!("Warning: Could not evaluate ASSUME '{}': {}", body, e);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Feature 2: Collect action coverage statistics by replaying from initial states.
+/// This is a lightweight post-hoc analysis that evaluates the Next relation
+/// per-disjunct to see which actions fire.
+fn collect_coverage(model: &TlaModel) -> tlaplusplus::CoverageStats {
+    use tlaplusplus::coverage::{ActionCoverageEntry, CoverageStats};
+    use tlaplusplus::model::Model;
+
+    let next_def = match model.module.definitions.get(&model.next_name) {
+        Some(def) => def,
+        None => return CoverageStats::default(),
+    };
+
+    // Split Next body into disjuncts (actions)
+    let disjuncts = split_action_body_disjuncts(&next_def.body);
+
+    let action_names: Vec<String> = disjuncts
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            // Try to extract a meaningful name from the disjunct
+            let trimmed = d.trim();
+            if let Some(name) = trimmed.split_whitespace().next() {
+                if name.chars().next().map_or(false, |c| c.is_alphabetic()) && !name.contains('(')
+                {
+                    return name.to_string();
+                }
+            }
+            format!("disjunct_{}", i)
+        })
+        .collect();
+
+    let mut stats = CoverageStats::default();
+    for name in &action_names {
+        stats.actions.insert(name.clone(), ActionCoverageEntry::default());
+    }
+
+    // Evaluate each disjunct against initial states to populate coverage
+    let initial_states = model.initial_states();
+    let mut explored = std::collections::HashSet::new();
+    let mut frontier: Vec<TlaState> = initial_states;
+    let mut next_frontier = Vec::new();
+
+    // BFS up to a limited depth to collect coverage stats
+    let max_coverage_depth = 10;
+    for _depth in 0..max_coverage_depth {
+        if frontier.is_empty() {
+            break;
+        }
+        for state in &frontier {
+            let fp = {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut h = DefaultHasher::new();
+                state.hash(&mut h);
+                h.finish()
+            };
+            if !explored.insert(fp) {
+                continue;
+            }
+
+            let instances = if model.module.instances.is_empty() {
+                None
+            } else {
+                Some(&model.module.instances)
+            };
+
+            // Try each disjunct individually
+            for (idx, disjunct) in disjuncts.iter().enumerate() {
+                match tlaplusplus::tla::evaluate_next_states_with_instances(
+                    disjunct,
+                    &model.module.definitions,
+                    instances,
+                    state,
+                ) {
+                    Ok(successors) if !successors.is_empty() => {
+                        let name = &action_names[idx];
+                        if let Some(entry) = stats.actions.get_mut(name) {
+                            entry.fires += 1;
+                            entry.states_generated += successors.len() as u64;
+                        }
+                        next_frontier.extend(successors);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        frontier = std::mem::take(&mut next_frontier);
+    }
+
+    stats
+}
+
+/// Feature 4: Dump state graph to a file.
+/// Format: one line per state "STATE hash", then "hash1 -> hash2" per transition.
+fn dump_state_graph(
+    model: &TlaModel,
+    path: &std::path::Path,
+) -> anyhow::Result<()> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+    use std::io::Write;
+    use tlaplusplus::model::Model;
+
+    eprintln!("Dumping state graph to {}...", path.display());
+
+    let mut state_hashes: HashMap<u64, TlaState> = HashMap::new();
+    let mut transitions: Vec<(u64, u64)> = Vec::new();
+    let mut visited: HashSet<u64> = HashSet::new();
+    let mut queue: VecDeque<TlaState> = VecDeque::new();
+
+    for init in model.initial_states() {
+        let fp = model_fingerprint(&init);
+        if visited.insert(fp) {
+            state_hashes.insert(fp, init.clone());
+            queue.push_back(init);
+        }
+    }
+
+    let mut successors = Vec::new();
+    while let Some(state) = queue.pop_front() {
+        let from_fp = model_fingerprint(&state);
+        successors.clear();
+        model.next_states(&state, &mut successors);
+
+        for succ in &successors {
+            let to_fp = model_fingerprint(succ);
+            transitions.push((from_fp, to_fp));
+            if visited.insert(to_fp) {
+                state_hashes.insert(to_fp, succ.clone());
+                queue.push_back(succ.clone());
+            }
+        }
+    }
+
+    let mut file = std::fs::File::create(path)?;
+    // Write states
+    for (hash, state) in &state_hashes {
+        writeln!(file, "STATE {:#018x} {:?}", hash, state)?;
+    }
+    writeln!(file)?;
+    // Write transitions
+    for (from, to) in &transitions {
+        writeln!(file, "{:#018x} -> {:#018x}", from, to)?;
+    }
+
+    eprintln!(
+        "Dumped {} states, {} transitions to {}",
+        state_hashes.len(),
+        transitions.len(),
+        path.display()
+    );
+    Ok(())
+}
+
+/// Compute fingerprint for dump_state_graph
+fn model_fingerprint(state: &TlaState) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    state.hash(&mut h);
+    h.finish()
+}
+
+/// Feature 5: Print difftrace - only show variables that changed between steps.
+fn print_difftrace(trace: &[TlaState]) {
+    if trace.is_empty() {
+        return;
+    }
+    println!("  step 0 (initial):");
+    for (k, v) in &trace[0] {
+        println!("    /\\ {} = {:?}", k, v);
+    }
+    for i in 1..trace.len() {
+        let prev = &trace[i - 1];
+        let curr = &trace[i];
+        println!("  step {} (changed):", i);
+        let mut any_changed = false;
+        for (k, v) in curr {
+            match prev.get(k) {
+                Some(old_v) if old_v == v => {
+                    // unchanged, skip in difftrace
+                }
+                _ => {
+                    println!("    /\\ {} = {:?}", k, v);
+                    any_changed = true;
+                }
+            }
+        }
+        // Check for variables that were removed
+        for k in prev.keys() {
+            if !curr.contains_key(k) {
+                println!("    /\\ {} = <removed>", k);
+                any_changed = true;
+            }
+        }
+        if !any_changed {
+            println!("    (no changes - stuttering step)");
+        }
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -1394,6 +1661,13 @@ fn main() -> anyhow::Result<()> {
             init,
             next,
             allow_deadlock,
+            simulate,
+            simulate_depth,
+            simulate_traces,
+            simulate_seed,
+            coverage,
+            dump,
+            difftrace,
             runtime,
             storage,
             s3,
@@ -1430,20 +1704,87 @@ fn main() -> anyhow::Result<()> {
                 model.allow_deadlock = true;
             }
 
+            // Feature 7: Evaluate ASSUME statements before exploration
+            evaluate_assumes(&model)?;
+
             // Print TLC-compatible output
             let start_time = chrono::Local::now();
             println!("Starting... ({})", start_time.format("%Y-%m-%d %H:%M:%S"));
             println!("Computing initial states...");
 
-            // Clone model for post-processing (liveness checking)
+            // Feature 1: Simulation mode
+            if simulate {
+                let sim_config = SimulationConfig {
+                    depth: simulate_depth,
+                    num_traces: simulate_traces,
+                    seed: simulate_seed,
+                };
+                let max_violations = runtime.max_violations;
+                println!(
+                    "Running simulation: {} traces, depth {}, seed {}",
+                    sim_config.num_traces, sim_config.depth, sim_config.seed
+                );
+                let sim_outcome = run_simulation(&model, &sim_config, max_violations);
+                let end_time = chrono::Local::now();
+
+                println!(
+                    "Simulation complete: {} traces, {} total states, max depth {}",
+                    sim_outcome.traces_run, sim_outcome.total_states, sim_outcome.max_depth_reached,
+                );
+                println!(
+                    "Finished in {:.3}s at ({})",
+                    sim_outcome.duration.as_secs_f64(),
+                    end_time.format("%Y-%m-%d %H:%M:%S")
+                );
+
+                if sim_outcome.violations.is_empty() {
+                    println!("violation=false");
+                    println!();
+                    println!("Simulation completed successfully! No violations found.");
+                } else {
+                    println!(
+                        "violation=true ({} violations found)",
+                        sim_outcome.violations.len()
+                    );
+                    for (i, v) in sim_outcome.violations.iter().enumerate() {
+                        println!();
+                        println!("--- Violation {} ---", i + 1);
+                        println!("  message: {}", v.message);
+                        if difftrace {
+                            print_difftrace(&v.trace);
+                        } else {
+                            for (step, state) in v.trace.iter().enumerate() {
+                                println!("  step {}: {:?}", step, state);
+                            }
+                        }
+                    }
+                    std::process::exit(1);
+                }
+                // Skip the rest of the RunTla block in simulation mode
+                return Ok(());
+            }
+
+            // Clone model for post-processing (liveness checking, coverage, dump)
             let model_for_liveness = model.clone();
 
-            let config = build_engine_config(&runtime, &storage, s3.s3_bucket.is_some())?;
-            let outcome = run_model_with_s3(model, config, &s3).map_err(|e| {
+            let engine_config =
+                build_engine_config(&runtime, &storage, s3.s3_bucket.is_some())?;
+            let outcome = run_model_with_s3(model, engine_config, &s3).map_err(|e| {
                 eprintln!("Error running model:");
                 eprintln!("  {}", e);
                 e
             })?;
+
+            // Feature 2: Coverage profiling
+            if coverage {
+                let cov_stats = collect_coverage(&model_for_liveness);
+                cov_stats.print_summary();
+            }
+
+            // Feature 4: Dump state graph
+            if let Some(ref dump_path) = dump {
+                dump_state_graph(&model_for_liveness, dump_path)?;
+            }
 
             // Print TLC-compatible final output
             let end_time = chrono::Local::now();
@@ -1488,10 +1829,37 @@ fn main() -> anyhow::Result<()> {
                 end_time.format("%Y-%m-%d %H:%M:%S")
             );
 
-            if let Some(violation) = outcome.violation {
-                println!("violation=true");
-                println!("violation_message={}", violation.message);
-                println!("violation_state={:?}", violation.state);
+            // Feature 3 & 5: Report violations (multiple if --continue or --max-violations)
+            // Collect all violations: first from outcome.violation, rest from outcome.violations
+            let mut all_violations_display = Vec::new();
+            if let Some(ref v) = outcome.violation {
+                all_violations_display.push(v);
+            }
+            for v in &outcome.violations {
+                all_violations_display.push(v);
+            }
+
+            if !all_violations_display.is_empty() {
+                println!(
+                    "violation=true ({} violations found)",
+                    all_violations_display.len()
+                );
+                for (i, violation) in all_violations_display.iter().enumerate() {
+                    println!();
+                    println!("--- Violation {} ---", i + 1);
+                    println!("  message: {}", violation.message);
+                    if difftrace {
+                        print_difftrace(&violation.trace);
+                    } else {
+                        println!("  state: {:?}", violation.state);
+                        if !violation.trace.is_empty() {
+                            println!("  trace ({} steps):", violation.trace.len());
+                            for (step, state) in violation.trace.iter().enumerate() {
+                                println!("    step {}: {:?}", step, state);
+                            }
+                        }
+                    }
+                }
                 std::process::exit(1);
             } else {
                 // No safety violations found - check liveness properties if present
@@ -5685,6 +6053,7 @@ INVARIANTS TypeOK
             unnamed_instances: Vec::new(),
             is_pluscal: false,
             recursive_declarations: BTreeSet::new(),
+            assumes: vec![],
         };
 
         let seeded = seed_probe_state_from_type_invariants(&mut probe_state, &module, None);
@@ -5760,6 +6129,7 @@ INVARIANTS TypeOK
             unnamed_instances: Vec::new(),
             is_pluscal: false,
             recursive_declarations: BTreeSet::new(),
+            assumes: vec![],
         };
 
         let seeded = seed_probe_state_from_type_invariants(&mut probe_state, &module, None);
@@ -5835,6 +6205,7 @@ INVARIANTS TypeOK
             unnamed_instances: Vec::new(),
             is_pluscal: false,
             recursive_declarations: BTreeSet::new(),
+            assumes: vec![],
         };
 
         let seeded = seed_probe_state_from_type_invariants(&mut probe_state, &module, None);
@@ -6061,6 +6432,7 @@ INVARIANTS TypeOK
             unnamed_instances: Vec::new(),
             is_pluscal: false,
             recursive_declarations: BTreeSet::new(),
+            assumes: vec![],
         };
 
         let seeded = seed_probe_state_from_type_invariants(&mut probe_state, &module, None);
@@ -6122,6 +6494,7 @@ INVARIANTS TypeOK
             unnamed_instances: Vec::new(),
             is_pluscal: false,
             recursive_declarations: BTreeSet::new(),
+            assumes: vec![],
         };
 
         let seeded = seed_probe_state_from_membership_body(
@@ -6167,6 +6540,7 @@ INVARIANTS TypeOK
             unnamed_instances: Vec::new(),
             is_pluscal: false,
             recursive_declarations: BTreeSet::new(),
+            assumes: vec![],
         };
 
         let seeded = seed_probe_state_from_membership_body(
@@ -6203,6 +6577,7 @@ INVARIANTS TypeOK
             unnamed_instances: Vec::new(),
             is_pluscal: false,
             recursive_declarations: BTreeSet::new(),
+            assumes: vec![],
         };
         let module = TlaModule {
             name: "MC".to_string(),
@@ -6232,6 +6607,7 @@ INVARIANTS TypeOK
             unnamed_instances: Vec::new(),
             is_pluscal: false,
             recursive_declarations: BTreeSet::new(),
+            assumes: vec![],
         };
 
         let clauses = expand_state_predicate_clauses(
@@ -7262,6 +7638,7 @@ INVARIANTS TypeInvariant
             unnamed_instances: Vec::new(),
             is_pluscal: false,
             recursive_declarations: BTreeSet::new(),
+            assumes: vec![],
         };
 
         let seeded = seed_probe_state_from_type_invariants(&mut probe_state, &module, None);
@@ -7431,6 +7808,7 @@ INVARIANTS TypeInvariant
             unnamed_instances: Vec::new(),
             is_pluscal: false,
             recursive_declarations: BTreeSet::new(),
+            assumes: vec![],
         };
 
         let seeded = seed_probe_state_from_type_invariants(&mut probe_state, &module, None);
@@ -9164,6 +9542,7 @@ INVARIANTS TypeInvariant
             unnamed_instances: Vec::new(),
             is_pluscal: false,
             recursive_declarations: BTreeSet::new(),
+            assumes: vec![],
         };
 
         let seeded = seed_probe_state_from_type_invariants(&mut probe_state, &module, None);
@@ -10592,6 +10971,7 @@ INVARIANTS TypeInvariant
                 },
             )]),
             recursive_declarations: BTreeSet::new(),
+            assumes: vec![],
             instances: BTreeMap::new(),
             unnamed_instances: Vec::new(),
             is_pluscal: false,
@@ -10642,6 +11022,7 @@ INVARIANTS TypeInvariant
                 ),
             ]),
             recursive_declarations: BTreeSet::new(),
+            assumes: vec![],
             instances: BTreeMap::new(),
             unnamed_instances: Vec::new(),
             is_pluscal: false,
@@ -10654,6 +11035,7 @@ INVARIANTS TypeInvariant
             variables: vec![],
             definitions: BTreeMap::new(),
             recursive_declarations: BTreeSet::new(),
+            assumes: vec![],
             instances: BTreeMap::from([(
                 "N".to_string(),
                 TlaModuleInstance {
