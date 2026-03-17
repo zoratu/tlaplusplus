@@ -80,6 +80,22 @@ pub trait Model: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Canonicalize a state under symmetry reduction.
+    ///
+    /// When a SYMMETRY set is configured, two states that differ only by a
+    /// permutation of the symmetric elements are considered equivalent.
+    /// This method maps every state to the canonical (lexicographically
+    /// smallest) representative of its equivalence class.
+    ///
+    /// The runtime calls this on each successor state **before**
+    /// fingerprinting and enqueueing, so that symmetric states are
+    /// recognised as duplicates even when they differ structurally.
+    ///
+    /// Default implementation returns the state unchanged (no symmetry).
+    fn canonicalize(&self, state: Self::State) -> Self::State {
+        state
+    }
+
     /// Compute fingerprint of a state
     ///
     /// This method allows models to customize how states are fingerprinted,
