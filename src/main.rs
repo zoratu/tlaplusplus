@@ -124,6 +124,16 @@ struct RuntimeArgs {
     /// Skip system configuration checks (THP, etc.) at startup
     #[arg(long, default_value_t = false)]
     skip_system_checks: bool,
+    /// Enable BFS parent tracking for error trace reconstruction (TLC-style).
+    /// Records parent pointers during exploration so violation traces can be
+    /// reconstructed by walking the parent chain instead of re-exploring.
+    #[arg(long, default_value_t = false)]
+    trace_parents: bool,
+    /// Maximum number of states to record for parent tracking.
+    /// When the limit is reached, new states stop being recorded and trace
+    /// reconstruction falls back to re-exploration if a violation is found.
+    #[arg(long, default_value_t = 10_000_000)]
+    max_trace_states: usize,
 }
 
 #[derive(Args, Clone, Debug)]
@@ -360,6 +370,8 @@ fn build_engine_config(
         bloom_switch_fpr: storage.bloom_switch_fpr,
         // Default to false - set to true in run_model_with_s3 when S3 is active
         defer_queue_segment_deletion: false,
+        trace_parents: runtime.trace_parents,
+        max_trace_states: runtime.max_trace_states,
     })
 }
 
