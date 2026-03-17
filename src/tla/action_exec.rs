@@ -128,6 +128,9 @@ fn is_probe_sampling_limitation(err: &anyhow::Error) -> bool {
         || msg.contains("DOMAIN expects a function")
         || msg.contains("unsupported for value Int(0)")
         || msg.contains("evaluation budget exceeded")
+        || msg.contains("too large")
+        || msg.contains("expected Set, got Int(")
+        || msg.contains("expected Seq, got Int(")
 }
 
 pub fn evaluate_next_states(
