@@ -1,5 +1,8 @@
 use crate::autotune::{AutoTuneConfig, AutoTuner, WorkerThrottle};
-use crate::fairness::TarjanSCC;
+use crate::fairness::{
+    ActionLabel as FairnessActionLabel, LabeledTransition as FairnessLabeledTransition, TarjanSCC,
+    check_fairness_on_scc,
+};
 use crate::model::{LabeledTransition, Model};
 use crate::storage::async_fingerprint_writer::{create_persist_channels, fingerprint_writer_task};
 use crate::storage::fingerprint_store::{
@@ -2443,9 +2446,11 @@ where
         return Err(anyhow!(err));
     }
 
-    let violation = violation_rx.try_recv().ok();
+    let mut violation = violation_rx.try_recv().ok();
 
     // Check fairness constraints if we collected labeled transitions
+    // (only if no safety violation was already found)
+    if violation.is_none() {
     if let Some(transitions_map) = labeled_transitions.as_ref() {
         eprintln!(
             "Checking fairness constraints on {} states with transitions...",
@@ -2519,20 +2524,89 @@ where
                     non_trivial_sccs.len()
                 );
 
-                // Get fairness constraints from model
-                // Note: We need access to fairness constraints, which requires the model
-                // to expose them. For now, we'll check if the model implements a method
-                // to get fairness constraints. This is model-specific (TlaModel has it).
+                let constraints = model.fairness_constraints();
 
-                // For now, we'll just report that we found cycles
-                eprintln!(
-                    "  Note: Fairness checking on cycles detected but constraint validation not yet wired"
-                );
-                eprintln!("        Models must expose fairness constraints for full checking");
+                if constraints.is_empty() {
+                    eprintln!("  No fairness constraints to check");
+                } else {
+                    eprintln!(
+                        "  Checking {} fairness constraints against SCCs",
+                        constraints.len()
+                    );
+
+                    // Convert model::LabeledTransition to fairness::LabeledTransition
+                    let fairness_transitions: Vec<FairnessLabeledTransition<M::State>> =
+                        all_transitions
+                            .iter()
+                            .map(|t| FairnessLabeledTransition {
+                                from: t.from.clone(),
+                                to: t.to.clone(),
+                                action: FairnessActionLabel {
+                                    name: t.action.name.clone(),
+                                    disjunct_index: t.action.disjunct_index,
+                                },
+                            })
+                            .collect();
+
+                    for (scc_idx, scc) in non_trivial_sccs.iter().enumerate() {
+                        let scc_states: Vec<M::State> =
+                            scc.iter().map(|s| (*s).clone()).collect();
+
+                        for constraint in &constraints {
+                            if let Err(e) = check_fairness_on_scc(
+                                &scc_states,
+                                constraint,
+                                &fairness_transitions,
+                            ) {
+                                eprintln!(
+                                    "  Fairness violation in SCC {} ({} states): {}",
+                                    scc_idx,
+                                    scc_states.len(),
+                                    e
+                                );
+
+                                // Pick a representative state from the SCC for the violation
+                                let representative = scc_states
+                                    .first()
+                                    .cloned()
+                                    .expect("non-trivial SCC has at least one state");
+
+                                // Build a cycle trace from the SCC states
+                                let mut trace = scc_states.clone();
+                                // Close the cycle by repeating the first state
+                                if let Some(first) = trace.first().cloned() {
+                                    trace.push(first);
+                                }
+
+                                violation = Some(Violation {
+                                    message: format!(
+                                        "Fairness violation: {}",
+                                        e
+                                    ),
+                                    state: representative,
+                                    property_type: PropertyType::Liveness,
+                                    trace,
+                                });
+
+                                // Stop on first fairness violation
+                                break;
+                            }
+                        }
+
+                        if violation.is_some() {
+                            break;
+                        }
+                    }
+
+                    if violation.is_none() {
+                        eprintln!("  All fairness constraints satisfied");
+                    }
+                }
             } else {
                 eprintln!("  No cycles detected - fairness constraints trivially satisfied");
             }
         }
+    }
     }
 
     let (states_generated, states_processed, states_distinct, duplicates, enqueued, checkpoints) =
