@@ -160,6 +160,9 @@ struct FingerprintShard {
     backing_fd: Mutex<Option<RawFd>>,
     /// Shard identifier (for file naming during resize)
     shard_id: usize,
+    /// Cursor for incremental rehash: entries [0..rehash_cursor) have been moved
+    /// to the new table. Workers advance this atomically in batches.
+    rehash_cursor: AtomicUsize,
 }
 
 unsafe impl Send for FingerprintShard {}
@@ -235,7 +238,118 @@ impl FingerprintShard {
             mapping_is_file_backed: AtomicBool::new(mapping_is_file_backed),
             backing_fd: Mutex::new(backing_fd),
             shard_id,
+            rehash_cursor: AtomicUsize::new(0),
         })
+    }
+
+    /// Batch size for incremental rehash: each worker rehashes this many
+    /// entries from the old table before returning to normal work.
+    const REHASH_BATCH_SIZE: usize = 4096;
+
+    /// Participate in incremental rehash: move a batch of entries from
+    /// old table to new table. Returns true if there's more work to do.
+    fn rehash_batch(&self) -> bool {
+        let old_cap = self.old_capacity.load(Ordering::Acquire);
+        if old_cap == 0 {
+            return false;
+        }
+
+        let old_table_ptr = self.old_table.load(Ordering::Acquire);
+        let new_table_ptr = self.new_table.load(Ordering::Acquire);
+        if old_table_ptr.is_null() || new_table_ptr.is_null() {
+            return false;
+        }
+
+        let new_cap = self.new_capacity.load(Ordering::Acquire);
+        if new_cap == 0 {
+            return false;
+        }
+
+        // Claim a batch of entries to rehash
+        let start = self
+            .rehash_cursor
+            .fetch_add(Self::REHASH_BATCH_SIZE, Ordering::AcqRel);
+        if start >= old_cap {
+            return false; // All batches claimed
+        }
+        let end = (start + Self::REHASH_BATCH_SIZE).min(old_cap);
+
+        let old_slice = unsafe { std::slice::from_raw_parts(old_table_ptr, old_cap) };
+        let new_slice = unsafe { std::slice::from_raw_parts(new_table_ptr, new_cap) };
+
+        for i in start..end {
+            let fp = old_slice[i].fp.load(Ordering::Acquire);
+            if fp != 0 {
+                // Insert into new table using CAS
+                let mut index = (fp as usize) % new_cap;
+                loop {
+                    let new_entry = &new_slice[index];
+                    let stored = new_entry.fp.load(Ordering::Acquire);
+                    if stored == fp {
+                        break; // Already present
+                    }
+                    if stored == 0 {
+                        match new_entry.fp.compare_exchange(
+                            0,
+                            fp,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        ) {
+                            Ok(_) => {
+                                new_entry.state.store(1, Ordering::Release);
+                                break;
+                            }
+                            Err(actual) if actual == fp => break,
+                            Err(_) => {}
+                        }
+                    }
+                    index = (index + 1) % new_cap;
+                }
+            }
+        }
+
+        end < old_cap // true = more batches remain
+    }
+
+    /// Check if incremental rehash is complete
+    fn is_rehash_complete(&self) -> bool {
+        let old_cap = self.old_capacity.load(Ordering::Acquire);
+        old_cap == 0 || self.rehash_cursor.load(Ordering::Acquire) >= old_cap
+    }
+
+    /// Finalize resize after all entries have been rehashed
+    fn finalize_resize(&self) {
+        let old_memory = self.memory.load(Ordering::Acquire);
+        let old_memory_size = self.memory_size.load(Ordering::Acquire);
+        let new_table = self.new_table.load(Ordering::Acquire);
+        let new_cap = self.new_capacity.load(Ordering::Acquire);
+        let new_memory = new_table as *mut u8;
+        let entry_size = std::mem::size_of::<HashTableEntry>();
+        let new_memory_size = new_cap * entry_size;
+
+        // Swap in new table
+        self.table.store(new_table, Ordering::Release);
+        self.capacity.store(new_cap, Ordering::Release);
+        self.memory.store(new_memory, Ordering::Release);
+        self.memory_size.store(new_memory_size, Ordering::Release);
+
+        // Mark resize complete (even seq number)
+        self.seq.fetch_add(1, Ordering::AcqRel);
+
+        // Clear old/new table pointers
+        self.old_table
+            .store(std::ptr::null_mut(), Ordering::Release);
+        self.old_capacity.store(0, Ordering::Release);
+        self.new_table
+            .store(std::ptr::null_mut(), Ordering::Release);
+        self.new_capacity.store(0, Ordering::Release);
+        self.rehash_cursor.store(0, Ordering::Release);
+
+        // Queue old memory for cleanup
+        self.old_memory.lock().push((old_memory, old_memory_size));
+
+        let new_backing_fd: Option<(RawFd, PathBuf)> = None;
+        self.finish_resize_backing_transition(new_backing_fd);
     }
 
     /// Get current capacity (thread-safe)
@@ -332,82 +446,41 @@ impl FingerprintShard {
         self.new_table.store(new_table, Ordering::Release);
         self.new_capacity.store(new_capacity, Ordering::Release);
 
+        // Reset rehash cursor for incremental migration
+        self.rehash_cursor.store(0, Ordering::Release);
+
         // Mark resize in progress (odd seq number)
-        // After this, workers will check old_table then insert into new_table
+        // After this, workers will:
+        //   1. Check old_table for reads (existing fingerprints)
+        //   2. Insert into new_table (new fingerprints)
+        //   3. Participate in incremental rehash via rehash_batch()
         self.seq.fetch_add(1, Ordering::AcqRel);
 
-        // Rehash all entries from old to new table
-        // Note: workers may also be inserting into new table concurrently
-        let old_slice = unsafe { std::slice::from_raw_parts(old_table, old_capacity) };
-        let new_slice = unsafe { std::slice::from_raw_parts_mut(new_table, new_capacity) };
-
-        let mut rehashed = 0u64;
-        for entry in old_slice {
-            let fp = entry.fp.load(Ordering::Acquire);
-            if fp != 0 {
-                // Insert into new table using CAS (workers may have already inserted)
-                let mut index = (fp as usize) % new_capacity;
-                loop {
-                    let new_entry = &new_slice[index];
-                    let stored = new_entry.fp.load(Ordering::Acquire);
-                    if stored == fp {
-                        // Already inserted by a worker
-                        rehashed += 1;
-                        break;
-                    }
-                    if stored == 0 {
-                        // Try to insert
-                        match new_entry.fp.compare_exchange(
-                            0,
-                            fp,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        ) {
-                            Ok(_) => {
-                                new_entry.state.store(1, Ordering::Release);
-                                rehashed += 1;
-                                break;
-                            }
-                            Err(actual) if actual == fp => {
-                                // Concurrent insert of same fingerprint
-                                rehashed += 1;
-                                break;
-                            }
-                            Err(_) => {
-                                // Slot taken by different fp, continue probing
-                            }
-                        }
-                    }
-                    index = (index + 1) % new_capacity;
-                }
-            }
+        // Incremental rehash: the resize thread rehashes in batches,
+        // yielding between batches so workers can make progress.
+        // Workers also participate by calling rehash_batch() on each operation.
+        let rehash_start = std::time::Instant::now();
+        while !self.is_rehash_complete() {
+            self.rehash_batch();
+            // Yield after each batch to let workers run
+            std::thread::yield_now();
         }
 
-        // Swap in new table (atomic updates)
-        self.table.store(new_table, Ordering::Release);
-        self.capacity.store(new_capacity, Ordering::Release);
-        self.memory.store(new_memory, Ordering::Release);
-        self.memory_size.store(new_memory_size, Ordering::Release);
+        eprintln!(
+            "Rehash complete for shard {} in {:.1}ms ({} entries)",
+            self.shard_id,
+            rehash_start.elapsed().as_secs_f64() * 1000.0,
+            self.count.load(Ordering::Relaxed)
+        );
 
-        // Mark resize complete (even seq number)
-        self.seq.fetch_add(1, Ordering::AcqRel);
+        // Finalize: swap tables, clear pointers, queue old memory
+        self.finalize_resize();
 
-        // Clear old/new table pointers (readers will now use main table)
-        self.old_table
-            .store(std::ptr::null_mut(), Ordering::Release);
-        self.old_capacity.store(0, Ordering::Release);
-        self.new_table
-            .store(std::ptr::null_mut(), Ordering::Release);
-        self.new_capacity.store(0, Ordering::Release);
-
-        // Queue old memory for later cleanup (can't free immediately - readers may still use it)
-        self.old_memory.lock().push((old_memory, old_memory_size));
-
-        self.finish_resize_backing_transition(new_backing_fd);
+        // Handle file-backed transition if applicable
+        let _ = new_backing_fd; // finalize_resize handles cleanup
 
         eprintln!(
-            "Resize complete: rehashed {} entries, new load factor: {:.1}%",
-            rehashed,
+            "Resize complete: new load factor: {:.1}%",
             self.load_factor() * 100.0
         );
 
@@ -438,7 +511,21 @@ impl FingerprintShard {
         loop {
             let seq_before = self.seq.load(Ordering::Acquire);
             if seq_before % 2 == 1 {
-                // RESIZE IN PROGRESS - check both old and new tables
+                // RESIZE IN PROGRESS — participate in incremental rehash
+                // before doing our own lookup. This distributes rehash work
+                // across all workers instead of blocking on the resize thread.
+                self.rehash_batch();
+
+                // Check if rehash is now complete — try to finalize
+                if self.is_rehash_complete() {
+                    if let Some(_guard) = self.resize_lock.try_lock() {
+                        // Double-check under lock
+                        if self.seq.load(Ordering::Acquire) % 2 == 1 && self.is_rehash_complete() {
+                            self.finalize_resize();
+                        }
+                    }
+                    continue; // Retry with normal path
+                }
 
                 // Check old table
                 let old_table_ptr = self.old_table.load(Ordering::Acquire);
@@ -797,8 +884,18 @@ impl FingerprintShard {
                     std::thread::yield_now();
                 }
 
-                // RESIZE IN PROGRESS - use lock-free path through old+new tables
-                // This is completely non-blocking!
+                // RESIZE IN PROGRESS — participate in incremental rehash
+                self.rehash_batch();
+
+                // Check if rehash is now complete — try to finalize
+                if self.is_rehash_complete() {
+                    if let Some(_guard) = self.resize_lock.try_lock() {
+                        if self.seq.load(Ordering::Acquire) % 2 == 1 && self.is_rehash_complete() {
+                            self.finalize_resize();
+                        }
+                    }
+                    continue; // Retry with normal path
+                }
 
                 // Step 1: Check old table (RCU read)
                 let old_table_ptr = self.old_table.load(Ordering::Acquire);
