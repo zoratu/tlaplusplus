@@ -653,13 +653,27 @@ fn apply_memory_budget(config: &EngineConfig, effective_memory_max: Option<u64>)
     let mut queue_limit = config.queue_inmem_limit;
 
     if let Some(memory_max) = effective_memory_max {
-        let budget_fp_cache = (memory_max.saturating_mul(60) / 100).max(64 * 1024 * 1024);
+        // Memory budget split:
+        //   25% fingerprint store (sized separately, see fp store init)
+        //   10% per-worker fingerprint cache
+        //   50% state queue (in-memory portion)
+        //   15% OS, worker stacks, other overhead
+        let budget_fp_cache = (memory_max.saturating_mul(10) / 100).max(64 * 1024 * 1024);
         fp_cache = fp_cache.min(budget_fp_cache);
 
         let state_bytes = config.estimated_state_bytes.max(1) as u64;
-        let budget_queue_items = (memory_max.saturating_mul(30) / 100) / state_bytes;
+        let budget_queue_items = (memory_max.saturating_mul(50) / 100) / state_bytes;
         let budget_queue_items = budget_queue_items.max(10_000) as usize;
         queue_limit = queue_limit.min(budget_queue_items);
+
+        if std::env::var("TLAPP_VERBOSE").is_ok() {
+            eprintln!(
+                "Memory budget ({:.1} GB): fp_cache={:.0}MB, queue_limit={}M items",
+                memory_max as f64 / (1024.0 * 1024.0 * 1024.0),
+                budget_fp_cache as f64 / (1024.0 * 1024.0),
+                budget_queue_items / 1_000_000
+            );
+        }
     }
 
     (fp_cache, queue_limit)
@@ -1047,28 +1061,31 @@ where
     //   - Bounded memory (~120MB for 100M items at 1% FPR)
     //   - Small false positive rate (~1%) may cause re-exploration of some states
 
-    // Size the fingerprint store based on expected items OR available memory
-    // (whichever gives a larger initial allocation). This minimizes costly
-    // resize operations that stall all workers during rehash.
+    // Size the fingerprint store based on expected items, capped by available
+    // memory. We allocate just enough for the expected workload and rely on
+    // incremental resize (zero-stall) if the model exceeds the estimate.
+    //
+    // Memory budget: fingerprints get at most 25% of available RAM.
+    // The rest is needed for the state queue, worker stacks, OS, etc.
+    // On a 96GB machine: ~24GB for fingerprints (~840M entries).
+    // On a 256GB machine: ~64GB for fingerprints (~2.2B entries).
     let bytes_per_entry = 16; // 8-byte fp + 8-byte state
     let load_factor = 0.9;
     let items_based_bytes =
         (config.fp_expected_items as f64 / load_factor * bytes_per_entry as f64) as usize;
 
-    // Auto-size from available memory: use up to 60% of available RAM for fingerprints.
-    // This avoids resize for most runs by pre-allocating enough capacity.
-    let memory_based_bytes = effective_memory_max
-        .map(|mem| (mem as f64 * 0.6) as usize)
-        .unwrap_or(0);
+    let memory_cap = effective_memory_max
+        .map(|mem| (mem as f64 * 0.25) as usize)
+        .unwrap_or(usize::MAX);
 
-    let total_bytes_needed = items_based_bytes.max(memory_based_bytes);
-    if memory_based_bytes > items_based_bytes {
-        let items_capacity =
-            (memory_based_bytes as f64 * load_factor / bytes_per_entry as f64) as usize;
+    let total_bytes_needed = items_based_bytes.min(memory_cap);
+    if items_based_bytes > memory_cap {
+        let capped_items = (memory_cap as f64 * load_factor / bytes_per_entry as f64) as usize;
         eprintln!(
-            "Fingerprint store: auto-sized from available memory ({:.1} GB → capacity ~{}M items)",
-            memory_based_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-            items_capacity / 1_000_000
+            "Fingerprint store: capped to 25% of RAM ({:.1} GB, ~{}M items). \
+             Incremental resize will expand if needed.",
+            memory_cap as f64 / (1024.0 * 1024.0 * 1024.0),
+            capped_items / 1_000_000
         );
     }
 
@@ -1086,11 +1103,12 @@ where
 
     // Only calculate shard_size_mb for page-aligned mode
     let shard_size_mb = if !config.use_bloom_fingerprints {
-        // Minimum 256MB per shard to avoid frequent resizes.
-        // Larger initial shards = fewer resize events = less contention.
-        let min_shard_bytes = 256 * 1024 * 1024; // 256MB minimum
+        // Shard size: divide total evenly, with a reasonable minimum.
+        // With incremental resize, small initial shards are fine — resize
+        // is zero-stall. No need for aggressive minimum.
+        let min_shard_bytes = 16 * 1024 * 1024; // 16MB minimum per shard
         let bytes_per_shard = (total_bytes_needed / shard_count).max(min_shard_bytes);
-        (bytes_per_shard / (1024 * 1024)).max(256) // At least 256MB
+        (bytes_per_shard / (1024 * 1024)).max(16) // At least 16MB
     } else {
         0 // Not used in bloom mode
     };
