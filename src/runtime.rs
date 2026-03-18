@@ -1047,12 +1047,30 @@ where
     //   - Bounded memory (~120MB for 100M items at 1% FPR)
     //   - Small false positive rate (~1%) may cause re-exploration of some states
 
-    // Calculate memory per shard based on expected items
-    // Each entry is 16 bytes (8-byte fp + 8-byte padding), plus 10% headroom for open addressing
-    let bytes_per_entry = 16;
-    let load_factor = 0.9; // 10% headroom
-    let total_bytes_needed =
+    // Size the fingerprint store based on expected items OR available memory
+    // (whichever gives a larger initial allocation). This minimizes costly
+    // resize operations that stall all workers during rehash.
+    let bytes_per_entry = 16; // 8-byte fp + 8-byte state
+    let load_factor = 0.9;
+    let items_based_bytes =
         (config.fp_expected_items as f64 / load_factor * bytes_per_entry as f64) as usize;
+
+    // Auto-size from available memory: use up to 60% of available RAM for fingerprints.
+    // This avoids resize for most runs by pre-allocating enough capacity.
+    let memory_based_bytes = effective_memory_max
+        .map(|mem| (mem as f64 * 0.6) as usize)
+        .unwrap_or(0);
+
+    let total_bytes_needed = items_based_bytes.max(memory_based_bytes);
+    if memory_based_bytes > items_based_bytes {
+        let items_capacity =
+            (memory_based_bytes as f64 * load_factor / bytes_per_entry as f64) as usize;
+        eprintln!(
+            "Fingerprint store: auto-sized from available memory ({:.1} GB → capacity ~{}M items)",
+            memory_based_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            items_capacity / 1_000_000
+        );
+    }
 
     // Auto-calculate optimal shard count if user specified 0 or default
     let shard_count = if config.fp_shards == 0 {
@@ -1068,10 +1086,11 @@ where
 
     // Only calculate shard_size_mb for page-aligned mode
     let shard_size_mb = if !config.use_bloom_fingerprints {
-        // Minimum 64MB per shard to avoid frequent resizes with many workers
-        let min_shard_bytes = 64 * 1024 * 1024; // 64MB minimum
+        // Minimum 256MB per shard to avoid frequent resizes.
+        // Larger initial shards = fewer resize events = less contention.
+        let min_shard_bytes = 256 * 1024 * 1024; // 256MB minimum
         let bytes_per_shard = (total_bytes_needed / shard_count).max(min_shard_bytes);
-        (bytes_per_shard / (1024 * 1024)).max(64) // At least 64MB
+        (bytes_per_shard / (1024 * 1024)).max(256) // At least 256MB
     } else {
         0 // Not used in bloom mode
     };
