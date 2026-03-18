@@ -612,14 +612,19 @@ impl FingerprintShard {
                         probes += 1;
                     }
 
-                    // New table full during resize
+                    // New table full during resize — yield to let the resize thread
+                    // make progress instead of spinning on CAS
                     if retries % 1000 == 0 {
                         eprintln!(
                             "Warning: fp {:#x} (stats) retry {} - new table full during resize",
                             fp, retries
                         );
                     }
-                    std::hint::spin_loop();
+                    if retries < 10 {
+                        std::hint::spin_loop();
+                    } else {
+                        std::thread::yield_now();
+                    }
                     continue;
                 }
 
@@ -628,13 +633,12 @@ impl FingerprintShard {
                 if seq_recheck % 2 == 0 {
                     continue;
                 }
-                if retries % 1000 == 0 {
-                    eprintln!(
-                        "Warning: fp {:#x} (stats) retry {} - waiting for new_table",
-                        fp, retries
-                    );
+                // Resize still in progress — yield instead of spinning
+                if retries < 10 {
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
                 }
-                std::hint::spin_loop();
                 continue;
             }
 
@@ -775,11 +779,9 @@ impl FingerprintShard {
             // Exponential backoff to reduce contention at high worker counts
             // This helps prevent livelock when many workers are competing
             if retries > 100 {
-                // After 100 retries, use exponential backoff with jitter
-                let backoff_spins = 1u32 << ((retries.min(10_000) / 100).min(10));
-                for _ in 0..backoff_spins {
-                    std::hint::spin_loop();
-                }
+                // After 100 retries, yield to let other threads (especially the
+                // resize thread) make progress instead of spinning
+                std::thread::yield_now();
             }
             if retries > 0 && retries % 1000 == 0 {
                 std::thread::yield_now();
@@ -879,25 +881,25 @@ impl FingerprintShard {
                             self.seq.load(Ordering::Relaxed)
                         );
                     }
-                    std::hint::spin_loop();
+                    if retries < 10 {
+                        std::hint::spin_loop();
+                    } else {
+                        std::thread::yield_now();
+                    }
                     continue;
                 }
 
                 // new_table not yet set up OR resize just completed and cleared it
-                // Re-read seq to check if resize completed
                 let seq_recheck = self.seq.load(Ordering::Acquire);
                 if seq_recheck % 2 == 0 {
-                    // Resize completed! Take normal path on next iteration
                     continue;
                 }
-                // Still resizing but new_table not ready - very brief window
-                if retries % 1000 == 0 {
-                    eprintln!(
-                        "Warning: fp {:#x} retry {} - waiting for new_table (seq={} -> {})",
-                        fp, retries, seq_before, seq_recheck
-                    );
+                // Still resizing but new_table not ready - yield
+                if retries < 10 {
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
                 }
-                std::hint::spin_loop();
                 continue;
             }
 
