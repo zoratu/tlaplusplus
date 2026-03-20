@@ -1282,6 +1282,8 @@ where
     // when RSS approaches the effective memory cap. Only active when file-backed
     // fingerprints were successfully configured.
     let mem_monitor_stop = Arc::new(AtomicBool::new(false));
+    let mem_monitor_thread_handle: Arc<parking_lot::RwLock<Option<std::thread::Thread>>> =
+        Arc::new(parking_lot::RwLock::new(None));
     let mem_monitor_thread: Option<std::thread::JoinHandle<()>> =
         if should_start_fingerprint_memory_monitor(
             &config,
@@ -1290,6 +1292,7 @@ where
         ) {
             let monitor_fp_store = Arc::clone(&fp_store);
             let monitor_stop = Arc::clone(&mem_monitor_stop);
+            let monitor_handle_slot = Arc::clone(&mem_monitor_thread_handle);
             // invariant: should_start_fingerprint_memory_monitor checks effective_memory_max.is_some()
             let memory_max =
                 effective_memory_max.expect("memory monitor started without effective_memory_max");
@@ -1297,13 +1300,18 @@ where
             std::thread::Builder::new()
                 .name("tlapp-mem-monitor".into())
                 .spawn(move || {
+                    // Register thread handle for fast unparking on shutdown
+                    *monitor_handle_slot.write() = Some(std::thread::current());
                     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 };
                     let threshold_90 = (memory_max as f64 * 0.90) as u64;
                     let threshold_95 = (memory_max as f64 * 0.95) as u64;
                     let mut warned_95 = false;
 
                     while !monitor_stop.load(Ordering::Relaxed) {
-                        std::thread::sleep(Duration::from_secs(5));
+                        // Use park_timeout instead of sleep so the main thread
+                        // can unpark us for immediate shutdown (avoids 5s delay
+                        // on model completion)
+                        std::thread::park_timeout(Duration::from_secs(5));
                         if monitor_stop.load(Ordering::Relaxed) {
                             break;
                         }
@@ -2497,6 +2505,11 @@ where
     queue.finish(); // Signal completion
 
     mem_monitor_stop.store(true, Ordering::Relaxed);
+    // Unpark the monitor thread so it wakes up immediately instead of
+    // sleeping for up to 5 seconds before checking the stop flag
+    if let Some(thread) = mem_monitor_thread_handle.read().as_ref() {
+        thread.unpark();
+    }
     if let Some(handle) = mem_monitor_thread {
         let _ = handle.join();
     }
