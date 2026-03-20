@@ -1889,7 +1889,7 @@ fn choose_candidates_without_domain(
 }
 
 fn stable_choose_model_value(var: &str, predicate: &str, idx: usize) -> TlaValue {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut hasher = ahash::AHasher::default();
     var.hash(&mut hasher);
     predicate.trim().hash(&mut hasher);
     let digest = hasher.finish();

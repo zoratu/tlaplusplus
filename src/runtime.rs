@@ -2035,6 +2035,11 @@ where
             let mut unique_fps: Vec<u64> = Vec::with_capacity(worker_fp_batch_size);
             let mut batch_seen: Vec<bool> = Vec::with_capacity(worker_fp_batch_size);
             let mut local_fp_dedup: HashSet<u64> = HashSet::with_capacity(worker_fp_batch_size * 2);
+            // Pre-allocate per-iteration vecs outside the loop to avoid repeated allocation
+            let mut states_with_home_numa: Vec<(M::State, usize)> =
+                Vec::with_capacity(worker_fp_batch_size);
+            let mut fps_to_check: Vec<u64> = Vec::with_capacity(worker_fp_batch_size);
+            let mut states_to_check: Vec<M::State> = Vec::with_capacity(worker_fp_batch_size);
 
             // Per-worker persistent fingerprint cache to reduce global store CAS contention
             // This catches duplicates locally before hitting shared atomics
@@ -2302,13 +2307,6 @@ where
                         );
                     }
                 }
-
-                // Pair states with their fingerprint's home NUMA for routing
-                let mut states_with_home_numa: Vec<(M::State, usize)> =
-                    Vec::with_capacity(worker_fp_batch_size);
-                // Fingerprints that need global store check (not in local cache)
-                let mut fps_to_check: Vec<u64> = Vec::with_capacity(worker_fp_batch_size);
-                let mut states_to_check: Vec<M::State> = Vec::with_capacity(worker_fp_batch_size);
 
                 // Compute parent fingerprint once for parent tracking
                 let current_state_fp = if worker_parent_map.is_some() {
