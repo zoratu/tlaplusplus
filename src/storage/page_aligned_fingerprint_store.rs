@@ -165,6 +165,14 @@ struct FingerprintShard {
     /// Cursor for incremental rehash: entries [0..rehash_cursor) have been moved
     /// to the new table. Workers advance this atomically in batches.
     rehash_cursor: AtomicUsize,
+    /// Adaptive batch size for incremental rehash, determined at resize start
+    /// based on table occupancy. Larger batches when table is sparse (less CAS
+    /// contention), smaller when dense.
+    rehash_batch_size: AtomicUsize,
+    /// Number of rehash batches processed by workers (not the resize thread)
+    rehash_worker_batches: AtomicUsize,
+    /// Number of rehash batches processed by the resize thread
+    rehash_resize_batches: AtomicUsize,
 }
 
 unsafe impl Send for FingerprintShard {}
@@ -241,16 +249,31 @@ impl FingerprintShard {
             backing_fd: Mutex::new(backing_fd),
             shard_id,
             rehash_cursor: AtomicUsize::new(0),
+            rehash_batch_size: AtomicUsize::new(4096),
+            rehash_worker_batches: AtomicUsize::new(0),
+            rehash_resize_batches: AtomicUsize::new(0),
         })
     }
 
-    /// Batch size for incremental rehash: each worker rehashes this many
-    /// entries from the old table before returning to normal work.
-    const REHASH_BATCH_SIZE: usize = 4096;
+    /// Compute adaptive rehash batch size based on table occupancy.
+    /// Sparse tables (<50% full) use larger batches (16384) since there are
+    /// fewer entries to move and less CAS contention. Dense tables (>75% full)
+    /// use smaller batches (1024) to reduce contention and yield more CPU to workers.
+    fn compute_rehash_batch_size(&self) -> usize {
+        let load = self.load_factor();
+        if load < 0.50 {
+            16384
+        } else if load > 0.75 {
+            1024
+        } else {
+            4096
+        }
+    }
 
     /// Participate in incremental rehash: move a batch of entries from
     /// old table to new table. Returns true if there's more work to do.
-    fn rehash_batch(&self) -> bool {
+    /// When `is_resize_thread` is true, the batch is counted as resize-thread work.
+    fn rehash_batch_counted(&self, is_resize_thread: bool) -> bool {
         let old_cap = self.old_capacity.load(Ordering::Acquire);
         if old_cap == 0 {
             return false;
@@ -267,14 +290,23 @@ impl FingerprintShard {
             return false;
         }
 
+        let batch_size = self.rehash_batch_size.load(Ordering::Relaxed);
+
         // Claim a batch of entries to rehash
         let start = self
             .rehash_cursor
-            .fetch_add(Self::REHASH_BATCH_SIZE, Ordering::AcqRel);
+            .fetch_add(batch_size, Ordering::AcqRel);
         if start >= old_cap {
             return false; // All batches claimed
         }
-        let end = (start + Self::REHASH_BATCH_SIZE).min(old_cap);
+        let end = (start + batch_size).min(old_cap);
+
+        // Track which thread type processed this batch
+        if is_resize_thread {
+            self.rehash_resize_batches.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.rehash_worker_batches.fetch_add(1, Ordering::Relaxed);
+        }
 
         let old_slice = unsafe { std::slice::from_raw_parts(old_table_ptr, old_cap) };
         let new_slice = unsafe { std::slice::from_raw_parts(new_table_ptr, new_cap) };
@@ -311,6 +343,11 @@ impl FingerprintShard {
         }
 
         end < old_cap // true = more batches remain
+    }
+
+    /// Participate in incremental rehash (called by workers).
+    fn rehash_batch(&self) -> bool {
+        self.rehash_batch_counted(false)
     }
 
     /// Check if incremental rehash is complete
@@ -446,8 +483,14 @@ impl FingerprintShard {
         self.new_table.store(new_table, Ordering::Release);
         self.new_capacity.store(new_capacity, Ordering::Release);
 
-        // Reset rehash cursor for incremental migration
+        // Reset rehash cursor and batch counters for incremental migration
         self.rehash_cursor.store(0, Ordering::Release);
+        self.rehash_worker_batches.store(0, Ordering::Relaxed);
+        self.rehash_resize_batches.store(0, Ordering::Relaxed);
+
+        // Determine adaptive batch size based on current occupancy
+        let adaptive_batch = self.compute_rehash_batch_size();
+        self.rehash_batch_size.store(adaptive_batch, Ordering::Release);
 
         // Mark resize in progress (odd seq number)
         // After this, workers will:
@@ -461,16 +504,22 @@ impl FingerprintShard {
         // Workers also participate by calling rehash_batch() on each operation.
         let rehash_start = std::time::Instant::now();
         while !self.is_rehash_complete() {
-            self.rehash_batch();
+            self.rehash_batch_counted(true);
             // Yield after each batch to let workers run
             std::thread::yield_now();
         }
 
+        let rehash_elapsed = rehash_start.elapsed();
+        let resize_batches = self.rehash_resize_batches.load(Ordering::Relaxed);
+        let worker_batches = self.rehash_worker_batches.load(Ordering::Relaxed);
         eprintln!(
-            "Rehash complete for shard {} in {:.1}ms ({} entries)",
+            "Rehash complete for shard {} in {:.1}ms ({} entries, batch_size={}, resize_thread={} batches, workers={} batches)",
             self.shard_id,
-            rehash_start.elapsed().as_secs_f64() * 1000.0,
-            self.count.load(Ordering::Relaxed)
+            rehash_elapsed.as_secs_f64() * 1000.0,
+            self.count.load(Ordering::Relaxed),
+            adaptive_batch,
+            resize_batches,
+            worker_batches,
         );
 
         // Finalize: swap tables, clear pointers, queue old memory
