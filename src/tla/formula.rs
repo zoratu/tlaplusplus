@@ -185,35 +185,32 @@ pub fn split_top_level(expr: &str, delimiter: &str) -> Vec<String> {
             // Don't split inside quantifier bodies when the body started with the same delimiter
             // For example: \E op \in S : \/ A \/ B \/ C
             // The body starts with \/, so all subsequent \/ are part of the body.
-            // But: \E x \in S : (A \/ B) \/ C
-            // The body starts with (, so \/ C is a separate disjunct.
+            // Similarly: \A t \in S : /\ \A k \in Key : f[t][k] /\ written[t] = {}
+            // The body starts with /\, so all /\ (including those before inner quantifiers)
+            // are part of the body.
             if in_quantifier_body && quantifier_body_uses_delimiter {
-                if delimiter == "/\\" {
-                    let after_delim: String = chars[i + delim_chars.len()..].iter().collect();
-                    let after_delim = after_delim.trim_start();
-                    let starts_new_quantifier = after_delim.starts_with("\\A ")
-                        || after_delim.starts_with("\\A(")
-                        || after_delim.starts_with("\\E ")
-                        || after_delim.starts_with("\\E(");
-                    if !starts_new_quantifier {
-                        current.push(c);
-                        i += 1;
-                        continue;
-                    }
-                    // Falls through to split - in_quantifier_body will be reset below
-                } else if delimiter == "\\/" {
-                    // Don't split disjunctions inside quantifier body when body uses disjunction
+                current.push(c);
+                i += 1;
+                continue;
+            }
+            // Also keep simple conjunctions inside quantifier bodies when splitting on /\
+            // e.g.: ~ \E m \in msgs : m.type = "2a" /\ m.bal = b
+            // BUT: if the delimiter introduces a new top-level quantifier, we MUST
+            // split here so the new quantifier is treated as a separate conjunct.
+            // e.g.: \A t \in tx : ... /\ \A t \in TxId \ tx : ...
+            if in_quantifier_body && delimiter == "/\\" && !quantifier_body_uses_delimiter {
+                let after_delim: String = chars[i + delim_chars.len()..].iter().collect();
+                let after_delim = after_delim.trim_start();
+                let starts_new_quantifier = after_delim.starts_with("\\A ")
+                    || after_delim.starts_with("\\A(")
+                    || after_delim.starts_with("\\E ")
+                    || after_delim.starts_with("\\E(");
+                if !starts_new_quantifier {
                     current.push(c);
                     i += 1;
                     continue;
                 }
-            }
-            // Also keep simple conjunctions inside quantifier bodies when splitting on /\
-            // e.g.: ~ \E m \in msgs : m.type = "2a" /\ m.bal = b
-            if in_quantifier_body && delimiter == "/\\" && !quantifier_body_uses_delimiter {
-                current.push(c);
-                i += 1;
-                continue;
+                // Falls through to split - in_quantifier_body will be reset below
             }
             let piece = current.trim();
             if !piece.is_empty() {
@@ -717,5 +714,73 @@ mod tests {
             "Should not split deeply nested IF-THEN-ELSE"
         );
         assert!(parts[0].contains("base"), "Should contain inner value");
+    }
+
+    #[test]
+    fn test_split_conjunction_after_quantifier_body_with_new_quantifier() {
+        // Regression test: when a quantifier body does NOT start with /\,
+        // a subsequent /\ that introduces a new quantifier must still split.
+        // This matches the TxLifecycle invariant pattern from KeyValueStore.
+        let expr = r"\A t \in tx : \A k \in Key : f[t][k] /\ \A t \in TxId \ tx : g[t]";
+        let parts = split_top_level(expr, "/\\");
+        assert_eq!(
+            parts.len(),
+            2,
+            "Should split into two conjuncts when /\\ precedes a new \\A quantifier, got: {:?}",
+            parts
+        );
+        assert!(
+            parts[0].starts_with("\\A t \\in tx"),
+            "First part should be the first forall: {:?}",
+            parts[0]
+        );
+        assert!(
+            parts[1].starts_with("\\A t \\in TxId"),
+            "Second part should be the second forall: {:?}",
+            parts[1]
+        );
+    }
+
+    #[test]
+    fn test_split_multi_line_conjunction_with_leading_slashes() {
+        // Exact pattern from TxLifecycle invariant body (multi-line with leading /\)
+        let expr = r"/\ \A t \in tx :
+        \A k \in Key : (store[k] /= snapshotStore[t][k] /\ k \notin written[t]) => k \in missed[t]
+    /\ \A t \in TxId \ tx :
+        /\ \A k \in Key : snapshotStore[t][k] = NoVal
+        /\ written[t] = {}
+        /\ missed[t] = {}";
+        let parts = split_top_level(expr, "/\\");
+        assert_eq!(
+            parts.len(),
+            2,
+            "Should split into two conjuncts (both leading /\\), got {} parts: {:?}",
+            parts.len(),
+            parts
+        );
+        assert!(
+            parts[0].contains("\\A t \\in tx"),
+            "First part should contain first forall: {:?}",
+            parts[0]
+        );
+        assert!(
+            parts[1].contains("\\A t \\in TxId"),
+            "Second part should contain second forall: {:?}",
+            parts[1]
+        );
+    }
+
+    #[test]
+    fn test_simple_conjunction_inside_quantifier_body_not_split() {
+        // Verify that simple conjunctions inside a quantifier body are NOT split.
+        // e.g.: ~ \E m \in msgs : m.type = "2a" /\ m.bal = b
+        let expr = r#"~ \E m \in msgs : m.type = "2a" /\ m.bal = b"#;
+        let parts = split_top_level(expr, "/\\");
+        assert_eq!(
+            parts.len(),
+            1,
+            "Should not split conjunctions inside quantifier body: {:?}",
+            parts
+        );
     }
 }

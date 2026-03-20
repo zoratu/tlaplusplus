@@ -1655,6 +1655,14 @@ fn eval_compiled_opcall(
         "FoldSet" if arg_values.len() == 3 && !user_defined_shadow => {
             return eval_operator_call("FoldSet", arg_values.clone(), ctx, depth + 1);
         }
+        "FoldFunctionOnSet" if arg_values.len() == 4 && !user_defined_shadow => {
+            return eval_operator_call(
+                "FoldFunctionOnSet",
+                arg_values.clone(),
+                ctx,
+                depth + 1,
+            );
+        }
         // === Community module: UndirectedGraphs ===
         "IsUndirectedGraph" if arg_values.len() == 1 && !user_defined_shadow => {
             return eval_operator_call("IsUndirectedGraph", arg_values.clone(), ctx, depth + 1);
