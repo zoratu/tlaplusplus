@@ -847,9 +847,9 @@ fn collect_coverage(model: &TlaModel) -> tlaplusplus::CoverageStats {
         }
         for state in &frontier {
             let fp = {
-                use std::collections::hash_map::DefaultHasher;
+                use ahash::AHasher;
                 use std::hash::{Hash, Hasher};
-                let mut h = DefaultHasher::new();
+                let mut h = AHasher::default();
                 state.hash(&mut h);
                 h.finish()
             };
@@ -1022,9 +1022,9 @@ fn dump_state_graph(
 
 /// Compute fingerprint for dump_state_graph
 fn model_fingerprint(state: &TlaState) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
+    use ahash::AHasher;
     use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
+    let mut h = AHasher::default();
     state.hash(&mut h);
     h.finish()
 }
