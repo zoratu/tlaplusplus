@@ -6,9 +6,10 @@ use crate::tla::{
     ClauseKind, CompiledActionIr, CompiledExpr, ConfigValue, EvalContext, TemporalFormula,
     TlaConfig, TlaDefinition, TlaModule, TlaState, TlaValue, classify_clause, compile_action_ir,
     compile_expr, eval_action_constraint, eval_compiled, eval_expr,
-    evaluate_next_states_labeled_with_instances, evaluate_next_states_with_instances,
-    insert_compiled_action, looks_like_action, normalize_operator_ref_name, parse_tla_config,
-    parse_tla_module_file, split_top_level,
+    count_next_disjuncts, evaluate_next_states_labeled_with_instances,
+    evaluate_next_states_swarm, evaluate_next_states_with_instances, insert_compiled_action,
+    looks_like_action, normalize_operator_ref_name, parse_tla_config, parse_tla_module_file,
+    split_top_level,
 };
 use anyhow::{Context, Result, anyhow};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -378,6 +379,51 @@ impl Model for TlaModel {
 
     fn fairness_constraints(&self) -> Vec<FairnessConstraint> {
         self.fairness_constraints.clone()
+    }
+
+    fn num_next_disjuncts(&self) -> usize {
+        let next_def = match self.module.definitions.get(&self.next_name) {
+            Some(d) => d,
+            None => return 0,
+        };
+        count_next_disjuncts(&next_def.body)
+    }
+
+    fn next_states_swarm(
+        &self,
+        state: &Self::State,
+        enabled_mask: &[usize],
+        out: &mut Vec<Self::State>,
+    ) {
+        let next_def = self
+            .module
+            .definitions
+            .get(&self.next_name)
+            .unwrap_or_else(|| panic!("missing Next definition '{}'", self.next_name));
+
+        let instances = if self.module.instances.is_empty() {
+            None
+        } else {
+            Some(&self.module.instances)
+        };
+
+        match evaluate_next_states_swarm(
+            &next_def.body,
+            &self.module.definitions,
+            instances,
+            state,
+            enabled_mask,
+        ) {
+            Ok(states) => {
+                out.extend(states);
+            }
+            Err(err) => {
+                if self.allow_deadlock {
+                    return;
+                }
+                panic!("swarm next-state evaluation failed: {err}");
+            }
+        }
     }
 }
 

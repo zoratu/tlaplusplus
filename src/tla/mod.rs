@@ -11,9 +11,9 @@ pub mod temporal;
 pub mod value;
 
 pub use action_exec::{
-    NextBranchProbe, evaluate_next_states, evaluate_next_states_labeled,
-    evaluate_next_states_labeled_with_instances, evaluate_next_states_with_instances,
-    insert_compiled_action, probe_next_disjuncts,
+    NextBranchProbe, count_next_disjuncts, evaluate_next_states, evaluate_next_states_labeled,
+    evaluate_next_states_labeled_with_instances, evaluate_next_states_swarm,
+    evaluate_next_states_with_instances, insert_compiled_action, probe_next_disjuncts,
 };
 pub use action_ir::{
     ActionClause, ActionIr, compile_action_ir, compile_action_ir_branches, looks_like_action,

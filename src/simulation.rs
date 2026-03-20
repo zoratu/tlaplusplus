@@ -3,6 +3,15 @@
 //! Instead of exhaustive BFS, randomly picks one initial state and one successor
 //! at each step, checking invariants along the way. Much faster than BFS for
 //! finding bugs in large state spaces.
+//!
+//! ## Swarm Mode
+//!
+//! When `swarm` is enabled, each trace randomly selects a subset (50-90%) of
+//! Next action disjuncts to enable. This implements "Swarm Testing" (Groce et
+//! al., ISSTA 2012): by varying which actions are available per trace, the
+//! simulation reaches diverse parts of the state space that the "all actions
+//! enabled" approach rarely visits. This is especially effective for finding
+//! bugs that only manifest when certain actions are disabled.
 
 use crate::model::Model;
 use crate::runtime::{PropertyType, Violation};
@@ -18,6 +27,8 @@ pub struct SimulationConfig {
     pub num_traces: usize,
     /// Random seed (0 = use system entropy via time).
     pub seed: u64,
+    /// Enable swarm testing: randomly disable Next disjuncts per trace.
+    pub swarm: bool,
 }
 
 impl Default for SimulationConfig {
@@ -26,6 +37,7 @@ impl Default for SimulationConfig {
             depth: 100,
             num_traces: 1000,
             seed: 0,
+            swarm: false,
         }
     }
 }
@@ -38,6 +50,9 @@ pub struct SimulationOutcome<S> {
     pub total_states: u64,
     pub duration: Duration,
     pub violations: Vec<Violation<S>>,
+    /// Per-trace swarm configs: which disjunct indices were enabled.
+    /// Only populated when swarm mode is active.
+    pub swarm_configs: Vec<Vec<usize>>,
 }
 
 /// Simple xoshiro256** PRNG (no external dependency needed).
@@ -75,12 +90,42 @@ impl Rng {
     fn range(&mut self, n: usize) -> usize {
         (self.next_u64() % n as u64) as usize
     }
+
+    /// Select a random subset containing between `min_frac` and `max_frac` of
+    /// `n` items. Returns a sorted Vec of selected indices.
+    fn random_subset(&mut self, n: usize, min_frac: f64, max_frac: f64) -> Vec<usize> {
+        if n == 0 {
+            return Vec::new();
+        }
+        // Pick a target count between min and max
+        let min_count = ((n as f64 * min_frac).ceil() as usize).max(1);
+        let max_count = ((n as f64 * max_frac).floor() as usize).min(n);
+        let target = if min_count >= max_count {
+            min_count
+        } else {
+            min_count + self.range(max_count - min_count + 1)
+        };
+
+        // Fisher-Yates partial shuffle to select `target` items
+        let mut indices: Vec<usize> = (0..n).collect();
+        for i in 0..target.min(n) {
+            let j = i + self.range(n - i);
+            indices.swap(i, j);
+        }
+        indices.truncate(target);
+        indices.sort_unstable();
+        indices
+    }
 }
 
 /// Run simulation mode: random trace exploration.
 ///
 /// For each trace, picks a random initial state and then repeatedly picks
 /// a random successor, checking invariants at each step.
+///
+/// When `config.swarm` is true and the model supports disjunct-level control
+/// (`num_next_disjuncts() > 1`), each trace randomly enables 50-90% of the
+/// Next action disjuncts, creating diverse exploration configurations.
 pub fn run_simulation<M>(
     model: &M,
     config: &SimulationConfig,
@@ -99,6 +144,7 @@ where
             total_states: 0,
             duration: started_at.elapsed(),
             violations: vec![],
+            swarm_configs: vec![],
         };
     }
 
@@ -113,17 +159,38 @@ where
     };
     let mut rng = Rng::new(seed);
 
+    // Check if swarm mode is possible (need >1 disjunct)
+    let num_disjuncts = model.num_next_disjuncts();
+    let swarm_active = config.swarm && num_disjuncts > 1;
+
+    if swarm_active {
+        eprintln!(
+            "Swarm mode: {} Next disjuncts detected, will randomly select 50-90% per trace",
+            num_disjuncts
+        );
+    }
+
     let mut violations = Vec::new();
     let mut max_depth_reached = 0usize;
     let mut total_states = 0u64;
     let mut successors = Vec::with_capacity(64);
     let mut traces_completed = 0usize;
+    let mut swarm_configs = Vec::new();
 
     for trace_idx in 0..config.num_traces {
         if violations.len() >= max_violations {
             break;
         }
         traces_completed = trace_idx + 1;
+
+        // In swarm mode, select a random subset of disjuncts for this trace
+        let enabled_disjuncts = if swarm_active {
+            let subset = rng.random_subset(num_disjuncts, 0.5, 0.9);
+            swarm_configs.push(subset.clone());
+            Some(subset)
+        } else {
+            None
+        };
 
         // Pick a random initial state
         let init_idx = rng.range(initial_states.len());
@@ -147,7 +214,13 @@ where
 
         for step in 0..config.depth {
             successors.clear();
-            model.next_states(&current, &mut successors);
+
+            // Use swarm-filtered or full next-state generation
+            if let Some(ref enabled) = enabled_disjuncts {
+                model.next_states_swarm(&current, enabled, &mut successors);
+            } else {
+                model.next_states(&current, &mut successors);
+            }
             total_states += 1;
 
             if successors.is_empty() {
@@ -191,11 +264,22 @@ where
         }
     }
 
+    // In swarm mode, report which disjunct subsets found violations
+    if swarm_active && !violations.is_empty() {
+        eprintln!(
+            "Swarm: {} violations found across {} traces ({} unique disjunct configs)",
+            violations.len(),
+            traces_completed,
+            swarm_configs.len(),
+        );
+    }
+
     SimulationOutcome {
         traces_run: traces_completed,
         max_depth_reached,
         total_states,
         duration: started_at.elapsed(),
         violations,
+        swarm_configs,
     }
 }
