@@ -23,7 +23,15 @@ pub enum TlaValue {
     Undefined,
 }
 
-pub type TlaState = BTreeMap<String, TlaValue>;
+pub type TlaState = BTreeMap<Arc<str>, TlaValue>;
+
+/// Build a [`TlaState`] from `(&str, TlaValue)` pairs, converting keys to `Arc<str>`.
+pub fn tla_state<const N: usize>(pairs: [(&str, TlaValue); N]) -> TlaState {
+    pairs
+        .into_iter()
+        .map(|(k, v)| (Arc::from(k), v))
+        .collect()
+}
 
 impl TlaValue {
     pub fn as_bool(&self) -> Result<bool> {

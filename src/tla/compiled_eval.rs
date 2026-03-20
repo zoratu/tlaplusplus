@@ -9,6 +9,8 @@ use crate::tla::eval::{
 };
 use crate::tla::formula::split_top_level;
 use crate::tla::value::TlaValue;
+#[cfg(test)]
+use crate::tla::value::tla_state;
 use anyhow::{Result, anyhow};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -1929,12 +1931,12 @@ pub fn apply_compiled_action_ir_multi(
     for branch in branches {
         let mut next = current.clone();
         for var in branch.unchanged_vars {
-            if let Some(old) = current.get(&var) {
-                next.insert(var, old.clone());
+            if let Some(old) = current.get(var.as_str()) {
+                next.insert(Arc::from(var), old.clone());
             }
         }
         for (var, value) in branch.staged {
-            next.insert(var, value);
+            next.insert(Arc::from(var), value);
         }
         out.push(next);
     }
@@ -2028,7 +2030,7 @@ fn eval_compiled_clause_to_branch<'a>(
             let mut branch = branch;
             for var in vars {
                 branch.unchanged_vars.push(var.clone());
-                if let Some(value) = branch.ctx.state.get(var) {
+                if let Some(value) = branch.ctx.state.get(var.as_str()) {
                     branch
                         .staged
                         .entry(var.clone())
@@ -2132,7 +2134,7 @@ fn ctx_with_staged_primes<'a>(
 mod tests {
     use super::*;
     use crate::tla::compiled_expr::compile_expr;
-    use crate::tla::{TlaDefinition, TlaState};
+    use crate::tla::{TlaDefinition, TlaState, tla_state};
 
     fn empty_ctx() -> EvalContext<'static> {
         static EMPTY_STATE: std::sync::OnceLock<TlaState> = std::sync::OnceLock::new();
@@ -2302,11 +2304,11 @@ mod tests {
     fn test_compiled_eval_supports_numeric_prefixed_identifiers() {
         let mut state = TlaState::new();
         state.insert(
-            "1bMessage".to_string(),
+            Arc::from("1bMessage"),
             TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(1)]))),
         );
         state.insert(
-            "2bMessage".to_string(),
+            Arc::from("2bMessage"),
             TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(2)]))),
         );
         let ctx = EvalContext::new(&state);
@@ -2488,8 +2490,8 @@ mod tests {
 
         // Create a state with initial values
         let mut state = TlaState::new();
-        state.insert("x".to_string(), TlaValue::Int(5));
-        state.insert("y".to_string(), TlaValue::Int(10));
+        state.insert(Arc::from("x"), TlaValue::Int(5));
+        state.insert(Arc::from("y"), TlaValue::Int(10));
 
         let ctx = EvalContext::new(&state);
 
@@ -2539,10 +2541,10 @@ mod tests {
         use crate::tla::compiled_expr::CompiledActionIr;
         use crate::tla::{ActionClause, ActionIr};
 
-        let state = TlaState::from([
-            ("flag".to_string(), TlaValue::Bool(false)),
-            ("x".to_string(), TlaValue::Int(7)),
-            ("y".to_string(), TlaValue::Int(9)),
+        let state = tla_state([
+            ("flag", TlaValue::Bool(false)),
+            ("x", TlaValue::Int(7)),
+            ("y", TlaValue::Int(9)),
         ]);
         let ctx = EvalContext::new(&state);
 
@@ -2567,10 +2569,10 @@ mod tests {
         use crate::tla::compiled_expr::CompiledActionIr;
         use crate::tla::{ActionClause, ActionIr};
 
-        let state = TlaState::from([
-            ("flag".to_string(), TlaValue::Bool(false)),
-            ("count".to_string(), TlaValue::Int(7)),
-            ("announced".to_string(), TlaValue::Bool(false)),
+        let state = tla_state([
+            ("flag", TlaValue::Bool(false)),
+            ("count", TlaValue::Int(7)),
+            ("announced", TlaValue::Bool(false)),
         ]);
         let ctx = EvalContext::new(&state);
 
@@ -2601,7 +2603,7 @@ mod tests {
         use crate::tla::compiled_expr::CompiledActionIr;
         use crate::tla::{ActionClause, ActionIr};
 
-        let state = TlaState::from([("flip".to_string(), TlaValue::String("H".to_string()))]);
+        let state = tla_state([("flip", TlaValue::String("H".to_string()))]);
         let ctx = EvalContext::new(&state);
 
         let action_ir = ActionIr {
@@ -2639,9 +2641,9 @@ mod tests {
                 is_recursive: false,
             },
         )]);
-        let state = TlaState::from([
-            ("a".to_string(), TlaValue::Int(2)),
-            ("b".to_string(), TlaValue::Int(3)),
+        let state = tla_state([
+            ("a", TlaValue::Int(2)),
+            ("b", TlaValue::Int(3)),
         ]);
         let ctx = EvalContext::with_definitions(&state, &defs);
 
@@ -2656,9 +2658,9 @@ mod tests {
         use crate::tla::compiled_expr::CompiledActionIr;
         use crate::tla::{ActionClause, ActionIr};
 
-        let state = TlaState::from([
-            ("x".to_string(), TlaValue::Int(0)),
-            ("y".to_string(), TlaValue::Int(9)),
+        let state = tla_state([
+            ("x", TlaValue::Int(0)),
+            ("y", TlaValue::Int(9)),
         ]);
         let ctx = EvalContext::new(&state);
 
@@ -2688,27 +2690,27 @@ mod tests {
         let asset = TlaValue::ModelValue("asset1".to_string());
         let alice = TlaValue::ModelValue("alice".to_string());
         let bob = TlaValue::ModelValue("bob".to_string());
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "Participants".to_string(),
+                "Participants",
                 TlaValue::Set(Arc::new(BTreeSet::from([alice.clone(), bob.clone()]))),
             ),
             (
-                "referencePrice".to_string(),
+                "referencePrice",
                 TlaValue::Function(Arc::new(BTreeMap::from([(
                     asset.clone(),
                     TlaValue::Int(15),
                 )]))),
             ),
             (
-                "positions".to_string(),
+                "positions",
                 TlaValue::Function(Arc::new(BTreeMap::from([
                     (alice.clone(), TlaValue::Int(1)),
                     (bob.clone(), TlaValue::Int(-1)),
                 ]))),
             ),
             (
-                "balances".to_string(),
+                "balances",
                 TlaValue::Function(Arc::new(BTreeMap::from([
                     (alice.clone(), TlaValue::Int(100)),
                     (bob.clone(), TlaValue::Int(100)),
@@ -2750,21 +2752,21 @@ IN
         let bot = TlaValue::ModelValue("bot1".to_string());
         let seller = TlaValue::ModelValue("seller1".to_string());
         let asset = TlaValue::ModelValue("asset1".to_string());
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "Sellers".to_string(),
+                "Sellers",
                 TlaValue::Set(Arc::new(BTreeSet::from([seller.clone()]))),
             ),
             (
-                "Assets".to_string(),
+                "Assets",
                 TlaValue::Set(Arc::new(BTreeSet::from([asset.clone()]))),
             ),
             (
-                "ccpTrades".to_string(),
+                "ccpTrades",
                 TlaValue::Set(Arc::new(BTreeSet::new())),
             ),
             (
-                "ccpPositions".to_string(),
+                "ccpPositions",
                 TlaValue::Function(Arc::new(BTreeMap::from([
                     (
                         bot.clone(),
@@ -2783,11 +2785,11 @@ IN
                 ]))),
             ),
             (
-                "deployments".to_string(),
+                "deployments",
                 TlaValue::Set(Arc::new(BTreeSet::new())),
             ),
             (
-                "actionCount".to_string(),
+                "actionCount",
                 TlaValue::Function(Arc::new(BTreeMap::from([(bot.clone(), TlaValue::Int(0))]))),
             ),
         ]);
@@ -2946,7 +2948,7 @@ IN
 #[cfg(test)]
 mod forall_tests {
     use super::*;
-    use crate::tla::TlaState;
+    use crate::tla::{TlaState, tla_state};
     use crate::tla::compiled_expr::compile_expr;
     use std::sync::Arc;
 
@@ -2972,10 +2974,10 @@ mod forall_tests {
         .collect();
 
         state.insert(
-            "listings".to_string(),
+            Arc::from("listings"),
             TlaValue::Set(Arc::new(listings_set)),
         );
-        state.insert("MinPrice".to_string(), TlaValue::Int(5));
+        state.insert(Arc::from("MinPrice"), TlaValue::Int(5));
 
         // Create context
         let ctx = EvalContext::new(&state);
@@ -3024,14 +3026,14 @@ fn test_full_typeok_pattern_cluster_lease_failover() {
         .iter()
         .map(|s| TlaValue::ModelValue(s.to_string()))
         .collect();
-    state.insert("Shards".to_string(), TlaValue::Set(Arc::new(shards_set)));
+    state.insert(Arc::from("Shards"), TlaValue::Set(Arc::new(shards_set)));
 
     // Create Clients set
     let clients_set: BTreeSet<TlaValue> = ["c1", "c2"]
         .iter()
         .map(|s| TlaValue::ModelValue(s.to_string()))
         .collect();
-    state.insert("Clients".to_string(), TlaValue::Set(Arc::new(clients_set)));
+    state.insert(Arc::from("Clients"), TlaValue::Set(Arc::new(clients_set)));
 
     // Create shardTerm function: s1 -> 1, s2 -> 2, s3 -> 3, s4 -> 4
     let mut shardterm_map = BTreeMap::new();
@@ -3042,7 +3044,7 @@ fn test_full_typeok_pattern_cluster_lease_failover() {
         );
     }
     state.insert(
-        "shardTerm".to_string(),
+            Arc::from("shardTerm"),
         TlaValue::Function(Arc::new(shardterm_map)),
     );
 
@@ -3057,7 +3059,7 @@ fn test_full_typeok_pattern_cluster_lease_failover() {
         );
     }
     state.insert(
-        "shardLeader".to_string(),
+            Arc::from("shardLeader"),
         TlaValue::Function(Arc::new(shardleader_map)),
     );
 
@@ -3082,11 +3084,11 @@ fn test_full_typeok_pattern_cluster_lease_failover() {
         );
     }
     state.insert(
-        "leases".to_string(),
+            Arc::from("leases"),
         TlaValue::Function(Arc::new(leases_outer)),
     );
 
-    state.insert("MaxTerm".to_string(), TlaValue::Int(10));
+    state.insert(Arc::from("MaxTerm"), TlaValue::Int(10));
 
     let ctx = EvalContext::new(&state);
 
@@ -3159,11 +3161,11 @@ fn test_full_price_bands_invariant() {
     let listings_set: BTreeSet<TlaValue> = [TlaValue::Record(Arc::new(rec1))].into_iter().collect();
 
     state.insert(
-        "listings".to_string(),
+            Arc::from("listings"),
         TlaValue::Set(Arc::new(listings_set)),
     );
-    state.insert("MinPrice".to_string(), TlaValue::Int(5));
-    state.insert("MaxPrice".to_string(), TlaValue::Int(20));
+    state.insert(Arc::from("MinPrice"), TlaValue::Int(5));
+    state.insert(Arc::from("MaxPrice"), TlaValue::Int(20));
 
     let ctx = EvalContext::new(&state);
 
@@ -3188,21 +3190,21 @@ fn test_nested_quantifiers_typeok_evaluation() {
         .iter()
         .map(|s| TlaValue::ModelValue(s.to_string()))
         .collect();
-    state.insert("Shards".to_string(), TlaValue::Set(Arc::new(shards_set)));
+    state.insert(Arc::from("Shards"), TlaValue::Set(Arc::new(shards_set)));
 
     // Create Clients set
     let clients_set: BTreeSet<TlaValue> = ["c1", "c2"]
         .iter()
         .map(|s| TlaValue::ModelValue(s.to_string()))
         .collect();
-    state.insert("Clients".to_string(), TlaValue::Set(Arc::new(clients_set)));
+    state.insert(Arc::from("Clients"), TlaValue::Set(Arc::new(clients_set)));
 
     // Create shardTerm function: s1 -> 1, s2 -> 2
     let mut shardterm_map = BTreeMap::new();
     shardterm_map.insert(TlaValue::ModelValue("s1".to_string()), TlaValue::Int(1));
     shardterm_map.insert(TlaValue::ModelValue("s2".to_string()), TlaValue::Int(2));
     state.insert(
-        "shardTerm".to_string(),
+            Arc::from("shardTerm"),
         TlaValue::Function(Arc::new(shardterm_map)),
     );
 
@@ -3225,11 +3227,11 @@ fn test_nested_quantifiers_typeok_evaluation() {
         );
     }
     state.insert(
-        "leases".to_string(),
+            Arc::from("leases"),
         TlaValue::Function(Arc::new(leases_outer)),
     );
 
-    state.insert("MaxTerm".to_string(), TlaValue::Int(10));
+    state.insert(Arc::from("MaxTerm"), TlaValue::Int(10));
 
     let ctx = EvalContext::new(&state);
 
@@ -3279,16 +3281,16 @@ fn test_compiled_cartesian_product_times() {
 
 #[test]
 fn test_compiled_sequence_builtins_accept_sequence_like_functions() {
-    let state = TlaState::from([
+    let state = tla_state([
         (
-            "seq_like".to_string(),
+            "seq_like",
             TlaValue::Function(Arc::new(BTreeMap::from([
                 (TlaValue::Int(1), TlaValue::Int(1)),
                 (TlaValue::Int(2), TlaValue::Int(2)),
             ]))),
         ),
         (
-            "other".to_string(),
+            "other",
             TlaValue::Function(Arc::new(BTreeMap::from([(
                 TlaValue::Int(1),
                 TlaValue::Int(3),
@@ -3335,7 +3337,7 @@ fn test_compiled_sequence_builtins_accept_sequence_like_functions() {
 mod compiled_action_correctness_tests {
     use super::*;
     use crate::tla::compiled_expr::CompiledActionIr;
-    use crate::tla::{ActionClause, ActionIr, EvalContext, TlaState, TlaValue};
+    use crate::tla::{ActionClause, ActionIr, EvalContext, TlaState, TlaValue, tla_state};
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
@@ -3357,8 +3359,8 @@ mod compiled_action_correctness_tests {
     /// Compiled \A guard must block when quantifier body is false for some element.
     #[test]
     fn forall_guard_blocks_when_false() {
-        let state = TlaState::from([(
-            "locked".to_string(),
+        let state = tla_state([(
+            "locked",
             TlaValue::Function(Arc::new(BTreeMap::from([
                 (TlaValue::String("p1".to_string()), TlaValue::Bool(true)),
                 (TlaValue::String("p2".to_string()), TlaValue::Bool(false)),
@@ -3397,8 +3399,8 @@ mod compiled_action_correctness_tests {
     /// Compiled \A guard must pass when quantifier body is true for all elements.
     #[test]
     fn forall_guard_passes_when_true() {
-        let state = TlaState::from([(
-            "locked".to_string(),
+        let state = tla_state([(
+            "locked",
             TlaValue::Function(Arc::new(BTreeMap::from([
                 (TlaValue::String("p1".to_string()), TlaValue::Bool(false)),
                 (TlaValue::String("p2".to_string()), TlaValue::Bool(false)),
@@ -3435,12 +3437,12 @@ mod compiled_action_correctness_tests {
     /// IF/THEN/ELSE guard: THEN branch blocks, ELSE branch passes.
     #[test]
     fn if_guard_selects_correct_branch() {
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "mode".to_string(),
+                "mode",
                 TlaValue::String("exclusive".to_string()),
             ),
-            ("count".to_string(), TlaValue::Int(2)),
+            ("count", TlaValue::Int(2)),
         ]);
         let ctx = EvalContext::new(&state);
 
@@ -3462,9 +3464,9 @@ mod compiled_action_correctness_tests {
         assert!(result.is_empty(), "IF/THEN guard should block: {result:?}");
 
         // Now with mode = "shared", ELSE branch is TRUE → should pass
-        let state2 = TlaState::from([
-            ("mode".to_string(), TlaValue::String("shared".to_string())),
-            ("count".to_string(), TlaValue::Int(2)),
+        let state2 = tla_state([
+            ("mode", TlaValue::String("shared".to_string())),
+            ("count", TlaValue::Int(2)),
         ]);
         let ctx2 = EvalContext::new(&state2);
         let result2 = compile_and_run(
@@ -3488,9 +3490,9 @@ mod compiled_action_correctness_tests {
     /// by checking the successor state contains the unchanged variable.
     #[test]
     fn unchanged_copies_current_value() {
-        let state = TlaState::from([
-            ("x".to_string(), TlaValue::Int(42)),
-            ("y".to_string(), TlaValue::String("keep_me".to_string())),
+        let state = tla_state([
+            ("x", TlaValue::Int(42)),
+            ("y", TlaValue::String("keep_me".to_string())),
         ]);
         let ctx = EvalContext::new(&state);
 
@@ -3519,7 +3521,7 @@ mod compiled_action_correctness_tests {
     /// Negation guard: ~active must block when active=TRUE.
     #[test]
     fn negation_guard_blocks_and_passes() {
-        let state_active = TlaState::from([("active".to_string(), TlaValue::Bool(true))]);
+        let state_active = tla_state([("active", TlaValue::Bool(true))]);
         let ctx_active = EvalContext::new(&state_active);
 
         let result = compile_and_run(
@@ -3531,7 +3533,7 @@ mod compiled_action_correctness_tests {
         );
         assert!(result.is_empty(), "~active should block when active=TRUE");
 
-        let state_inactive = TlaState::from([("active".to_string(), TlaValue::Bool(false))]);
+        let state_inactive = tla_state([("active", TlaValue::Bool(false))]);
         let ctx_inactive = EvalContext::new(&state_inactive);
 
         let result2 = compile_and_run(
@@ -3547,7 +3549,7 @@ mod compiled_action_correctness_tests {
     /// Exists clause must produce one successor per domain element.
     #[test]
     fn exists_produces_correct_successor_count() {
-        let state = TlaState::from([("chosen".to_string(), TlaValue::Int(0))]);
+        let state = tla_state([("chosen", TlaValue::Int(0))]);
         let mut defs = BTreeMap::new();
         defs.insert(
             "Items".to_string(),
@@ -3582,9 +3584,9 @@ mod compiled_action_correctness_tests {
     /// must not interfere — each IR produces its own independent successors.
     #[test]
     fn separate_actions_produce_independent_successors() {
-        let state = TlaState::from([
-            ("x".to_string(), TlaValue::Int(0)),
-            ("y".to_string(), TlaValue::Int(0)),
+        let state = tla_state([
+            ("x", TlaValue::Int(0)),
+            ("y", TlaValue::Int(0)),
         ]);
         let ctx = EvalContext::new(&state);
 
@@ -3629,7 +3631,7 @@ mod compiled_action_correctness_tests {
     fn test_compiled_case_expression_guard() {
         // phase = "prepare" → CASE arm yields TRUE → should produce successor
         let state_prepare =
-            TlaState::from([("phase".to_string(), TlaValue::String("prepare".to_string()))]);
+            tla_state([("phase", TlaValue::String("prepare".to_string()))]);
         let ctx_prepare = EvalContext::new(&state_prepare);
 
         let result = compile_and_run(
@@ -3653,7 +3655,7 @@ mod compiled_action_correctness_tests {
 
         // phase = "commit" → CASE arm yields FALSE → should block
         let state_commit =
-            TlaState::from([("phase".to_string(), TlaValue::String("commit".to_string()))]);
+            tla_state([("phase", TlaValue::String("commit".to_string()))]);
         let ctx_commit = EvalContext::new(&state_commit);
 
         let result2 = compile_and_run(
@@ -3679,9 +3681,9 @@ mod compiled_action_correctness_tests {
     #[test]
     fn test_compiled_implication_guard() {
         // ready=TRUE, value=0: TRUE => (0 >= 0) = TRUE => should pass
-        let state_pass = TlaState::from([
-            ("ready".to_string(), TlaValue::Bool(true)),
-            ("value".to_string(), TlaValue::Int(0)),
+        let state_pass = tla_state([
+            ("ready", TlaValue::Bool(true)),
+            ("value", TlaValue::Int(0)),
         ]);
         let ctx_pass = EvalContext::new(&state_pass);
 
@@ -3704,9 +3706,9 @@ mod compiled_action_correctness_tests {
         );
 
         // ready=TRUE, value=-1: TRUE => (-1 >= 0) = FALSE => should block
-        let state_block = TlaState::from([
-            ("ready".to_string(), TlaValue::Bool(true)),
-            ("value".to_string(), TlaValue::Int(-1)),
+        let state_block = tla_state([
+            ("ready", TlaValue::Bool(true)),
+            ("value", TlaValue::Int(-1)),
         ]);
         let ctx_block = EvalContext::new(&state_block);
 
@@ -3731,8 +3733,8 @@ mod compiled_action_correctness_tests {
     /// Sequence operations: Len guard + Tail assignment.
     #[test]
     fn test_compiled_sequence_operations_in_guard() {
-        let state = TlaState::from([(
-            "msgs".to_string(),
+        let state = tla_state([(
+            "msgs",
             TlaValue::Seq(Arc::new(vec![
                 TlaValue::String("msg1".to_string()),
                 TlaValue::String("msg2".to_string()),
@@ -3763,7 +3765,7 @@ mod compiled_action_correctness_tests {
         assert_eq!(succ_msgs, &expected, "Tail should remove first element");
 
         // Empty sequence: Len = 0, guard should block
-        let state_empty = TlaState::from([("msgs".to_string(), TlaValue::Seq(Arc::new(vec![])))]);
+        let state_empty = tla_state([("msgs", TlaValue::Seq(Arc::new(vec![])))]);
         let ctx_empty = EvalContext::new(&state_empty);
 
         let result2 = compile_and_run(
@@ -3788,8 +3790,8 @@ mod compiled_action_correctness_tests {
     /// Function construction: [n \in Nodes |-> f[n] + 1].
     #[test]
     fn test_compiled_function_construction_in_assignment() {
-        let state = TlaState::from([(
-            "f".to_string(),
+        let state = tla_state([(
+            "f",
             TlaValue::Function(Arc::new(BTreeMap::from([
                 (TlaValue::String("n1".to_string()), TlaValue::Int(0)),
                 (TlaValue::String("n2".to_string()), TlaValue::Int(0)),
@@ -3838,8 +3840,8 @@ mod compiled_action_correctness_tests {
             ("x".to_string(), TlaValue::Int(3)),
             ("y".to_string(), TlaValue::Int(4)),
         ])));
-        let state = TlaState::from([(
-            "data".to_string(),
+        let state = tla_state([(
+            "data",
             TlaValue::Function(Arc::new(BTreeMap::from([
                 (TlaValue::String("a".to_string()), inner_a),
                 (TlaValue::String("b".to_string()), inner_b.clone()),
@@ -3901,8 +3903,8 @@ mod compiled_action_correctness_tests {
         use std::collections::BTreeSet;
 
         // vals = {1, 2, 3, 4, 5}: 2 elements > 3 → guard passes
-        let state_pass = TlaState::from([(
-            "vals".to_string(),
+        let state_pass = tla_state([(
+            "vals",
             TlaValue::Set(Arc::new(BTreeSet::from([
                 TlaValue::Int(1),
                 TlaValue::Int(2),
@@ -3932,8 +3934,8 @@ mod compiled_action_correctness_tests {
         );
 
         // vals = {1, 2, 3}: 0 elements > 3 → guard blocks
-        let state_block = TlaState::from([(
-            "vals".to_string(),
+        let state_block = tla_state([(
+            "vals",
             TlaValue::Set(Arc::new(BTreeSet::from([
                 TlaValue::Int(1),
                 TlaValue::Int(2),
@@ -3965,16 +3967,16 @@ mod compiled_action_correctness_tests {
     fn test_compiled_choose_in_assignment() {
         use std::collections::BTreeSet;
 
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "items".to_string(),
+                "items",
                 TlaValue::Set(Arc::new(BTreeSet::from([
                     TlaValue::Int(10),
                     TlaValue::Int(20),
                     TlaValue::Int(30),
                 ]))),
             ),
-            ("picked".to_string(), TlaValue::Int(0)),
+            ("picked", TlaValue::Int(0)),
         ]);
         let ctx = EvalContext::new(&state);
 
@@ -4015,7 +4017,7 @@ mod swarm_eval_consistency_tests {
     use super::*;
     use crate::tla::compiled_expr::compile_expr;
     use crate::tla::eval::eval_expr;
-    use crate::tla::{TlaDefinition, TlaState, parse_tla_config, parse_tla_module_file};
+    use crate::tla::{TlaDefinition, TlaState, parse_tla_config, parse_tla_module_file, tla_state};
     use std::path::PathBuf;
 
     /// Locate the corpus/language directory relative to the crate root.
