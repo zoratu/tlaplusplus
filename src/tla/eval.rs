@@ -395,7 +395,11 @@ fn eval_transition_expr(expr: &str, ctx: &TransitionContext<'_>, depth: usize) -
         return Ok(TlaValue::Bool(apply_comparison(&left_val, op, &right_val)?));
     }
 
-    // TODO: Add support for full expression evaluation with primed variables
+    // Deferred: full primed-variable expression evaluation is not needed for
+    // action constraint checking — the main evaluator in eval_action_clause_text_multi
+    // handles primed variables via staged assignments and classify_clause().
+    // This fallback only fires for eval_action_constraint() which is used for
+    // post-hoc constraint validation, not successor generation.
     Err(anyhow!(
         "complex action constraints not yet fully supported: {}",
         expr
@@ -613,15 +617,28 @@ fn eval_action_clause_to_branch(
             Ok(vec![branch])
         }
         ActionClause::PrimedMembership { var, set_expr } => {
-            let domain = eval_expr(set_expr, &eval_ctx)?;
-            let values = domain.as_set()?.iter().cloned().collect::<Vec<_>>();
-            let mut out = Vec::with_capacity(values.len());
-            for value in values {
-                let mut branch = branch.clone();
-                branch.staged.insert(var.clone(), value);
-                out.push(branch);
+            // If this variable was already assigned by a prior clause,
+            // treat as a guard (membership check) not nondeterministic assignment
+            if branch.staged.contains_key(var) {
+                let existing = branch.staged.get(var).unwrap();
+                let domain = eval_expr(set_expr, &eval_ctx)?;
+                let set = domain.as_set()?;
+                if set.contains(existing) {
+                    Ok(vec![branch])
+                } else {
+                    Ok(Vec::new()) // Guard failed
+                }
+            } else {
+                let domain = eval_expr(set_expr, &eval_ctx)?;
+                let values = domain.as_set()?.iter().cloned().collect::<Vec<_>>();
+                let mut out = Vec::with_capacity(values.len());
+                for value in values {
+                    let mut branch = branch.clone();
+                    branch.staged.insert(var.clone(), value);
+                    out.push(branch);
+                }
+                Ok(out)
             }
-            Ok(out)
         }
         ActionClause::Unchanged { vars } => {
             let mut branch = branch;
@@ -972,15 +989,28 @@ fn eval_action_clause_text_multi(
             Ok(vec![branch])
         }
         ClauseKind::PrimedMembership { var, set_expr } => {
-            let domain = eval_expr(&set_expr, &eval_ctx)?;
-            let values = domain.as_set()?.iter().cloned().collect::<Vec<_>>();
-            let mut out = Vec::with_capacity(values.len());
-            for value in values {
-                let mut branch = branch.clone();
-                branch.staged.insert(var.clone(), value);
-                out.push(branch);
+            // If this variable was already assigned by a prior clause,
+            // treat as a guard (membership check) not nondeterministic assignment
+            if branch.staged.contains_key(&var) {
+                let existing = branch.staged.get(&var).unwrap();
+                let domain = eval_expr(&set_expr, &eval_ctx)?;
+                let set = domain.as_set()?;
+                if set.contains(existing) {
+                    Ok(vec![branch])
+                } else {
+                    Ok(Vec::new()) // Guard failed
+                }
+            } else {
+                let domain = eval_expr(&set_expr, &eval_ctx)?;
+                let values = domain.as_set()?.iter().cloned().collect::<Vec<_>>();
+                let mut out = Vec::with_capacity(values.len());
+                for value in values {
+                    let mut branch = branch.clone();
+                    branch.staged.insert(var.clone(), value);
+                    out.push(branch);
+                }
+                Ok(out)
             }
-            Ok(out)
         }
         ClauseKind::Unchanged { vars } => {
             let mut branch = branch;
@@ -6503,7 +6533,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "regression: nested action body evaluation returns wrong state (cat_box=1 vs expected 3)"]
     fn applies_action_ir_with_nested_action_references() {
         let state = TlaState::from([
             ("cat_box".to_string(), TlaValue::Int(2)),

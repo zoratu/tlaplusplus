@@ -2001,17 +2001,11 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                // TODO: Fairness checking
-                // Fairness constraints (WF/SF) require analyzing strongly connected components
-                // in the labeled transition graph. This needs runtime integration to:
-                // 1. Collect labeled transitions during exploration (using model.next_states_labeled)
-                // 2. Build the transition graph
-                // 3. Find SCCs using Tarjan's algorithm
-                // 4. Check fairness constraints on each SCC using BuchiChecker
-                //
-                // The infrastructure is in place (see src/fairness.rs, src/liveness.rs),
-                // but integration requires modifying the generic runtime to optionally collect
-                // labeled transitions when fairness constraints are present.
+                // Fairness checking (WF/SF) was wired into the runtime via PR #60.
+                // The runtime now collects labeled transitions and runs SCC-based
+                // fairness analysis post-exploration (see fairness.rs, liveness.rs).
+                // The analyze-tla command does not perform full model checking, so
+                // fairness is not checked here — it runs during `run-tla`.
 
                 println!("violation=false");
                 println!();
