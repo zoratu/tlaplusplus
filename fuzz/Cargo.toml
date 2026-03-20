@@ -79,3 +79,11 @@ path = "fuzz_targets/fuzz_checkpoint_quiescence.rs"
 test = false
 doc = false
 bench = false
+
+# Swarm testing fuzz target (Groce et al., ISSTA 2012)
+[[bin]]
+name = "fuzz_tla_swarm"
+path = "fuzz_targets/fuzz_tla_swarm.rs"
+test = false
+doc = false
+bench = false
