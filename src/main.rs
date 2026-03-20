@@ -309,6 +309,9 @@ enum Command {
         /// Dump state graph to a file after exploration
         #[arg(long)]
         dump: Option<std::path::PathBuf>,
+        /// Format for --dump output: "dot" (GraphViz, default) or "raw" (legacy)
+        #[arg(long, default_value = "dot")]
+        dump_format: String,
         /// Show only changed variables in error traces (like TLC's -difftrace)
         #[arg(long, default_value_t = false)]
         difftrace: bool,
@@ -860,23 +863,33 @@ fn collect_coverage(model: &TlaModel) -> tlaplusplus::CoverageStats {
                 Some(&model.module.instances)
             };
 
-            // Try each disjunct individually
+            // Try each disjunct individually, timing each evaluation
             for (idx, disjunct) in disjuncts.iter().enumerate() {
-                match tlaplusplus::tla::evaluate_next_states_with_instances(
+                let eval_start = std::time::Instant::now();
+                let result = tlaplusplus::tla::evaluate_next_states_with_instances(
                     disjunct,
                     &model.module.definitions,
                     instances,
                     state,
-                ) {
+                );
+                let elapsed_nanos = eval_start.elapsed().as_nanos() as u64;
+                match result {
                     Ok(successors) if !successors.is_empty() => {
                         let name = &action_names[idx];
                         if let Some(entry) = stats.actions.get_mut(name) {
                             entry.fires += 1;
                             entry.states_generated += successors.len() as u64;
+                            entry.elapsed_nanos += elapsed_nanos;
                         }
                         next_frontier.extend(successors);
                     }
-                    _ => {}
+                    _ => {
+                        // Still track time for non-firing evaluations
+                        let name = &action_names[idx];
+                        if let Some(entry) = stats.actions.get_mut(name) {
+                            entry.elapsed_nanos += elapsed_nanos;
+                        }
+                    }
                 }
             }
         }
@@ -887,24 +900,30 @@ fn collect_coverage(model: &TlaModel) -> tlaplusplus::CoverageStats {
 }
 
 /// Feature 4: Dump state graph to a file.
-/// Format: one line per state "STATE hash", then "hash1 -> hash2" per transition.
+///
+/// Supports two formats controlled by `format`:
+/// - `"dot"` (default): GraphViz DOT format with styled initial and violating states
+/// - `"raw"`: Legacy format with `STATE hash {state}` lines and `hash -> hash` edges
 fn dump_state_graph(
     model: &TlaModel,
     path: &std::path::Path,
+    format: &str,
 ) -> anyhow::Result<()> {
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::io::Write;
     use tlaplusplus::model::Model;
 
-    eprintln!("Dumping state graph to {}...", path.display());
+    eprintln!("Dumping state graph to {} (format={})...", path.display(), format);
 
     let mut state_hashes: HashMap<u64, TlaState> = HashMap::new();
     let mut transitions: Vec<(u64, u64)> = Vec::new();
     let mut visited: HashSet<u64> = HashSet::new();
     let mut queue: VecDeque<TlaState> = VecDeque::new();
+    let mut initial_fps: HashSet<u64> = HashSet::new();
 
     for init in model.initial_states() {
         let fp = model_fingerprint(&init);
+        initial_fps.insert(fp);
         if visited.insert(fp) {
             state_hashes.insert(fp, init.clone());
             queue.push_back(init);
@@ -927,15 +946,69 @@ fn dump_state_graph(
         }
     }
 
-    let mut file = std::fs::File::create(path)?;
-    // Write states
-    for (hash, state) in &state_hashes {
-        writeln!(file, "STATE {:#018x} {:?}", hash, state)?;
+    // Check which states violate invariants
+    let mut violating_fps: HashSet<u64> = HashSet::new();
+    for (fp, state) in &state_hashes {
+        if model.check_invariants(state).is_err() {
+            violating_fps.insert(*fp);
+        }
     }
-    writeln!(file)?;
-    // Write transitions
-    for (from, to) in &transitions {
-        writeln!(file, "{:#018x} -> {:#018x}", from, to)?;
+
+    let mut file = std::fs::File::create(path)?;
+
+    match format {
+        "raw" => {
+            // Legacy format
+            for (hash, state) in &state_hashes {
+                writeln!(file, "STATE {:#018x} {:?}", hash, state)?;
+            }
+            writeln!(file)?;
+            for (from, to) in &transitions {
+                writeln!(file, "{:#018x} -> {:#018x}", from, to)?;
+            }
+        }
+        _ => {
+            // DOT format (default)
+            writeln!(file, "digraph StateGraph {{")?;
+            writeln!(file, "  node [shape=box, fontsize=10];")?;
+            writeln!(file)?;
+
+            // Write node definitions with labels
+            for (hash, state) in &state_hashes {
+                // Build label: var=value lines
+                let label: String = state
+                    .iter()
+                    .map(|(var, val)| format!("{}={:?}", var, val))
+                    .collect::<Vec<_>>()
+                    .join("\\n");
+
+                // Determine style based on state role
+                let is_initial = initial_fps.contains(hash);
+                let is_violating = violating_fps.contains(hash);
+
+                let style = match (is_initial, is_violating) {
+                    (true, true) => " style=filled, fillcolor=red",
+                    (true, false) => " style=filled, fillcolor=lightblue",
+                    (false, true) => " style=filled, fillcolor=red",
+                    (false, false) => "",
+                };
+
+                writeln!(
+                    file,
+                    "  \"{:#018x}\" [label=\"{}\"{style}];",
+                    hash, label,
+                )?;
+            }
+
+            writeln!(file)?;
+
+            // Write edges
+            for (from, to) in &transitions {
+                writeln!(file, "  \"{:#018x}\" -> \"{:#018x}\";", from, to)?;
+            }
+
+            writeln!(file, "}}")?;
+        }
     }
 
     eprintln!(
@@ -1673,6 +1746,7 @@ fn main() -> anyhow::Result<()> {
             swarm,
             coverage,
             dump,
+            dump_format,
             difftrace,
             runtime,
             storage,
@@ -1790,7 +1864,7 @@ fn main() -> anyhow::Result<()> {
 
             // Feature 4: Dump state graph
             if let Some(ref dump_path) = dump {
-                dump_state_graph(&model_for_liveness, dump_path)?;
+                dump_state_graph(&model_for_liveness, dump_path, &dump_format)?;
             }
 
             // Print TLC-compatible final output
