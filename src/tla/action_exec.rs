@@ -2043,7 +2043,10 @@ CONSTANTS
                     (rm3.clone(), TlaValue::String("prepared".to_string())),
                 ]))),
             ),
-            ("tmState", TlaValue::String("commit".to_string())),
+            (
+                "tmState",
+                TlaValue::String("commit".to_string()),
+            ),
             (
                 "pc",
                 TlaValue::Function(Arc::new(BTreeMap::from([
@@ -2107,7 +2110,10 @@ CONSTANTS
             ("count", TlaValue::Int(7)),
             ("announced", TlaValue::Bool(false)),
             ("light", TlaValue::String("off".to_string())),
-            ("designated", TlaValue::String("alice".to_string())),
+            (
+                "designated",
+                TlaValue::String("alice".to_string()),
+            ),
             ("threshold", TlaValue::Int(7)),
             (
                 "Prisoner",
@@ -2312,7 +2318,10 @@ CONSTANTS
                 "msgs",
                 TlaValue::Set(Arc::new(BTreeSet::from([msg_a1, msg_a2]))),
             ),
-            ("Quorum", TlaValue::Set(Arc::new(BTreeSet::from([quorum])))),
+            (
+                "Quorum",
+                TlaValue::Set(Arc::new(BTreeSet::from([quorum]))),
+            ),
             ("sent", TlaValue::Bool(false)),
             ("v1", v1),
         ]);
@@ -2422,26 +2431,22 @@ SPECIFICATION
         )
         .expect("cfg should be written");
 
+        let parsed_module = parse_tla_module_file(&mc).expect("parsed module should load");
         let model = TlaModel::from_files(&mc, Some(&cfg), None, None).expect("model");
         let probe_state = model
             .initial_states_vec
             .first()
             .cloned()
             .expect("initial state");
-        let next_def = model
-            .module
+        let next_def = parsed_module
             .definitions
             .get("Next")
             .expect("Next definition should exist");
 
         let probe = probe_next_disjuncts_with_instances(
             &next_def.body,
-            &model.module.definitions,
-            if model.module.instances.is_empty() {
-                None
-            } else {
-                Some(&model.module.instances)
-            },
+            &parsed_module.definitions,
+            Some(&parsed_module.instances),
             &probe_state,
         );
 
@@ -2601,39 +2606,34 @@ SPECIFICATION
         )
         .expect("cfg should be written");
 
+        let parsed_module = parse_tla_module_file(&mc).expect("parsed module should load");
         let model = TlaModel::from_files(&mc, Some(&cfg), None, None).expect("model");
         let probe_state = model
             .initial_states_vec
             .first()
             .cloned()
             .expect("initial state");
-        let next_def = model
-            .module
+        let next_def = parsed_module
             .definitions
             .get("Next")
             .expect("Next definition should exist");
 
         let probe = probe_next_disjuncts_with_instances(
             &next_def.body,
-            &model.module.definitions,
-            if model.module.instances.is_empty() {
-                None
-            } else {
-                Some(&model.module.instances)
-            },
+            &parsed_module.definitions,
+            Some(&parsed_module.instances),
             &probe_state,
         );
 
-        let phase2a_def = model
-            .module
+        let phase2a_def = parsed_module
             .definitions
             .get("Phase2a")
             .expect("Phase2a definition should exist");
         let phase2a_ir = compile_action_ir(phase2a_def);
         let mut ctx = crate::tla::EvalContext::with_definitions_and_instances(
             &probe_state,
-            &model.module.definitions,
-            &model.module.instances,
+            &parsed_module.definitions,
+            &parsed_module.instances,
         );
         {
             let locals_mut = std::rc::Rc::make_mut(&mut ctx.locals);
@@ -2646,8 +2646,8 @@ SPECIFICATION
         let phase2a = execute_branch(
             "Phase2a(0, v1)",
             &BTreeMap::new(),
-            &model.module.definitions,
-            Some(&model.module.instances),
+            &parsed_module.definitions,
+            Some(&parsed_module.instances),
             &probe_state,
         );
         assert!(phase2a.is_ok(), "{phase2a:?}");
