@@ -112,4 +112,32 @@ pub trait Model: Send + Sync + 'static {
         state.hash(&mut hasher);
         hasher.finish()
     }
+
+    /// Return the number of Next action disjuncts for swarm testing.
+    ///
+    /// Swarm testing (Groce et al., ISSTA 2012) randomly disables subsets of
+    /// Next disjuncts per simulation trace, creating configuration diversity
+    /// that finds more bugs than the "use everything" approach.
+    ///
+    /// Returns 0 if the model does not support disjunct-level control.
+    fn num_next_disjuncts(&self) -> usize {
+        0
+    }
+
+    /// Generate next states using only the specified subset of disjuncts.
+    ///
+    /// `enabled_mask` contains the indices of disjuncts to evaluate (from
+    /// `0..num_next_disjuncts()`). Only models that return nonzero from
+    /// `num_next_disjuncts()` need to implement this.
+    ///
+    /// Default implementation ignores the mask and calls `next_states()`.
+    fn next_states_swarm(
+        &self,
+        state: &Self::State,
+        enabled_mask: &[usize],
+        out: &mut Vec<Self::State>,
+    ) {
+        let _ = enabled_mask;
+        self.next_states(state, out);
+    }
 }

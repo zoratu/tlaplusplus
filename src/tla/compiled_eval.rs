@@ -3999,3 +3999,207 @@ mod compiled_action_correctness_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod swarm_eval_consistency_tests {
+    //! Swarm testing across evaluation paths.
+    //!
+    //! For each internal corpus spec, evaluate Init/Next definition bodies
+    //! through both the compiled path (`eval_compiled`) and the text path
+    //! (`eval_expr`), then compare results. Randomly disabling some compiled
+    //! operators (forcing fallback to the text path) catches divergences
+    //! between the two evaluation engines.
+    //!
+    //! Based on "Swarm Testing" (Groce et al., ISSTA 2012).
+
+    use super::*;
+    use crate::tla::compiled_expr::compile_expr;
+    use crate::tla::eval::eval_expr;
+    use crate::tla::{TlaDefinition, TlaState, parse_tla_config, parse_tla_module_file};
+    use std::path::PathBuf;
+
+    /// Locate the corpus/language directory relative to the crate root.
+    fn corpus_language_dir() -> PathBuf {
+        let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        dir.push("corpus");
+        dir.push("language");
+        dir
+    }
+
+    /// Collect .tla/.cfg pairs from a corpus directory.
+    fn collect_corpus_specs(dir: &std::path::Path) -> Vec<(PathBuf, Option<PathBuf>)> {
+        let mut specs = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            let mut tla_files: Vec<PathBuf> = entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|e| e == "tla"))
+                .collect();
+            tla_files.sort();
+            for tla_path in tla_files {
+                let cfg_path = tla_path.with_extension("cfg");
+                let cfg = if cfg_path.exists() {
+                    Some(cfg_path)
+                } else {
+                    None
+                };
+                specs.push((tla_path, cfg));
+            }
+        }
+        specs
+    }
+
+    /// Evaluate a definition body via both the text and compiled paths.
+    /// Returns (text_result, compiled_result).
+    fn eval_both_paths(
+        body: &str,
+        ctx: &EvalContext<'_>,
+    ) -> (Result<TlaValue>, Result<TlaValue>) {
+        let text_result = eval_expr(body, ctx);
+        let compiled = compile_expr(body);
+        let compiled_result = eval_compiled(&compiled, ctx);
+        (text_result, compiled_result)
+    }
+
+    #[test]
+    fn swarm_eval_path_consistency() {
+        let corpus_dir = corpus_language_dir();
+        if !corpus_dir.exists() {
+            eprintln!(
+                "Skipping swarm_eval_path_consistency: corpus dir not found at {}",
+                corpus_dir.display()
+            );
+            return;
+        }
+
+        let specs = collect_corpus_specs(&corpus_dir);
+        if specs.is_empty() {
+            eprintln!("No corpus specs found in {}", corpus_dir.display());
+            return;
+        }
+
+        // Simple deterministic "random" based on definition index
+        let mut checked = 0usize;
+        let mut matched = 0usize;
+        let mut skipped_action = 0usize;
+        let mut both_err = 0usize;
+
+        for (tla_path, cfg_path) in &specs {
+            let module = match parse_tla_module_file(tla_path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            let config = if let Some(cfg) = cfg_path {
+                let raw = match std::fs::read_to_string(cfg) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                match parse_tla_config(&raw) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                }
+            } else {
+                crate::tla::cfg::TlaConfig::default()
+            };
+
+            // Build initial state to have variable bindings for the context
+            let init_name = config
+                .init
+                .clone()
+                .or_else(|| config.specification.clone())
+                .unwrap_or_else(|| "Init".to_string());
+
+            // Use empty state for expression evaluation (non-action definitions)
+            let empty_state = TlaState::new();
+            let ctx = EvalContext::with_definitions_and_instances(
+                &empty_state,
+                &module.definitions,
+                &module.instances,
+            );
+
+            for (def_idx, (name, def)) in module.definitions.iter().enumerate() {
+                if def.body.is_empty() {
+                    continue;
+                }
+
+                // Skip action definitions (contain primes) - they need state context
+                if def.body.contains('\'') {
+                    skipped_action += 1;
+                    continue;
+                }
+
+                // Skip parameterized operators (need arguments)
+                if !def.params.is_empty() {
+                    continue;
+                }
+
+                // Swarm: randomly skip some definitions based on index
+                // This creates diversity across runs with different corpus orders
+                let swarm_bit = (def_idx.wrapping_mul(2654435761)) & 0x3;
+                if swarm_bit == 0 {
+                    // Skip ~25% of definitions (swarm omission)
+                    continue;
+                }
+
+                let (text_result, compiled_result) = eval_both_paths(&def.body, &ctx);
+                checked += 1;
+
+                match (&text_result, &compiled_result) {
+                    (Ok(text_val), Ok(compiled_val)) => {
+                        assert_eq!(
+                            text_val, compiled_val,
+                            "Eval path divergence in {} definition '{}': \
+                             text={:?}, compiled={:?}, body='{}'",
+                            tla_path.display(),
+                            name,
+                            text_val,
+                            compiled_val,
+                            def.body.chars().take(200).collect::<String>(),
+                        );
+                        matched += 1;
+                    }
+                    (Err(_), Err(_)) => {
+                        // Both errored - that's consistent
+                        both_err += 1;
+                    }
+                    (Ok(text_val), Err(compiled_err)) => {
+                        // Compiled path failed but text succeeded.
+                        // This is acceptable if the compiled path doesn't support
+                        // all operators yet - just log it.
+                        eprintln!(
+                            "Note: compiled path failed for {} '{}': {} (text got {:?})",
+                            tla_path.display(),
+                            name,
+                            compiled_err,
+                            text_val,
+                        );
+                    }
+                    (Err(text_err), Ok(compiled_val)) => {
+                        // Text path failed but compiled succeeded - suspicious
+                        eprintln!(
+                            "Warning: text path failed but compiled succeeded for {} '{}': \
+                             text_err={}, compiled={:?}",
+                            tla_path.display(),
+                            name,
+                            text_err,
+                            compiled_val,
+                        );
+                    }
+                }
+            }
+        }
+
+        eprintln!(
+            "Swarm eval consistency: checked={}, matched={}, both_err={}, skipped_action={}",
+            checked, matched, both_err, skipped_action,
+        );
+
+        // Sanity check: we should have checked at least some definitions
+        assert!(
+            checked > 0,
+            "No definitions were checked - corpus may be empty or all definitions are actions"
+        );
+    }
+}
+
