@@ -1163,6 +1163,16 @@ fn matches_membership_expr(
                             }
                             Ok(true)
                         }
+                        TlaValue::Function(func)
+                            if crate::tla::compiled_eval::func_is_sequence_shaped(func) =>
+                        {
+                            for val in func.values() {
+                                if !matches_membership_expr(val, set_expr, ctx, depth + 1)? {
+                                    return Ok(false);
+                                }
+                            }
+                            Ok(true)
+                        }
                         _ => Ok(false),
                     };
                 }
