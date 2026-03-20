@@ -2,17 +2,16 @@ use crate::fairness::{FairnessConstraint, LabeledTransition};
 use crate::model::Model;
 use crate::symmetry::{SymmetrySpec, canonicalize_tla_state};
 use crate::tla::module::TlaModuleInstance;
+#[cfg(test)]
+use crate::tla::tla_state;
 use crate::tla::{
     ClauseKind, CompiledActionIr, CompiledExpr, ConfigValue, EvalContext, TemporalFormula,
     TlaConfig, TlaDefinition, TlaModule, TlaState, TlaValue, classify_clause, compile_action_ir,
-    compile_expr, eval_action_constraint, eval_compiled, eval_expr,
-    count_next_disjuncts, evaluate_next_states_labeled_with_instances,
-    evaluate_next_states_swarm, evaluate_next_states_with_instances, insert_compiled_action,
-    looks_like_action, normalize_operator_ref_name, parse_tla_config, parse_tla_module_file,
-    split_top_level,
+    compile_expr, count_next_disjuncts, eval_action_constraint, eval_compiled, eval_expr,
+    evaluate_next_states_labeled_with_instances, evaluate_next_states_swarm,
+    evaluate_next_states_with_instances, insert_compiled_action, looks_like_action,
+    normalize_operator_ref_name, parse_tla_config, parse_tla_module_file, split_top_level,
 };
-#[cfg(test)]
-use crate::tla::tla_state;
 use anyhow::{Context, Result, anyhow};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
@@ -70,7 +69,32 @@ impl TlaModel {
             next_override.map(ToString::to_string),
         )?;
 
-        let initial_states_vec = evaluate_init_states(&module, &config, &init_name)?;
+        let mut initial_states_vec = evaluate_init_states(&module, &config, &init_name)?;
+
+        // Strip non-variable entries from states. Constants like Node={n1,n2,n3},
+        // MaxLog=3, Nat={0..5} should NOT be in the state — they're available via
+        // definitions. Model value constants (a1=a1) MUST stay because their
+        // definitions are self-referential and can't be resolved without state lookup.
+        //
+        // TLC does not include any constants in the state. We keep model values
+        // as a pragmatic workaround until the evaluator handles self-referential
+        // constant definitions properly.
+        {
+            let variable_set: std::collections::HashSet<&str> =
+                module.variables.iter().map(|v| v.as_str()).collect();
+            let model_value_constants: std::collections::HashSet<&str> = config
+                .constants
+                .iter()
+                .filter(|(_, v)| matches!(v, ConfigValue::ModelValue(_)))
+                .map(|(k, _)| k.as_str())
+                .collect();
+            for state in &mut initial_states_vec {
+                state.retain(|k, _| {
+                    variable_set.contains(k.as_ref()) || model_value_constants.contains(k.as_ref())
+                });
+            }
+        }
+
         let invariant_exprs = resolve_invariant_exprs(&module, &config);
         let temporal_properties = resolve_temporal_properties(&module, &config)?;
         let mut fairness_constraints = extract_fairness_constraints(&temporal_properties);
@@ -1303,7 +1327,10 @@ fn evaluate_init_states(
 
         if all_guards_pass {
             // Verify all variables are assigned
-            let all_assigned = module.variables.iter().all(|v| state.contains_key(v.as_str()));
+            let all_assigned = module
+                .variables
+                .iter()
+                .all(|v| state.contains_key(v.as_str()));
             if all_assigned {
                 valid_states.push(state);
             }
@@ -1492,7 +1519,9 @@ fn inject_constants_into_module_tree(
     }
 }
 
-/// Convert a ConfigValue to a TLA+ expression string
+/// Convert a ConfigValue to a TLA+ expression string.
+/// Model values use a special `__ModelValue__("name")` syntax that the evaluator
+/// recognizes to avoid self-referential resolution (e.g., `a1 = a1` would loop).
 fn config_value_to_expr(value: &ConfigValue) -> String {
     match value {
         ConfigValue::Int(n) => n.to_string(),
