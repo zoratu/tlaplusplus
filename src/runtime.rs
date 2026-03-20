@@ -1236,7 +1236,8 @@ where
                         match std::fs::read(&fp_path) {
                             Ok(bytes) => bytes
                                 .chunks_exact(8)
-                                .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+                                // invariant: chunks_exact(8) guarantees exactly 8 bytes per chunk
+                                .map(|c| u64::from_le_bytes(c.try_into().expect("chunks_exact(8) produced non-8-byte chunk")))
                                 .collect(),
                             Err(e) => {
                                 eprintln!("Warning: failed to load shard {}: {}", shard_id, e);
@@ -1247,7 +1248,8 @@ where
                 }
                 handles
                     .into_iter()
-                    .map(|h| h.join().unwrap())
+                    // propagate panics from scoped shard-loading threads
+                    .map(|h| h.join().expect("shard loader thread panicked"))
                     .collect::<Vec<_>>()
             });
 
@@ -1283,7 +1285,8 @@ where
         ) {
             let monitor_fp_store = Arc::clone(&fp_store);
             let monitor_stop = Arc::clone(&mem_monitor_stop);
-            let memory_max = effective_memory_max.unwrap();
+            // invariant: should_start_fingerprint_memory_monitor checks effective_memory_max.is_some()
+            let memory_max = effective_memory_max.expect("memory monitor started without effective_memory_max");
             Some(
             std::thread::Builder::new()
                 .name("tlapp-mem-monitor".into())
@@ -2184,7 +2187,8 @@ where
                     // Reconstruct trace to violation
                     let trace = if let Some(ref pm) = worker_parent_map {
                         // Use BFS parent tracking: walk parent chain back to initial state
-                        let sm = worker_state_map.as_ref().unwrap();
+                        // invariant: state_map is always Some when parent_map is Some (both gated by config.trace_parents)
+                        let sm = worker_state_map.as_ref().expect("state_map missing but parent_map present");
                         let mut chain = vec![state.clone()];
                         let mut fp = worker_model.fingerprint(&state);
                         while let Some(parent_fp_entry) = pm.get(&fp) {
