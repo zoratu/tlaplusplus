@@ -131,6 +131,7 @@ pub struct AutoSwitchingFingerprintStore {
     memory_monitor: MemoryMonitor,
 
     /// Assigned CPUs for workers (for store creation)
+    #[allow(dead_code)]
     assigned_cpus: Vec<Option<usize>>,
 
     /// Persistence channels (if enabled)

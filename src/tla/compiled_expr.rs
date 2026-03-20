@@ -874,7 +874,7 @@ fn split_top_level(expr: &str, delim: &str) -> Vec<String> {
     let mut case_depth: usize = 0; // Track CASE expression nesting
     let mut quantifier_depth: usize = 0; // Track nested quantifier depth (not just boolean!)
     let mut quantifier_base_indent: Option<usize> = None; // Indentation of first quantifier's line
-    let mut current_col: usize = 0; // Current column position
+    let mut __current_col: usize = 0; // Current column position
     let mut line_indent: usize = 0; // Indentation of current line (spaces at start)
     let mut at_line_start = true; // Are we at the start of a line (counting spaces)?
     let mut in_string = false;
@@ -887,7 +887,7 @@ fn split_top_level(expr: &str, delim: &str) -> Vec<String> {
 
         // Track column position and line indentation
         if c == '\n' {
-            current_col = 0;
+            _current_col = 0;
             line_indent = 0;
             at_line_start = true;
         } else {
@@ -898,7 +898,7 @@ fn split_top_level(expr: &str, delim: &str) -> Vec<String> {
                     at_line_start = false;
                 }
             }
-            current_col += 1;
+            _current_col += 1;
         }
 
         if c == '"' && (i == 0 || chars[i - 1] != '\\') {
@@ -921,7 +921,7 @@ fn split_top_level(expr: &str, delim: &str) -> Vec<String> {
                 current.push(c);
                 current.push(chars[i + 1]);
                 i += 2;
-                current_col += 1;
+                _current_col += 1;
                 continue;
             }
             if c == '>' && chars[i + 1] == '>' {
@@ -929,7 +929,7 @@ fn split_top_level(expr: &str, delim: &str) -> Vec<String> {
                 current.push(c);
                 current.push(chars[i + 1]);
                 i += 2;
-                current_col += 1;
+                _current_col += 1;
                 continue;
             }
         }
@@ -954,14 +954,14 @@ fn split_top_level(expr: &str, delim: &str) -> Vec<String> {
                 let_depth += 1;
                 current.push_str("LET");
                 i += 3;
-                current_col += 2;
+                _current_col += 2;
                 continue;
             }
             // Just push IN without decrementing - the LET body extends to the end
             if let_depth > 0 && matches_keyword_at(&chars, i, "IN") {
                 current.push_str("IN");
                 i += 2;
-                current_col += 1;
+                _current_col += 1;
                 continue;
             }
 
@@ -970,14 +970,14 @@ fn split_top_level(expr: &str, delim: &str) -> Vec<String> {
                 if_depth += 1;
                 current.push_str("IF");
                 i += 2;
-                current_col += 1;
+                _current_col += 1;
                 continue;
             }
             if if_depth > 0 && matches_keyword_at(&chars, i, "ELSE") {
                 if_depth = if_depth.saturating_sub(1);
                 current.push_str("ELSE");
                 i += 4;
-                current_col += 3;
+                _current_col += 3;
                 continue;
             }
 
@@ -986,7 +986,7 @@ fn split_top_level(expr: &str, delim: &str) -> Vec<String> {
                 case_depth += 1;
                 current.push_str("CASE");
                 i += 4;
-                current_col += 3;
+                _current_col += 3;
                 continue;
             }
         }
@@ -1021,8 +1021,8 @@ fn split_top_level(expr: &str, delim: &str) -> Vec<String> {
                                 current.push(chars[k]);
                             }
                             i = j + 1;
-                            // Adjust current_col for the characters we just pushed
-                            current_col += chars_pushed;
+                            // Adjust _current_col for the characters we just pushed
+                            _current_col += chars_pushed;
                             break;
                         }
                         _ => {}
