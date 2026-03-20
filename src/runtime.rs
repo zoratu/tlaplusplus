@@ -1237,7 +1237,12 @@ where
                             Ok(bytes) => bytes
                                 .chunks_exact(8)
                                 // invariant: chunks_exact(8) guarantees exactly 8 bytes per chunk
-                                .map(|c| u64::from_le_bytes(c.try_into().expect("chunks_exact(8) produced non-8-byte chunk")))
+                                .map(|c| {
+                                    u64::from_le_bytes(
+                                        c.try_into()
+                                            .expect("chunks_exact(8) produced non-8-byte chunk"),
+                                    )
+                                })
                                 .collect(),
                             Err(e) => {
                                 eprintln!("Warning: failed to load shard {}: {}", shard_id, e);
@@ -1286,7 +1291,8 @@ where
             let monitor_fp_store = Arc::clone(&fp_store);
             let monitor_stop = Arc::clone(&mem_monitor_stop);
             // invariant: should_start_fingerprint_memory_monitor checks effective_memory_max.is_some()
-            let memory_max = effective_memory_max.expect("memory monitor started without effective_memory_max");
+            let memory_max =
+                effective_memory_max.expect("memory monitor started without effective_memory_max");
             Some(
             std::thread::Builder::new()
                 .name("tlapp-mem-monitor".into())
@@ -1563,56 +1569,57 @@ where
                     );
                 }
 
+                let ckpt_start = Instant::now();
+
                 if is_emergency {
+                    // EMERGENCY: Full checkpoint with queue drain for crash recovery.
+                    // Must pause workers, drain queue to disk, flush fingerprints.
                     eprintln!(
                         "Checkpoint: EMERGENCY checkpoint requested (spot instance preemption)..."
                     );
-                } else {
-                    eprintln!("Checkpoint: starting periodic checkpoint...");
-                }
-                let ckpt_start = Instant::now();
 
-                // CRITICAL: Set checkpoint flag BEFORE requesting pause!
-                // This prevents workers from terminating when they see empty
-                // queues while waiting for pause. Without this, workers in
-                // pop_slow_path check should_terminate(), see empty queues,
-                // and exit before checkpoint can drain/reload items.
-                ckpt_queue.set_checkpoint_in_progress(true);
-
-                request_checkpoint_pause(ckpt_queue.as_ref(), &ckpt_pause);
-                let quiescence_achieved = ckpt_pause.wait_for_quiescence(
-                    &ckpt_exploration_stop,
-                    &ckpt_active_workers,
-                    &ckpt_live_workers,
-                );
-
-                // If quiescence timed out, skip this checkpoint
-                if !quiescence_achieved {
-                    eprintln!(
-                        "Checkpoint: quiescence timeout, skipping checkpoint and resuming workers"
+                    ckpt_queue.set_checkpoint_in_progress(true);
+                    request_checkpoint_pause(ckpt_queue.as_ref(), &ckpt_pause);
+                    let quiescence_achieved = ckpt_pause.wait_for_quiescence(
+                        &ckpt_exploration_stop,
+                        &ckpt_active_workers,
+                        &ckpt_live_workers,
                     );
-                    ckpt_pause.resume();
-                    ckpt_queue.set_pause_requested(false);
-                    ckpt_queue.set_checkpoint_in_progress(false);
-                    continue;
-                }
 
-                // Flush queue state to disk
-                if let Err(e) = ckpt_queue.checkpoint_flush() {
-                    eprintln!("Checkpoint: queue flush failed: {}", e);
-                    ckpt_pause.resume();
-                    ckpt_queue.set_pause_requested(false);
-                    ckpt_queue.set_checkpoint_in_progress(false);
-                    continue;
-                }
+                    if !quiescence_achieved {
+                        eprintln!(
+                            "Checkpoint: quiescence timeout, skipping checkpoint and resuming workers"
+                        );
+                        ckpt_pause.resume();
+                        ckpt_queue.set_pause_requested(false);
+                        ckpt_queue.set_checkpoint_in_progress(false);
+                        continue;
+                    }
 
-                // Flush fingerprints to disk
-                if let Err(e) = ckpt_fp_store.flush() {
-                    eprintln!("Checkpoint: fingerprint flush failed: {}", e);
-                    ckpt_pause.resume();
-                    ckpt_queue.set_pause_requested(false);
-                    ckpt_queue.set_checkpoint_in_progress(false);
-                    continue;
+                    if let Err(e) = ckpt_queue.checkpoint_flush() {
+                        eprintln!("Checkpoint: queue flush failed: {}", e);
+                        ckpt_pause.resume();
+                        ckpt_queue.set_pause_requested(false);
+                        ckpt_queue.set_checkpoint_in_progress(false);
+                        continue;
+                    }
+
+                    if let Err(e) = ckpt_fp_store.flush() {
+                        eprintln!("Checkpoint: fingerprint flush failed: {}", e);
+                        ckpt_pause.resume();
+                        ckpt_queue.set_pause_requested(false);
+                        ckpt_queue.set_checkpoint_in_progress(false);
+                        continue;
+                    }
+                } else {
+                    // PERIODIC: Lightweight checkpoint — no worker pause, no queue drain.
+                    // Just snapshot atomic counters and write manifest for progress tracking.
+                    // Workers continue exploring uninterrupted.
+                    //
+                    // Full drain is only done on emergency (SIGTERM/spot preemption).
+                    // This avoids the O(queue_size) drain that was taking 100+ seconds
+                    // and stalling all 96 workers.
+                    eprintln!("Checkpoint: lightweight periodic (no worker pause)");
                 }
 
                 // Write checkpoint manifest
@@ -1684,51 +1691,26 @@ where
                     }
                 }
 
-                // For emergency checkpoint (spot preemption), signal completion and don't resume
                 if is_emergency {
+                    // Emergency: signal completion, wait for process exit
                     eprintln!(
                         "Checkpoint: EMERGENCY checkpoint complete, signaling for S3 flush..."
                     );
                     crate::chaos::clear_emergency_checkpoint();
                     crate::chaos::set_emergency_checkpoint_complete();
-                    // Don't resume workers - signal handler will exit process after S3 flush
-                    // But we need to clear flags so signal handler can proceed
                     ckpt_queue.set_pause_requested(false);
                     ckpt_queue.set_checkpoint_in_progress(false);
-                    // Wait here until process exits (signal handler will call exit())
                     loop {
                         std::thread::sleep(Duration::from_secs(60));
                     }
                 }
 
-                // Resume workers (normal checkpoint path)
+                // Resume workers if they were paused (emergency path only)
+                // For periodic checkpoints, workers were never paused.
+                // The resume() call is safe even if workers aren't paused —
+                // it just clears the requested flag and unparks threads.
                 ckpt_pause.resume();
                 ckpt_queue.set_pause_requested(false);
-
-                // Wait for background loader to refill queue before allowing termination
-                // This prevents workers from seeing empty queues and terminating prematurely
-                // The background loader started loading when checkpoint_draining cleared
-                let wait_start = Instant::now();
-                let max_wait = std::time::Duration::from_secs(30);
-                while !ckpt_queue.has_pending_work() && wait_start.elapsed() < max_wait {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-                if wait_start.elapsed() >= max_wait && !ckpt_queue.has_pending_work() {
-                    eprintln!(
-                        "Checkpoint: warning: queue still empty after 30s wait, model may have completed"
-                    );
-                } else {
-                    let pending = ckpt_queue.pending_count();
-                    let total_pending = ckpt_queue.total_pending_count();
-                    eprintln!(
-                        "Checkpoint: queue refilled in {:.1}s (inmem: {}, total: {}), resuming workers",
-                        wait_start.elapsed().as_secs_f64(),
-                        pending,
-                        total_pending
-                    );
-                }
-
-                // Now allow termination
                 ckpt_queue.set_checkpoint_in_progress(false);
                 last_checkpoint = Instant::now();
             }
@@ -2193,7 +2175,9 @@ where
                     let trace = if let Some(ref pm) = worker_parent_map {
                         // Use BFS parent tracking: walk parent chain back to initial state
                         // invariant: state_map is always Some when parent_map is Some (both gated by config.trace_parents)
-                        let sm = worker_state_map.as_ref().expect("state_map missing but parent_map present");
+                        let sm = worker_state_map
+                            .as_ref()
+                            .expect("state_map missing but parent_map present");
                         let mut chain = vec![state.clone()];
                         let mut fp = worker_model.fingerprint(&state);
                         while let Some(parent_fp_entry) = pm.get(&fp) {
