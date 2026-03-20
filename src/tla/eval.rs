@@ -237,7 +237,7 @@ impl<'a> EvalContext<'a> {
                 self.locals
                     .get(&format!("{var}'"))
                     .cloned()
-                    .map(|value| (var.clone(), value))
+                    .map(|value| (var.to_string(), value))
             })
             .collect();
         if !primed_bindings.is_empty() {
@@ -560,12 +560,12 @@ pub(crate) fn apply_action_ir_with_context_multi(
     for branch in branches {
         let mut next = current.clone();
         for var in branch.unchanged_vars {
-            if let Some(old) = current.get(&var) {
-                next.insert(var, old.clone());
+            if let Some(old) = current.get(var.as_str()) {
+                next.insert(Arc::from(var), old.clone());
             }
         }
         for (var, value) in branch.staged {
-            next.insert(var, value);
+            next.insert(Arc::from(var), value);
         }
         out.push(next);
     }
@@ -644,7 +644,7 @@ fn eval_action_clause_to_branch(
             let mut branch = branch;
             for var in vars {
                 branch.unchanged_vars.push(var.clone());
-                if let Some(value) = ctx.state.get(var) {
+                if let Some(value) = ctx.state.get(var.as_str()) {
                     branch
                         .staged
                         .entry(var.clone())
@@ -742,7 +742,7 @@ fn eval_stuttering_action_multi(
     let mut stutter = branch;
     for var in vars {
         stutter.unchanged_vars.push(var.clone());
-        if let Some(value) = ctx.state.get(var) {
+        if let Some(value) = ctx.state.get(var.as_str()) {
             stutter
                 .staged
                 .entry(var.clone())
@@ -1016,7 +1016,7 @@ fn eval_action_clause_text_multi(
             let mut branch = branch;
             for var in vars {
                 branch.unchanged_vars.push(var.clone());
-                if let Some(value) = ctx.state.get(&var) {
+                if let Some(value) = ctx.state.get(var.as_str()) {
                     branch.staged.entry(var).or_insert_with(|| value.clone());
                 }
             }
@@ -6331,6 +6331,7 @@ fn skip_leading_ws(input: &str, mut idx: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tla::tla_state;
     use proptest::prelude::*;
     use std::collections::BTreeSet;
 
@@ -6359,9 +6360,9 @@ mod tests {
 
     #[test]
     fn evals_arithmetic_and_boolean() {
-        let state = TlaState::from([
-            ("x".to_string(), TlaValue::Int(4)),
-            ("y".to_string(), TlaValue::Int(2)),
+        let state = tla_state([
+            ("x", TlaValue::Int(4)),
+            ("y", TlaValue::Int(2)),
         ]);
         let ctx = EvalContext::new(&state);
         assert_eq!(
@@ -6416,8 +6417,8 @@ mod tests {
 
     #[test]
     fn resolves_named_operator_identifiers_as_higher_order_values() {
-        let state = TlaState::from([(
-            "waiting".to_string(),
+        let state = tla_state([(
+            "waiting",
             TlaValue::Seq(Arc::new(vec![
                 TlaValue::Seq(Arc::new(vec![
                     TlaValue::String("read".to_string()),
@@ -6489,9 +6490,9 @@ mod tests {
     proptest! {
         #[test]
         fn bitwise_xor_is_self_inverse(a in any::<i64>(), b in any::<i64>()) {
-            let state = TlaState::from([
-                ("a".to_string(), TlaValue::Int(a)),
-                ("b".to_string(), TlaValue::Int(b)),
+            let state = tla_state([
+                ("a", TlaValue::Int(a)),
+                ("b", TlaValue::Int(b)),
             ]);
             let ctx = EvalContext::new(&state);
 
@@ -6504,9 +6505,9 @@ mod tests {
 
     #[test]
     fn applies_action_ir() {
-        let state = TlaState::from([
-            ("x".to_string(), TlaValue::Int(1)),
-            ("y".to_string(), TlaValue::Int(2)),
+        let state = tla_state([
+            ("x", TlaValue::Int(1)),
+            ("y", TlaValue::Int(2)),
         ]);
         let action = ActionIr {
             name: "Tick".to_string(),
@@ -6534,11 +6535,11 @@ mod tests {
 
     #[test]
     fn applies_action_ir_with_nested_action_references() {
-        let state = TlaState::from([
-            ("cat_box".to_string(), TlaValue::Int(2)),
-            ("observed_box".to_string(), TlaValue::Int(2)),
+        let state = tla_state([
+            ("cat_box", TlaValue::Int(2)),
+            ("observed_box", TlaValue::Int(2)),
             (
-                "direction".to_string(),
+                "direction",
                 TlaValue::String("right".to_string()),
             ),
         ]);
@@ -6590,7 +6591,7 @@ mod tests {
 
     #[test]
     fn applies_action_ir_with_primed_membership_generates_all_choices() {
-        let state = TlaState::from([("flip".to_string(), TlaValue::String("H".to_string()))]);
+        let state = tla_state([("flip", TlaValue::String("H".to_string()))]);
         let action = ActionIr {
             name: "TossCoin".to_string(),
             params: vec![],
@@ -6615,7 +6616,7 @@ mod tests {
 
     #[test]
     fn action_guard_can_block_transition() {
-        let state = TlaState::from([("x".to_string(), TlaValue::Int(10))]);
+        let state = tla_state([("x", TlaValue::Int(10))]);
         let action = ActionIr {
             name: "Blocked".to_string(),
             params: vec![],
@@ -6629,10 +6630,10 @@ mod tests {
 
     #[test]
     fn applies_action_ir_with_conditional_branches() {
-        let state = TlaState::from([
-            ("flag".to_string(), TlaValue::Bool(false)),
-            ("x".to_string(), TlaValue::Int(7)),
-            ("y".to_string(), TlaValue::Int(9)),
+        let state = tla_state([
+            ("flag", TlaValue::Bool(false)),
+            ("x", TlaValue::Int(7)),
+            ("y", TlaValue::Int(9)),
         ]);
         let action = ActionIr {
             name: "Conditional".to_string(),
@@ -6652,10 +6653,10 @@ mod tests {
 
     #[test]
     fn applies_action_ir_with_unchanged_primes_referenced_later() {
-        let state = TlaState::from([
-            ("flag".to_string(), TlaValue::Bool(false)),
-            ("count".to_string(), TlaValue::Int(7)),
-            ("announced".to_string(), TlaValue::Bool(false)),
+        let state = tla_state([
+            ("flag", TlaValue::Bool(false)),
+            ("count", TlaValue::Int(7)),
+            ("announced", TlaValue::Bool(false)),
         ]);
         let action = ActionIr {
             name: "Counter".to_string(),
@@ -6681,10 +6682,10 @@ mod tests {
 
     #[test]
     fn applies_let_action_with_body_starting_with_disjunction() {
-        let state = TlaState::from([
-            ("observed_box".to_string(), TlaValue::Int(2)),
+        let state = tla_state([
+            ("observed_box", TlaValue::Int(2)),
             (
-                "direction".to_string(),
+                "direction",
                 TlaValue::String("right".to_string()),
             ),
         ]);
@@ -6708,9 +6709,9 @@ mod tests {
 
     #[test]
     fn quantified_let_action_generates_multiple_successors() {
-        let state = TlaState::from([
-            ("x".to_string(), TlaValue::Int(0)),
-            ("y".to_string(), TlaValue::Int(9)),
+        let state = tla_state([
+            ("x", TlaValue::Int(0)),
+            ("y", TlaValue::Int(9)),
         ]);
         let ctx = EvalContext::new(&state);
         let action = ActionIr {
@@ -6757,8 +6758,8 @@ mod tests {
             ),
         ]);
 
-        let state = TlaState::from([(
-            "actionCount".to_string(),
+        let state = tla_state([(
+            "actionCount",
             TlaValue::Function(Arc::new(BTreeMap::from([(
                 TlaValue::ModelValue("bot1".to_string()),
                 TlaValue::Int(1),
@@ -6775,8 +6776,8 @@ mod tests {
 
     #[test]
     fn evaluates_except_updates() {
-        let state = TlaState::from([(
-            "actionCount".to_string(),
+        let state = tla_state([(
+            "actionCount",
             TlaValue::Function(Arc::new(BTreeMap::from([(
                 TlaValue::ModelValue("bot1".to_string()),
                 TlaValue::Int(1),
@@ -6800,27 +6801,27 @@ mod tests {
         let asset = TlaValue::ModelValue("asset1".to_string());
         let alice = TlaValue::ModelValue("alice".to_string());
         let bob = TlaValue::ModelValue("bob".to_string());
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "Participants".to_string(),
+                "Participants",
                 TlaValue::Set(Arc::new(BTreeSet::from([alice.clone(), bob.clone()]))),
             ),
             (
-                "referencePrice".to_string(),
+                "referencePrice",
                 TlaValue::Function(Arc::new(BTreeMap::from([(
                     asset.clone(),
                     TlaValue::Int(15),
                 )]))),
             ),
             (
-                "positions".to_string(),
+                "positions",
                 TlaValue::Function(Arc::new(BTreeMap::from([
                     (alice.clone(), TlaValue::Int(1)),
                     (bob.clone(), TlaValue::Int(-1)),
                 ]))),
             ),
             (
-                "balances".to_string(),
+                "balances",
                 TlaValue::Function(Arc::new(BTreeMap::from([
                     (alice.clone(), TlaValue::Int(100)),
                     (bob.clone(), TlaValue::Int(100)),
@@ -6857,21 +6858,21 @@ IN
         let bot = TlaValue::ModelValue("bot1".to_string());
         let seller = TlaValue::ModelValue("seller1".to_string());
         let asset = TlaValue::ModelValue("asset1".to_string());
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "Sellers".to_string(),
+                "Sellers",
                 TlaValue::Set(Arc::new(BTreeSet::from([seller.clone()]))),
             ),
             (
-                "Assets".to_string(),
+                "Assets",
                 TlaValue::Set(Arc::new(BTreeSet::from([asset.clone()]))),
             ),
             (
-                "ccpTrades".to_string(),
+                "ccpTrades",
                 TlaValue::Set(Arc::new(BTreeSet::new())),
             ),
             (
-                "ccpPositions".to_string(),
+                "ccpPositions",
                 TlaValue::Function(Arc::new(BTreeMap::from([
                     (
                         bot.clone(),
@@ -6890,11 +6891,11 @@ IN
                 ]))),
             ),
             (
-                "deployments".to_string(),
+                "deployments",
                 TlaValue::Set(Arc::new(BTreeSet::new())),
             ),
             (
-                "actionCount".to_string(),
+                "actionCount",
                 TlaValue::Function(Arc::new(BTreeMap::from([(bot.clone(), TlaValue::Int(0))]))),
             ),
         ]);
@@ -6993,16 +6994,16 @@ IN
             ("mbal".to_string(), TlaValue::Int(0)),
             ("mval".to_string(), v1.clone()),
         ])));
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "msgs".to_string(),
+                "msgs",
                 TlaValue::Set(Arc::new(BTreeSet::from([msg_a1, msg_a2]))),
             ),
             (
-                "Quorum".to_string(),
+                "Quorum",
                 TlaValue::Set(Arc::new(BTreeSet::from([quorum]))),
             ),
-            ("sent".to_string(), TlaValue::Bool(false)),
+            ("sent", TlaValue::Bool(false)),
         ]);
         let ctx = EvalContext::new(&state)
             .with_local_values(&[("b", TlaValue::Int(1)), ("v", v1.clone())]);
@@ -7047,13 +7048,13 @@ IN
         let a2 = TlaValue::ModelValue("a2".to_string());
         let v1 = TlaValue::ModelValue("v1".to_string());
         let quorum = TlaValue::Set(Arc::new(BTreeSet::from([a1.clone(), a2.clone()])));
-        let state = TlaState::from([
-            ("msgs".to_string(), TlaValue::Set(Arc::new(BTreeSet::new()))),
+        let state = tla_state([
+            ("msgs", TlaValue::Set(Arc::new(BTreeSet::new()))),
             (
-                "Quorum".to_string(),
+                "Quorum",
                 TlaValue::Set(Arc::new(BTreeSet::from([quorum]))),
             ),
-            ("sent".to_string(), TlaValue::Bool(false)),
+            ("sent", TlaValue::Bool(false)),
         ]);
         let ctx = EvalContext::new(&state).with_local_values(&[("b", TlaValue::Int(0)), ("v", v1)]);
         let action = ActionIr {
@@ -7108,16 +7109,16 @@ IN
             ("mbal".to_string(), TlaValue::Int(0)),
             ("mval".to_string(), v1.clone()),
         ])));
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "msgs".to_string(),
+                "msgs",
                 TlaValue::Set(Arc::new(BTreeSet::from([msg_a1, msg_a2]))),
             ),
             (
-                "Quorum".to_string(),
+                "Quorum",
                 TlaValue::Set(Arc::new(BTreeSet::from([quorum]))),
             ),
-            ("sent".to_string(), TlaValue::Bool(false)),
+            ("sent", TlaValue::Bool(false)),
         ]);
         let ctx = EvalContext::new(&state).with_local_values(&[("b", TlaValue::Int(1)), ("v", v1)]);
         let def = TlaDefinition {
@@ -7156,16 +7157,16 @@ IN
             TlaValue::ModelValue("n1".to_string()),
             TlaValue::ModelValue("n2".to_string()),
         ]));
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "NetworkPath".to_string(),
+                "NetworkPath",
                 TlaValue::Function(Arc::new(BTreeMap::from([(
                     tuple_key,
                     TlaValue::Bool(true),
                 )]))),
             ),
-            ("src".to_string(), TlaValue::ModelValue("n1".to_string())),
-            ("dst".to_string(), TlaValue::ModelValue("n2".to_string())),
+            ("src", TlaValue::ModelValue("n1".to_string())),
+            ("dst", TlaValue::ModelValue("n2".to_string())),
         ]);
 
         let ctx = EvalContext::new(&state);
@@ -7181,16 +7182,16 @@ IN
             TlaValue::ModelValue("n1".to_string()),
             TlaValue::ModelValue("n2".to_string()),
         ]));
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "NetworkPath".to_string(),
+                "NetworkPath",
                 TlaValue::Function(Arc::new(BTreeMap::from([(
                     tuple_key,
                     TlaValue::Bool(true),
                 )]))),
             ),
-            ("src".to_string(), TlaValue::ModelValue("n1".to_string())),
-            ("dst".to_string(), TlaValue::ModelValue("n2".to_string())),
+            ("src", TlaValue::ModelValue("n1".to_string())),
+            ("dst", TlaValue::ModelValue("n2".to_string())),
         ]);
 
         let ctx = EvalContext::new(&state);
@@ -7209,9 +7210,9 @@ IN
 
     #[test]
     fn domain_accepts_indexed_function_values() {
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "ReplicatedLog".to_string(),
+                "ReplicatedLog",
                 TlaValue::Function(Arc::new(BTreeMap::from([(
                     TlaValue::ModelValue("n1".to_string()),
                     TlaValue::Function(Arc::new(BTreeMap::from([
@@ -7220,7 +7221,7 @@ IN
                     ]))),
                 )]))),
             ),
-            ("node".to_string(), TlaValue::ModelValue("n1".to_string())),
+            ("node", TlaValue::ModelValue("n1".to_string())),
         ]);
         let ctx = EvalContext::new(&state);
 
@@ -7251,16 +7252,16 @@ IN
 
     #[test]
     fn set_minus_accepts_compact_rhs_without_spaces() {
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "Nodes".to_string(),
+                "Nodes",
                 TlaValue::Set(Arc::new(BTreeSet::from([
                     TlaValue::Int(1),
                     TlaValue::Int(2),
                     TlaValue::Int(3),
                 ]))),
             ),
-            ("n".to_string(), TlaValue::Int(2)),
+            ("n", TlaValue::Int(2)),
         ]);
         let ctx = EvalContext::new(&state);
 
@@ -7275,9 +7276,9 @@ IN
 
     #[test]
     fn set_minus_accepts_union_prefix_rhs() {
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "Pos".to_string(),
+                "Pos",
                 TlaValue::Set(Arc::new(BTreeSet::from([
                     TlaValue::Int(1),
                     TlaValue::Int(2),
@@ -7285,7 +7286,7 @@ IN
                 ]))),
             ),
             (
-                "board".to_string(),
+                "board",
                 TlaValue::Set(Arc::new(BTreeSet::from([
                     TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(1)]))),
                     TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(3)]))),
@@ -7313,8 +7314,8 @@ IN
 
     #[test]
     fn evaluates_quantifier_and_choose() {
-        let state = TlaState::from([(
-            "S".to_string(),
+        let state = tla_state([(
+            "S",
             TlaValue::Set(Arc::new(BTreeSet::from([
                 TlaValue::Int(1),
                 TlaValue::Int(2),
@@ -7335,8 +7336,8 @@ IN
 
     #[test]
     fn evaluates_choose_without_domain_using_stable_model_value() {
-        let state = TlaState::from([(
-            "SignedBlock".to_string(),
+        let state = tla_state([(
+            "SignedBlock",
             TlaValue::Set(Arc::new(BTreeSet::from([
                 TlaValue::ModelValue("b1".to_string()),
                 TlaValue::ModelValue("b2".to_string()),
@@ -7355,9 +7356,9 @@ IN
             "stable choose value should not collide with the existing set"
         );
 
-        let state_with_alias = TlaState::from([
-            ("SignedBlock".to_string(), state["SignedBlock"].clone()),
-            ("remembered".to_string(), value.clone()),
+        let state_with_alias = tla_state([
+            ("SignedBlock", state["SignedBlock"].clone()),
+            ("remembered", value.clone()),
         ]);
         let aliased_ctx = EvalContext::new(&state_with_alias);
         let repeated = eval_expr("CHOOSE b : b \\notin SignedBlock", &aliased_ctx)
@@ -7368,16 +7369,16 @@ IN
 
     #[test]
     fn choose_without_domain_stays_equal_across_repeated_definition_evaluation() {
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "Hash".to_string(),
+                "Hash",
                 TlaValue::Set(Arc::new(BTreeSet::from([
                     TlaValue::ModelValue("h1".to_string()),
                     TlaValue::ModelValue("h2".to_string()),
                 ]))),
             ),
             (
-                "SignedBlock".to_string(),
+                "SignedBlock",
                 TlaValue::Set(Arc::new(BTreeSet::new())),
             ),
         ]);
@@ -7404,10 +7405,10 @@ IN
         let base_ctx = EvalContext::with_definitions(&state, &definitions);
         let hash_function = eval_expr("hashFunction", &base_ctx).expect("function should evaluate");
 
-        let state_with_function = TlaState::from([
-            ("Hash".to_string(), state["Hash"].clone()),
-            ("SignedBlock".to_string(), state["SignedBlock"].clone()),
-            ("hashFunction".to_string(), hash_function),
+        let state_with_function = tla_state([
+            ("Hash", state["Hash"].clone()),
+            ("SignedBlock", state["SignedBlock"].clone()),
+            ("hashFunction", hash_function),
         ]);
         let ctx = EvalContext::with_definitions(&state_with_function, &definitions);
 
@@ -7442,8 +7443,8 @@ IN
                 },
             ),
         ]);
-        let state = TlaState::from([(
-            "Calls".to_string(),
+        let state = tla_state([(
+            "Calls",
             TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(1)]))),
         )]);
         let ctx = EvalContext::with_definitions(&state, &defs)
@@ -7485,7 +7486,7 @@ IN
         let current =
             TlaValue::Function(Arc::new(BTreeMap::from([(key.clone(), TlaValue::Int(0))])));
         let next = TlaValue::Function(Arc::new(BTreeMap::from([(key.clone(), TlaValue::Int(1))])));
-        let state = TlaState::from([("weight".to_string(), current)]);
+        let state = tla_state([("weight", current)]);
         let ctx = EvalContext::new(&state).with_local_values(&[("p", key), ("weight'", next)]);
 
         assert_eq!(
@@ -7496,7 +7497,7 @@ IN
 
     #[test]
     fn evaluates_case_expression() {
-        let state = TlaState::from([("d".to_string(), TlaValue::Int(2))]);
+        let state = tla_state([("d", TlaValue::Int(2))]);
         let ctx = EvalContext::new(&state);
         let expr = "CASE d = 1 -> 10 [] d = 2 -> 20 [] OTHER -> 0";
         assert_eq!(
@@ -7534,7 +7535,7 @@ IN
         );
 
         // Test lambda with captured context
-        let state_with_y = TlaState::from([("y".to_string(), TlaValue::Int(10))]);
+        let state_with_y = tla_state([("y", TlaValue::Int(10))]);
         let ctx_with_y = EvalContext::new(&state_with_y);
         assert_eq!(
             eval_expr("(LAMBDA x: x + y)[5]", &ctx_with_y)
@@ -7547,8 +7548,8 @@ IN
     fn higher_order_operator_parameters() {
         // Test operator with P(_) syntax for higher-order parameter
         // Similar to CigaretteSmokers example: ChooseOne(S, P(_))
-        let state = TlaState::from([(
-            "items".to_string(),
+        let state = tla_state([(
+            "items",
             TlaValue::Set(Arc::new(BTreeSet::from([
                 TlaValue::Int(1),
                 TlaValue::Int(2),
@@ -7636,7 +7637,7 @@ IN
             TlaValue::Seq(Arc::new(vec![TlaValue::Int(2), TlaValue::Int(2)])),
         ])));
         let board = TlaValue::Set(Arc::new(BTreeSet::from([piece_a, piece_b.clone()])));
-        let state = TlaState::from([("board".to_string(), board)]);
+        let state = tla_state([("board", board)]);
         let defs = BTreeMap::from([
             (
                 "ChooseOne".to_string(),
@@ -7813,16 +7814,16 @@ IN
         let up = TlaValue::String("Up".to_string());
         let stationary = TlaValue::String("Stationary".to_string());
 
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "Elevator".to_string(),
+                "Elevator",
                 TlaValue::Set(Arc::new(BTreeSet::from([
                     elevator_1.clone(),
                     elevator_2.clone(),
                 ]))),
             ),
             (
-                "ElevatorState".to_string(),
+                "ElevatorState",
                 TlaValue::Function(Arc::new(BTreeMap::from([
                     (
                         elevator_1.clone(),
@@ -7841,7 +7842,7 @@ IN
                 ]))),
             ),
             (
-                "c".to_string(),
+                "c",
                 TlaValue::Record(Arc::new(BTreeMap::from([
                     ("floor".to_string(), TlaValue::Int(2)),
                     ("direction".to_string(), up),
@@ -7875,22 +7876,22 @@ IN
 
     #[test]
     fn evals_empty_universal_quantifier_with_record_body() {
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "ActiveElevatorCalls".to_string(),
+                "ActiveElevatorCalls",
                 TlaValue::Set(Arc::new(BTreeSet::new())),
             ),
             (
-                "Elevator".to_string(),
+                "Elevator",
                 TlaValue::Set(Arc::new(BTreeSet::from([
                     TlaValue::ModelValue("e1".to_string()),
                     TlaValue::ModelValue("e2".to_string()),
                 ]))),
             ),
-            ("e".to_string(), TlaValue::ModelValue("e1".to_string())),
-            ("nextFloor".to_string(), TlaValue::Int(1)),
+            ("e", TlaValue::ModelValue("e1".to_string())),
+            ("nextFloor", TlaValue::Int(1)),
             (
-                "Floor".to_string(),
+                "Floor",
                 TlaValue::Set(Arc::new(BTreeSet::from([
                     TlaValue::Int(1),
                     TlaValue::Int(2),
@@ -7930,8 +7931,8 @@ IN
 
     #[test]
     fn subseq_accepts_sequence_like_functions() {
-        let state = TlaState::from([(
-            "log".to_string(),
+        let state = tla_state([(
+            "log",
             TlaValue::Function(Arc::new(BTreeMap::from([
                 (TlaValue::Int(1), TlaValue::String("a".to_string())),
                 (TlaValue::Int(2), TlaValue::String("b".to_string())),
@@ -7954,16 +7955,16 @@ IN
 
     #[test]
     fn concat_accepts_sequence_like_functions() {
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "lhs".to_string(),
+                "lhs",
                 TlaValue::Function(Arc::new(BTreeMap::from([
                     (TlaValue::Int(1), TlaValue::Int(1)),
                     (TlaValue::Int(2), TlaValue::Int(2)),
                 ]))),
             ),
             (
-                "rhs".to_string(),
+                "rhs",
                 TlaValue::Function(Arc::new(BTreeMap::from([(
                     TlaValue::Int(1),
                     TlaValue::Int(3),
@@ -7988,7 +7989,7 @@ IN
     #[test]
     fn if_with_equality_in_condition() {
         let state =
-            TlaState::from([("opts".to_string(), TlaValue::Set(Arc::new(BTreeSet::new())))]);
+            tla_state([("opts", TlaValue::Set(Arc::new(BTreeSet::new())))]);
         let ctx = EvalContext::new(&state);
 
         // IF expression with equality in condition should not be split at =
@@ -8001,8 +8002,8 @@ IN
         );
 
         // Same test with non-empty set
-        let state2 = TlaState::from([(
-            "opts".to_string(),
+        let state2 = tla_state([(
+            "opts",
             TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(1)]))),
         )]);
         let ctx2 = EvalContext::new(&state2);
@@ -8016,7 +8017,7 @@ IN
 
     #[test]
     fn if_with_nested_let_in_else() {
-        let state = TlaState::from([("S".to_string(), TlaValue::Set(Arc::new(BTreeSet::new())))]);
+        let state = tla_state([("S", TlaValue::Set(Arc::new(BTreeSet::new())))]);
         let ctx = EvalContext::new(&state);
 
         // IF with nested LET in ELSE branch
@@ -8029,8 +8030,8 @@ IN
         );
 
         // Same test with non-empty set to exercise the ELSE branch
-        let state2 = TlaState::from([(
-            "S".to_string(),
+        let state2 = tla_state([(
+            "S",
             TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(1)]))),
         )]);
         let ctx2 = EvalContext::new(&state2);
@@ -8275,15 +8276,15 @@ IN
         //       /\ inodeState[i].writers >= 0
         // would incorrectly split and result in "/" being parsed as an expression atom
 
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "Inodes".to_string(),
+                "Inodes",
                 TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::ModelValue(
                     "i1".to_string(),
                 )]))),
             ),
             (
-                "inodeState".to_string(),
+                "inodeState",
                 TlaValue::Function(Arc::new(BTreeMap::from([(
                     TlaValue::ModelValue("i1".to_string()),
                     TlaValue::Record(Arc::new(BTreeMap::from([
@@ -8315,21 +8316,21 @@ IN
         //   /\ \A i \in Inodes : ...
         //   /\ \A c \in Clients, i \in Inodes : ...
 
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "Inodes".to_string(),
+                "Inodes",
                 TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::ModelValue(
                     "i1".to_string(),
                 )]))),
             ),
             (
-                "Clients".to_string(),
+                "Clients",
                 TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::ModelValue(
                     "c1".to_string(),
                 )]))),
             ),
             (
-                "inodeState".to_string(),
+                "inodeState",
                 TlaValue::Function(Arc::new(BTreeMap::from([(
                     TlaValue::ModelValue("i1".to_string()),
                     TlaValue::Record(Arc::new(BTreeMap::from([
@@ -8340,7 +8341,7 @@ IN
                 )]))),
             ),
             (
-                "serverCharters".to_string(),
+                "serverCharters",
                 TlaValue::Function(Arc::new(BTreeMap::from([(
                     TlaValue::ModelValue("i1".to_string()),
                     TlaValue::Function(Arc::new(BTreeMap::from([(
@@ -8353,7 +8354,7 @@ IN
                 )]))),
             ),
             (
-                "clientCharters".to_string(),
+                "clientCharters",
                 TlaValue::Function(Arc::new(BTreeMap::from([(
                     TlaValue::ModelValue("c1".to_string()),
                     TlaValue::Function(Arc::new(BTreeMap::from([(
@@ -8366,7 +8367,7 @@ IN
                 )]))),
             ),
             (
-                "AccessLevel".to_string(),
+                "AccessLevel",
                 TlaValue::Set(Arc::new(BTreeSet::from([
                     TlaValue::String("NONE".to_string()),
                     TlaValue::String("READ".to_string()),
@@ -8400,21 +8401,21 @@ IN
 
         // Test the CoherentIO TypeOK pattern with compiled expressions
 
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "Inodes".to_string(),
+                "Inodes",
                 TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::ModelValue(
                     "i1".to_string(),
                 )]))),
             ),
             (
-                "Clients".to_string(),
+                "Clients",
                 TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::ModelValue(
                     "c1".to_string(),
                 )]))),
             ),
             (
-                "inodeState".to_string(),
+                "inodeState",
                 TlaValue::Function(Arc::new(BTreeMap::from([(
                     TlaValue::ModelValue("i1".to_string()),
                     TlaValue::Record(Arc::new(BTreeMap::from([
@@ -8425,7 +8426,7 @@ IN
                 )]))),
             ),
             (
-                "serverCharters".to_string(),
+                "serverCharters",
                 TlaValue::Function(Arc::new(BTreeMap::from([(
                     TlaValue::ModelValue("i1".to_string()),
                     TlaValue::Function(Arc::new(BTreeMap::from([(
@@ -8438,7 +8439,7 @@ IN
                 )]))),
             ),
             (
-                "clientCharters".to_string(),
+                "clientCharters",
                 TlaValue::Function(Arc::new(BTreeMap::from([(
                     TlaValue::ModelValue("c1".to_string()),
                     TlaValue::Function(Arc::new(BTreeMap::from([(
@@ -8451,7 +8452,7 @@ IN
                 )]))),
             ),
             (
-                "AccessLevel".to_string(),
+                "AccessLevel",
                 TlaValue::Set(Arc::new(BTreeSet::from([
                     TlaValue::String("NONE".to_string()),
                     TlaValue::String("READ".to_string()),
@@ -8545,9 +8546,9 @@ IN
 
         // Exact pattern from failing TypeOK - this is the full TypeOK with
         // both single-var and multi-var quantifiers with different domains
-        let state = TlaState::from_iter([
+        let state = tla_state([
             (
-                "inodeState".to_string(),
+                "inodeState",
                 TlaValue::Function(Arc::new(BTreeMap::from_iter([
                     (
                         TlaValue::Int(1),
@@ -8568,7 +8569,7 @@ IN
                 ]))),
             ),
             (
-                "serverCharters".to_string(),
+                "serverCharters",
                 TlaValue::Function(Arc::new(BTreeMap::from_iter([
                     (
                         TlaValue::Int(1),
@@ -8611,7 +8612,7 @@ IN
                 ]))),
             ),
             (
-                "clientCharters".to_string(),
+                "clientCharters",
                 TlaValue::Function(Arc::new(BTreeMap::from_iter([
                     (
                         TlaValue::String("a".to_string()),
@@ -8654,21 +8655,21 @@ IN
                 ]))),
             ),
             (
-                "Inodes".to_string(),
+                "Inodes",
                 TlaValue::Set(Arc::new(BTreeSet::from_iter([
                     TlaValue::Int(1),
                     TlaValue::Int(2),
                 ]))),
             ),
             (
-                "Clients".to_string(),
+                "Clients",
                 TlaValue::Set(Arc::new(BTreeSet::from_iter([
                     TlaValue::String("a".to_string()),
                     TlaValue::String("b".to_string()),
                 ]))),
             ),
             (
-                "AccessLevel".to_string(),
+                "AccessLevel",
                 TlaValue::Set(Arc::new(BTreeSet::from_iter([
                     TlaValue::String("Read".to_string()),
                     TlaValue::String("Write".to_string()),
@@ -8711,7 +8712,7 @@ IN
             (TlaValue::Int(3), TlaValue::Int(30)),
         ])));
 
-        let state = TlaState::from([("f".to_string(), func)]);
+        let state = tla_state([("f", func)]);
         let ctx = EvalContext::new(&state);
 
         // FunAsSeq(f, 1, 3) should produce <<10, 20, 30>>
@@ -8734,7 +8735,7 @@ IN
             (TlaValue::Int(4), TlaValue::Int(40)),
         ])));
 
-        let state = TlaState::from([("f".to_string(), func)]);
+        let state = tla_state([("f", func)]);
         let ctx = EvalContext::new(&state);
 
         // FunAsSeq(f, 2, 2) should produce <<20, 30>>
@@ -8751,7 +8752,7 @@ IN
             TlaValue::Int(10),
         )])));
 
-        let state = TlaState::from([("f".to_string(), func)]);
+        let state = tla_state([("f", func)]);
         let ctx = EvalContext::new(&state);
 
         let result = eval_expr("FunAsSeq(f, 1, 0)", &ctx).expect("FunAsSeq should evaluate");
@@ -8770,7 +8771,7 @@ IN
             (TlaValue::Int(3), TlaValue::Int(300)),
         ])));
 
-        let state = TlaState::from([("f".to_string(), func)]);
+        let state = tla_state([("f", func)]);
         let ctx = EvalContext::new(&state);
 
         let compiled = compile_expr("FunAsSeq(f, 1, 3)");
@@ -8794,7 +8795,7 @@ IN
             TlaValue::Int(4),
         ]));
 
-        let state = TlaState::from([("s".to_string(), seq)]);
+        let state = tla_state([("s", seq)]);
         let ctx = EvalContext::new(&state);
 
         // FunAsSeq(s, 2, 2) should produce <<2, 3>>
@@ -8807,7 +8808,7 @@ IN
     #[test]
     fn evals_multiline_if_then_else() {
         // Test IF-THEN-ELSE with newlines (as would come from a parsed module)
-        let state = TlaState::from([("condition".to_string(), TlaValue::Bool(false))]);
+        let state = tla_state([("condition", TlaValue::Bool(false))]);
         let ctx = EvalContext::new(&state);
 
         // Expression with newlines as stored in TlaDefinition body
@@ -8820,7 +8821,7 @@ IN
         );
 
         // Test with condition=true
-        let state_true = TlaState::from([("condition".to_string(), TlaValue::Bool(true))]);
+        let state_true = tla_state([("condition", TlaValue::Bool(true))]);
         let ctx_true = EvalContext::new(&state_true);
         let result_true = eval_expr(expr, &ctx_true).expect("multiline IF should evaluate");
         assert_eq!(
@@ -8833,7 +8834,7 @@ IN
     #[test]
     fn evals_multiline_else_with_conjunction() {
         // Test ELSE branch with conjunction spanning multiple lines
-        let state = TlaState::from([("condition".to_string(), TlaValue::Bool(false))]);
+        let state = tla_state([("condition", TlaValue::Bool(false))]);
         let ctx = EvalContext::new(&state);
 
         // Expression like DiningPhilosophers with multiline ELSE containing /\
@@ -8849,9 +8850,9 @@ IN
     #[test]
     fn evals_nested_multiline_if_then_else() {
         // Test nested IF-THEN-ELSE where outer ELSE contains another IF
-        let state = TlaState::from([
-            ("outer".to_string(), TlaValue::Bool(false)),
-            ("inner".to_string(), TlaValue::Bool(false)),
+        let state = tla_state([
+            ("outer", TlaValue::Bool(false)),
+            ("inner", TlaValue::Bool(false)),
         ]);
         let ctx = EvalContext::new(&state);
 
@@ -8864,9 +8865,9 @@ IN
         );
 
         // Test inner=true case
-        let state_inner = TlaState::from([
-            ("outer".to_string(), TlaValue::Bool(false)),
-            ("inner".to_string(), TlaValue::Bool(true)),
+        let state_inner = tla_state([
+            ("outer", TlaValue::Bool(false)),
+            ("inner", TlaValue::Bool(true)),
         ]);
         let ctx_inner = EvalContext::new(&state_inner);
         let result_inner =
@@ -8893,9 +8894,9 @@ IN
     fn evals_else_starting_with_conjunction_and_nested_if() {
         // Test the exact pattern from DiningPhilosophers:
         // ELSE /\ IF nested_cond THEN ... ELSE ...
-        let state = TlaState::from([
-            ("outer".to_string(), TlaValue::Bool(false)),
-            ("inner".to_string(), TlaValue::Bool(false)),
+        let state = tla_state([
+            ("outer", TlaValue::Bool(false)),
+            ("inner", TlaValue::Bool(false)),
         ]);
         let ctx = EvalContext::new(&state);
 
@@ -8929,7 +8930,7 @@ IN
             (TlaValue::Int(3), TlaValue::Int(30)),
         ])));
 
-        let state = TlaState::from([("f".to_string(), func)]);
+        let state = tla_state([("f", func)]);
         let ctx = EvalContext::new(&state);
 
         let result = eval_expr("Range(f)", &ctx).expect("Range should evaluate");
@@ -8951,7 +8952,7 @@ IN
             TlaValue::Int(3),
         ]));
 
-        let state = TlaState::from([("s".to_string(), seq)]);
+        let state = tla_state([("s", seq)]);
         let ctx = EvalContext::new(&state);
 
         let result = eval_expr("Range(s)", &ctx).expect("Range should evaluate on sequence");
@@ -8973,7 +8974,7 @@ IN
             ("c".to_string(), TlaValue::Int(10)), // Duplicate value
         ])));
 
-        let state = TlaState::from([("r".to_string(), rec)]);
+        let state = tla_state([("r", rec)]);
         let ctx = EvalContext::new(&state);
 
         let result = eval_expr("Range(r)", &ctx).expect("Range should evaluate on record");
@@ -8990,7 +8991,7 @@ IN
         // Range of an empty function is the empty set
         let func = TlaValue::Function(Arc::new(BTreeMap::new()));
 
-        let state = TlaState::from([("f".to_string(), func)]);
+        let state = tla_state([("f", func)]);
         let ctx = EvalContext::new(&state);
 
         let result = eval_expr("Range(f)", &ctx).expect("Range should evaluate on empty function");
@@ -9008,7 +9009,7 @@ IN
             (TlaValue::Int(2), TlaValue::Int(200)),
         ])));
 
-        let state = TlaState::from([("f".to_string(), func)]);
+        let state = tla_state([("f", func)]);
         let ctx = EvalContext::new(&state);
 
         let compiled = compile_expr("Range(f)");
@@ -9107,7 +9108,7 @@ IN
             TlaValue::Int(1),
             TlaValue::Int(3),
         )])));
-        let state = TlaState::from([("c1".to_string(), current)]);
+        let state = tla_state([("c1", current)]);
         let definitions = BTreeMap::new();
         let ctx = EvalContext::with_definitions_and_instances(&state, &definitions, &instances)
             .with_local_values(&[("c1'", next)]);
@@ -9198,7 +9199,7 @@ IN
                 is_recursive: false,
             },
         )]);
-        let state = TlaState::from([("x".to_string(), TlaValue::ModelValue("old".to_string()))]);
+        let state = tla_state([("x", TlaValue::ModelValue("old".to_string()))]);
         let ctx = EvalContext::with_definitions_and_instances(&state, &definitions, &instances);
         let action = crate::tla::compile_action_ir(&TlaDefinition {
             name: "RootNext".to_string(),
@@ -9400,7 +9401,7 @@ Buffer == INSTANCE RingBuffer
             "instance child should retain IndexOf"
         );
 
-        let state = TlaState::from([("Size".to_string(), TlaValue::Int(3))]);
+        let state = tla_state([("Size", TlaValue::Int(3))]);
         let ctx = EvalContext::with_definitions_and_instances(
             &state,
             &module.definitions,
@@ -9445,7 +9446,7 @@ Buffer == INSTANCE RingBuffer
         let signed_block = TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::ModelValue(
             "signed".to_string(),
         )])));
-        let seed_state = TlaState::from([("SignedBlock".to_string(), signed_block.clone())]);
+        let seed_state = tla_state([("SignedBlock", signed_block.clone())]);
         let seed_defs = BTreeMap::new();
         let seed_ctx =
             EvalContext::with_definitions_and_instances(&seed_state, &seed_defs, &instances);
@@ -9453,14 +9454,14 @@ Buffer == INSTANCE RingBuffer
 
         let hash_1 = TlaValue::ModelValue("h1".to_string());
         let hash_2 = TlaValue::ModelValue("h2".to_string());
-        let state = TlaState::from([
-            ("SignedBlock".to_string(), signed_block),
+        let state = tla_state([
+            ("SignedBlock", signed_block),
             (
-                "Hash".to_string(),
+                "Hash",
                 TlaValue::Set(Arc::new(BTreeSet::from([hash_1.clone(), hash_2.clone()]))),
             ),
             (
-                "hashFunction".to_string(),
+                "hashFunction",
                 TlaValue::Function(Arc::new(BTreeMap::from([
                     (hash_1.clone(), no_block.clone()),
                     (hash_2.clone(), no_block.clone()),
@@ -9520,8 +9521,8 @@ Buffer == INSTANCE RingBuffer
     #[test]
     fn enabled_supports_parameterized_action_calls() {
         let mut state = TlaState::new();
-        state.insert("x".to_string(), TlaValue::Int(1));
-        state.insert("y".to_string(), TlaValue::Int(2));
+        state.insert(Arc::from("x"), TlaValue::Int(1));
+        state.insert(Arc::from("y"), TlaValue::Int(2));
 
         let mut definitions = BTreeMap::new();
         definitions.insert(
@@ -9545,7 +9546,7 @@ Buffer == INSTANCE RingBuffer
 
     #[test]
     fn eval_action_body_supports_box_stuttering_formulas() {
-        let state = TlaState::from([("x".to_string(), TlaValue::Int(0))]);
+        let state = tla_state([("x", TlaValue::Int(0))]);
         let defs = BTreeMap::new();
         let ctx = EvalContext::with_definitions(&state, &defs);
 
@@ -9566,13 +9567,13 @@ Buffer == INSTANCE RingBuffer
 
     #[test]
     fn numeric_prefixed_identifiers_evaluate_as_identifiers() {
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "1bMessage".to_string(),
+                "1bMessage",
                 TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(1)]))),
             ),
             (
-                "2bMessage".to_string(),
+                "2bMessage",
                 TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(2)]))),
             ),
         ]);
@@ -9663,9 +9664,9 @@ Buffer == INSTANCE RingBuffer
 
     #[test]
     fn zero_arg_operator_primes_use_staged_next_state_bindings() {
-        let state = TlaState::from([
-            ("x".to_string(), TlaValue::Int(1)),
-            ("y".to_string(), TlaValue::Int(2)),
+        let state = tla_state([
+            ("x", TlaValue::Int(1)),
+            ("y", TlaValue::Int(2)),
         ]);
         let definitions = BTreeMap::from([
             (
@@ -9708,7 +9709,7 @@ Buffer == INSTANCE RingBuffer
 
     #[test]
     fn parameterized_operator_primes_use_staged_next_state_bindings() {
-        let state = TlaState::from([("x".to_string(), TlaValue::Int(1))]);
+        let state = tla_state([("x", TlaValue::Int(1))]);
         let definitions = BTreeMap::from([(
             "neutral".to_string(),
             TlaDefinition {

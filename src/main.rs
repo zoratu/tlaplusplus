@@ -16,6 +16,8 @@ use tlaplusplus::tla::{
     parse_stuttering_action_expr, parse_tla_config, parse_tla_module_file, restore_eval_budget,
     scan_module_closure, set_active_eval_budget, split_action_body_disjuncts, split_top_level,
 };
+#[cfg(test)]
+use tlaplusplus::tla::tla_state;
 use tlaplusplus::{EngineConfig, SimulationConfig, run_model, run_simulation};
 
 /// Parse human-readable byte sizes like "200GB", "10GiB", "512MB"
@@ -1388,7 +1390,7 @@ fn main() -> anyhow::Result<()> {
                         }
                         _ => {
                             if let Some(tv) = config_value_to_tla(v) {
-                                probe_state.insert(k.clone(), tv);
+                                probe_state.insert(Arc::from(k.as_str()), tv);
                             }
                         }
                     }
@@ -1406,12 +1408,12 @@ fn main() -> anyhow::Result<()> {
                             &parsed_module.instances,
                         );
                         if let Ok(value) = eval_expr(&ref_name, &ctx) {
-                            probe_state.insert(name, value);
+                            probe_state.insert(Arc::from(name.as_str()), value);
                             progress = true;
                         } else if let Some(value) =
                             representative_value_from_set_expr(&ref_name, &ctx)
                         {
-                            probe_state.insert(name, value);
+                            probe_state.insert(Arc::from(name.as_str()), value);
                             progress = true;
                         } else {
                             next_deferred.push((name, ref_name));
@@ -1467,7 +1469,7 @@ fn main() -> anyhow::Result<()> {
                         );
                         match eval_expr(&expr, &ctx) {
                             Ok(value) => {
-                                probe_state.insert(var, value);
+                                probe_state.insert(Arc::from(var.as_str()), value);
                                 probe_init_seeded += 1;
                                 progress = true;
                             }
@@ -1487,7 +1489,7 @@ fn main() -> anyhow::Result<()> {
                             Ok(set_val) => {
                                 // Pick a representative from the set
                                 if let Some(repr) = pick_representative_from_set(&set_val) {
-                                    probe_state.insert(var, repr);
+                                    probe_state.insert(Arc::from(var.as_str()), repr);
                                     probe_init_seeded += 1;
                                     progress = true;
                                 } else {
@@ -1499,7 +1501,7 @@ fn main() -> anyhow::Result<()> {
                                 if let Some(repr) =
                                     representative_value_from_set_expr(&set_expr, &ctx)
                                 {
-                                    probe_state.insert(var, repr);
+                                    probe_state.insert(Arc::from(var.as_str()), repr);
                                     probe_init_seeded += 1;
                                     progress = true;
                                 } else {
@@ -1528,7 +1530,7 @@ fn main() -> anyhow::Result<()> {
                 parsed_cfg.as_ref(),
             );
             for var in &parsed_module.variables {
-                probe_state.entry(var.clone()).or_insert(TlaValue::Int(0));
+                probe_state.entry(Arc::from(var.as_str())).or_insert(TlaValue::Int(0));
             }
             println!("probe_init_seeded={probe_init_seeded}");
             println!("probe_init_unresolved={probe_init_unresolved}");
@@ -2713,11 +2715,11 @@ fn seed_probe_state_from_membership_body(
         let mut next_pending = Vec::new();
         for (var, constraint) in pending {
             let ctx = build_probe_eval_context(probe_state, &module.definitions, &module.instances);
-            let current_constraint_status = probe_state.get(&var).and_then(|_| {
+            let current_constraint_status = probe_state.get(var.as_str()).and_then(|_| {
                 current_probe_value_satisfies_type_constraint(&var, &constraint, &ctx)
             });
             if let Some(repr) = representative_value_from_type_constraint(&constraint, &ctx) {
-                let should_update = match probe_state.get(&var) {
+                let should_update = match probe_state.get(var.as_str()) {
                     None => true,
                     Some(current) => match current_constraint_status {
                         Some(true) => {
@@ -2728,7 +2730,7 @@ fn seed_probe_state_from_membership_body(
                     },
                 };
                 if should_update {
-                    probe_state.insert(var, repr);
+                    probe_state.insert(Arc::from(var.as_str()), repr);
                     seeded += 1;
                     progress = true;
                 }
@@ -4242,7 +4244,7 @@ fn build_action_expr_probe_context<'a>(
     for clause in clauses {
         if let ActionClause::Unchanged { vars } = clause {
             for var in vars {
-                if let Some(value) = probe_state.get(var) {
+                if let Some(value) = probe_state.get(var.as_str()) {
                     locals_mut.insert(format!("{var}'"), value.clone());
                 }
             }
@@ -4266,13 +4268,13 @@ fn seed_nonempty_sequence_probe_locals(
     for var in find_sequence_accessed_vars(clauses) {
         if locals
             .get(&var)
-            .or_else(|| probe_state.get(&var))
+            .or_else(|| probe_state.get(var.as_str()))
             .is_some_and(|value| matches!(value, TlaValue::Seq(values) if !values.is_empty()))
         {
             continue;
         }
 
-        let Some(TlaValue::Seq(values)) = probe_state.get(&var) else {
+        let Some(TlaValue::Seq(values)) = probe_state.get(var.as_str()) else {
             continue;
         };
         if !values.is_empty() {
@@ -4849,7 +4851,7 @@ fn probe_action_body_via_runtime_eval(
                     .filter(|(var, value)| {
                         staged
                             .get(*var)
-                            .or_else(|| ctx.state.get(*var))
+                            .or_else(|| ctx.state.get(var.as_str()))
                             .is_none_or(|baseline| baseline != *value)
                     })
                     .count()
@@ -5336,7 +5338,7 @@ fn probe_action_clause_expr(
         ActionClause::Unchanged { vars } => {
             let locals_mut = std::rc::Rc::make_mut(&mut ctx.locals);
             for var in vars {
-                if let Some(value) = ctx.state.get(var) {
+                if let Some(value) = ctx.state.get(var.as_str()) {
                     locals_mut.insert(format!("{var}'"), value.clone());
                 }
             }
@@ -5436,7 +5438,7 @@ fn probe_stuttering_action_expr(
         .iter()
         .filter_map(|var| {
             ctx.state
-                .get(var)
+                .get(var.as_str())
                 .cloned()
                 .map(|value| (format!("{var}'"), value))
         })
@@ -5653,20 +5655,20 @@ Next ==
     }
 
     fn seed_braf_probe_state(module: &TlaModule) -> TlaState {
-        let mut probe_state = TlaState::from([
+        let mut probe_state = tla_state([
             (
-                "Symbols".to_string(),
+                "Symbols",
                 TlaValue::Set(Arc::new(BTreeSet::from([
                     TlaValue::ModelValue("A".to_string()),
                     TlaValue::ModelValue("B".to_string()),
                 ]))),
             ),
             (
-                "ArbitrarySymbol".to_string(),
+                "ArbitrarySymbol",
                 TlaValue::ModelValue("ArbitrarySymbol".to_string()),
             ),
-            ("BuffSz".to_string(), TlaValue::Int(2)),
-            ("MaxOffset".to_string(), TlaValue::Int(3)),
+            ("BuffSz", TlaValue::Int(2)),
+            ("MaxOffset", TlaValue::Int(3)),
         ]);
         let init_def = module.definitions.get("Init").expect("Init should exist");
         let mut pending_eq = Vec::new();
@@ -5696,7 +5698,7 @@ Next ==
                     build_probe_eval_context(&probe_state, &module.definitions, &module.instances);
                 match eval_expr(&expr, &ctx) {
                     Ok(value) => {
-                        probe_state.insert(var, value);
+                        probe_state.insert(Arc::from(var.as_str()), value);
                         progress = true;
                     }
                     Err(_) => next_pending_eq.push((var, expr)),
@@ -5710,7 +5712,7 @@ Next ==
                 match eval_expr(&set_expr, &ctx) {
                     Ok(set_val) => {
                         if let Some(repr) = pick_representative_from_set(&set_val) {
-                            probe_state.insert(var, repr);
+                            probe_state.insert(Arc::from(var.as_str()), repr);
                             progress = true;
                         } else {
                             next_pending_mem.push((var, set_expr));
@@ -5718,7 +5720,7 @@ Next ==
                     }
                     Err(_) => {
                         if let Some(repr) = representative_value_from_set_expr(&set_expr, &ctx) {
-                            probe_state.insert(var, repr);
+                            probe_state.insert(Arc::from(var.as_str()), repr);
                             progress = true;
                         } else {
                             next_pending_mem.push((var, set_expr));
@@ -5991,7 +5993,7 @@ INVARIANTS TypeOK
         // Test with model values (common in TLA+ specs)
         let mut state = TlaState::new();
         state.insert(
-            "N".to_string(),
+            Arc::from("N"),
             TlaValue::Set(Arc::new(
                 [
                     TlaValue::ModelValue("n1".to_string()),
@@ -6002,7 +6004,7 @@ INVARIANTS TypeOK
             )),
         );
         state.insert(
-            "R".to_string(),
+            Arc::from("R"),
             TlaValue::Set(Arc::new(
                 [TlaValue::Int(0), TlaValue::Int(1), TlaValue::Int(2)]
                     .into_iter()
@@ -6038,7 +6040,7 @@ INVARIANTS TypeOK
     fn seeds_probe_state_from_type_invariants() {
         let mut probe_state = TlaState::new();
         probe_state.insert(
-            "Readers".to_string(),
+            Arc::from("Readers"),
             TlaValue::Set(Arc::new(
                 [
                     TlaValue::ModelValue("r1".to_string()),
@@ -6097,7 +6099,7 @@ INVARIANTS TypeOK
     #[test]
     fn seeds_probe_state_from_subset_type_invariants() {
         let mut probe_state =
-            TlaState::from([("msgs".to_string(), TlaValue::Set(Arc::new(BTreeSet::new())))]);
+            tla_state([("msgs", TlaValue::Set(Arc::new(BTreeSet::new())))]);
         let module = TlaModule {
             name: "SubsetSeed".to_string(),
             path: String::new(),
@@ -6149,8 +6151,8 @@ INVARIANTS TypeOK
     fn seeds_probe_state_prefers_structured_function_values_from_type_invariants() {
         let proc_id = TlaValue::ModelValue("p1".to_string());
         let no_val = TlaValue::ModelValue("NoVal".to_string());
-        let mut probe_state = TlaState::from([(
-            "buf".to_string(),
+        let mut probe_state = tla_state([(
+            "buf",
             TlaValue::Function(Arc::new(BTreeMap::from([(
                 proc_id.clone(),
                 no_val.clone(),
@@ -6222,15 +6224,15 @@ INVARIANTS TypeOK
     fn seeds_probe_state_refines_placeholder_functions_even_when_placeholders_typecheck() {
         let proc_id = TlaValue::ModelValue("p1".to_string());
         let no_val = TlaValue::ModelValue("NoVal".to_string());
-        let mut probe_state = TlaState::from([
+        let mut probe_state = tla_state([
             (
-                "buf".to_string(),
+                "buf",
                 TlaValue::Function(Arc::new(BTreeMap::from([(
                     proc_id.clone(),
                     no_val.clone(),
                 )]))),
             ),
-            ("NoVal".to_string(), no_val),
+            ("NoVal", no_val),
         ]);
         let module = TlaModule {
             name: "BufSeed".to_string(),
@@ -6442,9 +6444,9 @@ INVARIANTS TypeOK
 
     #[test]
     fn type_invariant_seeding_preserves_initialized_functions_that_already_typecheck() {
-        let mut probe_state = TlaState::from([
+        let mut probe_state = tla_state([
             (
-                "Hash".to_string(),
+                "Hash",
                 TlaValue::Set(Arc::new(BTreeSet::from([
                     TlaValue::ModelValue("h1".to_string()),
                     TlaValue::ModelValue("h2".to_string()),
@@ -6452,11 +6454,11 @@ INVARIANTS TypeOK
                 ]))),
             ),
             (
-                "NoBlock".to_string(),
+                "NoBlock",
                 TlaValue::ModelValue("NoBlockVal".to_string()),
             ),
             (
-                "hashFunction".to_string(),
+                "hashFunction",
                 TlaValue::Function(Arc::new(BTreeMap::from([
                     (
                         TlaValue::ModelValue("h1".to_string()),
@@ -6538,7 +6540,7 @@ INVARIANTS TypeOK
                 TlaValue::ModelValue("NoBlockVal".to_string()),
             ),
         ])));
-        let mut probe_state = TlaState::from([("hashFunction".to_string(), expected.clone())]);
+        let mut probe_state = tla_state([("hashFunction", expected.clone())]);
         let module = TlaModule {
             name: "IndeterminateNanoLike".to_string(),
             path: String::new(),
@@ -6584,7 +6586,7 @@ INVARIANTS TypeOK
 
     #[test]
     fn indeterminate_type_constraints_can_upgrade_placeholder_values() {
-        let mut probe_state = TlaState::from([("hashFunction".to_string(), TlaValue::Int(0))]);
+        let mut probe_state = tla_state([("hashFunction", TlaValue::Int(0))]);
         let module = TlaModule {
             name: "IndeterminateNanoLike".to_string(),
             path: String::new(),
@@ -6702,30 +6704,30 @@ INVARIANTS TypeOK
             ("bal".to_string(), TlaValue::Int(1)),
             ("val".to_string(), TlaValue::ModelValue("v1".to_string())),
         ])));
-        let probe_state = TlaState::from([
+        let probe_state = tla_state([
             (
-                "maxBal".to_string(),
+                "maxBal",
                 TlaValue::Function(Arc::new(BTreeMap::from([(
                     acceptor.clone(),
                     TlaValue::Int(0),
                 )]))),
             ),
             (
-                "maxVBal".to_string(),
+                "maxVBal",
                 TlaValue::Function(Arc::new(BTreeMap::from([(
                     acceptor.clone(),
                     TlaValue::Int(0),
                 )]))),
             ),
             (
-                "maxVal".to_string(),
+                "maxVal",
                 TlaValue::Function(Arc::new(BTreeMap::from([(
                     acceptor.clone(),
                     TlaValue::ModelValue("None".to_string()),
                 )]))),
             ),
             (
-                "msgs".to_string(),
+                "msgs",
                 TlaValue::Set(Arc::new(BTreeSet::from([msg]))),
             ),
         ]);
@@ -7357,7 +7359,7 @@ INVARIANTS TypeInvariant
             .expect("initial state should exist");
         for (name, value) in &parsed_cfg.constants {
             if let Some(tv) = config_value_to_tla(value) {
-                probe_state.insert(name.clone(), tv);
+                probe_state.insert(Arc::from(name.as_str()), tv);
             }
         }
         for _ in 0..4 {
@@ -7366,7 +7368,7 @@ INVARIANTS TypeInvariant
                 let ConfigValue::OperatorRef(target_name) = value else {
                     continue;
                 };
-                if probe_state.contains_key(name) {
+                if probe_state.contains_key(name.as_str()) {
                     continue;
                 }
                 let ctx = build_probe_eval_context(
@@ -7376,7 +7378,7 @@ INVARIANTS TypeInvariant
                 );
                 let target_name = normalize_operator_ref_name(target_name);
                 if let Ok(resolved) = eval_expr(target_name, &ctx) {
-                    probe_state.insert(name.clone(), resolved);
+                    probe_state.insert(Arc::from(name.as_str()), resolved);
                     progress = true;
                 }
             }
@@ -7458,8 +7460,8 @@ INVARIANTS TypeInvariant
         let proc_id = TlaValue::ModelValue("p1".to_string());
         let adr = TlaValue::ModelValue("a1".to_string());
         let val = TlaValue::ModelValue("v1".to_string());
-        let probe_state = TlaState::from([(
-            "ctl".to_string(),
+        let probe_state = tla_state([(
+            "ctl",
             TlaValue::Function(Arc::new(BTreeMap::from([(
                 proc_id.clone(),
                 TlaValue::String("busy".to_string()),
@@ -7571,33 +7573,33 @@ INVARIANTS TypeInvariant
     fn cache_style_type_invariants_refine_alias_backed_buffers_for_action_probing() {
         let proc_id = TlaValue::ModelValue("p1".to_string());
         let no_val = TlaValue::ModelValue("NoVal".to_string());
-        let mut probe_state = TlaState::from([
+        let mut probe_state = tla_state([
             (
-                "wmem".to_string(),
+                "wmem",
                 TlaValue::Function(Arc::new(BTreeMap::from([(
                     TlaValue::ModelValue("a1".to_string()),
                     TlaValue::ModelValue("v1".to_string()),
                 )]))),
             ),
             (
-                "ctl".to_string(),
+                "ctl",
                 TlaValue::Function(Arc::new(BTreeMap::from([(
                     proc_id.clone(),
                     TlaValue::String("waiting".to_string()),
                 )]))),
             ),
             (
-                "buf".to_string(),
+                "buf",
                 TlaValue::Function(Arc::new(BTreeMap::from([(
                     proc_id.clone(),
                     no_val.clone(),
                 )]))),
             ),
             (
-                "memInt".to_string(),
+                "memInt",
                 TlaValue::Set(Arc::new(BTreeSet::new())),
             ),
-            ("NoVal".to_string(), no_val),
+            ("NoVal", no_val),
         ]);
         let module = TlaModule {
             name: "CacheProbe".to_string(),
@@ -7741,29 +7743,29 @@ INVARIANTS TypeInvariant
     #[test]
     fn paxos_style_type_invariants_seed_messages_for_phase2b_probe() {
         let acceptor = TlaValue::ModelValue("a1".to_string());
-        let mut probe_state = TlaState::from([
+        let mut probe_state = tla_state([
             (
-                "maxBal".to_string(),
+                "maxBal",
                 TlaValue::Function(Arc::new(BTreeMap::from([(
                     acceptor.clone(),
                     TlaValue::Int(-1),
                 )]))),
             ),
             (
-                "maxVBal".to_string(),
+                "maxVBal",
                 TlaValue::Function(Arc::new(BTreeMap::from([(
                     acceptor.clone(),
                     TlaValue::Int(-1),
                 )]))),
             ),
             (
-                "maxVal".to_string(),
+                "maxVal",
                 TlaValue::Function(Arc::new(BTreeMap::from([(
                     acceptor.clone(),
                     TlaValue::ModelValue("None".to_string()),
                 )]))),
             ),
-            ("msgs".to_string(), TlaValue::Set(Arc::new(BTreeSet::new()))),
+            ("msgs", TlaValue::Set(Arc::new(BTreeSet::new()))),
         ]);
         let module = TlaModule {
             name: "PaxosProbe".to_string(),
@@ -7939,8 +7941,8 @@ INVARIANTS TypeInvariant
     #[test]
     fn expr_probe_stages_primed_assignments_between_action_clauses() {
         let mut state = TlaState::new();
-        state.insert("big".to_string(), TlaValue::Int(2));
-        state.insert("small".to_string(), TlaValue::Int(3));
+        state.insert(Arc::from("big"), TlaValue::Int(2));
+        state.insert(Arc::from("small"), TlaValue::Int(3));
 
         let defs = BTreeMap::new();
         let def = TlaDefinition {
@@ -7985,8 +7987,8 @@ INVARIANTS TypeInvariant
     #[test]
     fn expr_probe_seeds_unchanged_vars_as_primed_bindings() {
         let mut state = TlaState::new();
-        state.insert("x".to_string(), TlaValue::Int(7));
-        state.insert("y".to_string(), TlaValue::Int(0));
+        state.insert(Arc::from("x"), TlaValue::Int(7));
+        state.insert(Arc::from("y"), TlaValue::Int(0));
 
         let defs = BTreeMap::new();
         let def = TlaDefinition {
@@ -8023,9 +8025,9 @@ INVARIANTS TypeInvariant
     #[test]
     fn expr_probe_stages_primes_from_nested_if_action_bodies() {
         let mut state = TlaState::new();
-        state.insert("flag".to_string(), TlaValue::Bool(true));
-        state.insert("count".to_string(), TlaValue::Int(1));
-        state.insert("announced".to_string(), TlaValue::Bool(false));
+        state.insert(Arc::from("flag"), TlaValue::Bool(true));
+        state.insert(Arc::from("count"), TlaValue::Int(1));
+        state.insert(Arc::from("announced"), TlaValue::Bool(false));
 
         let defs = BTreeMap::from([(
             "VictoryThreshold".to_string(),
@@ -8071,9 +8073,9 @@ INVARIANTS TypeInvariant
 
     #[test]
     fn expr_probe_evaluates_primed_zero_arg_operators_from_staged_bindings() {
-        let state = TlaState::from([
-            ("x".to_string(), TlaValue::Int(1)),
-            ("y".to_string(), TlaValue::Int(2)),
+        let state = tla_state([
+            ("x", TlaValue::Int(1)),
+            ("y", TlaValue::Int(2)),
         ]);
         let defs = BTreeMap::from([
             (
@@ -8130,8 +8132,8 @@ INVARIANTS TypeInvariant
     #[test]
     fn expr_probe_expands_nested_action_operator_calls() {
         let mut state = TlaState::new();
-        state.insert("x".to_string(), TlaValue::Int(1));
-        state.insert("y".to_string(), TlaValue::Int(0));
+        state.insert(Arc::from("x"), TlaValue::Int(1));
+        state.insert(Arc::from("y"), TlaValue::Int(0));
 
         let defs = BTreeMap::from([
             (
@@ -8176,19 +8178,19 @@ INVARIANTS TypeInvariant
 
     #[test]
     fn expr_probe_short_circuits_let_actions_before_invalid_local_defs() {
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "store".to_string(),
+                "store",
                 TlaValue::Function(Arc::new(BTreeMap::from([(
                     TlaValue::ModelValue("node1".to_string()),
                     TlaValue::Int(7),
                 )]))),
             ),
             (
-                "missing".to_string(),
+                "missing",
                 TlaValue::ModelValue("NoNode".to_string()),
             ),
-            ("x".to_string(), TlaValue::Int(0)),
+            ("x", TlaValue::Int(0)),
         ]);
         let def = TlaDefinition {
             name: "Disabled".to_string(),
@@ -8224,12 +8226,12 @@ INVARIANTS TypeInvariant
 
     #[test]
     fn expr_probe_skips_remaining_clauses_after_false_guard() {
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "signalled".to_string(),
+                "signalled",
                 TlaValue::Function(Arc::new(BTreeMap::<TlaValue, TlaValue>::new())),
             ),
-            ("light".to_string(), TlaValue::String("off".to_string())),
+            ("light", TlaValue::String("off".to_string())),
         ]);
         let defs = BTreeMap::from([(
             "NormalPrisoner".to_string(),
@@ -8283,9 +8285,9 @@ INVARIANTS TypeInvariant
 
     #[test]
     fn expr_probe_handles_top_level_let_action_with_multiple_assignments() {
-        let state = TlaState::from([
-            ("x".to_string(), TlaValue::Int(1)),
-            ("y".to_string(), TlaValue::Int(10)),
+        let state = tla_state([
+            ("x", TlaValue::Int(1)),
+            ("y", TlaValue::Int(10)),
         ]);
         let def = TlaDefinition {
             name: "Increment".to_string(),
@@ -8339,16 +8341,16 @@ INVARIANTS TypeInvariant
 
     #[test]
     fn expr_probe_handles_counter_action_style_multiline_if() {
-        let state = TlaState::from([
-            ("light".to_string(), TlaValue::String("on".to_string())),
-            ("count".to_string(), TlaValue::Int(2)),
-            ("VictoryThreshold".to_string(), TlaValue::Int(3)),
+        let state = tla_state([
+            ("light", TlaValue::String("on".to_string())),
+            ("count", TlaValue::Int(2)),
+            ("VictoryThreshold", TlaValue::Int(3)),
             (
-                "signalled".to_string(),
+                "signalled",
                 TlaValue::Function(Arc::new(BTreeMap::<TlaValue, TlaValue>::new())),
             ),
             (
-                "DesignatedCounter".to_string(),
+                "DesignatedCounter",
                 TlaValue::ModelValue("p1".to_string()),
             ),
         ]);
@@ -8429,34 +8431,34 @@ INVARIANTS TypeInvariant
             ),
         ])));
 
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "Elevator".to_string(),
+                "Elevator",
                 TlaValue::Set(Arc::new(BTreeSet::from([
                     elevator_1.clone(),
                     elevator_2.clone(),
                 ]))),
             ),
             (
-                "Floor".to_string(),
+                "Floor",
                 TlaValue::Set(Arc::new(BTreeSet::from([
                     TlaValue::Int(1),
                     TlaValue::Int(2),
                 ]))),
             ),
             (
-                "ElevatorState".to_string(),
+                "ElevatorState",
                 TlaValue::Function(Arc::new(BTreeMap::from([
                     (elevator_1.clone(), e1_state),
                     (elevator_2, e2_state),
                 ]))),
             ),
             (
-                "ActiveElevatorCalls".to_string(),
+                "ActiveElevatorCalls",
                 TlaValue::Set(Arc::new(BTreeSet::new())),
             ),
             (
-                "PersonState".to_string(),
+                "PersonState",
                 TlaValue::Function(Arc::new(BTreeMap::new())),
             ),
         ]);
@@ -8551,7 +8553,7 @@ INVARIANTS TypeInvariant
     fn infer_action_param_samples_from_next_exists_quantifiers() {
         let mut state = TlaState::new();
         state.insert(
-            "Boats".to_string(),
+            Arc::from("Boats"),
             TlaValue::Set(Arc::new(
                 [
                     TlaValue::ModelValue("leftBoat".to_string()),
@@ -8562,7 +8564,7 @@ INVARIANTS TypeInvariant
             )),
         );
         state.insert(
-            "Sides".to_string(),
+            Arc::from("Sides"),
             TlaValue::Set(Arc::new(
                 [
                     TlaValue::String("left".to_string()),
@@ -8604,8 +8606,8 @@ INVARIANTS TypeInvariant
     #[test]
     fn infer_action_param_samples_from_next_captures_boolean_arguments() {
         let proc = TlaValue::ModelValue("p1".to_string());
-        let state = TlaState::from([(
-            "Proc".to_string(),
+        let state = tla_state([(
+            "Proc",
             TlaValue::Set(Arc::new(BTreeSet::from([proc.clone()]))),
         )]);
         let defs = BTreeMap::from([(
@@ -8640,8 +8642,8 @@ INVARIANTS TypeInvariant
     #[test]
     fn infer_action_param_samples_from_next_handles_leading_conjunct_prefixes() {
         let proc = TlaValue::ModelValue("p1".to_string());
-        let state = TlaState::from([(
-            "Proc".to_string(),
+        let state = tla_state([(
+            "Proc",
             TlaValue::Set(Arc::new(BTreeSet::from([proc.clone()]))),
         )]);
         let defs = BTreeMap::from([(
@@ -8828,17 +8830,17 @@ INVARIANTS TypeInvariant
     #[test]
     fn action_expr_probe_seeds_boolean_params_used_in_nested_if_conditions() {
         let proc = TlaValue::ModelValue("p1".to_string());
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "Proc".to_string(),
+                "Proc",
                 TlaValue::Set(Arc::new(BTreeSet::from([proc.clone()]))),
             ),
             (
-                "nRcvdE".to_string(),
+                "nRcvdE",
                 TlaValue::Function(Arc::new(BTreeMap::from([(proc.clone(), TlaValue::Int(0))]))),
             ),
-            ("nSntE".to_string(), TlaValue::Int(0)),
-            ("nByz".to_string(), TlaValue::Int(1)),
+            ("nSntE", TlaValue::Int(0)),
+            ("nByz", TlaValue::Int(1)),
         ]);
         let clauses = vec![ActionClause::Guard {
             expr: "nRcvdE[i] < nSntE + (IF includeByz THEN nByz ELSE 0)".to_string(),
@@ -8864,7 +8866,7 @@ INVARIANTS TypeInvariant
     fn infer_action_param_samples_propagates_into_nested_action_calls() {
         let mut state = TlaState::new();
         state.insert(
-            "Workers".to_string(),
+            Arc::from("Workers"),
             TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::ModelValue(
                 "w1".to_string(),
             )]))),
@@ -9049,8 +9051,8 @@ INVARIANTS TypeInvariant
     fn build_action_expr_probe_context_refines_samples_from_function_domains() {
         let good = TlaValue::ModelValue("a1".to_string());
         let fake = TlaValue::ModelValue("fa1".to_string());
-        let state = TlaState::from([(
-            "knowsSent".to_string(),
+        let state = tla_state([(
+            "knowsSent",
             TlaValue::Function(Arc::new(BTreeMap::from([(
                 good.clone(),
                 TlaValue::Set(Arc::new(BTreeSet::new())),
@@ -9082,13 +9084,13 @@ INVARIANTS TypeInvariant
     #[test]
     fn build_action_expr_probe_context_seeds_sequence_heads_from_function_domains() {
         let car = TlaValue::ModelValue("r1".to_string());
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "WaitingBeforeBridge".to_string(),
+                "WaitingBeforeBridge",
                 TlaValue::Seq(Arc::new(Vec::new())),
             ),
             (
-                "Location".to_string(),
+                "Location",
                 TlaValue::Function(Arc::new(BTreeMap::from([(car.clone(), TlaValue::Int(8))]))),
             ),
         ]);
@@ -9109,13 +9111,13 @@ INVARIANTS TypeInvariant
     #[test]
     fn build_action_expr_probe_context_seeds_sequence_heads_from_direct_function_indexes() {
         let car = TlaValue::ModelValue("r1".to_string());
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "WaitingBeforeBridge".to_string(),
+                "WaitingBeforeBridge",
                 TlaValue::Seq(Arc::new(Vec::new())),
             ),
             (
-                "Location".to_string(),
+                "Location",
                 TlaValue::Function(Arc::new(BTreeMap::from([(car.clone(), TlaValue::Int(8))]))),
             ),
         ]);
@@ -9136,17 +9138,17 @@ INVARIANTS TypeInvariant
     #[test]
     fn build_action_expr_probe_context_seeds_sequence_heads_for_parsed_enter_bridge() {
         let car = TlaValue::ModelValue("r1".to_string());
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "WaitingBeforeBridge".to_string(),
+                "WaitingBeforeBridge",
                 TlaValue::Seq(Arc::new(Vec::new())),
             ),
             (
-                "Location".to_string(),
+                "Location",
                 TlaValue::Function(Arc::new(BTreeMap::from([(car.clone(), TlaValue::Int(8))]))),
             ),
             (
-                "CarsInBridge".to_string(),
+                "CarsInBridge",
                 TlaValue::Set(Arc::new(BTreeSet::new())),
             ),
         ]);
@@ -9240,7 +9242,7 @@ INVARIANTS TypeInvariant
     fn build_action_expr_probe_context_seeds_default_primed_state_bindings() {
         let mut state = TlaState::new();
         state.insert(
-            "rcvd".to_string(),
+            Arc::from("rcvd"),
             TlaValue::Function(Arc::new(BTreeMap::from([(
                 TlaValue::Int(1),
                 TlaValue::Set(Arc::new(BTreeSet::new())),
@@ -9256,7 +9258,7 @@ INVARIANTS TypeInvariant
 
     #[test]
     fn build_action_expr_probe_context_seeds_empty_sequences_used_by_head_or_tail() {
-        let state = TlaState::from([("AuthChannel".to_string(), TlaValue::Seq(Arc::new(vec![])))]);
+        let state = tla_state([("AuthChannel", TlaValue::Seq(Arc::new(vec![])))]);
         let defs = BTreeMap::new();
         let instances = BTreeMap::new();
         let clauses = vec![
@@ -9279,7 +9281,7 @@ INVARIANTS TypeInvariant
 
     #[test]
     fn build_action_expr_probe_context_seeds_record_elements_for_head_field_access() {
-        let state = TlaState::from([("FwCtlChannel".to_string(), TlaValue::Seq(Arc::new(vec![])))]);
+        let state = tla_state([("FwCtlChannel", TlaValue::Seq(Arc::new(vec![])))]);
         let defs = BTreeMap::new();
         let instances = BTreeMap::new();
         let clauses = vec![ActionClause::Guard {
@@ -9301,32 +9303,32 @@ INVARIANTS TypeInvariant
     fn sample_param_value_prefers_function_domains_and_integer_hints() {
         let mut state = TlaState::new();
         state.insert(
-            "Key".to_string(),
+            Arc::from("Key"),
             TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::ModelValue(
                 "k1".to_string(),
             )]))),
         );
         state.insert(
-            "TxId".to_string(),
+            Arc::from("TxId"),
             TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::ModelValue(
                 "t1".to_string(),
             )]))),
         );
         state.insert(
-            "Val".to_string(),
+            Arc::from("Val"),
             TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::ModelValue(
                 "v1".to_string(),
             )]))),
         );
         state.insert(
-            "signalled".to_string(),
+            Arc::from("signalled"),
             TlaValue::Function(Arc::new(BTreeMap::from([(
                 TlaValue::String("Bob".to_string()),
                 TlaValue::Int(0),
             )]))),
         );
         state.insert(
-            "pc".to_string(),
+            Arc::from("pc"),
             TlaValue::Function(Arc::new(BTreeMap::from([(
                 TlaValue::ModelValue("writer-1".to_string()),
                 TlaValue::String("Advance".to_string()),
@@ -9373,8 +9375,8 @@ INVARIANTS TypeInvariant
 
     #[test]
     fn sample_param_value_with_context_prefers_proc_sets_for_generic_p() {
-        let state = TlaState::from([(
-            "wmem".to_string(),
+        let state = tla_state([(
+            "wmem",
             TlaValue::Function(Arc::new(BTreeMap::from([(
                 TlaValue::ModelValue("a1".to_string()),
                 TlaValue::ModelValue("v1".to_string()),
@@ -9423,19 +9425,19 @@ INVARIANTS TypeInvariant
 
     #[test]
     fn representative_value_from_set_expr_handles_definition_backed_operator_calls() {
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "Symbols".to_string(),
+                "Symbols",
                 TlaValue::Set(Arc::new(BTreeSet::from([
                     TlaValue::ModelValue("A".to_string()),
                     TlaValue::ModelValue("B".to_string()),
                 ]))),
             ),
             (
-                "ArbitrarySymbol".to_string(),
+                "ArbitrarySymbol",
                 TlaValue::ModelValue("ArbitrarySymbol".to_string()),
             ),
-            ("BuffSz".to_string(), TlaValue::Int(2)),
+            ("BuffSz", TlaValue::Int(2)),
         ]);
         let defs = BTreeMap::from([
             (
@@ -9473,19 +9475,19 @@ INVARIANTS TypeInvariant
 
     #[test]
     fn infer_action_param_samples_handles_definition_backed_operator_call_domains() {
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "Symbols".to_string(),
+                "Symbols",
                 TlaValue::Set(Arc::new(BTreeSet::from([
                     TlaValue::ModelValue("A".to_string()),
                     TlaValue::ModelValue("B".to_string()),
                 ]))),
             ),
             (
-                "ArbitrarySymbol".to_string(),
+                "ArbitrarySymbol",
                 TlaValue::ModelValue("ArbitrarySymbol".to_string()),
             ),
-            ("MaxOffset".to_string(), TlaValue::Int(3)),
+            ("MaxOffset", TlaValue::Int(3)),
         ]);
         let defs = BTreeMap::from([
             (
@@ -9546,19 +9548,19 @@ INVARIANTS TypeInvariant
 
     #[test]
     fn braf_style_type_invariants_seed_booleans_and_array_records() {
-        let mut probe_state = TlaState::from([
+        let mut probe_state = tla_state([
             (
-                "Symbols".to_string(),
+                "Symbols",
                 TlaValue::Set(Arc::new(BTreeSet::from([
                     TlaValue::ModelValue("A".to_string()),
                     TlaValue::ModelValue("B".to_string()),
                 ]))),
             ),
             (
-                "ArbitrarySymbol".to_string(),
+                "ArbitrarySymbol",
                 TlaValue::ModelValue("ArbitrarySymbol".to_string()),
             ),
-            ("BuffSz".to_string(), TlaValue::Int(2)),
+            ("BuffSz", TlaValue::Int(2)),
         ]);
         let module = TlaModule {
             name: "BrafProbe".to_string(),
@@ -9755,20 +9757,20 @@ INVARIANTS TypeInvariant
     #[test]
     fn embedded_braf_file_init_and_typeok_seed_probe_state() {
         let module = parsed_braf_embedded_file_probe_module();
-        let mut probe_state = TlaState::from([
+        let mut probe_state = tla_state([
             (
-                "Symbols".to_string(),
+                "Symbols",
                 TlaValue::Set(Arc::new(BTreeSet::from([
                     TlaValue::ModelValue("A".to_string()),
                     TlaValue::ModelValue("B".to_string()),
                 ]))),
             ),
             (
-                "ArbitrarySymbol".to_string(),
+                "ArbitrarySymbol",
                 TlaValue::ModelValue("ArbitrarySymbol".to_string()),
             ),
-            ("BuffSz".to_string(), TlaValue::Int(2)),
-            ("MaxOffset".to_string(), TlaValue::Int(3)),
+            ("BuffSz", TlaValue::Int(2)),
+            ("MaxOffset", TlaValue::Int(3)),
         ]);
         let init_def = module.definitions.get("Init").expect("Init should exist");
         let mut pending_eq = Vec::new();
@@ -9798,7 +9800,7 @@ INVARIANTS TypeInvariant
                     build_probe_eval_context(&probe_state, &module.definitions, &module.instances);
                 match eval_expr(&expr, &ctx) {
                     Ok(value) => {
-                        probe_state.insert(var, value);
+                        probe_state.insert(Arc::from(var.as_str()), value);
                         progress = true;
                     }
                     Err(_) => next_pending_eq.push((var, expr)),
@@ -9812,7 +9814,7 @@ INVARIANTS TypeInvariant
                 match eval_expr(&set_expr, &ctx) {
                     Ok(set_val) => {
                         if let Some(repr) = pick_representative_from_set(&set_val) {
-                            probe_state.insert(var, repr);
+                            probe_state.insert(Arc::from(var.as_str()), repr);
                             progress = true;
                         } else {
                             next_pending_mem.push((var, set_expr));
@@ -9820,7 +9822,7 @@ INVARIANTS TypeInvariant
                     }
                     Err(_) => {
                         if let Some(repr) = representative_value_from_set_expr(&set_expr, &ctx) {
-                            probe_state.insert(var, repr);
+                            probe_state.insert(Arc::from(var.as_str()), repr);
                             progress = true;
                         } else {
                             next_pending_mem.push((var, set_expr));
@@ -9865,7 +9867,7 @@ INVARIANTS TypeInvariant
             .unwrap_or_default();
         for (name, value) in &parsed_cfg.constants {
             if let Some(tv) = config_value_to_tla(value) {
-                probe_state.insert(name.clone(), tv);
+                probe_state.insert(Arc::from(name.as_str()), tv);
             }
         }
 
@@ -9903,7 +9905,7 @@ INVARIANTS TypeInvariant
                     );
                     match eval_expr(&expr, &ctx) {
                         Ok(value) => {
-                            probe_state.insert(var, value);
+                            probe_state.insert(Arc::from(var.as_str()), value);
                             probe_init_seeded += 1;
                             progress = true;
                         }
@@ -9921,7 +9923,7 @@ INVARIANTS TypeInvariant
                     match eval_expr(&set_expr, &ctx) {
                         Ok(set_val) => {
                             if let Some(repr) = pick_representative_from_set(&set_val) {
-                                probe_state.insert(var, repr);
+                                probe_state.insert(Arc::from(var.as_str()), repr);
                                 probe_init_seeded += 1;
                                 progress = true;
                             } else {
@@ -9931,7 +9933,7 @@ INVARIANTS TypeInvariant
                         Err(_) => {
                             if let Some(repr) = representative_value_from_set_expr(&set_expr, &ctx)
                             {
-                                probe_state.insert(var, repr);
+                                probe_state.insert(Arc::from(var.as_str()), repr);
                                 probe_init_seeded += 1;
                                 progress = true;
                             } else {
@@ -9969,12 +9971,12 @@ INVARIANTS TypeInvariant
 
     #[test]
     fn init_membership_seeding_handles_definition_backed_operator_calls() {
-        let mut probe_state = TlaState::from([
+        let mut probe_state = tla_state([
             (
-                "ArbitrarySymbol".to_string(),
+                "ArbitrarySymbol",
                 TlaValue::ModelValue("ArbitrarySymbol".to_string()),
             ),
-            ("BuffSz".to_string(), TlaValue::Int(2)),
+            ("BuffSz", TlaValue::Int(2)),
         ]);
         let defs = BTreeMap::from([(
             "Array".to_string(),
@@ -9990,7 +9992,7 @@ INVARIANTS TypeInvariant
 
         let repr = representative_value_from_set_expr("Array({ArbitrarySymbol}, BuffSz)", &ctx)
             .expect("init membership representative should be synthesized");
-        probe_state.insert("buff".to_string(), repr);
+        probe_state.insert(Arc::from("buff"), repr);
 
         assert!(matches!(probe_state.get("buff"), Some(TlaValue::Record(_))));
     }
@@ -10079,10 +10081,10 @@ INVARIANTS TypeInvariant
 
     #[test]
     fn probe_action_call_binds_primed_instance_substitutions() {
-        let state = TlaState::from([
-            ("x".to_string(), TlaValue::Int(0)),
+        let state = tla_state([
+            ("x", TlaValue::Int(0)),
             (
-                "c1".to_string(),
+                "c1",
                 TlaValue::Function(Arc::new(BTreeMap::from([(
                     TlaValue::Int(1),
                     TlaValue::Int(0),
@@ -10129,10 +10131,10 @@ INVARIANTS TypeInvariant
 
     #[test]
     fn probe_action_call_applies_function_valued_instance_substitutions_from_outer_defs() {
-        let state = TlaState::from([
-            ("x".to_string(), TlaValue::Int(0)),
+        let state = tla_state([
+            ("x", TlaValue::Int(0)),
             (
-                "c1".to_string(),
+                "c1",
                 TlaValue::Function(Arc::new(BTreeMap::from([(
                     TlaValue::String("j1".to_string()),
                     TlaValue::Int(0),
@@ -10377,10 +10379,10 @@ INVARIANTS TypeInvariant
             ),
         ]);
 
-        let mut probe_state = TlaState::from([
-            ("Goal".to_string(), TlaValue::Int(4)),
+        let mut probe_state = tla_state([
+            ("Goal", TlaValue::Int(4)),
             (
-                "Capacities".to_string(),
+                "Capacities",
                 TlaValue::Seq(Arc::new(vec![capacity_1, capacity_2])),
             ),
         ]);
@@ -10410,7 +10412,7 @@ INVARIANTS TypeInvariant
                 let ctx = build_probe_eval_context(&probe_state, &defs, &instances);
                 match eval_expr(&expr, &ctx) {
                     Ok(value) => {
-                        probe_state.insert(var, value);
+                        probe_state.insert(Arc::from(var.as_str()), value);
                         progress = true;
                     }
                     Err(_) => next_pending_eq.push((var, expr)),
@@ -10423,7 +10425,7 @@ INVARIANTS TypeInvariant
                 match eval_expr(&set_expr, &ctx) {
                     Ok(set_val) => {
                         if let Some(repr) = pick_representative_from_set(&set_val) {
-                            probe_state.insert(var, repr);
+                            probe_state.insert(Arc::from(var.as_str()), repr);
                             progress = true;
                         } else {
                             next_pending_mem.push((var, set_expr));
@@ -10468,10 +10470,10 @@ INVARIANTS TypeInvariant
 
     #[test]
     fn existential_guard_without_witness_disables_following_clauses() {
-        let state = TlaState::from([
-            ("aCounter".to_string(), TlaValue::Int(0)),
+        let state = tla_state([
+            ("aCounter", TlaValue::Int(0)),
             (
-                "aSession".to_string(),
+                "aSession",
                 TlaValue::Set(Arc::new(BTreeSet::new())),
             ),
         ]);
@@ -10499,7 +10501,7 @@ INVARIANTS TypeInvariant
 
     #[test]
     fn empty_primed_membership_disables_following_clauses() {
-        let state = TlaState::from([("now".to_string(), TlaValue::Int(3))]);
+        let state = tla_state([("now", TlaValue::Int(3))]);
         let defs = BTreeMap::from([(
             "Real".to_string(),
             TlaDefinition {
@@ -10532,13 +10534,13 @@ INVARIANTS TypeInvariant
 
     #[test]
     fn helper_action_with_empty_sequence_precondition_gap_is_probeable() {
-        let state = TlaState::from([
-            ("AuthChannel".to_string(), TlaValue::Seq(Arc::new(vec![]))),
+        let state = tla_state([
+            ("AuthChannel", TlaValue::Seq(Arc::new(vec![]))),
             (
-                "ReplaySession".to_string(),
+                "ReplaySession",
                 TlaValue::Set(Arc::new(BTreeSet::new())),
             ),
-            ("ReplayCount".to_string(), TlaValue::Int(0)),
+            ("ReplayCount", TlaValue::Int(0)),
         ]);
         let defs = BTreeMap::from([(
             "SDPSvrAntiReplayAtk".to_string(),
@@ -10573,7 +10575,7 @@ INVARIANTS TypeInvariant
 
     #[test]
     fn probe_action_clause_expr_supports_box_stuttering_formulas() {
-        let state = TlaState::from([("x".to_string(), TlaValue::Int(0))]);
+        let state = tla_state([("x", TlaValue::Int(0))]);
         let defs = BTreeMap::new();
         let instances = BTreeMap::new();
         let clauses = vec![ActionClause::Guard {
@@ -10632,8 +10634,8 @@ INVARIANTS TypeInvariant
     #[test]
     fn expr_probe_expands_exists_action_clauses() {
         let mut state = TlaState::new();
-        state.insert("x".to_string(), TlaValue::Int(0));
-        state.insert("y".to_string(), TlaValue::Int(0));
+        state.insert(Arc::from("x"), TlaValue::Int(0));
+        state.insert(Arc::from("y"), TlaValue::Int(0));
 
         let defs = BTreeMap::from([
             (
@@ -10679,8 +10681,8 @@ INVARIANTS TypeInvariant
     #[test]
     fn expr_probe_expands_exists_action_clauses_with_disjunctions() {
         let mut state = TlaState::new();
-        state.insert("x".to_string(), TlaValue::Int(0));
-        state.insert("y".to_string(), TlaValue::Int(0));
+        state.insert(Arc::from("x"), TlaValue::Int(0));
+        state.insert(Arc::from("y"), TlaValue::Int(0));
 
         let defs = BTreeMap::from([(
             "Choice".to_string(),
@@ -10763,9 +10765,9 @@ INVARIANTS TypeInvariant
         let rm1 = TlaValue::ModelValue("rm1".to_string());
         let rm2 = TlaValue::ModelValue("rm2".to_string());
         let rm3 = TlaValue::ModelValue("rm3".to_string());
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "rmState".to_string(),
+                "rmState",
                 TlaValue::Function(Arc::new(BTreeMap::from([
                     (rm1.clone(), TlaValue::String("working".to_string())),
                     (rm2.clone(), TlaValue::String("working".to_string())),
@@ -10773,11 +10775,11 @@ INVARIANTS TypeInvariant
                 ]))),
             ),
             (
-                "tmState".to_string(),
+                "tmState",
                 TlaValue::String("commit".to_string()),
             ),
             (
-                "pc".to_string(),
+                "pc",
                 TlaValue::Function(Arc::new(BTreeMap::from([
                     (rm1.clone(), TlaValue::String("RS".to_string())),
                     (rm2.clone(), TlaValue::String("RS".to_string())),
@@ -10876,19 +10878,19 @@ INVARIANTS TypeInvariant
         let rm1 = TlaValue::ModelValue("rm1".to_string());
         let rm2 = TlaValue::ModelValue("rm2".to_string());
         let rm3 = TlaValue::ModelValue("rm3".to_string());
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "RM".to_string(),
+                "RM",
                 TlaValue::Set(Arc::new(BTreeSet::from([
                     rm1.clone(),
                     rm2.clone(),
                     rm3.clone(),
                 ]))),
             ),
-            ("RMMAYFAIL".to_string(), TlaValue::Bool(true)),
-            ("TMMAYFAIL".to_string(), TlaValue::Bool(false)),
+            ("RMMAYFAIL", TlaValue::Bool(true)),
+            ("TMMAYFAIL", TlaValue::Bool(false)),
             (
-                "rmState".to_string(),
+                "rmState",
                 TlaValue::Function(Arc::new(BTreeMap::from([
                     (rm1.clone(), TlaValue::String("working".to_string())),
                     (rm2.clone(), TlaValue::String("working".to_string())),
@@ -10896,11 +10898,11 @@ INVARIANTS TypeInvariant
                 ]))),
             ),
             (
-                "tmState".to_string(),
+                "tmState",
                 TlaValue::String("commit".to_string()),
             ),
             (
-                "pc".to_string(),
+                "pc",
                 TlaValue::Function(Arc::new(BTreeMap::from([
                     (TlaValue::Int(0), TlaValue::String("TS".to_string())),
                     (TlaValue::Int(10), TlaValue::String("BTS".to_string())),
@@ -10951,28 +10953,28 @@ INVARIANTS TypeInvariant
         let rm1 = TlaValue::ModelValue("rm1".to_string());
         let rm2 = TlaValue::ModelValue("rm2".to_string());
         let rm3 = TlaValue::ModelValue("rm3".to_string());
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "RM".to_string(),
+                "RM",
                 TlaValue::Set(Arc::new(BTreeSet::from([
                     rm1.clone(),
                     rm2.clone(),
                     rm3.clone(),
                 ]))),
             ),
-            ("RMMAYFAIL".to_string(), TlaValue::Bool(true)),
-            ("TMMAYFAIL".to_string(), TlaValue::Bool(true)),
+            ("RMMAYFAIL", TlaValue::Bool(true)),
+            ("TMMAYFAIL", TlaValue::Bool(true)),
             (
-                "rmState".to_string(),
+                "rmState",
                 TlaValue::Function(Arc::new(BTreeMap::from([
                     (rm1.clone(), TlaValue::String("working".to_string())),
                     (rm2.clone(), TlaValue::String("working".to_string())),
                     (rm3.clone(), TlaValue::String("working".to_string())),
                 ]))),
             ),
-            ("tmState".to_string(), TlaValue::String("init".to_string())),
+            ("tmState", TlaValue::String("init".to_string())),
             (
-                "pc".to_string(),
+                "pc",
                 TlaValue::Function(Arc::new(BTreeMap::from([
                     (TlaValue::Int(0), TlaValue::String("TS".to_string())),
                     (TlaValue::Int(10), TlaValue::String("BTS".to_string())),
