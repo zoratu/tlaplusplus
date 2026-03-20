@@ -9,6 +9,7 @@ pub mod module;
 pub mod scan;
 pub mod temporal;
 pub mod value;
+pub mod var_table;
 
 pub use action_exec::{
     NextBranchProbe, count_next_disjuncts, evaluate_next_states, evaluate_next_states_labeled,
@@ -36,4 +37,4 @@ pub use formula::{
 pub use module::{TlaDefinition, TlaModule, parse_tla_module_file, parse_tla_module_text};
 pub use scan::{ModuleScan, ScanAggregate, scan_module_closure};
 pub use temporal::TemporalFormula;
-pub use value::{TlaState, TlaValue};
+pub use value::{TlaState, TlaValue, tla_state};

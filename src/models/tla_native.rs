@@ -11,6 +11,8 @@ use crate::tla::{
     looks_like_action, normalize_operator_ref_name, parse_tla_config, parse_tla_module_file,
     split_top_level,
 };
+#[cfg(test)]
+use crate::tla::tla_state;
 use anyhow::{Context, Result, anyhow};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
@@ -443,7 +445,10 @@ impl TlaModel {
         } else {
             // No view defined - return full state as a value
             // Convert state to TlaValue::Record
-            let record: BTreeMap<String, TlaValue> = state.clone();
+            let record: BTreeMap<String, TlaValue> = state
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect();
             Ok(TlaValue::Record(Arc::new(record)))
         }
     }
@@ -1127,7 +1132,7 @@ fn evaluate_init_states(
             }
             _ => {
                 if let Some(tv) = config_value_to_tla(v) {
-                    base_state.insert(k.clone(), tv);
+                    base_state.insert(Arc::from(k.as_str()), tv);
                 }
             }
         }
@@ -1147,7 +1152,7 @@ fn evaluate_init_states(
             );
             match eval_expr(&ref_name, &ctx) {
                 Ok(value) => {
-                    base_state.insert(name, value);
+                    base_state.insert(Arc::from(name.as_str()), value);
                     progress = true;
                 }
                 Err(_) => next_deferred.push((name, ref_name)),
@@ -1196,7 +1201,7 @@ fn evaluate_init_states(
             );
             match eval_expr(&expr, &ctx) {
                 Ok(value) => {
-                    base_state.insert(var, value);
+                    base_state.insert(Arc::from(var.as_str()), value);
                     progress = true;
                 }
                 Err(_) => next_pending.push((var, expr)),
@@ -1251,7 +1256,7 @@ fn evaluate_init_states(
         for state in states {
             for value in &values {
                 let mut new_state = state.clone();
-                new_state.insert(var.clone(), value.clone());
+                new_state.insert(Arc::from(var.as_str()), value.clone());
                 new_states.push(new_state);
             }
         }
@@ -1298,7 +1303,7 @@ fn evaluate_init_states(
 
         if all_guards_pass {
             // Verify all variables are assigned
-            let all_assigned = module.variables.iter().all(|v| state.contains_key(v));
+            let all_assigned = module.variables.iter().all(|v| state.contains_key(v.as_str()));
             if all_assigned {
                 valid_states.push(state);
             }
@@ -1316,7 +1321,7 @@ fn evaluate_init_states(
         let missing: Vec<_> = module
             .variables
             .iter()
-            .filter(|v| !base_state_for_error.contains_key(*v))
+            .filter(|v| !base_state_for_error.contains_key(v.as_str()))
             .collect();
         if !missing.is_empty() {
             return Err(anyhow!(
@@ -1641,7 +1646,7 @@ Spec == Init /\ [][Next]_x
         assert!(model.allow_deadlock);
 
         // State x=3 should be deadlocked (x < 3 is false)
-        let deadlock_state = BTreeMap::from([("x".to_string(), TlaValue::Int(3))]);
+        let deadlock_state = tla_state([("x", TlaValue::Int(3))]);
         let mut next = Vec::new();
         model.next_states(&deadlock_state, &mut next);
         // With allow_deadlock, should return empty vec (no successors) without panic
