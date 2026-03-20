@@ -173,6 +173,51 @@ pub fn evaluate_next_states_with_instances(
     Ok(out)
 }
 
+/// Count the number of Next action disjuncts without evaluating them.
+pub fn count_next_disjuncts(next_body: &str) -> usize {
+    split_action_disjuncts(next_body).len()
+}
+
+/// Evaluate next states using only the specified subset of disjuncts (swarm mode).
+///
+/// `enabled_indices` lists which disjunct indices to evaluate. Disjuncts not in
+/// this list are skipped entirely. This implements the core swarm testing idea:
+/// each simulation trace randomly omits some actions, creating configuration
+/// diversity that explores different parts of the state space.
+pub fn evaluate_next_states_swarm(
+    next_body: &str,
+    definitions: &BTreeMap<String, TlaDefinition>,
+    instances: Option<&BTreeMap<String, TlaModuleInstance>>,
+    state: &TlaState,
+    enabled_indices: &[usize],
+) -> Result<Vec<TlaState>> {
+    let disjuncts = split_action_disjuncts(next_body);
+    let mut out = Vec::new();
+    let mut last_error = None;
+    for &idx in enabled_indices {
+        if idx >= disjuncts.len() {
+            continue;
+        }
+        match execute_branch(
+            disjuncts[idx].trim(),
+            &BTreeMap::new(),
+            definitions,
+            instances,
+            state,
+        ) {
+            Ok(successors) => out.extend(successors),
+            Err(err) => {
+                last_error = Some(err);
+            }
+        }
+    }
+    // Only propagate errors if we had a single enabled disjunct that failed
+    if out.is_empty() && last_error.is_some() && enabled_indices.len() == 1 {
+        return Err(last_error.unwrap());
+    }
+    Ok(out)
+}
+
 /// Evaluate next states with action labels for fairness checking
 ///
 /// This version tracks which action (disjunct) generated each successor state,

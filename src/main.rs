@@ -298,6 +298,11 @@ enum Command {
         /// Random seed for simulation (0 = system entropy)
         #[arg(long, default_value_t = 0)]
         simulate_seed: u64,
+        /// Enable swarm testing: randomly disable Next disjuncts per simulation trace.
+        /// Based on "Swarm Testing" (Groce et al., ISSTA 2012).
+        /// Only effective with --simulate.
+        #[arg(long, default_value_t = false)]
+        swarm: bool,
         /// Enable action coverage profiling
         #[arg(long, default_value_t = false)]
         coverage: bool,
@@ -1665,6 +1670,7 @@ fn main() -> anyhow::Result<()> {
             simulate_depth,
             simulate_traces,
             simulate_seed,
+            swarm,
             coverage,
             dump,
             difftrace,
@@ -1718,6 +1724,7 @@ fn main() -> anyhow::Result<()> {
                     depth: simulate_depth,
                     num_traces: simulate_traces,
                     seed: simulate_seed,
+                    swarm,
                 };
                 let max_violations = runtime.max_violations;
                 println!(
