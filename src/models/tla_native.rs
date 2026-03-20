@@ -2,16 +2,17 @@ use crate::fairness::{FairnessConstraint, LabeledTransition};
 use crate::model::Model;
 use crate::symmetry::{SymmetrySpec, canonicalize_tla_state};
 use crate::tla::module::TlaModuleInstance;
-#[cfg(test)]
-use crate::tla::tla_state;
 use crate::tla::{
     ClauseKind, CompiledActionIr, CompiledExpr, ConfigValue, EvalContext, TemporalFormula,
     TlaConfig, TlaDefinition, TlaModule, TlaState, TlaValue, classify_clause, compile_action_ir,
-    compile_expr, count_next_disjuncts, eval_action_constraint, eval_compiled, eval_expr,
-    evaluate_next_states_labeled_with_instances, evaluate_next_states_swarm,
-    evaluate_next_states_with_instances, insert_compiled_action, looks_like_action,
-    normalize_operator_ref_name, parse_tla_config, parse_tla_module_file, split_top_level,
+    compile_expr, eval_action_constraint, eval_compiled, eval_expr,
+    count_next_disjuncts, evaluate_next_states_labeled_with_instances,
+    evaluate_next_states_swarm, evaluate_next_states_with_instances, insert_compiled_action,
+    looks_like_action, normalize_operator_ref_name, parse_tla_config, parse_tla_module_file,
+    split_top_level,
 };
+#[cfg(test)]
+use crate::tla::tla_state;
 use anyhow::{Context, Result, anyhow};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
@@ -1120,11 +1121,8 @@ fn evaluate_init_states(
         }
     }
 
-    // Constants from config go into a context map (NOT the state).
-    // Only VARIABLES should be in the state — constants are resolved
-    // during expression evaluation via EvalContext definitions.
+    // Start with constants from config
     let mut base_state = BTreeMap::new();
-    let mut constant_bindings: BTreeMap<Arc<str>, TlaValue> = BTreeMap::new();
     let mut deferred_operator_refs = Vec::new();
     for (k, v) in &cfg.constants {
         match v {
@@ -1134,7 +1132,7 @@ fn evaluate_init_states(
             }
             _ => {
                 if let Some(tv) = config_value_to_tla(v) {
-                    constant_bindings.insert(Arc::from(k.as_str()), tv);
+                    base_state.insert(Arc::from(k.as_str()), tv);
                 }
             }
         }
@@ -1147,16 +1145,14 @@ fn evaluate_init_states(
         let mut progress = false;
         let mut next_deferred = Vec::new();
         for (name, ref_name) in deferred_operator_refs {
-            // Use constant_bindings as the evaluation state so constants
-            // can reference each other during resolution
             let ctx = EvalContext::with_definitions_and_instances(
-                &constant_bindings,
+                &base_state,
                 &definition_scope,
                 &module.instances,
             );
             match eval_expr(&ref_name, &ctx) {
                 Ok(value) => {
-                    constant_bindings.insert(Arc::from(name.as_str()), value);
+                    base_state.insert(Arc::from(name.as_str()), value);
                     progress = true;
                 }
                 Err(_) => next_deferred.push((name, ref_name)),
@@ -1167,15 +1163,6 @@ fn evaluate_init_states(
             break;
         }
         deferred_operator_refs = next_deferred;
-    }
-
-    // Make constants available during Init evaluation by adding them
-    // to the EvalContext state (they'll be stripped from the final
-    // state before returning — only VARIABLES remain in the state).
-    // This is needed because Init expressions reference constants
-    // like `[n \in Node |-> 0]` where Node is a constant.
-    for (k, v) in &constant_bindings {
-        base_state.insert(k.clone(), v.clone());
     }
 
     // Classify all clauses
@@ -1316,23 +1303,11 @@ fn evaluate_init_states(
 
         if all_guards_pass {
             // Verify all variables are assigned
-            let all_assigned = module
-                .variables
-                .iter()
-                .all(|v| state.contains_key(v.as_str()));
+            let all_assigned = module.variables.iter().all(|v| state.contains_key(v.as_str()));
             if all_assigned {
                 valid_states.push(state);
             }
         }
-    }
-
-    // Strip constants from states — only VARIABLES should remain.
-    // Constants were added to base_state for Init evaluation but
-    // must not be part of the model state (TLC doesn't include them).
-    let variable_set: std::collections::HashSet<&str> =
-        module.variables.iter().map(|v| v.as_str()).collect();
-    for state in &mut valid_states {
-        state.retain(|k, _| variable_set.contains(k.as_ref()));
     }
 
     if valid_states.is_empty() {
