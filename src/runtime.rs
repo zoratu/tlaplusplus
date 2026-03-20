@@ -3143,7 +3143,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Work-stealing queues don't persist state to disk; checkpoint/resume requires DiskBackedQueue
+    #[ignore = "checkpoint/resume requires DiskBackedQueue; work-stealing queues use in-memory deques that cannot be serialized to disk"]
     fn resumes_from_disk_queue_checkpoint() -> Result<()> {
         let work_dir = temp_work_dir("resume");
 

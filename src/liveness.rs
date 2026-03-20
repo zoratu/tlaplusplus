@@ -113,8 +113,10 @@ impl LivenessChecker {
             }
 
             TemporalFormula::WeakFairness { .. } | TemporalFormula::StrongFairness { .. } => {
-                // Fairness requires action/transition information, not just states
-                // TODO: Implement when we have transition-level trace
+                // Fairness is checked via SCC-based analysis in the runtime
+                // (see fairness.rs check_fairness_on_scc), not on finite traces.
+                // Finite traces lack the transition labels needed for WF/SF checks.
+                // Returning Ok here is correct: fairness is not violated on a prefix.
                 Ok(())
             }
 
@@ -208,7 +210,9 @@ impl LivenessChecker {
             }
         }
 
-        // TODO: Proper cycle detection to verify P holds in cycle
+        // Cycle detection for []<> is handled by the SCC-based liveness checker
+        // in the runtime (see fairness.rs). For finite traces, we can only check
+        // that P held at least once; full []<> verification requires the state graph.
         if count == 0 {
             return Err("Property never held in trace".to_string());
         }
