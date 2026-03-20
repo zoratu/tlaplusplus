@@ -4721,7 +4721,8 @@ fn split_top_level(expr: &str, delim: &str, keyword: bool) -> Vec<String> {
             // Check if we're at the start of LET keyword
             if expr[i..].starts_with("LET") {
                 let after_let = &expr[i + 3..];
-                if after_let.is_empty() || !after_let.chars().next().unwrap().is_alphanumeric() {
+                // invariant: is_empty() check above guarantees chars().next() is Some
+                if after_let.is_empty() || !after_let.chars().next().expect("non-empty string has no first char").is_alphanumeric() {
                     let_depth += 1;
                 }
             }
