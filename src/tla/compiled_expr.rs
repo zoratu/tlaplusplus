@@ -874,7 +874,7 @@ fn split_top_level(expr: &str, delim: &str) -> Vec<String> {
     let mut case_depth: usize = 0; // Track CASE expression nesting
     let mut quantifier_depth: usize = 0; // Track nested quantifier depth (not just boolean!)
     let mut quantifier_base_indent: Option<usize> = None; // Indentation of first quantifier's line
-    let mut __current_col: usize = 0; // Current column position
+    let mut _current_col: usize = 0; // Current column position
     let mut line_indent: usize = 0; // Indentation of current line (spaces at start)
     let mut at_line_start = true; // Are we at the start of a line (counting spaces)?
     let mut in_string = false;
