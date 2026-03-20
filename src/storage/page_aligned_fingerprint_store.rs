@@ -40,8 +40,10 @@ const MADV_DONTNEED: i32 = 4; // From linux/mman.h
 
 /// MADV_PAGEOUT - Linux 5.4+, asks kernel to page out (swap/writeback) the pages
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 const MADV_PAGEOUT: i32 = 21;
 #[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 const MADV_PAGEOUT: i32 = -1; // Not available
 
 /// Load factor threshold for triggering resize (75% - earlier to reduce contention)
@@ -431,10 +433,8 @@ impl FingerprintShard {
             std::ptr::write_bytes(new_table, 0, new_capacity);
         }
 
-        // Get old table info BEFORE marking resize in progress
+        // Get old table pointer BEFORE marking resize in progress
         let old_table = self.get_table();
-        let old_memory = self.memory.load(Ordering::Acquire);
-        let old_memory_size = self.memory_size.load(Ordering::Acquire);
 
         // Store old table for RCU-style reads during resize
         // Readers can check this table while resize is in progress

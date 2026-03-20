@@ -142,6 +142,7 @@ impl<'a> EvalContext<'a> {
         }
     }
 
+    #[allow(dead_code)]
     fn with_local_values(&self, values: &[(&str, TlaValue)]) -> Self {
         // Copy-on-write: only clone the locals map, reuse the rest
         let mut new_locals = (*self.locals).clone();
