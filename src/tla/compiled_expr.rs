@@ -410,6 +410,43 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
         return CompiledExpr::BooleanSet;
     }
 
+    // Infix operators used as higher-order values: +, -, *, \div, %
+    // In TLA+, these can be passed as operator arguments, e.g.
+    // FoldFunctionOnSet(+, 0, f, S). We compile them to Lambdas.
+    match expr {
+        "+" => {
+            return CompiledExpr::Lambda {
+                params: vec!["__a".to_string(), "__b".to_string()],
+                body: Box::new(CompiledExpr::Add(
+                    Box::new(CompiledExpr::Var("__a".to_string())),
+                    Box::new(CompiledExpr::Var("__b".to_string())),
+                )),
+                body_text: "__a + __b".to_string(),
+            };
+        }
+        "-" => {
+            return CompiledExpr::Lambda {
+                params: vec!["__a".to_string(), "__b".to_string()],
+                body: Box::new(CompiledExpr::Sub(
+                    Box::new(CompiledExpr::Var("__a".to_string())),
+                    Box::new(CompiledExpr::Var("__b".to_string())),
+                )),
+                body_text: "__a - __b".to_string(),
+            };
+        }
+        "*" => {
+            return CompiledExpr::Lambda {
+                params: vec!["__a".to_string(), "__b".to_string()],
+                body: Box::new(CompiledExpr::Mul(
+                    Box::new(CompiledExpr::Var("__a".to_string())),
+                    Box::new(CompiledExpr::Var("__b".to_string())),
+                )),
+                body_text: "__a * __b".to_string(),
+            };
+        }
+        _ => {}
+    }
+
     // Integer literal
     if let Ok(n) = expr.parse::<i64>() {
         return CompiledExpr::Int(n);
@@ -564,7 +601,14 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
         };
     }
 
-    // Arithmetic operators
+    // Set/sequence range: a..b (TLA+ precedence 9-9, lower than arithmetic)
+    // Must be parsed before +/- so that "0 .. N-1" parses as "0 .. (N-1)"
+    // rather than "(0 .. N) - 1".
+    if let Some((left, right)) = split_binary_op(expr, "..") {
+        return CompiledExpr::SetRange(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
+    }
+
+    // Arithmetic operators (TLA+ precedence: + is 10, - is 11, * is 13)
     if let Some((left, right)) = split_binary_op(expr, "+") {
         return CompiledExpr::Add(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
     }
@@ -670,11 +714,6 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
     // Higher precedence than @@, so parse it after set operations
     if let Some((left, right)) = split_binary_op(expr, ":>") {
         return CompiledExpr::FuncPair(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
-    }
-
-    // Set/sequence range: a..b
-    if let Some((left, right)) = split_binary_op(expr, "..") {
-        return CompiledExpr::SetRange(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
     }
 
     // Set literal: {a, b, c}
@@ -925,6 +964,16 @@ fn is_identifier(s: &str) -> bool {
 }
 
 fn split_top_level(expr: &str, delim: &str) -> Vec<String> {
+    // Delegate to the formula-level split_top_level which handles quantifier scoping
+    // correctly. The compiled_expr version previously used indentation-based sibling
+    // detection, but this broke when the expression was trimmed (losing the first
+    // line's indent). The formula version uses body-delimiter detection instead,
+    // which is more robust.
+    crate::tla::formula::split_top_level(expr, delim)
+}
+
+#[allow(dead_code)]
+fn split_top_level_old(expr: &str, delim: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
     let mut depth = 0;
@@ -1191,6 +1240,7 @@ fn split_binary_op<'a>(expr: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
     let mut let_depth = 0usize;
     let mut if_depth = 0usize; // Track IF...THEN nesting (protects conditions from split)
     let mut case_depth = 0usize; // Track CASE...[] nesting (arms contain = and ->)
+    let mut quantifier_depth = 0usize; // Track \A/\E quantifier body nesting
     let mut in_string = false;
     let chars: Vec<char> = expr.chars().collect();
     let op_chars: Vec<char> = op.chars().collect();
@@ -1258,13 +1308,41 @@ fn split_binary_op<'a>(expr: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
                 i += 4;
                 continue;
             }
-            // CASE expressions end at the end of the expression or when we hit
-            // a conjunction/disjunction at the same bracket level (but we don't
-            // track that here - just don't split inside CASE at all)
+            // Track quantifier bodies: \A x \in S : body or \E x \in S : body
+            // Operators inside the body should not be split at the top level.
+            if c == '\\' && i + 2 < chars.len() {
+                let next = chars[i + 1];
+                let after = chars[i + 2];
+                if (next == 'A' || next == 'E') && (after.is_whitespace() || after == '(') {
+                    // Found quantifier start - scan forward for the colon
+                    let mut j = i + 2;
+                    let mut inner_depth = 0i32;
+                    while j < chars.len() {
+                        match chars[j] {
+                            '(' | '[' | '{' => inner_depth += 1,
+                            ')' | ']' | '}' => inner_depth -= 1,
+                            ':' if inner_depth == 0 => {
+                                quantifier_depth += 1;
+                                i = j + 1;
+                                break;
+                            }
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    if j < chars.len() {
+                        continue;
+                    }
+                }
+            }
         }
 
         // Only split when at top level of all constructs
-        let at_top = bracket_depth == 0 && let_depth == 0 && if_depth == 0 && case_depth == 0;
+        let at_top = bracket_depth == 0
+            && let_depth == 0
+            && if_depth == 0
+            && case_depth == 0
+            && quantifier_depth == 0;
         if at_top && i + op_chars.len() <= chars.len() {
             // Check if operator matches
             let mut matches = true;
@@ -3472,5 +3550,82 @@ fn test_compile_unchanged_in_expression_context() {
             "UNCHANGED disjunct should be Bool(true), got: {:?}",
             parts[1]
         );
+    }
+}
+
+#[test]
+fn test_dotdot_has_lower_precedence_than_arithmetic() {
+    // "0 .. N-1" must parse as SetRange(0, Sub(N, 1))
+    // NOT as Sub(SetRange(0, N), 1)
+    let expr = compile_expr("0 .. N-1");
+    match &expr {
+        CompiledExpr::SetRange(lo, hi) => {
+            assert!(
+                matches!(**lo, CompiledExpr::Int(0)),
+                "low bound should be Int(0), got: {:?}",
+                lo
+            );
+            assert!(
+                matches!(**hi, CompiledExpr::Sub(_, _)),
+                "high bound should be Sub(N, 1), got: {:?}",
+                hi
+            );
+        }
+        other => panic!("expected SetRange, got: {:?}", other),
+    }
+
+    // "a+1 .. b-1" must parse as SetRange(Add(a,1), Sub(b,1))
+    let expr = compile_expr("a+1 .. b-1");
+    assert!(
+        matches!(expr, CompiledExpr::SetRange(_, _)),
+        "a+1 .. b-1 should be SetRange, got: {:?}",
+        expr
+    );
+    if let CompiledExpr::SetRange(lo, hi) = &expr {
+        assert!(
+            matches!(**lo, CompiledExpr::Add(_, _)),
+            "low bound should be Add, got: {:?}",
+            lo
+        );
+        assert!(
+            matches!(**hi, CompiledExpr::Sub(_, _)),
+            "high bound should be Sub, got: {:?}",
+            hi
+        );
+    }
+}
+
+#[test]
+fn test_txlifecycle_body_compiles_to_two_conjuncts() {
+    // Regression test: TxLifecycle invariant body from KeyValueStore spec.
+    // The body has two forall conjuncts that must be split correctly.
+    let body = r"    /\ \A t \in tx :
+        \A k \in Key : (store[k] /= snapshotStore[t][k] /\ k \notin written[t]) => k \in missed[t]
+    /\ \A t \in TxId \ tx :
+        /\ \A k \in Key : snapshotStore[t][k] = NoVal
+        /\ written[t] = {}
+        /\ missed[t] = {}";
+    let expr = compile_expr(body);
+    match &expr {
+        CompiledExpr::And(parts) => {
+            assert_eq!(
+                parts.len(),
+                2,
+                "Should have 2 conjuncts, got {}: {:?}",
+                parts.len(),
+                parts
+            );
+            assert!(
+                matches!(parts[0], CompiledExpr::Forall { .. }),
+                "First conjunct should be Forall, got: {:?}",
+                parts[0]
+            );
+            assert!(
+                matches!(parts[1], CompiledExpr::Forall { .. }),
+                "Second conjunct should be Forall, got: {:?}",
+                parts[1]
+            );
+        }
+        other => panic!("Expected And, got: {:?}", other),
     }
 }
