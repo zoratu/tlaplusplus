@@ -222,6 +222,16 @@ impl Model for TlaModel {
                 Ok(TlaValue::Bool(false)) => {
                     return Err(format!("invariant '{name}' violated"));
                 }
+                Ok(TlaValue::ModelValue(mv)) if mv == *name => {
+                    // The invariant name resolved to a ModelValue of itself,
+                    // meaning the definition was not found.  This typically
+                    // happens when the invariant is defined in an EXTENDS'd
+                    // module that could not be loaded.
+                    return Err(format!(
+                        "invariant '{name}' is not defined (not found in module \
+                         definitions or EXTENDS chain)"
+                    ));
+                }
                 Ok(other) => {
                     return Err(format!(
                         "invariant '{name}' did not evaluate to BOOLEAN: {other:?}"
@@ -500,16 +510,33 @@ fn resolve_invariant_exprs(module: &TlaModule, cfg: &TlaConfig) -> Vec<(String, 
     cfg.invariants
         .iter()
         .map(|inv| {
-            if let Some(def) = module.definitions.get(inv)
-                && def.params.is_empty()
-            {
+            if let Some(def) = module.definitions.get(inv) {
+                if def.params.is_empty() {
+                    if std::env::var("TLAPP_TRACE_INVARIANT").is_ok() {
+                        eprintln!(
+                            "=== Invariant '{}' body ===\n{}\n=== End ===",
+                            inv, def.body
+                        );
+                    }
+                    return (inv.clone(), def.body.clone());
+                }
+                // Parameterized definition used as invariant — treat the name
+                // as an identifier so the runtime evaluator can resolve it via
+                // the definition context (which turns it into a zero-arg call
+                // if the user really intended a constant).
+            } else {
+                // Definition not found in module — this can happen when the
+                // invariant is defined in an EXTENDS'd module that could not
+                // be loaded.  Fall through and use the name as the expression;
+                // the runtime evaluator will attempt to resolve it via
+                // ctx.definition().
                 if std::env::var("TLAPP_TRACE_INVARIANT").is_ok() {
                     eprintln!(
-                        "=== Invariant '{}' body ===\n{}\n=== End ===",
-                        inv, def.body
+                        "Warning: invariant '{}' not found in module definitions; \
+                         will attempt runtime resolution",
+                        inv
                     );
                 }
-                return (inv.clone(), def.body.clone());
             }
             (inv.clone(), inv.clone())
         })
