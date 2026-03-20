@@ -2139,6 +2139,26 @@ fn parse_base<'a>(
 
     if let Some((name, rest_after_name)) = parse_identifier_prefix(s) {
         let mut rest = rest_after_name;
+
+        // Strip PlusCal label prefix: "label:: expr" or "label(params):: expr"
+        // Labels are documentation-only in TLC — they don't affect evaluation.
+        {
+            let mut after_params = rest;
+            // Skip optional parameter list
+            if after_params.trim_start().starts_with('(') {
+                if let Ok((_, tail)) = take_bracket_group(after_params.trim_start(), '(', ')') {
+                    after_params = tail;
+                }
+            }
+            if let Some(body) = after_params.trim_start().strip_prefix("::") {
+                let body = body.trim_start();
+                if !body.is_empty() {
+                    // Re-parse from the body after the label
+                    return parse_base(body, ctx, depth);
+                }
+            }
+        }
+
         let has_runtime_value = ctx.runtime_value(&name).is_some();
         let operator_param_count = ctx.definition(&name).map(|def| def.params.len());
 

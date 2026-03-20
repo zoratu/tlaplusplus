@@ -389,6 +389,10 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
     // Strip outer parentheses
     let expr = strip_outer_parens(expr);
 
+    // Strip PlusCal label prefix: "label:: expr" or "label(x):: expr"
+    // Labels are documentation-only in TLC and don't affect evaluation.
+    let expr = strip_label_prefix(expr);
+
     // Literals
     if expr == "TRUE" {
         return CompiledExpr::Bool(true);
@@ -840,6 +844,61 @@ fn strip_outer_parens(expr: &str) -> &str {
     } else {
         expr
     }
+}
+
+/// Strip a PlusCal label prefix from an expression.
+///
+/// PlusCal-generated TLA+ specs include labels like `P0:: expr` or
+/// `lab(x):: expr`. Labels are documentation-only in TLC — they don't
+/// affect evaluation. This function strips the label and `::` and
+/// returns the remaining expression.
+fn strip_label_prefix(expr: &str) -> &str {
+    let s = expr.trim_start();
+    // A label starts with an identifier character
+    let first = match s.chars().next() {
+        Some(c) if c.is_alphabetic() || c == '_' => c,
+        _ => return expr,
+    };
+    // Find end of identifier
+    let id_end = 1 + s[first.len_utf8()..]
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .map(|c| c.len_utf8())
+        .sum::<usize>();
+    let after_id = &s[id_end..];
+    // Check for optional parameter list: (x) or (x, y)
+    let after_params = if after_id.starts_with('(') {
+        let mut depth = 0;
+        let mut end = 0;
+        for (i, c) in after_id.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if depth != 0 {
+            return expr;
+        }
+        &after_id[end..]
+    } else {
+        after_id
+    };
+    // Check for ::
+    let trimmed = after_params.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("::") {
+        let body = rest.trim_start();
+        if !body.is_empty() {
+            return body;
+        }
+    }
+    expr
 }
 
 fn is_identifier(s: &str) -> bool {
