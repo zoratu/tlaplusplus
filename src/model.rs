@@ -105,10 +105,10 @@ pub trait Model: Send + Sync + 'static {
     ///
     /// Default implementation uses standard hashing of the full state.
     fn fingerprint(&self, state: &Self::State) -> u64 {
-        use std::collections::hash_map::DefaultHasher;
+        use ahash::AHasher;
         use std::hash::Hasher;
 
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = AHasher::default();
         state.hash(&mut hasher);
         hasher.finish()
     }

@@ -337,10 +337,10 @@ fn compute_certificate<V>(graph: &ColoredGraph<V>, canonical_order: &[V]) -> Vec
 where
     V: Clone + Eq + Hash,
 {
-    use std::collections::hash_map::DefaultHasher;
+    use ahash::AHasher;
     use std::hash::Hasher;
 
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = AHasher::default();
 
     // Hash the canonical adjacency matrix
     for from_v in canonical_order {
@@ -366,10 +366,10 @@ fn compute_partial_certificate<V>(graph: &ColoredGraph<V>, partition: &[Vec<usiz
 where
     V: Clone + Eq + Hash,
 {
-    use std::collections::hash_map::DefaultHasher;
+    use ahash::AHasher;
     use std::hash::Hasher;
 
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = AHasher::default();
 
     // Hash discrete cells (fixed vertices) for early comparison
     for cell in partition {
