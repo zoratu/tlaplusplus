@@ -1014,7 +1014,44 @@ fn compiled_membership_contains(
                     }
                     Ok(true)
                 }
-                _ => Ok(false), // Not a sequence, so not in Seq(S)
+                // A TLA+ function with domain 1..n is equivalent to a sequence.
+                // [i \in 1..3 |-> x] produces a Function, not a Seq, but is in Seq(S).
+                TlaValue::Function(func) => {
+                    if func_is_sequence_shaped(func) {
+                        for val in func.values() {
+                            if !compiled_membership_contains(val, &args[0], ctx, depth + 1)? {
+                                return Ok(false);
+                            }
+                        }
+                        Ok(true)
+                    } else {
+                        Ok(false)
+                    }
+                }
+                _ => Ok(false),
+            }
+        }
+        // Handle [Domain -> Range] membership structurally instead of enumerating
+        CompiledExpr::FunctionSet { domain, range } => {
+            match value {
+                TlaValue::Function(func) => {
+                    let domain_val = eval_compiled_inner(domain, ctx, depth + 1)?;
+                    let domain_set = domain_val.as_set()?;
+                    // Check that the function's domain matches exactly
+                    let func_domain: std::collections::BTreeSet<TlaValue> =
+                        func.keys().cloned().collect();
+                    if func_domain != *domain_set {
+                        return Ok(false);
+                    }
+                    // Check that every value in the function's range is in the range set
+                    for val in func.values() {
+                        if !compiled_membership_contains(val, range, ctx, depth + 1)? {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                }
+                _ => Ok(false),
             }
         }
         _ => {
@@ -1022,6 +1059,22 @@ fn compiled_membership_contains(
             set_val.contains(value)
         }
     }
+}
+
+/// Check if a BTreeMap<TlaValue, TlaValue> has a sequence-shaped domain: {Int(1), Int(2), ..., Int(n)}.
+/// An empty function is also considered sequence-shaped (it represents the empty sequence <<>>).
+pub fn func_is_sequence_shaped(func: &std::collections::BTreeMap<TlaValue, TlaValue>) -> bool {
+    if func.is_empty() {
+        return true;
+    }
+    let n = func.len();
+    for i in 1..=n {
+        if !func.contains_key(&TlaValue::Int(i as i64)) {
+            return false;
+        }
+    }
+    // Also check that the domain has exactly n elements (no extra keys)
+    func.len() == n
 }
 
 fn membership_matches_text(
@@ -1050,14 +1103,20 @@ fn membership_matches_text(
                 if let Some(set_expr) = inner.strip_suffix(")") {
                     return match value {
                         TlaValue::Seq(seq) => {
-                            let mut all_in_set = true;
                             for elem in seq.iter() {
                                 if !membership_matches_text(elem, set_expr, ctx, depth + 1)? {
-                                    all_in_set = false;
-                                    break;
+                                    return Ok(false);
                                 }
                             }
-                            Ok(all_in_set)
+                            Ok(true)
+                        }
+                        TlaValue::Function(func) if func_is_sequence_shaped(func) => {
+                            for val in func.values() {
+                                if !membership_matches_text(val, set_expr, ctx, depth + 1)? {
+                                    return Ok(false);
+                                }
+                            }
+                            Ok(true)
                         }
                         _ => Ok(false),
                     };
@@ -4205,3 +4264,136 @@ mod swarm_eval_consistency_tests {
     }
 }
 
+#[cfg(test)]
+mod seq_membership_tests {
+    use super::*;
+    use crate::tla::compiled_expr::compile_expr;
+    use crate::tla::{EvalContext, TlaState, TlaValue, tla_state};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    /// A function with domain 1..n should be accepted as a member of Seq(S).
+    /// This is the bug that caused a false positive TypeInvariant violation in
+    /// MCCheckpointCoordination: BlankLog = [i \in LogIndex |-> NoNode] produces
+    /// a TlaValue::Function, but Log == Seq(Node \cup {NoNode}) requires Seq
+    /// membership.
+    #[test]
+    fn function_with_seq_domain_is_in_seq_set() {
+        // Create a function {1 |-> "a", 2 |-> "b", 3 |-> "a"} which is sequence-shaped
+        let func = TlaValue::Function(Arc::new(BTreeMap::from([
+            (TlaValue::Int(1), TlaValue::String("a".into())),
+            (TlaValue::Int(2), TlaValue::String("b".into())),
+            (TlaValue::Int(3), TlaValue::String("a".into())),
+        ])));
+
+        let state = tla_state([
+            ("f", func.clone()),
+            (
+                "S",
+                TlaValue::Set(Arc::new(
+                    [
+                        TlaValue::String("a".into()),
+                        TlaValue::String("b".into()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                )),
+            ),
+        ]);
+        let ctx = EvalContext::new(&state);
+
+        // f \in Seq(S) should be TRUE since f is sequence-shaped and all values are in S
+        let compiled = compile_expr("f \\in Seq(S)");
+        let result = eval_compiled(&compiled, &ctx).unwrap();
+        assert_eq!(result, TlaValue::Bool(true));
+    }
+
+    /// A function with non-sequential domain should NOT be in Seq(S).
+    #[test]
+    fn function_with_non_seq_domain_not_in_seq_set() {
+        let func = TlaValue::Function(Arc::new(BTreeMap::from([
+            (TlaValue::Int(0), TlaValue::String("a".into())),
+            (TlaValue::Int(1), TlaValue::String("b".into())),
+        ])));
+
+        let state = tla_state([
+            ("f", func),
+            (
+                "S",
+                TlaValue::Set(Arc::new(
+                    [
+                        TlaValue::String("a".into()),
+                        TlaValue::String("b".into()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                )),
+            ),
+        ]);
+        let ctx = EvalContext::new(&state);
+
+        // Domain starts at 0, not 1 -- not a valid sequence
+        let compiled = compile_expr("f \\in Seq(S)");
+        let result = eval_compiled(&compiled, &ctx).unwrap();
+        assert_eq!(result, TlaValue::Bool(false));
+    }
+
+    /// Membership in [Domain -> Range] should be checked structurally via the
+    /// compiled FunctionSet arm, without enumerating all possible functions.
+    #[test]
+    fn function_set_membership_checked_structurally() {
+        let func = TlaValue::Function(Arc::new(BTreeMap::from([
+            (TlaValue::Int(1), TlaValue::Bool(true)),
+            (TlaValue::Int(2), TlaValue::Bool(false)),
+        ])));
+
+        let state = tla_state([
+            ("f", func),
+            (
+                "D",
+                TlaValue::Set(Arc::new(
+                    [TlaValue::Int(1), TlaValue::Int(2)]
+                        .into_iter()
+                        .collect(),
+                )),
+            ),
+        ]);
+        let ctx = EvalContext::new(&state);
+
+        // f \in [D -> BOOLEAN] should be TRUE
+        let compiled = compile_expr("f \\in [D -> BOOLEAN]");
+        let result = eval_compiled(&compiled, &ctx).unwrap();
+        assert_eq!(result, TlaValue::Bool(true));
+    }
+
+    #[test]
+    fn func_is_sequence_shaped_basic() {
+        // Empty is sequence-shaped
+        assert!(func_is_sequence_shaped(&BTreeMap::new()));
+
+        // {1 -> x} is sequence-shaped
+        let mut m = BTreeMap::new();
+        m.insert(TlaValue::Int(1), TlaValue::Bool(true));
+        assert!(func_is_sequence_shaped(&m));
+
+        // {1 -> x, 2 -> y} is sequence-shaped
+        m.insert(TlaValue::Int(2), TlaValue::Bool(false));
+        assert!(func_is_sequence_shaped(&m));
+
+        // {0 -> x} is NOT sequence-shaped (starts at 0)
+        let mut m2 = BTreeMap::new();
+        m2.insert(TlaValue::Int(0), TlaValue::Bool(true));
+        assert!(!func_is_sequence_shaped(&m2));
+
+        // {1 -> x, 3 -> y} is NOT sequence-shaped (gap at 2)
+        let mut m3 = BTreeMap::new();
+        m3.insert(TlaValue::Int(1), TlaValue::Bool(true));
+        m3.insert(TlaValue::Int(3), TlaValue::Bool(false));
+        assert!(!func_is_sequence_shaped(&m3));
+
+        // {"a" -> x} is NOT sequence-shaped (non-integer keys)
+        let mut m4 = BTreeMap::new();
+        m4.insert(TlaValue::String("a".into()), TlaValue::Bool(true));
+        assert!(!func_is_sequence_shaped(&m4));
+    }
+}
