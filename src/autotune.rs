@@ -162,6 +162,8 @@ pub struct AutoTuner {
     throttle: Arc<WorkerThrottle>,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
+    /// Thread handle for fast unparking on shutdown
+    thread_handle: Arc<parking_lot::RwLock<Option<std::thread::Thread>>>,
     /// Best observed throughput and worker count (reserved for future adaptive tuning)
     #[allow(dead_code)]
     best_throughput: AtomicU64,
@@ -180,6 +182,7 @@ impl AutoTuner {
             throttle,
             stop,
             handle: None,
+            thread_handle: Arc::new(parking_lot::RwLock::new(None)),
             best_throughput: AtomicU64::new(0),
             best_workers: AtomicUsize::new(0),
         }
@@ -193,10 +196,12 @@ impl AutoTuner {
         let config = self.config.clone();
         let throttle = Arc::clone(&self.throttle);
         let stop = Arc::clone(&self.stop);
+        let thread_handle_slot = Arc::clone(&self.thread_handle);
 
         let handle = std::thread::Builder::new()
             .name("autotune".to_string())
             .spawn(move || {
+                *thread_handle_slot.write() = Some(std::thread::current());
                 Self::tuner_loop(config, throttle, stop, get_throughput);
             })
             .expect("Failed to spawn autotune thread");
@@ -218,11 +223,16 @@ impl AutoTuner {
         let mut best_throughput_rate = 0.0f64;
         let mut best_workers = config.max_workers;
 
-        // Warmup period - give workers time to stabilize
-        std::thread::sleep(Duration::from_secs(3));
+        // Warmup period - give workers time to stabilize.
+        // Use park_timeout so we can be woken for immediate shutdown.
+        std::thread::park_timeout(Duration::from_secs(3));
+        if stop.load(Ordering::Acquire) {
+            eprintln!("AutoTune: stopped during warmup");
+            return;
+        }
 
         while !stop.load(Ordering::Acquire) {
-            std::thread::sleep(config.sample_interval);
+            std::thread::park_timeout(config.sample_interval);
 
             if stop.load(Ordering::Acquire) {
                 break;
@@ -322,6 +332,10 @@ impl AutoTuner {
 
     /// Wait for tuner thread to finish
     pub fn join(mut self) {
+        // Unpark the thread so it wakes from park_timeout immediately
+        if let Some(thread) = self.thread_handle.read().as_ref() {
+            thread.unpark();
+        }
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
