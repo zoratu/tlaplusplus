@@ -1153,7 +1153,7 @@ fn is_word_char(c: char) -> bool {
 mod tests {
     use super::*;
     use crate::models::tla_native::TlaModel;
-    use crate::tla::{parse_tla_module_file, parse_tla_module_text};
+    use crate::tla::{parse_tla_module_file, parse_tla_module_text, tla_state};
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1271,11 +1271,11 @@ Next == TManager \/ BTManager
             ),
         ]);
 
-        let state = TlaState::from([
-            ("x".to_string(), TlaValue::Int(0)),
-            ("y".to_string(), TlaValue::Int(7)),
+        let state = tla_state([
+            ("x", TlaValue::Int(0)),
+            ("y", TlaValue::Int(7)),
             (
-                "S".to_string(),
+                "S",
                 TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(1)]))),
             ),
         ]);
@@ -1335,40 +1335,40 @@ Next == TManager \/ BTManager
             ),
         ]);
 
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "TxId".to_string(),
+                "TxId",
                 TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::String(
                     "t1".to_string(),
                 )]))),
             ),
             (
-                "tx".to_string(),
+                "tx",
                 TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::String(
                     "t1".to_string(),
                 )]))),
             ),
             (
-                "Key".to_string(),
+                "Key",
                 TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::String(
                     "k1".to_string(),
                 )]))),
             ),
             (
-                "Val".to_string(),
+                "Val",
                 TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::String(
                     "v1".to_string(),
                 )]))),
             ),
             (
-                "store".to_string(),
+                "store",
                 TlaValue::Function(Arc::new(BTreeMap::from([(
                     TlaValue::String("k1".to_string()),
                     TlaValue::String("old".to_string()),
                 )]))),
             ),
             (
-                "snapshotStore".to_string(),
+                "snapshotStore",
                 TlaValue::Function(Arc::new(BTreeMap::from([(
                     TlaValue::String("t1".to_string()),
                     TlaValue::Function(Arc::new(BTreeMap::from([(
@@ -1378,14 +1378,14 @@ Next == TManager \/ BTManager
                 )]))),
             ),
             (
-                "written".to_string(),
+                "written",
                 TlaValue::Function(Arc::new(BTreeMap::from([(
                     TlaValue::String("t1".to_string()),
                     TlaValue::Set(Arc::new(BTreeSet::new())),
                 )]))),
             ),
             (
-                "missed".to_string(),
+                "missed",
                 TlaValue::Function(Arc::new(BTreeMap::from([(
                     TlaValue::String("t1".to_string()),
                     TlaValue::Set(Arc::new(BTreeSet::new())),
@@ -1540,7 +1540,7 @@ CONSTANTS
                 is_recursive: false,
             },
         )]);
-        let state = TlaState::from([("x".to_string(), TlaValue::ModelValue("old".to_string()))]);
+        let state = tla_state([("x", TlaValue::ModelValue("old".to_string()))]);
 
         let probe = probe_next_disjuncts_with_instances("H!Next", &defs, Some(&instances), &state);
 
@@ -1577,10 +1577,10 @@ CONSTANTS
                 module: Some(Box::new(helper_module)),
             },
         )]);
-        let state = TlaState::from([
-            ("x".to_string(), TlaValue::Int(0)),
+        let state = tla_state([
+            ("x", TlaValue::Int(0)),
             (
-                "c1".to_string(),
+                "c1",
                 TlaValue::Function(Arc::new(BTreeMap::from([(
                     TlaValue::Int(1),
                     TlaValue::Int(0),
@@ -1644,7 +1644,7 @@ CONSTANTS
                 is_recursive: false,
             },
         )]);
-        let state = TlaState::from([("x".to_string(), TlaValue::ModelValue("old".to_string()))]);
+        let state = tla_state([("x", TlaValue::ModelValue("old".to_string()))]);
 
         let probe = probe_next_disjuncts_with_instances(
             "IF TRUE THEN H!Next ELSE /\\ UNCHANGED x",
@@ -1707,7 +1707,7 @@ CONSTANTS
                 },
             ),
         ]);
-        let state = TlaState::from([("x".to_string(), TlaValue::Int(0))]);
+        let state = tla_state([("x", TlaValue::Int(0))]);
 
         let probe =
             probe_next_disjuncts_with_instances("H!Next(5)", &defs, Some(&instances), &state);
@@ -1789,7 +1789,7 @@ CONSTANTS
                 },
             ),
         ]);
-        let state = TlaState::from([("x".to_string(), TlaValue::Int(0))]);
+        let state = tla_state([("x", TlaValue::Int(0))]);
 
         let probe =
             probe_next_disjuncts_with_instances("H!Next(5)", &defs, Some(&instances), &state);
@@ -1844,11 +1844,11 @@ CONSTANTS
             ),
         ]);
 
-        let state = TlaState::from([
-            ("x".to_string(), TlaValue::Int(0)),
-            ("y".to_string(), TlaValue::Int(0)),
+        let state = tla_state([
+            ("x", TlaValue::Int(0)),
+            ("y", TlaValue::Int(0)),
             (
-                "pendingOps".to_string(),
+                "pendingOps",
                 TlaValue::Set(Arc::new(BTreeSet::from([
                     TlaValue::Int(1),
                     TlaValue::Int(2),
@@ -1922,11 +1922,11 @@ CONSTANTS
             ),
         ]);
 
-        let state = TlaState::from([
-            ("x".to_string(), TlaValue::Int(0)),
-            ("y".to_string(), TlaValue::Int(0)),
+        let state = tla_state([
+            ("x", TlaValue::Int(0)),
+            ("y", TlaValue::Int(0)),
             (
-                "pendingOps".to_string(),
+                "pendingOps",
                 TlaValue::Set(Arc::new(BTreeSet::from([
                     TlaValue::Int(1),
                     TlaValue::Int(2),
@@ -1990,17 +1990,17 @@ CONSTANTS
             ),
         ]);
 
-        let state = TlaState::from([
-            ("tm".to_string(), TlaValue::Int(0)),
+        let state = tla_state([
+            ("tm", TlaValue::Int(0)),
             (
-                "pc".to_string(),
+                "pc",
                 TlaValue::Function(Arc::new(BTreeMap::from([
                     (TlaValue::Int(1), TlaValue::String("Run".to_string())),
                     (TlaValue::Int(10), TlaValue::String("Run".to_string())),
                 ]))),
             ),
             (
-                "RM".to_string(),
+                "RM",
                 TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(1)]))),
             ),
         ]);
@@ -2024,19 +2024,19 @@ CONSTANTS
         let rm1 = TlaValue::ModelValue("rm1".to_string());
         let rm2 = TlaValue::ModelValue("rm2".to_string());
         let rm3 = TlaValue::ModelValue("rm3".to_string());
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "RM".to_string(),
+                "RM",
                 TlaValue::Set(Arc::new(BTreeSet::from([
                     rm1.clone(),
                     rm2.clone(),
                     rm3.clone(),
                 ]))),
             ),
-            ("RMMAYFAIL".to_string(), TlaValue::Bool(true)),
-            ("TMMAYFAIL".to_string(), TlaValue::Bool(false)),
+            ("RMMAYFAIL", TlaValue::Bool(true)),
+            ("TMMAYFAIL", TlaValue::Bool(false)),
             (
-                "rmState".to_string(),
+                "rmState",
                 TlaValue::Function(Arc::new(BTreeMap::from([
                     (rm1.clone(), TlaValue::String("working".to_string())),
                     (rm2.clone(), TlaValue::String("working".to_string())),
@@ -2044,11 +2044,11 @@ CONSTANTS
                 ]))),
             ),
             (
-                "tmState".to_string(),
+                "tmState",
                 TlaValue::String("commit".to_string()),
             ),
             (
-                "pc".to_string(),
+                "pc",
                 TlaValue::Function(Arc::new(BTreeMap::from([
                     (TlaValue::Int(0), TlaValue::String("TS".to_string())),
                     (TlaValue::Int(10), TlaValue::String("BTS".to_string())),
@@ -2106,17 +2106,17 @@ CONSTANTS
             ),
         ]);
 
-        let state = TlaState::from([
-            ("count".to_string(), TlaValue::Int(7)),
-            ("announced".to_string(), TlaValue::Bool(false)),
-            ("light".to_string(), TlaValue::String("off".to_string())),
+        let state = tla_state([
+            ("count", TlaValue::Int(7)),
+            ("announced", TlaValue::Bool(false)),
+            ("light", TlaValue::String("off".to_string())),
             (
-                "designated".to_string(),
+                "designated",
                 TlaValue::String("alice".to_string()),
             ),
-            ("threshold".to_string(), TlaValue::Int(7)),
+            ("threshold", TlaValue::Int(7)),
             (
-                "Prisoner".to_string(),
+                "Prisoner",
                 TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::String(
                     "alice".to_string(),
                 )]))),
@@ -2153,10 +2153,10 @@ CONSTANTS
             ),
         ]);
 
-        let state = TlaState::from([
-            ("current".to_string(), TlaValue::Int(1)),
-            ("destination".to_string(), TlaValue::Int(2)),
-            ("moved".to_string(), TlaValue::Bool(false)),
+        let state = tla_state([
+            ("current", TlaValue::Int(1)),
+            ("destination", TlaValue::Int(2)),
+            ("moved", TlaValue::Bool(false)),
         ]);
 
         let probe = probe_next_disjuncts("Move()", &defs, &state);
@@ -2167,9 +2167,9 @@ CONSTANTS
 
     #[test]
     fn probes_top_level_let_branches() {
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "Pos".to_string(),
+                "Pos",
                 TlaValue::Set(Arc::new(BTreeSet::from([
                     TlaValue::Int(1),
                     TlaValue::Int(2),
@@ -2177,7 +2177,7 @@ CONSTANTS
                 ]))),
             ),
             (
-                "board".to_string(),
+                "board",
                 TlaValue::Set(Arc::new(BTreeSet::from([
                     TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(1)]))),
                     TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(3)]))),
@@ -2224,11 +2224,11 @@ CONSTANTS
             },
         )]);
 
-        let state = TlaState::from([
-            ("count".to_string(), TlaValue::Int(1)),
-            ("flag".to_string(), TlaValue::Bool(true)),
+        let state = tla_state([
+            ("count", TlaValue::Int(1)),
+            ("flag", TlaValue::Bool(true)),
             (
-                "Proc".to_string(),
+                "Proc",
                 TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(1)]))),
             ),
         ]);
@@ -2313,17 +2313,17 @@ CONSTANTS
             ),
         ]);
 
-        let state = TlaState::from([
+        let state = tla_state([
             (
-                "msgs".to_string(),
+                "msgs",
                 TlaValue::Set(Arc::new(BTreeSet::from([msg_a1, msg_a2]))),
             ),
             (
-                "Quorum".to_string(),
+                "Quorum",
                 TlaValue::Set(Arc::new(BTreeSet::from([quorum]))),
             ),
-            ("sent".to_string(), TlaValue::Bool(false)),
-            ("v1".to_string(), v1),
+            ("sent", TlaValue::Bool(false)),
+            ("v1", v1),
         ]);
 
         let probe = probe_next_disjuncts(
