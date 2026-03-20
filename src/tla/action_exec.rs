@@ -168,7 +168,8 @@ pub fn evaluate_next_states_with_instances(
     // that didn't apply to this state (e.g., wrong message type).
     if out.is_empty() && last_error.is_some() && disjuncts.len() == 1 {
         // Single-branch specs: propagate the error since there's no fallback
-        return Err(last_error.unwrap());
+        // invariant: last_error.is_some() checked in condition above
+        return Err(last_error.expect("last_error was Some but unwrap failed"));
     }
     Ok(out)
 }
@@ -213,7 +214,8 @@ pub fn evaluate_next_states_swarm(
     }
     // Only propagate errors if we had a single enabled disjunct that failed
     if out.is_empty() && last_error.is_some() && enabled_indices.len() == 1 {
-        return Err(last_error.unwrap());
+        // invariant: last_error.is_some() checked in condition above
+        return Err(last_error.expect("last_error was Some but unwrap failed"));
     }
     Ok(out)
 }
