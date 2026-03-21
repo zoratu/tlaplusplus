@@ -5,18 +5,26 @@ use std::net::SocketAddr;
 /// Messages exchanged between cluster nodes.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Message {
-    /// Batch of (fingerprint, compressed_state) pairs to check-and-insert.
-    FingerprintBatch {
+    // --- Work stealing (independent exploration) ---
+    /// Request to steal work from a peer node.
+    StealRequest {
         from_node: u32,
-        batch_id: u64,
-        /// Each entry is `(fingerprint, zstd-compressed serialized state bytes)`.
-        entries: Vec<(u64, Vec<u8>)>,
+        /// Maximum number of states to steal.
+        max_items: u32,
     },
-    /// Response: bitmap indicating which entries were new (true) vs already seen (false).
-    FingerprintAck {
-        batch_id: u64,
-        new_bitmap: Vec<bool>,
+    /// Response to a steal request with serialized states.
+    StealResponse {
+        /// Compressed serialized states (each is a zstd-compressed bincode blob).
+        states: Vec<Vec<u8>>,
     },
+    /// Bloom filter exchange for probabilistic cross-node dedup.
+    BloomExchange {
+        from_node: u32,
+        /// Serialized BloomSnapshot (bincode).
+        bloom_data: Vec<u8>,
+    },
+
+    // --- Cluster management ---
     /// A node joining the cluster.
     Join {
         node_id: u32,
@@ -33,8 +41,7 @@ pub enum Message {
     },
     /// Stop exploration (invariant violation found).
     Stop { node_id: u32, message: String },
-    /// Termination token for distributed termination detection
-    /// (Dijkstra-Scholten / ring-based).
+    /// Termination token for distributed termination detection.
     TerminationToken {
         initiator: u32,
         round: u64,
@@ -75,7 +82,6 @@ mod tests {
             states_distinct: 500_000,
         };
         let encoded = encode_message(&msg).unwrap();
-        // First 4 bytes are length prefix
         let len = u32::from_be_bytes(encoded[..4].try_into().unwrap()) as usize;
         assert_eq!(len, encoded.len() - 4);
         let decoded = decode_message(&encoded[4..]).unwrap();
@@ -94,27 +100,61 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_fingerprint_batch() {
-        let msg = Message::FingerprintBatch {
+    fn roundtrip_steal_request() {
+        let msg = Message::StealRequest {
             from_node: 2,
-            batch_id: 42,
-            entries: vec![(0xDEADBEEF, vec![1, 2, 3]), (0xCAFEBABE, vec![4, 5])],
+            max_items: 512,
         };
         let encoded = encode_message(&msg).unwrap();
         let len = u32::from_be_bytes(encoded[..4].try_into().unwrap()) as usize;
         let decoded = decode_message(&encoded[4..4 + len]).unwrap();
         match decoded {
-            Message::FingerprintBatch {
+            Message::StealRequest {
                 from_node,
-                batch_id,
-                entries,
+                max_items,
             } => {
                 assert_eq!(from_node, 2);
-                assert_eq!(batch_id, 42);
-                assert_eq!(entries.len(), 2);
-                assert_eq!(entries[0].0, 0xDEADBEEF);
+                assert_eq!(max_items, 512);
             }
-            _ => panic!("expected FingerprintBatch"),
+            _ => panic!("expected StealRequest"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_steal_response() {
+        let msg = Message::StealResponse {
+            states: vec![vec![1, 2, 3], vec![4, 5, 6]],
+        };
+        let encoded = encode_message(&msg).unwrap();
+        let len = u32::from_be_bytes(encoded[..4].try_into().unwrap()) as usize;
+        let decoded = decode_message(&encoded[4..4 + len]).unwrap();
+        match decoded {
+            Message::StealResponse { states } => {
+                assert_eq!(states.len(), 2);
+                assert_eq!(states[0], vec![1, 2, 3]);
+            }
+            _ => panic!("expected StealResponse"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_bloom_exchange() {
+        let msg = Message::BloomExchange {
+            from_node: 1,
+            bloom_data: vec![0xFF; 100],
+        };
+        let encoded = encode_message(&msg).unwrap();
+        let len = u32::from_be_bytes(encoded[..4].try_into().unwrap()) as usize;
+        let decoded = decode_message(&encoded[4..4 + len]).unwrap();
+        match decoded {
+            Message::BloomExchange {
+                from_node,
+                bloom_data,
+            } => {
+                assert_eq!(from_node, 1);
+                assert_eq!(bloom_data.len(), 100);
+            }
+            _ => panic!("expected BloomExchange"),
         }
     }
 

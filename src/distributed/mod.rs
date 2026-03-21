@@ -1,18 +1,16 @@
-pub mod batch;
+pub mod bloom;
 pub mod handler;
 pub mod protocol;
-pub mod proxy;
-pub mod ring;
 pub mod transport;
+pub mod work_stealer;
 
 use std::net::SocketAddr;
 
 /// Configuration for a node in the distributed model-checking cluster.
 ///
-/// Each node owns a partition of the fingerprint space determined by
-/// `home_node(fp) = hash(fp) % num_nodes`. States that hash to remote
-/// nodes are batched and sent over TCP; remote nodes check-and-insert
-/// fingerprints and enqueue new states locally.
+/// Each node runs a fully independent model checker with its own FP store
+/// and work queue. The network is only used for work stealing (when a node's
+/// queue empties) and bloom filter exchange (periodic dedup summaries).
 #[derive(Clone, Debug)]
 pub struct ClusterConfig {
     /// Unique identifier for this node in the cluster.
@@ -21,10 +19,6 @@ pub struct ClusterConfig {
     pub listen_addr: SocketAddr,
     /// Addresses of all peer nodes (excluding self).
     pub peers: Vec<SocketAddr>,
-    /// Number of states to accumulate before sending a batch (default 512).
-    pub batch_size: usize,
-    /// Maximum milliseconds to wait before sending a partial batch (default 1).
-    pub batch_timeout_ms: u64,
 }
 
 impl ClusterConfig {
