@@ -14,12 +14,12 @@ Benchmarked on 128-core AMD EPYC (c6a.metal, 256GB RAM):
 | CPU utilization | 95%+ | ~60% | - |
 | Memory efficiency | Lock-free | GC pauses | - |
 
-### Production Models (192-core ARM, c8g.metal-48xl)
+### Sustained Throughput (192-core ARM, c8g.metal-48xl)
 
-| Model | States (30 min) | Rate | Notes |
-|-------|----------------|------|-------|
-| CoherentIO | 31.8M generated, 20.7M distinct | 1.05M/min | Sustained, no stalls |
-| ClusterLeaseFailover | 53M generated, 12M distinct | 1.75M/min | Continuous exploration |
+Tested on real-world Raft/consensus specs with 30-minute runs:
+- **1.0–1.75M states/min** sustained with zero checkpoint stalls
+- **31–53M states** explored per 30-minute run
+- Lightweight periodic checkpoints (0ms pause, no queue drain)
 
 ### TLC Comparison (8 workers, tlaplus/Examples corpus)
 
