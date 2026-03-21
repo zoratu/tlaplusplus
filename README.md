@@ -31,6 +31,27 @@ Tested on real-world Raft/consensus specs with 30-minute runs:
 
 **Note:** For small models (< 100 states), TLC's JVM starts faster than our NUMA-aware runtime initialization (~2s overhead). The speedup manifests on large state spaces where lock-free fingerprinting, NUMA-local memory, and zero GC pauses dominate.
 
+### Distributed Scaling (3-node cluster, 8 workers/node)
+
+Independent exploration with work stealing — zero network on the hot path:
+
+| Spec | 1 Node (30s) | 3 Nodes (30s) | Speedup |
+|------|-------------|--------------|---------|
+| Consensus spec (large) | 236K states | 1,069K states | **4.5x** |
+| Checkpoint coordination | 262K states | 1,403K states | **5.4x** |
+
+Super-linear scaling: 3x workers → 4.5–5.4x throughput. Each node runs a fully independent model checker with its own fingerprint store. Network is only used for work stealing (when a node's queue empties) and periodic Bloom filter exchange for dedup.
+
+```bash
+# Launch 3-node cluster
+node0$ tlaplusplus run-tla --module Spec.tla --cluster-listen 0.0.0.0:7878 \
+  --cluster-peers node1:7878,node2:7878 --node-id 0
+node1$ tlaplusplus run-tla --module Spec.tla --cluster-listen 0.0.0.0:7878 \
+  --cluster-peers node0:7878,node2:7878 --node-id 1
+node2$ tlaplusplus run-tla --module Spec.tla --cluster-listen 0.0.0.0:7878 \
+  --cluster-peers node0:7878,node1:7878 --node-id 2
+```
+
 ### NUMA Scaling (384-core, 6 NUMA nodes, 760GB RAM)
 
 | Configuration | %usr | %sys | States/min |
