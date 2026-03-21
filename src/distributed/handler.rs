@@ -1,60 +1,108 @@
+//! Inbound message handler for the independent-exploration distributed model checker.
+//!
+//! Handles three message types on the hot path:
+//! - `StealRequest`: pop states from local donation channel, serialize, send back
+//! - `StealResponse`: forward stolen states to the work stealer for local processing
+//! - `BloomExchange`: merge remote bloom filter into the work stealer
+//!
+//! Also handles termination tokens, stop signals, and heartbeats.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::storage::unified_fingerprint_store::UnifiedFingerprintStore;
+use crossbeam_channel::Sender;
 
 use super::protocol::Message;
-use super::proxy::DistributedFingerprintProxy;
 use super::transport::ClusterTransport;
+use super::work_stealer::DistributedWorkStealer;
+
+/// Inbound state received from a steal response.
+/// Contains the compressed serialized state bytes.
+pub struct StolenState {
+    pub compressed_state: Vec<u8>,
+}
 
 /// Spawn the inbound message handler as a tokio task.
 ///
-/// This task receives messages from the transport layer, processes them,
-/// and feeds new states back to the local worker queues via the proxy.
+/// This task receives messages from the transport layer and processes them:
 ///
-/// For `FingerprintBatch` messages:
-/// 1. Check each fingerprint against the local fingerprint store
-/// 2. States with new fingerprints are enqueued to the proxy's inbound channel
-///    for local workers to pick up and explore
-/// 3. Send `FingerprintAck` back to the sender with a bitmap of new vs seen
-///
-/// For `TerminationToken` messages:
-/// - Update peer idle status in the proxy
-/// - If all peers + self are idle, set global termination
-///
-/// For `Stop` messages:
-/// - Set the stop flag to halt local exploration
+/// - `StealRequest`: Pop states from the donation channel and send back
+/// - `StealResponse`: Forward states to the stolen-work channel for workers to pick up
+/// - `BloomExchange`: Merge the remote bloom into the work stealer
+/// - `TerminationToken`: Update peer idle status
+/// - `Stop`: Set the stop flag to halt exploration
 pub fn spawn_inbound_handler(
     handle: &tokio::runtime::Handle,
     transport: Arc<ClusterTransport>,
-    proxy: Arc<DistributedFingerprintProxy>,
-    fp_store: Arc<UnifiedFingerprintStore>,
+    stealer: Arc<DistributedWorkStealer>,
+    stolen_tx: Sender<StolenState>,
+    donate_rx: crossbeam_channel::Receiver<Vec<u8>>,
     stop: Arc<AtomicBool>,
 ) {
+    let transport_for_handler = Arc::clone(&transport);
     handle.spawn(async move {
         loop {
             if stop.load(Ordering::Acquire) {
                 break;
             }
 
-            let msg = match transport.recv().await {
+            let msg = match transport_for_handler.recv().await {
                 Some((_from, msg)) => msg,
-                None => {
-                    // Transport shut down
-                    break;
-                }
+                None => break, // Transport shut down
             };
 
             match msg {
-                Message::FingerprintBatch {
+                Message::StealRequest {
                     from_node,
-                    batch_id,
-                    entries,
+                    max_items,
                 } => {
-                    handle_fingerprint_batch(
-                        &proxy, &fp_store, &transport, from_node, batch_id, entries,
-                    )
-                    .await;
+                    // Pop up to max_items states from the donation channel
+                    let mut states = Vec::with_capacity(max_items as usize);
+                    for _ in 0..max_items {
+                        match donate_rx.try_recv() {
+                            Ok(compressed) => states.push(compressed),
+                            Err(_) => break,
+                        }
+                    }
+                    let donated_count = states.len() as u64;
+
+                    let response = Message::StealResponse { states };
+                    if let Err(e) = transport_for_handler.send(from_node, &response).await {
+                        eprintln!(
+                            "[cluster] failed to send steal response to node {}: {}",
+                            from_node, e
+                        );
+                    }
+
+                    if donated_count > 0 {
+                        stealer
+                            .states_donated
+                            .fetch_add(donated_count, Ordering::Relaxed);
+                    }
+                }
+
+                Message::StealResponse { states } => {
+                    let count = states.len();
+                    if count > 0 {
+                        stealer.note_work_received();
+                    }
+                    for compressed in states {
+                        let _ = stolen_tx.try_send(StolenState {
+                            compressed_state: compressed,
+                        });
+                    }
+                    if count > 0 {
+                        stealer
+                            .states_stolen
+                            .fetch_add(count as u64, Ordering::Relaxed);
+                    }
+                }
+
+                Message::BloomExchange {
+                    from_node: _,
+                    bloom_data,
+                } => {
+                    stealer.merge_remote_bloom(&bloom_data);
                 }
 
                 Message::TerminationToken {
@@ -62,17 +110,9 @@ pub fn spawn_inbound_handler(
                     round: _,
                     all_idle,
                 } => {
-                    if all_idle {
-                        // The initiator is reporting that it sees all nodes idle.
-                        // Mark all-idle for this peer.
-                        proxy.set_peer_idle(initiator, true);
-                    } else {
-                        proxy.set_peer_idle(initiator, false);
-                    }
-
-                    // Check if we can declare global termination
-                    if proxy.all_nodes_idle() {
-                        proxy.set_globally_terminated();
+                    stealer.set_peer_idle(initiator, all_idle);
+                    if stealer.all_nodes_idle() {
+                        stealer.set_globally_terminated();
                     }
                 }
 
@@ -81,81 +121,27 @@ pub fn spawn_inbound_handler(
                     stop.store(true, Ordering::Release);
                 }
 
-                Message::Heartbeat {
-                    node_id,
-                    states_generated: _,
-                    states_distinct: _,
-                } => {
-                    // Heartbeats are informational — could update peer stats
-                    // For now, just acknowledge the peer is alive
+                Message::Heartbeat { node_id, .. } => {
                     let _ = node_id;
                 }
 
-                Message::Join { .. } | Message::Leave { .. } | Message::FingerprintAck { .. } => {
-                    // Join/Leave: dynamic membership changes not yet supported
-                    // FingerprintAck: currently unused (fire-and-forget batching)
+                Message::Join { .. } | Message::Leave { .. } => {
+                    // Dynamic membership not yet supported
                 }
             }
         }
     });
 }
 
-/// Handle an inbound fingerprint batch: check each fingerprint against the
-/// local store, enqueue new states for exploration, and send an ack back.
-async fn handle_fingerprint_batch(
-    proxy: &DistributedFingerprintProxy,
-    fp_store: &UnifiedFingerprintStore,
-    transport: &ClusterTransport,
-    from_node: u32,
-    batch_id: u64,
-    entries: Vec<(u64, Vec<u8>)>,
-) {
-    let mut new_bitmap = Vec::with_capacity(entries.len());
-    let fps: Vec<u64> = entries.iter().map(|(fp, _)| *fp).collect();
-    let mut seen = vec![false; fps.len()];
-
-    // Batch check-and-insert against the local fingerprint store.
-    // Use worker_id=0 affinity since we're in the handler task.
-    if let Err(e) = fp_store.contains_or_insert_batch_with_affinity(&fps, &mut seen, 0) {
-        eprintln!(
-            "[cluster] fingerprint batch check failed for batch {} from node {}: {}",
-            batch_id, from_node, e
-        );
-        return;
-    }
-
-    for (idx, (fp, compressed_state)) in entries.into_iter().enumerate() {
-        let is_new = !seen[idx];
-        new_bitmap.push(is_new);
-        if is_new {
-            // This is a new state — enqueue it for local exploration
-            proxy.enqueue_inbound(fp, compressed_state);
-        }
-    }
-
-    // Send acknowledgment back to the sender
-    let ack = Message::FingerprintAck {
-        batch_id,
-        new_bitmap,
-    };
-    if let Err(e) = transport.send(from_node, &ack).await {
-        eprintln!(
-            "[cluster] failed to send FingerprintAck for batch {} to node {}: {}",
-            batch_id, from_node, e
-        );
-    }
-}
-
-/// Spawn a periodic termination-check task that broadcasts this node's
-/// idle status to all peers.
+/// Spawn a periodic bloom exchange + termination check task.
 ///
-/// Runs every `interval_ms` milliseconds. When the local node is idle
-/// (all workers idle + all queues empty + all outbound batches flushed),
-/// it broadcasts a `TerminationToken` with `all_idle=true`.
-pub fn spawn_termination_broadcaster(
+/// This task runs on a timer and:
+/// 1. Triggers bloom filter exchange with peers
+/// 2. Broadcasts this node's idle status for termination detection
+pub fn spawn_bloom_and_termination_task(
     handle: &tokio::runtime::Handle,
     transport: Arc<ClusterTransport>,
-    proxy: Arc<DistributedFingerprintProxy>,
+    stealer: Arc<DistributedWorkStealer>,
     stop: Arc<AtomicBool>,
     interval_ms: u64,
 ) {
@@ -170,21 +156,18 @@ pub fn spawn_termination_broadcaster(
                 break;
             }
 
-            if proxy.is_globally_terminated() {
+            if stealer.is_globally_terminated() {
                 break;
             }
 
-            // First, flush any expired batches from all workers
-            proxy.flush_all();
+            // Trigger bloom exchange if enough time has elapsed
+            stealer.maybe_exchange_bloom();
 
-            let is_idle = proxy.pending_count() == 0;
-            // Note: locally_idle must be set externally by the runtime
-            // based on worker idle status + queue emptiness
-
+            // Broadcast termination status
             let token = Message::TerminationToken {
-                initiator: proxy.node_id(),
+                initiator: stealer.node_id(),
                 round,
-                all_idle: is_idle,
+                all_idle: stealer.all_nodes_idle(),
             };
 
             if let Err(e) = transport.broadcast(&token).await {

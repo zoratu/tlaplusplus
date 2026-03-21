@@ -170,13 +170,14 @@ impl ClusterTransport {
                     // Extract source node_id from the message if possible,
                     // otherwise use u32::MAX as sentinel.
                     let from = match &msg {
-                        Message::FingerprintBatch { from_node, .. } => *from_node,
+                        Message::StealRequest { from_node, .. } => *from_node,
+                        Message::StealResponse { .. } => u32::MAX,
+                        Message::BloomExchange { from_node, .. } => *from_node,
                         Message::Join { node_id, .. } => *node_id,
                         Message::Leave { node_id } => *node_id,
                         Message::Heartbeat { node_id, .. } => *node_id,
                         Message::Stop { node_id, .. } => *node_id,
                         Message::TerminationToken { initiator, .. } => *initiator,
-                        Message::FingerprintAck { .. } => u32::MAX,
                     };
                     if tx.send((from, msg)).await.is_err() {
                         // Receiver dropped — transport is shutting down.
