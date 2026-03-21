@@ -1,3 +1,4 @@
+use crate::distributed::proxy::DistributedFingerprintProxy;
 use crate::autotune::{AutoTuneConfig, AutoTuner, WorkerThrottle};
 use crate::fairness::{
     ActionLabel as FairnessActionLabel, LabeledTransition as FairnessLabeledTransition, TarjanSCC,
@@ -10,7 +11,7 @@ use crate::storage::fingerprint_store::{
 };
 use crate::storage::numa::{NumaDiagnostics, NumaTopology, set_preferred_node};
 use crate::storage::page_aligned_fingerprint_store::FingerprintStats;
-use crate::storage::queue::{DiskBackedQueue, QueueStats};
+use crate::storage::queue::{DiskBackedQueue, QueueStats, serialize_compressed};
 use crate::storage::spillable_work_stealing::{SpillableConfig, SpillableWorkStealingQueues};
 use crate::storage::unified_fingerprint_store::{
     AutoSwitchConfigInput, UnifiedFingerprintConfig, UnifiedFingerprintStore,
@@ -31,7 +32,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct EngineConfig {
     pub workers: usize,
     pub core_ids: Option<Vec<usize>>,
@@ -91,6 +92,10 @@ pub struct EngineConfig {
     /// When this limit is reached, parent tracking stops recording new entries
     /// and falls back to `reconstruct_trace_limited` if a violation occurs.
     pub max_trace_states: usize,
+    /// Distributed fingerprint proxy for multi-node model checking.
+    /// When `Some`, fingerprints are routed to the owning node in the cluster.
+    /// When `None` (default), all fingerprints are checked locally.
+    pub distributed_proxy: Option<Arc<DistributedFingerprintProxy>>,
 }
 
 impl Default for EngineConfig {
@@ -133,6 +138,7 @@ impl Default for EngineConfig {
             defer_queue_segment_deletion: false, // Only true when S3 is active
             trace_parents: false,
             max_trace_states: 10_000_000, // 10M states
+            distributed_proxy: None,
         }
     }
 }
@@ -1977,6 +1983,28 @@ where
     numa_diagnostics.print_startup_info();
     pause.set_numa_diagnostics(numa_diagnostics);
 
+    // --- Distributed mode: spawn inbound message handler and termination broadcaster ---
+    if let Some(ref proxy) = config.distributed_proxy {
+        let handler_transport = Arc::clone(proxy.transport());
+        let handler_proxy = Arc::clone(proxy);
+        let handler_fp_store = Arc::clone(&fp_store);
+        let handler_stop = Arc::clone(&stop);
+
+        crate::distributed::handler::spawn_inbound_handler(
+            handler_transport.clone(),
+            handler_proxy.clone(),
+            handler_fp_store,
+            handler_stop.clone(),
+        );
+
+        crate::distributed::handler::spawn_termination_broadcaster(
+            handler_transport,
+            handler_proxy,
+            handler_stop,
+            100, // check every 100ms
+        );
+    }
+
     let mut workers = Vec::with_capacity(worker_plan.worker_count);
     for (worker_id, mut worker_state) in worker_states.into_iter().enumerate() {
         let worker_model = Arc::clone(&model);
@@ -2005,6 +2033,7 @@ where
         let worker_state_map = state_map.clone();
         let worker_trace_count = Arc::clone(&trace_state_count);
         let worker_max_trace_states = max_trace_states;
+        let worker_distributed_proxy = config.distributed_proxy.clone();
 
         workers.push(std::thread::spawn(move || {
             // Pin thread to CPU for cache locality
@@ -2133,6 +2162,36 @@ where
                         // After checkpoint, the loader thread may still be loading items from disk.
                         // Workers should not terminate while there's pending disk work - the loader
                         // will push items to the global queue that workers can steal.
+                        // Distributed mode: drain inbound states from remote nodes
+                        // before deciding to terminate. Remote nodes may have sent
+                        // us new states to explore.
+                        if let Some(ref proxy) = worker_distributed_proxy {
+                            let inbound = proxy.drain_inbound(worker_fp_batch_size);
+                            if !inbound.is_empty() {
+                                for entry in inbound {
+                                    // Deserialize and enqueue inbound states
+                                    match crate::storage::queue::deserialize_compressed::<M::State>(
+                                        &entry.compressed_state,
+                                    ) {
+                                        Ok(state) => {
+                                            let home_numa =
+                                                worker_fp_store.home_numa(entry.fingerprint);
+                                            worker_queue.push_batch_to_numa(
+                                                &mut worker_state,
+                                                std::iter::once((state, home_numa)),
+                                            );
+                                        }
+                                        Err(e) => {
+                                            eprintln!(
+                                                "[cluster] failed to deserialize inbound state: {}",
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+                                continue; // Re-enter loop to process the new states
+                            }
+                        }
                         if worker_queue.has_pending_work() {
                             // Give the loader thread time to load more items
                             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -2155,6 +2214,15 @@ where
                         // would not see.
                         if worker_queue.has_pending_work() {
                             continue;
+                        }
+                        // Distributed mode: do not terminate if the cluster
+                        // has not reached global termination consensus.
+                        if let Some(ref proxy) = worker_distributed_proxy {
+                            if !proxy.is_globally_terminated() {
+                                // Wait briefly for inbound work from remote nodes
+                                std::thread::sleep(std::time::Duration::from_millis(10));
+                                continue;
+                            }
                         }
                         // No work available and no checkpoint pending — safe to terminate
                         break;
@@ -2352,50 +2420,134 @@ where
                     }
 
                     if !fps_to_check.is_empty() {
-                        // Use worker-affinity batch to reduce CAS contention
-                        // Each worker processes shards in a different order
-                        worker_fp_store.contains_or_insert_batch_with_affinity(
-                            &fps_to_check,
-                            &mut batch_seen,
-                            worker_id,
-                        )?;
+                        // --- Distributed mode: split local vs remote fingerprints ---
+                        if let Some(ref proxy) = worker_distributed_proxy {
+                            // Partition into local and remote fingerprints
+                            let mut local_fps: Vec<u64> = Vec::new();
+                            let mut local_states: Vec<M::State> = Vec::new();
+                            let mut local_indices: Vec<usize> = Vec::new();
 
-                        for (idx, next_state) in states_to_check.drain(..).enumerate() {
-                            let fp = fps_to_check[idx];
-                            if batch_seen[idx] {
-                                *local_duplicates += 1;
-                                // Add to local cache to catch future duplicates
-                                if fp_cache.len() < LOCAL_FP_CACHE_SIZE {
-                                    fp_cache.insert(fp);
-                                }
-                            } else {
-                                *local_states_distinct += 1;
-                                // Add new fingerprint to local cache
-                                if fp_cache.len() < LOCAL_FP_CACHE_SIZE {
-                                    fp_cache.insert(fp);
-                                }
-                                // Record parent tracking for trace reconstruction
-                                if let Some(ref pm) = worker_parent_map {
-                                    if worker_trace_count.load(Ordering::Relaxed)
-                                        < worker_max_trace_states
-                                    {
-                                        pm.insert(fp, current_state_fp);
-                                        if let Some(ref sm) = worker_state_map {
-                                            sm.insert(fp, next_state.clone());
+                            for (idx, state) in states_to_check.drain(..).enumerate() {
+                                let fp = fps_to_check[idx];
+                                if proxy.is_local(fp) {
+                                    local_fps.push(fp);
+                                    local_states.push(state);
+                                    local_indices.push(idx);
+                                } else {
+                                    // Remote: serialize and send to owning node
+                                    match serialize_compressed(&state) {
+                                        Ok(compressed) => {
+                                            proxy.send_remote(worker_id, fp, compressed);
                                         }
-                                        worker_trace_count.fetch_add(1, Ordering::Relaxed);
+                                        Err(e) => {
+                                            eprintln!(
+                                                "[cluster] failed to serialize state for remote fp: {}",
+                                                e
+                                            );
+                                        }
+                                    }
+                                    // Add to local cache so we don't re-send
+                                    if fp_cache.len() < LOCAL_FP_CACHE_SIZE {
+                                        fp_cache.insert(fp);
                                     }
                                 }
-                                // Get the fingerprint's home NUMA for routing
-                                let home_numa = worker_fp_store.home_numa(fp);
-                                states_with_home_numa.push((next_state, home_numa));
                             }
-                        }
 
-                        // Batch push with NUMA-aware routing
-                        let pushed = worker_queue
-                            .push_batch_to_numa(&mut worker_state, states_with_home_numa.drain(..));
-                        *local_enqueued += pushed as u64;
+                            // Check-and-insert local fingerprints
+                            if !local_fps.is_empty() {
+                                let mut local_seen = vec![false; local_fps.len()];
+                                worker_fp_store.contains_or_insert_batch_with_affinity(
+                                    &local_fps,
+                                    &mut local_seen,
+                                    worker_id,
+                                )?;
+
+                                for (i, next_state) in local_states.into_iter().enumerate() {
+                                    let fp = local_fps[i];
+                                    if local_seen[i] {
+                                        *local_duplicates += 1;
+                                        if fp_cache.len() < LOCAL_FP_CACHE_SIZE {
+                                            fp_cache.insert(fp);
+                                        }
+                                    } else {
+                                        *local_states_distinct += 1;
+                                        if fp_cache.len() < LOCAL_FP_CACHE_SIZE {
+                                            fp_cache.insert(fp);
+                                        }
+                                        if let Some(ref pm) = worker_parent_map {
+                                            if worker_trace_count.load(Ordering::Relaxed)
+                                                < worker_max_trace_states
+                                            {
+                                                pm.insert(fp, current_state_fp);
+                                                if let Some(ref sm) = worker_state_map {
+                                                    sm.insert(fp, next_state.clone());
+                                                }
+                                                worker_trace_count.fetch_add(1, Ordering::Relaxed);
+                                            }
+                                        }
+                                        let home_numa = worker_fp_store.home_numa(fp);
+                                        states_with_home_numa.push((next_state, home_numa));
+                                    }
+                                }
+
+                                let pushed = worker_queue.push_batch_to_numa(
+                                    &mut worker_state,
+                                    states_with_home_numa.drain(..),
+                                );
+                                *local_enqueued += pushed as u64;
+                            }
+
+                            // Periodically flush expired remote batches
+                            proxy.flush_expired(worker_id);
+                        } else {
+                            // --- Single-node mode: existing path (zero overhead) ---
+                            // Use worker-affinity batch to reduce CAS contention
+                            // Each worker processes shards in a different order
+                            worker_fp_store.contains_or_insert_batch_with_affinity(
+                                &fps_to_check,
+                                &mut batch_seen,
+                                worker_id,
+                            )?;
+
+                            for (idx, next_state) in states_to_check.drain(..).enumerate() {
+                                let fp = fps_to_check[idx];
+                                if batch_seen[idx] {
+                                    *local_duplicates += 1;
+                                    // Add to local cache to catch future duplicates
+                                    if fp_cache.len() < LOCAL_FP_CACHE_SIZE {
+                                        fp_cache.insert(fp);
+                                    }
+                                } else {
+                                    *local_states_distinct += 1;
+                                    // Add new fingerprint to local cache
+                                    if fp_cache.len() < LOCAL_FP_CACHE_SIZE {
+                                        fp_cache.insert(fp);
+                                    }
+                                    // Record parent tracking for trace reconstruction
+                                    if let Some(ref pm) = worker_parent_map {
+                                        if worker_trace_count.load(Ordering::Relaxed)
+                                            < worker_max_trace_states
+                                        {
+                                            pm.insert(fp, current_state_fp);
+                                            if let Some(ref sm) = worker_state_map {
+                                                sm.insert(fp, next_state.clone());
+                                            }
+                                            worker_trace_count.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    }
+                                    // Get the fingerprint's home NUMA for routing
+                                    let home_numa = worker_fp_store.home_numa(fp);
+                                    states_with_home_numa.push((next_state, home_numa));
+                                }
+                            }
+
+                            // Batch push with NUMA-aware routing
+                            let pushed = worker_queue.push_batch_to_numa(
+                                &mut worker_state,
+                                states_with_home_numa.drain(..),
+                            );
+                            *local_enqueued += pushed as u64;
+                        }
                     }
 
                     *local_duplicates += duplicates_in_batch;
@@ -2459,7 +2611,16 @@ where
             // Flush queue counters
             worker_queue.flush_worker_counters(&mut worker_state);
 
-            worker_live.fetch_sub(1, Ordering::AcqRel);
+            // Distributed mode: flush any remaining outbound batches and
+            // signal locally idle when the last worker exits.
+            let remaining = worker_live.fetch_sub(1, Ordering::AcqRel);
+            if remaining == 1 {
+                // This is the last worker — signal locally idle
+                if let Some(ref proxy) = worker_distributed_proxy {
+                    proxy.flush_all();
+                    proxy.set_locally_idle(true);
+                }
+            }
         }));
     }
 

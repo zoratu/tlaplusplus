@@ -1,6 +1,10 @@
 use clap::{Args, Parser, Subcommand};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use tlaplusplus::distributed::proxy::DistributedFingerprintProxy;
+use tlaplusplus::distributed::ring::PartitionRing;
+use tlaplusplus::distributed::transport::ClusterTransport;
+use tlaplusplus::distributed::ClusterConfig;
 use tlaplusplus::models::counter_grid::CounterGridModel;
 use tlaplusplus::models::flurm_job_lifecycle::FlurmJobLifecycleModel;
 use tlaplusplus::models::high_branching::HighBranchingModel;
@@ -426,6 +430,7 @@ fn build_engine_config(
         defer_queue_segment_deletion: false,
         trace_parents: runtime.trace_parents,
         max_trace_states: runtime.max_trace_states,
+        distributed_proxy: None, // Set later when --cluster-listen is specified
     })
 }
 
@@ -1768,7 +1773,7 @@ fn main() -> anyhow::Result<()> {
             runtime,
             storage,
             s3,
-            cluster: _cluster,
+            cluster,
         } => {
             run_system_checks(runtime.skip_system_checks);
             // Auto-detect config file if not specified
@@ -1866,7 +1871,106 @@ fn main() -> anyhow::Result<()> {
             // Clone model for post-processing (liveness checking, coverage, dump)
             let model_for_liveness = model.clone();
 
-            let engine_config = build_engine_config(&runtime, &storage, s3.s3_bucket.is_some())?;
+            let mut engine_config =
+                build_engine_config(&runtime, &storage, s3.s3_bucket.is_some())?;
+
+            // --- Distributed cluster startup ---
+            if let Some(ref listen_addr_str) = cluster.cluster_listen {
+                let listen_addr: std::net::SocketAddr = listen_addr_str.parse().map_err(|e| {
+                    anyhow::anyhow!("invalid --cluster-listen address '{}': {}", listen_addr_str, e)
+                })?;
+                let peers: Vec<std::net::SocketAddr> = cluster
+                    .cluster_peers
+                    .iter()
+                    .map(|s| {
+                        s.parse()
+                            .map_err(|e| anyhow::anyhow!("invalid peer address '{}': {}", s, e))
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+
+                let cluster_config = ClusterConfig {
+                    node_id: cluster.node_id,
+                    listen_addr,
+                    peers: peers.clone(),
+                    batch_size: 512,
+                    batch_timeout_ms: 1,
+                };
+                let num_nodes = cluster_config.num_nodes();
+
+                // Build tokio runtime for cluster transport
+                let tokio_rt = tokio::runtime::Runtime::new()
+                    .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {}", e))?;
+                let tokio_handle = tokio_rt.handle().clone();
+
+                // Start transport (bind listener)
+                let transport = tokio_handle.block_on(async {
+                    ClusterTransport::new(cluster_config.clone()).await
+                })?;
+
+                // Connect to peers (retry with brief delay for startup ordering)
+                println!(
+                    "[cluster] node {} listening on {}, connecting to {} peers...",
+                    cluster.node_id, listen_addr, peers.len()
+                );
+                tokio_handle.block_on(async {
+                    for attempt in 0..30 {
+                        match transport.connect_to_peers().await {
+                            Ok(()) => return Ok(()),
+                            Err(e) => {
+                                if attempt < 29 {
+                                    eprintln!(
+                                        "[cluster] peer connection attempt {} failed: {}, retrying...",
+                                        attempt + 1, e
+                                    );
+                                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                                } else {
+                                    return Err(e);
+                                }
+                            }
+                        }
+                    }
+                    unreachable!()
+                })?;
+                println!("[cluster] connected to all peers");
+
+                // Build partition ring — assume all nodes have equal capacity
+                // (could be extended with per-node core counts from Join messages)
+                let num_cores = engine_config.workers.max(1) as u32;
+                let mut ring_nodes: Vec<(u32, u32)> = Vec::new();
+                for i in 0..num_nodes {
+                    ring_nodes.push((i, num_cores));
+                }
+                let ring = PartitionRing::new(&ring_nodes);
+
+                // Create distributed proxy
+                let proxy = Arc::new(DistributedFingerprintProxy::new(
+                    cluster.node_id,
+                    ring,
+                    Arc::clone(&transport),
+                    tokio_handle.clone(),
+                    engine_config.workers.max(1),
+                    num_nodes,
+                    512, // batch_size
+                    1,   // batch_timeout_ms
+                ));
+
+                // Spawn inbound message handler and termination broadcaster.
+                // These need the fp_store, which is created inside run_model.
+                // For now, we store the proxy in engine_config and the handler
+                // will be spawned from within run_model using the fp_store created there.
+                // We store transport/stop references for handler spawning.
+                engine_config.distributed_proxy = Some(Arc::clone(&proxy));
+
+                // Leak the tokio runtime so it stays alive for the duration of the process.
+                // The runtime is needed for the transport's async tasks.
+                std::mem::forget(tokio_rt);
+
+                println!(
+                    "[cluster] distributed mode active: node {}, {} total nodes",
+                    cluster.node_id, num_nodes
+                );
+            }
+
             let outcome = run_model_with_s3(model, engine_config, &s3).map_err(|e| {
                 eprintln!("Error running model:");
                 eprintln!("  {}", e);
