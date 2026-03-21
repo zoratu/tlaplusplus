@@ -8,6 +8,8 @@ use tlaplusplus::models::tla_native::TlaModel;
 use tlaplusplus::system::{check_thp_and_warn, parse_cpu_list};
 use tlaplusplus::tla::action_exec::probe_next_disjuncts_with_instances;
 use tlaplusplus::tla::module::TlaModuleInstance;
+#[cfg(test)]
+use tlaplusplus::tla::tla_state;
 use tlaplusplus::tla::{
     ActionClause, ClauseKind, ConfigValue, EvalContext, TlaConfig, TlaDefinition, TlaModule,
     TlaState, TlaValue, classify_clause, compile_action_ir, compile_action_ir_branches,
@@ -16,8 +18,6 @@ use tlaplusplus::tla::{
     parse_stuttering_action_expr, parse_tla_config, parse_tla_module_file, restore_eval_budget,
     scan_module_closure, set_active_eval_budget, split_action_body_disjuncts, split_top_level,
 };
-#[cfg(test)]
-use tlaplusplus::tla::tla_state;
 use tlaplusplus::{EngineConfig, SimulationConfig, run_model, run_simulation};
 
 /// Parse human-readable byte sizes like "200GB", "10GiB", "512MB"
@@ -209,6 +209,20 @@ struct S3Args {
     s3_upload_interval_secs: u64,
 }
 
+#[derive(Args, Clone, Debug)]
+struct ClusterArgs {
+    /// Listen address for distributed cluster communication (e.g., 0.0.0.0:7878).
+    /// When set, enables distributed mode.
+    #[arg(long)]
+    cluster_listen: Option<String>,
+    /// Comma-separated peer addresses (e.g., 10.0.0.2:7878,10.0.0.3:7878)
+    #[arg(long, value_delimiter = ',')]
+    cluster_peers: Vec<String>,
+    /// This node's ID in the cluster (must be unique per node)
+    #[arg(long, default_value_t = 0)]
+    node_id: u32,
+}
+
 #[derive(Subcommand, Debug)]
 enum Command {
     RunCounterGrid {
@@ -323,6 +337,8 @@ enum Command {
         storage: StorageArgs,
         #[command(flatten)]
         s3: S3Args,
+        #[command(flatten)]
+        cluster: ClusterArgs,
     },
     /// List available checkpoints from S3 and/or local disk
     ListCheckpoints {
@@ -821,8 +837,7 @@ fn collect_coverage(model: &TlaModel) -> tlaplusplus::CoverageStats {
             // Try to extract a meaningful name from the disjunct
             let trimmed = d.trim();
             if let Some(name) = trimmed.split_whitespace().next() {
-                if name.chars().next().map_or(false, |c| c.is_alphabetic()) && !name.contains('(')
-                {
+                if name.chars().next().map_or(false, |c| c.is_alphabetic()) && !name.contains('(') {
                     return name.to_string();
                 }
             }
@@ -832,7 +847,9 @@ fn collect_coverage(model: &TlaModel) -> tlaplusplus::CoverageStats {
 
     let mut stats = CoverageStats::default();
     for name in &action_names {
-        stats.actions.insert(name.clone(), ActionCoverageEntry::default());
+        stats
+            .actions
+            .insert(name.clone(), ActionCoverageEntry::default());
     }
 
     // Evaluate each disjunct against initial states to populate coverage
@@ -906,16 +923,16 @@ fn collect_coverage(model: &TlaModel) -> tlaplusplus::CoverageStats {
 /// Supports two formats controlled by `format`:
 /// - `"dot"` (default): GraphViz DOT format with styled initial and violating states
 /// - `"raw"`: Legacy format with `STATE hash {state}` lines and `hash -> hash` edges
-fn dump_state_graph(
-    model: &TlaModel,
-    path: &std::path::Path,
-    format: &str,
-) -> anyhow::Result<()> {
+fn dump_state_graph(model: &TlaModel, path: &std::path::Path, format: &str) -> anyhow::Result<()> {
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::io::Write;
     use tlaplusplus::model::Model;
 
-    eprintln!("Dumping state graph to {} (format={})...", path.display(), format);
+    eprintln!(
+        "Dumping state graph to {} (format={})...",
+        path.display(),
+        format
+    );
 
     let mut state_hashes: HashMap<u64, TlaState> = HashMap::new();
     let mut transitions: Vec<(u64, u64)> = Vec::new();
@@ -995,11 +1012,7 @@ fn dump_state_graph(
                     (false, false) => "",
                 };
 
-                writeln!(
-                    file,
-                    "  \"{:#018x}\" [label=\"{}\"{style}];",
-                    hash, label,
-                )?;
+                writeln!(file, "  \"{:#018x}\" [label=\"{}\"{style}];", hash, label,)?;
             }
 
             writeln!(file)?;
@@ -1530,7 +1543,9 @@ fn main() -> anyhow::Result<()> {
                 parsed_cfg.as_ref(),
             );
             for var in &parsed_module.variables {
-                probe_state.entry(Arc::from(var.as_str())).or_insert(TlaValue::Int(0));
+                probe_state
+                    .entry(Arc::from(var.as_str()))
+                    .or_insert(TlaValue::Int(0));
             }
             println!("probe_init_seeded={probe_init_seeded}");
             println!("probe_init_unresolved={probe_init_unresolved}");
@@ -1753,6 +1768,7 @@ fn main() -> anyhow::Result<()> {
             runtime,
             storage,
             s3,
+            cluster: _cluster,
         } => {
             run_system_checks(runtime.skip_system_checks);
             // Auto-detect config file if not specified
@@ -1850,8 +1866,7 @@ fn main() -> anyhow::Result<()> {
             // Clone model for post-processing (liveness checking, coverage, dump)
             let model_for_liveness = model.clone();
 
-            let engine_config =
-                build_engine_config(&runtime, &storage, s3.s3_bucket.is_some())?;
+            let engine_config = build_engine_config(&runtime, &storage, s3.s3_bucket.is_some())?;
             let outcome = run_model_with_s3(model, engine_config, &s3).map_err(|e| {
                 eprintln!("Error running model:");
                 eprintln!("  {}", e);
@@ -6098,8 +6113,7 @@ INVARIANTS TypeOK
 
     #[test]
     fn seeds_probe_state_from_subset_type_invariants() {
-        let mut probe_state =
-            tla_state([("msgs", TlaValue::Set(Arc::new(BTreeSet::new())))]);
+        let mut probe_state = tla_state([("msgs", TlaValue::Set(Arc::new(BTreeSet::new())))]);
         let module = TlaModule {
             name: "SubsetSeed".to_string(),
             path: String::new(),
@@ -6453,10 +6467,7 @@ INVARIANTS TypeOK
                     TlaValue::ModelValue("h3".to_string()),
                 ]))),
             ),
-            (
-                "NoBlock",
-                TlaValue::ModelValue("NoBlockVal".to_string()),
-            ),
+            ("NoBlock", TlaValue::ModelValue("NoBlockVal".to_string())),
             (
                 "hashFunction",
                 TlaValue::Function(Arc::new(BTreeMap::from([
@@ -6726,10 +6737,7 @@ INVARIANTS TypeOK
                     TlaValue::ModelValue("None".to_string()),
                 )]))),
             ),
-            (
-                "msgs",
-                TlaValue::Set(Arc::new(BTreeSet::from([msg]))),
-            ),
+            ("msgs", TlaValue::Set(Arc::new(BTreeSet::from([msg])))),
         ]);
         let definitions = BTreeMap::from([
             (
@@ -7595,10 +7603,7 @@ INVARIANTS TypeInvariant
                     no_val.clone(),
                 )]))),
             ),
-            (
-                "memInt",
-                TlaValue::Set(Arc::new(BTreeSet::new())),
-            ),
+            ("memInt", TlaValue::Set(Arc::new(BTreeSet::new()))),
             ("NoVal", no_val),
         ]);
         let module = TlaModule {
@@ -8073,10 +8078,7 @@ INVARIANTS TypeInvariant
 
     #[test]
     fn expr_probe_evaluates_primed_zero_arg_operators_from_staged_bindings() {
-        let state = tla_state([
-            ("x", TlaValue::Int(1)),
-            ("y", TlaValue::Int(2)),
-        ]);
+        let state = tla_state([("x", TlaValue::Int(1)), ("y", TlaValue::Int(2))]);
         let defs = BTreeMap::from([
             (
                 "PairSum".to_string(),
@@ -8186,10 +8188,7 @@ INVARIANTS TypeInvariant
                     TlaValue::Int(7),
                 )]))),
             ),
-            (
-                "missing",
-                TlaValue::ModelValue("NoNode".to_string()),
-            ),
+            ("missing", TlaValue::ModelValue("NoNode".to_string())),
             ("x", TlaValue::Int(0)),
         ]);
         let def = TlaDefinition {
@@ -8285,10 +8284,7 @@ INVARIANTS TypeInvariant
 
     #[test]
     fn expr_probe_handles_top_level_let_action_with_multiple_assignments() {
-        let state = tla_state([
-            ("x", TlaValue::Int(1)),
-            ("y", TlaValue::Int(10)),
-        ]);
+        let state = tla_state([("x", TlaValue::Int(1)), ("y", TlaValue::Int(10))]);
         let def = TlaDefinition {
             name: "Increment".to_string(),
             params: vec![],
@@ -8349,10 +8345,7 @@ INVARIANTS TypeInvariant
                 "signalled",
                 TlaValue::Function(Arc::new(BTreeMap::<TlaValue, TlaValue>::new())),
             ),
-            (
-                "DesignatedCounter",
-                TlaValue::ModelValue("p1".to_string()),
-            ),
+            ("DesignatedCounter", TlaValue::ModelValue("p1".to_string())),
         ]);
         let def = TlaDefinition {
             name: "CounterAction".to_string(),
@@ -8457,10 +8450,7 @@ INVARIANTS TypeInvariant
                 "ActiveElevatorCalls",
                 TlaValue::Set(Arc::new(BTreeSet::new())),
             ),
-            (
-                "PersonState",
-                TlaValue::Function(Arc::new(BTreeMap::new())),
-            ),
+            ("PersonState", TlaValue::Function(Arc::new(BTreeMap::new()))),
         ]);
         let defs = BTreeMap::from([(
             "CanServiceCall".to_string(),
@@ -9085,10 +9075,7 @@ INVARIANTS TypeInvariant
     fn build_action_expr_probe_context_seeds_sequence_heads_from_function_domains() {
         let car = TlaValue::ModelValue("r1".to_string());
         let state = tla_state([
-            (
-                "WaitingBeforeBridge",
-                TlaValue::Seq(Arc::new(Vec::new())),
-            ),
+            ("WaitingBeforeBridge", TlaValue::Seq(Arc::new(Vec::new()))),
             (
                 "Location",
                 TlaValue::Function(Arc::new(BTreeMap::from([(car.clone(), TlaValue::Int(8))]))),
@@ -9112,10 +9099,7 @@ INVARIANTS TypeInvariant
     fn build_action_expr_probe_context_seeds_sequence_heads_from_direct_function_indexes() {
         let car = TlaValue::ModelValue("r1".to_string());
         let state = tla_state([
-            (
-                "WaitingBeforeBridge",
-                TlaValue::Seq(Arc::new(Vec::new())),
-            ),
+            ("WaitingBeforeBridge", TlaValue::Seq(Arc::new(Vec::new()))),
             (
                 "Location",
                 TlaValue::Function(Arc::new(BTreeMap::from([(car.clone(), TlaValue::Int(8))]))),
@@ -9139,18 +9123,12 @@ INVARIANTS TypeInvariant
     fn build_action_expr_probe_context_seeds_sequence_heads_for_parsed_enter_bridge() {
         let car = TlaValue::ModelValue("r1".to_string());
         let state = tla_state([
-            (
-                "WaitingBeforeBridge",
-                TlaValue::Seq(Arc::new(Vec::new())),
-            ),
+            ("WaitingBeforeBridge", TlaValue::Seq(Arc::new(Vec::new()))),
             (
                 "Location",
                 TlaValue::Function(Arc::new(BTreeMap::from([(car.clone(), TlaValue::Int(8))]))),
             ),
-            (
-                "CarsInBridge",
-                TlaValue::Set(Arc::new(BTreeSet::new())),
-            ),
+            ("CarsInBridge", TlaValue::Set(Arc::new(BTreeSet::new()))),
         ]);
         let defs = BTreeMap::from([
             (
@@ -10472,10 +10450,7 @@ INVARIANTS TypeInvariant
     fn existential_guard_without_witness_disables_following_clauses() {
         let state = tla_state([
             ("aCounter", TlaValue::Int(0)),
-            (
-                "aSession",
-                TlaValue::Set(Arc::new(BTreeSet::new())),
-            ),
+            ("aSession", TlaValue::Set(Arc::new(BTreeSet::new()))),
         ]);
         let defs = BTreeMap::new();
         let instances = BTreeMap::new();
@@ -10536,10 +10511,7 @@ INVARIANTS TypeInvariant
     fn helper_action_with_empty_sequence_precondition_gap_is_probeable() {
         let state = tla_state([
             ("AuthChannel", TlaValue::Seq(Arc::new(vec![]))),
-            (
-                "ReplaySession",
-                TlaValue::Set(Arc::new(BTreeSet::new())),
-            ),
+            ("ReplaySession", TlaValue::Set(Arc::new(BTreeSet::new()))),
             ("ReplayCount", TlaValue::Int(0)),
         ]);
         let defs = BTreeMap::from([(
@@ -10774,10 +10746,7 @@ INVARIANTS TypeInvariant
                     (rm3.clone(), TlaValue::String("prepared".to_string())),
                 ]))),
             ),
-            (
-                "tmState",
-                TlaValue::String("commit".to_string()),
-            ),
+            ("tmState", TlaValue::String("commit".to_string())),
             (
                 "pc",
                 TlaValue::Function(Arc::new(BTreeMap::from([
@@ -10897,10 +10866,7 @@ INVARIANTS TypeInvariant
                     (rm3.clone(), TlaValue::String("prepared".to_string())),
                 ]))),
             ),
-            (
-                "tmState",
-                TlaValue::String("commit".to_string()),
-            ),
+            ("tmState", TlaValue::String("commit".to_string())),
             (
                 "pc",
                 TlaValue::Function(Arc::new(BTreeMap::from([
