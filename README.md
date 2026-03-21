@@ -4,6 +4,8 @@ A Rust implementation of TLA+ model checking with TLC feature parity, achieving 
 
 ## Performance
 
+### Synthetic Model (Counter-Grid)
+
 Benchmarked on 128-core AMD EPYC (c6a.metal, 256GB RAM):
 
 | Metric | tlaplusplus | Java TLC | Speedup |
@@ -12,7 +14,24 @@ Benchmarked on 128-core AMD EPYC (c6a.metal, 256GB RAM):
 | CPU utilization | 95%+ | ~60% | - |
 | Memory efficiency | Lock-free | GC pauses | - |
 
-Validated on 384-core systems (6 NUMA nodes, 760GB RAM):
+### Production Models (192-core ARM, c8g.metal-48xl)
+
+| Model | States (30 min) | Rate | Notes |
+|-------|----------------|------|-------|
+| CoherentIO | 31.8M generated, 20.7M distinct | 1.05M/min | Sustained, no stalls |
+| ClusterLeaseFailover | 53M generated, 12M distinct | 1.75M/min | Continuous exploration |
+
+### TLC Comparison (8 workers, tlaplus/Examples corpus)
+
+| Spec | States | tlaplusplus | TLC | Speedup |
+|------|--------|-------------|-----|---------|
+| MCReachable | 8 | 2.7s | 67.4s | **25.0x** |
+| CoffeeCan100Beans | 5,150 | 2.7s | 1.1s | 0.4x |
+| DieHard | 16 | 2.3s | 0.7s | 0.3x |
+
+**Note:** For small models (< 100 states), TLC's JVM starts faster than our NUMA-aware runtime initialization (~2s overhead). The speedup manifests on large state spaces where lock-free fingerprinting, NUMA-local memory, and zero GC pauses dominate.
+
+### NUMA Scaling (384-core, 6 NUMA nodes, 760GB RAM)
 
 | Configuration | %usr | %sys | States/min |
 |--------------|------|------|------------|
