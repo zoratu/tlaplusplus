@@ -2,17 +2,16 @@ use crate::fairness::{FairnessConstraint, LabeledTransition};
 use crate::model::Model;
 use crate::symmetry::{SymmetrySpec, canonicalize_tla_state};
 use crate::tla::module::TlaModuleInstance;
+#[cfg(test)]
+use crate::tla::tla_state;
 use crate::tla::{
     ClauseKind, CompiledActionIr, CompiledExpr, ConfigValue, EvalContext, TemporalFormula,
     TlaConfig, TlaDefinition, TlaModule, TlaState, TlaValue, classify_clause, compile_action_ir,
-    compile_expr, eval_action_constraint, eval_compiled, eval_expr,
-    count_next_disjuncts, evaluate_next_states_labeled_with_instances,
-    evaluate_next_states_swarm, evaluate_next_states_with_instances, insert_compiled_action,
-    looks_like_action, normalize_operator_ref_name, parse_tla_config, parse_tla_module_file,
-    split_top_level,
+    compile_expr, count_next_disjuncts, eval_action_constraint, eval_compiled, eval_expr,
+    evaluate_next_states_labeled_with_instances, evaluate_next_states_swarm,
+    evaluate_next_states_with_instances, insert_compiled_action, looks_like_action,
+    normalize_operator_ref_name, parse_tla_config, parse_tla_module_file, split_top_level,
 };
-#[cfg(test)]
-use crate::tla::tla_state;
 use anyhow::{Context, Result, anyhow};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
@@ -62,6 +61,12 @@ impl TlaModel {
         // Inject constants from config into module definitions
         // This makes constants available during action evaluation
         inject_constants_into_definitions(&mut module, &config);
+
+        // TLC-style directory search: if config references definitions (invariants,
+        // properties, init, next) not found in the module, search sibling .tla files
+        // in the same directory. This matches TLC's behavior of implicitly searching
+        // the working directory for unresolved definitions.
+        resolve_sibling_definitions(module_path, &mut module, &config);
 
         let (init_name, next_name) = resolve_init_next_names(
             &mut module,
@@ -1330,7 +1335,10 @@ fn evaluate_init_states(
 
         if all_guards_pass {
             // Verify all variables are assigned
-            let all_assigned = module.variables.iter().all(|v| state.contains_key(v.as_str()));
+            let all_assigned = module
+                .variables
+                .iter()
+                .all(|v| state.contains_key(v.as_str()));
             if all_assigned {
                 valid_states.push(state);
             }
@@ -1458,6 +1466,89 @@ fn extract_fairness_from_formula(
         }
         TemporalFormula::StatePredicate(_) => {
             // No fairness constraints in state predicates
+        }
+    }
+}
+
+/// TLC-style directory search: find definitions referenced by config (invariants,
+/// properties) that aren't in the module's EXTENDS chain, by parsing sibling .tla
+/// files in the same directory.
+fn resolve_sibling_definitions(module_path: &Path, module: &mut TlaModule, config: &TlaConfig) {
+    // Collect names referenced by config that aren't in module definitions
+    let mut missing: Vec<String> = Vec::new();
+    for inv in &config.invariants {
+        if !module.definitions.contains_key(inv) {
+            missing.push(inv.clone());
+        }
+    }
+    for prop in &config.properties {
+        if !module.definitions.contains_key(prop) {
+            missing.push(prop.clone());
+        }
+    }
+
+    if missing.is_empty() {
+        return;
+    }
+
+    // Search sibling .tla files in the same directory
+    let dir = module_path.parent().unwrap_or(Path::new("."));
+    let module_filename = module_path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("");
+
+    let tla_files: Vec<_> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_str().unwrap_or("");
+            name.ends_with(".tla") && name != module_filename
+        })
+        .collect();
+
+    for entry in &tla_files {
+        let path = entry.path();
+        let sibling = match parse_tla_module_file(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        let mut found_any = false;
+        for name in &missing {
+            if let Some(def) = sibling.definitions.get(name) {
+                eprintln!(
+                    "Resolved '{}' from sibling module {} (TLC-style directory search)",
+                    name,
+                    path.display()
+                );
+                module.definitions.insert(name.clone(), def.clone());
+                found_any = true;
+            }
+        }
+
+        if found_any {
+            // Merge definitions (operators) from sibling — needed to evaluate
+            // the resolved invariant/property expressions. Do NOT merge variables
+            // — those belong to the sibling's state space, not ours.
+            for (k, v) in &sibling.definitions {
+                module
+                    .definitions
+                    .entry(k.clone())
+                    .or_insert_with(|| v.clone());
+            }
+        }
+    }
+
+    // Report any still-missing definitions
+    for name in &missing {
+        if !module.definitions.contains_key(name) {
+            eprintln!(
+                "Warning: '{}' not found in module definitions or sibling .tla files",
+                name
+            );
         }
     }
 }
