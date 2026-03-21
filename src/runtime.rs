@@ -1,5 +1,5 @@
-use crate::distributed::proxy::DistributedFingerprintProxy;
 use crate::autotune::{AutoTuneConfig, AutoTuner, WorkerThrottle};
+use crate::distributed::proxy::DistributedFingerprintProxy;
 use crate::fairness::{
     ActionLabel as FairnessActionLabel, LabeledTransition as FairnessLabeledTransition, TarjanSCC,
     check_fairness_on_scc,
@@ -1990,7 +1990,9 @@ where
         let handler_fp_store = Arc::clone(&fp_store);
         let handler_stop = Arc::clone(&stop);
 
+        let tokio_handle = proxy.tokio_handle();
         crate::distributed::handler::spawn_inbound_handler(
+            &tokio_handle,
             handler_transport.clone(),
             handler_proxy.clone(),
             handler_fp_store,
@@ -1998,6 +2000,7 @@ where
         );
 
         crate::distributed::handler::spawn_termination_broadcaster(
+            &tokio_handle,
             handler_transport,
             handler_proxy,
             handler_stop,

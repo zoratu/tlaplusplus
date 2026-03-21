@@ -231,6 +231,11 @@ impl DistributedFingerprintProxy {
         &self.transport
     }
 
+    /// Tokio runtime handle for spawning async tasks.
+    pub fn tokio_handle(&self) -> tokio::runtime::Handle {
+        self.tokio_handle.clone()
+    }
+
     // --- Distributed termination detection ---
 
     /// Mark this node as locally idle or active.
