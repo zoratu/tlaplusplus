@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::storage::unified_fingerprint_store::UnifiedFingerprintStore;
 
@@ -25,12 +25,13 @@ use super::transport::ClusterTransport;
 /// For `Stop` messages:
 /// - Set the stop flag to halt local exploration
 pub fn spawn_inbound_handler(
+    handle: &tokio::runtime::Handle,
     transport: Arc<ClusterTransport>,
     proxy: Arc<DistributedFingerprintProxy>,
     fp_store: Arc<UnifiedFingerprintStore>,
     stop: Arc<AtomicBool>,
 ) {
-    tokio::spawn(async move {
+    handle.spawn(async move {
         loop {
             if stop.load(Ordering::Acquire) {
                 break;
@@ -51,12 +52,7 @@ pub fn spawn_inbound_handler(
                     entries,
                 } => {
                     handle_fingerprint_batch(
-                        &proxy,
-                        &fp_store,
-                        &transport,
-                        from_node,
-                        batch_id,
-                        entries,
+                        &proxy, &fp_store, &transport, from_node, batch_id, entries,
                     )
                     .await;
                 }
@@ -81,10 +77,7 @@ pub fn spawn_inbound_handler(
                 }
 
                 Message::Stop { node_id, message } => {
-                    eprintln!(
-                        "[cluster] received stop from node {}: {}",
-                        node_id, message
-                    );
+                    eprintln!("[cluster] received stop from node {}: {}", node_id, message);
                     stop.store(true, Ordering::Release);
                 }
 
@@ -160,12 +153,13 @@ async fn handle_fingerprint_batch(
 /// (all workers idle + all queues empty + all outbound batches flushed),
 /// it broadcasts a `TerminationToken` with `all_idle=true`.
 pub fn spawn_termination_broadcaster(
+    handle: &tokio::runtime::Handle,
     transport: Arc<ClusterTransport>,
     proxy: Arc<DistributedFingerprintProxy>,
     stop: Arc<AtomicBool>,
     interval_ms: u64,
 ) {
-    tokio::spawn(async move {
+    handle.spawn(async move {
         let mut round = 0u64;
         let interval = tokio::time::Duration::from_millis(interval_ms);
 
