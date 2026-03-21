@@ -1,5 +1,7 @@
 pub mod batch;
+pub mod handler;
 pub mod protocol;
+pub mod proxy;
 pub mod ring;
 pub mod transport;
 
