@@ -222,12 +222,12 @@ impl FingerprintShard {
         let entry_size = std::mem::size_of::<HashTableEntry>();
         let capacity = (memory_size / entry_size) * 9 / 10;
 
-        // Initialize hash table in allocated memory
+        // The hash table uses zero (0) as the "empty slot" sentinel.
+        // mmap(MAP_ANONYMOUS) guarantees zero-filled pages on first access,
+        // so we skip explicit zero-initialization. Pages are faulted lazily
+        // by the kernel when first written, avoiding 1.6GB of page faults
+        // at startup for specs that only explore a few states.
         let table = memory as *mut HashTableEntry;
-        unsafe {
-            // Zero-initialize all entries
-            std::ptr::write_bytes(table, 0, capacity);
-        }
 
         Ok(Self {
             memory: AtomicPtr::new(memory),
@@ -293,9 +293,7 @@ impl FingerprintShard {
         let batch_size = self.rehash_batch_size.load(Ordering::Relaxed);
 
         // Claim a batch of entries to rehash
-        let start = self
-            .rehash_cursor
-            .fetch_add(batch_size, Ordering::AcqRel);
+        let start = self.rehash_cursor.fetch_add(batch_size, Ordering::AcqRel);
         if start >= old_cap {
             return false; // All batches claimed
         }
@@ -465,10 +463,8 @@ impl FingerprintShard {
         };
         let new_table = new_memory as *mut HashTableEntry;
 
-        // Zero-initialize new table
-        unsafe {
-            std::ptr::write_bytes(new_table, 0, new_capacity);
-        }
+        // New mmap is already zero-filled (MAP_ANONYMOUS guarantee).
+        // Skip explicit zero-init to avoid touching every page upfront.
 
         // Get old table pointer BEFORE marking resize in progress
         let old_table = self.get_table();
@@ -490,7 +486,8 @@ impl FingerprintShard {
 
         // Determine adaptive batch size based on current occupancy
         let adaptive_batch = self.compute_rehash_batch_size();
-        self.rehash_batch_size.store(adaptive_batch, Ordering::Release);
+        self.rehash_batch_size
+            .store(adaptive_batch, Ordering::Release);
 
         // Mark resize in progress (odd seq number)
         // After this, workers will:
