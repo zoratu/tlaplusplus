@@ -4782,7 +4782,13 @@ fn split_top_level(expr: &str, delim: &str, keyword: bool) -> Vec<String> {
             if expr[i..].starts_with("LET") {
                 let after_let = &expr[i + 3..];
                 // invariant: is_empty() check above guarantees chars().next() is Some
-                if after_let.is_empty() || !after_let.chars().next().expect("non-empty string has no first char").is_alphanumeric() {
+                if after_let.is_empty()
+                    || !after_let
+                        .chars()
+                        .next()
+                        .expect("non-empty string has no first char")
+                        .is_alphanumeric()
+                {
                     let_depth += 1;
                 }
             }
@@ -6390,10 +6396,7 @@ mod tests {
 
     #[test]
     fn evals_arithmetic_and_boolean() {
-        let state = tla_state([
-            ("x", TlaValue::Int(4)),
-            ("y", TlaValue::Int(2)),
-        ]);
+        let state = tla_state([("x", TlaValue::Int(4)), ("y", TlaValue::Int(2))]);
         let ctx = EvalContext::new(&state);
         assert_eq!(
             eval_expr("x + y * 3", &ctx).expect("expr should evaluate"),
@@ -6535,10 +6538,7 @@ mod tests {
 
     #[test]
     fn applies_action_ir() {
-        let state = tla_state([
-            ("x", TlaValue::Int(1)),
-            ("y", TlaValue::Int(2)),
-        ]);
+        let state = tla_state([("x", TlaValue::Int(1)), ("y", TlaValue::Int(2))]);
         let action = ActionIr {
             name: "Tick".to_string(),
             params: vec![],
@@ -6568,10 +6568,7 @@ mod tests {
         let state = tla_state([
             ("cat_box", TlaValue::Int(2)),
             ("observed_box", TlaValue::Int(2)),
-            (
-                "direction",
-                TlaValue::String("right".to_string()),
-            ),
+            ("direction", TlaValue::String("right".to_string())),
         ]);
 
         let mut definitions = BTreeMap::new();
@@ -6714,10 +6711,7 @@ mod tests {
     fn applies_let_action_with_body_starting_with_disjunction() {
         let state = tla_state([
             ("observed_box", TlaValue::Int(2)),
-            (
-                "direction",
-                TlaValue::String("right".to_string()),
-            ),
+            ("direction", TlaValue::String("right".to_string())),
         ]);
         let action = ActionIr {
             name: "ObserveBox".to_string(),
@@ -6739,10 +6733,7 @@ mod tests {
 
     #[test]
     fn quantified_let_action_generates_multiple_successors() {
-        let state = tla_state([
-            ("x", TlaValue::Int(0)),
-            ("y", TlaValue::Int(9)),
-        ]);
+        let state = tla_state([("x", TlaValue::Int(0)), ("y", TlaValue::Int(9))]);
         let ctx = EvalContext::new(&state);
         let action = ActionIr {
             name: "Pick".to_string(),
@@ -6897,10 +6888,7 @@ IN
                 "Assets",
                 TlaValue::Set(Arc::new(BTreeSet::from([asset.clone()]))),
             ),
-            (
-                "ccpTrades",
-                TlaValue::Set(Arc::new(BTreeSet::new())),
-            ),
+            ("ccpTrades", TlaValue::Set(Arc::new(BTreeSet::new()))),
             (
                 "ccpPositions",
                 TlaValue::Function(Arc::new(BTreeMap::from([
@@ -6920,10 +6908,7 @@ IN
                     ),
                 ]))),
             ),
-            (
-                "deployments",
-                TlaValue::Set(Arc::new(BTreeSet::new())),
-            ),
+            ("deployments", TlaValue::Set(Arc::new(BTreeSet::new()))),
             (
                 "actionCount",
                 TlaValue::Function(Arc::new(BTreeMap::from([(bot.clone(), TlaValue::Int(0))]))),
@@ -7029,10 +7014,7 @@ IN
                 "msgs",
                 TlaValue::Set(Arc::new(BTreeSet::from([msg_a1, msg_a2]))),
             ),
-            (
-                "Quorum",
-                TlaValue::Set(Arc::new(BTreeSet::from([quorum]))),
-            ),
+            ("Quorum", TlaValue::Set(Arc::new(BTreeSet::from([quorum])))),
             ("sent", TlaValue::Bool(false)),
         ]);
         let ctx = EvalContext::new(&state)
@@ -7080,10 +7062,7 @@ IN
         let quorum = TlaValue::Set(Arc::new(BTreeSet::from([a1.clone(), a2.clone()])));
         let state = tla_state([
             ("msgs", TlaValue::Set(Arc::new(BTreeSet::new()))),
-            (
-                "Quorum",
-                TlaValue::Set(Arc::new(BTreeSet::from([quorum]))),
-            ),
+            ("Quorum", TlaValue::Set(Arc::new(BTreeSet::from([quorum])))),
             ("sent", TlaValue::Bool(false)),
         ]);
         let ctx = EvalContext::new(&state).with_local_values(&[("b", TlaValue::Int(0)), ("v", v1)]);
@@ -7144,10 +7123,7 @@ IN
                 "msgs",
                 TlaValue::Set(Arc::new(BTreeSet::from([msg_a1, msg_a2]))),
             ),
-            (
-                "Quorum",
-                TlaValue::Set(Arc::new(BTreeSet::from([quorum]))),
-            ),
+            ("Quorum", TlaValue::Set(Arc::new(BTreeSet::from([quorum])))),
             ("sent", TlaValue::Bool(false)),
         ]);
         let ctx = EvalContext::new(&state).with_local_values(&[("b", TlaValue::Int(1)), ("v", v1)]);
@@ -7407,10 +7383,7 @@ IN
                     TlaValue::ModelValue("h2".to_string()),
                 ]))),
             ),
-            (
-                "SignedBlock",
-                TlaValue::Set(Arc::new(BTreeSet::new())),
-            ),
+            ("SignedBlock", TlaValue::Set(Arc::new(BTreeSet::new()))),
         ]);
         let definitions = BTreeMap::from([
             (
@@ -8018,8 +7991,7 @@ IN
 
     #[test]
     fn if_with_equality_in_condition() {
-        let state =
-            tla_state([("opts", TlaValue::Set(Arc::new(BTreeSet::new())))]);
+        let state = tla_state([("opts", TlaValue::Set(Arc::new(BTreeSet::new())))]);
         let ctx = EvalContext::new(&state);
 
         // IF expression with equality in condition should not be split at =
@@ -9694,10 +9666,7 @@ Buffer == INSTANCE RingBuffer
 
     #[test]
     fn zero_arg_operator_primes_use_staged_next_state_bindings() {
-        let state = tla_state([
-            ("x", TlaValue::Int(1)),
-            ("y", TlaValue::Int(2)),
-        ]);
+        let state = tla_state([("x", TlaValue::Int(1)), ("y", TlaValue::Int(2))]);
         let definitions = BTreeMap::from([
             (
                 "PairSum".to_string(),

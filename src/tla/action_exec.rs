@@ -2043,10 +2043,7 @@ CONSTANTS
                     (rm3.clone(), TlaValue::String("prepared".to_string())),
                 ]))),
             ),
-            (
-                "tmState",
-                TlaValue::String("commit".to_string()),
-            ),
+            ("tmState", TlaValue::String("commit".to_string())),
             (
                 "pc",
                 TlaValue::Function(Arc::new(BTreeMap::from([
@@ -2110,10 +2107,7 @@ CONSTANTS
             ("count", TlaValue::Int(7)),
             ("announced", TlaValue::Bool(false)),
             ("light", TlaValue::String("off".to_string())),
-            (
-                "designated",
-                TlaValue::String("alice".to_string()),
-            ),
+            ("designated", TlaValue::String("alice".to_string())),
             ("threshold", TlaValue::Int(7)),
             (
                 "Prisoner",
@@ -2318,10 +2312,7 @@ CONSTANTS
                 "msgs",
                 TlaValue::Set(Arc::new(BTreeSet::from([msg_a1, msg_a2]))),
             ),
-            (
-                "Quorum",
-                TlaValue::Set(Arc::new(BTreeSet::from([quorum]))),
-            ),
+            ("Quorum", TlaValue::Set(Arc::new(BTreeSet::from([quorum])))),
             ("sent", TlaValue::Bool(false)),
             ("v1", v1),
         ]);
