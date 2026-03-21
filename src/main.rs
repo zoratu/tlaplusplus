@@ -1,10 +1,10 @@
 use clap::{Args, Parser, Subcommand};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use tlaplusplus::distributed::proxy::DistributedFingerprintProxy;
-use tlaplusplus::distributed::ring::PartitionRing;
-use tlaplusplus::distributed::transport::ClusterTransport;
 use tlaplusplus::distributed::ClusterConfig;
+use tlaplusplus::distributed::handler::StolenState;
+use tlaplusplus::distributed::transport::ClusterTransport;
+use tlaplusplus::distributed::work_stealer::DistributedWorkStealer;
 use tlaplusplus::models::counter_grid::CounterGridModel;
 use tlaplusplus::models::flurm_job_lifecycle::FlurmJobLifecycleModel;
 use tlaplusplus::models::high_branching::HighBranchingModel;
@@ -430,7 +430,11 @@ fn build_engine_config(
         defer_queue_segment_deletion: false,
         trace_parents: runtime.trace_parents,
         max_trace_states: runtime.max_trace_states,
-        distributed_proxy: None, // Set later when --cluster-listen is specified
+        distributed_stealer: None, // Set later when --cluster-listen is specified
+        stolen_states_rx: None,
+        donate_states_tx: None,
+        donate_states_rx: None,
+        stolen_states_tx: None,
     })
 }
 
@@ -1877,7 +1881,11 @@ fn main() -> anyhow::Result<()> {
             // --- Distributed cluster startup ---
             if let Some(ref listen_addr_str) = cluster.cluster_listen {
                 let listen_addr: std::net::SocketAddr = listen_addr_str.parse().map_err(|e| {
-                    anyhow::anyhow!("invalid --cluster-listen address '{}': {}", listen_addr_str, e)
+                    anyhow::anyhow!(
+                        "invalid --cluster-listen address '{}': {}",
+                        listen_addr_str,
+                        e
+                    )
                 })?;
                 let peers: Vec<std::net::SocketAddr> = cluster
                     .cluster_peers
@@ -1892,8 +1900,6 @@ fn main() -> anyhow::Result<()> {
                     node_id: cluster.node_id,
                     listen_addr,
                     peers: peers.clone(),
-                    batch_size: 512,
-                    batch_timeout_ms: 1,
                 };
                 let num_nodes = cluster_config.num_nodes();
 
@@ -1903,14 +1909,15 @@ fn main() -> anyhow::Result<()> {
                 let tokio_handle = tokio_rt.handle().clone();
 
                 // Start transport (bind listener)
-                let transport = tokio_handle.block_on(async {
-                    ClusterTransport::new(cluster_config.clone()).await
-                })?;
+                let transport = tokio_handle
+                    .block_on(async { ClusterTransport::new(cluster_config.clone()).await })?;
 
                 // Connect to peers (retry with brief delay for startup ordering)
                 println!(
                     "[cluster] node {} listening on {}, connecting to {} peers...",
-                    cluster.node_id, listen_addr, peers.len()
+                    cluster.node_id,
+                    listen_addr,
+                    peers.len()
                 );
                 tokio_handle.block_on(async {
                     for attempt in 0..30 {
@@ -1933,33 +1940,25 @@ fn main() -> anyhow::Result<()> {
                 })?;
                 println!("[cluster] connected to all peers");
 
-                // Build partition ring — assume all nodes have equal capacity
-                // (could be extended with per-node core counts from Join messages)
-                let num_cores = engine_config.workers.max(1) as u32;
-                let mut ring_nodes: Vec<(u32, u32)> = Vec::new();
-                for i in 0..num_nodes {
-                    ring_nodes.push((i, num_cores));
-                }
-                let ring = PartitionRing::new(&ring_nodes);
-
-                // Create distributed proxy
-                let proxy = Arc::new(DistributedFingerprintProxy::new(
+                // Create distributed work stealer (independent exploration + work stealing)
+                let stealer = Arc::new(DistributedWorkStealer::new(
                     cluster.node_id,
-                    ring,
+                    num_nodes,
                     Arc::clone(&transport),
                     tokio_handle.clone(),
-                    engine_config.workers.max(1),
-                    num_nodes,
-                    512, // batch_size
-                    1,   // batch_timeout_ms
                 ));
 
-                // Spawn inbound message handler and termination broadcaster.
-                // These need the fp_store, which is created inside run_model.
-                // For now, we store the proxy in engine_config and the handler
-                // will be spawned from within run_model using the fp_store created there.
-                // We store transport/stop references for handler spawning.
-                engine_config.distributed_proxy = Some(Arc::clone(&proxy));
+                // Create channels for stolen-state and donation exchange
+                // stolen_states: handler pushes StealResponse states, workers drain
+                let (stolen_tx, stolen_rx) = crossbeam_channel::bounded::<StolenState>(65_536);
+                // donate_states: workers push serialized states, handler pops for StealRequests
+                let (donate_tx, donate_rx) = crossbeam_channel::bounded::<Vec<u8>>(65_536);
+
+                engine_config.distributed_stealer = Some(Arc::clone(&stealer));
+                engine_config.stolen_states_rx = Some(stolen_rx);
+                engine_config.donate_states_tx = Some(donate_tx);
+                engine_config.donate_states_rx = Some(donate_rx);
+                engine_config.stolen_states_tx = Some(stolen_tx);
 
                 // Leak the tokio runtime so it stays alive for the duration of the process.
                 // The runtime is needed for the transport's async tasks.

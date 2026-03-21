@@ -1,5 +1,6 @@
 use crate::autotune::{AutoTuneConfig, AutoTuner, WorkerThrottle};
-use crate::distributed::proxy::DistributedFingerprintProxy;
+use crate::distributed::handler::StolenState;
+use crate::distributed::work_stealer::DistributedWorkStealer;
 use crate::fairness::{
     ActionLabel as FairnessActionLabel, LabeledTransition as FairnessLabeledTransition, TarjanSCC,
     check_fairness_on_scc,
@@ -92,10 +93,18 @@ pub struct EngineConfig {
     /// When this limit is reached, parent tracking stops recording new entries
     /// and falls back to `reconstruct_trace_limited` if a violation occurs.
     pub max_trace_states: usize,
-    /// Distributed fingerprint proxy for multi-node model checking.
-    /// When `Some`, fingerprints are routed to the owning node in the cluster.
-    /// When `None` (default), all fingerprints are checked locally.
-    pub distributed_proxy: Option<Arc<DistributedFingerprintProxy>>,
+    /// Distributed work stealer for multi-node model checking.
+    /// When `Some`, enables work stealing and bloom filter exchange across nodes.
+    /// When `None` (default), single-node mode with zero overhead.
+    pub distributed_stealer: Option<Arc<DistributedWorkStealer>>,
+    /// Receiver for states stolen from remote nodes. Workers drain this when idle.
+    pub stolen_states_rx: Option<crossbeam_channel::Receiver<StolenState>>,
+    /// Sender for states to donate to remote nodes on steal requests.
+    pub donate_states_tx: Option<crossbeam_channel::Sender<Vec<u8>>>,
+    /// Receiver end of the donate channel — passed to the inbound handler.
+    pub donate_states_rx: Option<crossbeam_channel::Receiver<Vec<u8>>>,
+    /// Sender end of the stolen-states channel — passed to the inbound handler.
+    pub stolen_states_tx: Option<crossbeam_channel::Sender<StolenState>>,
 }
 
 impl Default for EngineConfig {
@@ -138,7 +147,11 @@ impl Default for EngineConfig {
             defer_queue_segment_deletion: false, // Only true when S3 is active
             trace_parents: false,
             max_trace_states: 10_000_000, // 10M states
-            distributed_proxy: None,
+            distributed_stealer: None,
+            stolen_states_rx: None,
+            donate_states_tx: None,
+            donate_states_rx: None,
+            stolen_states_tx: None,
         }
     }
 }
@@ -1983,26 +1996,32 @@ where
     numa_diagnostics.print_startup_info();
     pause.set_numa_diagnostics(numa_diagnostics);
 
-    // --- Distributed mode: spawn inbound message handler and termination broadcaster ---
-    if let Some(ref proxy) = config.distributed_proxy {
-        let handler_transport = Arc::clone(proxy.transport());
-        let handler_proxy = Arc::clone(proxy);
-        let handler_fp_store = Arc::clone(&fp_store);
+    // --- Distributed mode: spawn inbound message handler and bloom/termination task ---
+    if let Some(ref stealer) = config.distributed_stealer {
+        let handler_transport = Arc::clone(stealer.transport());
+        let handler_stealer = Arc::clone(stealer);
         let handler_stop = Arc::clone(&stop);
+        let tokio_handle = stealer.tokio_handle();
 
-        let tokio_handle = proxy.tokio_handle();
-        crate::distributed::handler::spawn_inbound_handler(
-            &tokio_handle,
-            handler_transport.clone(),
-            handler_proxy.clone(),
-            handler_fp_store,
-            handler_stop.clone(),
-        );
+        // Spawn inbound handler with the steal/donate channels
+        if let (Some(stolen_tx), Some(donate_rx)) =
+            (&config.stolen_states_tx, &config.donate_states_rx)
+        {
+            crate::distributed::handler::spawn_inbound_handler(
+                &tokio_handle,
+                handler_transport.clone(),
+                handler_stealer.clone(),
+                stolen_tx.clone(),
+                donate_rx.clone(),
+                handler_stop.clone(),
+            );
+        }
 
-        crate::distributed::handler::spawn_termination_broadcaster(
+        // Spawn bloom exchange and termination broadcaster
+        crate::distributed::handler::spawn_bloom_and_termination_task(
             &tokio_handle,
             handler_transport,
-            handler_proxy,
+            handler_stealer,
             handler_stop,
             100, // check every 100ms
         );
@@ -2036,7 +2055,9 @@ where
         let worker_state_map = state_map.clone();
         let worker_trace_count = Arc::clone(&trace_state_count);
         let worker_max_trace_states = max_trace_states;
-        let worker_distributed_proxy = config.distributed_proxy.clone();
+        let worker_distributed_stealer = config.distributed_stealer.clone();
+        let worker_stolen_rx = config.stolen_states_rx.clone();
+        let worker_donate_tx = config.donate_states_tx.clone();
 
         workers.push(std::thread::spawn(move || {
             // Pin thread to CPU for cache locality
@@ -2165,34 +2186,38 @@ where
                         // After checkpoint, the loader thread may still be loading items from disk.
                         // Workers should not terminate while there's pending disk work - the loader
                         // will push items to the global queue that workers can steal.
-                        // Distributed mode: drain inbound states from remote nodes
-                        // before deciding to terminate. Remote nodes may have sent
-                        // us new states to explore.
-                        if let Some(ref proxy) = worker_distributed_proxy {
-                            let inbound = proxy.drain_inbound(worker_fp_batch_size);
-                            if !inbound.is_empty() {
-                                for entry in inbound {
-                                    // Deserialize and enqueue inbound states
-                                    match crate::storage::queue::deserialize_compressed::<M::State>(
-                                        &entry.compressed_state,
-                                    ) {
-                                        Ok(state) => {
-                                            let home_numa =
-                                                worker_fp_store.home_numa(entry.fingerprint);
-                                            worker_queue.push_batch_to_numa(
-                                                &mut worker_state,
-                                                std::iter::once((state, home_numa)),
-                                            );
-                                        }
-                                        Err(e) => {
-                                            eprintln!(
-                                                "[cluster] failed to deserialize inbound state: {}",
-                                                e
-                                            );
+                        // Distributed mode: drain stolen states from remote nodes
+                        // before deciding to terminate.
+                        if let Some(ref stolen_rx) = worker_stolen_rx {
+                            let mut got_work = false;
+                            for _ in 0..worker_fp_batch_size {
+                                match stolen_rx.try_recv() {
+                                    Ok(entry) => {
+                                        match crate::storage::queue::deserialize_compressed::<M::State>(
+                                            &entry.compressed_state,
+                                        ) {
+                                            Ok(state) => {
+                                                let fp = worker_model.fingerprint(&state);
+                                                let home_numa = worker_fp_store.home_numa(fp);
+                                                worker_queue.push_batch_to_numa(
+                                                    &mut worker_state,
+                                                    std::iter::once((state, home_numa)),
+                                                );
+                                                got_work = true;
+                                            }
+                                            Err(e) => {
+                                                eprintln!(
+                                                    "[cluster] failed to deserialize stolen state: {}",
+                                                    e
+                                                );
+                                            }
                                         }
                                     }
+                                    Err(_) => break,
                                 }
-                                continue; // Re-enter loop to process the new states
+                            }
+                            if got_work {
+                                continue;
                             }
                         }
                         if worker_queue.has_pending_work() {
@@ -2220,9 +2245,9 @@ where
                         }
                         // Distributed mode: do not terminate if the cluster
                         // has not reached global termination consensus.
-                        if let Some(ref proxy) = worker_distributed_proxy {
-                            if !proxy.is_globally_terminated() {
-                                // Wait briefly for inbound work from remote nodes
+                        if let Some(ref stealer) = worker_distributed_stealer {
+                            if !stealer.is_globally_terminated() {
+                                // Wait briefly for stolen work from remote nodes
                                 std::thread::sleep(std::time::Duration::from_millis(10));
                                 continue;
                             }
@@ -2300,6 +2325,17 @@ where
                         break;
                     }
                     continue;
+                }
+
+                // Distributed mode: skip state if remote bloom says already explored.
+                // This is probabilistic dedup — avoids redundant next_states() calls
+                // for states that another node has likely already expanded.
+                if let Some(ref stealer) = worker_distributed_stealer {
+                    let fp = worker_model.fingerprint(&state);
+                    if stealer.should_skip_state(fp) {
+                        worker_queue.worker_idle(worker_state.id());
+                        continue;
+                    }
                 }
 
                 // Apply backpressure: if queue is too full, skip successor generation
@@ -2423,134 +2459,67 @@ where
                     }
 
                     if !fps_to_check.is_empty() {
-                        // --- Distributed mode: split local vs remote fingerprints ---
-                        if let Some(ref proxy) = worker_distributed_proxy {
-                            // Partition into local and remote fingerprints
-                            let mut local_fps: Vec<u64> = Vec::new();
-                            let mut local_states: Vec<M::State> = Vec::new();
-                            let mut local_indices: Vec<usize> = Vec::new();
+                        // --- Unified path: all fingerprints checked locally ---
+                        // In distributed mode, each node has its own FP store.
+                        // Bloom filter dedup is checked earlier (before next_states).
+                        // Use worker-affinity batch to reduce CAS contention.
+                        worker_fp_store.contains_or_insert_batch_with_affinity(
+                            &fps_to_check,
+                            &mut batch_seen,
+                            worker_id,
+                        )?;
 
-                            for (idx, state) in states_to_check.drain(..).enumerate() {
-                                let fp = fps_to_check[idx];
-                                if proxy.is_local(fp) {
-                                    local_fps.push(fp);
-                                    local_states.push(state);
-                                    local_indices.push(idx);
-                                } else {
-                                    // Remote: serialize and send to owning node
-                                    match serialize_compressed(&state) {
-                                        Ok(compressed) => {
-                                            proxy.send_remote(worker_id, fp, compressed);
+                        for (idx, next_state) in states_to_check.drain(..).enumerate() {
+                            let fp = fps_to_check[idx];
+                            if batch_seen[idx] {
+                                *local_duplicates += 1;
+                                if fp_cache.len() < LOCAL_FP_CACHE_SIZE {
+                                    fp_cache.insert(fp);
+                                }
+                            } else {
+                                *local_states_distinct += 1;
+                                if fp_cache.len() < LOCAL_FP_CACHE_SIZE {
+                                    fp_cache.insert(fp);
+                                }
+                                // Record in distributed bloom filter for cross-node dedup
+                                if let Some(ref stealer) = worker_distributed_stealer {
+                                    stealer.record_explored(fp);
+                                }
+                                // Record parent tracking for trace reconstruction
+                                if let Some(ref pm) = worker_parent_map {
+                                    if worker_trace_count.load(Ordering::Relaxed)
+                                        < worker_max_trace_states
+                                    {
+                                        pm.insert(fp, current_state_fp);
+                                        if let Some(ref sm) = worker_state_map {
+                                            sm.insert(fp, next_state.clone());
                                         }
-                                        Err(e) => {
-                                            eprintln!(
-                                                "[cluster] failed to serialize state for remote fp: {}",
-                                                e
-                                            );
-                                        }
-                                    }
-                                    // Add to local cache so we don't re-send
-                                    if fp_cache.len() < LOCAL_FP_CACHE_SIZE {
-                                        fp_cache.insert(fp);
+                                        worker_trace_count.fetch_add(1, Ordering::Relaxed);
                                     }
                                 }
+                                let home_numa = worker_fp_store.home_numa(fp);
+                                states_with_home_numa.push((next_state, home_numa));
                             }
-
-                            // Check-and-insert local fingerprints
-                            if !local_fps.is_empty() {
-                                let mut local_seen = vec![false; local_fps.len()];
-                                worker_fp_store.contains_or_insert_batch_with_affinity(
-                                    &local_fps,
-                                    &mut local_seen,
-                                    worker_id,
-                                )?;
-
-                                for (i, next_state) in local_states.into_iter().enumerate() {
-                                    let fp = local_fps[i];
-                                    if local_seen[i] {
-                                        *local_duplicates += 1;
-                                        if fp_cache.len() < LOCAL_FP_CACHE_SIZE {
-                                            fp_cache.insert(fp);
-                                        }
-                                    } else {
-                                        *local_states_distinct += 1;
-                                        if fp_cache.len() < LOCAL_FP_CACHE_SIZE {
-                                            fp_cache.insert(fp);
-                                        }
-                                        if let Some(ref pm) = worker_parent_map {
-                                            if worker_trace_count.load(Ordering::Relaxed)
-                                                < worker_max_trace_states
-                                            {
-                                                pm.insert(fp, current_state_fp);
-                                                if let Some(ref sm) = worker_state_map {
-                                                    sm.insert(fp, next_state.clone());
-                                                }
-                                                worker_trace_count.fetch_add(1, Ordering::Relaxed);
-                                            }
-                                        }
-                                        let home_numa = worker_fp_store.home_numa(fp);
-                                        states_with_home_numa.push((next_state, home_numa));
-                                    }
-                                }
-
-                                let pushed = worker_queue.push_batch_to_numa(
-                                    &mut worker_state,
-                                    states_with_home_numa.drain(..),
-                                );
-                                *local_enqueued += pushed as u64;
-                            }
-
-                            // Periodically flush expired remote batches
-                            proxy.flush_expired(worker_id);
-                        } else {
-                            // --- Single-node mode: existing path (zero overhead) ---
-                            // Use worker-affinity batch to reduce CAS contention
-                            // Each worker processes shards in a different order
-                            worker_fp_store.contains_or_insert_batch_with_affinity(
-                                &fps_to_check,
-                                &mut batch_seen,
-                                worker_id,
-                            )?;
-
-                            for (idx, next_state) in states_to_check.drain(..).enumerate() {
-                                let fp = fps_to_check[idx];
-                                if batch_seen[idx] {
-                                    *local_duplicates += 1;
-                                    // Add to local cache to catch future duplicates
-                                    if fp_cache.len() < LOCAL_FP_CACHE_SIZE {
-                                        fp_cache.insert(fp);
-                                    }
-                                } else {
-                                    *local_states_distinct += 1;
-                                    // Add new fingerprint to local cache
-                                    if fp_cache.len() < LOCAL_FP_CACHE_SIZE {
-                                        fp_cache.insert(fp);
-                                    }
-                                    // Record parent tracking for trace reconstruction
-                                    if let Some(ref pm) = worker_parent_map {
-                                        if worker_trace_count.load(Ordering::Relaxed)
-                                            < worker_max_trace_states
-                                        {
-                                            pm.insert(fp, current_state_fp);
-                                            if let Some(ref sm) = worker_state_map {
-                                                sm.insert(fp, next_state.clone());
-                                            }
-                                            worker_trace_count.fetch_add(1, Ordering::Relaxed);
-                                        }
-                                    }
-                                    // Get the fingerprint's home NUMA for routing
-                                    let home_numa = worker_fp_store.home_numa(fp);
-                                    states_with_home_numa.push((next_state, home_numa));
-                                }
-                            }
-
-                            // Batch push with NUMA-aware routing
-                            let pushed = worker_queue.push_batch_to_numa(
-                                &mut worker_state,
-                                states_with_home_numa.drain(..),
-                            );
-                            *local_enqueued += pushed as u64;
                         }
+
+                        // Distributed mode: donate some states for remote steal requests.
+                        // Push every 8th new state to the donation channel (low overhead).
+                        if let Some(ref donate_tx) = worker_donate_tx {
+                            for (idx, (state, _)) in states_with_home_numa.iter().enumerate() {
+                                if idx % 8 == 0 {
+                                    if let Ok(compressed) = serialize_compressed(state) {
+                                        let _ = donate_tx.try_send(compressed);
+                                    }
+                                }
+                            }
+                        }
+
+                        // Batch push with NUMA-aware routing
+                        let pushed = worker_queue.push_batch_to_numa(
+                            &mut worker_state,
+                            states_with_home_numa.drain(..),
+                        );
+                        *local_enqueued += pushed as u64;
                     }
 
                     *local_duplicates += duplicates_in_batch;
@@ -2614,14 +2583,11 @@ where
             // Flush queue counters
             worker_queue.flush_worker_counters(&mut worker_state);
 
-            // Distributed mode: flush any remaining outbound batches and
-            // signal locally idle when the last worker exits.
+            // Distributed mode: signal locally idle when the last worker exits.
             let remaining = worker_live.fetch_sub(1, Ordering::AcqRel);
             if remaining == 1 {
-                // This is the last worker — signal locally idle
-                if let Some(ref proxy) = worker_distributed_proxy {
-                    proxy.flush_all();
-                    proxy.set_locally_idle(true);
+                if let Some(ref stealer) = worker_distributed_stealer {
+                    stealer.set_locally_idle(true);
                 }
             }
         }));
