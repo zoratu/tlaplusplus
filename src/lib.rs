@@ -2,6 +2,7 @@ pub mod autotune;
 pub mod canon;
 pub mod chaos;
 pub mod coverage;
+pub mod distributed;
 pub mod fairness;
 pub mod liveness;
 pub mod model;

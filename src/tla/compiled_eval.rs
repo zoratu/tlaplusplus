@@ -1656,12 +1656,7 @@ fn eval_compiled_opcall(
             return eval_operator_call("FoldSet", arg_values.clone(), ctx, depth + 1);
         }
         "FoldFunctionOnSet" if arg_values.len() == 4 && !user_defined_shadow => {
-            return eval_operator_call(
-                "FoldFunctionOnSet",
-                arg_values.clone(),
-                ctx,
-                depth + 1,
-            );
+            return eval_operator_call("FoldFunctionOnSet", arg_values.clone(), ctx, depth + 1);
         }
         // === Community module: UndirectedGraphs ===
         "IsUndirectedGraph" if arg_values.len() == 1 && !user_defined_shadow => {
@@ -2708,10 +2703,7 @@ mod tests {
                 is_recursive: false,
             },
         )]);
-        let state = tla_state([
-            ("a", TlaValue::Int(2)),
-            ("b", TlaValue::Int(3)),
-        ]);
+        let state = tla_state([("a", TlaValue::Int(2)), ("b", TlaValue::Int(3))]);
         let ctx = EvalContext::with_definitions(&state, &defs);
 
         assert_eq!(
@@ -2725,10 +2717,7 @@ mod tests {
         use crate::tla::compiled_expr::CompiledActionIr;
         use crate::tla::{ActionClause, ActionIr};
 
-        let state = tla_state([
-            ("x", TlaValue::Int(0)),
-            ("y", TlaValue::Int(9)),
-        ]);
+        let state = tla_state([("x", TlaValue::Int(0)), ("y", TlaValue::Int(9))]);
         let ctx = EvalContext::new(&state);
 
         let action_ir = ActionIr {
@@ -2828,10 +2817,7 @@ IN
                 "Assets",
                 TlaValue::Set(Arc::new(BTreeSet::from([asset.clone()]))),
             ),
-            (
-                "ccpTrades",
-                TlaValue::Set(Arc::new(BTreeSet::new())),
-            ),
+            ("ccpTrades", TlaValue::Set(Arc::new(BTreeSet::new()))),
             (
                 "ccpPositions",
                 TlaValue::Function(Arc::new(BTreeMap::from([
@@ -2851,10 +2837,7 @@ IN
                     ),
                 ]))),
             ),
-            (
-                "deployments",
-                TlaValue::Set(Arc::new(BTreeSet::new())),
-            ),
+            ("deployments", TlaValue::Set(Arc::new(BTreeSet::new()))),
             (
                 "actionCount",
                 TlaValue::Function(Arc::new(BTreeMap::from([(bot.clone(), TlaValue::Int(0))]))),
@@ -3015,8 +2998,8 @@ IN
 #[cfg(test)]
 mod forall_tests {
     use super::*;
-    use crate::tla::{TlaState, tla_state};
     use crate::tla::compiled_expr::compile_expr;
+    use crate::tla::{TlaState, tla_state};
     use std::sync::Arc;
 
     #[test]
@@ -3040,10 +3023,7 @@ mod forall_tests {
         .into_iter()
         .collect();
 
-        state.insert(
-            Arc::from("listings"),
-            TlaValue::Set(Arc::new(listings_set)),
-        );
+        state.insert(Arc::from("listings"), TlaValue::Set(Arc::new(listings_set)));
         state.insert(Arc::from("MinPrice"), TlaValue::Int(5));
 
         // Create context
@@ -3111,7 +3091,7 @@ fn test_full_typeok_pattern_cluster_lease_failover() {
         );
     }
     state.insert(
-            Arc::from("shardTerm"),
+        Arc::from("shardTerm"),
         TlaValue::Function(Arc::new(shardterm_map)),
     );
 
@@ -3126,7 +3106,7 @@ fn test_full_typeok_pattern_cluster_lease_failover() {
         );
     }
     state.insert(
-            Arc::from("shardLeader"),
+        Arc::from("shardLeader"),
         TlaValue::Function(Arc::new(shardleader_map)),
     );
 
@@ -3151,7 +3131,7 @@ fn test_full_typeok_pattern_cluster_lease_failover() {
         );
     }
     state.insert(
-            Arc::from("leases"),
+        Arc::from("leases"),
         TlaValue::Function(Arc::new(leases_outer)),
     );
 
@@ -3227,10 +3207,7 @@ fn test_full_price_bands_invariant() {
 
     let listings_set: BTreeSet<TlaValue> = [TlaValue::Record(Arc::new(rec1))].into_iter().collect();
 
-    state.insert(
-            Arc::from("listings"),
-        TlaValue::Set(Arc::new(listings_set)),
-    );
+    state.insert(Arc::from("listings"), TlaValue::Set(Arc::new(listings_set)));
     state.insert(Arc::from("MinPrice"), TlaValue::Int(5));
     state.insert(Arc::from("MaxPrice"), TlaValue::Int(20));
 
@@ -3271,7 +3248,7 @@ fn test_nested_quantifiers_typeok_evaluation() {
     shardterm_map.insert(TlaValue::ModelValue("s1".to_string()), TlaValue::Int(1));
     shardterm_map.insert(TlaValue::ModelValue("s2".to_string()), TlaValue::Int(2));
     state.insert(
-            Arc::from("shardTerm"),
+        Arc::from("shardTerm"),
         TlaValue::Function(Arc::new(shardterm_map)),
     );
 
@@ -3294,7 +3271,7 @@ fn test_nested_quantifiers_typeok_evaluation() {
         );
     }
     state.insert(
-            Arc::from("leases"),
+        Arc::from("leases"),
         TlaValue::Function(Arc::new(leases_outer)),
     );
 
@@ -3505,10 +3482,7 @@ mod compiled_action_correctness_tests {
     #[test]
     fn if_guard_selects_correct_branch() {
         let state = tla_state([
-            (
-                "mode",
-                TlaValue::String("exclusive".to_string()),
-            ),
+            ("mode", TlaValue::String("exclusive".to_string())),
             ("count", TlaValue::Int(2)),
         ]);
         let ctx = EvalContext::new(&state);
@@ -3651,10 +3625,7 @@ mod compiled_action_correctness_tests {
     /// must not interfere — each IR produces its own independent successors.
     #[test]
     fn separate_actions_produce_independent_successors() {
-        let state = tla_state([
-            ("x", TlaValue::Int(0)),
-            ("y", TlaValue::Int(0)),
-        ]);
+        let state = tla_state([("x", TlaValue::Int(0)), ("y", TlaValue::Int(0))]);
         let ctx = EvalContext::new(&state);
 
         let result_x = compile_and_run(
@@ -3697,8 +3668,7 @@ mod compiled_action_correctness_tests {
     #[test]
     fn test_compiled_case_expression_guard() {
         // phase = "prepare" → CASE arm yields TRUE → should produce successor
-        let state_prepare =
-            tla_state([("phase", TlaValue::String("prepare".to_string()))]);
+        let state_prepare = tla_state([("phase", TlaValue::String("prepare".to_string()))]);
         let ctx_prepare = EvalContext::new(&state_prepare);
 
         let result = compile_and_run(
@@ -3721,8 +3691,7 @@ mod compiled_action_correctness_tests {
         );
 
         // phase = "commit" → CASE arm yields FALSE → should block
-        let state_commit =
-            tla_state([("phase", TlaValue::String("commit".to_string()))]);
+        let state_commit = tla_state([("phase", TlaValue::String("commit".to_string()))]);
         let ctx_commit = EvalContext::new(&state_commit);
 
         let result2 = compile_and_run(
@@ -3748,10 +3717,7 @@ mod compiled_action_correctness_tests {
     #[test]
     fn test_compiled_implication_guard() {
         // ready=TRUE, value=0: TRUE => (0 >= 0) = TRUE => should pass
-        let state_pass = tla_state([
-            ("ready", TlaValue::Bool(true)),
-            ("value", TlaValue::Int(0)),
-        ]);
+        let state_pass = tla_state([("ready", TlaValue::Bool(true)), ("value", TlaValue::Int(0))]);
         let ctx_pass = EvalContext::new(&state_pass);
 
         let result = compile_and_run(
@@ -4120,10 +4086,7 @@ mod swarm_eval_consistency_tests {
 
     /// Evaluate a definition body via both the text and compiled paths.
     /// Returns (text_result, compiled_result).
-    fn eval_both_paths(
-        body: &str,
-        ctx: &EvalContext<'_>,
-    ) -> (Result<TlaValue>, Result<TlaValue>) {
+    fn eval_both_paths(body: &str, ctx: &EvalContext<'_>) -> (Result<TlaValue>, Result<TlaValue>) {
         let text_result = eval_expr(body, ctx);
         let compiled = compile_expr(body);
         let compiled_result = eval_compiled(&compiled, ctx);
@@ -4217,7 +4180,8 @@ mod swarm_eval_consistency_tests {
                 match (&text_result, &compiled_result) {
                     (Ok(text_val), Ok(compiled_val)) => {
                         assert_eq!(
-                            text_val, compiled_val,
+                            text_val,
+                            compiled_val,
                             "Eval path divergence in {} definition '{}': \
                              text={:?}, compiled={:?}, body='{}'",
                             tla_path.display(),
@@ -4299,12 +4263,9 @@ mod seq_membership_tests {
             (
                 "S",
                 TlaValue::Set(Arc::new(
-                    [
-                        TlaValue::String("a".into()),
-                        TlaValue::String("b".into()),
-                    ]
-                    .into_iter()
-                    .collect(),
+                    [TlaValue::String("a".into()), TlaValue::String("b".into())]
+                        .into_iter()
+                        .collect(),
                 )),
             ),
         ]);
@@ -4329,12 +4290,9 @@ mod seq_membership_tests {
             (
                 "S",
                 TlaValue::Set(Arc::new(
-                    [
-                        TlaValue::String("a".into()),
-                        TlaValue::String("b".into()),
-                    ]
-                    .into_iter()
-                    .collect(),
+                    [TlaValue::String("a".into()), TlaValue::String("b".into())]
+                        .into_iter()
+                        .collect(),
                 )),
             ),
         ]);
@@ -4360,9 +4318,7 @@ mod seq_membership_tests {
             (
                 "D",
                 TlaValue::Set(Arc::new(
-                    [TlaValue::Int(1), TlaValue::Int(2)]
-                        .into_iter()
-                        .collect(),
+                    [TlaValue::Int(1), TlaValue::Int(2)].into_iter().collect(),
                 )),
             ),
         ]);
