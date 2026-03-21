@@ -990,7 +990,9 @@ fn calculate_optimal_shard_count(
     // Clamp to reasonable bounds
     // Min: at least 2x NUMA nodes for distribution (64 for backwards compat)
     // Max: 4096 shards is plenty (avoid excessive overhead)
-    let min_shards = (numa_node_count * 2).max(64);
+    // Minimum: enough for NUMA distribution. No arbitrary 64 floor —
+    // small worker counts get small shard counts for fast startup.
+    let min_shards = (numa_node_count * 2).max(worker_count.next_power_of_two());
     let max_shards = 4096;
 
     let final_count = adjusted.clamp(min_shards, max_shards);
@@ -1097,18 +1099,19 @@ where
             total_bytes_needed,
         )
     } else {
-        // User specified explicit count - round to power of 2 and ensure minimum
-        config.fp_shards.next_power_of_two().max(64)
+        // User specified explicit count - round to power of 2
+        config.fp_shards.next_power_of_two().max(2)
     };
 
     // Only calculate shard_size_mb for page-aligned mode
     let shard_size_mb = if !config.use_bloom_fingerprints {
-        // Shard size: divide total evenly, with a reasonable minimum.
-        // With incremental resize, small initial shards are fine — resize
-        // is zero-stall. No need for aggressive minimum.
-        let min_shard_bytes = 16 * 1024 * 1024; // 16MB minimum per shard
+        // Start small, grow via incremental resize (zero-stall).
+        // Avoids allocating 1.6GB for a 16-state spec.
+        // 2MB per shard is enough for ~56K entries at 75% load — plenty
+        // to get started, and resize doubles capacity seamlessly.
+        let min_shard_bytes = 2 * 1024 * 1024; // 2MB minimum per shard
         let bytes_per_shard = (total_bytes_needed / shard_count).max(min_shard_bytes);
-        (bytes_per_shard / (1024 * 1024)).max(16) // At least 16MB
+        (bytes_per_shard / (1024 * 1024)).max(2) // At least 2MB
     } else {
         0 // Not used in bloom mode
     };
