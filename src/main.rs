@@ -294,10 +294,19 @@ enum Command {
         config: Option<std::path::PathBuf>,
     },
     RunTla {
-        #[arg(long)]
-        module: std::path::PathBuf,
+        /// Path to the TLA+ module file. Required unless --fetch-module is used.
+        #[arg(long, required_unless_present = "fetch_module")]
+        module: Option<std::path::PathBuf>,
         #[arg(long)]
         config: Option<std::path::PathBuf>,
+        /// Fetch spec module from S3 URI (e.g., s3://bucket/path/Spec.tla).
+        /// Downloaded to a temp directory before parsing. For distributed
+        /// model checking where nodes don't share a filesystem.
+        #[arg(long)]
+        fetch_module: Option<String>,
+        /// Fetch config from S3 URI (e.g., s3://bucket/path/Spec.cfg).
+        #[arg(long)]
+        fetch_config: Option<String>,
         #[arg(long)]
         init: Option<String>,
         #[arg(long)]
@@ -1091,6 +1100,55 @@ fn print_difftrace(trace: &[TlaState]) {
     }
 }
 
+/// Download a file from an S3 URI (s3://bucket/path/to/file) to a local temp directory.
+/// Returns the local path to the downloaded file.
+fn fetch_s3_file(uri: &str) -> anyhow::Result<std::path::PathBuf> {
+    let stripped = uri
+        .strip_prefix("s3://")
+        .ok_or_else(|| anyhow::anyhow!("S3 URI must start with s3://, got: {}", uri))?;
+    let (bucket, key) = stripped
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("S3 URI must have bucket/key format: {}", uri))?;
+
+    let filename = std::path::Path::new(key)
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("S3 key has no filename: {}", key))?;
+
+    let tmp_dir = std::env::temp_dir().join("tlaplusplus-fetch");
+    std::fs::create_dir_all(&tmp_dir)?;
+    let local_path = tmp_dir.join(filename);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    rt.block_on(async {
+        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .load()
+            .await;
+        let client = aws_sdk_s3::Client::new(&config);
+
+        let resp = client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to fetch s3://{}/{}: {}", bucket, key, e))?;
+
+        let bytes = resp
+            .body
+            .collect()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to read S3 response body: {}", e))?;
+
+        std::fs::write(&local_path, bytes.into_bytes())?;
+        Ok::<_, anyhow::Error>(())
+    })?;
+
+    Ok(local_path)
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -1762,6 +1820,8 @@ fn main() -> anyhow::Result<()> {
         Command::RunTla {
             module,
             config,
+            fetch_module,
+            fetch_config,
             init,
             next,
             allow_deadlock,
@@ -1780,6 +1840,24 @@ fn main() -> anyhow::Result<()> {
             cluster,
         } => {
             run_system_checks(runtime.skip_system_checks);
+
+            // Fetch spec/config from S3 if requested (for distributed runs
+            // where nodes don't share a filesystem)
+            let module = if let Some(ref uri) = fetch_module {
+                let local = fetch_s3_file(uri)?;
+                eprintln!("Fetched module from {}", uri);
+                local
+            } else {
+                module.expect("--module is required when --fetch-module is not used")
+            };
+            let config = if let Some(ref uri) = fetch_config {
+                let local = fetch_s3_file(uri)?;
+                eprintln!("Fetched config from {}", uri);
+                Some(local)
+            } else {
+                config
+            };
+
             // Auto-detect config file if not specified
             let config_path = config.or_else(|| {
                 let cfg_path = module.with_extension("cfg");
