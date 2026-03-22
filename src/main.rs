@@ -1134,7 +1134,7 @@ fn fetch_s3_file(uri: &str) -> anyhow::Result<std::path::PathBuf> {
             .key(key)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to fetch s3://{}/{}: {}", bucket, key, e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to fetch s3://{}/{}: {:?}", bucket, key, e))?;
 
         let bytes = resp
             .body
