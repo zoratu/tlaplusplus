@@ -868,11 +868,37 @@ fn extract_init_next_from_spec(
     spec_body: &str,
     module: &TlaModule,
 ) -> (Option<SpecComponent>, Option<SpecComponent>) {
+    extract_init_next_from_spec_inner(spec_body, module, 0)
+}
+
+fn extract_init_next_from_spec_inner(
+    spec_body: &str,
+    module: &TlaModule,
+    depth: usize,
+) -> (Option<SpecComponent>, Option<SpecComponent>) {
+    if depth > 5 {
+        return (None, None);
+    }
+
     let parts = split_top_level(spec_body, "/\\");
+
+    // If there's a single part that's a definition reference, chase it
+    if parts.len() == 1 {
+        let part = parts[0].trim();
+        if let Some(name) = parse_simple_identifier(part) {
+            if let Some(def) = module.definitions.get(&name) {
+                let result = extract_init_next_from_spec_inner(&def.body, module, depth + 1);
+                if result.0.is_some() || result.1.is_some() {
+                    return result;
+                }
+            }
+        }
+    }
+
     let mut init: Option<SpecComponent> = None;
     let mut next: Option<SpecComponent> = None;
 
-    for part in parts {
+    for part in &parts {
         let part = part.trim();
         if part.is_empty() {
             continue;
@@ -903,6 +929,27 @@ fn extract_init_next_from_spec(
         // Check for WF_/SF_ fairness constraints - skip these for Init/Next extraction
         if part.starts_with("WF_") || part.starts_with("SF_") {
             continue;
+        }
+
+        // If part is a definition reference whose body contains [][, chase it
+        // This handles patterns like `Spec == TypeOK /\ LiveSpec` where LiveSpec
+        // contains the [][Next]_vars pattern
+        if next.is_none() {
+            if let Some(name) = parse_simple_identifier(part) {
+                if let Some(def) = module.definitions.get(&name) {
+                    if def.body.contains("[][") {
+                        let (sub_init, sub_next) =
+                            extract_init_next_from_spec_inner(&def.body, module, depth + 1);
+                        if sub_next.is_some() {
+                            next = sub_next;
+                            if init.is_none() {
+                                init = sub_init;
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
         }
 
         // Otherwise, it might be Init
@@ -1169,7 +1216,7 @@ fn evaluate_init_states(
             }
         }
     }
-    for _ in 0..deferred_operator_refs.len().saturating_add(1) {
+    for _ in 0..deferred_operator_refs.len().saturating_add(2) {
         if deferred_operator_refs.is_empty() {
             break;
         }
@@ -1187,7 +1234,19 @@ fn evaluate_init_states(
                     base_state.insert(Arc::from(name.as_str()), value);
                     progress = true;
                 }
-                Err(_) => next_deferred.push((name, ref_name)),
+                Err(_) => {
+                    // Try resolving as a zero-arg definition from definition_scope
+                    if let Some(def) = definition_scope.get(&ref_name) {
+                        if def.params.is_empty() {
+                            if let Ok(value) = eval_expr(&def.body, &ctx) {
+                                base_state.insert(Arc::from(name.as_str()), value);
+                                progress = true;
+                                continue;
+                            }
+                        }
+                    }
+                    next_deferred.push((name, ref_name));
+                }
             }
         }
 
@@ -1218,7 +1277,7 @@ fn evaluate_init_states(
 
     // First, resolve equality assignments (deterministic)
     let mut pending = equality_assignments;
-    for _ in 0..pending.len().saturating_add(1) {
+    for _ in 0..pending.len().saturating_add(2) {
         if pending.is_empty() {
             break;
         }
@@ -1241,12 +1300,54 @@ fn evaluate_init_states(
         }
 
         if !progress {
-            let names = next_pending
-                .iter()
-                .map(|(var, _)| var.as_str())
-                .collect::<Vec<_>>()
-                .join(",");
-            return Err(anyhow!("failed to resolve Init assignments: {names}"));
+            // Recovery: try evaluating with definitions injected as state values.
+            // Some Init expressions reference operators/constants that aren't in state
+            // but are in definition_scope (e.g., PlusCal ProcSet, Initiator).
+            let mut augmented_state = base_state.clone();
+            for (name, def) in &definition_scope {
+                if !augmented_state.contains_key(name.as_str()) && def.params.is_empty() {
+                    let ctx = EvalContext::with_definitions_and_instances(
+                        &augmented_state,
+                        &definition_scope,
+                        &module.instances,
+                    );
+                    if let Ok(val) = eval_expr(&def.body, &ctx) {
+                        augmented_state.insert(Arc::from(name.as_str()), val);
+                    }
+                }
+            }
+
+            // Retry with augmented state
+            let mut retry_pending = Vec::new();
+            for (var, expr) in next_pending {
+                let ctx = EvalContext::with_definitions_and_instances(
+                    &augmented_state,
+                    &definition_scope,
+                    &module.instances,
+                );
+                match eval_expr(&expr, &ctx) {
+                    Ok(value) => {
+                        base_state.insert(Arc::from(var.as_str()), value);
+                        progress = true;
+                    }
+                    Err(_) => retry_pending.push((var, expr)),
+                }
+            }
+            next_pending = retry_pending;
+
+            if !progress {
+                // Demote remaining to membership or guard — some variables may
+                // get assigned during guard evaluation or can be skipped
+                for (var, expr) in &next_pending {
+                    eprintln!(
+                        "Warning: could not resolve Init assignment for '{}', treating as guard",
+                        var
+                    );
+                    guards.push(format!("{} = {}", var, expr));
+                }
+                next_pending.clear();
+                break;
+            }
         }
 
         pending = next_pending;
@@ -1295,7 +1396,7 @@ fn evaluate_init_states(
         states = new_states;
 
         // Limit total number of initial states
-        const MAX_INIT_STATES: usize = 1_000_000;
+        const MAX_INIT_STATES: usize = 10_000_000;
         if states.len() > MAX_INIT_STATES {
             return Err(anyhow!(
                 "too many initial states ({} > {}). Consider constraining Init.",
@@ -1341,6 +1442,73 @@ fn evaluate_init_states(
                 .all(|v| state.contains_key(v.as_str()));
             if all_assigned {
                 valid_states.push(state);
+            }
+        }
+    }
+
+    // If no valid states but some variables are unassigned, try recovery:
+    // re-scan guards for patterns like `var = expr` or `var \in set` that
+    // classify_clause missed (common in PlusCal-generated Init)
+    if valid_states.is_empty() && !had_membership_choices {
+        let missing: Vec<String> = module
+            .variables
+            .iter()
+            .filter(|v| !base_state_for_error.contains_key(v.as_str()))
+            .cloned()
+            .collect();
+
+        if !missing.is_empty() {
+            let mut recovered = false;
+            let mut recovery_state = base_state_for_error.clone();
+            for guard in &guards {
+                for var in &missing {
+                    if recovery_state.contains_key(var.as_str()) {
+                        continue;
+                    }
+                    // Try to find `var = expr` pattern using bracket-aware splitting
+                    let pattern = format!("{} = ", var);
+                    if let Some(idx) = guard.find(&pattern) {
+                        let rhs = guard[idx + pattern.len()..].trim();
+                        let ctx = EvalContext::with_definitions_and_instances(
+                            &recovery_state,
+                            &definition_scope,
+                            &module.instances,
+                        );
+                        if let Ok(value) = eval_expr(rhs, &ctx) {
+                            recovery_state.insert(Arc::from(var.as_str()), value);
+                            recovered = true;
+                        }
+                    }
+                    // Try `var \in set` pattern
+                    let mem_pattern = format!("{} \\in ", var);
+                    if let Some(idx) = guard.find(&mem_pattern) {
+                        let rhs = guard[idx + mem_pattern.len()..].trim();
+                        let ctx = EvalContext::with_definitions_and_instances(
+                            &recovery_state,
+                            &definition_scope,
+                            &module.instances,
+                        );
+                        if let Ok(set_val) = eval_expr(rhs, &ctx) {
+                            if let Ok(set) = set_val.as_set() {
+                                if let Some(first) = set.iter().next() {
+                                    recovery_state.insert(Arc::from(var.as_str()), first.clone());
+                                    recovered = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if recovered {
+                // Check if all variables now assigned
+                let all_assigned = module
+                    .variables
+                    .iter()
+                    .all(|v| recovery_state.contains_key(v.as_str()));
+                if all_assigned {
+                    valid_states.push(recovery_state);
+                }
             }
         }
     }
