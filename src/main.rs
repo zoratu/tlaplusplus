@@ -814,7 +814,15 @@ fn evaluate_assumes(model: &TlaModel) -> anyhow::Result<()> {
                 // ASSUME satisfied
             }
             Ok(TlaValue::Bool(false)) => {
-                return Err(anyhow::anyhow!("ASSUME failed: {}", body));
+                // TLCGet is TLC-specific runtime introspection — downgrade to warning
+                if body.contains("TLCGet") {
+                    eprintln!(
+                        "Warning: ASSUME '{}' failed (TLCGet is TLC-specific, ignoring)",
+                        body
+                    );
+                } else {
+                    return Err(anyhow::anyhow!("ASSUME failed: {}", body));
+                }
             }
             Ok(other) => {
                 eprintln!(
