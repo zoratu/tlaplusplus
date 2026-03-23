@@ -3528,6 +3528,69 @@ pub(crate) fn eval_operator_call(
             }
             return Err(anyhow!("BagRemove: first argument is not a bag"));
         }
+        // === Standard module: IOUtils ===
+        "IOEnv" if args.is_empty() && !user_defined_shadow => {
+            let mut rec = BTreeMap::new();
+            for (k, v) in std::env::vars() {
+                rec.insert(k, TlaValue::String(v));
+            }
+            return Ok(TlaValue::Record(Arc::new(rec)));
+        }
+        "ndJsonDeserialize" if args.len() == 1 && !user_defined_shadow => {
+            let path = match &args[0] {
+                TlaValue::String(s) => s.clone(),
+                TlaValue::ModelValue(s) => s.clone(),
+                other => return Err(anyhow!("expected string argument, got {:?}", other)),
+            };
+            let content = std::fs::read_to_string(&path)
+                .map_err(|e| anyhow!("ndJsonDeserialize: {}: {}", path, e))?;
+            let mut items = Vec::new();
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let json_val: serde_json::Value = serde_json::from_str(trimmed)
+                    .map_err(|e| anyhow!("ndJsonDeserialize: parse error: {}", e))?;
+                items.push(json_to_tla_value(&json_val));
+            }
+            return Ok(TlaValue::Seq(Arc::new(items)));
+        }
+        "JsonDeserialize" if args.len() == 1 && !user_defined_shadow => {
+            let path = match &args[0] {
+                TlaValue::String(s) => s.clone(),
+                TlaValue::ModelValue(s) => s.clone(),
+                other => return Err(anyhow!("expected string argument, got {:?}", other)),
+            };
+            let content = std::fs::read_to_string(&path)
+                .map_err(|e| anyhow!("JsonDeserialize: {}: {}", path, e))?;
+            let json_val: serde_json::Value = serde_json::from_str(&content)
+                .map_err(|e| anyhow!("JsonDeserialize: parse error: {}", e))?;
+            return Ok(json_to_tla_value(&json_val));
+        }
+        "JsonSerialize" if args.len() == 2 && !user_defined_shadow => {
+            let path = match &args[0] {
+                TlaValue::String(s) => s.clone(),
+                TlaValue::ModelValue(s) => s.clone(),
+                other => return Err(anyhow!("expected string argument, got {:?}", other)),
+            };
+            let json = tla_value_to_json(&args[1]);
+            let json_str =
+                serde_json::to_string_pretty(&json).map_err(|e| anyhow!("JsonSerialize: {}", e))?;
+            std::fs::write(&path, json_str)
+                .map_err(|e| anyhow!("JsonSerialize: {}: {}", path, e))?;
+            return Ok(TlaValue::Bool(true));
+        }
+        "ToString" if args.len() == 1 && !user_defined_shadow => {
+            let s = match &args[0] {
+                TlaValue::Int(n) => n.to_string(),
+                TlaValue::Bool(b) => (if *b { "TRUE" } else { "FALSE" }).to_string(),
+                TlaValue::String(s) => s.clone(),
+                TlaValue::ModelValue(s) => s.clone(),
+                other => format!("{:?}", other),
+            };
+            return Ok(TlaValue::String(s));
+        }
         // === Community module: UndirectedGraphs ===
         "IsUndirectedGraph" if args.len() == 1 && !user_defined_shadow => {
             let g = &args[0];
@@ -6479,6 +6542,66 @@ fn skip_leading_ws(input: &str, mut idx: usize) -> usize {
         idx += ch.len_utf8();
     }
     idx
+}
+
+/// Convert a serde_json::Value to a TlaValue.
+fn json_to_tla_value(v: &serde_json::Value) -> TlaValue {
+    match v {
+        serde_json::Value::Null => TlaValue::ModelValue("null".to_string()),
+        serde_json::Value::Bool(b) => TlaValue::Bool(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                TlaValue::Int(i)
+            } else if let Some(f) = n.as_f64() {
+                // Truncate floats to ints for TLA+
+                TlaValue::Int(f as i64)
+            } else {
+                TlaValue::String(n.to_string())
+            }
+        }
+        serde_json::Value::String(s) => TlaValue::String(s.clone()),
+        serde_json::Value::Array(arr) => {
+            let items: Vec<TlaValue> = arr.iter().map(json_to_tla_value).collect();
+            TlaValue::Seq(Arc::new(items))
+        }
+        serde_json::Value::Object(obj) => {
+            let mut rec = BTreeMap::new();
+            for (k, v) in obj {
+                rec.insert(k.clone(), json_to_tla_value(v));
+            }
+            TlaValue::Record(Arc::new(rec))
+        }
+    }
+}
+
+/// Convert a TlaValue to a serde_json::Value.
+fn tla_value_to_json(v: &TlaValue) -> serde_json::Value {
+    match v {
+        TlaValue::Int(n) => serde_json::Value::Number((*n).into()),
+        TlaValue::Bool(b) => serde_json::Value::Bool(*b),
+        TlaValue::String(s) => serde_json::Value::String(s.clone()),
+        TlaValue::ModelValue(s) => serde_json::Value::String(s.clone()),
+        TlaValue::Seq(items) => {
+            serde_json::Value::Array(items.iter().map(tla_value_to_json).collect())
+        }
+        TlaValue::Record(rec) => {
+            let obj: serde_json::Map<String, serde_json::Value> = rec
+                .iter()
+                .map(|(k, v)| (k.clone(), tla_value_to_json(v)))
+                .collect();
+            serde_json::Value::Object(obj)
+        }
+        TlaValue::Set(set) => serde_json::Value::Array(set.iter().map(tla_value_to_json).collect()),
+        TlaValue::Function(map) => {
+            let obj: serde_json::Map<String, serde_json::Value> = map
+                .iter()
+                .map(|(k, v)| (format!("{:?}", k), tla_value_to_json(v)))
+                .collect();
+            serde_json::Value::Object(obj)
+        }
+        TlaValue::Lambda { .. } => serde_json::Value::String("<lambda>".to_string()),
+        _ => serde_json::Value::Null,
+    }
 }
 
 #[cfg(test)]
