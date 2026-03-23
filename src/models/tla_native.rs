@@ -1346,6 +1346,37 @@ fn evaluate_init_states(
         }
     }
 
+    // If the Init body is a top-level disjunction (\/ branch1 \/ branch2),
+    // process each branch as a separate Init and merge results.
+    // This handles SmokeInit-style specs with multiple Init alternatives.
+    if trimmed_body.starts_with("\\/") {
+        let branches = split_top_level(trimmed_body, "\\/");
+        let mut all_states = Vec::new();
+        for branch in &branches {
+            let branch = branch.trim();
+            if branch.is_empty() {
+                continue;
+            }
+            let synth_name = format!("__SyntheticInitBranch_{init_name}__");
+            let mut module_clone = module.clone();
+            module_clone.definitions.insert(
+                synth_name.clone(),
+                TlaDefinition {
+                    name: synth_name.clone(),
+                    params: vec![],
+                    body: branch.to_string(),
+                    is_recursive: false,
+                },
+            );
+            if let Ok(states) = evaluate_init_states(&module_clone, cfg, &synth_name) {
+                all_states.extend(states);
+            }
+        }
+        if !all_states.is_empty() {
+            return Ok(all_states);
+        }
+    }
+
     // Start with constants from config
     let mut base_state = BTreeMap::new();
     let mut deferred_operator_refs = Vec::new();
