@@ -267,7 +267,32 @@ fn matches_keyword_at(chars: &[char], i: usize, keyword: &str) -> bool {
 }
 
 pub fn classify_clause(clause: &str) -> ClauseKind {
-    let trimmed = strip_leading_action_labels(clause.trim());
+    let mut trimmed = strip_leading_action_labels(clause.trim());
+    // Strip outer parentheses: (h_turn = 1) → h_turn = 1
+    while trimmed.starts_with('(') && trimmed.ends_with(')') {
+        let inner = &trimmed[1..trimmed.len() - 1];
+        // Only strip if the parens are balanced (not part of a nested expression)
+        let mut depth = 0i32;
+        let mut balanced = true;
+        for c in inner.chars() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth < 0 {
+                        balanced = false;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if balanced && depth == 0 {
+            trimmed = inner.trim();
+        } else {
+            break;
+        }
+    }
 
     if let Some(rest) = trimmed.strip_prefix("UNCHANGED") {
         let vars = parse_unchanged_list(rest);
