@@ -2223,32 +2223,79 @@ fn evaluate_init_states(
                 .cloned()
                 .collect();
             if !missing_vars.is_empty() {
-                // Search all definitions for assignments to missing variables
+                // Search all definitions (including instance modules) for
+                // assignments to missing variables. This handles Init <- MCInit
+                // where MCInit doesn't assign all vars but the original Init does.
                 for var in &missing_vars {
-                    // Look for `var = expr` or `var \in set` in any definition body
+                    if state.contains_key(var.as_str()) {
+                        continue;
+                    }
+                    // Search top-level definitions
                     for def in definition_scope.values() {
-                        if def.params.is_empty() {
-                            let clauses = expand_state_predicate_clauses(
-                                &def.body,
-                                &module.definitions,
-                                &module.instances,
-                            );
-                            for clause in &clauses {
-                                match classify_clause(clause) {
-                                    ClauseKind::UnprimedEquality {
-                                        var: ref v,
-                                        ref expr,
-                                    } if v == var => {
-                                        let ctx = EvalContext::with_definitions_and_instances(
+                        if state.contains_key(var.as_str()) {
+                            break;
+                        }
+                        if !def.params.is_empty() || !def.body.contains(var.as_str()) {
+                            continue;
+                        }
+                        for clause in expand_state_predicate_clauses(
+                            &def.body,
+                            &module.definitions,
+                            &module.instances,
+                        ) {
+                            if let ClauseKind::UnprimedEquality {
+                                var: ref v,
+                                ref expr,
+                            } = classify_clause(&clause)
+                            {
+                                if v == var {
+                                    if let Ok(val) = eval_expr(
+                                        expr,
+                                        &EvalContext::with_definitions_and_instances(
                                             &state,
                                             &definition_scope,
                                             &module.instances,
-                                        );
-                                        if let Ok(val) = eval_expr(expr, &ctx) {
-                                            state.insert(Arc::from(var.as_str()), val);
+                                        ),
+                                    ) {
+                                        state.insert(Arc::from(var.as_str()), val);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Search instance module definitions
+                    if !state.contains_key(var.as_str()) {
+                        for instance in module.instances.values() {
+                            if let Some(ref m) = instance.module {
+                                for def in m.definitions.values() {
+                                    if def.params.is_empty() && def.body.contains(var.as_str()) {
+                                        for clause in expand_state_predicate_clauses(
+                                            &def.body,
+                                            &m.definitions,
+                                            &m.instances,
+                                        ) {
+                                            if let ClauseKind::UnprimedEquality {
+                                                var: ref v,
+                                                ref expr,
+                                            } = classify_clause(&clause)
+                                            {
+                                                if v == var {
+                                                    if let Ok(val) =
+                                                        eval_expr(
+                                                            expr, &EvalContext::with_definitions_and_instances(&state, &definition_scope, &module.instances),
+                                                        )
+                                                    {
+                                                        state.insert(
+                                                            Arc::from(
+                                                                var.as_str(),
+                                                            ),
+                                                            val,
+                                                        );
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
-                                    _ => {}
                                 }
                             }
                         }
