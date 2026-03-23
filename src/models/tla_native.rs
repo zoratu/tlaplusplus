@@ -1216,7 +1216,7 @@ fn evaluate_init_states(
     cfg: &TlaConfig,
     init_name: &str,
 ) -> Result<Vec<TlaState>> {
-    let definition_scope = merged_definition_scope(module);
+    let mut definition_scope = merged_definition_scope(module);
     let init_def = module
         .definitions
         .get(init_name)
@@ -1371,7 +1371,29 @@ fn evaluate_init_states(
         }
 
         if !progress {
-            break;
+            // Log unresolved operator refs for debugging
+            for (name, ref_name) in &next_deferred {
+                eprintln!(
+                    "Warning: could not resolve constant operator '{}' <- '{}', \
+                     trying as definition injection",
+                    name, ref_name
+                );
+                // Last resort: if the ref is a definition, inject its body as a
+                // synthetic definition for the constant name
+                if let Some(def) = definition_scope.get(ref_name).cloned() {
+                    let mut injected = def.clone();
+                    injected.name = name.clone();
+                    definition_scope.insert(name.clone(), injected);
+                    progress = true;
+                }
+            }
+            if progress {
+                // Clear next_deferred since we injected as definitions
+                next_deferred.clear();
+            }
+            if !progress {
+                break;
+            }
         }
         deferred_operator_refs = next_deferred;
     }
