@@ -1125,6 +1125,30 @@ fn append_expanded_state_predicate_clause(
         return;
     }
 
+    // Handle TLC sub-expression references: Name!N refers to the N-th conjunct
+    // of the definition body. E.g., Init!1 = first conjunct of Init.
+    if let Some(bang_pos) = trimmed.find('!') {
+        let name_part = trimmed[..bang_pos].trim();
+        let index_part = trimmed[bang_pos + 1..].trim();
+        if let Ok(index) = index_part.parse::<usize>() {
+            if let Some(def) = definitions.get(name_part) {
+                let conjuncts = split_top_level(&def.body, "/\\");
+                if index >= 1 && index <= conjuncts.len() {
+                    let conjunct = conjuncts[index - 1].trim();
+                    append_expanded_state_predicate_clause(
+                        conjunct,
+                        definitions,
+                        instances,
+                        active_instance,
+                        visiting,
+                        out,
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
     if let Some((key, def, child_definitions, child_instances, instance_override)) =
         resolve_zero_arg_state_definition(trimmed, definitions, instances)
         && visiting.insert(key.clone())

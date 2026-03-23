@@ -2476,7 +2476,7 @@ fn try_eval_record_set(
         .product();
 
     // Limit the size to avoid memory explosion
-    let max_records = 5_000_000u64;
+    let max_records = 10_000_000u64;
     if total_records > max_records {
         return Err(anyhow!(
             "record set too large: {} records (max {})",
@@ -3711,6 +3711,17 @@ pub(crate) fn eval_operator_call(
                 .next()
                 .cloned()
                 .ok_or_else(|| anyhow!("RandomElement expects a non-empty set"));
+        }
+        // Randomization module: RandomSubset(k, S) - returns a random subset of S with k elements
+        // For model checking, we return the first k elements (deterministic)
+        "RandomSubset" => {
+            if args.len() != 2 {
+                return Err(anyhow!("RandomSubset expects 2 arguments (k, S)"));
+            }
+            let k = args[0].as_int()? as usize;
+            let set = args[1].as_set()?;
+            let subset: BTreeSet<TlaValue> = set.iter().take(k).cloned().collect();
+            return Ok(TlaValue::Set(Arc::new(subset)));
         }
         // TLC module: Range(f) - returns the set of all values in the range of function f
         // Range(f) == {f[x] : x \in DOMAIN f}
