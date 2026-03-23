@@ -1472,6 +1472,38 @@ fn evaluate_init_states(
     let mut i = 0;
     while i < raw_clauses.len() {
         let c = raw_clauses[i].trim().to_string();
+
+        // If this clause starts with \E (existential quantifier), the body
+        // may have been split across subsequent clauses. Rejoin them.
+        // Pattern: \E x \in S : body1 /\ body2 gets split into
+        // ["\E x \in S : body1", "body2"] — we need to rejoin.
+        if c.starts_with("\\E ") || c.starts_with("\\exists ") {
+            let mut merged = c.clone();
+            // The \E clause should contain a colon. If it does, check if
+            // there are subsequent clauses that are part of the body.
+            // We greedily grab following clauses that look like variable
+            // assignments inside the quantifier.
+            while i + 1 < raw_clauses.len() {
+                let next = raw_clauses[i + 1].trim();
+                // Stop if next clause is another \E, \/ or clearly independent
+                if next.starts_with("\\E ")
+                    || next.starts_with("\\exists ")
+                    || next.starts_with("\\/")
+                {
+                    break;
+                }
+                // Check if next clause references variables that might be
+                // bound by the quantifier, or contains assignments that
+                // depend on it. Heuristic: if the clause contains an identifier
+                // from the \E binder, it belongs to the body.
+                merged = format!("{} /\\ {}", merged, next);
+                i += 1;
+            }
+            merged_clauses.push(merged);
+            i += 1;
+            continue;
+        }
+
         // If this clause starts with \/ or contains \/ midway, it's part of
         // a disjunction that got split. Merge it back.
         if c.starts_with("\\/") {
@@ -1967,8 +1999,109 @@ fn evaluate_init_states(
         }
     }
 
-    // Handle \E quantifier guards — expand states for each satisfying assignment
+    // Handle \E quantifier guards — expand states for each satisfying assignment.
+    // For Init, the \E body contains unprimed assignments (not primed like Next).
+    // We parse the binder, enumerate domain values, and for each value evaluate
+    // the body conjuncts to extract variable assignments.
     for guard in &existential_guards {
+        if let Some(colon_pos) = find_top_level_colon(guard) {
+            let binder_part = guard[..colon_pos].trim();
+            let body_part = guard[colon_pos + 1..].trim();
+
+            let binder_text = binder_part
+                .strip_prefix("\\E ")
+                .or_else(|| binder_part.strip_prefix("\\exists "))
+                .unwrap_or(binder_part);
+
+            if let Some(in_pos) = binder_text.find("\\in") {
+                let bind_var = binder_text[..in_pos].trim();
+                let domain_expr = binder_text[in_pos + 3..].trim();
+
+                let mut new_states = Vec::new();
+                for state in &states {
+                    let ctx = EvalContext::with_definitions_and_instances(
+                        state,
+                        &definition_scope,
+                        &module.instances,
+                    );
+
+                    // Evaluate domain
+                    let domain_set = match eval_expr(domain_expr, &ctx) {
+                        Ok(v) => match v.as_set() {
+                            Ok(s) => s.clone(),
+                            Err(_) => continue,
+                        },
+                        Err(_) => continue,
+                    };
+
+                    // For each binding value, evaluate body conjuncts
+                    for bind_val in domain_set.iter() {
+                        let mut trial_state = state.clone();
+                        trial_state.insert(Arc::from(bind_var), bind_val.clone());
+
+                        // Split body on /\ and classify each conjunct
+                        let body_clauses = split_top_level(body_part, "/\\");
+                        let mut all_ok = true;
+                        for bc in &body_clauses {
+                            let bc = bc.trim();
+                            if bc.is_empty() {
+                                continue;
+                            }
+                            match classify_clause(bc) {
+                                ClauseKind::UnprimedEquality { ref var, .. }
+                                    if module.variables.contains(var) =>
+                                {
+                                    if let ClauseKind::UnprimedEquality { var, expr } =
+                                        classify_clause(bc)
+                                    {
+                                        let ctx2 = EvalContext::with_definitions_and_instances(
+                                            &trial_state,
+                                            &definition_scope,
+                                            &module.instances,
+                                        );
+                                        if let Ok(val) = eval_expr(&expr, &ctx2) {
+                                            trial_state.insert(Arc::from(var.as_str()), val);
+                                        } else {
+                                            all_ok = false;
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    // Guard conjunct — evaluate as boolean
+                                    let ctx2 = EvalContext::with_definitions_and_instances(
+                                        &trial_state,
+                                        &definition_scope,
+                                        &module.instances,
+                                    );
+                                    match eval_expr(bc, &ctx2) {
+                                        Ok(TlaValue::Bool(false)) => {
+                                            all_ok = false;
+                                        }
+                                        Err(_) => {
+                                            all_ok = false;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                        if all_ok {
+                            // Remove the binding variable (it's not a module variable)
+                            if !module.variables.contains(&bind_var.to_string()) {
+                                trial_state.remove(bind_var);
+                            }
+                            new_states.push(trial_state);
+                        }
+                    }
+                }
+                if !new_states.is_empty() {
+                    states = new_states;
+                }
+                continue;
+            }
+        }
+
+        // Fallback: try eval_action_body_multi
         let mut new_states = Vec::new();
         for state in &states {
             let ctx = EvalContext::with_definitions_and_instances(
@@ -1989,7 +2122,6 @@ fn evaluate_init_states(
                 }
             }
             if new_states.is_empty() {
-                // Keep the original state if \E didn't produce bindings
                 new_states.push(state.clone());
             }
         }
