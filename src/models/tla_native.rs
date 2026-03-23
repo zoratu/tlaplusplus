@@ -1243,6 +1243,13 @@ fn evaluate_init_states(
     init_name: &str,
 ) -> Result<Vec<TlaState>> {
     let mut definition_scope = merged_definition_scope(module);
+    if std::env::var("TLAPP_DEBUG_INIT").is_ok() {
+        eprintln!(
+            "[init] definition_scope has {} defs, AntiFunction={}",
+            definition_scope.len(),
+            definition_scope.contains_key("AntiFunction")
+        );
+    }
     let init_def = module
         .definitions
         .get(init_name)
