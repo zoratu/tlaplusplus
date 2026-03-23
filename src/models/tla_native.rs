@@ -1836,31 +1836,90 @@ fn evaluate_init_states(
     // Generate all combinations of membership choices (cross product)
     let had_membership_choices = !membership_choices.is_empty();
     let base_state_for_error = base_state.clone();
-    let mut states = vec![base_state];
 
+    // Calculate cross-product size to decide eager vs lazy
+    let mut cross_product_size: u64 = 1;
+    let mut active_choices: Vec<(String, Vec<TlaValue>)> = Vec::new();
     for (var, values) in &membership_choices {
-        // Skip deferred memberships (placeholder values)
         if values.len() == 1 && values[0] == TlaValue::String("__DEFERRED__".into()) {
             continue;
         }
-        let mut new_states = Vec::new();
-        for state in &states {
-            for value in values {
-                let mut new_state = state.clone();
-                new_state.insert(Arc::from(var.as_str()), value.clone());
-                new_states.push(new_state);
+        cross_product_size = cross_product_size.saturating_mul(values.len() as u64);
+        active_choices.push((var.clone(), values.clone()));
+    }
+
+    const MAX_EAGER_INIT_STATES: u64 = 10_000_000;
+
+    let mut states = vec![base_state];
+
+    if cross_product_size > MAX_EAGER_INIT_STATES {
+        // Lazy enumeration: use an odometer-style iterator
+        eprintln!(
+            "Init cross-product has {} states, using lazy enumeration",
+            cross_product_size
+        );
+
+        let base = states.into_iter().next().unwrap();
+        let mut indices = vec![0usize; active_choices.len()];
+        let mut generated = 0u64;
+        let mut lazy_states = Vec::new();
+
+        loop {
+            // Build state from current indices
+            let mut state = base.clone();
+            for (i, (var, values)) in active_choices.iter().enumerate() {
+                state.insert(Arc::from(var.as_str()), values[indices[i]].clone());
+            }
+            lazy_states.push(state);
+            generated += 1;
+
+            // Progress reporting every 1M states
+            if generated % 1_000_000 == 0 {
+                eprintln!(
+                    "  Generated {} / {} initial states...",
+                    generated, cross_product_size
+                );
+            }
+
+            // Advance indices (odometer pattern, rightmost increments first)
+            let mut carry = true;
+            for i in (0..indices.len()).rev() {
+                if carry {
+                    indices[i] += 1;
+                    if indices[i] < active_choices[i].1.len() {
+                        carry = false;
+                    } else {
+                        indices[i] = 0;
+                    }
+                }
+            }
+            if carry {
+                break; // All combinations exhausted
+            }
+
+            // Memory safety: cap at 100M states
+            if generated >= 100_000_000 {
+                eprintln!(
+                    "Warning: capped lazy enumeration at {} states (of {} total)",
+                    generated, cross_product_size
+                );
+                break;
             }
         }
-        states = new_states;
 
-        // Limit total number of initial states
-        const MAX_INIT_STATES: usize = 10_000_000;
-        if states.len() > MAX_INIT_STATES {
-            return Err(anyhow!(
-                "too many initial states ({} > {}). Consider constraining Init.",
-                states.len(),
-                MAX_INIT_STATES
-            ));
+        states = lazy_states;
+    } else {
+        // Eager cross-product (existing path)
+        for (var, values) in &active_choices {
+            let mut new_states = Vec::new();
+            for state in &states {
+                for value in values {
+                    let mut new_state = state.clone();
+                    new_state.insert(Arc::from(var.as_str()), value.clone());
+                    new_states.push(new_state);
+                }
+            }
+            states = new_states;
         }
     }
 

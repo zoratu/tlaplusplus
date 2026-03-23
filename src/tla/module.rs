@@ -79,6 +79,9 @@ const BUILTIN_MODULES: &[&str] = &[
     "FoldsTheorems",
     "FunctionTheorems",
     "FiniteSetsExtTheorems",
+    // I/O and utility modules
+    "IOUtils",
+    "CSV",
     // Other community modules
     "Relation",
     "Combinatorics",
