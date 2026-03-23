@@ -687,9 +687,11 @@ fn merge_instance_definitions(
         }
     }
 
-    // Merge variables (don't duplicate)
+    // Merge variables (don't duplicate, and skip vars that are already
+    // defined as operators in the target — e.g., Stuttering's `vars` variable
+    // vs Lock's `vars == <<pc, lock>>` definition)
     for var in &source.variables {
-        if !target.variables.contains(var) {
+        if !target.variables.contains(var) && !target.definitions.contains_key(var) {
             target.variables.push(var.clone());
         }
     }
