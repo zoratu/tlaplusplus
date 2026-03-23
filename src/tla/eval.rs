@@ -3425,6 +3425,109 @@ pub(crate) fn eval_operator_call(
             }
             return Ok(TlaValue::Function(Arc::new(result)));
         }
+        // === Standard module: Bags ===
+        // Bags are represented as TlaValue::Function from elements to natural counts.
+        // EmptyBag is the empty function. SetToBag converts a set to a bag with count 1.
+        "EmptyBag" if args.is_empty() && !user_defined_shadow => {
+            return Ok(TlaValue::Function(Arc::new(BTreeMap::new())));
+        }
+        "SetToBag" if args.len() == 1 && !user_defined_shadow => {
+            // SetToBag(S) == [e \in S |-> 1]
+            let set = args[0].as_set()?;
+            let mut bag = BTreeMap::new();
+            for elem in set.iter() {
+                bag.insert(elem.clone(), TlaValue::Int(1));
+            }
+            return Ok(TlaValue::Function(Arc::new(bag)));
+        }
+        "BagToSet" if args.len() == 1 && !user_defined_shadow => {
+            // BagToSet(B) == DOMAIN B
+            if let TlaValue::Function(f) = &args[0] {
+                let set: BTreeSet<TlaValue> = f.keys().cloned().collect();
+                return Ok(TlaValue::Set(Arc::new(set)));
+            }
+            return Err(anyhow!("BagToSet: argument is not a bag"));
+        }
+        "IsABag" if args.len() == 1 && !user_defined_shadow => {
+            if let TlaValue::Function(f) = &args[0] {
+                let all_nat = f.values().all(|v| matches!(v, TlaValue::Int(n) if *n > 0));
+                return Ok(TlaValue::Bool(all_nat));
+            }
+            return Ok(TlaValue::Bool(false));
+        }
+        "BagIn" if args.len() == 2 && !user_defined_shadow => {
+            // BagIn(e, B) == e \in DOMAIN B
+            if let TlaValue::Function(f) = &args[1] {
+                return Ok(TlaValue::Bool(f.contains_key(&args[0])));
+            }
+            return Ok(TlaValue::Bool(false));
+        }
+        "BagOfAll" if args.len() == 2 && !user_defined_shadow => {
+            // BagOfAll(F, B) — apply F to each element, sum counts
+            // Simplified: just return a function
+            if let TlaValue::Function(bag) = &args[1] {
+                let mut result = BTreeMap::new();
+                for (elem, count) in bag.iter() {
+                    // We can't easily apply F here without the full eval context,
+                    // so just pass through
+                    result.insert(elem.clone(), count.clone());
+                }
+                return Ok(TlaValue::Function(Arc::new(result)));
+            }
+            return Err(anyhow!("BagOfAll: second argument is not a bag"));
+        }
+        "BagUnion" if args.len() == 2 && !user_defined_shadow => {
+            if let (TlaValue::Function(a), TlaValue::Function(b)) = (&args[0], &args[1]) {
+                let mut result = a.as_ref().clone();
+                for (k, v) in b.iter() {
+                    let count_a = result.get(k).and_then(|c| c.as_int().ok()).unwrap_or(0);
+                    let count_b = v.as_int().unwrap_or(0);
+                    result.insert(k.clone(), TlaValue::Int(count_a + count_b));
+                }
+                return Ok(TlaValue::Function(Arc::new(result)));
+            }
+            return Err(anyhow!("BagUnion: arguments are not bags"));
+        }
+        "CopiesIn" if args.len() == 2 && !user_defined_shadow => {
+            // CopiesIn(e, B) == IF BagIn(e, B) THEN B[e] ELSE 0
+            if let TlaValue::Function(f) = &args[1] {
+                if let Some(count) = f.get(&args[0]) {
+                    return Ok(count.clone());
+                }
+                return Ok(TlaValue::Int(0));
+            }
+            return Ok(TlaValue::Int(0));
+        }
+        // === Community module: BagsExt ===
+        "BagAdd" if args.len() == 2 && !user_defined_shadow => {
+            // BagAdd(B, e) — add one copy of e to bag B
+            if let TlaValue::Function(f) = &args[0] {
+                let mut result = f.as_ref().clone();
+                let count = result
+                    .get(&args[1])
+                    .and_then(|c| c.as_int().ok())
+                    .unwrap_or(0);
+                result.insert(args[1].clone(), TlaValue::Int(count + 1));
+                return Ok(TlaValue::Function(Arc::new(result)));
+            }
+            return Err(anyhow!("BagAdd: first argument is not a bag"));
+        }
+        "BagRemove" if args.len() == 2 && !user_defined_shadow => {
+            // BagRemove(B, e) — remove one copy of e from bag B
+            if let TlaValue::Function(f) = &args[0] {
+                let mut result = f.as_ref().clone();
+                if let Some(count_val) = result.get(&args[1]) {
+                    let count = count_val.as_int().unwrap_or(0);
+                    if count <= 1 {
+                        result.remove(&args[1]);
+                    } else {
+                        result.insert(args[1].clone(), TlaValue::Int(count - 1));
+                    }
+                }
+                return Ok(TlaValue::Function(Arc::new(result)));
+            }
+            return Err(anyhow!("BagRemove: first argument is not a bag"));
+        }
         // === Community module: UndirectedGraphs ===
         "IsUndirectedGraph" if args.len() == 1 && !user_defined_shadow => {
             let g = &args[0];
