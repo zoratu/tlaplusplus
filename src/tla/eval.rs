@@ -2476,7 +2476,7 @@ fn try_eval_record_set(
         .product();
 
     // Limit the size to avoid memory explosion
-    let max_records = 1_000_000u64;
+    let max_records = 5_000_000u64;
     if total_records > max_records {
         return Err(anyhow!(
             "record set too large: {} records (max {})",
