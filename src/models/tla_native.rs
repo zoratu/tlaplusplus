@@ -954,7 +954,9 @@ fn extract_init_next_from_spec_inner(
                             extract_init_next_from_spec_inner(&def.body, module, depth + 1);
                         if sub_next.is_some() {
                             next = sub_next;
-                            if init.is_none() {
+                            // Prefer the chased Init over an inline expression
+                            // that was likely just a side-effect (e.g., PrintT(R))
+                            if sub_init.is_some() {
                                 init = sub_init;
                             }
                             continue;
@@ -1354,11 +1356,7 @@ fn evaluate_init_states(
                     base_state.insert(Arc::from(name.as_str()), value);
                     progress = true;
                 }
-                Err(e) => {
-                    eprintln!(
-                        "Note: eval_expr('{}') for constant '{}' failed: {}",
-                        ref_name, name, e
-                    );
+                Err(_) => {
                     // Try resolving as a zero-arg definition from definition_scope
                     if let Some(def) = definition_scope.get(&ref_name) {
                         if def.params.is_empty() {
