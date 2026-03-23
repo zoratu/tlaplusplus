@@ -1245,10 +1245,23 @@ fn evaluate_init_states(
     let mut definition_scope = merged_definition_scope(module);
     if std::env::var("TLAPP_DEBUG_INIT").is_ok() {
         eprintln!(
-            "[init] definition_scope has {} defs, AntiFunction={}",
+            "[init] module.definitions={} definition_scope={} AntiFunction in module={} in scope={}",
+            module.definitions.len(),
             definition_scope.len(),
+            module.definitions.contains_key("AntiFunction"),
             definition_scope.contains_key("AntiFunction")
         );
+        // Check instances
+        for (name, inst) in &module.instances {
+            if let Some(ref m) = inst.module {
+                eprintln!(
+                    "[init] instance '{}' has {} defs, AntiFunction={}",
+                    name,
+                    m.definitions.len(),
+                    m.definitions.contains_key("AntiFunction")
+                );
+            }
+        }
     }
     let init_def = module
         .definitions
