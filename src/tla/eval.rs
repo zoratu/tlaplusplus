@@ -265,6 +265,15 @@ impl<'a> EvalContext<'a> {
             return Ok(definition_as_lambda(&def, self.locals.as_ref()));
         }
 
+        // Check for known zero-arg built-in operators used as bare identifiers
+        // (e.g., IOEnv, EmptyBag — TLA+ uses them without parentheses)
+        match name {
+            "IOEnv" | "EmptyBag" => {
+                return eval_operator_call(name, Vec::new(), self, depth + 1);
+            }
+            _ => {}
+        }
+
         Ok(TlaValue::ModelValue(name.to_string()))
     }
 }
