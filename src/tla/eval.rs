@@ -3767,8 +3767,11 @@ pub(crate) fn eval_operator_call(
             }
 
             let mut result = Vec::with_capacity(b as usize);
+            // FunAsSeq(f, n, m) == [i \in 1..m |-> f[i]]
+            // n is unused (domain bound for type checking), m is length
+            let _ = a; // n is unused in evaluation
             for i in 1..=b {
-                let key = TlaValue::Int(a + i - 1);
+                let key = TlaValue::Int(i);
                 let val = func.apply(&key)?.clone();
                 result.push(val);
             }
@@ -8843,7 +8846,8 @@ IN
 
     #[test]
     fn test_funasseq_offset() {
-        // Test with offset: FunAsSeq(f, 2, 2) extracts elements starting at index 2
+        // FunAsSeq(f, n, m) == [i \in 1..m |-> f[i]]
+        // n is the domain bound (unused in eval), m is the output length
         let func = TlaValue::Function(Arc::new(BTreeMap::from([
             (TlaValue::Int(1), TlaValue::Int(10)),
             (TlaValue::Int(2), TlaValue::Int(20)),
@@ -8854,9 +8858,9 @@ IN
         let state = tla_state([("f", func)]);
         let ctx = EvalContext::new(&state);
 
-        // FunAsSeq(f, 2, 2) should produce <<20, 30>>
-        let result = eval_expr("FunAsSeq(f, 2, 2)", &ctx).expect("FunAsSeq should evaluate");
-        let expected = TlaValue::Seq(Arc::new(vec![TlaValue::Int(20), TlaValue::Int(30)]));
+        // FunAsSeq(f, 4, 2) should produce <<f[1], f[2]>> = <<10, 20>>
+        let result = eval_expr("FunAsSeq(f, 4, 2)", &ctx).expect("FunAsSeq should evaluate");
+        let expected = TlaValue::Seq(Arc::new(vec![TlaValue::Int(10), TlaValue::Int(20)]));
         assert_eq!(result, expected);
     }
 
@@ -8914,10 +8918,10 @@ IN
         let state = tla_state([("s", seq)]);
         let ctx = EvalContext::new(&state);
 
-        // FunAsSeq(s, 2, 2) should produce <<2, 3>>
+        // FunAsSeq(s, 4, 2) should produce <<s[1], s[2]>> = <<1, 2>>
         let result =
-            eval_expr("FunAsSeq(s, 2, 2)", &ctx).expect("FunAsSeq should evaluate on sequence");
-        let expected = TlaValue::Seq(Arc::new(vec![TlaValue::Int(2), TlaValue::Int(3)]));
+            eval_expr("FunAsSeq(s, 4, 2)", &ctx).expect("FunAsSeq should evaluate on sequence");
+        let expected = TlaValue::Seq(Arc::new(vec![TlaValue::Int(1), TlaValue::Int(2)]));
         assert_eq!(result, expected);
     }
 
