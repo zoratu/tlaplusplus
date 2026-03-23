@@ -1273,9 +1273,45 @@ fn evaluate_init_states(
     let mut membership_assignments: Vec<(String, String)> = Vec::new();
     let mut guards: Vec<String> = Vec::new();
 
-    for clause in
-        expand_state_predicate_clauses(&init_def.body, &module.definitions, &module.instances)
-    {
+    // Expand and merge clauses — rejoin disjunctive branches that split_top_level
+    // may have broken apart. E.g., Init with:
+    //   /\ \/ Guard1 /\ var = expr1
+    //      \/ Guard2 /\ var = expr2
+    // produces clauses ["\\/ Guard1", "var = expr1 \\/ Guard2", "var = expr2"]
+    // We need to rejoin these into a single disjunctive clause.
+    let raw_clauses =
+        expand_state_predicate_clauses(&init_def.body, &module.definitions, &module.instances);
+    let mut merged_clauses = Vec::new();
+    let mut i = 0;
+    while i < raw_clauses.len() {
+        let c = raw_clauses[i].trim().to_string();
+        // If this clause starts with \/ or contains \/ midway, it's part of
+        // a disjunction that got split. Merge it back.
+        if c.starts_with("\\/") {
+            // This clause and potentially following ones form a disjunction
+            let mut merged = c.clone();
+            // Look ahead for continuations that contain \/ or follow the pattern
+            while i + 1 < raw_clauses.len() {
+                let next = raw_clauses[i + 1].trim();
+                if next.contains("\\/") || next.starts_with("\\/") {
+                    merged = format!("{} /\\ {}", merged, next);
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            merged_clauses.push(merged);
+        } else if c.contains("\\/") {
+            // The \/ appeared in the middle of a clause (e.g., "expr1 \\/ Guard")
+            // This shouldn't normally happen from a clean split, but handle it
+            merged_clauses.push(c);
+        } else {
+            merged_clauses.push(c);
+        }
+        i += 1;
+    }
+
+    for clause in merged_clauses {
         // For disjunctive clauses (\/ branches), try to resolve them
         // using already-known constants. This handles patterns like:
         //   \/ Light_Unknown /\ light \in {"off","on"}
