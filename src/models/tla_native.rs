@@ -2671,6 +2671,18 @@ fn inject_constants_into_module_tree(
             _ => (Vec::new(), config_value_to_expr(value)),
         };
 
+        // Save original definition under a backup name before overriding.
+        // This allows Init <- MCInit to still find assignments from the
+        // original Init (e.g., passes = IF terminated THEN 0 ELSE -1).
+        if let Some(original) = module.definitions.get(name) {
+            let backup_name = format!("__Original_{}__", name);
+            if !module.definitions.contains_key(&backup_name) {
+                let mut backup = original.clone();
+                backup.name = backup_name.clone();
+                module.definitions.insert(backup_name, backup);
+            }
+        }
+
         module.definitions.insert(
             name.clone(),
             TlaDefinition {
