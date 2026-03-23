@@ -1354,7 +1354,11 @@ fn evaluate_init_states(
                     base_state.insert(Arc::from(name.as_str()), value);
                     progress = true;
                 }
-                Err(_) => {
+                Err(e) => {
+                    eprintln!(
+                        "Note: eval_expr('{}') for constant '{}' failed: {}",
+                        ref_name, name, e
+                    );
                     // Try resolving as a zero-arg definition from definition_scope
                     if let Some(def) = definition_scope.get(&ref_name) {
                         if def.params.is_empty() {
