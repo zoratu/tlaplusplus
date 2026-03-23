@@ -1276,6 +1276,88 @@ fn evaluate_init_states(
     for clause in
         expand_state_predicate_clauses(&init_def.body, &module.definitions, &module.instances)
     {
+        // For disjunctive clauses (\/ branches), try to resolve them
+        // using already-known constants. This handles patterns like:
+        //   \/ Light_Unknown /\ light \in {"off","on"}
+        //   \/ ~Light_Unknown /\ light = "off"
+        // When Light_Unknown is a known constant (FALSE), this simplifies
+        // to `light = "off"`.
+        let clause_trimmed = clause.trim();
+        if clause_trimmed.contains("\\/") {
+            let ctx = EvalContext::with_definitions_and_instances(
+                &base_state,
+                &definition_scope,
+                &module.instances,
+            );
+            // Try evaluating the whole disjunction — if it produces a
+            // definite value, we can skip it (TRUE guard) or reject (FALSE)
+            if let Ok(TlaValue::Bool(_)) = eval_expr(clause_trimmed, &ctx) {
+                guards.push(clause);
+                continue;
+            }
+            // Otherwise, try splitting on \/ and finding the branch that
+            // has satisfiable guards + variable assignments
+            let branches = split_top_level(clause_trimmed, "\\/");
+            if branches.len() > 1 {
+                let mut handled = false;
+                for branch in &branches {
+                    let branch = branch.trim();
+                    if branch.is_empty() {
+                        continue;
+                    }
+                    // Check if this branch's guard evaluates to TRUE
+                    let sub_clauses = split_top_level(branch, "/\\");
+                    let mut branch_ok = true;
+                    let mut branch_assignments = Vec::new();
+                    let mut branch_memberships = Vec::new();
+                    for sc in &sub_clauses {
+                        let sc = sc.trim();
+                        match classify_clause(sc) {
+                            ClauseKind::UnprimedEquality { ref var, .. }
+                                if module.variables.contains(var) =>
+                            {
+                                branch_assignments.push(sc.to_string());
+                            }
+                            ClauseKind::UnprimedMembership { ref var, .. }
+                                if module.variables.contains(var) =>
+                            {
+                                branch_memberships.push(sc.to_string());
+                            }
+                            _ => {
+                                // Guard — check if it's satisfied
+                                if let Ok(TlaValue::Bool(false)) = eval_expr(sc, &ctx) {
+                                    branch_ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if branch_ok
+                        && (!branch_assignments.is_empty() || !branch_memberships.is_empty())
+                    {
+                        for sc in &branch_assignments {
+                            if let ClauseKind::UnprimedEquality { var, expr } = classify_clause(sc)
+                            {
+                                equality_assignments.push((var, expr));
+                            }
+                        }
+                        for sc in &branch_memberships {
+                            if let ClauseKind::UnprimedMembership { var, set_expr } =
+                                classify_clause(sc)
+                            {
+                                membership_assignments.push((var, set_expr));
+                            }
+                        }
+                        handled = true;
+                        break;
+                    }
+                }
+                if handled {
+                    continue;
+                }
+            }
+        }
+
         match classify_clause(&clause) {
             ClauseKind::UnprimedEquality { var, expr } if module.variables.contains(&var) => {
                 equality_assignments.push((var, expr));
@@ -1454,27 +1536,61 @@ fn evaluate_init_states(
             next_pending = final_pending;
 
             if !progress && !next_pending.is_empty() {
-                let first = &next_pending[0];
-                return Err(anyhow!(
-                    "failed evaluating membership set for {}: {}",
-                    first.0,
-                    first.1
-                ));
+                // Defer these memberships to the cross-product phase where
+                // dependent variables will already be bound in each state.
+                // This handles patterns like:
+                //   active \in [Node -> BOOLEAN]
+                //   terminationDetected \in {FALSE, terminated}
+                // where `terminated` depends on `active`.
+                for (var, set_expr) in next_pending {
+                    membership_choices.push((var, vec![TlaValue::String("__DEFERRED__".into())]));
+                    guards.push(format!(
+                        "__DEFERRED_MEMBERSHIP__:{}:{}",
+                        membership_choices.len() - 1,
+                        set_expr
+                    ));
+                }
+                next_pending = Vec::new();
+                break;
             }
         }
 
         pending_memberships = next_pending;
     }
 
+    // Extract deferred membership expressions from guards
+    let mut deferred_memberships: Vec<(usize, String, String)> = Vec::new();
+    let mut real_guards: Vec<String> = Vec::new();
+    for guard in &guards {
+        if let Some(rest) = guard.strip_prefix("__DEFERRED_MEMBERSHIP__:") {
+            if let Some(colon_idx) = rest.find(':') {
+                let idx: usize = rest[..colon_idx].parse().unwrap_or(0);
+                let set_expr = rest[colon_idx + 1..].to_string();
+                // Find the variable name from membership_choices
+                if idx < membership_choices.len() {
+                    let var = membership_choices[idx].0.clone();
+                    deferred_memberships.push((idx, var, set_expr));
+                }
+            }
+        } else {
+            real_guards.push(guard.clone());
+        }
+    }
+    let guards = real_guards;
+
     // Generate all combinations of membership choices (cross product)
     let had_membership_choices = !membership_choices.is_empty();
     let base_state_for_error = base_state.clone();
     let mut states = vec![base_state];
 
-    for (var, values) in membership_choices {
+    for (var, values) in &membership_choices {
+        // Skip deferred memberships (placeholder values)
+        if values.len() == 1 && values[0] == TlaValue::String("__DEFERRED__".into()) {
+            continue;
+        }
         let mut new_states = Vec::new();
-        for state in states {
-            for value in &values {
+        for state in &states {
+            for value in values {
                 let mut new_state = state.clone();
                 new_state.insert(Arc::from(var.as_str()), value.clone());
                 new_states.push(new_state);
@@ -1490,6 +1606,31 @@ fn evaluate_init_states(
                 states.len(),
                 MAX_INIT_STATES
             ));
+        }
+    }
+
+    // Now expand deferred memberships — these depend on variables that
+    // are already bound in each state from the cross-product above
+    for (_idx, var, set_expr) in &deferred_memberships {
+        let mut new_states = Vec::new();
+        for state in &states {
+            let ctx = EvalContext::with_definitions_and_instances(
+                state,
+                &definition_scope,
+                &module.instances,
+            );
+            if let Ok(set_val) = eval_expr(set_expr, &ctx) {
+                if let Ok(set) = set_val.as_set() {
+                    for value in set.iter() {
+                        let mut new_state = state.clone();
+                        new_state.insert(Arc::from(var.as_str()), value.clone());
+                        new_states.push(new_state);
+                    }
+                }
+            }
+        }
+        if !new_states.is_empty() {
+            states = new_states;
         }
     }
 
