@@ -7,10 +7,11 @@ use crate::tla::tla_state;
 use crate::tla::{
     ClauseKind, CompiledActionIr, CompiledExpr, ConfigValue, EvalContext, TemporalFormula,
     TlaConfig, TlaDefinition, TlaModule, TlaState, TlaValue, classify_clause, compile_action_ir,
-    compile_expr, count_next_disjuncts, eval_action_constraint, eval_compiled, eval_expr,
-    evaluate_next_states_labeled_with_instances, evaluate_next_states_swarm,
-    evaluate_next_states_with_instances, insert_compiled_action, looks_like_action,
-    normalize_operator_ref_name, parse_tla_config, parse_tla_module_file, split_top_level,
+    compile_expr, count_next_disjuncts, eval_action_body_multi, eval_action_constraint,
+    eval_compiled, eval_expr, evaluate_next_states_labeled_with_instances,
+    evaluate_next_states_swarm, evaluate_next_states_with_instances, insert_compiled_action,
+    looks_like_action, normalize_operator_ref_name, parse_tla_config, parse_tla_module_file,
+    split_top_level,
 };
 use anyhow::{Context, Result, anyhow};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -829,6 +830,17 @@ fn resolve_init_next_names(
                 init = pluscal_init;
             }
         } else {
+            // Check if this is an evaluation-only module (no state machine)
+            // by looking for cfg with no INIT/NEXT/SPECIFICATION and module with no Init/Next
+            if cfg.init.is_none()
+                && cfg.next.is_none()
+                && cfg.specification.is_none()
+                && init == "Init"
+            {
+                return Err(anyhow!(
+                    "evaluation-only module (no Init/Next/SPECIFICATION defined)"
+                ));
+            }
             return Err(anyhow!("Init definition '{init}' not found in module"));
         }
     }
@@ -1354,29 +1366,104 @@ fn evaluate_init_states(
     }
 
     // Now handle membership assignments (nondeterministic)
-    // Evaluate each set expression and collect possible values
+    // Use a fixed-point loop: some membership sets depend on other variables
+    // being assigned first (e.g., `terminationDetected \in {FALSE, terminated}`
+    // where `terminated` depends on `active` which is also a membership assignment).
     let mut membership_choices: Vec<(String, Vec<TlaValue>)> = Vec::new();
+    let mut pending_memberships = membership_assignments;
 
-    for (var, set_expr) in membership_assignments {
-        let ctx = EvalContext::with_definitions_and_instances(
-            &base_state,
-            &definition_scope,
-            &module.instances,
-        );
-        let set_val = eval_expr(&set_expr, &ctx)
-            .with_context(|| format!("failed evaluating membership set for {var}: {set_expr}"))?;
-        let set = set_val
-            .as_set()
-            .with_context(|| format!("membership expression for {var} is not a set: {set_expr}"))?;
-
-        if set.is_empty() {
-            return Err(anyhow!(
-                "membership set for {var} is empty, no initial states possible"
-            ));
+    for _ in 0..pending_memberships.len().saturating_add(1) {
+        if pending_memberships.is_empty() {
+            break;
         }
 
-        let values: Vec<TlaValue> = set.iter().cloned().collect();
-        membership_choices.push((var, values));
+        let mut progress = false;
+        let mut next_pending = Vec::new();
+
+        for (var, set_expr) in pending_memberships {
+            let ctx = EvalContext::with_definitions_and_instances(
+                &base_state,
+                &definition_scope,
+                &module.instances,
+            );
+            match eval_expr(&set_expr, &ctx) {
+                Ok(set_val) => {
+                    if let Ok(set) = set_val.as_set() {
+                        if set.is_empty() {
+                            return Err(anyhow!(
+                                "membership set for {var} is empty, no initial states possible"
+                            ));
+                        }
+                        let values: Vec<TlaValue> = set.iter().cloned().collect();
+                        membership_choices.push((var.clone(), values));
+                        // For singleton sets, also add to base_state so dependent
+                        // memberships can resolve
+                        if set.len() == 1 {
+                            base_state.insert(
+                                Arc::from(var.as_str()),
+                                set.iter().next().unwrap().clone(),
+                            );
+                        }
+                        progress = true;
+                    } else {
+                        next_pending.push((var, set_expr));
+                    }
+                }
+                Err(_) => next_pending.push((var, set_expr)),
+            }
+        }
+
+        if !progress {
+            // Final attempt: try with all definitions injected as state values
+            let mut augmented = base_state.clone();
+            for (name, def) in &definition_scope {
+                if !augmented.contains_key(name.as_str()) && def.params.is_empty() {
+                    let ctx = EvalContext::with_definitions_and_instances(
+                        &augmented,
+                        &definition_scope,
+                        &module.instances,
+                    );
+                    if let Ok(val) = eval_expr(&def.body, &ctx) {
+                        augmented.insert(Arc::from(name.as_str()), val);
+                    }
+                }
+            }
+
+            let mut final_pending = Vec::new();
+            for (var, set_expr) in next_pending {
+                let ctx = EvalContext::with_definitions_and_instances(
+                    &augmented,
+                    &definition_scope,
+                    &module.instances,
+                );
+                match eval_expr(&set_expr, &ctx) {
+                    Ok(set_val) => {
+                        if let Ok(set) = set_val.as_set() {
+                            if !set.is_empty() {
+                                let values: Vec<TlaValue> = set.iter().cloned().collect();
+                                membership_choices.push((var, values));
+                                progress = true;
+                                continue;
+                            }
+                        }
+                        final_pending.push((var, set_expr));
+                    }
+                    Err(_) => final_pending.push((var, set_expr)),
+                }
+            }
+            next_pending = final_pending;
+
+            if !progress && !next_pending.is_empty() {
+                let first = &next_pending[0];
+                return Err(anyhow!(
+                    "failed evaluating membership set for {}: {}",
+                    first.0,
+                    first.1
+                ));
+            }
+        }
+
+        pending_memberships = next_pending;
     }
 
     // Generate all combinations of membership choices (cross product)
@@ -1449,7 +1536,7 @@ fn evaluate_init_states(
     // If no valid states but some variables are unassigned, try recovery:
     // re-scan guards for patterns like `var = expr` or `var \in set` that
     // classify_clause missed (common in PlusCal-generated Init)
-    if valid_states.is_empty() && !had_membership_choices {
+    if valid_states.is_empty() {
         let missing: Vec<String> = module
             .variables
             .iter()
@@ -1460,15 +1547,59 @@ fn evaluate_init_states(
         if !missing.is_empty() {
             let mut recovered = false;
             let mut recovery_state = base_state_for_error.clone();
+
+            // First try: evaluate the entire Init body as an expression.
+            // This handles \E quantifiers, LET/IN blocks, and complex patterns
+            // that clause-by-clause classification misses.
+            {
+                let ctx = EvalContext::with_definitions_and_instances(
+                    &recovery_state,
+                    &definition_scope,
+                    &module.instances,
+                );
+                if let Ok(TlaValue::Bool(true)) = eval_expr(&init_def.body, &ctx) {
+                    // Init evaluated to TRUE with current state — check if
+                    // variables got bound through side effects in the context
+                }
+            }
+
             for guard in &guards {
+                // Handle \E quantifiers: `\E x \in S : body`
+                // Extract variable assignments from inside the quantifier body
+                let guard_trimmed = guard.trim();
+                if guard_trimmed.starts_with("\\E ") || guard_trimmed.starts_with("\\exists ") {
+                    let ctx = EvalContext::with_definitions_and_instances(
+                        &recovery_state,
+                        &definition_scope,
+                        &module.instances,
+                    );
+                    // Use eval_action_body_multi to evaluate the existential
+                    // and extract variable assignments
+                    let staged = BTreeMap::<String, TlaValue>::new();
+                    if let Ok(result) = eval_action_body_multi(guard_trimmed, &ctx, &staged) {
+                        let result: Vec<(BTreeMap<String, TlaValue>, Vec<String>)> = result;
+                        if let Some((bindings, _)) = result.into_iter().next() {
+                            for (var_name, val) in bindings {
+                                if missing.contains(&var_name)
+                                    && !recovery_state.contains_key(var_name.as_str())
+                                {
+                                    recovery_state.insert(Arc::from(var_name.as_str()), val);
+                                    recovered = true;
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+
                 for var in &missing {
                     if recovery_state.contains_key(var.as_str()) {
                         continue;
                     }
-                    // Try to find `var = expr` pattern using bracket-aware splitting
+                    // Try to find `var = expr` pattern
                     let pattern = format!("{} = ", var);
-                    if let Some(idx) = guard.find(&pattern) {
-                        let rhs = guard[idx + pattern.len()..].trim();
+                    if let Some(idx) = guard_trimmed.find(&pattern) {
+                        let rhs = guard_trimmed[idx + pattern.len()..].trim();
                         let ctx = EvalContext::with_definitions_and_instances(
                             &recovery_state,
                             &definition_scope,
@@ -1481,8 +1612,8 @@ fn evaluate_init_states(
                     }
                     // Try `var \in set` pattern
                     let mem_pattern = format!("{} \\in ", var);
-                    if let Some(idx) = guard.find(&mem_pattern) {
-                        let rhs = guard[idx + mem_pattern.len()..].trim();
+                    if let Some(idx) = guard_trimmed.find(&mem_pattern) {
+                        let rhs = guard_trimmed[idx + mem_pattern.len()..].trim();
                         let ctx = EvalContext::with_definitions_and_instances(
                             &recovery_state,
                             &definition_scope,
