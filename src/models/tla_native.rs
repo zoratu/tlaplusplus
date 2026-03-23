@@ -1644,7 +1644,12 @@ fn evaluate_init_states(
                     base_state.insert(Arc::from(var.as_str()), value);
                     progress = true;
                 }
-                Err(_) => next_pending.push((var, expr)),
+                Err(e) => {
+                    if std::env::var("TLAPP_DEBUG_INIT").is_ok() {
+                        eprintln!("[init-eq] {} failed: {}", var, e);
+                    }
+                    next_pending.push((var, expr));
+                }
             }
         }
 
