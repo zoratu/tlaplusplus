@@ -445,6 +445,25 @@ fn load_extended_modules(
                         is_recursive: false,
                     });
             }
+            // Even for built-in modules, check if a local .tla file exists
+            // and load its definitions as fallback. This handles specs like
+            // EWD998ChanID that ship their own Functions.tla with operators
+            // like AntiFunction/Inverse that aren't in our built-in set.
+            if let Some(extended_module) =
+                parse_embedded_module_from_file_with_visited(base_path, &extended_name, visited)?
+            {
+                for (name, def) in extended_module.definitions {
+                    module.definitions.entry(name).or_insert(def);
+                }
+                for constant in extended_module.constants {
+                    if !module.constants.contains(&constant) {
+                        module.constants.push(constant);
+                    }
+                }
+                for rec_decl in extended_module.recursive_declarations {
+                    module.recursive_declarations.insert(rec_decl);
+                }
+            }
             continue;
         }
 
