@@ -1670,7 +1670,110 @@ fn evaluate_init_states(
         }
     }
 
-    // Filter states by guards
+    // Before filtering by guards, try to resolve guards that are actually
+    // late-binding equality assignments (e.g., `state = [self \in Node |-> ...]`
+    // where the RHS depends on membership variables now bound in each state).
+    // Also handle \E quantifier guards and membership guards.
+    let mut pure_guards = Vec::new();
+    let mut late_equalities: Vec<(String, String)> = Vec::new();
+    let mut late_memberships: Vec<(String, String)> = Vec::new();
+    let mut existential_guards: Vec<String> = Vec::new();
+    for guard in &guards {
+        let g = guard.trim();
+        if g.is_empty() {
+            continue;
+        }
+        if g.starts_with("\\E ") || g.starts_with("\\exists ") {
+            existential_guards.push(g.to_string());
+            continue;
+        }
+        match classify_clause(g) {
+            ClauseKind::UnprimedEquality { ref var, .. } if module.variables.contains(var) => {
+                if let ClauseKind::UnprimedEquality { var, expr } = classify_clause(g) {
+                    late_equalities.push((var, expr));
+                }
+            }
+            ClauseKind::UnprimedMembership { ref var, .. } if module.variables.contains(var) => {
+                if let ClauseKind::UnprimedMembership { var, set_expr } = classify_clause(g) {
+                    late_memberships.push((var, set_expr));
+                }
+            }
+            _ => pure_guards.push(g.to_string()),
+        }
+    }
+
+    // Apply late equality assignments to each state
+    if !late_equalities.is_empty() {
+        for state in &mut states {
+            for (var, expr) in &late_equalities {
+                if !state.contains_key(var.as_str()) {
+                    let ctx = EvalContext::with_definitions_and_instances(
+                        state,
+                        &definition_scope,
+                        &module.instances,
+                    );
+                    if let Ok(value) = eval_expr(expr, &ctx) {
+                        state.insert(Arc::from(var.as_str()), value);
+                    }
+                }
+            }
+        }
+    }
+
+    // Apply late membership assignments (expand states)
+    for (var, set_expr) in &late_memberships {
+        let mut new_states = Vec::new();
+        for state in &states {
+            let ctx = EvalContext::with_definitions_and_instances(
+                state,
+                &definition_scope,
+                &module.instances,
+            );
+            if let Ok(set_val) = eval_expr(set_expr, &ctx) {
+                if let Ok(set) = set_val.as_set() {
+                    for value in set.iter() {
+                        let mut new_state = state.clone();
+                        new_state.insert(Arc::from(var.as_str()), value.clone());
+                        new_states.push(new_state);
+                    }
+                }
+            }
+        }
+        if !new_states.is_empty() {
+            states = new_states;
+        }
+    }
+
+    // Handle \E quantifier guards — expand states for each satisfying assignment
+    for guard in &existential_guards {
+        let mut new_states = Vec::new();
+        for state in &states {
+            let ctx = EvalContext::with_definitions_and_instances(
+                state,
+                &definition_scope,
+                &module.instances,
+            );
+            let staged = BTreeMap::<String, TlaValue>::new();
+            if let Ok(result) = eval_action_body_multi(guard, &ctx, &staged) {
+                for (bindings, _) in result {
+                    let mut new_state = state.clone();
+                    for (k, v) in bindings {
+                        if module.variables.contains(&k) {
+                            new_state.insert(Arc::from(k.as_str()), v);
+                        }
+                    }
+                    new_states.push(new_state);
+                }
+            }
+            if new_states.is_empty() {
+                // Keep the original state if \E didn't produce bindings
+                new_states.push(state.clone());
+            }
+        }
+        states = new_states;
+    }
+
+    // Filter states by pure guards
     let mut valid_states = Vec::new();
     for state in states {
         let ctx = EvalContext::with_definitions_and_instances(
@@ -1680,10 +1783,7 @@ fn evaluate_init_states(
         );
 
         let mut all_guards_pass = true;
-        for guard in &guards {
-            if guard.trim().is_empty() {
-                continue;
-            }
+        for guard in &pure_guards {
             match eval_expr(guard, &ctx) {
                 Ok(val) => {
                     if !val.as_bool().unwrap_or(false) {
