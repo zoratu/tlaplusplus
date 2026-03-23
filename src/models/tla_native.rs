@@ -2213,7 +2213,49 @@ fn evaluate_init_states(
         }
 
         if all_guards_pass {
-            // Verify all variables are assigned
+            // Try to fill missing variables from other Init definitions
+            // This handles Init <- MCInit where MCInit doesn't assign all vars
+            let mut state = state;
+            let missing_vars: Vec<String> = module
+                .variables
+                .iter()
+                .filter(|v| !state.contains_key(v.as_str()))
+                .cloned()
+                .collect();
+            if !missing_vars.is_empty() {
+                // Search all definitions for assignments to missing variables
+                for var in &missing_vars {
+                    // Look for `var = expr` or `var \in set` in any definition body
+                    for def in definition_scope.values() {
+                        if def.params.is_empty() {
+                            let clauses = expand_state_predicate_clauses(
+                                &def.body,
+                                &module.definitions,
+                                &module.instances,
+                            );
+                            for clause in &clauses {
+                                match classify_clause(clause) {
+                                    ClauseKind::UnprimedEquality {
+                                        var: ref v,
+                                        ref expr,
+                                    } if v == var => {
+                                        let ctx = EvalContext::with_definitions_and_instances(
+                                            &state,
+                                            &definition_scope,
+                                            &module.instances,
+                                        );
+                                        if let Ok(val) = eval_expr(expr, &ctx) {
+                                            state.insert(Arc::from(var.as_str()), val);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             let all_assigned = module
                 .variables
                 .iter()
