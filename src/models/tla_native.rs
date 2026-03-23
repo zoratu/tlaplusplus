@@ -1057,6 +1057,26 @@ fn resolve_zero_arg_state_definition<'a>(
     }
 }
 
+/// Find the position of a top-level `:` (not inside brackets/parens/braces).
+fn find_top_level_colon(expr: &str) -> Option<usize> {
+    let mut paren = 0usize;
+    let mut bracket = 0usize;
+    let mut brace = 0usize;
+    for (i, c) in expr.char_indices() {
+        match c {
+            '(' => paren += 1,
+            ')' => paren = paren.saturating_sub(1),
+            '[' => bracket += 1,
+            ']' => bracket = bracket.saturating_sub(1),
+            '{' => brace += 1,
+            '}' => brace = brace.saturating_sub(1),
+            ':' if paren == 0 && bracket == 0 && brace == 0 => return Some(i),
+            _ => {}
+        }
+    }
+    None
+}
+
 fn expand_state_predicate_clauses(
     body: &str,
     definitions: &BTreeMap<String, TlaDefinition>,
@@ -1209,6 +1229,94 @@ fn evaluate_init_states(
         if module.definitions.contains_key(&ref_name) && ref_name != init_name {
             // Recursively evaluate the referenced init
             return evaluate_init_states(module, cfg, &ref_name);
+        }
+    }
+
+    // If the entire Init body is wrapped in \E quantifier(s), we need to
+    // handle it specially. Pattern: `\E x \in S : body` where body contains
+    // the actual variable assignments. We synthesize states by evaluating
+    // each binding of x and then processing the body as Init.
+    if trimmed_body.starts_with("\\E ") || trimmed_body.starts_with("\\exists ") {
+        // Find the colon that separates binder from body
+        if let Some(colon_pos) = find_top_level_colon(trimmed_body) {
+            let binder_part = trimmed_body[..colon_pos].trim();
+            let body_part = trimmed_body[colon_pos + 1..].trim();
+
+            // Parse the binder: \E x \in S
+            let binder_text = binder_part
+                .strip_prefix("\\E ")
+                .or_else(|| binder_part.strip_prefix("\\exists "))
+                .unwrap_or(binder_part);
+
+            // Find \in to split variable name and domain
+            if let Some(in_pos) = binder_text.find("\\in") {
+                let var_name = binder_text[..in_pos].trim();
+                let domain_expr = binder_text[in_pos + 3..].trim();
+
+                // Create a synthetic Init definition with the body
+                let synth_name = format!("__SyntheticInitBody_{init_name}__");
+                let mut module_clone = module.clone();
+                module_clone.definitions.insert(
+                    synth_name.clone(),
+                    TlaDefinition {
+                        name: synth_name.clone(),
+                        params: vec![],
+                        body: body_part.to_string(),
+                        is_recursive: false,
+                    },
+                );
+
+                // Evaluate domain
+                let temp_state = BTreeMap::new();
+                let ctx = EvalContext::with_definitions_and_instances(
+                    &temp_state,
+                    &definition_scope,
+                    &module.instances,
+                );
+
+                // Inject constants into temp state for domain eval
+                let mut eval_state = BTreeMap::new();
+                for (k, v) in &cfg.constants {
+                    if let Some(tv) = config_value_to_tla(v) {
+                        eval_state.insert(Arc::from(k.as_str()), tv);
+                    }
+                }
+                let ctx = EvalContext::with_definitions_and_instances(
+                    &eval_state,
+                    &definition_scope,
+                    &module.instances,
+                );
+
+                if let Ok(domain_val) = eval_expr(domain_expr, &ctx) {
+                    if let Ok(domain_set) = domain_val.as_set() {
+                        let mut all_states = Vec::new();
+                        for binding_val in domain_set.iter() {
+                            // Inject the binding as a constant
+                            let mut cfg_clone = cfg.clone();
+                            // Use a sentinel value that will be converted to TlaValue
+                            cfg_clone.constants.insert(
+                                var_name.to_string(),
+                                match binding_val {
+                                    TlaValue::Int(n) => ConfigValue::Int(*n),
+                                    TlaValue::Bool(b) => ConfigValue::Bool(*b),
+                                    TlaValue::String(s) => ConfigValue::String(s.clone()),
+                                    TlaValue::ModelValue(s) => ConfigValue::ModelValue(s.clone()),
+                                    _ => ConfigValue::ModelValue(format!("{:?}", binding_val)),
+                                },
+                            );
+                            // Try evaluating Init with this binding
+                            if let Ok(states) =
+                                evaluate_init_states(&module_clone, &cfg_clone, &synth_name)
+                            {
+                                all_states.extend(states);
+                            }
+                        }
+                        if !all_states.is_empty() {
+                            return Ok(all_states);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1698,7 +1806,43 @@ fn evaluate_init_states(
                     late_memberships.push((var, set_expr));
                 }
             }
-            _ => pure_guards.push(g.to_string()),
+            _ => {
+                // Check if this is a parameterized operator call like XInit(x)
+                // where x is a module variable — expand inline and re-classify
+                let mut handled_as_op = false;
+                if let Some(paren_pos) = g.find('(') {
+                    let op_name = g[..paren_pos].trim();
+                    if let Some(close) = g.rfind(')') {
+                        let arg = g[paren_pos + 1..close].trim();
+                        if module.variables.contains(&arg.to_string()) {
+                            if let Some(def) = definition_scope.get(op_name) {
+                                if def.params.len() == 1 {
+                                    // Substitute: replace param with arg in body
+                                    let expanded = def.body.replace(&def.params[0], arg);
+                                    match classify_clause(&expanded) {
+                                        ClauseKind::UnprimedEquality { var, expr }
+                                            if module.variables.contains(&var) =>
+                                        {
+                                            late_equalities.push((var, expr));
+                                            handled_as_op = true;
+                                        }
+                                        ClauseKind::UnprimedMembership { var, set_expr }
+                                            if module.variables.contains(&var) =>
+                                        {
+                                            late_memberships.push((var, set_expr));
+                                            handled_as_op = true;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if !handled_as_op {
+                    pure_guards.push(g.to_string());
+                }
+            }
         }
     }
 
