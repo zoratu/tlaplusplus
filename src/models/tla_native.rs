@@ -41,6 +41,9 @@ pub struct TlaModel {
     /// Whether to allow deadlocked states (no successors) without error.
     /// Equivalent to TLC's -deadlock flag.
     pub allow_deadlock: bool,
+    /// True if Next is trivially UNCHANGED vars (no transitions).
+    /// When set, next_states() returns empty immediately.
+    trivial_next: bool,
 }
 
 impl TlaModel {
@@ -143,6 +146,21 @@ impl TlaModel {
         // CHECK_DEADLOCK FALSE in cfg means allow deadlocked states
         let allow_deadlock = config.check_deadlock == Some(false);
 
+        // Detect trivial Next (UNCHANGED vars) — no transitions to explore.
+        // This optimizes specs like Einstein where Init generates millions of
+        // states but Next does nothing.
+        let trivial_next = module
+            .definitions
+            .get(&next_name)
+            .map(|def| {
+                let body = def.body.trim();
+                body.starts_with("UNCHANGED") || body == "FALSE" || body == "TRUE /\\ FALSE"
+            })
+            .unwrap_or(false);
+        if trivial_next {
+            eprintln!("Note: Next is UNCHANGED — skipping state exploration");
+        }
+
         Ok(Self {
             module,
             config,
@@ -160,6 +178,7 @@ impl TlaModel {
             compiled_invariants,
             compiled_state_constraints,
             allow_deadlock,
+            trivial_next,
         })
     }
 }
@@ -176,6 +195,12 @@ impl Model for TlaModel {
     }
 
     fn next_states(&self, state: &Self::State, out: &mut Vec<Self::State>) {
+        // Optimization: if Next is trivially UNCHANGED vars, skip evaluation.
+        // Every initial state is a fixed point — no transitions to explore.
+        if self.trivial_next {
+            return;
+        }
+
         let next_def = self
             .module
             .definitions
