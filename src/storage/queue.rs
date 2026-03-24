@@ -62,7 +62,7 @@ impl Default for DiskQueueConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct QueueStats {
     pub pushed: u64,
     pub popped: u64,
