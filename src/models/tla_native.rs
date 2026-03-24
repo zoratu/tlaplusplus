@@ -862,15 +862,16 @@ fn resolve_init_next_names(
                 && cfg.specification.is_none()
                 && init == "Init"
             {
-                return Err(anyhow!(
-                    "evaluation-only module (no Init/Next/SPECIFICATION defined)"
-                ));
+                // For eval-only modules, return empty init/next names.
+                // The model will have 0 initial states and complete immediately.
+                eprintln!("Note: evaluation-only module (no Init/Next/SPECIFICATION)");
+                return Ok(("__EVAL_ONLY__".to_string(), "__EVAL_ONLY__".to_string()));
             }
             return Err(anyhow!("Init definition '{init}' not found in module"));
         }
     }
 
-    if !module.definitions.contains_key(&next) {
+    if next != "__EVAL_ONLY__" && !module.definitions.contains_key(&next) {
         let pluscal_next = format!("{}_", next);
         if module.definitions.contains_key(&pluscal_next) {
             if module.is_pluscal {
@@ -1271,6 +1272,11 @@ fn evaluate_init_states(
     cfg: &TlaConfig,
     init_name: &str,
 ) -> Result<Vec<TlaState>> {
+    // Eval-only modules have no Init — return empty state list
+    if init_name == "__EVAL_ONLY__" {
+        return Ok(Vec::new());
+    }
+
     let mut definition_scope = merged_definition_scope(module);
     let init_def = module
         .definitions
