@@ -3583,6 +3583,171 @@ pub(crate) fn eval_operator_call(
             };
             return Ok(TlaValue::String(s));
         }
+        // === Community module: Bitwise ===
+        "IsABitVector" if args.len() == 2 && !user_defined_shadow => {
+            let val = args[0].as_int()?;
+            let n = args[1].as_int()?;
+            return Ok(TlaValue::Bool(val >= 0 && val < (1 << n)));
+        }
+        "IsANatural" if args.len() == 1 && !user_defined_shadow => {
+            return Ok(TlaValue::Bool(
+                matches!(&args[0], TlaValue::Int(n) if *n >= 0),
+            ));
+        }
+        // Bitwise AND, OR, XOR on integers
+        "BitsAnd" if args.len() == 2 && !user_defined_shadow => {
+            let a = args[0].as_int()?;
+            let b = args[1].as_int()?;
+            return Ok(TlaValue::Int(a & b));
+        }
+        "BitsOr" if args.len() == 2 && !user_defined_shadow => {
+            let a = args[0].as_int()?;
+            let b = args[1].as_int()?;
+            return Ok(TlaValue::Int(a | b));
+        }
+        "BitsXor" if args.len() == 2 && !user_defined_shadow => {
+            let a = args[0].as_int()?;
+            let b = args[1].as_int()?;
+            return Ok(TlaValue::Int(a ^ b));
+        }
+        "BitNot" if args.len() == 1 && !user_defined_shadow => {
+            let a = args[0].as_int()?;
+            return Ok(TlaValue::Int(!a));
+        }
+        "LeftShift" if args.len() == 2 && !user_defined_shadow => {
+            let a = args[0].as_int()?;
+            let n = args[1].as_int()?;
+            return Ok(TlaValue::Int(a << n));
+        }
+        "RightShift" if args.len() == 2 && !user_defined_shadow => {
+            let a = args[0].as_int()?;
+            let n = args[1].as_int()?;
+            return Ok(TlaValue::Int(a >> n));
+        }
+        // === Community module: Combinatorics ===
+        "Factorial" if args.len() == 1 && !user_defined_shadow => {
+            let n = args[0].as_int()?;
+            if n < 0 {
+                return Err(anyhow!("Factorial: argument must be non-negative"));
+            }
+            let mut result: i64 = 1;
+            for i in 2..=n {
+                result = result.saturating_mul(i);
+            }
+            return Ok(TlaValue::Int(result));
+        }
+        "nCk" if args.len() == 2 && !user_defined_shadow => {
+            let n = args[0].as_int()?;
+            let k = args[1].as_int()?;
+            if k < 0 || k > n {
+                return Ok(TlaValue::Int(0));
+            }
+            let k = k.min(n - k); // optimize
+            let mut result: i64 = 1;
+            for i in 0..k {
+                result = result * (n - i) / (i + 1);
+            }
+            return Ok(TlaValue::Int(result));
+        }
+        "nPk" if args.len() == 2 && !user_defined_shadow => {
+            let n = args[0].as_int()?;
+            let k = args[1].as_int()?;
+            if k < 0 || k > n {
+                return Ok(TlaValue::Int(0));
+            }
+            let mut result: i64 = 1;
+            for i in 0..k {
+                result = result.saturating_mul(n - i);
+            }
+            return Ok(TlaValue::Int(result));
+        }
+        // === Community module: CSV ===
+        "CSVRead" if args.len() == 1 && !user_defined_shadow => {
+            let path = match &args[0] {
+                TlaValue::String(s) => s.clone(),
+                TlaValue::ModelValue(s) => s.clone(),
+                other => return Err(anyhow!("CSVRead: expected string path, got {:?}", other)),
+            };
+            let content =
+                std::fs::read_to_string(&path).map_err(|e| anyhow!("CSVRead: {}: {}", path, e))?;
+            let mut rows = Vec::new();
+            for line in content.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let fields: Vec<TlaValue> = line
+                    .split(',')
+                    .map(|f| TlaValue::String(f.trim().to_string()))
+                    .collect();
+                rows.push(TlaValue::Seq(Arc::new(fields)));
+            }
+            return Ok(TlaValue::Seq(Arc::new(rows)));
+        }
+        "CSVWrite" if args.len() == 2 && !user_defined_shadow => {
+            let path = match &args[0] {
+                TlaValue::String(s) => s.clone(),
+                TlaValue::ModelValue(s) => s.clone(),
+                other => return Err(anyhow!("CSVWrite: expected string path, got {:?}", other)),
+            };
+            let data = tla_value_to_json(&args[1]);
+            let json_str = serde_json::to_string(&data).map_err(|e| anyhow!("CSVWrite: {}", e))?;
+            std::fs::write(&path, json_str).map_err(|e| anyhow!("CSVWrite: {}: {}", path, e))?;
+            return Ok(TlaValue::Bool(true));
+        }
+        // === Community module: VectorClocks ===
+        "VCLessOrEqual" if args.len() == 2 && !user_defined_shadow => {
+            // vc1 <= vc2 iff forall keys, vc1[k] <= vc2[k]
+            if let (TlaValue::Function(a), TlaValue::Function(b)) = (&args[0], &args[1]) {
+                for (k, va) in a.iter() {
+                    let ia = va.as_int().unwrap_or(0);
+                    let ib = b.get(k).and_then(|v| v.as_int().ok()).unwrap_or(0);
+                    if ia > ib {
+                        return Ok(TlaValue::Bool(false));
+                    }
+                }
+                return Ok(TlaValue::Bool(true));
+            }
+            return Err(anyhow!(
+                "VCLessOrEqual: arguments must be vector clocks (functions)"
+            ));
+        }
+        "VCLess" if args.len() == 2 && !user_defined_shadow => {
+            // vc1 < vc2 iff vc1 <= vc2 and vc1 != vc2
+            if let (TlaValue::Function(a), TlaValue::Function(b)) = (&args[0], &args[1]) {
+                let mut all_leq = true;
+                let mut any_less = false;
+                for (k, va) in a.iter() {
+                    let ia = va.as_int().unwrap_or(0);
+                    let ib = b.get(k).and_then(|v| v.as_int().ok()).unwrap_or(0);
+                    if ia > ib {
+                        all_leq = false;
+                        break;
+                    }
+                    if ia < ib {
+                        any_less = true;
+                    }
+                }
+                return Ok(TlaValue::Bool(all_leq && any_less));
+            }
+            return Err(anyhow!(
+                "VCLess: arguments must be vector clocks (functions)"
+            ));
+        }
+        "VCMerge" if args.len() == 2 && !user_defined_shadow => {
+            // max of each component
+            if let (TlaValue::Function(a), TlaValue::Function(b)) = (&args[0], &args[1]) {
+                let mut result = a.as_ref().clone();
+                for (k, vb) in b.iter() {
+                    let ib = vb.as_int().unwrap_or(0);
+                    let ia = result.get(k).and_then(|v| v.as_int().ok()).unwrap_or(0);
+                    result.insert(k.clone(), TlaValue::Int(ia.max(ib)));
+                }
+                return Ok(TlaValue::Function(Arc::new(result)));
+            }
+            return Err(anyhow!(
+                "VCMerge: arguments must be vector clocks (functions)"
+            ));
+        }
         // === Community module: UndirectedGraphs ===
         "IsUndirectedGraph" if args.len() == 1 && !user_defined_shadow => {
             let g = &args[0];
