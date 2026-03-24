@@ -182,7 +182,7 @@ pub struct RunOutcome<S> {
     pub violations: Vec<Violation<S>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RunStats {
     pub duration: Duration,
     pub states_generated: u64,
@@ -1526,6 +1526,19 @@ where
             "Finished computing initial states: {} distinct {} generated at {}.",
             distinct_initial, plural, timestamp
         );
+
+        // Early exit for 0 initial states (evaluation-only modules)
+        if distinct_initial == 0 {
+            eprintln!("0 states generated, 0 distinct states found, 0 states left on queue.");
+            eprintln!("Finished in 00s at ({})", timestamp);
+            eprintln!("violation=false\n");
+            eprintln!("Model checking completed successfully!");
+            return Ok(RunOutcome {
+                stats: RunStats::default(),
+                violation: None,
+                violations: vec![],
+            });
+        }
     }
 
     let checkpoint_thread_stop = Arc::new(AtomicBool::new(false));
