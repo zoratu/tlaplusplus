@@ -1132,7 +1132,11 @@ fn append_expanded_state_predicate_clause(
         let index_part = trimmed[bang_pos + 1..].trim();
         if let Ok(index) = index_part.parse::<usize>() {
             if let Some(def) = definitions.get(name_part) {
-                let conjuncts = split_top_level(&def.body, "/\\");
+                // Filter out empty conjuncts (from comment-stripped lines)
+                let conjuncts: Vec<String> = split_top_level(&def.body, "/\\")
+                    .into_iter()
+                    .filter(|c| !c.trim().is_empty())
+                    .collect();
                 if index >= 1 && index <= conjuncts.len() {
                     let conjunct = conjuncts[index - 1].trim();
                     append_expanded_state_predicate_clause(

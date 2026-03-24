@@ -1275,24 +1275,7 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
 
     let mut expr = raw_expr.trim();
     if expr.is_empty() {
-        // Get caller information to debug where empty expressions come from
-        eprintln!("\n=== EMPTY EXPRESSION AT DEPTH {} ===", depth);
-        eprintln!("raw_expr: {:?}", raw_expr);
-        eprintln!("locals: {:?}", ctx.locals.keys().collect::<Vec<_>>());
-
-        // Print a simplified backtrace
-        let bt = std::backtrace::Backtrace::force_capture();
-        let bt_str = format!("{:?}", bt);
-        eprintln!("\nBacktrace (showing tlaplusplus frames):");
-        for line in bt_str
-            .lines()
-            .filter(|l| l.contains("tlaplusplus::tla") && !l.contains("rust_begin_unwind"))
-            .take(15)
-        {
-            eprintln!("  {}", line.trim());
-        }
-
-        return Err(anyhow!("empty expression (raw: {raw_expr:?})"));
+        return Err(anyhow!("empty expression"));
     }
 
     expr = strip_outer_parens(expr);
