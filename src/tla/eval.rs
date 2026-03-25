@@ -2241,6 +2241,98 @@ fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
         let rhs = inner[colon_idx + 1..].trim();
 
         if contains_top_level_keyword(lhs, "\\in") {
+            // Optimization: for {x \in RecordSet : pred} where RecordSet is
+            // [field1: S1, field2: S2, ...], generate records inline with
+            // predicate filtering instead of materializing the full set.
+            let in_idx = find_top_level_keyword_index(lhs, "\\in").unwrap();
+            let var_name = lhs[..in_idx].trim();
+            let domain_expr = lhs[in_idx + "\\in".len()..].trim();
+
+            // Check if domain is a bracket expression (potential record set)
+            if domain_expr.starts_with('[') && domain_expr.ends_with(']') {
+                let bracket_inner = &domain_expr[1..domain_expr.len() - 1];
+                // Try record set pattern: field1: Set1, field2: Set2
+                if let Some(colon) = find_top_level_char(bracket_inner, ':') {
+                    let field_name = bracket_inner[..colon].trim();
+                    if is_valid_identifier(field_name)
+                        && !bracket_inner.contains("|->")
+                        && !bracket_inner.contains("->")
+                    {
+                        // This is a record set — generate records inline with filtering
+                        let entries = split_top_level_symbol(bracket_inner, ",");
+                        let mut field_specs: Vec<(String, Vec<TlaValue>)> = Vec::new();
+                        let mut is_record_set = true;
+                        for entry in &entries {
+                            let entry = entry.trim();
+                            if let Some(ci) = find_top_level_char(entry, ':') {
+                                let fname = entry[..ci].trim();
+                                let sexpr = entry[ci + 1..].trim();
+                                if is_valid_identifier(fname) {
+                                    if let Ok(sv) = eval_expr_inner(sexpr, ctx, depth + 1) {
+                                        if let Ok(s) = sv.as_set() {
+                                            field_specs.push((
+                                                fname.to_string(),
+                                                s.iter().cloned().collect(),
+                                            ));
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                            is_record_set = false;
+                            break;
+                        }
+
+                        if is_record_set && !field_specs.is_empty() {
+                            // Generate records inline with predicate
+                            let mut out = BTreeSet::new();
+                            let mut indices = vec![0usize; field_specs.len()];
+                            let total: u64 =
+                                field_specs.iter().map(|(_, v)| v.len() as u64).product();
+                            ctx.check_budget(total.min(100_000_000) as usize)?;
+
+                            loop {
+                                // Build record
+                                let mut rec = BTreeMap::new();
+                                for (i, (fname, vals)) in field_specs.iter().enumerate() {
+                                    rec.insert(fname.clone(), vals[indices[i]].clone());
+                                }
+                                let record = TlaValue::Record(Arc::new(rec));
+
+                                // Check predicate
+                                let mut child = ctx.clone();
+                                {
+                                    let locals = std::rc::Rc::make_mut(&mut child.locals);
+                                    locals.insert(var_name.to_string(), record.clone());
+                                }
+                                if let Ok(TlaValue::Bool(true)) =
+                                    eval_expr_inner(rhs, &child, depth + 1)
+                                {
+                                    out.insert(record);
+                                }
+
+                                // Advance indices
+                                let mut carry = true;
+                                for i in (0..indices.len()).rev() {
+                                    if carry {
+                                        indices[i] += 1;
+                                        if indices[i] < field_specs[i].1.len() {
+                                            carry = false;
+                                        } else {
+                                            indices[i] = 0;
+                                        }
+                                    }
+                                }
+                                if carry {
+                                    break;
+                                }
+                            }
+                            return Ok(TlaValue::Set(Arc::new(out)));
+                        }
+                    }
+                }
+            }
+
             let binders = parse_binders(lhs, ctx, depth + 1)?;
             let mut assignments = BTreeMap::new();
             let mut out = BTreeSet::new();
