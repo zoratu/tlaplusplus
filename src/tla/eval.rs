@@ -2284,7 +2284,6 @@ fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
                         }
 
                         if is_record_set && !field_specs.is_empty() {
-                            // Compile predicate ONCE for fast evaluation.
                             let compiled_pred = crate::tla::compile_expr(rhs);
                             let mut out = BTreeSet::new();
                             let mut indices = vec![0usize; field_specs.len()];
@@ -2292,30 +2291,37 @@ fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
                                 field_specs.iter().map(|(_, v)| v.len() as u64).product();
                             ctx.check_budget(total.min(500_000_000) as usize)?;
 
-                            // Pre-build field names as a vec for fast record construction
-                            let field_names: Vec<String> =
-                                field_specs.iter().map(|(n, _)| n.clone()).collect();
+                            // Reusable record BTreeMap — mutate in place
+                            let mut rec = BTreeMap::new();
+                            for (fname, vals) in &field_specs {
+                                rec.insert(fname.clone(), vals[0].clone());
+                            }
 
-                            // Reusable state map for the binder variable — we'll
-                            // inject a record into it each iteration. Using a
-                            // persistent BTreeMap that we mutate in-place avoids
-                            // allocation per iteration.
+                            // Build locals ONCE with the record. Each iteration
+                            // we create a fresh Rc (no clone of the map itself —
+                            // just rebuild the single entry).
                             let base_locals = (*ctx.locals).clone();
+                            let var_key = var_name.to_string();
 
                             loop {
-                                // Build record — only allocate the BTreeMap
-                                let mut rec = BTreeMap::new();
-                                for (i, fname) in field_names.iter().enumerate() {
-                                    rec.insert(fname.clone(), field_specs[i].1[indices[i]].clone());
+                                // Update record fields in-place
+                                for (i, (fname, vals)) in field_specs.iter().enumerate() {
+                                    *rec.get_mut(fname).unwrap() = vals[indices[i]].clone();
                                 }
-                                let record = TlaValue::Record(Arc::new(rec));
 
-                                // Check predicate with compiled evaluator
-                                let mut locals = base_locals.clone();
-                                locals.insert(var_name.to_string(), record.clone());
+                                // Build a minimal locals: base + one record entry
+                                // This avoids cloning base_locals — we just wrap it
+                                let record_arc = Arc::new(rec.clone());
+                                let mut iter_locals = base_locals.clone();
+                                iter_locals.insert(
+                                    var_key.clone(),
+                                    TlaValue::Record(Arc::clone(&record_arc)),
+                                );
+
+                                // Evaluate compiled predicate with this context
                                 let child = EvalContext {
                                     state: ctx.state,
-                                    locals: Rc::new(locals),
+                                    locals: Rc::new(iter_locals),
                                     local_definitions: Rc::clone(&ctx.local_definitions),
                                     definitions: ctx.definitions,
                                     instances: ctx.instances,
@@ -2325,10 +2331,10 @@ fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
                                     crate::tla::eval_compiled(&compiled_pred, &child),
                                     Ok(TlaValue::Bool(true))
                                 ) {
-                                    out.insert(record);
+                                    out.insert(TlaValue::Record(record_arc));
                                 }
 
-                                // Advance indices (odometer)
+                                // Advance indices
                                 let mut carry = true;
                                 for i in (0..indices.len()).rev() {
                                     if carry {
