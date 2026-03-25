@@ -2284,8 +2284,6 @@ fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
                         }
 
                         if is_record_set && !field_specs.is_empty() {
-                            let mut out = BTreeSet::new();
-
                             // Constraint propagation: for 2-field integer record sets
                             // with a sum-range predicate like c.f1 + c.f2 \in lo..hi,
                             // compute valid ranges directly instead of iterating all pairs.
@@ -2294,8 +2292,6 @@ fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
                                     .iter()
                                     .all(|(_, v)| v.iter().all(|x| matches!(x, TlaValue::Int(_))));
                                 if all_ints {
-                                    // Try to extract sum-range constraint from predicate
-                                    // Pattern: var.f1 + var.f2 \in lo..hi
                                     if let Some((sum_lo, sum_hi)) = extract_sum_range_constraint(
                                         rhs,
                                         var_name,
@@ -2313,32 +2309,49 @@ fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
                                             .and_then(|v| v.as_int().ok())
                                             .unwrap_or(0);
 
+                                        // Collect valid (f0, f1) integer pairs first,
+                                        // then bulk-construct records. Using integer
+                                        // pairs avoids expensive Record creation +
+                                        // BTreeSet comparison during enumeration.
+                                        let mut pairs: Vec<(i64, i64)> = Vec::new();
                                         for v0 in f0_vals {
                                             let a = v0.as_int().unwrap();
-                                            // Compute valid range for field 1
                                             let valid_lo = (sum_lo - a).max(f1_lo);
                                             let valid_hi = (sum_hi - a).min(f1_hi);
                                             if valid_lo > valid_hi {
                                                 continue;
                                             }
-                                            for v1 in f1_vals {
-                                                let b = v1.as_int().unwrap();
-                                                if b < valid_lo {
-                                                    continue;
-                                                }
-                                                if b > valid_hi {
-                                                    break; // f1_vals is sorted (from 0..N range)
-                                                }
-                                                let mut rec = BTreeMap::new();
-                                                rec.insert(f0_name.clone(), v0.clone());
-                                                rec.insert(f1_name.clone(), v1.clone());
-                                                out.insert(TlaValue::Record(Arc::new(rec)));
+                                            // Direct integer range instead of scanning f1_vals
+                                            for b in valid_lo..=valid_hi {
+                                                pairs.push((a, b));
                                             }
                                         }
+
+                                        eprintln!(
+                                            "Constraint propagation: {} valid records \
+                                             (from {}x{} = {} total)",
+                                            pairs.len(),
+                                            f0_vals.len(),
+                                            f1_vals.len(),
+                                            f0_vals.len() as u64 * f1_vals.len() as u64
+                                        );
+
+                                        // Bulk-construct BTreeSet from sorted pairs
+                                        let out: BTreeSet<TlaValue> = pairs
+                                            .into_iter()
+                                            .map(|(a, b)| {
+                                                let mut rec = BTreeMap::new();
+                                                rec.insert(f0_name.clone(), TlaValue::Int(a));
+                                                rec.insert(f1_name.clone(), TlaValue::Int(b));
+                                                TlaValue::Record(Arc::new(rec))
+                                            })
+                                            .collect();
                                         return Ok(TlaValue::Set(Arc::new(out)));
                                     }
                                 }
                             }
+
+                            let mut out = BTreeSet::new();
 
                             // Fallback: brute-force with compiled predicate
                             let compiled_pred = crate::tla::compile_expr(rhs);
