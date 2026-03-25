@@ -341,8 +341,9 @@ Periodic checkpoints (`--checkpoint-interval-secs`) persist state for crash reco
 - Parallel runtime with NUMA-aware work-stealing (10.7x faster than TLC)
 - Lock-free fingerprint storage with atomic CAS and dynamic resize
 - Native TLA+ frontend with full language coverage
-- 182/182 tlaplus/Examples corpus specs pass analysis (100%)
-- 577 tests, 19 property tests, 23 chaos tests, 8 fuzz targets
+- 163/182 tlaplus/Examples corpus specs pass model checking (90%), 0 errors
+- 161/182 analysis probes pass (88%), 0 failures
+- 600 tests, 620 failpoint tests, 19 property tests, 23 chaos tests, 8 fuzz targets
 - Safety invariant checking, liveness/fairness checking, deadlock detection
 - ENABLED operator (including parameterized actions)
 - Symmetry reduction (wired into runtime fingerprinting)
@@ -352,8 +353,11 @@ Periodic checkpoints (`--checkpoint-interval-secs`) persist state for crash reco
 - Continue after violation (`--continue --max-violations N`)
 - State graph dump (`--dump FILE`)
 - ASSUME evaluation at startup
-- 11 community modules (DyadicRationals, SequencesExt, Functions, Folds, FiniteSetsExt, UndirectedGraphs, Graphs, Relation, plus proof modules)
+- 17 community modules (DyadicRationals, SequencesExt, Functions, Folds, FiniteSetsExt, UndirectedGraphs, Graphs, Relation, Bags, BagsExt, IOUtils, Bitwise, Combinatorics, CSV, VectorClocks, Randomization, plus proof modules)
 - S3 checkpoint/resume for spot instance resilience
+- FLURM integration with `--fetch-module`/`--fetch-config` for distributed runs
+- Constraint propagation for filtered record set Init enumeration
+- Lazy Init enumeration for large cross-products (>10M states)
 - Evaluation budget to prevent exponential blowup in analysis
 
 ## Key Implementation Notes
