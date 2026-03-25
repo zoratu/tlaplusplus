@@ -2284,34 +2284,51 @@ fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
                         }
 
                         if is_record_set && !field_specs.is_empty() {
-                            // Generate records inline with predicate
+                            // Compile predicate ONCE for fast evaluation.
+                            let compiled_pred = crate::tla::compile_expr(rhs);
                             let mut out = BTreeSet::new();
                             let mut indices = vec![0usize; field_specs.len()];
                             let total: u64 =
                                 field_specs.iter().map(|(_, v)| v.len() as u64).product();
-                            ctx.check_budget(total.min(100_000_000) as usize)?;
+                            ctx.check_budget(total.min(500_000_000) as usize)?;
+
+                            // Pre-build field names as a vec for fast record construction
+                            let field_names: Vec<String> =
+                                field_specs.iter().map(|(n, _)| n.clone()).collect();
+
+                            // Reusable state map for the binder variable — we'll
+                            // inject a record into it each iteration. Using a
+                            // persistent BTreeMap that we mutate in-place avoids
+                            // allocation per iteration.
+                            let base_locals = (*ctx.locals).clone();
 
                             loop {
-                                // Build record
+                                // Build record — only allocate the BTreeMap
                                 let mut rec = BTreeMap::new();
-                                for (i, (fname, vals)) in field_specs.iter().enumerate() {
-                                    rec.insert(fname.clone(), vals[indices[i]].clone());
+                                for (i, fname) in field_names.iter().enumerate() {
+                                    rec.insert(fname.clone(), field_specs[i].1[indices[i]].clone());
                                 }
                                 let record = TlaValue::Record(Arc::new(rec));
 
-                                // Check predicate
-                                let mut child = ctx.clone();
-                                {
-                                    let locals = std::rc::Rc::make_mut(&mut child.locals);
-                                    locals.insert(var_name.to_string(), record.clone());
-                                }
-                                if let Ok(TlaValue::Bool(true)) =
-                                    eval_expr_inner(rhs, &child, depth + 1)
-                                {
+                                // Check predicate with compiled evaluator
+                                let mut locals = base_locals.clone();
+                                locals.insert(var_name.to_string(), record.clone());
+                                let child = EvalContext {
+                                    state: ctx.state,
+                                    locals: Rc::new(locals),
+                                    local_definitions: Rc::clone(&ctx.local_definitions),
+                                    definitions: ctx.definitions,
+                                    instances: ctx.instances,
+                                    eval_budget: ctx.eval_budget.clone(),
+                                };
+                                if matches!(
+                                    crate::tla::eval_compiled(&compiled_pred, &child),
+                                    Ok(TlaValue::Bool(true))
+                                ) {
                                     out.insert(record);
                                 }
 
-                                // Advance indices
+                                // Advance indices (odometer)
                                 let mut carry = true;
                                 for i in (0..indices.len()).rev() {
                                     if carry {
