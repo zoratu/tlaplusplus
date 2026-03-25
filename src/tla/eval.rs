@@ -2336,17 +2336,20 @@ fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
                                             f0_vals.len() as u64 * f1_vals.len() as u64
                                         );
 
-                                        // Bulk-construct BTreeSet from sorted pairs
-                                        let out: BTreeSet<TlaValue> = pairs
+                                        // Build records as Seq (Vec) — O(n) instead
+                                        // of BTreeSet O(n log n). The membership
+                                        // evaluator in evaluate_init_states handles
+                                        // both Set and Seq as membership domains.
+                                        let records: Vec<TlaValue> = pairs
                                             .into_iter()
                                             .map(|(a, b)| {
-                                                let mut rec = BTreeMap::new();
-                                                rec.insert(f0_name.clone(), TlaValue::Int(a));
-                                                rec.insert(f1_name.clone(), TlaValue::Int(b));
-                                                TlaValue::Record(Arc::new(rec))
+                                                TlaValue::Record(Arc::new(BTreeMap::from([
+                                                    (f0_name.clone(), TlaValue::Int(a)),
+                                                    (f1_name.clone(), TlaValue::Int(b)),
+                                                ])))
                                             })
                                             .collect();
-                                        return Ok(TlaValue::Set(Arc::new(out)));
+                                        return Ok(TlaValue::Seq(Arc::new(records)));
                                     }
                                 }
                             }
