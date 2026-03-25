@@ -2284,41 +2284,86 @@ fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
                         }
 
                         if is_record_set && !field_specs.is_empty() {
-                            let compiled_pred = crate::tla::compile_expr(rhs);
                             let mut out = BTreeSet::new();
+
+                            // Constraint propagation: for 2-field integer record sets
+                            // with a sum-range predicate like c.f1 + c.f2 \in lo..hi,
+                            // compute valid ranges directly instead of iterating all pairs.
+                            if field_specs.len() == 2 {
+                                let all_ints = field_specs
+                                    .iter()
+                                    .all(|(_, v)| v.iter().all(|x| matches!(x, TlaValue::Int(_))));
+                                if all_ints {
+                                    // Try to extract sum-range constraint from predicate
+                                    // Pattern: var.f1 + var.f2 \in lo..hi
+                                    if let Some((sum_lo, sum_hi)) = extract_sum_range_constraint(
+                                        rhs,
+                                        var_name,
+                                        &field_specs,
+                                        ctx,
+                                    ) {
+                                        let (f0_name, f0_vals) = &field_specs[0];
+                                        let (f1_name, f1_vals) = &field_specs[1];
+                                        let f1_lo = f1_vals
+                                            .first()
+                                            .and_then(|v| v.as_int().ok())
+                                            .unwrap_or(0);
+                                        let f1_hi = f1_vals
+                                            .last()
+                                            .and_then(|v| v.as_int().ok())
+                                            .unwrap_or(0);
+
+                                        for v0 in f0_vals {
+                                            let a = v0.as_int().unwrap();
+                                            // Compute valid range for field 1
+                                            let valid_lo = (sum_lo - a).max(f1_lo);
+                                            let valid_hi = (sum_hi - a).min(f1_hi);
+                                            if valid_lo > valid_hi {
+                                                continue;
+                                            }
+                                            for v1 in f1_vals {
+                                                let b = v1.as_int().unwrap();
+                                                if b < valid_lo {
+                                                    continue;
+                                                }
+                                                if b > valid_hi {
+                                                    break; // f1_vals is sorted (from 0..N range)
+                                                }
+                                                let mut rec = BTreeMap::new();
+                                                rec.insert(f0_name.clone(), v0.clone());
+                                                rec.insert(f1_name.clone(), v1.clone());
+                                                out.insert(TlaValue::Record(Arc::new(rec)));
+                                            }
+                                        }
+                                        return Ok(TlaValue::Set(Arc::new(out)));
+                                    }
+                                }
+                            }
+
+                            // Fallback: brute-force with compiled predicate
+                            let compiled_pred = crate::tla::compile_expr(rhs);
                             let mut indices = vec![0usize; field_specs.len()];
                             let total: u64 =
                                 field_specs.iter().map(|(_, v)| v.len() as u64).product();
                             ctx.check_budget(total.min(500_000_000) as usize)?;
 
-                            // Reusable record BTreeMap — mutate in place
                             let mut rec = BTreeMap::new();
                             for (fname, vals) in &field_specs {
                                 rec.insert(fname.clone(), vals[0].clone());
                             }
-
-                            // Build locals ONCE with the record. Each iteration
-                            // we create a fresh Rc (no clone of the map itself —
-                            // just rebuild the single entry).
                             let base_locals = (*ctx.locals).clone();
                             let var_key = var_name.to_string();
 
                             loop {
-                                // Update record fields in-place
                                 for (i, (fname, vals)) in field_specs.iter().enumerate() {
                                     *rec.get_mut(fname).unwrap() = vals[indices[i]].clone();
                                 }
-
-                                // Build a minimal locals: base + one record entry
-                                // This avoids cloning base_locals — we just wrap it
                                 let record_arc = Arc::new(rec.clone());
                                 let mut iter_locals = base_locals.clone();
                                 iter_locals.insert(
                                     var_key.clone(),
                                     TlaValue::Record(Arc::clone(&record_arc)),
                                 );
-
-                                // Evaluate compiled predicate with this context
                                 let child = EvalContext {
                                     state: ctx.state,
                                     locals: Rc::new(iter_locals),
@@ -2333,8 +2378,6 @@ fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
                                 ) {
                                     out.insert(TlaValue::Record(record_arc));
                                 }
-
-                                // Advance indices
                                 let mut carry = true;
                                 for i in (0..indices.len()).rev() {
                                     if carry {
@@ -6817,6 +6860,54 @@ fn skip_leading_ws(input: &str, mut idx: usize) -> usize {
 }
 
 /// Convert a serde_json::Value to a TlaValue.
+/// Try to extract a sum-range constraint from a predicate like
+/// `c.f1 + c.f2 \in lo..hi`. Returns Some((lo, hi)) if successful.
+/// The range bounds can be literals or resolvable expressions (e.g., MaxBeanCount).
+fn extract_sum_range_constraint(
+    pred_text: &str,
+    var_name: &str,
+    field_specs: &[(String, Vec<TlaValue>)],
+    ctx: &EvalContext<'_>,
+) -> Option<(i64, i64)> {
+    let pred = pred_text.trim();
+    // Pattern: var.f1 + var.f2 \in lo..hi
+    let in_idx = find_top_level_keyword_index(pred, "\\in")?;
+    let lhs = pred[..in_idx].trim();
+    let rhs = pred[in_idx + 3..].trim();
+
+    // Check LHS is var.f1 + var.f2
+    let plus_idx = lhs.find('+')?;
+    let left_part = lhs[..plus_idx].trim();
+    let right_part = lhs[plus_idx + 1..].trim();
+
+    let f1_prefix = format!("{}.", var_name);
+    let left_field = left_part.strip_prefix(&f1_prefix)?;
+    let right_field = right_part.strip_prefix(&f1_prefix)?;
+
+    if !field_specs.iter().any(|(n, _)| n == left_field)
+        || !field_specs.iter().any(|(n, _)| n == right_field)
+    {
+        return None;
+    }
+
+    // Parse RHS as lo..hi (bounds can be expressions, not just literals)
+    let dotdot_idx = rhs.find("..")?;
+    let lo_text = rhs[..dotdot_idx].trim();
+    let hi_text = rhs[dotdot_idx + 2..].trim();
+
+    // Try parsing as literal first, then evaluate as expression
+    let lo = lo_text
+        .parse::<i64>()
+        .ok()
+        .or_else(|| eval_expr_inner(lo_text, ctx, 0).ok()?.as_int().ok())?;
+    let hi = hi_text
+        .parse::<i64>()
+        .ok()
+        .or_else(|| eval_expr_inner(hi_text, ctx, 0).ok()?.as_int().ok())?;
+
+    Some((lo, hi))
+}
+
 fn json_to_tla_value(v: &serde_json::Value) -> TlaValue {
     match v {
         serde_json::Value::Null => TlaValue::ModelValue("null".to_string()),
