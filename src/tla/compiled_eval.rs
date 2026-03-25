@@ -993,6 +993,13 @@ fn compiled_membership_contains(
         CompiledExpr::NatSet => Ok(matches!(value.as_int(), Ok(n) if n >= 0)),
         CompiledExpr::IntSet => Ok(value.as_int().is_ok()),
         CompiledExpr::BooleanSet => Ok(matches!(value, TlaValue::Bool(_))),
+        // Fast path: x \in a..b → a <= x && x <= b (avoids set construction)
+        CompiledExpr::SetRange(lo, hi) => {
+            let x = value.as_int()?;
+            let a = eval_compiled_inner(lo, ctx, depth + 1)?.as_int()?;
+            let b = eval_compiled_inner(hi, ctx, depth + 1)?.as_int()?;
+            Ok(a <= x && x <= b)
+        }
         CompiledExpr::Var(name) => {
             if let Some(def) = ctx.definition(name)
                 && def.params.is_empty()
