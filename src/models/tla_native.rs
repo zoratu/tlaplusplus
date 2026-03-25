@@ -1760,22 +1760,27 @@ fn evaluate_init_states(
             );
             match eval_expr(&set_expr, &ctx) {
                 Ok(set_val) => {
-                    if let Ok(set) = set_val.as_set() {
-                        if set.is_empty() {
+                    // Accept both Set and Seq as membership domains.
+                    // Constraint-propagated record sets return Seq for O(n)
+                    // construction instead of BTreeSet O(n log n).
+                    let values: Option<Vec<TlaValue>> = if let Ok(set) = set_val.as_set() {
+                        Some(set.iter().cloned().collect())
+                    } else if let Ok(seq) = set_val.as_seq() {
+                        Some(seq.clone())
+                    } else {
+                        None
+                    };
+
+                    if let Some(values) = values {
+                        if values.is_empty() {
                             return Err(anyhow!(
                                 "membership set for {var} is empty, no initial states possible"
                             ));
                         }
-                        let values: Vec<TlaValue> = set.iter().cloned().collect();
-                        membership_choices.push((var.clone(), values));
-                        // For singleton sets, also add to base_state so dependent
-                        // memberships can resolve
-                        if set.len() == 1 {
-                            base_state.insert(
-                                Arc::from(var.as_str()),
-                                set.iter().next().unwrap().clone(),
-                            );
+                        if values.len() == 1 {
+                            base_state.insert(Arc::from(var.as_str()), values[0].clone());
                         }
+                        membership_choices.push((var.clone(), values));
                         progress = true;
                     } else {
                         next_pending.push((var, set_expr));
