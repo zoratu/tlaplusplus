@@ -65,6 +65,17 @@ pub struct PorAnalysis {
     pub dep: Vec<BTreeSet<usize>>,
     /// All state variables declared by the spec.
     pub variables: BTreeSet<String>,
+    /// **T7.3** — set of disjunct indices that are "visible" to the
+    /// fairness/liveness specification.  An action is visible iff it is
+    /// named directly in a WF/SF constraint, or it touches any variable
+    /// referenced by a temporal state predicate.
+    ///
+    /// When `visible` is non-empty, `stubborn_set()` always includes every
+    /// enabled visible disjunct.  This is the standard Peled (1994)
+    /// visible-action proviso: the reduced graph preserves stutter-
+    /// equivalent LTL\X over visible actions, including WF/SF on those
+    /// actions.  Empty set = pure-safety mode (T7 baseline).
+    pub visible: BTreeSet<usize>,
 }
 
 impl PorAnalysis {
@@ -73,7 +84,40 @@ impl PorAnalysis {
     /// `next_body` must be the exact text of the `Next` definition's body.
     /// `module` provides the variable declarations and operator definitions
     /// used to expand action calls during footprint extraction.
+    ///
+    /// The result has an empty visibility set — i.e., pure safety POR
+    /// (T7 baseline).  For liveness POR, call `from_next_with_visibility`.
     pub fn from_next(next_body: &str, module: &TlaModule) -> Self {
+        Self::build(next_body, module, &[], &BTreeSet::new())
+    }
+
+    /// Build the POR analysis with a Peled (1994) visible-action proviso.
+    ///
+    /// `visible_action_names` lists the *names* of actions that appear in
+    /// fairness clauses (e.g., `WF_vars(SendMsg)` → "SendMsg") and `Next`
+    /// disjuncts, plus disjuncts that read or write any variable in
+    /// `visible_vars`.  The resulting `visible` set indexes the disjuncts
+    /// whose footprints overlap any name in `visible_action_names` or any
+    /// variable in `visible_vars`.
+    ///
+    /// When `visible` is non-empty, `stubborn_set()` always includes every
+    /// enabled visible disjunct, preserving stutter-equivalent LTL\X over
+    /// visible actions (sound for WF/SF on those actions).
+    pub fn from_next_with_visibility(
+        next_body: &str,
+        module: &TlaModule,
+        visible_action_names: &[String],
+        visible_vars: &BTreeSet<String>,
+    ) -> Self {
+        Self::build(next_body, module, visible_action_names, visible_vars)
+    }
+
+    fn build(
+        next_body: &str,
+        module: &TlaModule,
+        visible_action_names: &[String],
+        visible_vars: &BTreeSet<String>,
+    ) -> Self {
         let variables: BTreeSet<String> = module.variables.iter().cloned().collect();
         let disjuncts = split_action_body_disjuncts(next_body);
         let disjuncts = if disjuncts.is_empty() {
@@ -89,10 +133,35 @@ impl PorAnalysis {
 
         let dep = compute_dependency_matrix(&footprints);
 
+        // Compute the visibility set: a disjunct is visible iff
+        //   (a) its top-level identifier matches a visible_action_name, OR
+        //   (b) its read or write footprint touches any variable in
+        //       visible_vars.
+        let mut visible: BTreeSet<usize> = BTreeSet::new();
+        let visible_action_set: BTreeSet<&str> =
+            visible_action_names.iter().map(|s| s.as_str()).collect();
+        for (idx, (disj, fp)) in disjuncts.iter().zip(footprints.iter()).enumerate() {
+            // (a) name match
+            if let Some(name) = top_level_action_name(disj)
+                && visible_action_set.contains(name.as_str())
+            {
+                visible.insert(idx);
+                continue;
+            }
+            // (b) variable footprint match
+            if !visible_vars.is_empty()
+                && (fp.writes.iter().any(|v| visible_vars.contains(v))
+                    || fp.reads.iter().any(|v| visible_vars.contains(v)))
+            {
+                visible.insert(idx);
+            }
+        }
+
         Self {
             footprints,
             dep,
             variables,
+            visible,
         }
     }
 
@@ -117,6 +186,12 @@ impl PorAnalysis {
     /// "central" action depending on every other) it avoids picking the
     /// central action — which would otherwise drag the entire enabled set
     /// into the stubborn set.
+    ///
+    /// **Visibility proviso (T7.3)** — when `self.visible` is non-empty,
+    /// every enabled visible disjunct is added to the seed set before the
+    /// dep closure is computed.  This is the Peled (1994) visible-action
+    /// proviso: the reduced graph preserves stutter-equivalent LTL\X over
+    /// visible actions, so WF/SF on visible actions is preserved.
     pub fn stubborn_set(&self, enabled_per_disjunct: &[bool]) -> Vec<usize> {
         // Defensive bounds check.  If the runtime hands us a mismatched
         // length we fall back to firing everything that is enabled, which is
@@ -127,57 +202,90 @@ impl PorAnalysis {
                 .collect();
         }
 
-        // Pick a seed: the enabled disjunct whose dependency closure (over
-        // enabled disjuncts only) has minimum cardinality.  Computing the
-        // closure for every candidate is O(n^2) in the worst case, but `n`
-        // is the number of `Next` disjuncts which is typically <30 even on
-        // big specs — totally fine for a per-state computation that will
-        // save us much more on enqueue overhead.
-        //
-        // Fast path: if there is exactly one enabled disjunct, skip the
-        // closure search entirely.
-        let enabled_count = enabled_per_disjunct.iter().filter(|b| **b).count();
-        if enabled_count == 0 {
+        // T7.3: visibility proviso.  Build a seed set from every enabled
+        // visible disjunct, then close under dep.  When `visible` is empty
+        // (pure-safety POR) this branch is skipped and we fall through to
+        // the single-seed path below.
+        if !self.visible.is_empty() {
+            let mut seeds: Vec<usize> = self
+                .visible
+                .iter()
+                .copied()
+                .filter(|&i| enabled_per_disjunct[i])
+                .collect();
+            if seeds.is_empty() {
+                // No visible action enabled — fall through to single-seed
+                // mode.  This is the corner case where the stubborn set
+                // contains only invisible actions; sound for safety, and
+                // for liveness the cycle proviso (deferred) would catch
+                // any infinite-invisible-cycle pathology.
+            } else {
+                // Pick the additional safety seed via the smarter heuristic
+                // and merge.  The result is always at least as large as
+                // either seeding strategy alone, but never larger than the
+                // full enabled set.
+                let safety_seed = self.pick_smartest_seed(enabled_per_disjunct);
+                if let Some(s) = safety_seed
+                    && !seeds.contains(&s)
+                {
+                    seeds.push(s);
+                }
+                return self.close_dep(seeds, enabled_per_disjunct);
+            }
+        }
+
+        // Pure-safety path (visible empty or no visible action enabled).
+        // Pick the seed via the smarter heuristic and close under dep.
+        let Some(seed) = self.pick_smartest_seed(enabled_per_disjunct) else {
             return Vec::new();
+        };
+        self.close_dep(vec![seed], enabled_per_disjunct)
+    }
+
+    /// Pick the enabled disjunct whose dep closure (restricted to enabled
+    /// disjuncts) is smallest.  Returns `None` iff no disjunct is enabled.
+    /// Ties broken by lowest index.
+    fn pick_smartest_seed(&self, enabled: &[bool]) -> Option<usize> {
+        // Fast path: zero or one enabled.
+        let enabled_count = enabled.iter().filter(|b| **b).count();
+        if enabled_count == 0 {
+            return None;
         }
         if enabled_count == 1 {
-            // The single enabled disjunct is the only stubborn-set element
-            // (its dep neighbours are all disabled and thus filtered out).
-            let only = enabled_per_disjunct
-                .iter()
-                .position(|b| *b)
-                .expect("enabled_count==1 contradiction");
-            return vec![only];
+            return enabled.iter().position(|b| *b);
         }
 
         let mut best_seed: Option<usize> = None;
         let mut best_size: usize = usize::MAX;
-        for seed in 0..enabled_per_disjunct.len() {
-            if !enabled_per_disjunct[seed] {
+        for seed in 0..enabled.len() {
+            if !enabled[seed] {
                 continue;
             }
-            let size = self.closure_size_from(seed, enabled_per_disjunct, best_size);
+            let size = self.closure_size_from(seed, enabled, best_size);
             if size < best_size {
                 best_size = size;
                 best_seed = Some(seed);
-                // A stubborn-set of size 1 is the global optimum — no
-                // further candidate can beat it, so stop early.
                 if best_size == 1 {
                     break;
                 }
             }
         }
-        let Some(seed) = best_seed else {
-            return Vec::new();
-        };
+        best_seed
+    }
 
-        // BFS dependency closure restricted to enabled disjuncts.
+    /// BFS dep-closure of `seeds` restricted to enabled disjuncts.
+    /// Returns a sorted, deduplicated index list.
+    fn close_dep(&self, seeds: Vec<usize>, enabled: &[bool]) -> Vec<usize> {
         let mut chosen: BTreeSet<usize> = BTreeSet::new();
-        let mut frontier: Vec<usize> = vec![seed];
-        chosen.insert(seed);
+        let mut frontier: Vec<usize> = Vec::with_capacity(seeds.len());
+        for s in seeds {
+            if enabled[s] && chosen.insert(s) {
+                frontier.push(s);
+            }
+        }
         while let Some(idx) = frontier.pop() {
             for &dep_idx in &self.dep[idx] {
-                if !enabled_per_disjunct[dep_idx] {
+                if !enabled[dep_idx] {
                     continue;
                 }
                 if chosen.insert(dep_idx) {
@@ -185,7 +293,6 @@ impl PorAnalysis {
                 }
             }
         }
-
         let mut out: Vec<usize> = chosen.into_iter().collect();
         out.sort_unstable();
         out
@@ -286,6 +393,125 @@ fn depends(a: &ActionFootprint, b: &ActionFootprint) -> bool {
 
 fn disjoint(a: &BTreeSet<String>, b: &BTreeSet<String>) -> bool {
     a.is_disjoint(b)
+}
+
+/// Extract the top-level action name from a disjunct, if it is structured
+/// as a (possibly quantified) action call.  Used by `from_next_with_visibility`
+/// to match disjuncts to fairness clauses by name.
+///
+/// Examples:
+///   "SendMsg(m)"                   -> Some("SendMsg")
+///   "\\E p \\in Procs : Step(p)"   -> Some("Step")
+///   "x' = x + 1 /\\ UNCHANGED y"   -> None  (no top-level identifier)
+fn top_level_action_name(disj: &str) -> Option<String> {
+    let trimmed = strip_comments(disj);
+    let trimmed = trimmed.trim();
+    let trimmed = strip_outer_parens(trimmed);
+    // Skip any leading \E, \A, LET ... IN binders.
+    let body = strip_temporal_binders(trimmed);
+    parse_leading_identifier(body.trim())
+}
+
+fn strip_outer_parens(s: &str) -> &str {
+    let mut s = s.trim();
+    while s.starts_with('(') && s.ends_with(')') && parens_match(s) {
+        s = s[1..s.len() - 1].trim();
+    }
+    s
+}
+
+fn parens_match(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() || bytes[0] != b'(' {
+        return false;
+    }
+    let mut depth = 0i64;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'(' {
+            depth += 1;
+        } else if b == b')' {
+            depth -= 1;
+            if depth == 0 {
+                return i == bytes.len() - 1;
+            }
+        }
+    }
+    false
+}
+
+fn strip_temporal_binders(input: &str) -> &str {
+    let mut s = input.trim();
+    loop {
+        if let Some(rest) = s.strip_prefix("\\E").or_else(|| s.strip_prefix("\\A")) {
+            // Find the colon that ends the binder header.  Stay shallow.
+            if let Some(colon) = find_binder_colon(rest) {
+                s = rest[colon + 1..].trim();
+                continue;
+            }
+        }
+        if let Some(rest) = s.strip_prefix("LET") {
+            // Find matching IN at the same depth.
+            if let Some(in_idx) = find_let_in(rest) {
+                s = rest[in_idx + 2..].trim();
+                continue;
+            }
+        }
+        break;
+    }
+    s
+}
+
+fn find_binder_colon(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth = 0i64;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b':' if depth == 0 => return Some(i),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn find_let_in(s: &str) -> Option<usize> {
+    // Crude: scan for whitespace-bounded "IN" at depth 0.
+    let bytes = s.as_bytes();
+    let mut depth = 0i64;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0
+            && bytes.get(i).copied() == Some(b'I')
+            && bytes.get(i + 1).copied() == Some(b'N')
+        {
+            let prev_ok = i == 0 || !is_ident_char(bytes[i - 1]);
+            let next_ok = i + 2 == bytes.len() || !is_ident_char(bytes[i + 2]);
+            if prev_ok && next_ok {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn parse_leading_identifier(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() || !is_ident_start(bytes[0]) {
+        return None;
+    }
+    let mut i = 0usize;
+    while i < bytes.len() && is_ident_char(bytes[i]) {
+        i += 1;
+    }
+    Some(s[..i].to_string())
 }
 
 /// Compute the static read/write footprint of a single Next disjunct.

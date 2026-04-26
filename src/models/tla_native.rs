@@ -193,42 +193,158 @@ impl TlaModel {
 
     /// Enable partial-order reduction.
     ///
-    /// Returns `Err` when the model uses temporal/fairness properties — POR
-    /// in this version preserves only safety, so the caller must run with
-    /// liveness checking disabled.
+    /// Pure-safety mode: when no fairness/liveness constraints are present,
+    /// `next_states()` switches to firing only a stubborn-set subset of
+    /// enabled `Next` disjuncts.
     ///
-    /// On success, `next_states()` switches to firing only a stubborn-set
-    /// subset of enabled `Next` disjuncts at every state.  Same initial
-    /// states; same invariant and constraint checking.
+    /// **Liveness mode (T7.3)**: when fairness or temporal properties are
+    /// present, POR is enabled with the Peled (1994) visible-action
+    /// proviso — every enabled visible action is always included in the
+    /// stubborn set.  Visible actions are: (a) actions named in WF/SF
+    /// clauses, and (b) actions whose footprint touches any variable used
+    /// by a temporal state predicate.  This preserves stutter-equivalent
+    /// LTL\X over visible actions, including WF/SF on those actions.
+    ///
+    /// **Caveat**: the BFS cycle-proviso (Bošnački & Holzmann 2007) is
+    /// not yet implemented, which means the reduced graph could in
+    /// principle contain a cycle of invisible actions that starves a fair
+    /// action.  In practice, the visibility proviso is sufficient when
+    /// every fair action is also a top-level Next disjunct (the common
+    /// case).  See `RELEASE_1.0.0_LOG.md` for the full proviso roadmap.
     pub fn enable_por(&mut self) -> anyhow::Result<()> {
-        if !self.fairness_constraints.is_empty() {
-            return Err(anyhow!(
-                "POR cannot be enabled when fairness constraints are present \
-                 (POR preserves only safety properties in this version)"
-            ));
-        }
-        if self.has_liveness_properties() {
-            return Err(anyhow!(
-                "POR cannot be enabled when liveness/temporal properties are present \
-                 (POR preserves only safety properties in this version)"
-            ));
-        }
         let next_def = self
             .module
             .definitions
             .get(&self.next_name)
             .ok_or_else(|| anyhow!("Next definition '{}' not found", self.next_name))?;
-        let analysis = PorAnalysis::from_next(&next_def.body, &self.module);
+
+        // Collect visible information for the Peled proviso.
+        let mut visible_action_names: Vec<String> = Vec::new();
+        let mut visible_vars: BTreeSet<String> = BTreeSet::new();
+        for fc in &self.fairness_constraints {
+            let action = match fc {
+                FairnessConstraint::Weak { action, .. } => action,
+                FairnessConstraint::Strong { action, .. } => action,
+            };
+            visible_action_names.push(action.clone());
+            // Also mark every variable touched by the action.  If the
+            // action name resolves to a definition, walk its body and mark
+            // all `var` and `var'` references.
+            if let Some(def) = self.module.definitions.get(action) {
+                collect_referenced_vars(&def.body, &self.module, &mut visible_vars);
+            }
+        }
+        // Add variables mentioned in any temporal state predicate (the
+        // arguments of <>, [], leads-to, and Eventually/Always sub-trees).
+        for (_name, formula) in &self.temporal_properties {
+            collect_temporal_vars(formula, &self.module, &mut visible_vars);
+        }
+
+        let analysis = PorAnalysis::from_next_with_visibility(
+            &next_def.body,
+            &self.module,
+            &visible_action_names,
+            &visible_vars,
+        );
+
+        let liveness_mode =
+            !self.fairness_constraints.is_empty() || self.has_liveness_properties();
+
         if std::env::var("TLAPP_POR_VERBOSE").is_ok() {
             eprintln!(
-                "POR analysis: {} actions, {} variables\n{}",
+                "POR analysis: {} actions, {} variables, {} visible{}\n{}",
                 analysis.num_actions(),
                 analysis.variables.len(),
+                analysis.visible.len(),
+                if liveness_mode {
+                    " [liveness mode]"
+                } else {
+                    " [safety mode]"
+                },
                 analysis.describe()
             );
         }
+
+        // Sanity check: in liveness mode the visibility set must not be
+        // empty (else fairness would be unprovably ignored).  Conversely,
+        // in safety mode visibility may be empty (and that's the T7
+        // baseline behaviour).
+        if liveness_mode && analysis.visible.is_empty() {
+            return Err(anyhow!(
+                "POR with liveness/fairness requested but no visible actions \
+                 could be identified — refusing to risk silent fairness loss. \
+                 Either name fair actions as top-level Next disjuncts or \
+                 disable POR for this spec."
+            ));
+        }
+
         self.por_analysis = Some(Arc::new(analysis));
         Ok(())
+    }
+}
+
+/// Walk an expression body, collect every state-variable identifier (with
+/// or without prime) it references.  Used by the visibility heuristic to
+/// determine which variables a fairness action touches.
+fn collect_referenced_vars(
+    body: &str,
+    module: &TlaModule,
+    out: &mut BTreeSet<String>,
+) {
+    let bytes = body.as_bytes();
+    let mut i = 0usize;
+    let var_set: BTreeSet<&str> = module.variables.iter().map(|s| s.as_str()).collect();
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_alphabetic() || b == b'_' {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let name = &body[start..i];
+            if var_set.contains(name) {
+                out.insert(name.to_string());
+            }
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Walk a temporal formula and collect every state variable referenced by
+/// any embedded state predicate (the argument of <>, [], ~>, etc.).
+fn collect_temporal_vars(
+    formula: &TemporalFormula,
+    module: &TlaModule,
+    out: &mut BTreeSet<String>,
+) {
+    match formula {
+        TemporalFormula::StatePredicate(expr) => {
+            collect_referenced_vars(expr, module, out);
+        }
+        TemporalFormula::Always(inner)
+        | TemporalFormula::Eventually(inner)
+        | TemporalFormula::InfinitelyOften(inner)
+        | TemporalFormula::EventuallyAlways(inner)
+        | TemporalFormula::Not(inner) => collect_temporal_vars(inner, module, out),
+        TemporalFormula::And(a, b)
+        | TemporalFormula::Or(a, b)
+        | TemporalFormula::LeadsTo(a, b) => {
+            collect_temporal_vars(a, module, out);
+            collect_temporal_vars(b, module, out);
+        }
+        TemporalFormula::TemporalForAll { formula: inner, .. }
+        | TemporalFormula::TemporalExists { formula: inner, .. } => {
+            collect_temporal_vars(inner, module, out)
+        }
+        TemporalFormula::WeakFairness { vars, .. }
+        | TemporalFormula::StrongFairness { vars, .. } => {
+            for v in vars {
+                if module.variables.iter().any(|m| m == v) {
+                    out.insert(v.clone());
+                }
+            }
+        }
     }
 }
 
@@ -631,12 +747,10 @@ impl TlaModel {
         }
 
         // T7.1: batched per-disjunct evaluation — split `next_body` once
-        // and evaluate every disjunct in a single pass.  The previous code
-        // called `evaluate_next_states_swarm(.., &[idx])` once per disjunct,
-        // re-splitting the body N times and paying N function-call frames
-        // worth of overhead.  On shared-state specs (Pipeline) where the
-        // stubborn set is the full enabled set, this overhead dominated
-        // and POR was net-slower than full enumeration.
+        // and evaluate every disjunct in a single pass.  Replaces N calls
+        // to `evaluate_next_states_swarm(.., &[idx])` (each of which
+        // re-split the body).  On shared-state specs (Pipeline) this lifts
+        // POR from net-slower to net-faster.
         let mut per_disjunct = evaluate_next_states_per_disjunct(
             &next_def.body,
             &self.module.definitions,
@@ -657,7 +771,6 @@ impl TlaModel {
         let enabled: Vec<bool> = per_disjunct.iter().map(|s| !s.is_empty()).collect();
         let stubborn = analysis.stubborn_set(&enabled);
         for idx in stubborn {
-            // Idx is guaranteed in-bounds by stubborn_set's contract.
             let succs = std::mem::take(&mut per_disjunct[idx]);
             out.extend(succs);
         }
