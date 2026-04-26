@@ -142,6 +142,17 @@ struct RuntimeArgs {
     /// Maximum number of violations to collect before stopping (default 1)
     #[arg(long, default_value_t = 1)]
     max_violations: usize,
+    /// Minimize counter-example traces before reporting (T9).
+    /// Default on. Runs a bounded delta-debug pass that searches for
+    /// shorter alternative paths reaching the same violating state.
+    /// Disable with `--minimize-trace=false`.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    minimize_trace: bool,
+    /// Wall-time budget for trace minimization, in seconds.
+    /// On expiry the best trace found so far is reported (always still a
+    /// valid counter-example; never longer than the original).
+    #[arg(long, default_value_t = 30)]
+    minimize_trace_budget_secs: u64,
 }
 
 #[derive(Args, Clone, Debug)]
@@ -1099,13 +1110,33 @@ fn model_fingerprint(state: &TlaState) -> u64 {
 }
 
 /// Feature 5: Print difftrace - only show variables that changed between steps.
+///
+/// `relevant_vars`, when `Some`, is the subset of state variables that the
+/// invariant references (T9 Phase B). Variables outside this set are
+/// printed with a "(noise)" tag so the user can quickly tell which
+/// changes actually drive the violation.
 fn print_difftrace(trace: &[TlaState]) {
+    print_difftrace_with_relevance(trace, None);
+}
+
+fn print_difftrace_with_relevance(
+    trace: &[TlaState],
+    relevant_vars: Option<&std::collections::HashSet<String>>,
+) {
     if trace.is_empty() {
         return;
     }
+    let is_relevant = |k: &str| -> bool { relevant_vars.is_none_or(|set| set.contains(k)) };
+    let tag = |k: &str| -> &'static str {
+        if relevant_vars.is_some() && !is_relevant(k) {
+            " (noise)"
+        } else {
+            ""
+        }
+    };
     println!("  step 0 (initial):");
     for (k, v) in &trace[0] {
-        println!("    /\\ {} = {:?}", k, v);
+        println!("    /\\ {} = {:?}{}", k, v, tag(k.as_ref()));
     }
     for i in 1..trace.len() {
         let prev = &trace[i - 1];
@@ -1118,7 +1149,7 @@ fn print_difftrace(trace: &[TlaState]) {
                     // unchanged, skip in difftrace
                 }
                 _ => {
-                    println!("    /\\ {} = {:?}", k, v);
+                    println!("    /\\ {} = {:?}{}", k, v, tag(k.as_ref()));
                     any_changed = true;
                 }
             }
@@ -1126,7 +1157,7 @@ fn print_difftrace(trace: &[TlaState]) {
         // Check for variables that were removed
         for k in prev.keys() {
             if !curr.contains_key(k) {
-                println!("    /\\ {} = <removed>", k);
+                println!("    /\\ {} = <removed>{}", k, tag(k.as_ref()));
                 any_changed = true;
             }
         }
@@ -2074,7 +2105,36 @@ fn main() -> anyhow::Result<()> {
                     "Running simulation: {} traces, depth {}, seed {}",
                     sim_config.num_traces, sim_config.depth, sim_config.seed
                 );
-                let sim_outcome = run_simulation(&model, &sim_config, max_violations);
+                let mut sim_outcome = run_simulation(&model, &sim_config, max_violations);
+                // T9 Phase A: minimize simulation violation traces too.
+                if runtime.minimize_trace && runtime.minimize_trace_budget_secs > 0 {
+                    let budget = std::time::Duration::from_secs(runtime.minimize_trace_budget_secs);
+                    for v in sim_outcome.violations.iter_mut() {
+                        let original = v.trace.len();
+                        if original > 1 {
+                            let res = tlaplusplus::minimize_trace(
+                                &model,
+                                std::mem::take(&mut v.trace),
+                                budget,
+                            );
+                            let final_len = res.trace.len();
+                            v.trace = res.trace;
+                            eprintln!(
+                                "Trace minimization: {} -> {} steps in {:?} ({} iter{}{})",
+                                original,
+                                final_len,
+                                res.elapsed,
+                                res.iterations,
+                                if res.iterations == 1 { "" } else { "s" },
+                                if res.budget_exhausted {
+                                    ", budget exhausted"
+                                } else {
+                                    ""
+                                }
+                            );
+                        }
+                    }
+                }
                 let end_time = chrono::Local::now();
 
                 println!(
@@ -2212,11 +2272,69 @@ fn main() -> anyhow::Result<()> {
                 );
             }
 
-            let outcome = run_model_with_s3(model, engine_config, &s3).map_err(|e| {
+            let mut outcome = run_model_with_s3(model, engine_config, &s3).map_err(|e| {
                 eprintln!("Error running model:");
                 eprintln!("  {}", e);
                 e
             })?;
+
+            // T9 Phase A: minimize counter-example traces before reporting.
+            // Default on; opt out with `--minimize-trace=false` or zero
+            // budget. Operates on the model used for liveness post-processing
+            // (a clone of the runtime model, identical Init/Next/invariants).
+            if runtime.minimize_trace && runtime.minimize_trace_budget_secs > 0 {
+                let budget = std::time::Duration::from_secs(runtime.minimize_trace_budget_secs);
+                if let Some(ref mut v) = outcome.violation {
+                    let original = v.trace.len();
+                    if original > 1 {
+                        let res = tlaplusplus::minimize_trace(
+                            &model_for_liveness,
+                            std::mem::take(&mut v.trace),
+                            budget,
+                        );
+                        let final_len = res.trace.len();
+                        v.trace = res.trace;
+                        eprintln!(
+                            "Trace minimization: {} -> {} steps in {:?} ({} iter{}{})",
+                            original,
+                            final_len,
+                            res.elapsed,
+                            res.iterations,
+                            if res.iterations == 1 { "" } else { "s" },
+                            if res.budget_exhausted {
+                                ", budget exhausted"
+                            } else {
+                                ""
+                            }
+                        );
+                    }
+                }
+                for v in outcome.violations.iter_mut() {
+                    let original = v.trace.len();
+                    if original > 1 {
+                        let res = tlaplusplus::minimize_trace(
+                            &model_for_liveness,
+                            std::mem::take(&mut v.trace),
+                            budget,
+                        );
+                        let final_len = res.trace.len();
+                        v.trace = res.trace;
+                        eprintln!(
+                            "Trace minimization: {} -> {} steps in {:?} ({} iter{}{})",
+                            original,
+                            final_len,
+                            res.elapsed,
+                            res.iterations,
+                            if res.iterations == 1 { "" } else { "s" },
+                            if res.budget_exhausted {
+                                ", budget exhausted"
+                            } else {
+                                ""
+                            }
+                        );
+                    }
+                }
+            }
 
             // Feature 2: Coverage profiling
             if coverage {
@@ -2287,12 +2405,64 @@ fn main() -> anyhow::Result<()> {
                     "violation=true ({} violations found)",
                     all_violations_display.len()
                 );
+                // T9 Phase B: pre-compute the set of state variables each
+                // invariant references syntactically, so the printer can
+                // mark unreferenced variables as "(noise)". This is purely
+                // presentation — the trace data structure is unchanged.
+                let var_names: Vec<String> = model_for_liveness
+                    .module
+                    .variables
+                    .iter()
+                    .cloned()
+                    .collect();
+                let invariant_relevance: std::collections::HashMap<
+                    String,
+                    std::collections::HashSet<String>,
+                > = model_for_liveness
+                    .invariant_exprs
+                    .iter()
+                    .map(|(name, body)| {
+                        let rel = tlaplusplus::extract_invariant_variables(body, &var_names);
+                        (name.clone(), rel)
+                    })
+                    .collect();
+                let relevant_vars_for = |msg: &str| -> Option<&std::collections::HashSet<String>> {
+                    // Violation messages currently have form "invariant 'NAME' violated".
+                    // Extract NAME and look up its relevance set.
+                    let prefix = "invariant '";
+                    let start = msg.find(prefix)? + prefix.len();
+                    let rest = &msg[start..];
+                    let end = rest.find('\'')?;
+                    let name = &rest[..end];
+                    invariant_relevance.get(name)
+                };
                 for (i, violation) in all_violations_display.iter().enumerate() {
                     println!();
                     println!("--- Violation {} ---", i + 1);
                     println!("  message: {}", violation.message);
+                    let relevant = relevant_vars_for(&violation.message);
+                    if let Some(rel) = relevant {
+                        let noise: Vec<&String> = var_names
+                            .iter()
+                            .filter(|v| !rel.contains(v.as_str()))
+                            .collect();
+                        if !noise.is_empty() {
+                            println!(
+                                "  invariant variables: {}",
+                                rel.iter().cloned().collect::<Vec<_>>().join(", ")
+                            );
+                            println!(
+                                "  noise variables (not referenced by invariant): {}",
+                                noise
+                                    .iter()
+                                    .map(|s| s.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            );
+                        }
+                    }
                     if difftrace {
-                        print_difftrace(&violation.trace);
+                        print_difftrace_with_relevance(&violation.trace, relevant);
                     } else {
                         println!("  state: {:?}", violation.state);
                         if !violation.trace.is_empty() {

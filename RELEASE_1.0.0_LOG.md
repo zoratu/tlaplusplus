@@ -1425,3 +1425,84 @@ Default-on. Reasoning: the ring only fires when the spill path is already engage
 
 - Direct: T9 (trace minimization on violation). The compression layer is independent of the violation-trace path, so T9 stays orthogonal.
 - Optional: T8.1 (real-spec benchmark) if we want a corpus-grounded number for the README before 1.0.0.
+
+### T9 — Trace minimization on violation (Phase 3)
+
+**Status:** landed, default-on. New module `src/trace_minimize.rs`. Counter-example traces are minimized in two phases (A: shortening, B: variable highlighting) before being printed. 20 new tests, **714 total** (was 694).
+
+**Phase A — path shortening (delta-debug variant).**
+
+`minimize_trace<M>(model, trace, budget)` runs two cheap passes in a loop until fixed point or budget exhaustion:
+
+1. **Earliest-violation truncation.** Linear scan to find the smallest index `i` such that `model.check_invariants(trace[i])` is `Err`. If `i + 1 < trace.len()`, truncate the suffix. This is O(N) per pass and catches the common case where the BFS-reconstructed trace continues exploring beyond the first violating state (e.g. when fairness checking ran on a wider exploration).
+2. **BFS shortcut search.** From every initial state, BFS up to `len(current_trace) - 1` levels deep, looking for any state at trace index `> 0` whose BFS distance from an initial state is strictly less than its trace index. On a hit, the trace prefix `[0..=i]` is replaced with the shorter discovered prefix; the suffix `[i+1..]` (still all valid Next transitions) is preserved.
+
+The loop terminates when no shortcut is found, the trace shrinks to length ≤ 1, or `start.elapsed() >= budget`. Default budget 30 s; on exhaustion the best-so-far trace is returned (always still a valid counter-example, never longer than the input).
+
+**Correctness invariants preserved across every iteration:**
+
+- First state ∈ `model.initial_states()`.
+- Every adjacent pair `(s_i, s_{i+1})` satisfies `s_{i+1} ∈ next_states(s_i)`.
+- `model.check_invariants(last)` returns `Err`.
+
+If the input trace's final state does not violate the invariant (defensive guard against caller misuse), the trace is returned unchanged.
+
+**Phase B — variable highlighting (presentation only).**
+
+`extract_invariant_variables(invariant_text, all_vars) -> HashSet<String>` tokenises the invariant source on identifier boundaries (`[A-Za-z_][A-Za-z0-9_]*`), strips TLA+ `\* ...` line comments and `(* ... *)` block comments (with depth tracking for nested blocks), and returns the subset of state variables that appear as whole-word tokens. The trace printer marks every state variable outside this set with " (noise)" and prints a one-line "noise variables (not referenced by invariant): ..." summary at the top of each violation block.
+
+This is purely cosmetic. The underlying `Violation::trace` is untouched. Transitive analysis (an invariant calling another operator that references `x` will not flag `x` as relevant) is parked as **T9.1**.
+
+**CLI flags added (RuntimeArgs).**
+
+- `--minimize-trace` (default `true`) — run Phase A before reporting.
+- `--minimize-trace-budget-secs` (default `30`) — wall-time cap on Phase A.
+
+**Integration test (`tests/trace_minimization_t9.rs`, 5 tests).**
+
+Fixture: `corpus/internals/TraceMinimizationDiamond.tla` (new) — 3 variables (`count`, `noise`, `phase`), 3 actions (`Tick`, `Bump`, `SwapPhase`), invariant `count < 5`. The non-`count` actions are independent of the invariant.
+
+- `phase_a_minimization_shortens_an_inflated_trace_on_real_tla_spec` — hand-builds a 9-state trace `[5×Tick, 2×Bump, 1×SwapPhase]`. `minimize_trace` truncates at the first violation (count=5 after 5 ticks) and returns a 6-state trace. Asserts: shorter, valid initial state, every transition valid Next, final state still violates.
+- `phase_a_returns_input_unchanged_when_already_optimal` — 6-state direct trace stays at 6 states.
+- `phase_b_extract_relevant_variables_from_inv_text` — pulls the invariant body from the parsed model and asserts only `count` is flagged.
+- `phase_a_on_real_known_violation_spec_preserves_violation` — runs on `corpus/internals/PorViolation.tla`'s natural trace, confirms the violation is preserved.
+- `phase_a_zero_budget_returns_safe_trace` — zero-budget run never panics and returns a still-violating trace.
+
+**Performance.** Diamond fixture (9 → 6 states): **375 µs**. PorViolation BFS-trace (4 → 4 states, no shortening): **83 µs**. Both well under the 30 s default budget.
+
+**End-to-end CLI smoke (PorViolation):**
+
+```
+Trace minimization: 4 -> 4 steps in 82.696µs (0 iters)
+...
+--- Violation 1 ---
+  message: invariant 'Inv' violated
+  invariant variables: count
+  noise variables (not referenced by invariant): flag
+  state: {"count": Int(3), "flag": Bool(false)}
+  trace (4 steps): ...
+```
+
+**Test count.** 714 total (was 694). Breakdown:
+
+- `src/trace_minimize.rs::tests` (15): 7 Phase B (variable extraction; substring/comment/identifier-boundary handling) + 8 Phase A (linear identity, diamond shortening, transition validity, empty/single-state, defensive non-violating input, zero budget, truncation pre-pass).
+- `tests/trace_minimization_t9.rs` (5): full TLA+-based integration covering shortening, optimality preservation, Phase B parsing, real-spec violation preservation, zero-budget safety.
+
+**Gates.**
+
+- 13/13 diff_tlc.
+- 11/11 compiled_vs_interpreted (proptest seed default).
+- 12 active state-graph snapshots (all green).
+- All existing 694 tests still pass.
+
+**Caveats / follow-ups (parked).**
+
+- **T9.1. Transitive variable relevance.** Phase B is syntactic at the invariant body. An invariant of the form `Safe == Helper(state)` where `Helper` references `count` does not currently flag `count`. A future pass would inline operator definitions before scanning, or run a single dependency-closure traversal over `module.definitions`.
+- **T9.2. Smarter shortcut seed.** Phase A's BFS visits every state up to `current.len() - 1` deep. For long traces this could become expensive; an alternative is to limit the BFS by a per-iteration node budget and revisit on next iteration. Not pursued because the 30 s wall-budget is already a hard cap.
+- **T9.3. Suffix shortening.** We currently truncate at the *earliest* violating state. We do not try to find an alternate, shorter suffix from an earlier non-violating state to a different violating state. The cheap form would be to apply Phase A recursively on each `[0..=k]` slice; not pursued because the use case (a bug in a suffix that disappears under truncation) is rare.
+
+**Commit:** TODO
+
+#### Recommended next
+
+- Direct: T10 (liveness checking scaling). T9 closes the violation-quality story for 1.0.0.
