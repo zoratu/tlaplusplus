@@ -48,7 +48,7 @@ These come first because every later change needs a regression gate.
 
 ## Phase 3 — Polish
 
-- [ ] **T8. State compression in queue.** zstd-compress cold queue segments (we already depend on zstd) or structural sharing for record-heavy states. Reduces memory footprint, enables larger models.
+- [x] **T8. State compression in queue.** Done — zstd-compressed in-memory ring between hot work-stealing deques and disk overflow. Default on, opt-out via `--queue-compression false`. Benchmark (queue micro-bench, 1M items, 8 workers): 13.2x compression ratio, +2% wall time, -68% peak memory. At 250K items: +21% time, -98% memory. Compression only fires when the spill path engages, so quick runs are unaffected. 8 new tests (5 ring unit + 3 integration); 694 total. See `### T8` log entry. Commit `fa378c9`.
 - [ ] **T9. Trace minimization on violation.** When an invariant violation is found, shrink the counter-example (proptest-style) before reporting. Quality-of-life for users.
 - [ ] **T10. Liveness checking scaling.** Iterative tableau or on-the-fly fairness for large state graphs. Currently correct but slow at scale.
 - [ ] **T11. Long-run soak / chaos.** Run failpoint chaos for hours under random fault injection. Catches accumulation bugs that single-fault tests miss.

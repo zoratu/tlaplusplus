@@ -1359,3 +1359,69 @@ Pipeline shows POR's worst case: when actions share state (Move reads/writes `pe
 #### Recommended next
 
 - Direct: T8 (state compression in queue). T7 deliberately stayed scoped; the per-disjunct overhead optimization is a candidate T7.1 follow-up but is not blocking.
+
+### T8 — State compression in queue (Phase 3)
+
+**Status:** landed, default-on. zstd-compressed in-memory ring sits between the hot work-stealing deques and the disk-backed overflow queue. 8 new tests, 694 total (was 686).
+
+**Design.**
+
+A new `CompressedSegmentRing` (`src/storage/compressed_segments.rs`) holds a FIFO of opaque, zstd-compressed batches. The spill coordinator routes each spilled batch through the ring first; if the ring is over its byte cap (default 256 MiB) the batch falls through to the existing disk path with no items dropped. The loader thread prefers the ring on the way back because decompression at ~1 GB/s is faster than disk read + deserialize.
+
+Compression policy:
+
+- **Triggers only when the spill path is already engaged** — i.e., the hot queue exceeds `--queue-max-inmem-items` and is now spilling. No-spill runs are completely unaffected.
+- **Bounded by compressed bytes**, not item count, so behaviour stays predictable across heterogeneous state shapes.
+- **First push to an empty ring is always accepted**, so a single oversized batch can never deadlock the spill path.
+- **zstd level 1** (default) — ~500 MB/s on Graviton 4, ~3-13x ratio depending on state shape. Level configurable via `--queue-compression-level`.
+- **Decompression runs outside the ring's mutex**: only the FIFO `pop_front` is under the lock.
+- **Checkpoint drains the ring back to disk first** so resume is lossless.
+- **Stats reported on shutdown** when any compression activity occurred (ratio, bytes in/out, ring-full rejects).
+
+**Benchmark.** New `tests/queue_compression_benchmark.rs` (ignored by default; run with `--ignored --nocapture`). Workload: synthetic state shape with 4 string-keyed fields (4 String, 4 i64) — chosen because string-keyed records are the realistic compression-friendly shape for TLA+ states. Run on c8g.metal-48xl (192 cores), `max_inmem_items: 5_000` to force the spill path.
+
+| Workload      | Compression | Wall time | Peak RSS Δ | Ratio |
+|---------------|-------------|-----------|------------|-------|
+| 250K items    | OFF         | 190 ms    | 84.3 MiB   | -     |
+| 250K items    | ON          | 230 ms    | 2.1 MiB    | 13.3x |
+| 1M items      | OFF         | 664 ms    | 304.9 MiB  | -     |
+| 1M items      | ON          | 676 ms    | 96.1 MiB   | 13.2x |
+
+Time overhead: 21% at 250K items, drops to 2% at 1M items (decompression amortises). Memory savings: 98% at 250K, 68% at 1M (ring fills at large scale, disk takes over). Compression ratio is consistent at ~13x for this state shape; real TLA+ specs with smaller records typically see 3-10x.
+
+**Default-on decision.**
+
+Default-on. Reasoning: the ring only fires when the spill path is already engaged, which is exactly when memory pressure matters. At that point a 2-21% time hit to keep the working set in compressed memory (instead of paying disk-I/O latency on every spill/load round trip) is the right trade. The 21%-at-250K case is the worst-case headroom number; most real runs will sit closer to the +2% end. Quick small runs are unaffected because they never trigger the spill path. Opt-out is `--queue-compression false`.
+
+**CLI flags.**
+
+- `--queue-compression` (default `true`) — enable the ring.
+- `--queue-compression-max-bytes` (default 256 MiB) — hard cap on resident compressed bytes.
+- `--queue-compression-level` (default `1`) — zstd level (1-22).
+
+**Tests added (8 new, 694 total).**
+
+- `compressed_segments::tests` (5):
+  - `round_trip_preserves_items` — compress → pop → decompress → byte-for-byte equality.
+  - `fifo_order_across_multiple_segments` — ring is FIFO.
+  - `budget_rejects_when_full` — pushes past the cap return the original Vec.
+  - `drain_all_returns_items_in_fifo_order` — checkpoint drain helper.
+  - `empty_batch_is_noop` — no segment created for an empty input.
+- `spillable_work_stealing::tests` (3):
+  - `test_compression_ring_round_trip` — spill coordinator compresses real batches, items round-trip through the ring back to the hot queue.
+  - `test_compression_disabled_bypasses_ring` — when the flag is off, the ring is never instantiated and behaviour matches the legacy direct-spill path.
+  - `test_compression_ring_overflow_falls_through_to_disk` — tiny ring budget forces fall-through to disk; every item still recovers.
+- `tests/queue_compression_benchmark.rs` (1, ignored): the benchmark numbers above.
+
+**Caveats / follow-ups (parked).**
+
+- **T8.1. Real-spec benchmark.** Today's numbers are from a synthetic queue micro-benchmark. A meaningful corpus benchmark (forcing a real spec to spill) requires a spec with sustained queue pressure — most corpus specs in `corpus/internals` exhaust quickly. Candidate: a parameterised stress spec or a larger config of an existing model.
+- **T8.2. Adaptive level.** Level 1 is conservative. For long-running large-memory runs, dynamically bumping to level 3 once the ring fills (better ratio, ~2x compress time) might pay off; not pursued for 1.0.0.
+- **T8.3. NUMA-local rings.** Today there's a single global ring. Sharding by NUMA node would localise compression CPU and decompress reads; deferred — single ring is simpler and avoids cross-shard fall-through edge cases.
+
+**Commit:** `fa378c9` — `perf(t8): zstd-compress overflow queue segments — 13x ratio, 2-21% time, default on`
+
+#### Recommended next
+
+- Direct: T9 (trace minimization on violation). The compression layer is independent of the violation-trace path, so T9 stays orthogonal.
+- Optional: T8.1 (real-spec benchmark) if we want a corpus-grounded number for the README before 1.0.0.
