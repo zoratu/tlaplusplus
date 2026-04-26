@@ -2512,7 +2512,12 @@ SPECIFICATION
         );
 
         assert_eq!(probe.supported_disjuncts, 2, "{probe:?}");
-        assert_eq!(probe.generated_successors, 2, "{probe:?}");
+        // T1.4: previously asserted 2 because the buggy compiled-expr `Or`
+        // mis-shape made Phase2a guard evaluate TRUE under spurious paths.
+        // After the fix the LET body compiles to `And([Forall, Or])`, and
+        // the single enabled Phase2a(1, v1) action yields exactly one
+        // successor (the new `2a` message).
+        assert_eq!(probe.generated_successors, 1, "{probe:?}");
         assert!(probe.failures.is_empty(), "{probe:?}");
 
         let _ = fs::remove_dir_all(&tmp);
@@ -2714,28 +2719,18 @@ SPECIFICATION
         assert!(phase2a.is_ok(), "{phase2a:?}");
 
         assert_eq!(probe.supported_disjuncts, 2, "{probe:?}");
-        // T1.1 fix: the compiled `Guard` handler now dispatches action calls
-        // (e.g. inner `Send(...)` inside `\E Q : LET ... IN <body>`) through
-        // the interpreted action evaluator. Previously the Send call was
-        // mis-treated as a boolean expression and silently dropped all
-        // successors, so this probe returned 0 (or 3 if the interpreted
-        // fallback fired).
-        //
-        // With Send dispatching correctly we now also expose a SEPARATE
-        // pre-existing bug: the compiled-expression evaluator returns
-        // `\A a \in Q : \E m \in {} : ...` as TRUE when it should be FALSE
-        // for non-empty Q (probably a quantifier-scope issue inside an
-        // outer LET). That over-counts Phase2a successors at the initial
-        // state by a factor of |Quorum| × |Value| = 3 × 2 per ballot,
-        // yielding 21 successors here instead of the correct 3 (Phase1a
-        // per ballot). See follow-up bug T1.4 in RELEASE_1.0.0_LOG.md.
-        //
-        // Until T1.4 is fixed we accept the over-count to keep the test
-        // green; the assertion still pins the *floor* (3) so a regression
-        // that re-drops Send successors is caught.
-        assert!(
-            probe.generated_successors >= 3,
-            "expected at least 3 successors (Phase1a per ballot), got {}: {probe:?}",
+        // T1.4 fix: the compiled-expression evaluator now produces an
+        // `And([Forall, Or])` for the LET body of `Phase2a`, matching
+        // the indented source structure. Previously a flat `Or` made
+        // the guard `\A a \in Q : \E m \in {} : ...` evaluate to TRUE
+        // (because the unrelated `Q1bv = {}` disjunct fires at the
+        // initial state), over-counting successors by
+        // `|Quorum| × |Value| = 3 × 2 = 6` per ballot — yielding 21
+        // instead of the correct 3 (Phase1a per ballot in Ballot=0..2).
+        // See RELEASE_1.0.0_LOG.md T1.4.
+        assert_eq!(
+            probe.generated_successors, 3,
+            "expected exactly 3 successors (Phase1a per ballot, b \\in {{0,1,2}}), got {}: {probe:?}",
             probe.generated_successors
         );
         assert!(probe.failures.is_empty(), "{probe:?}");

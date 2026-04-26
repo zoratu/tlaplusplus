@@ -554,6 +554,28 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
         return CompiledExpr::Implies(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
     }
 
+    // T1.4 fix: when the expression spans multiple lines, prefer
+    // INDENTATION-based boolean splitting before symbol-based splitting.
+    // The body-delimiter-based `formula::split_top_level` cannot reliably
+    // distinguish "\\/ inside an indented sub-block" from "\\/ at the
+    // top level of the expression"; for shapes like
+    //
+    //   /\ \A a \in Q : \E m \in Q1b : m.acc = a
+    //   /\ \/ Q1bv = {}
+    //      \/ \E m \in Q1bv : ...
+    //
+    // it would mis-split on the indented `\\/` and produce a flat
+    // `Or([Forall, Eq, Exists])` instead of an
+    // `And([Forall, Or([Eq, Exists])])`. With `Q1bv = {}` true at the
+    // initial state, the mis-compiled `Or` evaluated as TRUE — silently
+    // passing universally-quantified existential guards (Paxos `Phase2a`).
+    if let Some(parts) = split_indented_top_level_boolean(expr, "/\\") {
+        return CompiledExpr::And(parts.into_iter().map(|s| compile_expr(&s)).collect());
+    }
+    if let Some(parts) = split_indented_top_level_boolean(expr, "\\/") {
+        return CompiledExpr::Or(parts.into_iter().map(|s| compile_expr(&s)).collect());
+    }
+
     // Disjunction: \/
     let or_parts = split_top_level(expr, "\\/");
     if or_parts.len() > 1 {
@@ -970,6 +992,157 @@ fn split_top_level(expr: &str, delim: &str) -> Vec<String> {
     // line's indent). The formula version uses body-delimiter detection instead,
     // which is more robust.
     crate::tla::formula::split_top_level(expr, delim)
+}
+
+/// Split a multi-line boolean expression on its **outermost** vertical
+/// `delim` (`/\\` or `\\/`) operators, where "outermost" is determined by
+/// indentation: only delimiter tokens that begin a line at the smallest
+/// indent level are treated as splits.
+///
+/// Returns `None` when the expression doesn't span multiple lines, when
+/// no line begins with `delim`, or when the apparent split would yield a
+/// single clause (handing back to the caller's symbol-based fallback).
+///
+/// T1.4: this function exists to fix a soundness bug in the compiled
+/// expression evaluator. Before adding this pass, multi-line shapes like
+///
+/// ```text
+/// /\ \A a \in Q : \E m \in Q1b : ...
+/// /\ \/ Q1bv = {}
+///    \/ \E m \in Q1bv : ...
+/// ```
+///
+/// were mis-split by `formula::split_top_level("\\/")`, which doesn't
+/// know that the indented `\\/` lines are inside the second top-level
+/// `/\\` conjunct. The result was a flat `Or` instead of an
+/// `And([Forall, Or])` — silently passing universally-quantified
+/// existential guards in Paxos-style specs.
+fn split_indented_top_level_boolean(expr: &str, delim: &str) -> Option<Vec<String>> {
+    if !expr.contains('\n') {
+        return None;
+    }
+
+    let normalized = normalize_multiline_boolean_indentation(expr);
+
+    // Pass 1: find the smallest indent at which a line begins with `delim`.
+    let mut min_indent: Option<usize> = None;
+    for raw_line in normalized.lines() {
+        let line = raw_line.trim_end();
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with(delim) {
+            let indent = line.len().saturating_sub(trimmed.len());
+            min_indent = Some(min_indent.map_or(indent, |m| m.min(indent)));
+        }
+    }
+    let base_indent = min_indent?;
+
+    // Pass 2: collect the clauses, treating only `delim`-prefixed lines at
+    // `base_indent` as split points. All other lines (including indented
+    // `delim` lines, which are part of the current clause) are appended to
+    // the current clause verbatim, preserving indentation so that nested
+    // calls to compile_expr can see the same shape and split it again at
+    // the inner indent.
+    let mut clauses: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut saw_top_level = false;
+
+    for raw_line in normalized.lines() {
+        let line = raw_line.trim_end();
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let indent = line.len().saturating_sub(trimmed.len());
+        if indent == base_indent && trimmed.starts_with(delim) {
+            if saw_top_level {
+                if !current.trim().is_empty() {
+                    clauses.push(current.trim_end().to_string());
+                }
+                current.clear();
+            } else {
+                let prefix = current.trim();
+                if !prefix.is_empty() {
+                    // Content before the first delim that isn't a delim
+                    // line means the expression isn't a clean indented
+                    // boolean — bail out and let the caller handle it.
+                    return None;
+                }
+                current.clear();
+                saw_top_level = true;
+            }
+            let body = trimmed.trim_start_matches(delim).trim_start();
+            current.push_str(body);
+            continue;
+        }
+        if !saw_top_level {
+            // Haven't yet seen a top-level delim — don't accept this as
+            // an indented boolean split.
+            return None;
+        }
+        if !current.is_empty() {
+            current.push('\n');
+        }
+        current.push_str(line);
+    }
+
+    if !current.trim().is_empty() {
+        clauses.push(current.trim_end().to_string());
+    }
+
+    if clauses.len() <= 1 {
+        return None;
+    }
+
+    Some(clauses)
+}
+
+/// Strip the smallest common left-indent (excluding the first line) so
+/// that subsequent indent comparisons use a well-defined base. Mirrors
+/// the helper of the same name in `eval.rs` but kept private here to
+/// avoid coupling the two modules.
+fn normalize_multiline_boolean_indentation(expr: &str) -> String {
+    let mut lines = expr.lines();
+    let Some(first) = lines.next() else {
+        return String::new();
+    };
+    let rest: Vec<&str> = lines.collect();
+    if rest.is_empty() {
+        return expr.to_string();
+    }
+    let dedent = rest
+        .iter()
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(line.len().saturating_sub(trimmed.len()))
+            }
+        })
+        .min()
+        .unwrap_or(0);
+    if dedent == 0 {
+        return expr.to_string();
+    }
+    let mut out = String::with_capacity(expr.len());
+    out.push_str(first);
+    for line in rest {
+        out.push('\n');
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let indent = line.len().saturating_sub(trimmed.len());
+        let keep = indent.saturating_sub(dedent);
+        for _ in 0..keep {
+            out.push(' ');
+        }
+        out.push_str(trimmed);
+    }
+    out
 }
 
 #[allow(dead_code)]

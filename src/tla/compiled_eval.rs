@@ -3218,6 +3218,82 @@ mod forall_tests {
         assert!(result.is_ok(), "Evaluation failed: {:?}", result);
         assert_eq!(result.unwrap(), TlaValue::Bool(true));
     }
+
+    /// T1.4 regression: `\E m \in {} : <body>` must always be FALSE.
+    ///
+    /// Compiled fast path was previously silently returning TRUE in some
+    /// scope/contexts (see follow-on test below) — this is the simplest
+    /// shape of the soundness failure.
+    #[test]
+    fn t1_4_exists_over_empty_set_is_false() {
+        let state = TlaState::new();
+        let ctx = EvalContext::new(&state);
+        let expr = compile_expr("\\E m \\in {} : TRUE");
+        let v = eval_compiled(&expr, &ctx).expect("eval");
+        assert_eq!(
+            v,
+            TlaValue::Bool(false),
+            "\\E m \\in {{}} : TRUE must be FALSE"
+        );
+    }
+
+    /// T1.4 regression: `\A a \in NonEmpty : \E m \in {} : <anything>`
+    /// must be FALSE because the body is FALSE for every binding of `a`.
+    ///
+    /// Before T1.4 the compiled evaluator returned TRUE — which silently
+    /// passed invariants in Paxos-style protocol specs that quantify
+    /// universally over an inner existential.
+    #[test]
+    fn t1_4_forall_over_inner_empty_exists_is_false() {
+        let state = TlaState::new();
+        let ctx = EvalContext::new(&state);
+        let expr = compile_expr("\\A a \\in {1, 2, 3} : \\E m \\in {} : TRUE");
+        let v = eval_compiled(&expr, &ctx).expect("eval");
+        assert_eq!(
+            v,
+            TlaValue::Bool(false),
+            "\\A a \\in {{1,2,3}} : \\E m \\in {{}} : TRUE must be FALSE",
+        );
+    }
+
+    /// T1.4 regression: even with the inner-Exists domain bound by a LET
+    /// (which is how it appears in Paxos `Phase2a`), the result must be
+    /// FALSE when the LET-bound set is empty.
+    #[test]
+    fn t1_4_forall_over_inner_exists_with_let_bound_empty_set_is_false() {
+        let state = TlaState::new();
+        let ctx = EvalContext::new(&state);
+        let expr = compile_expr("LET S == {} IN \\A a \\in {1, 2, 3} : \\E m \\in S : m = a");
+        let v = eval_compiled(&expr, &ctx).expect("eval");
+        assert_eq!(v, TlaValue::Bool(false));
+    }
+
+    /// T1.4 regression: Paxos-style Phase2a guard using LET-bound
+    /// set-comprehension over an empty source variable. This is the
+    /// exact scope shape that exposed the bug.
+    #[test]
+    fn t1_4_paxos_phase2a_guard_with_empty_msgs_is_false() {
+        let mut state = TlaState::new();
+        // msgs == {} (empty set, mimicking initial Paxos state)
+        state.insert(Arc::from("msgs"), TlaValue::Set(Arc::new(BTreeSet::new())));
+        let mut q_set = BTreeSet::new();
+        q_set.insert(TlaValue::ModelValue("a1".to_string()));
+        q_set.insert(TlaValue::ModelValue("a2".to_string()));
+        let ctx = EvalContext::new(&state).with_local_value("Q", TlaValue::Set(Arc::new(q_set)));
+        // Mimic the Phase2a guard inside `\E Q \in Quorum : LET ... IN ...`:
+        //   Q1b == {m \in msgs : ...} -- becomes {} here
+        //   Body : \A a \in Q : \E m \in Q1b : m.acc = a
+        let expr = compile_expr(
+            "LET Q1b == {m \\in msgs : m.type = \"1b\"} \
+             IN \\A a \\in Q : \\E m \\in Q1b : m.acc = a",
+        );
+        let v = eval_compiled(&expr, &ctx).expect("eval");
+        assert_eq!(
+            v,
+            TlaValue::Bool(false),
+            "Phase2a-style guard with empty msgs must be FALSE",
+        );
+    }
 }
 
 #[test]
