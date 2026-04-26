@@ -1390,6 +1390,120 @@ Pipeline shows POR's worst case: when actions share state (Move reads/writes `pe
 
 - Direct: T8 (state compression in queue). T7 deliberately stayed scoped; the per-disjunct overhead optimization is a candidate T7.1 follow-up but is not blocking.
 
+### T7.1 + T7.2 + T7.3 — POR follow-ups (2026-04-25, post-1.0.0 sweep)
+
+Three POR follow-ups originally parked to v1.1.0 in the closeout sweep.
+Re-bench on 96-vCPU c8g.metal-24xl spot, `--release`:
+
+**Benchmarks (PorBench specs, full vs POR enumeration via `tests/por_benchmark.rs`):**
+
+| Spec                      | Reduction | Speedup before | Speedup after |
+|---------------------------|-----------|----------------|---------------|
+| PorBenchProcessGrid       | 36.8x     | 17.9x (T7)     | **39.2x**     |
+| PorBenchPipeline          |  1.1x     |  0.6x (T7)     | **1.1x**      |
+| PorTwoCounters            |  2.3x     |  1.6x (T7)     |  **2.4x**     |
+
+ProcessGrid roughly doubles. Pipeline crosses zero (no longer a regression
+versus full enumeration). TwoCounters edges up. The whole win is from T7.1
+batching; T7.2 and T7.3 are net-zero on these particular fixtures (their
+benefit shows on different shapes — see below).
+
+**T7.1 — batched per-disjunct evaluation (commit `58756dc`).**
+
+Added `evaluate_next_states_per_disjunct(next_body, definitions, instances,
+state) -> Vec<Vec<TlaState>>`. Splits `next_body` once via
+`split_action_disjuncts` and evaluates every disjunct in one pass, returning
+the per-disjunct successor sets. `next_states_por` now calls this once,
+reads the enabledness vector off it, hands it to `stubborn_set`, and
+extends `out` from only the chosen indices.
+
+The previous code called `evaluate_next_states_swarm(.., &[idx])` once per
+disjunct, paying N redundant `split_action_disjuncts` passes plus N
+function-call frames. On Pipeline (N=3, stubborn set ≈ full enabled set)
+this overhead dominated — POR was 0.6x speedup. After: 1.1x.
+
+**T7.2 — smarter stubborn-set seed (commit `593d805`).**
+
+Pick the enabled disjunct whose dep closure (over enabled disjuncts only)
+is smallest, ties broken by lowest index for determinism. Strictly at
+least as good as the lowest-index seed.
+
+The candidate scan is O(n²) worst-case but `n` = number of `Next`
+disjuncts (typically <30), and each closure computation early-exits as
+soon as the running size hits the current best. Two new unit tests:
+`smarter_seed_picks_smallest_dependency_cluster` (5 actions, 3 dep
+clusters: smarter seed picks the singleton-cluster action, lowest-index
+would have picked the doubleton-cluster) and
+`smarter_seed_falls_back_to_lowest_index_on_tie` (determinism guard).
+
+On the three PorBench specs the dep clusters are all fully connected, so
+smarter seed produces the same stubborn set as before. The win shows up
+on specs with disconnected dep clusters — common in larger specs with
+multiple independent subsystems.
+
+**T7.3 — POR for liveness via Peled visible-action proviso (commit `83e76ef`).**
+
+`PorAnalysis` gains a `visible: BTreeSet<usize>` field. New
+`from_next_with_visibility(next_body, module, action_names, vars)` builder.
+`stubborn_set` always includes every enabled visible disjunct in the seed
+set; the dep closure is then computed from the union.
+
+`enable_por()` no longer rejects WF/SF/temporal. Instead it derives
+`visible_action_names` from each `FairnessConstraint::{Weak,Strong}`
+action name, walks each named action's body to extract its variable
+footprint, and adds every variable mentioned in any temporal state
+predicate. The result is a `BTreeSet<usize>` of "visible" disjuncts. If
+that set is empty in liveness mode, `enable_por()` errors out (better
+fail loud than risk silent fairness loss).
+
+This is the standard Peled (1994) construction — preserves stutter-
+equivalent LTL\X over visible actions, which covers WF/SF on named
+actions (the common case).
+
+**Liveness POR validation:** `tests/por_correctness.rs::
+por_with_liveness_uses_visibility_proviso` builds the PorLiveness fixture
+(`Spec == Init /\ [][Next]_vars /\ WF_vars(Tick)`, `Liveness == <>(x = 5)`),
+enables POR, and asserts (a) `enable_por()` succeeds, (b) reduced state
+set ⊆ full state set, (c) reduced graph still reaches `x = 5`. Passes.
+
+**Caveat — BFS cycle proviso (deferred to v1.1.0).** Bošnački & Holzmann
+(2007) require an extra "no successor in the closed set" check during
+expansion to rule out the pathological case of an infinite invisible
+cycle in the reduced graph. Implementing this requires runtime support:
+the model boundary doesn't currently see the visited set. The visibility
+proviso is sound *enough* when every fair action is also a top-level
+Next disjunct (the normal pattern); for richer specs where a fair
+action is hidden inside a `\E p \in Procs : Step(p)` quantifier, the
+cycle proviso would tighten the guarantee. Concrete next steps for
+1.1.0:
+
+1. Add `Model::next_states_aware(state, &VisitedSet, &mut Vec<...>)`
+   API or pass an `is_visited: &dyn Fn(&Fingerprint) -> bool` closure.
+2. In `next_states_por`, after computing the stubborn set, check whether
+   any successor is `is_visited(succ_fp)`; if so AND the stubborn set is
+   a strict subset of enabled, fall back to fully expand.
+3. Update `tests/por_correctness.rs` with a fairness-cycle stress test
+   that the visibility proviso alone fails on but cycle+visibility passes.
+
+**Test counts.** Lib unit: 553 → 555 (+2, both T7.2 seed tests). POR
+correctness: 5 → 6 (+1, the new liveness-with-visibility test replaces
+the old liveness-rejection test; net +1). Total release: **727 → 730**.
+
+**Why the closeout sweep deferred these.** v1.0.0 needed POR shipped behind
+`--por` with a clean correctness story. T7's reduction win on the supported
+workload (36.8x on ProcessGrid) was already strong enough that the per-
+disjunct overhead didn't block release. T7.1 just made Pipeline (the
+worst-case shape) net-positive instead of net-negative. T7.2 is a tuning
+upgrade with no behavioural risk. T7.3 is an opt-in capability extension
+(POR was previously hard-rejected on liveness specs); the visibility
+proviso unlocks the common WF/SF case without the deeper cycle-proviso
+work that needs runtime API changes.
+
+**Commits:**
+- `58756dc` — `perf(t7.1): batched per-disjunct evaluation for POR`
+- `593d805` — `perf(t7.2): smarter stubborn-set seed selection`
+- `83e76ef` — `feat(t7.3): POR for liveness via Peled visible-action proviso`
+
 ### T8 — State compression in queue (Phase 3)
 
 **Status:** landed, default-on. zstd-compressed in-memory ring sits between the hot work-stealing deques and the disk-backed overflow queue. 8 new tests, 694 total (was 686).
@@ -1992,9 +2106,9 @@ regression.
 | T5.2 permutation symmetry | DEFER 1.1.0 | Symbolic-init opt-in; perm acceleration is additive. |
 | T5.3 projection-based all-SAT | DEFER 1.1.0 | 10-41x already achieved on supported shapes. |
 | T6.1 cross-node re-benchmark | DONE | See benchmark below. Cluster default-OFF. |
-| T7.1 batched per-disjunct eval | DEFER 1.1.0 | POR opt-in; 36.8x reduction on supported workload. |
-| T7.2 smarter stubborn-set seed | DEFER 1.1.0 | Deterministic seed is sound; smarter seed is tuning. |
-| T7.3 POR for liveness | DEFER 1.1.0 | T10 already shipped 550x liveness speedup. |
+| T7.1 batched per-disjunct eval | **SHIPPED post-1.0.0** | Pipeline 0.6x → 1.1x; ProcessGrid 19.7x → 39.2x. Commit `58756dc`. |
+| T7.2 smarter stubborn-set seed | **SHIPPED post-1.0.0** | Net-zero on PorBench (fully-connected dep graphs); win on disconnected-cluster shapes. Commit `593d805`. |
+| T7.3 POR for liveness | **SHIPPED post-1.0.0** | Peled visible-action proviso. Cycle proviso (Bošnački & Holzmann) parked to 1.1.0 — needs runtime API change. Commit `83e76ef`. |
 | T9.1 transitive variable relevance | DEFER 1.1.0 | Conservative over-marking, never under-marks. |
 | T9.2 smarter BFS seed | DEFER 1.1.0 | 30s budget rarely hit. |
 | T9.3 suffix shortening | DEFER 1.1.0 | BFS shortcut already optimal-length prefix. |
