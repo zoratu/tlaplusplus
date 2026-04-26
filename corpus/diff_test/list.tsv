@@ -1,0 +1,53 @@
+# Curated diff-test corpus: small, fast specs (TLC <10s) covering diverse language features.
+# Used by scripts/diff_tlc.sh and the diff-tlc CI workflow.
+#
+# Columns (tab-separated):
+#   spec_id            - human-readable name (also used in logs)
+#   module_path        - path to .tla relative to repo root
+#   config_path        - path to .cfg relative to repo root
+#   expect_violation   - "yes" if invariant violation expected, "no" otherwise
+#   notes              - short description of what the spec exercises
+#
+# Lines starting with '#' are comments. Blank lines ignored.
+# State counts are *not* pinned here — they are compared at runtime between
+# tlaplusplus and TLC, and any mismatch causes the diff harness to fail.
+#
+# To add a spec: pick something <10s under TLC, run scripts/diff_tlc.sh locally,
+# confirm zero divergences, then commit. If a spec exposes a real divergence,
+# leave it OUT of this list and file a bug — see the bottom of this file for
+# the running list of "known divergent" specs that we deliberately don't gate on.
+
+simple_counter	corpus/examples/SimpleCounter.tla	corpus/examples/SimpleCounter.cfg	no	tiny baseline; integer arithmetic; no violation
+simple_counter_violation	corpus/examples/SimpleCounterViolation.tla	corpus/examples/SimpleCounterViolation.cfg	yes	tiny baseline; invariant violation expected
+set_operators	corpus/language/SetOperatorsTest.tla	corpus/language/SetOperatorsTest.cfg	no	SUBSET, set membership, Cardinality
+record_set	corpus/language/RecordSetTest.tla	corpus/language/RecordSetTest.cfg	no	record sets [a: S, b: T] cross-products
+negative_int	corpus/language/NegativeIntTest.tla	corpus/language/NegativeIntTest.cfg	no	negative integer arithmetic, branching state space (~10K distinct)
+nested_except	corpus/language/NestedExceptTest.tla	corpus/language/NestedExceptTest.cfg	no	nested EXCEPT updates ![i][j], @ self-reference
+recursive	corpus/language/RecursiveTest.tla	corpus/language/RecursiveTest.cfg	no	RECURSIVE operators (Factorial, SumSeq, SeqLen)
+multiple_extends	corpus/language/MultipleExtendsTest.tla	corpus/language/MultipleExtendsTest.cfg	no	EXTENDS chain across multiple modules
+checkpoint_drain	corpus/internals/CheckpointDrain.tla	corpus/internals/CheckpointDrain.cfg	no	larger internal model; ~26K distinct states; ~3s under TLC
+
+# --------------------------------------------------------------------
+# KNOWN DIVERGENT SPECS (not gated; tracked for fix in follow-up work)
+# --------------------------------------------------------------------
+# These exposed real semantic divergences during T1 (RELEASE_1.0.0_LOG.md
+# entry 2026-04-25). They are intentionally excluded so the CI gate stays
+# meaningful. Re-add them once the underlying bug is fixed.
+#
+# corpus/language/ViewTest.tla / .cfg — VIEW projection not respected by
+#   fingerprinting; tlaplusplus reports 121 distinct, TLC 106. Investigate
+#   src/models/tla_native.rs:resolve_view and runtime fingerprint hashing.
+#
+# corpus/internals/QueueSegmentSync.tla with QueueSegmentSync_Fixed.cfg
+#   and QueueSegmentSync_Buggy.cfg — INIT/NEXT cfg form (not SPECIFICATION)
+#   produces only 5 distinct states under tlaplusplus; TLC produces 1531
+#   (Fixed) or finds a violation (Buggy). The Next disjunction over
+#   `\E segId \in localSegments : ...` does not appear to enumerate the
+#   growing set. Suspect src/tla/action_exec.rs or compiled-action codegen.
+#
+# corpus/internals/WorkQueue.tla / .cfg — distinct state count matches
+#   (15003), but tlaplusplus's fairness checker reports an SCC fairness
+#   violation that TLC accepts. TLC: "Model checking completed. No error
+#   has been found." tlaplusplus: "Fairness violation in SCC 0 ... action
+#   'Next' does not occur in SCC". Investigate src/fairness.rs SCC handling
+#   when the only enabled action labels match the spec's Next.

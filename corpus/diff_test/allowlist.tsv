@@ -1,0 +1,9 @@
+# Allowlist for diff_tlc.sh — use sparingly.
+#
+# Format: spec_id<TAB>reason
+#
+# Specs listed here are still RUN; any divergence is reported but does NOT
+# fail the script. This is the escape hatch for genuinely intentional
+# differences (e.g. a feature TLC doesn't implement that we model differently).
+#
+# If you add an entry, link to a tracking issue and remove it once fixed.

@@ -1,0 +1,72 @@
+name: diff-tlc
+
+# Differential testing of tlaplusplus against the reference TLC checker.
+# Catches silent semantic divergence (e.g. a refactor changes a state count
+# without us noticing) by running a curated subset of small, fast specs under
+# both checkers and comparing distinct-state counts and violation status.
+#
+# This workflow only builds a debug binary — release-perf is exercised
+# elsewhere. The whole job should finish in a few minutes.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  diff-tlc:
+    name: tlaplusplus vs TLC
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-diff-tlc-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-diff-tlc-${{ runner.os }}-
+
+      - name: Verify tla2tools.jar is vendored
+        run: |
+          if [[ ! -f tools/tla2tools.jar ]]; then
+            echo "ERROR: tools/tla2tools.jar missing — should be vendored in the repo" >&2
+            exit 1
+          fi
+          ls -la tools/tla2tools.jar
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build tlaplusplus (debug)
+        run: cargo build --bin tlaplusplus
+
+      - name: Run differential test harness
+        env:
+          TLAPLUSPLUS_BIN: ${{ github.workspace }}/target/debug/tlaplusplus
+          TLA2TOOLS_JAR: ${{ github.workspace }}/tools/tla2tools.jar
+          DIFF_TIMEOUT_SECS: "120"
+        run: ./scripts/diff_tlc.sh
+
+      - name: Upload diff harness logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diff-tlc-logs
+          path: .diff-tlc-out/
+          if-no-files-found: ignore
+          retention-days: 7
