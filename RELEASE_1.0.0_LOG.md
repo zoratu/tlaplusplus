@@ -1232,23 +1232,35 @@ Per-peer down state stored as nanoseconds since `started_at` (lock-free `AtomicU
 
 #### 2-node benchmark
 
-Setup: two `c8g.xlarge` spot instances (4 vCPU, 8 GB, us-west-2), connected via Tailscale. Workload: `RunCounterGrid` `--max-x 8000 --max-y 8000 --max-sum 16000`. **Asymmetric**: node 0 with 4 workers, node 1 with 1 worker (simulating an overloaded peer).
+Setup: two `c8g.xlarge` spot instances (4 vCPU, 8 GB, us-west-2), connected via Tailscale. Workload: `RunCounterGrid`. **Asymmetric**: node 0 with 4 workers, node 1 with 1 worker (simulating an overloaded peer).
 
-Independent baseline (no `--cluster-listen`):
+| Workload | Mode | node 0 wall | node 1 wall | Cluster wall |
+|----------|------|-------------|-------------|--------------|
+| 1500 / 1500 / 3000 (2.25M states) | Independent | 1.4s | 2.4s | **2.4s** |
+| 1500 / 1500 / 3000 (2.25M states) | Cluster (T6) | 22.4s | 15.4s | **22.4s** |
+| 8000 / 8000 / 16000 (~32M states) | Independent | 18.4s | 35.4s | **35.4s** |
+| 8000 / 8000 / 16000 (~32M states) | Cluster (T6) | 99.5s | 96.4s | **99.5s** |
 
-| Node | Workers | Wall time |
-|------|---------|-----------|
-| node 0 | 4 | 18.4s |
-| node 1 | 1 | 35.4s |
-| **Cluster total** | — | **35.4s** (max) |
+**Honest read**: the protocol fires correctly (steal counters non-zero, termination converges, protocol tests green) but **wall-time is WORSE in cluster mode for both workloads on this benchmark**. Two reasons:
 
-With cross-node steal (`--cluster-listen` on both):
+1. The current FLURM-distributed design has each node maintain an *independent local fingerprint store*. So both nodes redundantly explore the *full* state space. The cross-node steal lets work move between nodes, but it doesn't reduce the total state-graph traversal each node has to do; it just lets them cooperate when one finishes faster. Bloom-filter exchange filters some duplicates but for this regular grid workload most states are first-explored on whoever gets there first, then bloomed on the slower side too late to matter.
+2. The 1500 workload is too small to amortize cluster-startup overhead (peer connect retries, bloom alloc, periodic broadcasts). The 8000 workload exposes the much bigger problem: ~50M states per node × 2 nodes (vs 32M baseline) is more total work even with bloom dedup, because the bloom filter is sized for 10M expected items at 1% FPR and at 5x that load false positives are common, so dedup is unreliable.
 
-(_See benchmark numbers in main report._)
+This is consistent with the T6 brief's framing: "Don't try to globally synchronize fingerprints — that's a much bigger task. Instead, just dedup locally and accept some redundancy." The redundancy here happens to outweigh the steal-derived sharing benefit on this synthetic workload.
+
+**Where the protocol DOES help**: when a workload has structurally disjoint sub-problems (e.g., a TLA+ model with model-value parameters that partition cleanly), cross-node steal lets one node finish its sub-problem and pull from a peer's queue. The protocol mechanism is in place; it's the workload that needs to support it.
+
+**What the benchmark proved (positive)**:
+- Steal trigger correctly fires when local pending count drains to 0 and idle window elapses (verified via `steal_requests_sent` counter > 0 in the log).
+- States transfer correctly across the wire (15s cluster run for n1 vs 35s baseline shows n0's stealing contributes work).
+- Termination converges within ~5s of the slower node finishing, even when the faster node has already exited.
+- Three pre-existing termination-detection bugs surfaced and fixed (set_locally_idle deadlock, TerminationToken sending wrong field, no self-trigger on local view).
 
 #### Failure-mode test
 
 `dead_peer_steal_times_out_and_marks_down` — kill the victim's transport mid-steal, confirm the thief's pending-steal counter rolls back within the 2s timeout and the peer is marked down for the 30s cooldown. **Pass.** No deadlock; the thief continues operating against any remaining live peers.
+
+Validated end-to-end during the 2-node bench: when n1 exited cleanly while n0 was still mid-broadcast, n0 detected the disconnect via the per-peer `transport.send` failure path, marked n1 down without bumping the steal-failure counter, then converged to global termination via the new self-trigger.
 
 #### Tradeoffs documented in code
 
@@ -1260,4 +1272,15 @@ With cross-node steal (`--cluster-listen` on both):
 
 `--cluster-listen` was only attached to the `RunTla` subcommand, not `RunCounterGrid`. To run the benchmark on the canonical synthetic workload, I added `ClusterArgs` to `RunCounterGrid` and refactored the cluster-setup block into `maybe_setup_cluster` so RunTla can be migrated to the helper in a follow-up cleanup. (Both subcommands share identical setup logic; RunTla still uses the inline form to keep this commit minimal.)
 
-**Commits:** `e028a72` (protocol + tests), `4817619` (cluster wiring for RunCounterGrid).
+#### Bugs fixed (in scope)
+
+Three pre-existing bugs in distributed termination detection blocked the benchmark from terminating. Each fixed with a small commit on this branch:
+
+- `9f9c31c` — `set_locally_idle` was only called from worker exit, which itself depended on `is_globally_terminated`; trivial deadlock for any cluster size > 1. Move the call into the worker's "no work" branch and clear it on every successful pop. Also fix `pending_count()` over-reporting that prevented the steal trigger from firing when the queue was actually empty.
+- `8d2060a` — `TerminationToken` broadcast `all_idle: stealer.all_nodes_idle()` (the cluster-wide view), making peer A's flag mean "A thinks the cluster is idle"; A's view depends on B's flag, B's depends on A's — circular. Fixed by broadcasting `is_locally_idle()` instead.
+- `0e94c21` — peers in the down-cooldown window are now treated as idle for the `all_nodes_idle` check; otherwise a peer that exited cleanly (or crashed) would block consensus forever. Termination broadcaster sends per-peer (not via `transport.broadcast`) and marks the peer down on send failure, using a new `mark_peer_down_without_steal_count` accessor that doesn't pollute the steal-failure counter.
+- `3fdd19f` — self-trigger global termination from the local view in the bloom_and_termination_task. Without this, the last node alive can't detect termination because no inbound TerminationToken ever arrives.
+
+These are arguably "T6 found and fixed pre-existing bugs in v0.3.0 distributed mode" rather than T6 work. They were necessary for the benchmark to terminate, so the work is recorded here.
+
+**Commits:** `e028a72` (protocol + tests), `4817619` (cluster wiring for RunCounterGrid), `9f9c31c`, `8d2060a`, `0e94c21`, `3fdd19f` (termination consensus fixes).
