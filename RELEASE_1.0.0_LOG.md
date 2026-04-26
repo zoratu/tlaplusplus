@@ -1629,6 +1629,57 @@ Linear scaling vs N=8 (3x states → 3-4x phase time). The pre-T10 baseline at N
 
 **Commit:** `66535ac` — `perf(t10): liveness post-processing 550x faster — iterative Tarjan + fingerprint-keyed fairness check`
 
+### T10.1, T10.3, T10.4 — Liveness scaling follow-ups (Phase 4)
+
+**Date:** 2026-04-26 (1.0.0 follow-up sweep).
+**Spot:** c8g.xlarge in us-west-2 (4 cores, aarch64, 7.7 GB RAM), idle box.
+**Working tree:** `t10-followups` branch off `f161249`.
+
+**Goal.** T10 cut the liveness post-processing from 63 s to 115 ms on `LivenessBench` N=8 (~550x). The new dominant phase was the dashmap → triple-vec flatten (71% of the post-processing budget). The follow-ups are:
+- **T10.1.** Parallelize the flatten via rayon.
+- **T10.3.** Add a trivial-SCC pre-filter so Tarjan only sees the cycle skeleton.
+- **T10.4.** Build a per-action transition shard so each fairness check iterates only its own action's edges.
+- **T10.2.** Streaming on-the-fly SCC during exploration (deferred — see below).
+
+**Optimizations applied (single commit; module scope: `Cargo.toml` + `src/fairness.rs` + `src/runtime.rs` + new test file).**
+
+1. **T10.1 — parallel flatten via dashmap raw-shard rayon iter.** Enabled `dashmap = { version = "6.1.0", features = ["raw-api"] }` so the runtime can call `transitions_map.shards()` to get the underlying `&[CachePadded<RwLock<HashMap<K, SharedValue<V>>>>]` slice. We then `par_iter()` over the shards, taking each shard's read lock on a separate rayon thread and walking its `hashbrown::raw::RawTable` via `bucket.as_ref()` (the same path dashmap's own `OwningIter` uses). Each thread builds a per-shard `(triples, state_by_fp)` accumulator; the final merge is sequential. This avoids the ~330 ms `dashmap → owned-Vec` materialization step that the naïve `dashmap.iter().map(|e| e.value().clone()).collect()` approach incurred at N=10 (we never copy the `Vec<LabeledTransition>`; we read it under the shard lock).
+   - Threshold: only used when `transitions_map.len() >= 80_000`. Below that the rayon dispatch overhead and per-shard HashMap allocations exceed the parallel-hash win on a 4-core box.
+2. **T10.3 — trivial-SCC pre-filter.** New `fairness::trivial_scc_prefilter` implements iterative leaf-trim — it builds a reverse-adjacency map and peels every node with zero in-edges or zero out-edges *within the candidate set* (preserving self-loops). For pure DAGs this leaves nothing; for one-giant-SCC graphs it leaves everything. Wired into `runtime.rs::run_model` as Phase 2b. Heuristic: only run trim when the graph is sparse (`avg_outdeg < 2.0`) AND large (`>= 4096 nodes`) AND a sample probe finds at least one sink; otherwise skip. Empirically on `LivenessBench` (avg-outdeg 4.4) trim is correctly skipped; on a `DagBench` with avg-outdeg 3.7 the trim's O(N+E) reverse-adjacency build (95 ms at N=65K) costs more than Tarjan-on-DAG (46 ms) so the conservative heuristic is the right default. The function is exposed as a public helper for callers that know their workload benefits from trim.
+3. **T10.4 — per-action transition shard.** New `fairness::build_action_shard_index` builds a `HashMap<String, Vec<(u64, u64)>>` once after flatten; `check_fairness_on_scc_fp_sharded` then iterates only the relevant action's edges. Wrapper-Next constraints fast-path through the adjacency map (`scc_has_any_internal_edge`). The shard build uses a probe-then-insert pattern (`get_mut` → `entry`) to avoid cloning the action name on every transition — only on first occurrence per action.
+
+**Measurement (clean idle c8g.xlarge, 8 samples each, median).**
+
+| Spec | Phase | Baseline (T10 origin/main) | T10.1-4 | Δ |
+|---|---|---|---|---|
+| LivenessBench N=8 | Liveness post-processing | 139 ms | 137 ms | -2 ms (-1.4%) |
+| LivenessBench N=8 | Fairness check (constraint-on-SCC) | 1.6 ms | 0.65 ms | -2.5x |
+| LivenessBench N=8 | Per-action shard build | n/a | 3.7 ms | +3.7 ms |
+| LivenessBench N=8 | Trim | n/a | 60 µs (skipped) | +60 µs |
+| LivenessBench N=10 | Liveness post-processing | 477 ms | 449 ms | -28 ms (-5.9%) |
+| LivenessBench N=10 | Flatten | 338 ms (serial) | 315 ms (parallel via 16 shards) | -23 ms (-7%) |
+| LivenessBench N=10 | Fairness check | 16 ms | 1.9 ms | -8x |
+| LivenessBench N=10 | Per-action shard build | n/a | 14 ms | +14 ms |
+
+**Honest take.** The follow-ups deliver real-but-modest wins: T10 already squeezed the easy gains. On 4 cores T10.1's parallel flatten only nets ~7% (the work is dominated by serial state clones into the shared map, not parallelizable hashing). T10.4's fairness-check savings (8x) are real but partially offset by the shard build cost (+14 ms at N=10). T10.3 is correctly skipped on giant-SCC graphs and conservatively guarded so it never regresses on dense specs. Net at N=10 is ~6% off the T10 baseline; at N=8 it's within noise. On many-core boxes T10.1's win should grow (more shards in parallel); on specs with many sub-action constraints (24+) T10.4's win should grow proportionally. The infrastructure is in place — future workloads will see larger gains than the bench spec exposes.
+
+**Correctness gates.**
+
+- `cargo test --release --lib fairness` — 22 pass (was 13; +9 new: 4 trim, 5 shard-index helpers).
+- `cargo test --release --test wrapper_next_fairness_t1_3` — 2/2 pass (T1.3 wrapper-Next regression preserved).
+- `cargo test --release --test liveness_followups_t10_1_4` — 4/4 pass (new end-to-end coverage: DAG-shaped no-violation, triangle-fairness positive, never-fires negative, self-loop wrapper-Next satisfied).
+- `cargo test --release --bins --tests -- --test-threads 1` — **740 pass, 0 failed, 3 ignored** (was 727 → +13: 9 unit + 4 integration).
+- `scripts/diff_tlc.sh` — 13/13 pass; state counts match TLC v2.19 exactly.
+- `LivenessBench` (positive) and `LivenessFail` (negative) verdicts unchanged from T10 baseline.
+
+**T10.2 — DEFER TO 1.1.0.** Streaming SCC discovery during exploration. The current pipeline materializes the full `transitions_map: DashMap<u64, Vec<LabeledTransition<State>>>` in memory before fairness post-processing starts. For 100M+ state graphs that breaks even on machines with terabytes of RAM. The next lever is on-the-fly liveness — either:
+- **SPIN-style nested DFS** with accept-state book-keeping woven into the worker loop. Requires per-worker DFS-with-color tagging (replacing the current BFS-with-fingerprint dedup), accept-state tracking, and a restructured violation-trace collector that rebuilds counterexamples from per-worker DFS stacks rather than the parent-fingerprint map. Touches the worker hot path.
+- **Counter-example-guided liveness** (CEGAR-style) where we explore safety first, find a candidate cycle, then verify fairness on it — iterating until no more candidates. Lower runtime overhead but more complex control flow.
+
+Both are 2-4 weeks of focused work plus a corpus-level revalidation pass to ensure no liveness verdict changes. Out of scope for v1.0.0; deferring with a clear "what would need to change" sketch so the v1.1.0 implementor has a starting point.
+
+**Commit:** `<filled in below>`.
+
 ### T11 — Long-running chaos soak with random failpoint injection (Phase 3)
 
 **Date:** 2026-04-26.
