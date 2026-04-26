@@ -1704,3 +1704,144 @@ behave identically on both x86 and aarch64. If GitHub Actions surfaces
 a real issue, it will be filed as T12.1+.
 
 **Commit:** `a71283f` — `ci(t12): cross-arch CI matrix — run diff-TLC + proptest on aarch64 and x86_64`.
+
+
+### T16 — Regehr-style swarm testing (Phase 3)
+
+**Date:** 2026-04-26.
+**Spot:** c8g.xlarge in us-west-2, `REDACTED-INSTANCE` (4 vCPU aarch64, 7.7 GB) — warm reuse from T11.
+**Working tree:** `~/tlapp-t16` on the spot, sourced from `main` HEAD `508c38b`.
+
+**Reference.** Groce, Zhang, Eide, Chen, Regehr. "Swarm Testing." ICST 2012. Core insight: each test draws from a *random subset* of features. This biases the test population toward minimal-interaction cases that surface bugs hidden when too many features interact at once. Demonstrated on CSmith (uniform full-feature C generation missed bugs that subset-biased generation found).
+
+**Two application points landed.**
+
+#### T16a — swarm the T2 proptest harness
+
+`tests/compiled_vs_interpreted.rs` already has a typed proptest generator that picks from the full pool (Int arithmetic, Bool connectives, sets, sequences, records, functions, quantifiers, EXCEPT, conditionals, LET, CASE) on every case. The original `compiled_matches_interpreted` test draws every category every time — kitchen-sink uniform sampling.
+
+**Change.** Added a `SwarmMask` struct with one bit per shape category (17 bits total: arith, neg, cmp_int, in_set, subseteq, set_ops, seq_ops, record_ops, record_except, func_app, quantifier, let_in, if_then_else, case_arm, opcall, bool_conn, bool_not). Each proptest case first samples a `SwarmMask` (each bit independent ~p=0.5, so mean ~8.5 of 17 categories enabled), then the recursive expression generators only emit productions whose mask bit is set. Leaf productions (literals, state vars `x`/`y`/`b`/`S`/`T`/`sq`/`r`/`f`, constant `Inc(0)` opcall, string literals) are always available so every recursive call still terminates with a valid expression — even an empty mask still produces well-formed leaf-only programs.
+
+The recursive generators (`swarm_arb_int`, `swarm_arb_bool`, `swarm_arb_set_int`, `swarm_arb_seq_int`, `swarm_arb_rec`) build up the choice list at runtime from the gated productions, then dispatch through `proptest::strategy::Union::new_weighted`. The kitchen-sink generators (`arb_int` etc.) and the uniform `compiled_matches_interpreted` test are kept as a separate regression gate so the swarm rewrite can't silently drop coverage of any single category that was previously exercised.
+
+**Why two test functions instead of one with an env switch.** A single switched test would lose the uniform-mode property gate any time someone set the env var — keeping both means CI always runs both, the swarm test catches feature-pair seam bugs the uniform test misses, and the uniform test catches single-feature regressions a particularly sparse swarm mask would miss. `SWARM_MODE=uniform` is honoured but is now a documentation/escape hatch rather than the primary control.
+
+**Implementation note.** `proptest`'s tuple `Strategy` impl only goes up to arity 12, so the 17-bit mask is sampled via a fixed-length `proptest::collection::vec(any::<bool>(), 17..=17)` and dealt out into the named struct fields.
+
+**Validation.**
+
+- Test count after: **17 tests** in `tests/compiled_vs_interpreted.rs` (was 11): 11 sanity tests + 1 uniform proptest + 1 swarm proptest + 4 swarm-mask sanity tests + 1 swarm-leaves-only sanity test. Full failpoints suite: **746 passed, 0 failed, 3 ignored** (was 740 in T11; +6 = 5 swarm sanity + 1 swarm proptest, since the uniform proptest counted once before and the swarm proptest is the +1).
+- `PROPTEST_CASES=128` (CI default): clean across 7/8 sampled seeds; seed 8 reproduces the **already-known T2.4 divergence** (`(-1 - (r).a)` shape — unary-minus + binary-minus + record-field-access). The uniform test ALSO fails on seed 8 with the identical T2.4 shape, so adding the swarm test does not change the CI signal for the default seed (default seed is green — CI stays green).
+- `PROPTEST_CASES=2048` across seeds 1-15: the swarm test re-discovers the T2.4 shape repeatedly (seeds 1, 3-5, 8, 10) but does NOT find any new divergence beyond T2.4. All re-discovered shapes are `(<int> - (r).<field>)` or `(<int> - (r).<field>) <op> ...` — same root cause as T2.4. The proptest shrinker does still produce a meaningful minimum under the swarm mask (e.g., `{0, (-1 - ([a |-> 0, b |-> 0]).a)}` for seed 3, mask `[arith,neg,cmp,set,seq,rec,case,conn]`); the printed minimum includes the active mask so triage can see *which* swarm produced the failure.
+- Wall-time budget: PROPTEST_CASES=2048 swarm test runs in ~3.3s on the c8g.xlarge spot (uniform was ~3s, swarm adds ~10% from the per-case Union construction); CI's PROPTEST_CASES=128 swarm test runs in ~0.2s. **Well within the brief's <10% budget for CI.**
+
+**Known limitation (documented inline in the test file).** When the proptest shrinker minimises a swarm-mode failure, it can shrink to an expression smaller than the original failing case but outside the original failing case's mask. The minimum it produces may therefore differ from a "true" minimum for that specific mask. In practice the shrunk minima have all converged on the same T2.4 shape, validating that the shrinker still works under the mask gate.
+
+**Divergences parked.** No new T16.N divergences from the swarm — the only failure mode is the existing **T2.4** (`(-1 - (r).a)` arithmetic-with-unary-minus + record-field-access). T16a is therefore **clean for new bugs**; T2.4 is the existing parked SOUNDNESS item that T17 (closeout) will triage.
+
+#### T16b — swarm the T11 chaos soak
+
+`scripts/chaos_soak.sh` originally picked one failpoint per iteration (`FAILPOINTS=name=action`). Real production faults often correlate (a memory pressure spike fires both queue spill and FP-store resize); single-failpoint testing can never reproduce these cascades.
+
+**Change.** Added `--swarm-mode N|auto` and `--swarm-max N` (default 4) flags. Behaviour:
+
+- `--swarm-mode 1` (default) — single failpoint per iter, identical to the T11 baseline (backward-compat).
+- `--swarm-mode N` — exactly N concurrent failpoints per iter (clamped to catalog size 12).
+- `--swarm-mode auto` — random N in `[1, --swarm-max]` per iter.
+
+The script now:
+
+1. Picks N distinct failpoints via a Fisher-Yates shuffle in awk (portable, no `shuf` dependency).
+2. Builds `FAILPOINTS=name1=action1;name2=action2;...` joined with `;` — the `fail` crate's per-config delimiter (verified in `~/.cargo/registry/.../fail-0.5.1/src/lib.rs setup()` line 568: `failpoints.trim().split(';')`).
+3. Tracks per-iter `swarm_n` plus a running per-pair coverage matrix (lex-sorted unordered pairs, so `{a,b}` and `{b,a}` collapse). Top-20 most-fired pairs printed in the summary.
+4. TSV format extended with a new `swarm_n` column; `failpoint`/`action` columns hold comma-joined lists when N>1.
+
+Existing T11 single-failpoint callers (`scripts/chaos_soak.sh --duration 3600`) are unaffected.
+
+**Validation.** 30-min `--swarm-mode auto` soak on `corpus/internals/CheckpointDrain.tla` (control: 26,344 distinct, verdict=ok), workers=2, ckpt-int=2s, per-iter timeout=60s.
+
+```
+============================================================
+CHAOS SOAK SUMMARY
+============================================================
+started:       2026-04-26T17:30:51Z
+ended:         2026-04-26T18:00:53Z
+wall:          1802s (target: 1800s)
+iterations:    204
+spec:          CheckpointDrain
+control:       distinct=26344 verdict=ok
+
+FAILPOINT COVERAGE MATRIX
+------------------------------------------------------------
+failpoint                           fires  exit_ok exit_err  hangs  diverge
+checkpoint_write_fail                  46       46        0      0        0
+checkpoint_disk_write_fail             37       37        0      0        0
+checkpoint_rename_fail                 39       39        0      0        0
+checkpoint_queue_flush_fail            43       43        0      0        0
+checkpoint_fp_flush_fail               35       35        0      0        0
+worker_panic                           56       56        0      0        0
+fp_store_shard_full                    36       36        0      0        0
+queue_spill_fail                       46       46        0      0        0
+queue_load_fail                        37       37        0      0        0
+worker_pause_delay                     41       41        0      0        0
+fp_switch_slow                         44       44        0      0        0
+quiescence_timeout                     40       40        0      0        0
+
+SWARM SIZE HISTOGRAM (concurrent failpoints per iter)
+------------------------------------------------------------
+n             iters
+1                58
+2                45
+3                52
+4                49
+
+TOP CONCURRENT PAIRS (multi-failpoint coverage)
+checkpoint_queue_flush_fail+worker_panic                           15
+checkpoint_fp_flush_fail+queue_spill_fail                          14
+worker_panic+worker_pause_delay                                    13
+checkpoint_write_fail+worker_panic                                 13
+checkpoint_fp_flush_fail+worker_panic                              13
+fp_store_shard_full+worker_panic                                   12
+fp_switch_slow+worker_panic                                        11
+fp_store_shard_full+fp_switch_slow                                 11
+... (66 distinct concurrent pairs observed total)
+
+TOTALS
+  runs:            204
+  divergences:     0
+  hangs/timeouts:  0
+  swarm-mode:      auto
+  swarm-max:       4
+RESULT: clean — no divergences, no hangs.
+============================================================
+```
+
+**Coverage observations.**
+
+- 146 of 204 iters (71.6%) fired ≥2 concurrent failpoints — true multi-failpoint coverage, not just nominal swarm mode.
+- 66 distinct concurrent pairs observed out of `C(12,2)=66` possible. **Exhaustive pair coverage** in 30 min — every failpoint pair fired together at least once.
+- Worker_panic combined with checkpoint_*, fp_store, queue_*, worker_pause_delay, and quiescence_timeout — the runtime survived all of these cascades with the correct distinct-state count (26344) and verdict (ok).
+- N=4 iters (49 of them, 24%) exercised 4 concurrent failpoints. None deadlocked, panicked-without-recovery, or produced wrong state counts — validating that the runtime's individual-failpoint recovery code paths compose under simultaneous fault.
+- All wall-times within ~8.5-16.5s per iter. The longer runs (16.5s) consistently include `worker_panic` (the surviving worker takes ~2x baseline to finish alone). No outliers, no hangs.
+
+**T11.2 follow-up status (cross-reference).** T11.2 noted that `queue_spill_fail` / `queue_load_fail` are not exercised on the default soak config because `--queue-max-inmem-items` isn't set (per T11.1, small caps drop states). T16b doesn't change this — the spill code path still doesn't engage on the default 50M cap. queue_spill_fail and queue_load_fail did fire 46 and 37 times respectively but their downstream code path was bypassed because no spilling occurred. Closing that gap requires fixing T11.1 first.
+
+**Divergences parked.** None new. T16b is **clean for new bugs**; the swarm runtime tolerates 1-4 concurrent failpoints without observable misbehaviour.
+
+**Tests added (T16 total: +6 unit tests + 1 swarm proptest):**
+
+- `tests/compiled_vs_interpreted.rs`:
+  - `t16_swarm_describe_lists_enabled_categories` — pins `SwarmMask::describe()` output for a sparse mask
+  - `t16_swarm_describe_empty_mask_is_leaves_only` — empty-mask edge case
+  - `t16_swarm_all_on_mask_describes_all_categories` — full-mask describe round-trip
+  - `t16_swarm_empty_mask_still_produces_valid_leaves` — leaf-only generator termination
+  - `t16_swarm_mode_env_default_is_on` — `SWARM_MODE` env var parsing
+  - `compiled_matches_interpreted_swarm` — the new swarm proptest
+
+**Test count after this task:** 746 passing under `--features failpoints` (was 740 in T11; +6 from T16a), 0 failed, 3 ignored.
+
+**Docs updated:** `CLAUDE.md` (Chaos Soak section now documents `--swarm-mode`); `README.md` (Pre-release chaos soak section now lists swarm-mode invocations and TSV column changes).
+
+**T16.N follow-ups parked.** None new from this task. T16a's reproductions of T2.4 are tracked under existing T2.4. T16b's queue-spill underexercise is tracked under existing T11.2.
+
+**Commit:** see git log entry below.

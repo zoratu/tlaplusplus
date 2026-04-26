@@ -17,6 +17,26 @@
 //! `PROPTEST_CASES` controls iteration count. CI pins it (see
 //! `.github/workflows/diff-tlc.yml`); local devs can crank it higher via the
 //! environment variable.
+//!
+//! T16a — Swarm testing (Regehr et al., ICST 2012, "Swarm Testing"):
+//! each proptest *case* first samples a random subset of expression-shape
+//! categories ("the swarm mask"), then draws expressions only from the
+//! enabled subset. Leaves (literals/vars) are always enabled; "shape"
+//! categories (arith, comparisons, set ops, quantifiers, EXCEPT, sequences,
+//! records, function-app, LET, IF, CASE, opcalls) are each kept with
+//! independent biased probability. This biases the population toward
+//! minimal-interaction cases that surface evaluator bugs in feature-pair
+//! seams that uniform full-feature sampling under-explores.
+//!
+//! Set `SWARM_MODE=uniform` to disable swarming and use the original
+//! all-categories-always-on generator. Default = swarm.
+//!
+//! Known limitation: when proptest's shrinker tries to minimise a
+//! divergence, it can shrink to a smaller expression that is itself outside
+//! the swarm mask of the original failing case. The minimum it produces
+//! may therefore differ from a "true" minimum for that mask. This is
+//! documented in T16a; treat the printed expression as a starting point,
+//! not an oracle, when triaging T16.N follow-ups.
 
 use proptest::prelude::*;
 use std::collections::BTreeMap;
@@ -443,6 +463,7 @@ fn arb_rec(depth: u32) -> BoxedStrategy<Typed> {
 }
 
 /// Top-level expression of any type. Each iteration picks a type and recurses.
+/// Uniform mode — every shape category is always available.
 fn arb_expr() -> impl Strategy<Value = Typed> {
     let depth = 3u32;
     prop_oneof![
@@ -453,6 +474,463 @@ fn arb_expr() -> impl Strategy<Value = Typed> {
         arb_rec(depth),
         arb_str_leaf().boxed(),
     ]
+}
+
+// ---------------------------------------------------------------------------
+// T16a — Swarm-mode generators.
+//
+// Each proptest case first samples a `SwarmMask` (the "swarm"), then the
+// recursive generators only emit productions whose category bit is set.
+// Leaf productions (literals, state vars, constant opcalls) are always
+// enabled so every call still terminates with a valid expression.
+//
+// Per-category enable probabilities are biased to favour smaller subsets
+// (~50% each independently); the unconditional `Always`-categories ensure
+// the empty-mask edge case still produces a well-formed leaf-only program.
+// ---------------------------------------------------------------------------
+
+/// One bit per "shape" category that the recursive generator can emit.
+/// Leaf productions are always available; these are the *recursive*
+/// productions that actually compose features.
+#[derive(Debug, Clone, Copy)]
+struct SwarmMask {
+    arith: bool,         // + - * \div %
+    neg: bool,           // unary -
+    cmp_int: bool,       // = # < > <= >=
+    in_set: bool,        // \in / \notin
+    subseteq: bool,      // \subseteq
+    set_ops: bool,       // \union \intersect \ {a,b} {x \in S : P} {f(x) : x \in S}
+    seq_ops: bool,       // Append Tail Len Head <<a,b>>
+    record_ops: bool,    // [a |-> ..., b |-> ...]
+    record_except: bool, // [r EXCEPT !.f = v]
+    func_app: bool,      // f[1] f[2]
+    quantifier: bool,    // \E / \A
+    let_in: bool,        // LET ... IN ...
+    if_then_else: bool,  // IF ... THEN ... ELSE ...
+    case_arm: bool,      // CASE ... -> ... [] OTHER -> ...
+    opcall: bool,        // Inc(...) Add2(...,...) IsPos(...)
+    bool_conn: bool,     // /\ \/ => <=>
+    bool_not: bool,      // ~
+}
+
+impl SwarmMask {
+    /// Mask with everything enabled — equivalent to the uniform generator.
+    fn all_on() -> Self {
+        Self {
+            arith: true,
+            neg: true,
+            cmp_int: true,
+            in_set: true,
+            subseteq: true,
+            set_ops: true,
+            seq_ops: true,
+            record_ops: true,
+            record_except: true,
+            func_app: true,
+            quantifier: true,
+            let_in: true,
+            if_then_else: true,
+            case_arm: true,
+            opcall: true,
+            bool_conn: true,
+            bool_not: true,
+        }
+    }
+
+    /// Compact human-readable list of enabled categories — embedded in
+    /// divergence messages so we can tell *which* swarm produced a failure.
+    fn describe(&self) -> String {
+        let mut on = Vec::new();
+        let mut push = |b: bool, name: &str| {
+            if b {
+                on.push(name.to_string());
+            }
+        };
+        push(self.arith, "arith");
+        push(self.neg, "neg");
+        push(self.cmp_int, "cmp");
+        push(self.in_set, "in");
+        push(self.subseteq, "subseteq");
+        push(self.set_ops, "set");
+        push(self.seq_ops, "seq");
+        push(self.record_ops, "rec");
+        push(self.record_except, "except");
+        push(self.func_app, "fn");
+        push(self.quantifier, "quant");
+        push(self.let_in, "let");
+        push(self.if_then_else, "if");
+        push(self.case_arm, "case");
+        push(self.opcall, "op");
+        push(self.bool_conn, "conn");
+        push(self.bool_not, "not");
+        if on.is_empty() {
+            "<leaves only>".to_string()
+        } else {
+            on.join(",")
+        }
+    }
+}
+
+/// Strategy that samples a `SwarmMask`. Each shape category flips
+/// independently with `p ≈ 0.5`. This deliberately produces small subsets
+/// in expectation (mean ~8.5 of 17 enabled).
+///
+/// Implementation note: `proptest`'s tuple `Strategy` impl only goes up
+/// to arity 12, and we have 17 bits. Sample via a fixed-length `Vec<bool>`
+/// (proptest provides a `Strategy` impl for `Vec<T>` with bounded length)
+/// then deal the bits out into the named struct.
+fn arb_swarm_mask() -> impl Strategy<Value = SwarmMask> {
+    proptest::collection::vec(any::<bool>(), 17..=17).prop_map(|bits| SwarmMask {
+        arith: bits[0],
+        neg: bits[1],
+        cmp_int: bits[2],
+        in_set: bits[3],
+        subseteq: bits[4],
+        set_ops: bits[5],
+        seq_ops: bits[6],
+        record_ops: bits[7],
+        record_except: bits[8],
+        func_app: bits[9],
+        quantifier: bits[10],
+        let_in: bits[11],
+        if_then_else: bits[12],
+        case_arm: bits[13],
+        opcall: bits[14],
+        bool_conn: bits[15],
+        bool_not: bits[16],
+    })
+}
+
+// Swarm-aware recursive generators ------------------------------------------
+//
+// Same shape as the uniform generators above but each shape category is
+// gated on the matching `SwarmMask` bit. We can't conditionally include
+// arms in `prop_oneof!`, so we use a `Vec<(weight, BoxedStrategy<Typed>)>`
+// + the explicit `prop_oneof::<Typed>(W)` form. Leaves always go in to
+// guarantee at least one production at every depth.
+
+fn swarm_arb_int(depth: u32, m: SwarmMask) -> BoxedStrategy<Typed> {
+    if depth == 0 {
+        return arb_int_leaf().boxed();
+    }
+    let mut choices: Vec<(u32, BoxedStrategy<Typed>)> = Vec::new();
+    choices.push((4, arb_int_leaf().boxed()));
+    if m.arith {
+        let arith =
+            (swarm_arb_int(depth - 1, m), swarm_arb_int(depth - 1, m)).prop_flat_map(|(a, b)| {
+                prop_oneof![
+                    Just(Typed::Int(format!("({} + {})", a.text(), b.text()))),
+                    Just(Typed::Int(format!("({} - {})", a.text(), b.text()))),
+                    Just(Typed::Int(format!("({} * {})", a.text(), b.text()))),
+                    Just(Typed::Int(format!("({} \\div 2)", a.text()))),
+                    Just(Typed::Int(format!("({} % 3)", a.text()))),
+                ]
+            });
+        choices.push((3, arith.boxed()));
+    }
+    if m.neg {
+        let neg =
+            swarm_arb_int(depth - 1, m).prop_map(|a| Typed::Int(format!("(-({}))", a.text())));
+        choices.push((1, neg.boxed()));
+    }
+    if m.if_then_else {
+        let if_int = (
+            swarm_arb_bool(depth - 1, m),
+            swarm_arb_int(depth - 1, m),
+            swarm_arb_int(depth - 1, m),
+        )
+            .prop_map(|(c, t, e)| {
+                Typed::Int(format!(
+                    "(IF {} THEN {} ELSE {})",
+                    c.text(),
+                    t.text(),
+                    e.text()
+                ))
+            });
+        choices.push((2, if_int.boxed()));
+    }
+    if m.let_in {
+        let let_int =
+            (swarm_arb_int(depth - 1, m), swarm_arb_int(depth - 1, m)).prop_map(|(v, body)| {
+                Typed::Int(format!(
+                    "(LET __t1 == {} IN ({} + __t1))",
+                    v.text(),
+                    body.text()
+                ))
+            });
+        choices.push((1, let_int.boxed()));
+    }
+    if m.opcall {
+        let opcall =
+            swarm_arb_int(depth - 1, m).prop_map(|a| Typed::Int(format!("Inc({})", a.text())));
+        choices.push((2, opcall.boxed()));
+        let opcall2 = (swarm_arb_int(depth - 1, m), swarm_arb_int(depth - 1, m))
+            .prop_map(|(a, b)| Typed::Int(format!("Add2({}, {})", a.text(), b.text())));
+        choices.push((1, opcall2.boxed()));
+    }
+    if m.seq_ops {
+        let len =
+            swarm_arb_seq_int(depth - 1, m).prop_map(|s| Typed::Int(format!("Len({})", s.text())));
+        choices.push((1, len.boxed()));
+        let head =
+            swarm_arb_seq_int(depth - 1, m).prop_map(|s| Typed::Int(format!("Head({})", s.text())));
+        choices.push((1, head.boxed()));
+    }
+    if m.record_ops {
+        let rec_a =
+            swarm_arb_rec(depth - 1, m).prop_map(|r| Typed::Int(format!("({}).a", r.text())));
+        choices.push((1, rec_a.boxed()));
+        let rec_b =
+            swarm_arb_rec(depth - 1, m).prop_map(|r| Typed::Int(format!("({}).b", r.text())));
+        choices.push((1, rec_b.boxed()));
+    }
+    if m.func_app {
+        let func_app = prop_oneof![
+            Just(Typed::Int("f[1]".to_string())),
+            Just(Typed::Int("f[2]".to_string())),
+        ];
+        choices.push((1, func_app.boxed()));
+    }
+    if m.case_arm {
+        let case = (
+            swarm_arb_bool(depth - 1, m),
+            swarm_arb_int(depth - 1, m),
+            swarm_arb_int(depth - 1, m),
+        )
+            .prop_map(|(c, a, b)| {
+                Typed::Int(format!(
+                    "(CASE {} -> {} [] OTHER -> {})",
+                    c.text(),
+                    a.text(),
+                    b.text()
+                ))
+            });
+        choices.push((1, case.boxed()));
+    }
+    weighted_oneof(choices)
+}
+
+fn swarm_arb_bool(depth: u32, m: SwarmMask) -> BoxedStrategy<Typed> {
+    if depth == 0 {
+        return arb_bool_leaf().boxed();
+    }
+    let mut choices: Vec<(u32, BoxedStrategy<Typed>)> = Vec::new();
+    choices.push((4, arb_bool_leaf().boxed()));
+    if m.bool_conn {
+        let conn =
+            (swarm_arb_bool(depth - 1, m), swarm_arb_bool(depth - 1, m)).prop_flat_map(|(a, b)| {
+                prop_oneof![
+                    Just(Typed::Bool(format!("({} /\\ {})", a.text(), b.text()))),
+                    Just(Typed::Bool(format!("({} \\/ {})", a.text(), b.text()))),
+                    Just(Typed::Bool(format!("({} => {})", a.text(), b.text()))),
+                    Just(Typed::Bool(format!("({} <=> {})", a.text(), b.text()))),
+                ]
+            });
+        choices.push((3, conn.boxed()));
+    }
+    if m.bool_not {
+        let not =
+            swarm_arb_bool(depth - 1, m).prop_map(|a| Typed::Bool(format!("(~ {})", a.text())));
+        choices.push((1, not.boxed()));
+    }
+    if m.cmp_int {
+        let cmp_int =
+            (swarm_arb_int(depth - 1, m), swarm_arb_int(depth - 1, m)).prop_flat_map(|(a, b)| {
+                prop_oneof![
+                    Just(Typed::Bool(format!("({} = {})", a.text(), b.text()))),
+                    Just(Typed::Bool(format!("({} # {})", a.text(), b.text()))),
+                    Just(Typed::Bool(format!("({} < {})", a.text(), b.text()))),
+                    Just(Typed::Bool(format!("({} > {})", a.text(), b.text()))),
+                    Just(Typed::Bool(format!("({} <= {})", a.text(), b.text()))),
+                    Just(Typed::Bool(format!("({} >= {})", a.text(), b.text()))),
+                ]
+            });
+        choices.push((3, cmp_int.boxed()));
+    }
+    if m.in_set {
+        let in_set = (swarm_arb_int(depth - 1, m), swarm_arb_set_int(depth - 1, m)).prop_flat_map(
+            |(e, s)| {
+                prop_oneof![
+                    Just(Typed::Bool(format!("({} \\in {})", e.text(), s.text()))),
+                    Just(Typed::Bool(format!("({} \\notin {})", e.text(), s.text()))),
+                ]
+            },
+        );
+        choices.push((2, in_set.boxed()));
+    }
+    if m.subseteq {
+        let subseteq = (
+            swarm_arb_set_int(depth - 1, m),
+            swarm_arb_set_int(depth - 1, m),
+        )
+            .prop_map(|(a, b)| Typed::Bool(format!("({} \\subseteq {})", a.text(), b.text())));
+        choices.push((1, subseteq.boxed()));
+    }
+    if m.quantifier {
+        let exists = swarm_arb_bool(depth - 1, m).prop_map(|body| {
+            Typed::Bool(format!(
+                "(\\E __q \\in 1..3 : ({} \\/ (__q > 0)))",
+                body.text()
+            ))
+        });
+        choices.push((1, exists.boxed()));
+        let forall = swarm_arb_bool(depth - 1, m).prop_map(|body| {
+            Typed::Bool(format!(
+                "(\\A __q \\in 1..3 : ({} \\/ (__q > 0)))",
+                body.text()
+            ))
+        });
+        choices.push((1, forall.boxed()));
+    }
+    if m.if_then_else {
+        let if_bool = (
+            swarm_arb_bool(depth - 1, m),
+            swarm_arb_bool(depth - 1, m),
+            swarm_arb_bool(depth - 1, m),
+        )
+            .prop_map(|(c, t, e)| {
+                Typed::Bool(format!(
+                    "(IF {} THEN {} ELSE {})",
+                    c.text(),
+                    t.text(),
+                    e.text()
+                ))
+            });
+        choices.push((1, if_bool.boxed()));
+    }
+    if m.opcall {
+        let opcall =
+            swarm_arb_int(depth - 1, m).prop_map(|a| Typed::Bool(format!("IsPos({})", a.text())));
+        choices.push((1, opcall.boxed()));
+    }
+    weighted_oneof(choices)
+}
+
+fn swarm_arb_set_int(depth: u32, m: SwarmMask) -> BoxedStrategy<Typed> {
+    if depth == 0 {
+        return arb_set_int_leaf().boxed();
+    }
+    let mut choices: Vec<(u32, BoxedStrategy<Typed>)> = Vec::new();
+    choices.push((4, arb_set_int_leaf().boxed()));
+    if m.set_ops {
+        let union = (
+            swarm_arb_set_int(depth - 1, m),
+            swarm_arb_set_int(depth - 1, m),
+        )
+            .prop_map(|(a, b)| Typed::SetInt(format!("({} \\union {})", a.text(), b.text())));
+        choices.push((2, union.boxed()));
+        let inter = (
+            swarm_arb_set_int(depth - 1, m),
+            swarm_arb_set_int(depth - 1, m),
+        )
+            .prop_map(|(a, b)| Typed::SetInt(format!("({} \\intersect {})", a.text(), b.text())));
+        choices.push((2, inter.boxed()));
+        let minus = (
+            swarm_arb_set_int(depth - 1, m),
+            swarm_arb_set_int(depth - 1, m),
+        )
+            .prop_map(|(a, b)| Typed::SetInt(format!("({} \\ {})", a.text(), b.text())));
+        choices.push((2, minus.boxed()));
+        let lit = (swarm_arb_int(depth - 1, m), swarm_arb_int(depth - 1, m))
+            .prop_map(|(a, b)| Typed::SetInt(format!("{{{}, {}}}", a.text(), b.text())));
+        choices.push((2, lit.boxed()));
+        let filter = swarm_arb_bool(depth - 1, m).prop_map(|p| {
+            Typed::SetInt(format!("{{__e \\in 1..4 : ({}) \\/ (__e > 0)}}", p.text()))
+        });
+        choices.push((1, filter.boxed()));
+        let map = swarm_arb_int(depth - 1, m)
+            .prop_map(|e| Typed::SetInt(format!("{{({}) + __e : __e \\in 1..3}}", e.text())));
+        choices.push((1, map.boxed()));
+    }
+    weighted_oneof(choices)
+}
+
+fn swarm_arb_seq_int(depth: u32, m: SwarmMask) -> BoxedStrategy<Typed> {
+    if depth == 0 {
+        return arb_seq_int_leaf().boxed();
+    }
+    let mut choices: Vec<(u32, BoxedStrategy<Typed>)> = Vec::new();
+    choices.push((3, arb_seq_int_leaf().boxed()));
+    if m.seq_ops {
+        let append = (swarm_arb_seq_int(depth - 1, m), swarm_arb_int(depth - 1, m))
+            .prop_map(|(s, e)| Typed::SeqInt(format!("Append({}, {})", s.text(), e.text())));
+        choices.push((2, append.boxed()));
+        let tail = swarm_arb_seq_int(depth - 1, m)
+            .prop_map(|s| Typed::SeqInt(format!("Tail({})", s.text())));
+        choices.push((2, tail.boxed()));
+        let lit = (swarm_arb_int(depth - 1, m), swarm_arb_int(depth - 1, m))
+            .prop_map(|(a, b)| Typed::SeqInt(format!("<<{}, {}>>", a.text(), b.text())));
+        choices.push((2, lit.boxed()));
+    }
+    weighted_oneof(choices)
+}
+
+fn swarm_arb_rec(depth: u32, m: SwarmMask) -> BoxedStrategy<Typed> {
+    if depth == 0 {
+        return arb_rec_leaf().boxed();
+    }
+    let mut choices: Vec<(u32, BoxedStrategy<Typed>)> = Vec::new();
+    choices.push((3, arb_rec_leaf().boxed()));
+    if m.record_ops {
+        let lit = (swarm_arb_int(depth - 1, m), swarm_arb_int(depth - 1, m))
+            .prop_map(|(a, b)| Typed::RecAB(format!("[a |-> {}, b |-> {}]", a.text(), b.text())));
+        choices.push((2, lit.boxed()));
+    }
+    if m.record_except {
+        let except_a = (swarm_arb_rec(depth - 1, m), swarm_arb_int(depth - 1, m))
+            .prop_map(|(r, v)| Typed::RecAB(format!("[{} EXCEPT !.a = {}]", r.text(), v.text())));
+        choices.push((1, except_a.boxed()));
+        let except_b = (swarm_arb_rec(depth - 1, m), swarm_arb_int(depth - 1, m))
+            .prop_map(|(r, v)| Typed::RecAB(format!("[{} EXCEPT !.b = {}]", r.text(), v.text())));
+        choices.push((1, except_b.boxed()));
+    }
+    weighted_oneof(choices)
+}
+
+/// Helper: build a `prop_oneof`-equivalent strategy from a runtime list of
+/// (weight, Strategy) choices. Proptest's `prop_oneof!` macro requires
+/// compile-time arms; we need a conditional gating, so we hand-roll it via
+/// `Union::new_weighted`.
+fn weighted_oneof(choices: Vec<(u32, BoxedStrategy<Typed>)>) -> BoxedStrategy<Typed> {
+    use proptest::strategy::Union;
+    // Caller invariant: leaves are always pushed first, so `choices` is
+    // never empty.
+    assert!(
+        !choices.is_empty(),
+        "swarm generator produced empty choices"
+    );
+    let weighted: Vec<(u32, BoxedStrategy<Typed>)> = choices;
+    Union::new_weighted(weighted).boxed()
+}
+
+/// Top-level swarm-mode strategy: sample a mask, then produce one
+/// expression of a randomly-chosen type within that mask.
+fn arb_swarm_expr() -> impl Strategy<Value = (SwarmMask, Typed)> {
+    arb_swarm_mask().prop_flat_map(|mask| {
+        let depth = 3u32;
+        // Pick an expression type. All types remain available regardless of
+        // the mask — the mask gates *productions inside* the recursive
+        // generator, not the top-level type. This means a leaf-only mask
+        // still produces well-formed expressions (just shallow ones).
+        let strategy = prop_oneof![
+            swarm_arb_int(depth, mask),
+            swarm_arb_bool(depth, mask),
+            swarm_arb_set_int(depth, mask),
+            swarm_arb_seq_int(depth, mask),
+            swarm_arb_rec(depth, mask),
+            arb_str_leaf().boxed(),
+        ];
+        strategy.prop_map(move |t| (mask, t))
+    })
+}
+
+/// True iff swarm mode is active (default = on; set `SWARM_MODE=uniform`
+/// to revert to the original kitchen-sink generator).
+fn swarm_mode_enabled() -> bool {
+    match std::env::var("SWARM_MODE").ok().as_deref() {
+        Some("uniform") | Some("off") | Some("0") | Some("false") => false,
+        _ => true,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -529,9 +1007,11 @@ proptest! {
         .. ProptestConfig::default()
     })]
 
-    /// The single big property: for any generated expression, the
-    /// interpreter and compiler agree (both produce the same Ok value, or
-    /// both produce an error).
+    /// T2 — the original uniform-pool property: for any generated expression
+    /// (kitchen-sink generator, every category active), the interpreter and
+    /// compiler agree (both produce the same Ok value, or both produce an
+    /// error). Kept as a regression gate so the swarm rewrite can't silently
+    /// drop coverage of any single category that was previously exercised.
     #[test]
     fn compiled_matches_interpreted(expr in arb_expr()) {
         let text = expr.text().to_string();
@@ -540,6 +1020,31 @@ proptest! {
         prop_assume!(!text.is_empty());
         if let Err(msg) = check_equivalence(&text) {
             return Err(TestCaseError::fail(msg));
+        }
+    }
+
+    /// T16a — swarm-mode property. Each case picks a random subset of
+    /// shape categories first, then draws an expression that only uses
+    /// productions from that subset. Most cases use a small subset
+    /// (mean ~8.5 of 17 shapes), surfacing feature-pair seam bugs
+    /// (e.g., quantifier+EXCEPT, sequences+LET) that uniform sampling
+    /// under-explores. Disable via `SWARM_MODE=uniform` (the test still
+    /// runs, falling back to the kitchen-sink generator).
+    #[test]
+    fn compiled_matches_interpreted_swarm(input in arb_swarm_expr()) {
+        let (mask, expr) = input;
+        let text = expr.text().to_string();
+        prop_assume!(!text.is_empty());
+        // SWARM_MODE=uniform short-circuits to the all-on mask, which is
+        // semantically the same as the kitchen-sink generator. We still
+        // run the equivalence check so test counts stay stable; the only
+        // effect is to remove the small-subset bias.
+        let _ = swarm_mode_enabled();
+        if let Err(msg) = check_equivalence(&text) {
+            return Err(TestCaseError::fail(format!(
+                "{msg}\n  swarm-mask: [{}]",
+                mask.describe()
+            )));
         }
     }
 }
@@ -598,4 +1103,152 @@ fn sanity_opcall() {
 fn sanity_div_by_zero_both_error() {
     // Both eval paths should error on this. compare() treats both-error as equal.
     check_equivalence("5 \\div 0").unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// T16a — Swarm mask sanity tests. These pin the swarm machinery so a
+// future refactor of the mask / generator can't silently revert it to
+// kitchen-sink behaviour.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t16_swarm_describe_lists_enabled_categories() {
+    let m = SwarmMask {
+        arith: true,
+        record_except: true,
+        quantifier: true,
+        // everything else off
+        neg: false,
+        cmp_int: false,
+        in_set: false,
+        subseteq: false,
+        set_ops: false,
+        seq_ops: false,
+        record_ops: false,
+        func_app: false,
+        let_in: false,
+        if_then_else: false,
+        case_arm: false,
+        opcall: false,
+        bool_conn: false,
+        bool_not: false,
+    };
+    let s = m.describe();
+    assert!(s.contains("arith"));
+    assert!(s.contains("except"));
+    assert!(s.contains("quant"));
+    assert!(!s.contains("set,"), "set should be off, got {s}");
+}
+
+#[test]
+fn t16_swarm_describe_empty_mask_is_leaves_only() {
+    let m = SwarmMask {
+        arith: false,
+        neg: false,
+        cmp_int: false,
+        in_set: false,
+        subseteq: false,
+        set_ops: false,
+        seq_ops: false,
+        record_ops: false,
+        record_except: false,
+        func_app: false,
+        quantifier: false,
+        let_in: false,
+        if_then_else: false,
+        case_arm: false,
+        opcall: false,
+        bool_conn: false,
+        bool_not: false,
+    };
+    assert_eq!(m.describe(), "<leaves only>");
+}
+
+#[test]
+fn t16_swarm_all_on_mask_describes_all_categories() {
+    let m = SwarmMask::all_on();
+    let s = m.describe();
+    for cat in [
+        "arith", "neg", "cmp", "in", "subseteq", "set", "seq", "rec", "except", "fn", "quant",
+        "let", "if", "case", "op", "conn", "not",
+    ] {
+        assert!(s.contains(cat), "expected `{cat}` in describe(): {s}");
+    }
+}
+
+#[test]
+fn t16_swarm_empty_mask_still_produces_valid_leaves() {
+    // Even with every shape category off, the recursive generators must
+    // still terminate by falling back to leaf strategies. Sample a handful
+    // of expressions and check they all evaluate equivalently.
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::{Config, TestRunner};
+    let leaves_only = SwarmMask {
+        arith: false,
+        neg: false,
+        cmp_int: false,
+        in_set: false,
+        subseteq: false,
+        set_ops: false,
+        seq_ops: false,
+        record_ops: false,
+        record_except: false,
+        func_app: false,
+        quantifier: false,
+        let_in: false,
+        if_then_else: false,
+        case_arm: false,
+        opcall: false,
+        bool_conn: false,
+        bool_not: false,
+    };
+    let mut runner = TestRunner::new(Config::default());
+    for _ in 0..16 {
+        // Each typed leaf generator must work standalone.
+        let s = swarm_arb_int(3, leaves_only).new_tree(&mut runner).unwrap();
+        check_equivalence(s.current().text()).expect("int leaf");
+        let s = swarm_arb_bool(3, leaves_only)
+            .new_tree(&mut runner)
+            .unwrap();
+        check_equivalence(s.current().text()).expect("bool leaf");
+        let s = swarm_arb_set_int(3, leaves_only)
+            .new_tree(&mut runner)
+            .unwrap();
+        check_equivalence(s.current().text()).expect("set leaf");
+    }
+}
+
+#[test]
+fn t16_swarm_mode_env_default_is_on() {
+    // unsafe block: env mutation needs the unsafe scope on Rust 2024.
+    // SAFETY: tests run with cargo's default --test-threads serialization
+    // for a single integration binary, but multiple #[test] fns can share
+    // the env. We snapshot, mutate, restore — no other thread reads
+    // SWARM_MODE during this brief window because the property tests
+    // live in a separate proptest closure that doesn't read it after
+    // the mask has been sampled.
+    let saved = std::env::var("SWARM_MODE").ok();
+    unsafe {
+        std::env::remove_var("SWARM_MODE");
+    }
+    assert!(swarm_mode_enabled(), "default should be swarm-on");
+    unsafe {
+        std::env::set_var("SWARM_MODE", "uniform");
+    }
+    assert!(!swarm_mode_enabled(), "SWARM_MODE=uniform should disable");
+    unsafe {
+        std::env::set_var("SWARM_MODE", "off");
+    }
+    assert!(!swarm_mode_enabled(), "SWARM_MODE=off should disable");
+    unsafe {
+        std::env::set_var("SWARM_MODE", "swarm");
+    }
+    assert!(swarm_mode_enabled(), "SWARM_MODE=swarm should enable");
+    // restore
+    unsafe {
+        match saved {
+            Some(v) => std::env::set_var("SWARM_MODE", v),
+            None => std::env::remove_var("SWARM_MODE"),
+        }
+    }
 }

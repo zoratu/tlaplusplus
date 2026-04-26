@@ -229,20 +229,44 @@ run a chaos soak as a manual pre-release step:
 
 ```bash
 cargo build --release --features failpoints
+
+# Single-failpoint baseline (T11): one random failpoint per iter
 scripts/chaos_soak.sh --duration 3600
+
+# Swarm mode (T16b): multiple concurrent failpoints per iter,
+# surfaces fault-cascade bugs single-fault tests can't reach
+scripts/chaos_soak.sh --duration 3600 --swarm-mode auto
 ```
 
 The soak runs `tlaplusplus run-tla` against a target spec (default:
 `corpus/internals/CheckpointDrain.tla`, ~26K distinct states) in a tight
 loop. Each iteration sets `FAILPOINTS=<random-failpoint>=<random-action>`
-where most actions are transient (`1*return->off`, `2*return->off`) and a
-small fraction permanent (`return`). It then checks the run's distinct
-state count and invariant verdict against the no-failpoint control. The
-soak fails on any state-count mismatch, hang, or panic-without-recovery.
+(or `name1=action1;name2=action2;...` in swarm mode) where most actions
+are transient (`1*return->off`, `2*return->off`) and a small fraction
+permanent (`return`). It then checks the run's distinct state count and
+invariant verdict against the no-failpoint control. The soak fails on
+any state-count mismatch, hang, or panic-without-recovery.
+
+`--swarm-mode` controls how many concurrent failpoints fire per iteration
+(T16b — Regehr et al., ICST 2012, "Swarm Testing"):
+
+- `--swarm-mode 1` (default) — one failpoint per iter (T11 baseline,
+  backward-compatible).
+- `--swarm-mode N` — exactly N concurrent failpoints per iter (clamped
+  to catalog size 12).
+- `--swarm-mode auto` — random N in `[1, --swarm-max]` (default
+  `--swarm-max 4`) per iter. Recommended for finding fault-cascade bugs.
+
+Real production faults often correlate (memory pressure spikes both
+queue spill and FP-store resize); swarm mode reproduces this by enabling
+2-4 failpoints simultaneously. The summary prints both the per-failpoint
+fire counts and a top-N concurrent-pair coverage matrix so you can see
+which failure combinations were exercised.
 
 Wired in `src/main.rs::main()` under `cfg(feature = "failpoints")`:
 `fail::FailScenario::setup()` is called so the standard `FAILPOINTS` env
-var configures failpoints for the spawned process.
+var configures failpoints for the spawned process. The `fail` crate
+parses `;` as the per-failpoint config delimiter.
 
 ## Performance Tuning
 

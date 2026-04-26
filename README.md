@@ -162,18 +162,31 @@ instance) and is run manually as a release ritual, not per PR.
 # Build with failpoints support
 cargo build --release --features failpoints
 
-# Run a 1-hour soak against CheckpointDrain (default)
+# Run a 1-hour soak against CheckpointDrain (default), single failpoint per iter
 scripts/chaos_soak.sh --duration 3600
 
-# Or target a different spec
+# Swarm mode (T16b — Regehr et al. "Swarm Testing", ICST 2012):
+# random 1-4 concurrent failpoints per iter, surfaces fault-cascade bugs
+scripts/chaos_soak.sh --duration 3600 --swarm-mode auto
+
+# Or target a different spec / pin a fixed concurrent-failpoint count
 scripts/chaos_soak.sh --duration 3600 \
   --spec WorkStealingTermination \
+  --swarm-mode 3 \
   --per-iter-timeout 90
 ```
 
-Output: per-iteration TSV log under `.chaos-soak/iterations.tsv`, retained
-logs for any divergent / hanging iteration under `.chaos-soak/logs/`, and
-a `summary.txt` with the failpoint coverage matrix.
+`--swarm-mode` selects how many failpoints fire concurrently per iteration:
+
+- `1` (default) — single failpoint, T11-baseline behaviour, backward-compatible.
+- `N` (positive integer) — exactly N concurrent failpoints (clamped to catalog size).
+- `auto` — random N in `[1, --swarm-max]`, default `--swarm-max 4`.
+
+Output: per-iteration TSV log under `.chaos-soak/iterations.tsv` (with
+`swarm_n` column for concurrency count and comma-joined `failpoint`/`action`
+columns), retained logs for any divergent / hanging iteration under
+`.chaos-soak/logs/`, and a `summary.txt` with both the per-failpoint
+coverage matrix and a top concurrent-pair matrix (for swarm-mode runs).
 
 ## Configuration
 

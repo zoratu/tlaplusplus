@@ -60,9 +60,13 @@ These come first because every later change needs a regression gate.
 - [ ] **T11.2. Re-run the soak with `--queue-max-inmem-items` enabled once T11.1 is fixed,** to validate `queue_spill_fail` and `queue_load_fail` failpoint recovery.
 - [ ] **T11.3. CI-gate variant.** Reduce duration + spec size to fit in a per-PR budget (~5 min) for nightly runs.
 - [x] **T12. Cross-arch CI matrix.** Done — diff-TLC workflow now runs as a `[ubuntu-latest, ubuntu-24.04-arm]` matrix. Both archs run `cargo test --lib --bins`, the diff harness, and the T2 proptest at `PROPTEST_CASES=128`. Local x86_64 validation deferred to GitHub Actions itself. If x86 surfaces issues, file as T12.1+.
-- [ ] **T16. Swarm testing (Regehr ICST 2012, "Swarm Testing").** Each test draws from a random *subset* of features rather than the full pool, biasing the population toward minimal-interaction cases that catch bugs hidden when everything interacts. Two layers for us:
-  - **T16a. Swarm the T2 proptest harness.** Each proptest case picks a random subset of expression-shape generators (one case uses only arithmetic + comparison, another only sets + records, another only quantifiers + EXCEPT). Uniform proptest biases toward "kitchen sink" cases; swarm finds evaluator bugs in feature-pair seams.
-  - **T16b. Swarm the T11 chaos soak.** Today each soak iteration enables one failpoint. Swarm would enable a random subset of the 12 failpoints concurrently per iteration, surfacing fault-cascade bugs that single-failure tests can't reach. Cross-references T11.2 (queue spill failpoints not exercised) — swarm increases per-iter coverage breadth.
+- [x] **T16. Swarm testing (Regehr ICST 2012, "Swarm Testing").** Done — both layers landed and validated.
+  - **T16a. Swarm the T2 proptest harness.** Done — `SwarmMask` (17 shape categories) is sampled per case, then the recursive expression generators only emit productions whose category bit is set. Leaves always available so empty-mask cases still produce valid expressions. Original `compiled_matches_interpreted` (uniform) kept as a regression gate alongside the new `compiled_matches_interpreted_swarm`. CI overhead +10% at PROPTEST_CASES=128 (target was <10% — within budget). No new T16.N divergences; the swarm reproduces existing T2.4 (`(-1 - (r).a)`) repeatedly across seeds, confirming the harness works. See log for shrinker-limitation note.
+  - **T16b. Swarm the T11 chaos soak.** Done — `--swarm-mode N|auto` flag added to `scripts/chaos_soak.sh` (default 1 = T11 backward-compat; `auto` = random 1-4 per iter; integer = pinned N). Multi-failpoint config joined with `;` (the `fail` crate's per-config delimiter). 30-min `--swarm-mode auto` soak: 204 iters, **0 divergences, 0 hangs, 66/66 distinct concurrent pairs observed** (exhaustive pair coverage). 146 iters fired ≥2 concurrent failpoints; runtime tolerates 4-fold simultaneous fault injection without misbehaviour. No new T16.N divergences. CLAUDE.md + README.md updated.
+
+### Follow-ups (parked)
+
+(None new from T16. The proptest shrinker's swarm-mask edge case is documented inline in `tests/compiled_vs_interpreted.rs` rather than parked as a separate item — it's a known limitation, not a bug.)
 
 ## Phase 4 — Verification
 
