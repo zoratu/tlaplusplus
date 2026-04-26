@@ -156,6 +156,28 @@ pub struct SpillableWorkStealingQueues<T> {
     /// to the hot queue). Reported in stats so operators can see the ring
     /// is doing work.
     compressed_ring_loads: AtomicU64,
+
+    /// T11.1 SOUNDNESS — number of items currently in flight in the spill
+    /// pipeline that are NOT yet visible to `has_pending_work()` via the
+    /// hot queue, the compressed ring, or disk overflow. The pipeline:
+    ///
+    ///   worker spill_buffer -> per-worker channel -> coordinator
+    ///   accumulator -> route_spill_batch -> ring or disk overflow
+    ///
+    /// Items live in worker-owned buffers, MPSC channels, and the
+    /// coordinator's accumulator before they reach a tier visible to
+    /// termination detection. Without this counter, when the spill cap is
+    /// small (`--queue-max-inmem-items` low) all workers can drain their
+    /// hot queues, see `has_pending_work() == false`, and terminate while
+    /// a non-empty spill_buffer / channel / accumulator silently drops the
+    /// items in transit.
+    ///
+    /// Bumped per item in `push_local_batch` / `push_batch_to_numa` when
+    /// the spill path is taken; decremented per item in `route_spill_batch`
+    /// after the batch is successfully placed into the ring or disk
+    /// overflow (each of which IS visible to `has_pending_work()`).
+    /// The Arc is shared with the spill coordinator thread.
+    inflight_spilled: Arc<AtomicU64>,
 }
 
 impl<T> SpillableWorkStealingQueues<T>
@@ -205,10 +227,15 @@ where
             });
         }
 
+        // T11.1: shared in-flight counter so the spill coordinator can
+        // decrement after items reach a termination-visible tier.
+        let inflight_spilled = Arc::new(AtomicU64::new(0));
+
         // Start spill coordinator thread
         let coordinator_overflow = Arc::clone(&overflow);
         let coordinator_stop = Arc::clone(&stop_signal);
         let coordinator_ring = compressed_ring.as_ref().map(Arc::clone);
+        let coordinator_inflight = Arc::clone(&inflight_spilled);
         let spill_batch_size = config.spill_batch;
         let coordinator_handle = std::thread::Builder::new()
             .name("tlapp-spill-coordinator".to_string())
@@ -218,6 +245,7 @@ where
                     coordinator_overflow,
                     coordinator_ring,
                     coordinator_stop,
+                    coordinator_inflight,
                     spill_batch_size,
                 );
             })?;
@@ -230,6 +258,7 @@ where
         let loader_stop = Arc::clone(&stop_signal);
         let loader_draining = Arc::clone(&checkpoint_draining);
         let loader_ring = compressed_ring.as_ref().map(Arc::clone);
+        let loader_inflight = Arc::clone(&inflight_spilled);
         let loader_handle = std::thread::Builder::new()
             .name("tlapp-queue-loader".to_string())
             .spawn(move || {
@@ -239,6 +268,7 @@ where
                     loader_ring,
                     loader_stop,
                     loader_draining,
+                    loader_inflight,
                 );
             })?;
 
@@ -258,6 +288,7 @@ where
             spill_batches_sent: AtomicU64::new(0),
             spill_channel_full: AtomicU64::new(0),
             compressed_ring_loads: AtomicU64::new(0),
+            inflight_spilled,
         });
 
         Ok((queues, worker_states))
@@ -275,6 +306,7 @@ where
         overflow: Arc<DiskBackedQueue<T>>,
         compressed_ring: Option<Arc<CompressedSegmentRing>>,
         stop: Arc<AtomicBool>,
+        inflight_spilled: Arc<AtomicU64>,
         batch_size: usize,
     ) {
         let mut accumulator: Vec<T> = Vec::with_capacity(batch_size);
@@ -287,56 +319,101 @@ where
             recv_indices.push(idx);
         }
 
-        let flush_accumulator =
-            |accumulator: &mut Vec<T>, ring: &Option<Arc<CompressedSegmentRing>>| {
-                if accumulator.is_empty() {
-                    return;
-                }
-                let to_write = std::mem::replace(accumulator, Vec::with_capacity(batch_size));
-                Self::route_spill_batch(to_write, ring, &overflow);
-            };
+        let flush_accumulator = |accumulator: &mut Vec<T>,
+                                 ring: &Option<Arc<CompressedSegmentRing>>,
+                                 inflight: &Arc<AtomicU64>| {
+            if accumulator.is_empty() {
+                return;
+            }
+            let to_write = std::mem::replace(accumulator, Vec::with_capacity(batch_size));
+            Self::route_spill_batch(to_write, ring, &overflow, inflight);
+        };
 
-        while !stop.load(Ordering::Acquire) {
-            // Try to receive with timeout
+        // T11.1: drain receivers fully before exiting on stop. Otherwise
+        // items still queued in the per-worker channels are silently
+        // dropped at shutdown — and `inflight_spilled` would stay > 0,
+        // hanging termination. Keep draining as long as items might still
+        // arrive (workers active, stop not set) or are actually buffered.
+        //
+        // After `stop` is set we still need to drain everything currently
+        // in the per-worker channels into the ring/disk so the inflight
+        // counter reaches 0. We bound the post-stop drain to avoid hanging
+        // forever in the (unreachable on the happy path) case where some
+        // route_spill_batch error left inflight > 0 with no items left to
+        // drain.
+        let mut idle_post_stop_iters = 0u32;
+        const MAX_IDLE_POST_STOP_ITERS: u32 = 200; // ~2s at 10ms timeout
+        loop {
+            let stopped = stop.load(Ordering::Acquire);
+
+            // Try to receive with short timeout
             let result = sel.select_timeout(std::time::Duration::from_millis(10));
-
             match result {
                 Ok(oper) => {
-                    // Find which receiver was ready
                     let recv_idx = oper.index();
                     if let Ok(batch) = oper.recv(&receivers[recv_idx]) {
-                        // Add items to accumulator
+                        idle_post_stop_iters = 0;
                         accumulator.extend(batch.items);
-
-                        // If accumulator is full, route to ring/disk
                         if accumulator.len() >= batch_size {
-                            flush_accumulator(&mut accumulator, &compressed_ring);
+                            flush_accumulator(
+                                &mut accumulator,
+                                &compressed_ring,
+                                &inflight_spilled,
+                            );
                         }
                     }
                 }
                 Err(crossbeam_channel::SelectTimeoutError) => {
-                    // Timeout - flush any accumulated items
-                    flush_accumulator(&mut accumulator, &compressed_ring);
+                    flush_accumulator(&mut accumulator, &compressed_ring, &inflight_spilled);
+                    if stopped {
+                        if inflight_spilled.load(Ordering::Acquire) == 0 {
+                            break;
+                        }
+                        idle_post_stop_iters += 1;
+                        if idle_post_stop_iters >= MAX_IDLE_POST_STOP_ITERS {
+                            eprintln!(
+                                "Warning: spill coordinator giving up shutdown drain with {} items still in flight",
+                                inflight_spilled.load(Ordering::Acquire)
+                            );
+                            break;
+                        }
+                    }
                 }
             }
         }
 
-        // Final flush on shutdown
-        flush_accumulator(&mut accumulator, &compressed_ring);
+        // Final flush on shutdown (in case the loop exited via the stopped
+        // branch right after a successful recv).
+        flush_accumulator(&mut accumulator, &compressed_ring, &inflight_spilled);
     }
 
     /// Route a spilled batch through the compressed ring first, falling
     /// back to direct disk spill if the ring is full or disabled. Items
     /// are never dropped: the ring returns them on rejection so we can
     /// hand them to disk overflow.
+    ///
+    /// T11.1: decrements `inflight_spilled` per item once the item reaches
+    /// a tier visible to `has_pending_work()` (compressed ring or disk
+    /// overflow). The counter was incremented when the item entered the
+    /// per-worker spill_buffer; the decrement here closes the accounting
+    /// loop. Without it, items in transit between worker -> channel ->
+    /// coordinator -> ring/disk are invisible to termination detection
+    /// and the runtime can stop while states are still in flight.
     fn route_spill_batch(
         batch: Vec<T>,
         compressed_ring: &Option<Arc<CompressedSegmentRing>>,
         overflow: &Arc<DiskBackedQueue<T>>,
+        inflight_spilled: &Arc<AtomicU64>,
     ) {
         let to_disk = if let Some(ring) = compressed_ring.as_ref() {
+            let attempted = batch.len() as u64;
             match ring.try_push_batch(batch) {
-                Ok(None) => return,             // Accepted by the ring; nothing else to do.
+                Ok(None) => {
+                    // Accepted by the ring; ring.is_empty() is now false,
+                    // so items are visible to has_pending_work().
+                    inflight_spilled.fetch_sub(attempted, Ordering::AcqRel);
+                    return;
+                }
                 Ok(Some(returned)) => returned, // Ring full — spill these to disk.
                 Err(e) => {
                     // Internal error path; current implementation never
@@ -345,6 +422,9 @@ where
                         "Warning: compressed ring push errored ({}); cannot recover items here",
                         e
                     );
+                    // Items are lost here; intentionally do NOT decrement
+                    // inflight so termination doesn't fire silently on a
+                    // lossy spill path. Operator will see the warning.
                     return;
                 }
             }
@@ -353,20 +433,37 @@ where
         };
 
         for item in to_disk {
-            if let Err(e) = overflow.push(item) {
-                eprintln!("Warning: spill coordinator push failed: {}", e);
+            match overflow.push(item) {
+                Ok(()) => {
+                    // Visible to overflow.has_pending_work() now.
+                    inflight_spilled.fetch_sub(1, Ordering::AcqRel);
+                }
+                Err(e) => {
+                    eprintln!("Warning: spill coordinator push failed: {}", e);
+                    // Item dropped; intentionally do NOT decrement (see
+                    // ring-error branch above for rationale).
+                }
             }
         }
     }
 
     /// Background thread that loads from disk (or the compressed ring)
     /// when hot queues need refilling.
+    ///
+    /// T11.1: takes the shared `inflight_spilled` counter so it can keep
+    /// `disk_has_pending_work` set while items are still in flight in the
+    /// spill pipeline (per-worker buffers, MPSC channels, coordinator
+    /// accumulator). Without this, the inner termination check in
+    /// `WorkStealingQueues::should_terminate` (called from
+    /// `pop_slow_path`) returns true between coordinator flushes and
+    /// workers exit early before the in-flight items reach disk/ring.
     fn loader_thread(
         hot: Arc<WorkStealingQueues<T>>,
         overflow: Arc<DiskBackedQueue<T>>,
         compressed_ring: Option<Arc<CompressedSegmentRing>>,
         stop: Arc<AtomicBool>,
         checkpoint_draining: Arc<AtomicBool>,
+        inflight_spilled: Arc<AtomicU64>,
     ) {
         // Threshold: start loading when queue drops below this
         // Must be high enough to keep 64+ workers busy while loading more
@@ -405,14 +502,20 @@ where
                 .as_ref()
                 .map(|r| !r.is_empty())
                 .unwrap_or(false);
-            let has_work = has_disk_work || has_ring_work;
+            // T11.1: items in flight in the spill pipeline are also pending —
+            // they will become visible to disk/ring once the coordinator
+            // routes them. Without this, the inner WorkStealingQueues
+            // termination check could fire between coordinator flushes.
+            let has_inflight_spill = inflight_spilled.load(Ordering::Acquire) > 0;
+            let has_work = has_disk_work || has_ring_work || has_inflight_spill;
 
             // CRITICAL: Update hot queue's disk_has_pending_work flag BEFORE any continue.
             // This prevents workers from terminating when hot queues are empty
             // but disk has millions of items waiting to be loaded.
             // Must happen every iteration, even when pending >= HIGH_WATER_MARK.
             // The flag also covers the in-memory compressed ring so workers
-            // don't terminate while compressed segments are still pending.
+            // don't terminate while compressed segments are still pending,
+            // AND covers items still in transit in the spill pipeline (T11.1).
             hot.set_disk_has_pending_work(has_work);
 
             // Only pause loading if hot queues actually have enough items
@@ -555,11 +658,27 @@ where
             for item in items {
                 worker_state.spill_buffer.push(item);
                 count += 1;
+                // T11.1: bump inflight as items enter the spill pipeline.
+                // Decremented in route_spill_batch once items reach the
+                // ring or disk overflow.
+                self.inflight_spilled.fetch_add(1, Ordering::AcqRel);
 
                 // When buffer is full, try to send to coordinator
                 if worker_state.spill_buffer.len() >= worker_state.spill_buffer_threshold {
                     self.flush_worker_spill_buffer(worker_state);
                 }
+            }
+            // T11.1: always flush at the end of a spill batch (not just at
+            // the 4K threshold). Otherwise, when the runtime is in the
+            // small-cap regime, items can sit in the spill_buffer
+            // indefinitely. The worker's hot queue is regularly refilled
+            // by the loader from items that DO make it through, so the
+            // worker rarely hits the slow-path flush in pop_for_worker.
+            // Without this end-of-call flush, items accumulate in the
+            // buffer and never reach disk/ring even though the worker is
+            // making progress on other states.
+            if !worker_state.spill_buffer.is_empty() {
+                self.flush_worker_spill_buffer(worker_state);
             }
             self.spill_redirects
                 .fetch_add(count as u64, Ordering::Relaxed);
@@ -589,11 +708,21 @@ where
             for (item, _home_numa) in items {
                 worker_state.spill_buffer.push(item);
                 count += 1;
+                // T11.1: see push_local_batch — bump inflight as items
+                // enter the spill pipeline so termination detection sees
+                // them while they're in transit.
+                self.inflight_spilled.fetch_add(1, Ordering::AcqRel);
 
                 // When buffer is full, try to send to coordinator
                 if worker_state.spill_buffer.len() >= worker_state.spill_buffer_threshold {
                     self.flush_worker_spill_buffer(worker_state);
                 }
+            }
+            // T11.1: always flush at end of call so items don't sit in the
+            // worker's spill_buffer forever. See push_local_batch for the
+            // full rationale.
+            if !worker_state.spill_buffer.is_empty() {
+                self.flush_worker_spill_buffer(worker_state);
             }
             self.spill_redirects
                 .fetch_add(count as u64, Ordering::Relaxed);
@@ -678,6 +807,17 @@ where
             return Some(item);
         }
 
+        // T11.1: when the local hot path is empty, flush this worker's
+        // spill_buffer so its in-flight items can flow through the
+        // coordinator into ring/disk and become visible to other workers
+        // (and to has_pending_work()). Without this, a worker can sit on
+        // a partial buffer (below the 4K threshold) forever, and the
+        // runtime will hang because has_pending_work() reports
+        // inflight > 0 while no worker is making progress.
+        if !worker_state.spill_buffer.is_empty() {
+            self.flush_worker_spill_buffer(worker_state);
+        }
+
         // Check pause again before potentially blocking disk I/O
         if self.hot.is_pause_requested() {
             return None;
@@ -760,6 +900,11 @@ where
         if self.overflow.has_pending_work() {
             return false;
         }
+        // T11.1: items in worker spill_buffer / spill_tx channel /
+        // coordinator accumulator are not yet in any visible tier above.
+        if self.inflight_spilled.load(Ordering::Acquire) > 0 {
+            return false;
+        }
         true
     }
 
@@ -807,7 +952,8 @@ where
         self.overflow.finish();
     }
 
-    /// Check if all queues are empty (hot + compressed ring + disk).
+    /// Check if all queues are empty (hot + compressed ring + disk +
+    /// in-flight spill pipeline).
     pub fn is_empty(&self) -> bool {
         if !self.hot.is_empty() {
             return false;
@@ -817,10 +963,19 @@ where
                 return false;
             }
         }
-        self.overflow.is_empty()
+        if !self.overflow.is_empty() {
+            return false;
+        }
+        // T11.1: pipeline buffers/channels still hold items.
+        self.inflight_spilled.load(Ordering::Acquire) == 0
     }
 
     /// Check if there's pending work in any tier.
+    ///
+    /// T11.1: includes items in flight in the spill pipeline (per-worker
+    /// spill_buffer, MPSC channel to coordinator, coordinator accumulator)
+    /// that have not yet reached the ring or disk overflow. Without this
+    /// check, workers terminate prematurely while items are in transit.
     pub fn has_pending_work(&self) -> bool {
         if self.hot.has_pending_work() {
             return true;
@@ -830,7 +985,10 @@ where
                 return true;
             }
         }
-        self.overflow.has_pending_work()
+        if self.overflow.has_pending_work() {
+            return true;
+        }
+        self.inflight_spilled.load(Ordering::Acquire) > 0
     }
 
     /// Get approximate pending count (in-memory only for speed)
@@ -2251,6 +2409,126 @@ mod tests {
             snap.push_rejected_full,
             snap.segments_compressed,
         );
+
+        let _ = std::fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    /// T11.1 regression — `has_pending_work()` must report items still in
+    /// flight in the per-worker spill_buffer (or in the channel /
+    /// coordinator accumulator). Before the fix, items in the spill
+    /// pipeline below the batch threshold were invisible to termination
+    /// detection and the runtime could exit while states were lost in
+    /// transit.
+    #[test]
+    fn t11_1_inflight_items_keep_has_pending_work_true() -> Result<()> {
+        let dir = temp_path("t11-1-inflight");
+        let config = SpillableConfig {
+            // tiny cap forces the spill path immediately
+            max_inmem_items: 4,
+            spill_dir: dir.clone(),
+            spill_batch: 100,
+            load_existing: false,
+            // large worker buffer so items DON'T flush automatically —
+            // they stay in the per-worker spill_buffer, which is the
+            // worst case for termination detection
+            worker_spill_buffer_size: 4096,
+            worker_channel_bound: 4,
+            defer_segment_deletion: false,
+            compression_enabled: true,
+            compression_max_bytes: 64 * 1024 * 1024,
+            compression_level: 1,
+        };
+        let (queues, mut workers) =
+            SpillableWorkStealingQueues::<u64>::new(1, vec![0], config)?;
+
+        // Prime pending_count above the cap so push_local_batch takes
+        // the spill path. push_global bumps the hot queue's pushed
+        // counter without bumping popped.
+        for i in 0..10u64 {
+            queues.push_global(i);
+        }
+        // Sanity: pending_count >= max_inmem_items (4) so the next
+        // push_local_batch must take the spill path.
+        assert!(queues.pending_count() >= 4);
+
+        // Now push 200 items via push_local_batch. They go through the
+        // spill path. With the T11.1 fix, push_local_batch always flushes
+        // the spill_buffer at end-of-call, so items leave the buffer
+        // immediately into the channel; from there the coordinator
+        // routes them into the ring/disk asynchronously.
+        let items: Vec<u64> = (1000..1200).collect();
+        let pushed = queues.push_local_batch(&mut workers[0], items.into_iter());
+        assert_eq!(pushed, 200);
+
+        // T11.1 invariant: until the coordinator has routed every item
+        // into the ring/disk, the inflight counter must be > 0 AND
+        // has_pending_work must be true. We can't deterministically
+        // observe inflight_spilled at any specific value because the
+        // coordinator is racing against us, but at least at this exact
+        // moment some items are still in flight (channel + accumulator).
+        // We capture the value to check the invariant: until inflight
+        // reaches 0, has_pending_work must hold.
+        let inflight = queues.inflight_spilled.load(Ordering::Acquire);
+        if inflight > 0 {
+            assert!(
+                queues.has_pending_work(),
+                "has_pending_work must be true with {} items in flight \
+                 (T11.1 regression: termination would silently drop these)",
+                inflight
+            );
+            assert!(
+                !queues.is_empty(),
+                "is_empty must be false with {} items in flight",
+                inflight
+            );
+            assert!(
+                !queues.should_terminate(),
+                "should_terminate must be false with {} items in flight",
+                inflight
+            );
+        }
+        // Either way the queue is non-empty: hot has 10 push_global'd
+        // items, plus the 200 in flight or already in ring/disk.
+        assert!(queues.has_pending_work());
+        assert!(!queues.is_empty());
+        assert!(!queues.should_terminate());
+
+        // Drain the 10 hot queue items first.
+        let mut hot_popped = 0;
+        while queues.pop_for_worker(&mut workers[0]).is_some() {
+            hot_popped += 1;
+            if hot_popped >= 10 {
+                break;
+            }
+        }
+        assert_eq!(hot_popped, 10);
+
+        // Now pop the rest. pop_for_worker auto-flushes the spill_buffer
+        // when the hot queue is empty (T11.1 fix), so the in-flight
+        // items flow through the coordinator into the ring/disk and
+        // back into the hot queue.
+        let mut popped = 0;
+        let mut attempts = 0;
+        while popped < pushed && attempts < 500 {
+            if queues.pop_for_worker(&mut workers[0]).is_some() {
+                popped += 1;
+                attempts = 0;
+            } else {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        assert_eq!(
+            popped, pushed,
+            "must recover all {} items via the spill->ring/disk->hot pipeline",
+            pushed
+        );
+
+        // Final state: pipeline empty, termination allowed.
+        assert_eq!(queues.inflight_spilled.load(Ordering::Acquire), 0);
+        assert!(queues.is_empty());
+        assert!(queues.should_terminate());
 
         let _ = std::fs::remove_dir_all(dir);
         Ok(())
