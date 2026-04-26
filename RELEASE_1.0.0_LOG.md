@@ -2739,3 +2739,186 @@ minimal.
 - `perf(t9.2): multi-source BFS seed (init + median) for long-trace minimization` — `f0a5da4`
 - `feat(t9.3): suffix shortening to alternate violations` — `8252eb8`
 
+
+### T11.1 / T11.2 — Spill-pipeline soundness fix + re-soak (post-1.0 unblock)
+
+**Spot:** c8g.xlarge in us-west-2, `REDACTED-INSTANCE` (4 vCPU aarch64,
+7.7 GB) — re-using the T11 / T16b instance.
+
+**T11.1 root cause.** Items in the spill pipeline were invisible to
+termination detection. The pipeline is
+
+  worker.spill_buffer (Vec)  ->  per-worker MPSC channel (16 batches)
+       ->  coordinator.accumulator (Vec)  ->  route_spill_batch
+       ->  compressed ring  OR  disk overflow
+
+`SpillableWorkStealingQueues::has_pending_work()` and
+`should_terminate()` only checked `hot.has_pending_work()` /
+`ring.is_empty()` / `overflow.has_pending_work()`. None of the three
+intermediate buffers (`spill_buffer`, channel, accumulator) is visible
+through any of those tiers. With a small `--queue-max-inmem-items`,
+workers regularly take the spill path; once a worker spills items but
+hasn't crossed the 4096-item buffer threshold, the items sit in the
+buffer. If the worker pool then collectively goes idle (all hot queues
+empty, all stealers empty) the runtime declares termination and the
+in-flight items are silently dropped.
+
+This is *exactly* a counter accounting bug — discrete, not architectural.
+
+**Fix (commit `fix(t11.1)`).** `src/storage/spillable_work_stealing.rs`:
+
+1. Added `inflight_spilled: Arc<AtomicU64>` on
+   `SpillableWorkStealingQueues`. Bumped per item in
+   `push_local_batch` / `push_batch_to_numa` when the spill path is
+   taken (line ~625 and ~675), decremented per item in
+   `route_spill_batch` after items reach the compressed ring (Ok(None))
+   or each successful disk overflow push (line ~410-440).
+2. Threaded the counter into `has_pending_work()` (line ~895),
+   `should_terminate()` (line ~810), `is_empty()` (line ~880), and the
+   loader thread's `disk_has_pending_work` flag (line ~510). The
+   loader's flag covers the case where the inner
+   `WorkStealingQueues::should_terminate()` (called from
+   `pop_slow_path`) would otherwise bail.
+3. Made `push_local_batch` / `push_batch_to_numa` always flush the
+   spill_buffer at end-of-call (in addition to the existing
+   threshold-based flush). Without this, items in the buffer would
+   linger forever when the worker's hot queue keeps getting refilled
+   by the loader and the worker rarely hits the slow-path flush in
+   `pop_for_worker`.
+4. Added a slow-path flush in `pop_for_worker`: when the inner hot pop
+   returns `None`, flush the spill_buffer before trying disk reload.
+5. Made the spill coordinator stop-aware: post-stop, keep draining
+   per-worker channels until either `inflight_spilled == 0` or 2 s
+   elapse, so shutdown doesn't strand items (with a logged warning if
+   the 2 s grace expires).
+
+**Iteration note.** A first attempt only added the inflight counter +
+the `has_pending_work()` updates and did NOT include the loader
+`disk_has_pending_work` plumbing or the end-of-call buffer flush.
+Result on the c8g.xlarge re-run: workers correctly refused to terminate
+(progress stuck at `4,155 distinct, 4,159 states left on queue`) but
+made zero forward progress. Inner `pop_slow_path` was looping forever
+(`should_terminate` saw `disk_has_pending_work = false` even though
+`inflight_spilled > 0`), so outer `pop_for_worker` never ran the
+spill_buffer flush. Adding (1) the loader's inflight check and (2) the
+end-of-call buffer flush in `push_*_batch` resolved it. This is logged
+as a warning to anyone touching this code: the inflight counter alone
+is not enough — workers also need a way to drain their own buffers
+without depending on inner-pop returning `None`.
+
+**T11.1 validation (REDACTED-INSTANCE, c8g.xlarge, 22:23 UTC).**
+
+```
+=== cap=2000   ===  5/5 runs return  26,344 distinct, 80,389 generated
+=== cap=10000  ===  5/5 runs return  26,344 distinct, 80,389 generated
+=== cap=20000  ===  5/5 runs return  26,344 distinct, 80,389 generated
+=== cap=50000  ===  5/5 runs return  26,344 distinct, 80,389 generated
+```
+
+20/20 runs pass; matches the 26,344 baseline exactly across all four
+caps. Wall-time at cap=2000 (~9.4 s) is comparable to the default 50 M
+cap (~11.5 s) on this 2-worker spec.
+
+Test counts on remote (c8g.xlarge):
+- `cargo test --release`: **728 passed, 0 failed** (was 727 — net +1
+  from the new `t11_1_inflight_items_keep_has_pending_work_true` unit
+  test).
+- `cargo test --release --features failpoints`: **748 passed, 0 failed**
+  (was 746 — net +2).
+
+Regression test: `t11_1_inflight_items_keep_has_pending_work_true` in
+`src/storage/spillable_work_stealing.rs::tests`. Asserts the
+spill_buffer items remain visible to `has_pending_work()` /
+`should_terminate()` until the coordinator routes them, then asserts
+all items round-trip through the pipeline back into the hot queue.
+Plus an `#[ignore]`d integration suite in
+`tests/queue_spill_soundness_t11_1.rs` that drives the release binary
+at multiple caps; runs with `cargo test --release --test
+queue_spill_soundness_t11_1 -- --ignored`.
+
+**T11.1 follow-on (worker_panic + spill).** During the T11.2 re-soak,
+the first iteration that fired `worker_panic` revealed a follow-on bug:
+the run hung at "3,990 distinct, 4,005 left on queue" until the
+per-iter 120 s timeout. Root cause: when a worker panics, its
+`spill_tx` Sender is dropped, leaving the corresponding Receiver
+disconnected. The spill coordinator's `crossbeam_channel::Select`
+considered the disconnected Receiver "ready" on every select call and
+returned its disconnect-error as the winning operation, starving the
+other workers' channels. The coordinator was tight-spinning on a
+single dead receiver and never drained the live ones, so
+`inflight_spilled` stayed > 0 and the alive worker's
+`has_pending_work()` remained true forever.
+
+Fix in the same file (`spillable_work_stealing.rs`):
+
+1. `spill_coordinator_thread` now keeps an `active_receivers:
+   Vec<(usize, Receiver<_>)>` and rebuilds the `Select` from it each
+   iteration. On a disconnect-error, it `swap_remove`s the dead entry
+   so it's never re-selected.
+2. Added a `Drop` impl on `SpillableWorkerState` that, on panic, tries
+   one final `try_send` of any items still in the worker's
+   `spill_buffer`; on disconnect/full it decrements `inflight_spilled`
+   directly (with a logged warning) so termination doesn't hang on
+   genuinely-lost items. Callers should still call
+   `flush_worker_counters` before dropping on the happy path.
+
+Validation: `FAILPOINTS=worker_panic=1*return->off` against
+CheckpointDrain at cap=2000 now completes in 16.5 s with 26,344
+distinct (was 120 s timeout). 5 baseline runs (no failpoints) at caps
+2000 and 50000 still all return 26,344 distinct.
+
+**T11.2 re-soak (commit `test(t11.2)`).** Once both T11.1 fixes landed,
+ran the 30-min swarm chaos soak with `--queue-max-inmem 2000` so the
+spill path actually engages under fault injection. Command:
+
+```
+scripts/chaos_soak.sh --duration 1800 --queue-max-inmem 2000 \
+                       --swarm-mode auto --workers 2
+```
+
+Results on c8g.xlarge (REDACTED-INSTANCE, 22:55-23:25 UTC):
+
+```
+iterations:    166
+divergences:    0
+hangs/timeouts: 0
+distinct concurrent pairs observed: 65
+RESULT: clean.
+```
+
+Swarm size distribution: n=1: 45 iters; n=2: 43; n=3: 42; n=4: 36.
+
+Per-failpoint downstream fire counts (all "exit_ok" in the soak's
+column, meaning the failpoint reached its `fail_point!()` site AND
+the runtime recovered to a normal exit-0 with the baseline distinct
+count):
+
+```
+queue_spill_fail        37 fires, 37 ok, 0 hangs, 0 diverge
+queue_load_fail         34 fires, 34 ok, 0 hangs, 0 diverge
+worker_panic            30 fires, 30 ok, 0 hangs, 0 diverge
+fp_store_shard_full     37 fires, 37 ok
+checkpoint_disk_write_fail   36, 36 ok
+checkpoint_fp_flush_fail     36, 36 ok
+checkpoint_rename_fail       36, 36 ok
+checkpoint_queue_flush_fail  35, 35 ok
+checkpoint_write_fail        35, 35 ok
+quiescence_timeout      32, 32 ok
+fp_switch_slow          29, 29 ok
+worker_pause_delay      24, 24 ok
+```
+
+This is what T11.2 was waiting on: with `--queue-max-inmem 2000` the
+spill path engages on every iter, the failpoints' downstream code
+paths are exercised, and the runtime survives every concurrent-fault
+combination the swarm threw at it. Note that the in-memory
+compressed ring (default-on) absorbs the majority of spill batches
+before they reach disk; `queue_spill_fail` fires anyway when the ring
+momentarily fills and a batch falls through to `overflow.push`. See
+**T11.4** in the plan for a follow-up about the silent-loss path on a
+permanent `queue_spill_fail` injection — out of scope for this fix.
+
+Worker_panic iters now complete in ~16s (panic recovery, vs ~10s
+baseline) instead of timing out at 120s — confirms the second T11.1
+commit (the spill-coordinator disconnect fix) is doing its job in the
+real soak environment.
