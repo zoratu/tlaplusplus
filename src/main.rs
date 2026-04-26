@@ -1319,6 +1319,13 @@ fn maybe_setup_cluster(
 }
 
 fn main() -> anyhow::Result<()> {
+    // T11: when built with --features failpoints, initialize the FailScenario
+    // so the standard `FAILPOINTS=name=action[;...]` env var configures
+    // failpoints for this process. Without this call, externally-set FAILPOINTS
+    // is ignored. The teardown is handled implicitly on process exit.
+    #[cfg(feature = "failpoints")]
+    let _failpoint_scenario = fail::FailScenario::setup();
+
     let cli = Cli::parse();
 
     match cli.command {

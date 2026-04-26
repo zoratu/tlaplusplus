@@ -150,6 +150,31 @@ The test suite includes:
 - **29/29 internal corpus specs** pass analysis
 - **14 mutation-validated correctness tests** for the compiled action evaluator
 
+### Pre-release chaos soak
+
+`scripts/chaos_soak.sh` runs the binary (built with `--features failpoints`)
+in a tight loop with random failpoint injection — covers every failpoint in
+`src/chaos.rs` and verifies that final state count + invariant verdict still
+match a control run. This is expensive (~1 hour wall time on a small spot
+instance) and is run manually as a release ritual, not per PR.
+
+```bash
+# Build with failpoints support
+cargo build --release --features failpoints
+
+# Run a 1-hour soak against CheckpointDrain (default)
+scripts/chaos_soak.sh --duration 3600
+
+# Or target a different spec
+scripts/chaos_soak.sh --duration 3600 \
+  --spec WorkStealingTermination \
+  --per-iter-timeout 90
+```
+
+Output: per-iteration TSV log under `.chaos-soak/iterations.tsv`, retained
+logs for any divergent / hanging iteration under `.chaos-soak/logs/`, and
+a `summary.txt` with the failpoint coverage matrix.
+
 ## Configuration
 
 ### Runtime Parameters

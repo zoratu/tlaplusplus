@@ -16,6 +16,7 @@
 /.analyze-tla/
 /.claude/
 /.bench-t10/
+/.chaos-soak/
 package.json
 package-lock.json
 tests/*.proptest-regressions

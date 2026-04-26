@@ -221,6 +221,29 @@ Recovery behaviors:
 - **I/O failures**: Exponential backoff retry (3 attempts, 100ms-2s delays)
 - **Memory pressure**: Graceful degradation, emergency checkpoints
 
+### Chaos Soak (T11, pre-release ritual)
+
+Single-shot failpoint tests catch "does this one fault recover" but not
+"does the system survive 1000+ random faults over an hour." For 1.0.0 we
+run a chaos soak as a manual pre-release step:
+
+```bash
+cargo build --release --features failpoints
+scripts/chaos_soak.sh --duration 3600
+```
+
+The soak runs `tlaplusplus run-tla` against a target spec (default:
+`corpus/internals/CheckpointDrain.tla`, ~26K distinct states) in a tight
+loop. Each iteration sets `FAILPOINTS=<random-failpoint>=<random-action>`
+where most actions are transient (`1*return->off`, `2*return->off`) and a
+small fraction permanent (`return`). It then checks the run's distinct
+state count and invariant verdict against the no-failpoint control. The
+soak fails on any state-count mismatch, hang, or panic-without-recovery.
+
+Wired in `src/main.rs::main()` under `cfg(feature = "failpoints")`:
+`fail::FailScenario::setup()` is called so the standard `FAILPOINTS` env
+var configures failpoints for the spawned process.
+
 ## Performance Tuning
 
 Key parameters for many-core systems:
