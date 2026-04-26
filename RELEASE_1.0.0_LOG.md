@@ -1682,5 +1682,5 @@ RESULT: clean — no divergences, no hangs.
 - **T11.2. Spill failpoints (`queue_spill_fail`, `queue_load_fail`) are not exercised on the default soak config.** Because the soak avoids `--queue-max-inmem-items` (per T11.1), spill never engages on CheckpointDrain so these two failpoints never fire their downstream code path even when `FAILPOINTS=queue_spill_fail=return` is set. Once T11.1 is fixed, re-run the soak with a small queue cap to validate.
 - **T11.3. Soak as a CI gate.** Today the soak is a manual ritual. We could parameterize it down to ~5 minutes with a smaller spec and run it on every PR, or as a nightly. Not pursued because the cost / signal trade-off favors keeping it as a release-time check.
 
-**Commit:** TODO_FILL_AT_END.
+**Commit:** `8b183dd` — `test(t11): chaos soak harness — 1h, 387 iters, 0 divergences across 12 failpoints`.
 
