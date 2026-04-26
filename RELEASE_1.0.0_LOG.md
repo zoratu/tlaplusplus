@@ -652,3 +652,128 @@ constraint extractor. The pre-existing `BuchiChecker` API in
 
 **Commit:** `73c2967` — `fix: top-level EXCEPT and unary-minus disambiguation in compiled-expr parser (T2.1 + T2.2)`.
 
+### T2.3 — `..` precedence vs set ops (interpreter + compiler) — closes proptest gate
+
+**Date:** 2026-04-25.
+
+**Status:** closed. Single root cause manifesting on BOTH the interpreter
+and the compiled fast path. Proptest harness now passes cleanly across 9
+seeds at `PROPTEST_CASES=256`.
+
+**Root cause:** the TLA+ range operator `..` is at precedence 9-9 in the
+official TLA+ grammar (Lamport, *Specifying Systems*, §16.1.10 cheat
+sheet) — *tighter* than the set-op tier (8-8: `\union`, `\intersect`,
+`\\`) and the relational tier (5-5: `\subseteq`, `\in`, `=`, `<`, ...).
+Both evaluators violated this:
+
+- **Interpreter (`src/tla/eval.rs::eval_expr`, ~line 5727):** `..` was
+  one of the patterns in `split_top_level_comparison` alongside
+  `\subseteq`, `\in`, `=`, etc. The function scans left-to-right and
+  matches the first-position pattern, so on `1..3 \subseteq S` it hit
+  the `..` at index 1 first → split as `1` and `3 \subseteq S` →
+  recursed on `3 \subseteq S` (which yields a Bool, not an Int) →
+  surfaced as `Err(expected Int, got Bool)` (or `expected Set, got
+  Int(3)` depending on how the right side recursed).
+
+- **Compiler (`src/tla/compiled_expr.rs::compile_expr`, ~line 626 pre-fix):**
+  the cascade placed the `..` split BEFORE the set-op block. Since the
+  cascade walks loosest-first (loosest split becomes the outermost AST
+  node), `..` was effectively treated as LOOSER than `\union`, so
+  `S \union 1..3` became `(S \union 1) .. 3` → `Err(expected Set, got
+  Int(1))` at evaluate time.
+
+Both directions are silent misparses for any spec writing
+`n..m \subseteq S` (or `\union`, `\intersect`, `\\`, `=`) without
+paren-wrapping the range. The previous agent's task notes only mentioned
+the interpreter side; the harness fails-fast on the first divergence so
+the parallel compiler bug was masked until the interpreter fix.
+
+**Fix locations:**
+
+- `src/tla/eval.rs:5727-5755` `split_top_level_comparison` patterns —
+  removed `".."` (with explanatory comment); preserved `\subseteq`,
+  `\in`, `\notin`, `\leq`, etc. in their existing slots.
+- `src/tla/eval.rs:1457-1466` — removed the `".."` arm from the
+  comparison-match body.
+- `src/tla/eval.rs:1607-1625` — added a new dispatch block in
+  `eval_expr_inner` calling `split_top_level_range`, slotted between
+  the `^^` block (~line 1602) and the additive split (~line 1631);
+  this places `..` at TLA+ precedence 9-9, between set ops (8-8 above)
+  and additive (10-10 below).
+- `src/tla/eval.rs:5935-6027` — new `split_top_level_range(expr) ->
+  Option<(&str, &str)>` helper. Tracks `()`, `[]`, `{}`, `<<>>` depth
+  and string nesting; finds the first top-level `..` that has both a
+  non-empty trimmed LHS and RHS; defensively skips `...` (TLA+ doesn't
+  use it but be safe).
+- `src/tla/compiled_expr.rs:626-755` — `compile_expr` cascade
+  reordered. `@@` (precedence 6) and `:>` (7) moved up to come BEFORE
+  the set-op block. Set-op block (`\union`, `\cup`, `\intersect`,
+  `\cap`, `\o`, `\circ`, `\X`, `\times`, `\\`) moved up to come BEFORE
+  the `..` split. `..` now appears AFTER the set-op block but BEFORE
+  the additive (`+`/`-`) and multiplicative (`*`/`\div`/`%`) blocks.
+
+**Why both sides of the cascade matter:** even after the interpreter fix
+the proptest harness re-failed on the *compiler* side. Without fixing
+both, the harness could never go green: the harness asserts
+`eval_expr(e) == eval_compiled(compile_expr(e))` (or both Err), so any
+asymmetry between the two surfaces as a divergence.
+
+**Regression tests added (8 total):**
+- `src/tla/eval.rs::tests::t2_3_dotdot_binds_tighter_than_subseteq` —
+  both `(1..3) \subseteq {0,0}` and bare `1..3 \subseteq {0,0}` →
+  `Bool(false)`; `1..3 \subseteq {1,2,3,4}` → `Bool(true)`.
+- `src/tla/eval.rs::tests::t2_3_dotdot_binds_tighter_than_union` —
+  paren and bare `1..3 \union {5}` both → `{1,2,3,5}`.
+- `src/tla/eval.rs::tests::t2_3_dotdot_binds_tighter_than_intersect`
+  — paren and bare `1..3 \intersect {2,7}` both → `{2}`.
+- `src/tla/eval.rs::tests::t2_3_dotdot_binds_tighter_than_set_minus`
+  — paren and bare `1..5 \ {2,4}` both → `{1,3,5}`.
+- `src/tla/eval.rs::tests::t2_3_dotdot_binds_tighter_than_equality` —
+  paren and bare `1..3 = {1,2,3}` both → `Bool(true)`.
+- `src/tla/eval.rs::tests::t2_3_dotdot_still_looser_than_addition` —
+  sanity check the OPPOSITE direction: `0 .. 5-1` parses as
+  `0 .. (5-1)` → `{0,1,2,3,4}` (NOT `(0..5)-1`); `1+1 .. 2+2` →
+  `{2,3,4}`.
+- `src/tla/eval.rs::tests::t2_3_dotdot_inside_filter_set_body` —
+  the original T2.3 minimised filter-set-body shape:
+  `({__e \in 1..4 : ((1..3 \subseteq S)) \/ (__e > 0)} \intersect {0, 0})`
+  with `S = {1,2,3}` → `{}`.
+- `src/tla/compiled_expr.rs::t2_3_dotdot_binds_tighter_than_set_ops` —
+  AST-shape assertions for `S \union 1..3` (Union with inner SetRange),
+  `S \intersect 1..n` (Intersect with inner SetRange), `S \ 1..3`
+  (SetMinus with inner SetRange), and `1..3 \subseteq S` (Subset with
+  inner SetRange on the LHS).
+
+**Tests that needed updating:** none. No existing test was encoding the
+buggy behavior.
+
+**Validation evidence (spot `REDACTED-INSTANCE`, c8g.xlarge, us-west-2):**
+- `cargo test --release -- --skip compiled_matches_interpreted`:
+  **633 tests pass** (492 lib + 90 bin + 15+11+10+2+5+6+2 across
+  `tests/`, 1+2 ignored, 1 filtered, 0 failed). Net +8 from the new
+  T2.3 regression tests (was 625 after T2.1+T2.2 landed).
+- `cargo test --release --test compiled_vs_interpreted` with
+  `PROPTEST_CASES=256` across 9 distinct seeds (`1, 7, 42, 100, 256,
+  555, 7777, 9999, 12345`): **all 9 pass cleanly, 0 divergences.**
+  Plus `PROPTEST_CASES=2048` on seed 1: also clean. Confirms the
+  proptest gate is now reliably green.
+- `scripts/diff_tlc.sh`: **13/13 pass, 0 fail, 0 allowlisted.**
+- Sample corpus parity (state counts under release binary, all match
+  prior baselines exactly):
+  - `corpus/internals/CheckpointDrain.tla` → 26,344 distinct ✓
+  - `corpus/internals/WorkQueue.tla` → 15,003 distinct ✓
+  - `corpus/internals/WorkStealingTermination.tla` → 64,805 distinct ✓
+  - `corpus/internals/QueueSegmentSync.tla` (Buggy.cfg) → 47 distinct,
+    expected violation correctly detected ✓
+  - `corpus/language/MultipleExtendsTest.tla` (uses
+    `s \subseteq 0..10` shape — directly exercises the fixed
+    precedence) → 6 distinct, no violation ✓.
+
+**Wider scope discovered:** None new. The T2.3 fix surfaced a parallel
+bug in the *compiler* with the same root cause (precedence of `..` vs
+set ops), patched in the same commit. No new T2.N entries needed; T2 is
+fully closed and the proptest equivalence harness is the regression gate
+going forward.
+
+**Commit:** `c6ab53f`.
+
