@@ -3,7 +3,7 @@ use crate::distributed::handler::StolenState;
 use crate::distributed::work_stealer::DistributedWorkStealer;
 use crate::fairness::{
     ActionLabel as FairnessActionLabel, LabeledTransition as FairnessLabeledTransition, TarjanSCC,
-    check_fairness_on_scc,
+    check_fairness_on_scc_with_next,
 };
 use crate::model::{LabeledTransition, Model};
 use crate::storage::async_fingerprint_writer::{create_persist_channels, fingerprint_writer_task};
@@ -2849,10 +2849,11 @@ where
                                 scc.iter().map(|s| (*s).clone()).collect();
 
                             for constraint in &constraints {
-                                if let Err(e) = check_fairness_on_scc(
+                                if let Err(e) = check_fairness_on_scc_with_next(
                                     &scc_states,
                                     constraint,
                                     &fairness_transitions,
+                                    model.next_action_name(),
                                 ) {
                                     eprintln!(
                                         "  Fairness violation in SCC {} ({} states): {}",

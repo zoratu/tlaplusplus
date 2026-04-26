@@ -424,6 +424,10 @@ impl Model for TlaModel {
         self.fairness_constraints.clone()
     }
 
+    fn next_action_name(&self) -> Option<&str> {
+        Some(&self.next_name)
+    }
+
     fn num_next_disjuncts(&self) -> usize {
         let next_def = match self.module.definitions.get(&self.next_name) {
             Some(d) => d,

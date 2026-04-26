@@ -29,6 +29,7 @@ checkpoint_drain	corpus/internals/CheckpointDrain.tla	corpus/internals/Checkpoin
 queue_segment_sync_fixed	corpus/internals/QueueSegmentSync.tla	corpus/internals/QueueSegmentSync_Fixed.cfg	no	regression for T1.1 soundness fix; 1531 distinct states; \E segId \in S : Action(segId) inside disjunctive Next
 queue_segment_sync_buggy	corpus/internals/QueueSegmentSync.tla	corpus/internals/QueueSegmentSync_Buggy.cfg	yes	regression for T1.1 soundness fix; expected SegmentsRecoverable violation must be caught
 view_test	corpus/language/ViewTest.tla	corpus/language/ViewTest.cfg	no	regression for T1.5 splitter soundness fix; 106 distinct under VIEW <<x, y>>; pre-fix counted 121 due to spurious successor that dropped `timestamp' = timestamp + 1`
+work_queue	corpus/internals/WorkQueue.tla	corpus/internals/WorkQueue.cfg	no	regression for T1.3 wrapper-Next fairness fix; 15003 distinct; pre-fix tlaplusplus reported a false-positive Buchi-style fairness violation on the single-state self-loop SCC at the terminated state
 
 # --------------------------------------------------------------------
 # KNOWN DIVERGENT SPECS (not gated; tracked for fix in follow-up work)
@@ -40,9 +41,6 @@ view_test	corpus/language/ViewTest.tla	corpus/language/ViewTest.cfg	no	regressio
 # (ViewTest.tla was promoted to the active list above on 2026-04-25 after the
 # T1.5 splitter fix; it now reports 106 distinct states matching TLC.)
 #
-# corpus/internals/WorkQueue.tla / .cfg — distinct state count matches
-#   (15003), but tlaplusplus's fairness checker reports an SCC fairness
-#   violation that TLC accepts. TLC: "Model checking completed. No error
-#   has been found." tlaplusplus: "Fairness violation in SCC 0 ... action
-#   'Next' does not occur in SCC". Investigate src/fairness.rs SCC handling
-#   when the only enabled action labels match the spec's Next.
+# (WorkQueue.tla was promoted to the active list above on 2026-04-26 after
+# the T1.3 wrapper-Next fairness fix; it now reports no fairness violation
+# matching TLC.)

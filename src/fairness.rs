@@ -168,15 +168,50 @@ pub fn check_fairness_on_scc<S>(
 where
     S: Clone + Eq + Hash + Debug,
 {
+    check_fairness_on_scc_with_next(scc, constraint, transitions, None)
+}
+
+/// Check fairness on an SCC, with knowledge of the wrapper Next-action name.
+///
+/// `next_action_name` is the spec's top-level Next definition name (typically
+/// `"Next"`). When the fairness constraint references the wrapper Next action
+/// (e.g., `WF_vars(Next)`) rather than a specific named subaction, *every*
+/// transition in the state graph counts as a Next step, so the constraint is
+/// satisfied as long as any edge exists in the SCC.
+///
+/// Without this distinction, a single-state self-loop SCC (e.g., a `Terminated
+/// /\ UNCHANGED vars` stutter that the user added explicitly to model
+/// termination) would be incorrectly flagged as a Next-fairness violation,
+/// because none of the labeled transitions carry the literal name `"Next"` —
+/// the action labeller extracts the head identifier of each disjunct
+/// (`Terminated`, `WorkerTakeItem`, `LoaderLoad`, ...).
+pub fn check_fairness_on_scc_with_next<S>(
+    scc: &[S],
+    constraint: &FairnessConstraint,
+    transitions: &[LabeledTransition<S>],
+    next_action_name: Option<&str>,
+) -> Result<()>
+where
+    S: Clone + Eq + Hash + Debug,
+{
     let action_name = constraint.action_name();
 
-    // Check if the action occurs in this SCC
-    let action_occurs = transitions
-        .iter()
-        .any(|t| scc.contains(&t.from) && scc.contains(&t.to) && t.action.name == action_name);
+    // If the fairness constraint targets the wrapper Next action itself, then
+    // every transition in the SCC is, by definition, a Next step. The presence
+    // of any edge in the SCC means Next has occurred.
+    let constraint_is_wrapper_next = next_action_name.map(|n| n == action_name).unwrap_or(false);
+
+    // Check if the action occurs in this SCC. Either the transition is labelled
+    // with the action name directly, or the constraint is on the wrapper Next
+    // (in which case any in-SCC transition counts).
+    let action_occurs = transitions.iter().any(|t| {
+        scc.contains(&t.from)
+            && scc.contains(&t.to)
+            && (t.action.name == action_name || constraint_is_wrapper_next)
+    });
 
     // For both weak and strong fairness, if the action is enabled in the SCC,
-    // it must occur at least once
+    // it must occur at least once.
     //
     // Note: Proper fairness checking requires tracking enablement, which needs
     // evaluation of action guards. For now, we do a conservative check.

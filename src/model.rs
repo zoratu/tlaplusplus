@@ -58,6 +58,20 @@ pub trait Model: Send + Sync + 'static {
         Vec::new()
     }
 
+    /// Name of the wrapper next-state action (e.g., `"Next"` for a TLA+ spec
+    /// that defines `Next == ...`).
+    ///
+    /// The fairness checker uses this to recognise when a constraint like
+    /// `WF_vars(Next)` is targeting the entire next-state relation rather than
+    /// a specific named subaction. In that case any transition in an SCC
+    /// counts as a Next step.
+    ///
+    /// Returns `None` if the model has no concept of a wrapper next action
+    /// (the default).
+    fn next_action_name(&self) -> Option<&str> {
+        None
+    }
+
     fn check_invariants(&self, state: &Self::State) -> Result<(), String>;
 
     /// Check state constraints - returns Ok(()) if state should be explored, Err if pruned

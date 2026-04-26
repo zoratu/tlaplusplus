@@ -17,6 +17,7 @@ pub mod tla;
 pub use coverage::{CoverageStats, CoverageTracker};
 pub use fairness::{
     ActionLabel, FairnessConstraint, LabeledTransition, TarjanSCC, check_fairness_on_scc,
+    check_fairness_on_scc_with_next,
 };
 pub use liveness::{BuchiChecker, CycleDetector, LivenessChecker};
 pub use model::Model;
