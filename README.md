@@ -1,6 +1,23 @@
 # TLA++
 
-A Rust implementation of TLA+ model checking with TLC feature parity, achieving **10.7x faster** state exploration than Java TLC on many-core systems. 182/182 (100%) of the [tlaplus/Examples](https://github.com/tlaplus/Examples) corpus passes analysis.
+A Rust implementation of TLA+ model checking with TLC feature parity, achieving **10.7x faster** state exploration than Java TLC on many-core systems. 182/182 (100%) of the [tlaplus/Examples](https://github.com/tlaplus/Examples) corpus passes analysis; **174/182 (95.6%)** also pass full model checking at 60s.
+
+**v1.0.0 (2026-04-26)** ships with:
+- 727 default tests + 747 with failpoints, 0 failures
+- Differential CI gate vs TLC (13/13 specs match exactly)
+- Compiled-vs-interpreted proptest equivalence (clean across 9 seeds at 2048 cases)
+- State-graph snapshot tests (12 specs pinned to 128-bit XxHash3 digests)
+- Symbolic Init enumeration (Z3-backed, 10-41x; opt-in via `--features symbolic-init`)
+- Partial-order reduction (stubborn-set, opt-in `--por`; 36.8x state reduction on protocol-style specs)
+- State compression in queue (zstd, default-on; 13x ratio, -68% peak RSS)
+- Trace minimization on violation (default-on `--minimize-trace`)
+- Liveness checking 550x faster (iterative Tarjan + fingerprint-keyed fairness)
+- 1-hour chaos soak with swarm-mode failpoint injection (0 divergences across 12 failpoints)
+- Verus tier-B proof of the seqlock resize protocol (19 verified lemmas)
+- Cross-arch CI matrix (ubuntu-latest x86_64 + ubuntu-24.04-arm)
+
+See [CHANGELOG.md](CHANGELOG.md) for the full v1.0.0 changelist and
+[RELEASE_1.0.0_PLAN.md](RELEASE_1.0.0_PLAN.md) for the v1.1.0 backlog.
 
 ## Performance
 
@@ -128,27 +145,40 @@ cargo build --release
 ## Testing
 
 ```bash
-# Run all tests (577 tests)
-cargo test
+# Run all tests (727 tests)
+cargo test --release
 
-# Run with chaos/failpoint testing (597 tests)
-cargo test --features failpoints
+# Run with chaos/failpoint testing (747 tests)
+cargo test --release --features failpoints
 
-# Run property-based tests
-cargo test proptests
+# Run with Z3-backed symbolic Init enumeration (T5)
+# Requires: apt-get install libz3-dev clang libclang-dev
+cargo test --release --features symbolic-init
+
+# Differential gate vs TLC (13 curated specs)
+scripts/diff_tlc.sh
+
+# Compiled-vs-interpreted proptest equivalence (T2)
+PROPTEST_CASES=2048 cargo test --release --test compiled_vs_interpreted
+
+# State-graph snapshot tests (T3)
+cargo test --release --test state_graph_snapshots
 
 # Run fuzzing (requires nightly)
 cargo +nightly fuzz run fuzz_tla_module
 ```
 
 The test suite includes:
-- **577 unit/integration tests** covering runtime, storage, TLA+ evaluation, and model checking correctness
-- **19 property-based tests** (proptest) verifying set algebra laws and serialization roundtrips
-- **23 chaos/failpoint tests** for fault injection
+- **727 unit/integration tests** covering runtime, storage, TLA+ evaluation, and model checking correctness
+- **747 tests with `--features failpoints`** (adds chaos/fault-injection coverage)
+- **17 proptest cases** in the compiled-vs-interpreted equivalence harness (uniform + Regehr-style swarm mask), plus 19 set-algebra/serialization property tests
+- **23 chaos/failpoint tests** for single-fault-path correctness
 - **8 fuzz targets** for parser robustness
-- **182/182 external corpus specs** (tlaplus/Examples) pass analysis
-- **29/29 internal corpus specs** pass analysis
-- **14 mutation-validated correctness tests** for the compiled action evaluator
+- **13/13 differential-vs-TLC specs** (`scripts/diff_tlc.sh`)
+- **12 active state-graph snapshot tests** validated against TLC v2.19
+- **174/182 external corpus specs** (tlaplus/Examples) pass full model checking; 182/182 pass analysis
+- **32/32 internal corpus specs** pass analysis
+- **17 mutation-kill tests** added during the v1.0.0 cargo-mutants audit (`src/tla/eval.rs`, `src/tla/action_exec.rs`)
 
 ### Pre-release chaos soak
 

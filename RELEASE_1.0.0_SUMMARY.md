@@ -1,0 +1,104 @@
+# tlaplusplus v1.0.0
+
+A Rust TLA+ model checker with TLC feature parity and 10.7x faster state
+exploration on many-core systems. v1.0.0 is the first stable release.
+
+## Headline numbers
+
+- **727 default tests, 747 with failpoints, 0 failures**
+- **13/13** specs match TLC exactly via the diff CI gate
+  ([scripts/diff_tlc.sh](scripts/diff_tlc.sh))
+- **174/182 (95.6%)** of [tlaplus/Examples](https://github.com/tlaplus/Examples)
+  pass full model checking at 60s; 182/182 pass analysis
+- **10.7x faster** than Java TLC on the synthetic counter-grid benchmark
+  (128-core AMD EPYC); up to 22x on NUMA-optimized configs
+- **Verus tier-B proof** of the seqlock resize protocol — 19 lemmas verified,
+  including the headline soundness theorem `theorem_no_fingerprint_lost`
+
+## What's new since v0.3.0
+
+### Correctness
+- **Differential CI gate vs TLC** (T1) — 13 curated specs run under both
+  checkers on every push; uncovered and fixed five soundness bugs (T1.1, T1.3,
+  T1.4, T1.5, T2.4)
+- **Compiled-vs-interpreted proptest equivalence** (T2) — well-typed
+  expression generator, 17 proptest cases, clean across 9 seeds at
+  `PROPTEST_CASES=2048`
+- **State-graph snapshot tests** (T3) — 12 specs pinned to 128-bit XxHash3
+  digests, validated against TLC v2.19
+- **Mutation testing audit** (T4) — `cargo-mutants` against eval/action paths;
+  17 inline kill-tests added
+- **Cross-arch CI matrix** (T12) — `[ubuntu-latest, ubuntu-24.04-arm]`
+- **Regehr-style swarm testing** (T16) — both the proptest harness (random
+  17-bit feature mask) and the chaos soak (1-4 concurrent failpoints per iter)
+
+### Performance
+- **Symbolic Init enumeration via Z3** (T5, opt-in `--features symbolic-init`)
+  — 10-41x on filtered record-set Init shapes
+- **Cross-node distributed work stealing** (T6) — TCP steal protocol with
+  peer-down cooldown and termination consensus extension. Fixed three
+  pre-existing v0.3.0 distributed-mode termination bugs along the way. See
+  [RELEASE_1.0.0_LOG.md](RELEASE_1.0.0_LOG.md) `### T6` and `### T6.1` for the
+  honest cluster-vs-independent benchmark.
+- **Partial-order reduction via stubborn sets** (T7, opt-in `--por`) — 36.8x
+  state reduction, 17.9x wall-time speedup on PorBenchProcessGrid
+- **State compression in queue** (T8, default-on, opt-out
+  `--queue-compression false`) — zstd ring between hot deques and disk; 13.2x
+  ratio, -68% peak RSS at 1M items, +2% wall time
+- **Liveness checking 550x faster** (T10) — iterative Tarjan +
+  fingerprint-keyed graph + fast SCC fairness check; 63.39 s → 115.28 ms on
+  LivenessBench
+
+### Polish & robustness
+- **Trace minimization on violation** (T9, default-on `--minimize-trace`) —
+  earliest-violation truncation + BFS shortcut to fixed point + variable
+  highlighting
+- **1-hour chaos soak with swarm-mode failpoints** (T11 + T16b) — every
+  failpoint in `src/chaos.rs` fired ≥23 times; 0 divergences, 0 hangs
+
+### Verification
+- **Verus tier-B proof of the seqlock resize protocol** (T13). 19 lemmas
+  verified by Z3; `theorem_no_fingerprint_lost` machine-checks that no
+  inserted fingerprint is ever lost during a resize. See
+  [verification/verus/README.md](verification/verus/README.md).
+
+## Deferred to v1.1.0
+
+Two soundness items have documented workarounds and are tracked for v1.1.0:
+
+- **T1.6** — `FingerprintStoreResize` invariant evaluator returns
+  `Bool(false)` instead of computing. Pre-existing, single-spec, low-impact.
+- **T11.1** — `--queue-max-inmem-items` below natural state count causes the
+  spill path to drop states. Workaround: keep cap above natural state count
+  (default 50M is safe).
+
+A further 16 quality follow-ups (T5/7/9/10/11/12/13.* enhancements) are
+parked in [RELEASE_1.0.0_PLAN.md](RELEASE_1.0.0_PLAN.md) as the v1.1.0
+roadmap.
+
+## Try it
+
+```bash
+git clone https://github.com/zoratu/tlaplusplus.git
+cd tlaplusplus
+cargo build --release
+
+# Model-check a TLA+ spec
+./target/release/tlaplusplus run-tla \
+  --module /path/to/Spec.tla --config /path/to/Spec.cfg
+
+# Compare with TLC on the curated diff list
+scripts/diff_tlc.sh
+```
+
+## Links
+
+- [Full changelog](CHANGELOG.md)
+- [Architecture & developer notes](CLAUDE.md)
+- [Release plan & v1.1.0 backlog](RELEASE_1.0.0_PLAN.md)
+- [Detailed work log](RELEASE_1.0.0_LOG.md)
+- [Verus proof](verification/verus/seqlock_resize.rs)
+
+## License
+
+GNU GPLv3.

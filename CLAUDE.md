@@ -24,18 +24,27 @@ Key performance features:
 # Build release binary
 cargo build --release
 
-# Run all tests (577 tests)
-cargo test
+# Run all tests (727 tests)
+cargo test --release
 
-# Run with chaos/failpoint testing
-cargo test --features failpoints
+# Run with chaos/failpoint testing (746 tests)
+cargo test --release --features failpoints
 
 # Run with Z3-backed symbolic Init enumeration (T5)
 # Requires: apt-get install libz3-dev clang libclang-dev
-cargo test --features symbolic-init
+cargo test --release --features symbolic-init
 
-# Run property-based tests
-cargo test proptests
+# Differential gate vs TLC (13 curated specs)
+scripts/diff_tlc.sh
+
+# Compiled-vs-interpreted proptest equivalence (T2)
+PROPTEST_CASES=2048 cargo test --release --test compiled_vs_interpreted
+
+# State-graph snapshot tests (T3)
+cargo test --release --test state_graph_snapshots
+
+# Chaos soak (T11) — 1-hour release ritual, opt-in via --features failpoints
+scripts/chaos_soak.sh --duration 3600 --swarm-mode auto
 
 # Run fuzzing (requires nightly)
 cargo +nightly fuzz run fuzz_tla_module
@@ -391,30 +400,58 @@ Periodic checkpoints (`--checkpoint-interval-secs`) persist state for crash reco
   - Workers check `has_pending_work()` before breaking from main loop
   - Aggressive loading (no sleep between batches) when queue < 500K items
 
-## Current Status
+## Current Status (v1.0.0)
 
-**Working (TLC feature parity)**:
-- Parallel runtime with NUMA-aware work-stealing (10.7x faster than TLC)
+**Working (TLC feature parity + 1.0.0 additions)**:
+
+Test suite & gates:
+- **727 default tests**, 0 failures, 5 ignored (`cargo test --release`)
+- **746 tests with `--features failpoints`**, 0 failures
+- **13/13 differential-vs-TLC specs** pass via `scripts/diff_tlc.sh` (state counts agree exactly with TLC v2.19); CI gate via `.github/workflows/diff-tlc.yml` runs on a `[ubuntu-latest, ubuntu-24.04-arm]` cross-arch matrix
+- **T2 proptest equivalence**: compiled-vs-interpreted on Int/Bool/Set/Seq/Record/Str expressions, clean across 9 seeds at `PROPTEST_CASES=2048`; CI runs at 128
+- **T16a swarm proptest**: random subset of 17 shape categories per case (Regehr-style); kept alongside the uniform regression
+- **State-graph snapshot tests**: 12 active snapshots for 7 small TLA+ specs, validated against TLC v2.19
+- **17 community modules** (DyadicRationals, SequencesExt, Functions, Folds, FiniteSetsExt, UndirectedGraphs, Graphs, Relation, Bags, BagsExt, IOUtils, Bitwise, Combinatorics, CSV, VectorClocks, Randomization, plus proof modules)
+- **174/182 (95.6%) tlaplus/Examples corpus** pass at 60s on v0.3.0 baseline; v1.0.0 carries the same compatibility surface
+- 19 property tests, 23 chaos tests, 8 fuzz targets
+
+Runtime & checking:
+- Parallel runtime with NUMA-aware work-stealing (10.7x faster than TLC on synthetic; up to 22x on NUMA-optimized configs)
 - Lock-free fingerprint storage with atomic CAS and dynamic resize
 - Native TLA+ frontend with full language coverage
-- 163/182 tlaplus/Examples corpus specs pass model checking (90%), 0 errors
-- 161/182 analysis probes pass (88%), 0 failures
-- 600 tests, 620 failpoint tests, 19 property tests, 23 chaos tests, 8 fuzz targets
-- Safety invariant checking, liveness/fairness checking, deadlock detection
+- Safety invariant checking, liveness/fairness checking (T10: ~550x faster fairness post-processing), deadlock detection
 - ENABLED operator (including parameterized actions)
 - Symmetry reduction (wired into runtime fingerprinting)
+- **Partial-order reduction (T7)** — opt-in `--por`, stubborn-set with static dependency analysis; safety-only (auto-rejects when fairness/liveness present); benchmark on PorBenchProcessGrid 36.8x state reduction, 17.9x wall-time speedup
+- **Symbolic Init enumeration (T5)** — opt-in `--features symbolic-init`, Z3-backed enumeration of filtered record-set Init shapes; 10-41x on TightCan
+- **State compression in queue (T8)** — default-on zstd-compressed in-memory ring sits between hot work-stealing deques and disk overflow; 13.2x ratio, -68% peak RSS at 1M items, +2% wall time; opt-out via `--queue-compression false`
+- **Trace minimization (T9)** — default-on `--minimize-trace`; Phase A (truncation + BFS shortcut to fixed point) + Phase B (variable-relevance highlighting); 30s budget
 - Simulation mode (`--simulate`)
 - BFS parent tracking for full error traces (`--trace-parents`)
 - Diff traces (`--difftrace`), coverage profiling (`--coverage`)
 - Continue after violation (`--continue --max-violations N`)
 - State graph dump (`--dump FILE`)
 - ASSUME evaluation at startup
-- 17 community modules (DyadicRationals, SequencesExt, Functions, Folds, FiniteSetsExt, UndirectedGraphs, Graphs, Relation, Bags, BagsExt, IOUtils, Bitwise, Combinatorics, CSV, VectorClocks, Randomization, plus proof modules)
 - S3 checkpoint/resume for spot instance resilience
 - FLURM integration with `--fetch-module`/`--fetch-config` for distributed runs
 - Constraint propagation for filtered record set Init enumeration
 - Lazy Init enumeration for large cross-products (>10M states)
 - Evaluation budget to prevent exponential blowup in analysis
+
+Distributed:
+- Cross-node TCP work-stealing protocol (T6); opt-in `--cluster-listen`. Cluster mode kept opt-in for v1.0.0 — see `RELEASE_1.0.0_LOG.md` `### T6.1` for the cluster-vs-independent benchmark and the rationale.
+
+Verification:
+- Verus tier-B proof of the seqlock resize protocol (T13). 19 lemmas verified by Z3, including the headline `theorem_no_fingerprint_lost`. Lives at `verification/verus/seqlock_resize.rs`; run via `verification/verus/run_proof.sh`. Tier A (verify production Rust directly) tracked in v1.1.0 backlog.
+
+Chaos & swarm:
+- 1-hour chaos soak (`scripts/chaos_soak.sh`) covers all 12 failpoints in `src/chaos.rs`; 0 divergences, 0 hangs in the v1.0.0 release run.
+- Swarm-mode chaos (`--swarm-mode N|auto`, T16b) injects 1-4 concurrent failpoints per iteration; runtime tolerates 4-fold simultaneous fault injection.
+
+Deferred to v1.1.0 (with workarounds):
+- T1.6: `FingerprintStoreResize` invariant evaluator returns `Bool(false)` (single-spec, low-impact).
+- T11.1: `--queue-max-inmem-items` below natural state count drops states (workaround: keep cap above natural state count; default 50M is safe).
+- See `RELEASE_1.0.0_PLAN.md` for the full v1.1.0 backlog (T5/7/9/10/11/12/13 follow-ups).
 
 ## Key Implementation Notes
 
