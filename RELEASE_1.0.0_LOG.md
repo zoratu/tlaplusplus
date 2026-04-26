@@ -1678,7 +1678,7 @@ Linear scaling vs N=8 (3x states → 3-4x phase time). The pre-T10 baseline at N
 
 Both are 2-4 weeks of focused work plus a corpus-level revalidation pass to ensure no liveness verdict changes. Out of scope for v1.0.0; deferring with a clear "what would need to change" sketch so the v1.1.0 implementor has a starting point.
 
-**Commit:** `<filled in below>`.
+**Commit:** `d4bb59f` — `perf(t10.1, t10.3, t10.4): liveness post-processing follow-ups — parallel flatten + trim + per-action shard`.
 
 ### T11 — Long-running chaos soak with random failpoint injection (Phase 3)
 
