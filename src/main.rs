@@ -2422,6 +2422,28 @@ fn main() -> anyhow::Result<()> {
                     .iter()
                     .cloned()
                     .collect();
+                // T9.1: build an operator-body registry from the loaded
+                // module so the relevance scan can transitively inline
+                // operator definitions.  An invariant like `Inv == IsBad(s)`
+                // where `IsBad(s) == s.x > 5` will now correctly mark `x`
+                // as referenced.
+                let operator_registry: std::collections::BTreeMap<
+                    String,
+                    tlaplusplus::OperatorBody,
+                > = model_for_liveness
+                    .module
+                    .definitions
+                    .iter()
+                    .map(|(name, def)| {
+                        (
+                            name.clone(),
+                            tlaplusplus::OperatorBody {
+                                name: def.name.clone(),
+                                body: def.body.clone(),
+                            },
+                        )
+                    })
+                    .collect();
                 let invariant_relevance: std::collections::HashMap<
                     String,
                     std::collections::HashSet<String>,
@@ -2429,7 +2451,11 @@ fn main() -> anyhow::Result<()> {
                     .invariant_exprs
                     .iter()
                     .map(|(name, body)| {
-                        let rel = tlaplusplus::extract_invariant_variables(body, &var_names);
+                        let rel = tlaplusplus::extract_invariant_variables_transitive(
+                            body,
+                            &var_names,
+                            &operator_registry,
+                        );
                         (name.clone(), rel)
                     })
                     .collect();

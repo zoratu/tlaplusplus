@@ -28,9 +28,17 @@
 //! syntactically referenced are flagged as "noise" so the printer can
 //! visually de-emphasise them.  This is purely cosmetic — it does not
 //! shrink the trace, only annotates it.
+//!
+//! ### T9.1 — Transitive variable relevance
+//!
+//! [`extract_invariant_variables_transitive`] extends the syntactic scan
+//! by recursively inlining operator definitions.  An invariant of the
+//! form `Inv == IsBad(state)` where `IsBad(s) == s.x > 5` will mark `x`
+//! as referenced (rather than just `s`, which doesn't even appear in
+//! the variable list).  Cycle-safe via a visited set.
 
 use crate::model::Model;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 /// Result of Phase A trace shortening.
@@ -351,6 +359,126 @@ pub fn extract_invariant_variables(
     }
 
     found
+}
+
+/// Lightweight definition descriptor consumed by
+/// [`extract_invariant_variables_transitive`].  Mirrors the shape of
+/// `crate::tla::module::TlaDefinition` (name, params, body) but is
+/// kept separate so the trace minimizer doesn't need to depend on the
+/// TLA module-loading layer.
+///
+/// Callers in `main.rs` adapt `BTreeMap<String, TlaDefinition>` into
+/// the format expected here via [`OperatorBody`] tuples.
+#[derive(Debug, Clone)]
+pub struct OperatorBody {
+    /// The operator's defined name (used for cycle detection and lookup).
+    pub name: String,
+    /// The operator's body source text (scanned for further references).
+    pub body: String,
+}
+
+/// Transitive variant of [`extract_invariant_variables`] that follows
+/// operator-call chains.
+///
+/// Given the invariant text and a registry of operator definitions, this
+/// pass scans `invariant_text` for identifiers, then recursively scans
+/// the bodies of any operators referenced (cycle-safe via a visited
+/// set).  Variable names matched at any level are accumulated.
+///
+/// Example: with `invariant_text = "Inv == IsBad(state)"` and operators
+/// `IsBad(s) == s.x > 5`, the call returns `{x}` even though `x` is not
+/// syntactically in the invariant body — because the operator-inlining
+/// pass picks it up from `IsBad`'s body.
+///
+/// Operator definitions whose names don't match the variable list are
+/// recursed into; their parameter names are excluded from the variable
+/// match (so `IsBad(s)` won't accidentally flag `s` if `s` happens to
+/// also be a state variable name — an unusual but possible collision).
+pub fn extract_invariant_variables_transitive(
+    invariant_text: &str,
+    all_variables: &[String],
+    operators: &BTreeMap<String, OperatorBody>,
+) -> HashSet<String> {
+    let var_set: HashSet<&str> = all_variables.iter().map(|s| s.as_str()).collect();
+    let mut found: HashSet<String> = HashSet::new();
+    if var_set.is_empty() {
+        return found;
+    }
+    let mut visited_ops: HashSet<String> = HashSet::new();
+    // Bound recursion depth to avoid pathological blowups; 64 is well
+    // above any realistic invariant call-chain depth.
+    scan_with_inlining(
+        invariant_text,
+        &var_set,
+        operators,
+        &mut found,
+        &mut visited_ops,
+        64,
+    );
+    found
+}
+
+/// Recursive helper: tokenize `text`, check each identifier against
+/// `var_set` (variables) AND against `operators` (recurse).  Tracks
+/// `visited_ops` to avoid infinite loops on mutually recursive
+/// operators.  `depth_remaining` bounds total recursion depth.
+fn scan_with_inlining(
+    text: &str,
+    var_set: &HashSet<&str>,
+    operators: &BTreeMap<String, OperatorBody>,
+    found: &mut HashSet<String>,
+    visited_ops: &mut HashSet<String>,
+    depth_remaining: usize,
+) {
+    if depth_remaining == 0 {
+        return;
+    }
+    let cleaned = strip_tla_comments(text);
+    // Collect identifiers; check for variable-name and operator-name
+    // matches in a single pass.  We collect operator names to recurse
+    // into AFTER finishing the current scan, so the recursion is
+    // breadth-first-ish (reduces stack depth on long chains).
+    let mut to_recurse: Vec<String> = Vec::new();
+    let bytes = cleaned.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c.is_ascii_alphabetic() || c == b'_' {
+            let s = i;
+            i += 1;
+            while i < bytes.len() {
+                let cc = bytes[i];
+                if cc.is_ascii_alphanumeric() || cc == b'_' {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            let tok = &cleaned[s..i];
+            if var_set.contains(tok) {
+                found.insert(tok.to_string());
+            }
+            if operators.contains_key(tok) && !visited_ops.contains(tok) {
+                to_recurse.push(tok.to_string());
+            }
+        } else {
+            i += 1;
+        }
+    }
+    for op_name in to_recurse {
+        if visited_ops.insert(op_name.clone()) {
+            if let Some(op) = operators.get(&op_name) {
+                scan_with_inlining(
+                    &op.body,
+                    var_set,
+                    operators,
+                    found,
+                    visited_ops,
+                    depth_remaining - 1,
+                );
+            }
+        }
+    }
 }
 
 /// Strip `\* ...` line comments and `(* ... *)` block comments from a
@@ -686,6 +814,111 @@ mod tests {
         // Truncation should take the trace down to [0, 1, 2].
         assert_eq!(result.trace.len(), 3);
         assert_eq!(result.trace.last().unwrap().0, 2);
+    }
+
+    // ------------------------------------------------------------------
+    // T9.1 — transitive variable relevance through operator inlining
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn t91_transitive_picks_up_variable_through_one_operator() {
+        // Inv == IsBad(s) where IsBad(s) == s.x > 5
+        // The variable name "x" appears only in the operator body, not
+        // in the invariant text; the transitive scan must still find it.
+        let inv = "Inv == IsBad(s)";
+        let vars = vec!["x".to_string(), "y".to_string()];
+        let mut ops: BTreeMap<String, OperatorBody> = BTreeMap::new();
+        ops.insert(
+            "IsBad".to_string(),
+            OperatorBody {
+                name: "IsBad".to_string(),
+                body: "IsBad(s) == s.x > 5".to_string(),
+            },
+        );
+        let found = extract_invariant_variables_transitive(inv, &vars, &ops);
+        assert!(found.contains("x"), "transitive scan must include x");
+        assert!(!found.contains("y"), "y is not referenced anywhere");
+    }
+
+    #[test]
+    fn t91_transitive_chains_through_multiple_operators() {
+        // Inv == OuterCheck
+        // OuterCheck == InnerCheck
+        // InnerCheck == count > 0
+        let inv = "Inv == OuterCheck";
+        let vars = vec!["count".to_string(), "flag".to_string()];
+        let mut ops: BTreeMap<String, OperatorBody> = BTreeMap::new();
+        ops.insert(
+            "OuterCheck".to_string(),
+            OperatorBody {
+                name: "OuterCheck".to_string(),
+                body: "OuterCheck == InnerCheck".to_string(),
+            },
+        );
+        ops.insert(
+            "InnerCheck".to_string(),
+            OperatorBody {
+                name: "InnerCheck".to_string(),
+                body: "InnerCheck == count > 0".to_string(),
+            },
+        );
+        let found = extract_invariant_variables_transitive(inv, &vars, &ops);
+        assert!(found.contains("count"));
+        assert!(!found.contains("flag"));
+    }
+
+    #[test]
+    fn t91_transitive_handles_recursive_operators_without_looping() {
+        // Mutually recursive ops should not cause infinite recursion.
+        let inv = "Inv == A";
+        let vars = vec!["x".to_string()];
+        let mut ops: BTreeMap<String, OperatorBody> = BTreeMap::new();
+        ops.insert(
+            "A".to_string(),
+            OperatorBody {
+                name: "A".to_string(),
+                body: "A == B /\\ x = 0".to_string(),
+            },
+        );
+        ops.insert(
+            "B".to_string(),
+            OperatorBody {
+                name: "B".to_string(),
+                body: "B == A".to_string(),
+            },
+        );
+        let found = extract_invariant_variables_transitive(inv, &vars, &ops);
+        assert!(found.contains("x"));
+    }
+
+    #[test]
+    fn t91_transitive_falls_back_to_syntactic_when_no_operators() {
+        // With an empty operator registry, the transitive variant must
+        // produce the same result as the syntactic one.
+        let inv = "Inv == count > 0";
+        let vars = vec!["count".to_string(), "flag".to_string()];
+        let ops: BTreeMap<String, OperatorBody> = BTreeMap::new();
+        let trans = extract_invariant_variables_transitive(inv, &vars, &ops);
+        let syn = extract_invariant_variables(inv, &vars);
+        assert_eq!(trans, syn);
+    }
+
+    #[test]
+    fn t91_transitive_does_not_match_operators_inside_comments() {
+        // An operator name appearing only in a comment must not trigger
+        // recursion — `strip_tla_comments` runs at every level.
+        let inv = "Inv == TRUE \\* IsBad would mention x\n";
+        let vars = vec!["x".to_string()];
+        let mut ops: BTreeMap<String, OperatorBody> = BTreeMap::new();
+        ops.insert(
+            "IsBad".to_string(),
+            OperatorBody {
+                name: "IsBad".to_string(),
+                body: "IsBad == x > 0".to_string(),
+            },
+        );
+        let found = extract_invariant_variables_transitive(inv, &vars, &ops);
+        assert!(!found.contains("x"));
     }
 
     #[test]

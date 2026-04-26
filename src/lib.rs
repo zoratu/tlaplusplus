@@ -24,4 +24,7 @@ pub use liveness::{BuchiChecker, CycleDetector, LivenessChecker};
 pub use model::Model;
 pub use runtime::{EngineConfig, PropertyType, RunOutcome, RunStats, Violation, run_model};
 pub use simulation::{SimulationConfig, SimulationOutcome, run_simulation};
-pub use trace_minimize::{MinimizeResult, extract_invariant_variables, minimize_trace};
+pub use trace_minimize::{
+    MinimizeResult, OperatorBody, extract_invariant_variables,
+    extract_invariant_variables_transitive, minimize_trace,
+};
