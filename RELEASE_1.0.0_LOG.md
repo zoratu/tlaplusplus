@@ -1684,3 +1684,23 @@ RESULT: clean — no divergences, no hangs.
 
 **Commit:** `8b183dd` — `test(t11): chaos soak harness — 1h, 387 iters, 0 divergences across 12 failpoints`.
 
+
+### T12 — Cross-arch CI matrix (Phase 3)
+
+**Date:** 2026-04-26.
+
+**Change:** `.github/workflows/diff-tlc.yml` now runs as a matrix over
+`[ubuntu-latest, ubuntu-24.04-arm]`. Both runners build a debug binary,
+run `cargo test --lib --bins`, run `scripts/diff_tlc.sh`, and run the T2
+proptest equivalence at `PROPTEST_CASES=128` (lowered from 256 to keep
+the doubled job count inside the per-PR budget). `fail-fast: false` so
+a single-arch failure doesn't mask the other.
+
+**x86_64 validation:** deferred — the workflow itself is the validator.
+The repo is mostly portable Rust; the only platform-specific code is
+`procfs` (linux-only, both archs) and `set_mempolicy` (linux syscall,
+arch-agnostic). Atomic ops use `std::sync::atomic` orderings that should
+behave identically on both x86 and aarch64. If GitHub Actions surfaces
+a real issue, it will be filed as T12.1+.
+
+**Commit:** `a71283f` — `ci(t12): cross-arch CI matrix — run diff-TLC + proptest on aarch64 and x86_64`.
