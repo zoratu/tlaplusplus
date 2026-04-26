@@ -3,6 +3,230 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::hash::Hash;
 
+/// T10.3 — trivial-SCC pre-filter via iterative leaf trim.
+///
+/// A node `v` cannot belong to any non-trivial SCC if either
+///
+///   * `v` has no outgoing edge that stays inside the candidate set (a sink), or
+///   * `v` has no incoming edge from inside the candidate set (a source),
+///
+/// **and** `v` does not have a self-loop. Iteratively peeling such nodes
+/// shrinks the input to Tarjan to "states that genuinely participate in a
+/// cycle." For state graphs that are mostly DAG-shaped (typical for
+/// safety-only specs), trim removes nearly every node and Tarjan's input
+/// shrinks dramatically. For one-giant-SCC graphs (the LivenessBench
+/// shape) trim removes nothing — costs O(N + E) extra.
+///
+/// Returns the candidate node set and a boolean indicating whether any
+/// trimming actually happened (so the caller can still hand the original
+/// adjacency back to Tarjan when trim was a no-op, avoiding the O(N + E)
+/// "filter to candidates" wrapper cost).
+///
+/// Self-loops are preserved: any node with `v -> v` is always a candidate
+/// because it forms a non-trivial SCC by itself.
+pub fn trivial_scc_prefilter(
+    nodes: &[u64],
+    adjacency: &HashMap<u64, Vec<u64>>,
+) -> (HashSet<u64>, bool) {
+    use std::collections::VecDeque;
+
+    // Node fingerprints with self-loops are always candidates — they're
+    // a non-trivial SCC by themselves. Compute up front so we never trim
+    // them.
+    let mut self_loops: HashSet<u64> = HashSet::new();
+    for (&v, succs) in adjacency.iter() {
+        if succs.iter().any(|&s| s == v) {
+            self_loops.insert(v);
+        }
+    }
+
+    // candidate set starts as all nodes; degrees count edges inside the
+    // candidate set in both directions.
+    let mut candidates: HashSet<u64> = nodes.iter().copied().collect();
+
+    // out_deg[v] = |{w : v -> w, w in candidates}|
+    // in_deg[v]  = |{w : w -> v, w in candidates}|
+    let mut out_deg: HashMap<u64, usize> = HashMap::with_capacity(nodes.len());
+    let mut in_deg: HashMap<u64, usize> = HashMap::with_capacity(nodes.len());
+    let mut reverse: HashMap<u64, Vec<u64>> = HashMap::with_capacity(nodes.len());
+
+    for &v in nodes {
+        out_deg.entry(v).or_insert(0);
+        in_deg.entry(v).or_insert(0);
+    }
+    for (&v, succs) in adjacency.iter() {
+        for &w in succs {
+            // count v -> w (skip self-loops; they don't help cycle detection
+            // for the trim algorithm — we keep them via the self_loops set).
+            if v == w {
+                continue;
+            }
+            *out_deg.entry(v).or_insert(0) += 1;
+            *in_deg.entry(w).or_insert(0) += 1;
+            reverse.entry(w).or_insert_with(Vec::new).push(v);
+        }
+    }
+
+    // Initial worklist: every node with zero in-degree or zero out-degree
+    // (and no self-loop).
+    let mut work: VecDeque<u64> = VecDeque::new();
+    for &v in nodes {
+        if self_loops.contains(&v) {
+            continue;
+        }
+        let id = in_deg.get(&v).copied().unwrap_or(0);
+        let od = out_deg.get(&v).copied().unwrap_or(0);
+        if id == 0 || od == 0 {
+            work.push_back(v);
+        }
+    }
+
+    let mut trimmed_any = false;
+    while let Some(v) = work.pop_front() {
+        if !candidates.contains(&v) {
+            continue;
+        }
+        if self_loops.contains(&v) {
+            continue;
+        }
+        candidates.remove(&v);
+        trimmed_any = true;
+
+        // For each successor w of v: w lost an in-edge.
+        if let Some(succs) = adjacency.get(&v) {
+            for &w in succs {
+                if w == v || !candidates.contains(&w) {
+                    continue;
+                }
+                if let Some(d) = in_deg.get_mut(&w) {
+                    *d = d.saturating_sub(1);
+                    if *d == 0 && !self_loops.contains(&w) {
+                        work.push_back(w);
+                    }
+                }
+            }
+        }
+        // For each predecessor u of v: u lost an out-edge.
+        if let Some(preds) = reverse.get(&v) {
+            for &u in preds {
+                if u == v || !candidates.contains(&u) {
+                    continue;
+                }
+                if let Some(d) = out_deg.get_mut(&u) {
+                    *d = d.saturating_sub(1);
+                    if *d == 0 && !self_loops.contains(&u) {
+                        work.push_back(u);
+                    }
+                }
+            }
+        }
+    }
+
+    (candidates, trimmed_any)
+}
+
+/// T10.4 — per-action transition shard.
+///
+/// Builds a `HashMap<action_name, Vec<(from_fp, to_fp)>>` so that each
+/// fairness check can iterate only the transitions labelled with its
+/// action, instead of every transition in the graph. For a spec with many
+/// sub-action fairness constraints (e.g. `\A t \in Threads :
+/// WF_vars(StealItem(t))`) this turns the per-constraint work from
+/// `O(transitions)` into `O(transitions_for_this_action)`.
+///
+/// Wrapper-Next constraints (where the constraint targets the model's
+/// wrapper next-action name) still need to scan everything, but that case
+/// can be dispatched to a single "any in-SCC edge counts" check which
+/// uses the original flattened triples or the adjacency map. The runtime
+/// handles the wrapper-Next case directly without touching the shard
+/// index.
+///
+/// Implementation note: action names are stored as owned `String` keys
+/// because the source tx_triples vec owns the names; once the shard is
+/// built, downstream callers borrow the keys.
+pub type ActionShardIndex = HashMap<String, Vec<(u64, u64)>>;
+
+pub fn build_action_shard_index(triples: &[(u64, u64, String)]) -> ActionShardIndex {
+    // Avoid cloning the action name on every transition. We use the
+    // raw_entry API: probe with &str, only clone the String key on the
+    // first time we see this action.
+    use std::collections::hash_map::Entry;
+    let mut shards: ActionShardIndex = HashMap::with_capacity(16);
+    for (from, to, name) in triples {
+        // Cheap probe-then-insert pattern. The hash is computed once;
+        // the key clone happens only when the action is new.
+        match shards.get_mut(name) {
+            Some(v) => v.push((*from, *to)),
+            None => match shards.entry(name.clone()) {
+                Entry::Occupied(mut o) => o.get_mut().push((*from, *to)),
+                Entry::Vacant(v) => {
+                    v.insert(vec![(*from, *to)]);
+                }
+            },
+        }
+    }
+    shards
+}
+
+/// Wrapper-Next variant of [`check_fairness_on_scc_fp`] that uses the
+/// adjacency map to short-circuit "any in-SCC edge exists". This is the
+/// fast path for `WF_vars(Next)` style constraints.
+pub fn scc_has_any_internal_edge(
+    scc_fps: &HashSet<u64>,
+    adjacency: &HashMap<u64, Vec<u64>>,
+) -> bool {
+    // For each node in the SCC, check if it has any successor inside the
+    // SCC. As soon as we find one, we're done.
+    for fp in scc_fps {
+        if let Some(succs) = adjacency.get(fp) {
+            for &w in succs {
+                if scc_fps.contains(&w) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// T10.4 — fairness check on SCC using a per-action shard index.
+///
+/// Iterates only the transitions for the constraint's action, instead of
+/// the full transition list. Falls back to the wrapper-Next check (any
+/// in-SCC edge) when the constraint targets the wrapper.
+pub fn check_fairness_on_scc_fp_sharded(
+    scc_fps: &HashSet<u64>,
+    constraint: &FairnessConstraint,
+    shards: &ActionShardIndex,
+    adjacency: &HashMap<u64, Vec<u64>>,
+    next_action_name: Option<&str>,
+) -> Result<()> {
+    let action_name = constraint.action_name();
+    let constraint_is_wrapper_next = next_action_name.map(|n| n == action_name).unwrap_or(false);
+
+    let action_occurs = if constraint_is_wrapper_next {
+        // Wrapper Next: any in-SCC edge counts, regardless of label.
+        scc_has_any_internal_edge(scc_fps, adjacency)
+    } else if let Some(edges) = shards.get(action_name) {
+        // Named action: iterate only this action's edges.
+        edges
+            .iter()
+            .any(|(from, to)| scc_fps.contains(from) && scc_fps.contains(to))
+    } else {
+        // Action name not in any transition label at all → cannot occur.
+        false
+    };
+
+    if !action_occurs && !scc_fps.is_empty() {
+        return Err(anyhow!(
+            "Fairness constraint may be violated: action '{}' does not occur in SCC",
+            action_name
+        ));
+    }
+
+    Ok(())
+}
+
 /// Action label for tracking which actions are taken in transitions
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ActionLabel {
@@ -472,6 +696,168 @@ mod tests {
             (11, 10, "Other"),
         ];
         assert!(check_fairness_on_scc_fp(&scc_fps, &constraint, txs.into_iter(), None).is_err());
+    }
+
+    // ---- T10.3 trivial-SCC pre-filter tests ----
+
+    #[test]
+    fn test_trim_dag_removes_everything() {
+        // Linear DAG 1 -> 2 -> 3 -> 4: no cycles, every node should be
+        // trimmed. Only 4 has out-degree 0; only 1 has in-degree 0. We
+        // peel them, then 2 and 3 follow.
+        let nodes = vec![1u64, 2, 3, 4];
+        let mut adj: HashMap<u64, Vec<u64>> = HashMap::new();
+        adj.insert(1, vec![2]);
+        adj.insert(2, vec![3]);
+        adj.insert(3, vec![4]);
+        adj.insert(4, vec![]);
+        let (cands, trimmed) = trivial_scc_prefilter(&nodes, &adj);
+        assert!(trimmed);
+        assert!(cands.is_empty(), "expected DAG nodes all trimmed");
+    }
+
+    #[test]
+    fn test_trim_giant_cycle_keeps_everything() {
+        // 1 -> 2 -> 3 -> 1: every node is in the cycle. Trim must keep
+        // them all, since none has zero in/out within the cycle.
+        let nodes = vec![1u64, 2, 3];
+        let mut adj: HashMap<u64, Vec<u64>> = HashMap::new();
+        adj.insert(1, vec![2]);
+        adj.insert(2, vec![3]);
+        adj.insert(3, vec![1]);
+        let (cands, trimmed) = trivial_scc_prefilter(&nodes, &adj);
+        assert!(!trimmed, "expected no trimming on giant cycle");
+        assert_eq!(cands.len(), 3);
+    }
+
+    #[test]
+    fn test_trim_preserves_self_loop() {
+        // 1 -> 2 -> 2 (self-loop). 1 has out-edge but no in-edge → trim.
+        // 2 has self-loop → keep (non-trivial SCC by itself).
+        let nodes = vec![1u64, 2];
+        let mut adj: HashMap<u64, Vec<u64>> = HashMap::new();
+        adj.insert(1, vec![2]);
+        adj.insert(2, vec![2]);
+        let (cands, trimmed) = trivial_scc_prefilter(&nodes, &adj);
+        assert!(trimmed);
+        assert!(cands.contains(&2), "self-loop must survive trim");
+        assert!(!cands.contains(&1));
+    }
+
+    #[test]
+    fn test_trim_mixed_graph() {
+        // 1 -> 2 -> 3 -> 2 (cycle 2-3) and 4 -> 5 (DAG tail).
+        // Trim should drop {1, 4, 5} and keep {2, 3}.
+        let nodes = vec![1u64, 2, 3, 4, 5];
+        let mut adj: HashMap<u64, Vec<u64>> = HashMap::new();
+        adj.insert(1, vec![2]);
+        adj.insert(2, vec![3]);
+        adj.insert(3, vec![2]);
+        adj.insert(4, vec![5]);
+        adj.insert(5, vec![]);
+        let (cands, trimmed) = trivial_scc_prefilter(&nodes, &adj);
+        assert!(trimmed);
+        assert_eq!(cands.len(), 2);
+        assert!(cands.contains(&2));
+        assert!(cands.contains(&3));
+    }
+
+    // ---- T10.4 per-action transition shard tests ----
+
+    #[test]
+    fn test_action_shard_index_groups_by_name() {
+        let triples = vec![
+            (1u64, 2, "Step".to_string()),
+            (2, 3, "Step".to_string()),
+            (3, 1, "Reset".to_string()),
+            (5, 6, "Other".to_string()),
+        ];
+        let shards = build_action_shard_index(&triples);
+        assert_eq!(shards.len(), 3);
+        assert_eq!(shards.get("Step").unwrap().len(), 2);
+        assert_eq!(shards.get("Reset").unwrap().len(), 1);
+        assert_eq!(shards.get("Other").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_check_fairness_on_scc_fp_sharded_named_action() {
+        // SCC = {1, 2, 3}, action "Step" occurs only outside SCC → fail.
+        let scc_fps: HashSet<u64> = [1u64, 2, 3].into_iter().collect();
+        let constraint = FairnessConstraint::Weak {
+            vars: vec!["v".to_string()],
+            action: "Step".to_string(),
+        };
+        let triples = vec![
+            (10, 11, "Step".to_string()), // outside SCC
+            (1, 2, "Other".to_string()),
+            (2, 3, "Other".to_string()),
+            (3, 1, "Other".to_string()),
+        ];
+        let shards = build_action_shard_index(&triples);
+        let mut adj: HashMap<u64, Vec<u64>> = HashMap::new();
+        adj.insert(1, vec![2]);
+        adj.insert(2, vec![3]);
+        adj.insert(3, vec![1]);
+        adj.insert(10, vec![11]);
+        let r = check_fairness_on_scc_fp_sharded(&scc_fps, &constraint, &shards, &adj, None);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn test_check_fairness_on_scc_fp_sharded_passes_when_action_in_scc() {
+        let scc_fps: HashSet<u64> = [1u64, 2, 3].into_iter().collect();
+        let constraint = FairnessConstraint::Weak {
+            vars: vec!["v".to_string()],
+            action: "Step".to_string(),
+        };
+        let triples = vec![
+            (1, 2, "Step".to_string()),
+            (2, 3, "Step".to_string()),
+            (3, 1, "Reset".to_string()),
+        ];
+        let shards = build_action_shard_index(&triples);
+        let mut adj: HashMap<u64, Vec<u64>> = HashMap::new();
+        adj.insert(1, vec![2]);
+        adj.insert(2, vec![3]);
+        adj.insert(3, vec![1]);
+        let r = check_fairness_on_scc_fp_sharded(&scc_fps, &constraint, &shards, &adj, None);
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn test_check_fairness_on_scc_fp_sharded_wrapper_next_uses_adjacency() {
+        // Constraint targets "Next" wrapper; SCC has a self-loop edge
+        // labelled with a subaction name → wrapper-Next must see the
+        // edge and pass.
+        let scc_fps: HashSet<u64> = [1u64].into_iter().collect();
+        let constraint = FairnessConstraint::Weak {
+            vars: vec!["v".to_string()],
+            action: "Next".to_string(),
+        };
+        let triples = vec![(1u64, 1, "Terminated".to_string())];
+        let shards = build_action_shard_index(&triples);
+        let mut adj: HashMap<u64, Vec<u64>> = HashMap::new();
+        adj.insert(1, vec![1]);
+        let r =
+            check_fairness_on_scc_fp_sharded(&scc_fps, &constraint, &shards, &adj, Some("Next"));
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn test_check_fairness_on_scc_fp_sharded_wrapper_next_fails_on_isolated_node() {
+        // A truly isolated single-node SCC (no edges at all) must still
+        // flag wrapper-Next as missing — there's no transition for Next
+        // to occur on.
+        let scc_fps: HashSet<u64> = [42u64].into_iter().collect();
+        let constraint = FairnessConstraint::Weak {
+            vars: vec!["v".to_string()],
+            action: "Next".to_string(),
+        };
+        let shards: ActionShardIndex = HashMap::new();
+        let adj: HashMap<u64, Vec<u64>> = HashMap::new();
+        let r =
+            check_fairness_on_scc_fp_sharded(&scc_fps, &constraint, &shards, &adj, Some("Next"));
+        assert!(r.is_err());
     }
 
     #[test]

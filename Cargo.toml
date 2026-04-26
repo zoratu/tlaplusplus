@@ -24,7 +24,7 @@ crossbeam-channel = "0.5.15"
 crossbeam-deque = "0.8.6"
 crossbeam-queue = "0.3.12"
 crossbeam-utils = "0.8.21"
-dashmap = "6.1.0"
+dashmap = { version = "6.1.0", features = ["raw-api"] }
 libc = "0.2.182"
 num_cpus = "1.17.0"
 parking_lot = "0.12.5"
