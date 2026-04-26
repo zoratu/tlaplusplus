@@ -89,6 +89,11 @@ pub struct SpillableWorkerState<T> {
     spill_tx: Sender<SpillBatch<T>>,
     /// Count of items spilled by this worker
     items_spilled: u64,
+    /// T11.1: shared in-flight counter so Drop can release any items
+    /// still in spill_buffer when the worker thread panics. Without this,
+    /// a panicked worker leaves inflight permanently > 0 and the runtime
+    /// hangs on termination detection.
+    inflight_spilled: Arc<AtomicU64>,
 }
 
 impl<T> SpillableWorkerState<T> {
@@ -102,6 +107,59 @@ impl<T> SpillableWorkerState<T> {
     #[inline]
     pub fn numa_node(&self) -> usize {
         self.inner.numa_node
+    }
+}
+
+impl<T> Drop for SpillableWorkerState<T> {
+    fn drop(&mut self) {
+        // T11.1 panic-safety: any items remaining in the spill_buffer at
+        // drop time will not reach the coordinator (their thread is
+        // unwinding or just exiting). We must release them from the
+        // inflight counter so termination detection can proceed.
+        // Items still in the per-worker channel (already sent) are
+        // accounted for separately — the coordinator drains them
+        // post-stop. Items in spill_buffer have NOT been bumped into
+        // the channel-tracked path, so the counter still holds their
+        // count and we decrement here.
+        //
+        // Note: this loses the items themselves (they're dropped along
+        // with the Vec). For the panic case this is unavoidable — the
+        // worker died holding them. For graceful shutdown, callers
+        // should already have flushed via flush_worker_counters before
+        // dropping; this Drop is defensive.
+        let leftover = self.spill_buffer.len() as u64;
+        if leftover > 0 {
+            // Best-effort: try to send the buffer once more before
+            // dropping. If the channel is closed (coordinator shutting
+            // down), we still need to release the inflight count so
+            // termination doesn't hang.
+            let buf = std::mem::take(&mut self.spill_buffer);
+            let batch = SpillBatch {
+                worker_id: self.inner.id,
+                items: buf,
+            };
+            match self.spill_tx.try_send(batch) {
+                Ok(()) => {
+                    // Items will be routed by the coordinator and then
+                    // decremented in route_spill_batch. Nothing to do
+                    // here.
+                }
+                Err(crossbeam_channel::TrySendError::Full(b))
+                | Err(crossbeam_channel::TrySendError::Disconnected(b)) => {
+                    // Couldn't send: items are lost on the floor.
+                    // Release them from the inflight counter so
+                    // termination doesn't hang. Operator must look at
+                    // panic logs to know if this happened.
+                    eprintln!(
+                        "Warning: SpillableWorkerState dropping {} items in spill_buffer (worker_id={}) — releasing inflight counter",
+                        b.items.len(),
+                        b.worker_id
+                    );
+                    self.inflight_spilled
+                        .fetch_sub(leftover, Ordering::AcqRel);
+                }
+            }
+        }
     }
 }
 
@@ -211,6 +269,12 @@ where
             None
         };
 
+        // T11.1: shared in-flight counter so the spill coordinator can
+        // decrement after items reach a termination-visible tier, and so
+        // SpillableWorkerState::drop can release leaked spill_buffer
+        // items on worker panic.
+        let inflight_spilled = Arc::new(AtomicU64::new(0));
+
         // Create per-worker channels and spillable states
         let mut worker_states = Vec::with_capacity(num_workers);
         let mut spill_receivers: Vec<Receiver<SpillBatch<T>>> = Vec::with_capacity(num_workers);
@@ -224,12 +288,9 @@ where
                 spill_buffer_threshold: config.worker_spill_buffer_size,
                 spill_tx: tx,
                 items_spilled: 0,
+                inflight_spilled: Arc::clone(&inflight_spilled),
             });
         }
-
-        // T11.1: shared in-flight counter so the spill coordinator can
-        // decrement after items reach a termination-visible tier.
-        let inflight_spilled = Arc::new(AtomicU64::new(0));
 
         // Start spill coordinator thread
         let coordinator_overflow = Arc::clone(&overflow);
@@ -311,14 +372,6 @@ where
     ) {
         let mut accumulator: Vec<T> = Vec::with_capacity(batch_size);
 
-        // Use select! to receive from any worker without polling
-        let mut sel = crossbeam_channel::Select::new();
-        let mut recv_indices: Vec<usize> = Vec::with_capacity(receivers.len());
-        for (_i, rx) in receivers.iter().enumerate() {
-            let idx = sel.recv(rx);
-            recv_indices.push(idx);
-        }
-
         let flush_accumulator = |accumulator: &mut Vec<T>,
                                  ring: &Option<Arc<CompressedSegmentRing>>,
                                  inflight: &Arc<AtomicU64>| {
@@ -341,29 +394,75 @@ where
         // forever in the (unreachable on the happy path) case where some
         // route_spill_batch error left inflight > 0 with no items left to
         // drain.
+        //
+        // T11.1 panic-safety: receivers can become disconnected mid-run
+        // when a worker panics (its `spill_tx` Sender is dropped during
+        // stack unwind). A disconnected receiver always "wins" Select
+        // because select considers it ready, which would tight-loop here
+        // and starve other senders. We must rebuild the Select set
+        // whenever a receiver becomes disconnected, removing it.
+        let mut active_receivers: Vec<(usize, Receiver<SpillBatch<T>>)> = receivers
+            .into_iter()
+            .enumerate()
+            .collect();
         let mut idle_post_stop_iters = 0u32;
         const MAX_IDLE_POST_STOP_ITERS: u32 = 200; // ~2s at 10ms timeout
+
         loop {
             let stopped = stop.load(Ordering::Acquire);
 
-            // Try to receive with short timeout
-            let result = sel.select_timeout(std::time::Duration::from_millis(10));
-            match result {
-                Ok(oper) => {
-                    let recv_idx = oper.index();
-                    if let Ok(batch) = oper.recv(&receivers[recv_idx]) {
-                        idle_post_stop_iters = 0;
-                        accumulator.extend(batch.items);
-                        if accumulator.len() >= batch_size {
-                            flush_accumulator(
-                                &mut accumulator,
-                                &compressed_ring,
-                                &inflight_spilled,
-                            );
+            if active_receivers.is_empty() {
+                // All workers' channels disconnected. Final flush + exit.
+                flush_accumulator(&mut accumulator, &compressed_ring, &inflight_spilled);
+                break;
+            }
+
+            // Build a fresh Select over only the still-connected receivers.
+            // We need to ensure all borrows of `active_receivers` are
+            // released before we may mutate it (swap_remove on disconnect),
+            // so do the select + recv in a tight scope.
+            #[derive(Debug)]
+            enum CoordTick<T2> {
+                Got(Vec<T2>),
+                Disconnect(usize),
+                Timeout,
+            }
+            let tick: CoordTick<T> = {
+                let mut sel = crossbeam_channel::Select::new();
+                for (_, rx) in active_receivers.iter() {
+                    sel.recv(rx);
+                }
+                match sel.select_timeout(std::time::Duration::from_millis(10)) {
+                    Ok(oper) => {
+                        let recv_idx = oper.index();
+                        let (_orig_id, rx) = &active_receivers[recv_idx];
+                        match oper.recv(rx) {
+                            Ok(batch) => CoordTick::Got(batch.items),
+                            Err(_disconnected) => CoordTick::Disconnect(recv_idx),
                         }
                     }
+                    Err(crossbeam_channel::SelectTimeoutError) => CoordTick::Timeout,
                 }
-                Err(crossbeam_channel::SelectTimeoutError) => {
+            };
+            match tick {
+                CoordTick::Got(items) => {
+                    idle_post_stop_iters = 0;
+                    accumulator.extend(items);
+                    if accumulator.len() >= batch_size {
+                        flush_accumulator(
+                            &mut accumulator,
+                            &compressed_ring,
+                            &inflight_spilled,
+                        );
+                    }
+                }
+                CoordTick::Disconnect(recv_idx) => {
+                    // T11.1: this worker's Sender was dropped (likely a
+                    // panic). Remove its receiver from the active set so
+                    // future selects don't tight-loop on it.
+                    active_receivers.swap_remove(recv_idx);
+                }
+                CoordTick::Timeout => {
                     flush_accumulator(&mut accumulator, &compressed_ring, &inflight_spilled);
                     if stopped {
                         if inflight_spilled.load(Ordering::Acquire) == 0 {

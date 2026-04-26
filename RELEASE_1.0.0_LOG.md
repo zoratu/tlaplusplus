@@ -2188,8 +2188,39 @@ Plus an `#[ignore]`d integration suite in
 at multiple caps; runs with `cargo test --release --test
 queue_spill_soundness_t11_1 -- --ignored`.
 
-**T11.2 re-soak.** Once T11.1 was confirmed fixed, ran a 30-min swarm
-chaos soak with a small queue cap so the spill path actually engages
-under fault injection. See its own commit `test(t11.2)` for the iter
-count, divergences, and downstream fire counts of `queue_spill_fail` /
-`queue_load_fail`.
+**T11.1 follow-on (worker_panic + spill).** During the T11.2 re-soak,
+the first iteration that fired `worker_panic` revealed a follow-on bug:
+the run hung at "3,990 distinct, 4,005 left on queue" until the
+per-iter 120 s timeout. Root cause: when a worker panics, its
+`spill_tx` Sender is dropped, leaving the corresponding Receiver
+disconnected. The spill coordinator's `crossbeam_channel::Select`
+considered the disconnected Receiver "ready" on every select call and
+returned its disconnect-error as the winning operation, starving the
+other workers' channels. The coordinator was tight-spinning on a
+single dead receiver and never drained the live ones, so
+`inflight_spilled` stayed > 0 and the alive worker's
+`has_pending_work()` remained true forever.
+
+Fix in the same file (`spillable_work_stealing.rs`):
+
+1. `spill_coordinator_thread` now keeps an `active_receivers:
+   Vec<(usize, Receiver<_>)>` and rebuilds the `Select` from it each
+   iteration. On a disconnect-error, it `swap_remove`s the dead entry
+   so it's never re-selected.
+2. Added a `Drop` impl on `SpillableWorkerState` that, on panic, tries
+   one final `try_send` of any items still in the worker's
+   `spill_buffer`; on disconnect/full it decrements `inflight_spilled`
+   directly (with a logged warning) so termination doesn't hang on
+   genuinely-lost items. Callers should still call
+   `flush_worker_counters` before dropping on the happy path.
+
+Validation: `FAILPOINTS=worker_panic=1*return->off` against
+CheckpointDrain at cap=2000 now completes in 16.5 s with 26,344
+distinct (was 120 s timeout). 5 baseline runs (no failpoints) at caps
+2000 and 50000 still all return 26,344 distinct.
+
+**T11.2 re-soak.** Once both T11.1 fixes landed, ran a 30-min swarm
+chaos soak with `--queue-max-inmem 2000` so the spill path actually
+engages under fault injection. See its own commit `test(t11.2)` for
+the iter count, divergences, and downstream fire counts of
+`queue_spill_fail` / `queue_load_fail`.
