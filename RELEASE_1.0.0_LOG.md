@@ -367,5 +367,5 @@ interpreted IR.
 
 **Wider scope discovered:** None — the fix is narrowly contained. T1.2 (VIEW projection) was a misdiagnosis whose symptom was actually T1.5; this fix closes both. The `compile_action_ir_branches` path was already correct (it's used by analyze-tla); only the runtime `evaluate_next_states` path needed the three-part fix above.
 
-**Commit:** _to be filled in after `git commit`_.
+**Commit:** `2881d8b`.
 
