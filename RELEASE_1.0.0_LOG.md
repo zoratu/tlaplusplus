@@ -179,3 +179,100 @@ pointing at T1.4.
 **Commit:** `4865611` — `fix(soundness): expand action calls inside compiled
 \E ... : Action(x) (T1.1)`
 
+### T1.2 — VIEW projection investigation: misdiagnosis, real bug is in Next splitter (NOT patched)
+
+**Status:** investigated, **the original diagnosis was wrong**. VIEW projection
+IS being applied to fingerprinting. The 121-vs-106 discrepancy in `ViewTest.tla`
+is caused by a **wider parser bug**: top-level `\/` inside a `/\`-conjunction
+Next body is incorrectly treated as a top-level disjunction, producing spurious
+successor states. Per the working rule "if the bug is wider, document and stop",
+no patch was applied. Filed as a follow-up (recommend **T1.5** — Next splitter).
+
+**Investigation evidence (run on spot `REDACTED-INSTANCE`, c8g.xlarge):**
+
+1. Confirmed `TlaModel::fingerprint` (`src/models/tla_native.rs:346`) does call
+   `evaluate_view` and the global FP store dedupes correctly. With
+   `TLAPP_VIEW_DEBUG=1` instrumented, the view eval returns
+   `Seq([Int(x), Int(y)])` for every state and there are exactly 121 unique
+   `<<x, y>>` results — meaning the FP store has 121 *distinct view-projected
+   values*. So VIEW is wired in.
+
+2. Removed VIEW from the cfg (`SPECIFICATION Spec\nINVARIANTS TypeOK`, no
+   `VIEW StateView`). Result: still **321 generated, 121 distinct**. The full
+   state count under no-view is also 121 because the buggy Next happens to
+   produce a one-to-one (x,y)↔timestamp relationship (timestamp ends up equal
+   to the y-increment count along any path). Confirmed VIEW has nothing to do
+   with the discrepancy.
+
+3. Instrumented `TlaModel::next_states` to dump successors. From init
+   `(t=0, x=0, y=0)` tlaplusplus generates **3 successors**:
+     - `(t=0, x=0, y=0)` — pure stutter, identical to source
+     - `(t=0, x=1, y=0)` — `x` incremented but **timestamp NOT incremented**
+     - `(t=1, x=0, y=1)` — correct `y`-disjunct outcome
+   Expected (TLC, 2 successors): `(t=1, x=1, y=0)` and `(t=1, x=0, y=1)`.
+
+4. Instrumented `evaluate_next_states_with_instances` to print
+   `split_action_disjuncts(next_body)`. Output:
+   ```
+   -> 3 disjuncts:
+     [0] "/\\ x + y < 15\n    /\\"
+     [1] "/\\ x < 10\n          /\\ x' = x + 1\n          /\\ y' = y"
+     [2] "/\\ y < 10\n          /\\ y' = y + 1\n          /\\ x' = x\n    /\\ timestamp' = timestamp + 1"
+   ```
+   The Next body
+   ```
+   /\ x + y < 15
+   /\ \/ /\ x < 10 /\ x' = x + 1 /\ y' = y
+      \/ /\ y < 10 /\ y' = y + 1 /\ x' = x
+   /\ timestamp' = timestamp + 1
+   ```
+   should be *one* action body with an inner 2-way disjunction, but the
+   splitter slices on the inner `\/` characters at top level, yielding three
+   bogus "branches" — one with no primed assignments (→ stutter), one missing
+   the timestamp clause, and one with the timestamp clause attached only to
+   the `y`-disjunct.
+
+**Root cause (file:line):** `src/tla/action_exec.rs:799 split_action_disjuncts`
+delegates to `src/tla/action_ir.rs:141 split_action_body_disjuncts`. When
+`split_indented_action_disjuncts` returns `None` (because no top-level line
+*starts* with `\/` after trimming — here every meaningful line starts with
+`/\`), the code falls through to `split_top_level(trimmed, "\\/")`, which
+greedily splits on every top-level `\/` regardless of whether it sits inside
+a top-level conjunction. The interpreter path
+(`evaluate_next_states_with_instances`) is therefore inconsistent with the
+analyze-tla path (`compile_action_ir_branches`), which correctly cross-products
+the disjunction inside each conjunct.
+
+**Why this is wider than VIEW:** the broken splitting affects *any* spec whose
+Next has the shape `/\ guard /\ \/ branch1 \/ branch2 /\ shared_postcondition`
+— a **very common** TLA+ idiom for "guarded branches with a shared post-step
+update". Specs that happen not to use this layout (e.g. those that lift
+disjunction to the very top: `Next == \/ Action1 \/ Action2`) are unaffected,
+which is why the corpus pass rate (174/182) doesn't reflect the breadth of
+this. Beyond VIEW, this is a **soundness-relevant** bug: it can cause
+tlaplusplus to either miss states (if the spurious branches drop required
+clauses, as here) or invent states that violate guards. Either direction can
+hide invariant violations.
+
+**Recommended fix sketch (NOT applied; for follow-up task):**
+`split_action_body_disjuncts` should return `vec![trimmed]` when the input is
+a top-level `/\`-conjunction (i.e. starts with `/\` and `split_top_level` on
+`/\` yields ≥2 parts). The downstream interpreter/IR-compile path already
+handles inner disjunctions correctly per conjunct.
+
+**Validation that no patch was applied:**
+- `./target/release/tlaplusplus run-tla --module corpus/language/ViewTest.tla --config corpus/language/ViewTest.cfg --allow-deadlock --skip-system-checks`
+  still reports `321 states generated, 121 distinct` — same as before
+  investigation. All instrumentation reverted.
+- `corpus/diff_test/list.tsv` left unchanged: `ViewTest` remains in the
+  KNOWN DIVERGENT SPECS comment block. The 11-spec curated harness is
+  unaffected (no `cargo test` rerun needed since no source change was
+  retained).
+
+**Commits:** none — investigation only; no source changes shipped.
+
+**Follow-up filed:** add a new task (T1.5 in plan) to fix
+`split_action_body_disjuncts` so that top-level `/\` bodies are not split on
+inner `\/`. Once that lands, ViewTest's 106-distinct count should fall out
+automatically and the diff harness can re-include it.
+
