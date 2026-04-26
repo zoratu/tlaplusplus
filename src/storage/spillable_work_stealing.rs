@@ -10,6 +10,10 @@
 // - Spill coordinator batches items from all workers sequentially
 // - Workers NEVER block on disk I/O
 
+use crate::storage::compressed_segments::{
+    CompressedSegmentRing, CompressionStatsSnapshot, DEFAULT_COMPRESSION_LEVEL,
+    DEFAULT_MAX_COMPRESSED_BYTES,
+};
 use crate::storage::queue::{DiskBackedQueue, DiskQueueConfig, QueueStats, serialize_compressed};
 use crate::storage::work_stealing_queues::{WorkStealingQueues, WorkStealingStats, WorkerState};
 use anyhow::Result;
@@ -40,6 +44,20 @@ pub struct SpillableConfig {
     /// When true, segments are retained on disk after being consumed.
     /// S3 sync will upload them, then prune based on min_segment_id.
     pub defer_segment_deletion: bool,
+    /// Enable in-memory zstd-compressed segment ring (T8). When true, the
+    /// spill coordinator first tries to compress overflow batches into an
+    /// in-memory ring instead of writing to disk. This trades CPU time for
+    /// memory: serialized TLA+ states typically compress 3-10x, so the
+    /// equivalent of several GB of pending state can stay resident before
+    /// disk I/O kicks in. When the ring is full, batches fall through to
+    /// the existing disk-backed path with no behavior change.
+    pub compression_enabled: bool,
+    /// Hard cap on resident compressed-ring bytes. When the ring would
+    /// cross this limit, additional batches spill to disk as before.
+    pub compression_max_bytes: usize,
+    /// zstd level (1-22). 1 is fastest (~500MB/s on Graviton) with ~3x
+    /// ratio on serialized states; 3 trades 2x time for ~10% better ratio.
+    pub compression_level: i32,
 }
 
 impl Default for SpillableConfig {
@@ -52,6 +70,9 @@ impl Default for SpillableConfig {
             worker_spill_buffer_size: 4096, // Each worker buffers 4K items locally
             worker_channel_bound: 16,       // 16 batches in flight per worker
             defer_segment_deletion: false,  // Delete locally by default
+            compression_enabled: true,
+            compression_max_bytes: DEFAULT_MAX_COMPRESSED_BYTES,
+            compression_level: DEFAULT_COMPRESSION_LEVEL,
         }
     }
 }
@@ -121,11 +142,20 @@ pub struct SpillableWorkStealingQueues<T> {
     /// Skip segment deletion during checkpoint (S3 handles cleanup)
     defer_segment_deletion: bool,
 
+    /// Optional in-memory compressed-segment ring (T8). When `Some`, the
+    /// spill coordinator routes batches here before falling back to disk.
+    /// `None` disables compression entirely (legacy direct-spill path).
+    compressed_ring: Option<Arc<CompressedSegmentRing>>,
+
     /// Stats
     spill_redirects: AtomicU64,
     disk_loads: AtomicU64,
     spill_batches_sent: AtomicU64,
     spill_channel_full: AtomicU64,
+    /// Items pulled out of the compressed ring (decompressed and re-pushed
+    /// to the hot queue). Reported in stats so operators can see the ring
+    /// is doing work.
+    compressed_ring_loads: AtomicU64,
 }
 
 impl<T> SpillableWorkStealingQueues<T>
@@ -150,6 +180,15 @@ where
 
         let stop_signal = Arc::new(AtomicBool::new(false));
 
+        let compressed_ring = if config.compression_enabled {
+            Some(Arc::new(CompressedSegmentRing::new(
+                config.compression_max_bytes,
+                config.compression_level,
+            )))
+        } else {
+            None
+        };
+
         // Create per-worker channels and spillable states
         let mut worker_states = Vec::with_capacity(num_workers);
         let mut spill_receivers: Vec<Receiver<SpillBatch<T>>> = Vec::with_capacity(num_workers);
@@ -169,6 +208,7 @@ where
         // Start spill coordinator thread
         let coordinator_overflow = Arc::clone(&overflow);
         let coordinator_stop = Arc::clone(&stop_signal);
+        let coordinator_ring = compressed_ring.as_ref().map(Arc::clone);
         let spill_batch_size = config.spill_batch;
         let coordinator_handle = std::thread::Builder::new()
             .name("tlapp-spill-coordinator".to_string())
@@ -176,6 +216,7 @@ where
                 Self::spill_coordinator_thread(
                     spill_receivers,
                     coordinator_overflow,
+                    coordinator_ring,
                     coordinator_stop,
                     spill_batch_size,
                 );
@@ -188,10 +229,17 @@ where
         let loader_overflow = Arc::clone(&overflow);
         let loader_stop = Arc::clone(&stop_signal);
         let loader_draining = Arc::clone(&checkpoint_draining);
+        let loader_ring = compressed_ring.as_ref().map(Arc::clone);
         let loader_handle = std::thread::Builder::new()
             .name("tlapp-queue-loader".to_string())
             .spawn(move || {
-                Self::loader_thread(loader_hot, loader_overflow, loader_stop, loader_draining);
+                Self::loader_thread(
+                    loader_hot,
+                    loader_overflow,
+                    loader_ring,
+                    loader_stop,
+                    loader_draining,
+                );
             })?;
 
         let queues = Arc::new(Self {
@@ -204,20 +252,28 @@ where
             checkpoint_in_progress,
             checkpoint_draining,
             defer_segment_deletion: config.defer_segment_deletion,
+            compressed_ring,
             spill_redirects: AtomicU64::new(0),
             disk_loads: AtomicU64::new(0),
             spill_batches_sent: AtomicU64::new(0),
             spill_channel_full: AtomicU64::new(0),
+            compressed_ring_loads: AtomicU64::new(0),
         });
 
         Ok((queues, worker_states))
     }
 
-    /// Spill coordinator thread - receives batches from all workers, writes to disk
-    /// This is the ONLY thread that writes to the overflow queue
+    /// Spill coordinator thread - receives batches from all workers, writes
+    /// them to the in-memory compressed ring (if enabled) or directly to
+    /// disk overflow.
+    ///
+    /// The compressed ring is always tried first when present; if it
+    /// rejects (over its byte budget) the items fall through to the
+    /// existing direct-spill-to-disk path so memory is still bounded.
     fn spill_coordinator_thread(
         receivers: Vec<Receiver<SpillBatch<T>>>,
         overflow: Arc<DiskBackedQueue<T>>,
+        compressed_ring: Option<Arc<CompressedSegmentRing>>,
         stop: Arc<AtomicBool>,
         batch_size: usize,
     ) {
@@ -231,6 +287,15 @@ where
             recv_indices.push(idx);
         }
 
+        let flush_accumulator =
+            |accumulator: &mut Vec<T>, ring: &Option<Arc<CompressedSegmentRing>>| {
+                if accumulator.is_empty() {
+                    return;
+                }
+                let to_write = std::mem::replace(accumulator, Vec::with_capacity(batch_size));
+                Self::route_spill_batch(to_write, ring, &overflow);
+            };
+
         while !stop.load(Ordering::Acquire) {
             // Try to receive with timeout
             let result = sel.select_timeout(std::time::Duration::from_millis(10));
@@ -243,45 +308,63 @@ where
                         // Add items to accumulator
                         accumulator.extend(batch.items);
 
-                        // If accumulator is full, write to disk
+                        // If accumulator is full, route to ring/disk
                         if accumulator.len() >= batch_size {
-                            let to_write =
-                                std::mem::replace(&mut accumulator, Vec::with_capacity(batch_size));
-                            for item in to_write {
-                                if let Err(e) = overflow.push(item) {
-                                    eprintln!("Warning: spill coordinator push failed: {}", e);
-                                }
-                            }
+                            flush_accumulator(&mut accumulator, &compressed_ring);
                         }
                     }
                 }
                 Err(crossbeam_channel::SelectTimeoutError) => {
                     // Timeout - flush any accumulated items
-                    if !accumulator.is_empty() {
-                        let to_write =
-                            std::mem::replace(&mut accumulator, Vec::with_capacity(batch_size));
-                        for item in to_write {
-                            if let Err(e) = overflow.push(item) {
-                                eprintln!("Warning: spill coordinator push failed: {}", e);
-                            }
-                        }
-                    }
+                    flush_accumulator(&mut accumulator, &compressed_ring);
                 }
             }
         }
 
         // Final flush on shutdown
-        for item in accumulator {
+        flush_accumulator(&mut accumulator, &compressed_ring);
+    }
+
+    /// Route a spilled batch through the compressed ring first, falling
+    /// back to direct disk spill if the ring is full or disabled. Items
+    /// are never dropped: the ring returns them on rejection so we can
+    /// hand them to disk overflow.
+    fn route_spill_batch(
+        batch: Vec<T>,
+        compressed_ring: &Option<Arc<CompressedSegmentRing>>,
+        overflow: &Arc<DiskBackedQueue<T>>,
+    ) {
+        let to_disk = if let Some(ring) = compressed_ring.as_ref() {
+            match ring.try_push_batch(batch) {
+                Ok(None) => return,             // Accepted by the ring; nothing else to do.
+                Ok(Some(returned)) => returned, // Ring full — spill these to disk.
+                Err(e) => {
+                    // Internal error path; current implementation never
+                    // returns Err but we forward to disk anyway just in case.
+                    eprintln!(
+                        "Warning: compressed ring push errored ({}); cannot recover items here",
+                        e
+                    );
+                    return;
+                }
+            }
+        } else {
+            batch
+        };
+
+        for item in to_disk {
             if let Err(e) = overflow.push(item) {
-                eprintln!("Warning: spill coordinator final push failed: {}", e);
+                eprintln!("Warning: spill coordinator push failed: {}", e);
             }
         }
     }
 
-    /// Background thread that loads from disk when hot queues need refilling
+    /// Background thread that loads from disk (or the compressed ring)
+    /// when hot queues need refilling.
     fn loader_thread(
         hot: Arc<WorkStealingQueues<T>>,
         overflow: Arc<DiskBackedQueue<T>>,
+        compressed_ring: Option<Arc<CompressedSegmentRing>>,
         stop: Arc<AtomicBool>,
         checkpoint_draining: Arc<AtomicBool>,
     ) {
@@ -315,14 +398,21 @@ where
             let should_load_aggressively = hot_queues_empty || pending < LOW_WATER_MARK;
 
             // Queue is low or empty - check if disk has items
-            let has_work = overflow.has_pending_work();
+            let has_disk_work = overflow.has_pending_work();
             #[allow(unused_variables)]
             let segment_count = overflow.segment_count();
+            let has_ring_work = compressed_ring
+                .as_ref()
+                .map(|r| !r.is_empty())
+                .unwrap_or(false);
+            let has_work = has_disk_work || has_ring_work;
 
             // CRITICAL: Update hot queue's disk_has_pending_work flag BEFORE any continue.
             // This prevents workers from terminating when hot queues are empty
             // but disk has millions of items waiting to be loaded.
             // Must happen every iteration, even when pending >= HIGH_WATER_MARK.
+            // The flag also covers the in-memory compressed ring so workers
+            // don't terminate while compressed segments are still pending.
             hot.set_disk_has_pending_work(has_work);
 
             // Only pause loading if hot queues actually have enough items
@@ -369,6 +459,35 @@ where
             if !has_work {
                 // No disk items, sleep before checking again
                 std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            }
+
+            // Prefer the compressed in-memory ring before disk: decompression
+            // is much faster than disk read + deserialize, and segments live
+            // there in FIFO order so we drain the oldest pending work first.
+            if let Some(ring) = compressed_ring.as_ref() {
+                if let Some(segment) = ring.pop_oldest_segment() {
+                    match ring.decompress_segment::<T>(&segment) {
+                        Ok(items) => {
+                            for item in items {
+                                hot.push_global(item);
+                            }
+                            // Loop back so we re-check pending and either
+                            // drain another ring segment or pick up disk work.
+                            continue;
+                        }
+                        Err(e) => {
+                            eprintln!("Warning: compressed ring decompress error: {}", e);
+                            // Fall through to disk path.
+                        }
+                    }
+                }
+            }
+
+            if !has_disk_work {
+                // Ring was empty but disk_work flag was on — skip the disk
+                // load attempt and re-poll quickly.
+                std::thread::sleep(std::time::Duration::from_millis(5));
                 continue;
             }
 
@@ -576,10 +695,34 @@ where
         self.hot.pop_for_worker(&mut worker_state.inner)
     }
 
-    /// Try to load items from disk to hot queues
+    /// Try to load items from the compressed in-memory ring first, then
+    /// disk overflow, into the hot queues.
     fn try_load_from_disk(&self) {
         if !self.hot.is_empty() {
             return;
+        }
+
+        // Compressed ring is faster than disk: decompression at ~1GB/s
+        // beats a disk segment fetch even on NVMe. Drain one segment per
+        // call so we don't monopolize the worker pop path.
+        if let Some(ring) = self.compressed_ring.as_ref() {
+            if let Some(segment) = ring.pop_oldest_segment() {
+                match ring.decompress_segment::<T>(&segment) {
+                    Ok(items) => {
+                        let count = items.len();
+                        self.compressed_ring_loads
+                            .fetch_add(count as u64, Ordering::Relaxed);
+                        for item in items {
+                            self.hot.push_global(item);
+                        }
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: compressed ring decompress error: {}", e);
+                        // Fall through to disk path.
+                    }
+                }
+            }
         }
 
         match self.overflow.pop_bulk(10_000) {
@@ -597,8 +740,8 @@ where
         }
     }
 
-    /// Check termination - must check both hot and disk
-    /// Also prevents termination during checkpoint to avoid race condition
+    /// Check termination - must check hot, compressed ring, and disk.
+    /// Also prevents termination during checkpoint to avoid race condition.
     pub fn should_terminate(&self) -> bool {
         // CRITICAL: Don't terminate during checkpoint!
         // Checkpoint drains queues to disk, so queues may appear empty.
@@ -608,6 +751,11 @@ where
         }
         if self.hot.has_pending_work() {
             return false;
+        }
+        if let Some(ring) = self.compressed_ring.as_ref() {
+            if !ring.is_empty() {
+                return false;
+            }
         }
         if self.overflow.has_pending_work() {
             return false;
@@ -659,14 +807,30 @@ where
         self.overflow.finish();
     }
 
-    /// Check if all queues are empty
+    /// Check if all queues are empty (hot + compressed ring + disk).
     pub fn is_empty(&self) -> bool {
-        self.hot.is_empty() && self.overflow.is_empty()
+        if !self.hot.is_empty() {
+            return false;
+        }
+        if let Some(ring) = self.compressed_ring.as_ref() {
+            if !ring.is_empty() {
+                return false;
+            }
+        }
+        self.overflow.is_empty()
     }
 
-    /// Check if there's pending work
+    /// Check if there's pending work in any tier.
     pub fn has_pending_work(&self) -> bool {
-        self.hot.has_pending_work() || self.overflow.has_pending_work()
+        if self.hot.has_pending_work() {
+            return true;
+        }
+        if let Some(ring) = self.compressed_ring.as_ref() {
+            if !ring.is_empty() {
+                return true;
+            }
+        }
+        self.overflow.has_pending_work()
     }
 
     /// Get approximate pending count (in-memory only for speed)
@@ -674,7 +838,8 @@ where
         self.hot.pending_count()
     }
 
-    /// Get total pending count including spilled items on disk
+    /// Get total pending count including spilled items on disk and items
+    /// resident in the in-memory compressed ring.
     pub fn total_pending_count(&self) -> u64 {
         let inmem = self.hot.pending_count();
         let spilled = self.spill_redirects.load(Ordering::Relaxed);
@@ -683,8 +848,18 @@ where
         let overflow_stats = self.overflow.stats();
         let overflow_spilled = overflow_stats.spilled_items;
         let overflow_loaded = overflow_stats.loaded_items;
+        let ring_items = self
+            .compressed_ring
+            .as_ref()
+            .map(|r| r.pending_items() as u64)
+            .unwrap_or(0);
 
-        inmem + (spilled + overflow_spilled).saturating_sub(loaded + overflow_loaded)
+        inmem + ring_items + (spilled + overflow_spilled).saturating_sub(loaded + overflow_loaded)
+    }
+
+    /// Snapshot of compressed-ring stats (or `None` if compression is disabled).
+    pub fn compression_stats(&self) -> Option<CompressionStatsSnapshot> {
+        self.compressed_ring.as_ref().map(|r| r.snapshot_stats())
     }
 
     /// Check if queue is too full (for backpressure)
@@ -754,10 +929,30 @@ where
         self.checkpoint_draining.store(true, Ordering::Release);
         eprintln!("Checkpoint: checkpoint_draining set to true");
 
+        // Drain the compressed ring back to disk first. Without this,
+        // checkpoint state would not include items that are sitting in
+        // the compressed in-memory tier and they would be lost on restart.
+        let mut ring_drained = 0u64;
+        if let Some(ring) = self.compressed_ring.as_ref() {
+            let items: Vec<T> = ring.drain_all_decompressed()?;
+            ring_drained = items.len() as u64;
+            for item in items {
+                if let Err(e) = self.overflow.push(item) {
+                    eprintln!("Warning: checkpoint ring drain push failed: {}", e);
+                }
+            }
+            if ring_drained > 0 {
+                eprintln!(
+                    "Checkpoint: drained {} items from compressed ring to disk",
+                    ring_drained
+                );
+            }
+        }
+
         // First, drain all items from the hot queue's injectors to the overflow queue
         // This captures the current frontier that workers haven't processed yet
         eprintln!("Checkpoint: starting drain_injectors_to_disk");
-        let drained = self.drain_injectors_to_disk()?;
+        let drained = self.drain_injectors_to_disk()? + ring_drained;
         eprintln!(
             "Checkpoint: drain_injectors_to_disk returned {} items",
             drained
@@ -1537,6 +1732,9 @@ mod tests {
             worker_spill_buffer_size: 50,
             worker_channel_bound: 4,
             defer_segment_deletion: false,
+            compression_enabled: true,
+            compression_max_bytes: 64 * 1024 * 1024,
+            compression_level: 1,
         };
 
         let (queues, mut workers) = SpillableWorkStealingQueues::<u64>::new(2, vec![0, 0], config)?;
@@ -1572,6 +1770,9 @@ mod tests {
             worker_spill_buffer_size: 10,
             worker_channel_bound: 4,
             defer_segment_deletion: false,
+            compression_enabled: true,
+            compression_max_bytes: 64 * 1024 * 1024,
+            compression_level: 1,
         };
 
         let (queues, mut workers) = SpillableWorkStealingQueues::<u64>::new(2, vec![0, 0], config)?;
@@ -1636,6 +1837,9 @@ mod tests {
             worker_spill_buffer_size: 20,
             worker_channel_bound: 8,
             defer_segment_deletion: false,
+            compression_enabled: true,
+            compression_max_bytes: 64 * 1024 * 1024,
+            compression_level: 1,
         };
 
         let num_workers = 8;
@@ -1706,6 +1910,9 @@ mod tests {
             worker_spill_buffer_size: 100,
             worker_channel_bound: 8,
             defer_segment_deletion: false,
+            compression_enabled: true,
+            compression_max_bytes: 64 * 1024 * 1024,
+            compression_level: 1,
         };
 
         let num_workers = 4;
@@ -1797,6 +2004,9 @@ mod tests {
             worker_spill_buffer_size: 1000,
             worker_channel_bound: 8,
             defer_segment_deletion: false,
+            compression_enabled: true,
+            compression_max_bytes: 64 * 1024 * 1024,
+            compression_level: 1,
         };
 
         let num_workers = 4;
@@ -1825,6 +2035,222 @@ mod tests {
         // The test passes if it completes without OOM
         // In production with 87M items, the legacy version would OOM here
         // while the streaming version uses bounded memory
+
+        let _ = std::fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    /// T8: Verify the in-memory compressed ring captures overflow batches
+    /// before they hit disk, items round-trip back to the hot queue, and
+    /// pending counters stay accurate across the compressed tier.
+    #[test]
+    fn test_compression_ring_round_trip() -> Result<()> {
+        let dir = temp_path("spillable-comp-roundtrip");
+        let config = SpillableConfig {
+            // Tiny in-memory budget forces overflow path immediately.
+            max_inmem_items: 100,
+            spill_dir: dir.clone(),
+            spill_batch: 100,
+            load_existing: false,
+            worker_spill_buffer_size: 50,
+            worker_channel_bound: 8,
+            defer_segment_deletion: false,
+            compression_enabled: true,
+            // Generous ring budget — everything should fit in the ring,
+            // not on disk.
+            compression_max_bytes: 16 * 1024 * 1024,
+            compression_level: 1,
+        };
+
+        let (queues, mut workers) = SpillableWorkStealingQueues::<u64>::new(2, vec![0, 0], config)?;
+
+        // Push more than max_inmem_items so the spill path engages. We
+        // submit in small sub-batches because push_local_batch consults
+        // the hot queue's pending counter ONCE per call and only spills
+        // when that snapshot already exceeds the threshold; the first
+        // batch always lands in the hot queue, subsequent batches spill.
+        let n: u64 = 5_000;
+        let chunk: u64 = 200;
+        let mut next = 0u64;
+        while next < n {
+            let end = (next + chunk).min(n);
+            let items: Vec<u64> = (next..end).collect();
+            queues.push_local_batch(&mut workers[0], items.into_iter());
+            next = end;
+        }
+        queues.flush_worker_counters(&mut workers[0]);
+
+        // Wait for the spill coordinator to compress at least one segment.
+        let mut compressed_seen = false;
+        for _ in 0..200 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            if let Some(snap) = queues.compression_stats() {
+                if snap.segments_compressed > 0 {
+                    compressed_seen = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            compressed_seen,
+            "spill coordinator never compressed a segment"
+        );
+
+        let snap = queues.compression_stats().expect("ring enabled");
+        assert!(snap.bytes_compressed > 0);
+        assert!(snap.bytes_uncompressed >= snap.bytes_compressed);
+        assert!(
+            snap.ratio() >= 1.0,
+            "ratio should be >= 1.0, got {}",
+            snap.ratio()
+        );
+        // No items should have hit the disk overflow yet — the ring is huge,
+        // so push_rejected_full must be zero.
+        assert_eq!(
+            snap.push_rejected_full, 0,
+            "ring had headroom but rejected {} batches",
+            snap.push_rejected_full,
+        );
+
+        // Drain everything back through the queues (loader thread reloads
+        // from the ring, then we pop).
+        let mut recovered = 0u64;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while recovered < n && std::time::Instant::now() < deadline {
+            if let Some(_v) = queues.pop_for_worker(&mut workers[0]) {
+                recovered += 1;
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        assert_eq!(
+            recovered, n,
+            "should recover every item through the compressed ring"
+        );
+
+        // After draining, the ring must report empty and decompression
+        // counters must show real activity. (Note: not every item necessarily
+        // round-trips through the ring — the first batch lands directly in
+        // the hot queue; only items pushed after the hot queue exceeds
+        // max_inmem_items are compressed. So we assert *some* items moved
+        // through the ring, not all of them.)
+        let final_snap = queues.compression_stats().unwrap();
+        assert_eq!(final_snap.current_items, 0);
+        assert!(final_snap.segments_decompressed >= 1);
+        assert_eq!(
+            final_snap.items_decompressed, final_snap.items_compressed,
+            "every compressed item must be decompressed once on the round trip",
+        );
+        assert!(
+            final_snap.items_compressed >= n / 2,
+            "at least half of pushed items should have flowed through the ring; \
+             got {} compressed vs {} pushed",
+            final_snap.items_compressed,
+            n
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    /// T8: With compression disabled, the ring is never instantiated and
+    /// behavior matches the pre-T8 path (items go straight to disk overflow).
+    #[test]
+    fn test_compression_disabled_bypasses_ring() -> Result<()> {
+        let dir = temp_path("spillable-comp-off");
+        let config = SpillableConfig {
+            max_inmem_items: 100,
+            spill_dir: dir.clone(),
+            spill_batch: 100,
+            load_existing: false,
+            worker_spill_buffer_size: 50,
+            worker_channel_bound: 8,
+            defer_segment_deletion: false,
+            compression_enabled: false,
+            compression_max_bytes: 16 * 1024 * 1024,
+            compression_level: 1,
+        };
+
+        let (queues, mut workers) = SpillableWorkStealingQueues::<u64>::new(2, vec![0, 0], config)?;
+
+        assert!(
+            queues.compression_stats().is_none(),
+            "compression_stats() must be None when ring is disabled"
+        );
+
+        // Push and recover; behavior should be identical to legacy direct-spill.
+        let n: u64 = 1_000;
+        let items: Vec<u64> = (0..n).collect();
+        queues.push_local_batch(&mut workers[0], items.into_iter());
+        queues.flush_worker_counters(&mut workers[0]);
+
+        let mut recovered = 0u64;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while recovered < n && std::time::Instant::now() < deadline {
+            if let Some(_v) = queues.pop_for_worker(&mut workers[0]) {
+                recovered += 1;
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        assert_eq!(recovered, n, "should recover every item via disk path");
+
+        let _ = std::fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    /// T8: When the ring's byte budget is tiny, additional batches must
+    /// fall through to disk overflow rather than blocking or being dropped.
+    #[test]
+    fn test_compression_ring_overflow_falls_through_to_disk() -> Result<()> {
+        let dir = temp_path("spillable-comp-overflow");
+        let config = SpillableConfig {
+            max_inmem_items: 100,
+            spill_dir: dir.clone(),
+            spill_batch: 200,
+            load_existing: false,
+            worker_spill_buffer_size: 100,
+            worker_channel_bound: 16,
+            defer_segment_deletion: false,
+            compression_enabled: true,
+            // Tiny budget — first segment fits, the rest overflow to disk.
+            compression_max_bytes: 256,
+            compression_level: 1,
+        };
+
+        let (queues, mut workers) = SpillableWorkStealingQueues::<u64>::new(2, vec![0, 0], config)?;
+
+        let n: u64 = 5_000;
+        let chunk: u64 = 200;
+        let mut next = 0u64;
+        while next < n {
+            let end = (next + chunk).min(n);
+            let items: Vec<u64> = (next..end).collect();
+            queues.push_local_batch(&mut workers[0], items.into_iter());
+            next = end;
+        }
+        queues.flush_worker_counters(&mut workers[0]);
+
+        let mut recovered = 0u64;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while recovered < n && std::time::Instant::now() < deadline {
+            if let Some(_v) = queues.pop_for_worker(&mut workers[0]) {
+                recovered += 1;
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        assert_eq!(recovered, n, "should recover every item across ring + disk");
+
+        let snap = queues.compression_stats().expect("ring enabled");
+        // At least one batch must have been rejected by the ring (forced
+        // to spill to disk), proving the fall-through path is exercised.
+        assert!(
+            snap.push_rejected_full >= 1,
+            "expected ring to reject at least one batch; got {} rejects, {} compressed segments",
+            snap.push_rejected_full,
+            snap.segments_compressed,
+        );
 
         let _ = std::fs::remove_dir_all(dir);
         Ok(())

@@ -173,6 +173,18 @@ struct StorageArgs {
     /// Max items in memory before spilling to disk (when enable_queue_spilling is true)
     #[arg(long, default_value_t = 50_000_000)]
     queue_max_inmem_items: u64,
+    /// Enable in-memory zstd compression for overflow segments (T8).
+    /// When on, batches that would otherwise spill to disk are first
+    /// compressed and held in a bounded in-memory ring (default 256MB).
+    /// This typically defers disk I/O for 1-2GB-equivalent of state.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    queue_compression: bool,
+    /// Hard cap on resident compressed-ring bytes (default 256MB).
+    #[arg(long, default_value_t = 256 * 1024 * 1024)]
+    queue_compression_max_bytes: usize,
+    /// zstd compression level (1-22; 1 fastest, 22 best ratio).
+    #[arg(long, default_value_t = 1)]
+    queue_compression_level: i32,
     /// Disable fingerprint persistence (persistence is enabled by default for resume support)
     #[arg(long, default_value_t = false)]
     disable_fp_persistence: bool,
@@ -441,6 +453,9 @@ fn build_engine_config(
         queue_spill_channel_bound: storage.queue_spill_channel_bound,
         enable_queue_spilling: !storage.disable_queue_spilling,
         queue_max_inmem_items: storage.queue_max_inmem_items,
+        queue_compression: storage.queue_compression,
+        queue_compression_max_bytes: storage.queue_compression_max_bytes,
+        queue_compression_level: storage.queue_compression_level,
         auto_tune: runtime.auto_tune,
         enable_fp_persistence: (s3_enabled && !runtime.fresh) || !storage.disable_fp_persistence,
         use_bloom_fingerprints: storage.use_bloom_fingerprints,

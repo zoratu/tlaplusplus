@@ -67,6 +67,20 @@ pub struct EngineConfig {
     pub enable_queue_spilling: bool,
     /// Max items in memory before spilling (when enable_queue_spilling is true)
     pub queue_max_inmem_items: u64,
+    /// Enable in-memory zstd compression of overflow segments (T8). Sits
+    /// between the hot work-stealing queue and the disk-backed overflow:
+    /// instead of writing every overflow batch directly to disk, batches
+    /// are first compressed and held in a bounded in-memory ring. A 256MB
+    /// ring typically holds 1-2GB-equivalent of TLA+ states, deferring
+    /// disk I/O for the common case of brief memory pressure.
+    pub queue_compression: bool,
+    /// Hard cap on resident compressed-ring bytes when compression is on.
+    /// Default 256MB.
+    pub queue_compression_max_bytes: usize,
+    /// zstd level for the compressed ring (1-22). Level 1 is fastest with
+    /// ~3x ratio on serialized states; level 3 trades 2x time for ~10%
+    /// better ratio. Default 1.
+    pub queue_compression_level: i32,
     /// Enable auto-tuning of worker count based on CPU utilization
     pub auto_tune: bool,
     /// Enable fingerprint persistence to disk (required for resume)
@@ -137,6 +151,9 @@ impl Default for EngineConfig {
             queue_spill_channel_bound: 128,
             enable_queue_spilling: true,
             queue_max_inmem_items: 50_000_000, // 50M items before spilling
+            queue_compression: true,
+            queue_compression_max_bytes: 256 * 1024 * 1024,
+            queue_compression_level: 1,
             auto_tune: false,
             enable_fp_persistence: true, // Enable by default for resume support
             use_bloom_fingerprints: false, // Use page-aligned by default (faster)
@@ -1394,6 +1411,9 @@ where
         worker_channel_bound: 16,       // 16 batches in flight per worker
         // When S3 is active, defer segment deletion until S3 confirms upload
         defer_segment_deletion: config.defer_queue_segment_deletion,
+        compression_enabled: config.queue_compression,
+        compression_max_bytes: config.queue_compression_max_bytes,
+        compression_level: config.queue_compression_level,
     };
     let (queue, worker_states) = SpillableWorkStealingQueues::new(
         worker_plan.worker_count,
@@ -2787,6 +2807,22 @@ where
 
     // Queue cleanup happens automatically
     let _ = fp_store.flush();
+
+    if let Some(snap) = queue.compression_stats() {
+        if snap.segments_compressed > 0 || snap.segments_decompressed > 0 {
+            eprintln!(
+                "Queue compression: ratio={:.2}x compressed_bytes={} uncompressed_bytes={} segments_in/out={}/{} compress_ms={} decompress_ms={} ring_full_rejects={}",
+                snap.ratio(),
+                snap.bytes_compressed,
+                snap.bytes_uncompressed,
+                snap.segments_compressed,
+                snap.segments_decompressed,
+                snap.compress_time_us / 1000,
+                snap.decompress_time_us / 1000,
+                snap.push_rejected_full,
+            );
+        }
+    }
 
     if let Ok(err) = error_rx.try_recv() {
         return Err(anyhow!(err));
