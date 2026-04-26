@@ -34,6 +34,9 @@ pub enum CompiledExpr {
     Or(Vec<CompiledExpr>),
     Not(Box<CompiledExpr>),
     Implies(Box<CompiledExpr>, Box<CompiledExpr>),
+    /// Logical equivalence (biconditional): a <=> b. True iff both sides
+    /// evaluate to the same Boolean.
+    Iff(Box<CompiledExpr>, Box<CompiledExpr>),
 
     // Comparison operators
     Eq(Box<CompiledExpr>, Box<CompiledExpr>),
@@ -179,6 +182,7 @@ impl CompiledExpr {
             }
             CompiledExpr::Not(e) | CompiledExpr::Neg(e) => e.is_fully_compiled(),
             CompiledExpr::Implies(a, b)
+            | CompiledExpr::Iff(a, b)
             | CompiledExpr::Eq(a, b)
             | CompiledExpr::Neq(a, b)
             | CompiledExpr::Lt(a, b)
@@ -548,6 +552,14 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
     }
 
     // Logical operators (in precedence order)
+
+    // Equivalence (biconditional): <=>
+    // MUST be split BEFORE `=>` because `split_binary_op(expr, "=>")` would
+    // otherwise match the `=>` *inside* `<=>` (no `<` look-back protection).
+    // T1.6 (FingerprintStoreResize) regression: see RELEASE_1.0.0_LOG.md.
+    if let Some((left, right)) = split_binary_op(expr, "<=>") {
+        return CompiledExpr::Iff(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
+    }
 
     // Implication: =>
     if let Some((left, right)) = split_binary_op(expr, "=>") {
@@ -3074,6 +3086,62 @@ mod tests {
         let expr = compile_expr("~p");
         assert!(matches!(expr, CompiledExpr::Not(_)));
     }
+
+    /// T1.6 (FingerprintStoreResize) regression: `<=>` must compile to
+    /// `Iff(...)`, NOT to `Implies((... <), ...)`. The bug pre-fix:
+    /// `split_binary_op(expr, "=>")` matched the `=>` *inside* `<=>`, leaving
+    /// LHS = `(seqlock % 2 = 1) <` and the resulting compiled tree later
+    /// errored with `expected Int, got Bool(false)` at runtime (the trailing
+    /// `<` made the LHS unparseable). See RELEASE_1.0.0_LOG.md `### T1.6`.
+    #[test]
+    fn iff_compiles_as_iff_not_implies_t1_6() {
+        let expr = compile_expr("(seqlock % 2 = 1) <=> resizing");
+        assert!(
+            matches!(expr, CompiledExpr::Iff(_, _)),
+            "<=> must compile to Iff, got: {:?}",
+            expr
+        );
+
+        // Make sure left side is the parenthesised comparison, NOT a malformed
+        // `Lt((seqlock % 2 = 1), <empty>)`.
+        if let CompiledExpr::Iff(lhs, rhs) = expr {
+            assert!(
+                matches!(*lhs, CompiledExpr::Eq(_, _)),
+                "lhs of <=> should be Eq(seqlock % 2, 1), got: {:?}",
+                lhs
+            );
+            assert!(
+                matches!(*rhs, CompiledExpr::Var(_)),
+                "rhs of <=> should be Var(resizing), got: {:?}",
+                rhs
+            );
+        }
+
+        // `=>` (without `<`) must still compile to Implies.
+        let imp = compile_expr("p => q");
+        assert!(
+            matches!(imp, CompiledExpr::Implies(_, _)),
+            "=> must still compile to Implies, got: {:?}",
+            imp
+        );
+
+        // Mixed precedence: `a => b <=> c` must parse as `(a => b) <=> c`
+        // (=> binds tighter than <=>).
+        let mixed = compile_expr("a => b <=> c");
+        assert!(
+            matches!(mixed, CompiledExpr::Iff(_, _)),
+            "a => b <=> c must compile to Iff at the top, got: {:?}",
+            mixed
+        );
+        if let CompiledExpr::Iff(lhs, _) = mixed {
+            assert!(
+                matches!(*lhs, CompiledExpr::Implies(_, _)),
+                "lhs of `a => b <=> c` should be Implies(a, b), got: {:?}",
+                lhs
+            );
+        }
+    }
+
 
     #[test]
     fn test_compile_comparison() {

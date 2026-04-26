@@ -1342,6 +1342,26 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
         return Ok(TlaValue::Bool(false));
     }
 
+    // Logical equivalence (biconditional): a <=> b
+    // Lower precedence than =>, so split first; otherwise the `=>` splitter
+    // below would match the `=>` *inside* `<=>` and silently mis-parse
+    // `(seqlock % 2 = 1) <=> resizing` as `((seqlock % 2 = 1) <) => resizing`.
+    // T1.6 (FingerprintStoreResize) regression: see RELEASE_1.0.0_LOG.md.
+    let iff_parts = split_top_level_symbol(expr, "<=>");
+    if iff_parts.len() > 1 {
+        // <=> is right-associative-equivalent (a <=> b <=> c is rare; treat as fold).
+        // We evaluate left-to-right reducing pairs by ==.
+        let mut acc: Option<bool> = None;
+        for part in &iff_parts {
+            let v = eval_expr_inner(part, ctx, depth + 1)?.as_bool()?;
+            acc = Some(match acc {
+                None => v,
+                Some(prev) => prev == v,
+            });
+        }
+        return Ok(TlaValue::Bool(acc.expect("iff_parts non-empty")));
+    }
+
     let implies_parts = split_top_level_symbol(expr, "=>");
     if implies_parts.len() > 1 {
         return Ok(TlaValue::Bool(eval_implies_parts(
@@ -7264,6 +7284,69 @@ mod tests {
                 TlaValue::String("read".to_string()),
                 TlaValue::Int(1),
             ]))]))
+        );
+    }
+
+    /// T1.6 regression: the interpreter must split `<=>` BEFORE `=>`.
+    /// Pre-fix, `split_top_level_symbol(expr, "=>")` matched the `=>` inside
+    /// `<=>`, so `(seqlock % 2 = 1) <=> resizing` evaluated against the
+    /// FingerprintStoreResize initial state errored with
+    /// `expected Int, got Bool(false)` (the bogus LHS `(seqlock % 2 = 1) <`
+    /// fell through to a malformed `<` comparison).
+    #[test]
+    fn evaluates_iff_biconditional_t1_6() {
+        // Mirror FingerprintStoreResize initial state: seqlock = 0, resizing = FALSE.
+        let state = tla_state([
+            ("seqlock", TlaValue::Int(0)),
+            ("resizing", TlaValue::Bool(false)),
+        ]);
+        let ctx = EvalContext::new(&state);
+
+        // (0 % 2 = 1)  =>  FALSE; resizing = FALSE; FALSE <=> FALSE = TRUE.
+        assert_eq!(
+            eval_expr("(seqlock % 2 = 1) <=> resizing", &ctx)
+                .expect("biconditional should evaluate without type-error"),
+            TlaValue::Bool(true),
+            "FingerprintStoreResize SeqlockConsistent invariant must hold at init"
+        );
+
+        // Sanity: TRUE <=> TRUE = TRUE, TRUE <=> FALSE = FALSE, FALSE <=> FALSE = TRUE.
+        assert_eq!(
+            eval_expr("TRUE <=> TRUE", &ctx).unwrap(),
+            TlaValue::Bool(true)
+        );
+        assert_eq!(
+            eval_expr("TRUE <=> FALSE", &ctx).unwrap(),
+            TlaValue::Bool(false)
+        );
+        assert_eq!(
+            eval_expr("FALSE <=> FALSE", &ctx).unwrap(),
+            TlaValue::Bool(true)
+        );
+
+        // `=>` (without `<`) must still evaluate as implication.
+        assert_eq!(
+            eval_expr("FALSE => TRUE", &ctx).unwrap(),
+            TlaValue::Bool(true)
+        );
+        assert_eq!(
+            eval_expr("TRUE => FALSE", &ctx).unwrap(),
+            TlaValue::Bool(false)
+        );
+
+        // Mixed precedence: `a => b <=> c` parses as `(a => b) <=> c`
+        // (=> binds tighter than <=>). With a = FALSE, b = anything, the
+        // implication is vacuously TRUE; then TRUE <=> resizing = FALSE.
+        let state2 = tla_state([
+            ("a", TlaValue::Bool(false)),
+            ("b", TlaValue::Bool(true)),
+            ("c", TlaValue::Bool(false)),
+        ]);
+        let ctx2 = EvalContext::new(&state2);
+        assert_eq!(
+            eval_expr("a => b <=> c", &ctx2).unwrap(),
+            TlaValue::Bool(false),
+            "(a => b) <=> c with a=FALSE,b=TRUE,c=FALSE should be (TRUE) <=> FALSE = FALSE"
         );
     }
 

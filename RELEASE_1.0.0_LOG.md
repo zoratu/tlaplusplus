@@ -2091,3 +2091,99 @@ that's tracked for v1.1+.
 **T15 — tag and push.** Local v1.0.0 tag created via
 `git tag -a v1.0.0 -m "..."`. **Tag NOT pushed** — that and
 `gh release create` are user-triggered per the brief.
+
+### T1.6 — `<=>` (logical equivalence) silently mis-parsed as `=>` (2026-04-26)
+
+**Symptom:** `corpus/internals/FingerprintStoreResize.tla` errored out
+during invariant evaluation with `expected Int, got Bool(false)`. The
+spec's `SeqlockConsistent` invariant is
+
+```
+SeqlockConsistent == (seqlock % 2 = 1) <=> resizing
+```
+
+The earlier T1.4 sample-corpus run (RELEASE_1.0.0_LOG.md ~line 461)
+flagged this as a "pre-existing invariant evaluation issue" and parked
+it as DEFER TO 1.1.0; the T17 closeout sweep folded it back into the
+1.0.0 fix list.
+
+**Root cause:** Neither the interpreter (`src/tla/eval.rs`) nor the
+compiler (`src/tla/compiled_expr.rs`) knew about the TLA+ biconditional
+operator `<=>`. Both ran their `=>` splitter
+(`split_top_level_symbol(expr, "=>")` and `split_binary_op(expr, "=>")`
+respectively) directly against the raw expression. Those splitters
+match the literal byte sequence `=>` with no `<` look-back guard, so on
+input `(seqlock % 2 = 1) <=> resizing` they grabbed the `=>` *inside*
+the `<=>` and produced
+
+- LHS = `(seqlock % 2 = 1) <`   (mal-formed; trailing `<`)
+- RHS = `resizing`
+
+The compiler then ran `split_comparison(LHS, "<")` which returned
+`Lt(Eq(seqlock % 2, 1), Unparsed(""))`, and the runtime evaluator
+yielded the `expected Int, got Bool(false)` error when the bogus `<`
+tried to coerce its empty RHS.
+
+The interpreter would crash analogously on the first state where the
+comparison was reachable (initial state for FingerprintStoreResize:
+`seqlock = 0, resizing = FALSE`).
+
+`<=>` was already supported in the symbolic-init Z3 translator
+(`src/tla/symbolic_init.rs:308`), confirming this was a pure
+expression-evaluator gap — the parser code path simply never grew an
+arm for it.
+
+**Fix (3 narrow edits, 1 new enum variant):**
+
+1. `src/tla/eval.rs` (interpreter `eval_expr_inner`): added a `<=>`
+   split arm BEFORE the existing `=>` split arm. The new arm uses the
+   same `split_top_level_symbol` helper (which already handles
+   parens/brackets/quantifier-bodies), then folds the parts left-to-right
+   reducing pairs by Boolean equality. Multi-part `a <=> b <=> c` is
+   uncommon in real specs but supported as a fold for symmetry with
+   the n-ary `/\` and `\/` arms.
+2. `src/tla/compiled_expr.rs`: added `CompiledExpr::Iff(Box<…>, Box<…>)`
+   variant; added a `split_binary_op(expr, "<=>")` arm BEFORE the
+   `Implies` arm in `compile_expr`; added `Iff(a, b)` to the
+   `is_fully_compiled` binary-op chain.
+3. `src/tla/compiled_eval.rs`: added a `CompiledExpr::Iff(a, b)` arm
+   to `eval_compiled_inner` that evaluates both sides as Boolean and
+   returns `Bool(lhs == rhs)`. The pre-existing `_ =>
+   eval_compiled_inner(expr, ...)` fallback in `eval_with_self_ref_inner`
+   covers the SelfRef path automatically.
+
+Mixed-precedence sanity: `a => b <=> c` parses as `(a => b) <=> c`
+because `<=>` is split first (its splitter consumes the whole
+expression at top level), leaving the `=>` to be split inside the
+LHS. This matches the standard TLA+ precedence (Lamport, "Specifying
+Systems" appendix: `=>` precedence 1-1, `<=>` precedence 2-2 — `<=>`
+binds looser, so it's the top-level cut).
+
+**Validation (c8g.xlarge, 4 cores, aarch64):**
+
+- `cargo test --release` → **730 tests passing, 0 failed**
+  (was 727 baseline; +3 new T1.6 regression tests).
+- `cargo test --release --lib iff` → all 3 new tests green:
+  - `tla::eval::tests::evaluates_iff_biconditional_t1_6`
+  - `tla::compiled_expr::tests::iff_compiles_as_iff_not_implies_t1_6`
+  - `tla::compiled_eval::tests::test_eval_iff_t1_6`
+- `scripts/diff_tlc.sh` → **13/13 PASS, 0 fail, 0 allowlisted**.
+- `PROPTEST_CASES=256 cargo test --release --test compiled_vs_interpreted`
+  → **17 tests passing**, including `compiled_matches_interpreted` and
+  `compiled_matches_interpreted_swarm`.
+- `./target/release/tlaplusplus run-tla --module
+  corpus/internals/FingerprintStoreResize.tla --config
+  corpus/internals/FingerprintStoreResize.cfg --workers 4` →
+  **52,376 generated, 15,970 distinct, 0 violations** in 2 s.
+- TLC v1.7.4 on the same spec → **52,376 generated, 15,970 distinct,
+  0 violations** in 1 s. Exact match.
+
+**Wider scope discovered:** `<=>` is used in exactly **one** spec in
+the entire `corpus/` tree (`FingerprintStoreResize.tla`). No other
+specs are affected. The fix is contained to the three TLA+ frontend
+files; no runtime, storage, or model-trait code touched.
+
+**Worktree branch:** `worktree-agent-afa7eed1f512d281b`. Commit: see
+git log on that branch (single commit `fix(t1.6): handle <=>
+biconditional in interpreter and compiler`). NOT pushed to origin per
+the brief; merged centrally.
