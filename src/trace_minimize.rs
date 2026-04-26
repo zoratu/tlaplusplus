@@ -38,7 +38,7 @@
 //! the variable list).  Cycle-safe via a visited set.
 
 use crate::model::Model;
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 /// Result of Phase A trace shortening.
@@ -130,29 +130,37 @@ pub fn minimize_trace<M: Model>(
             break;
         }
 
-        match find_shortcut(model, &current, depth_cap, start, budget) {
+        // T9.2: choose seeds = {initial states} ∪ {median trace state}.
+        // The trace endpoint (current.last()) is itself a violation, so
+        // forward BFS from there is unhelpful — but the median is a
+        // useful interior seed for long traces, where BFS-from-init
+        // may exhaust the budget before reaching the back half.
+        let seeds = build_seeds(&current);
+        match find_shortcut(model, &current, &seeds, depth_cap, start, budget) {
             ShortcutResult::Found {
-                replacement_prefix,
+                replacement_segment,
+                source_index,
                 target_index,
             } => {
-                // Replace `current[0..=target_index]` with `replacement_prefix`.
-                // Preconditions checked: `replacement_prefix` ends at a state
-                // equal to `current[target_index]`, and is shorter.
-                debug_assert!(replacement_prefix.len() < target_index + 1);
-                let mut new_trace = replacement_prefix;
-                new_trace.extend(current.into_iter().skip(target_index + 1));
+                // Replace `current[source_index..=target_index]` with
+                // `replacement_segment`.  Precondition (debug-checked):
+                // segment[0] == current[source_index], segment.last() ==
+                // current[target_index], and segment is strictly shorter.
+                debug_assert!(target_index > source_index);
+                debug_assert!(replacement_segment.len() < target_index - source_index + 1);
+                debug_assert!(!replacement_segment.is_empty());
+                let mut new_trace: Vec<M::State> = Vec::with_capacity(
+                    current.len() - (target_index - source_index + 1) + replacement_segment.len(),
+                );
+                new_trace.extend(current.iter().take(source_index).cloned());
+                new_trace.extend(replacement_segment.into_iter());
+                new_trace.extend(current.iter().skip(target_index + 1).cloned());
                 current = new_trace;
                 iterations += 1;
                 // Validate that the reconstructed trace still ends in a
                 // violating state.  If something went wrong, abort
-                // shortening and keep the previous trace.
+                // shortening and keep what we have.
                 if model.check_invariants(current.last().unwrap()).is_ok() {
-                    // Should never happen — final state was unchanged.
-                    // Still, guard against it: revert to original by
-                    // breaking with whatever we have (trace before the
-                    // bad splice was already replaced — but this is
-                    // unreachable in practice because `target_index <
-                    // current.len()` and we kept the suffix).
                     break;
                 }
             }
@@ -174,9 +182,14 @@ pub fn minimize_trace<M: Model>(
 }
 
 enum ShortcutResult<S> {
-    /// Found a shorter prefix that reaches `current[target_index]`.
+    /// Found a shorter segment that connects `current[source_index]` to
+    /// `current[target_index]`.  When `source_index == 0`, the segment
+    /// starts at an initial state and replaces the trace prefix; when
+    /// `source_index > 0`, it replaces the interior segment between two
+    /// trace states (T9.2 internal-shortcut case).
     Found {
-        replacement_prefix: Vec<S>,
+        replacement_segment: Vec<S>,
+        source_index: usize,
         target_index: usize,
     },
     /// No improvement possible.
@@ -185,69 +198,178 @@ enum ShortcutResult<S> {
     BudgetExhausted,
 }
 
-/// BFS from each initial state up to `depth_cap - 1` transitions deep,
-/// looking for any state equal to `current[i]` with `i > 0`.  If found at
-/// the smallest possible BFS depth `d`, and `d < i`, return a replacement
-/// prefix of length `d + 1` (initial → ... → match) and `target_index = i`.
+/// A BFS seed: either an initial state of the model (`Init`) or an
+/// interior state of the trace at index `trace_index` (`Trace`).
 ///
-/// We only consider `i > 0` because a 0-length prefix would not shorten.
+/// T9.2 widens `find_shortcut` to multi-source BFS — initial states
+/// plus the median trace state — so very long traces can be shortened
+/// from the inside-out, not just from index 0.  Forward BFS from the
+/// trace's *final* state is intentionally omitted: it's already a
+/// violation, so any path forward leaves the violating-prefix invariant.
+///
+/// Init seeds are produced inline by [`find_shortcut`] (which calls
+/// `model.initial_states()`); only Trace seeds need to be returned by
+/// [`build_seeds`], which is why this enum is not exhaustively
+/// constructed at the call site.
+#[derive(Clone)]
+enum Seed<S> {
+    #[allow(dead_code)]
+    Init(S),
+    Trace {
+        state: S,
+        trace_index: usize,
+    },
+}
+
+/// Build the seed list for [`find_shortcut`].  Always includes all
+/// initial states of the model (Phase A's original behaviour).  For
+/// traces of length >= 8 (heuristic threshold to avoid duplication on
+/// already-short traces), also seeds with the trace's median state.
+///
+/// The median seed lets the BFS find shortcuts in the back half of the
+/// trace without first having to reach it from `s0`.  On a 1000-state
+/// trace, BFS-from-init at depth 500 might exhaust the budget before
+/// finding a useful candidate; BFS from `current[500]` at depth 250
+/// reaches the violation in many fewer expansions.
+fn build_seeds<S: Clone>(current: &[S]) -> Vec<Seed<S>> {
+    let mut seeds: Vec<Seed<S>> = Vec::new();
+    // Initial-state seeds are deferred to `find_shortcut`, which calls
+    // `model.initial_states()` directly (so we don't have to clone the
+    // model state into this helper).  We tag this here only via the
+    // trace seeds; the BFS always starts from inits unconditionally.
+    if current.len() >= 8 {
+        let mid = current.len() / 2;
+        // Skip seeding at index 0 (handled by Init seeds) and at the
+        // last index (already-violating; forward BFS is unhelpful).
+        if mid > 0 && mid + 1 < current.len() {
+            seeds.push(Seed::Trace {
+                state: current[mid].clone(),
+                trace_index: mid,
+            });
+        }
+    }
+    seeds
+}
+
+/// Multi-source BFS from initial states (always) plus any extra
+/// `interior_seeds` (Trace variants from [`build_seeds`]).
+///
+/// For each seed, we look for any later-trace state reachable in fewer
+/// transitions than the trace itself takes.  Specifically:
+///
+/// - From an `Init` seed, depth `d` to `current[i]` is a win iff `d < i`.
+/// - From a `Trace { trace_index: src }` seed, depth `d` to `current[j]`
+///   is a win iff `j > src + 1` and `d < j - src`.
+///
+/// On hit we reconstruct the replacement segment from parent pointers.
+/// We commit to the *first* hit found in BFS order (which is the lowest
+/// depth across all sources, breaking ties by source order).
 fn find_shortcut<M: Model>(
     model: &M,
     current: &[M::State],
+    interior_seeds: &[Seed<M::State>],
     depth_cap: usize,
     start: Instant,
     budget: Duration,
 ) -> ShortcutResult<M::State> {
-    use std::collections::HashMap;
-
     // Map: fingerprint of trace state -> its index in `current`.
-    // We skip index 0 (no shortening possible) and look for the
-    // smallest-index match — which by BFS-from-init also yields the
-    // shortest replacement prefix that hits any later trace state.
+    // First occurrence wins (smallest index) — that's the index we
+    // compare against to decide if BFS found a strict shortcut.
     let mut trace_index: HashMap<u64, usize> = HashMap::with_capacity(current.len());
-    for (i, st) in current.iter().enumerate().skip(1) {
-        // First occurrence wins (smallest index).  BFS distance from s0
-        // to current[i] in the original trace is `i`, so any BFS path
-        // shorter than `i` reaching the same state is a strict win.
+    for (i, st) in current.iter().enumerate() {
         trace_index.entry(model.fingerprint(st)).or_insert(i);
+    }
+
+    // SourceTag identifies which BFS root a parent-chain leads back to.
+    // Init(fp) means the chain ends at an initial state with that fp;
+    // Trace(idx) means the chain ends at the trace's state at `idx`.
+    #[derive(Clone, Copy)]
+    enum SourceTag {
+        Init,
+        Trace(usize),
+    }
+
+    // parent[fp] = (parent_fp, depth, state_clone, source_tag)
+    let mut visited: HashSet<u64> = HashSet::new();
+    let mut parent: HashMap<u64, (Option<u64>, usize, M::State, SourceTag)> = HashMap::new();
+    let mut queue: VecDeque<(M::State, u64, usize, SourceTag)> = VecDeque::new();
+
+    // Helper: try to plant a seed at `state`.  Returns Some(result) if
+    // the seed itself is a shortcut win (an init that already equals a
+    // later trace state); otherwise enqueues for BFS expansion.
+    let plant_seed = |state: M::State,
+                      tag: SourceTag,
+                      visited: &mut HashSet<u64>,
+                      parent: &mut HashMap<u64, (Option<u64>, usize, M::State, SourceTag)>,
+                      queue: &mut VecDeque<(M::State, u64, usize, SourceTag)>|
+     -> Option<ShortcutResult<M::State>> {
+        let fp = model.fingerprint(&state);
+        if !visited.insert(fp) {
+            return None;
+        }
+        parent.insert(fp, (None, 0, state.clone(), tag));
+        // Self-hit check: does this seed itself collide with a later trace state?
+        if let Some(&i) = trace_index.get(&fp) {
+            match tag {
+                SourceTag::Init if i > 0 => {
+                    // Replacement prefix [init] of length 1 vs trace
+                    // distance i.  Win iff i > 0 (segment len 1 < i+1
+                    // iff i >= 1).
+                    return Some(ShortcutResult::Found {
+                        replacement_segment: vec![state],
+                        source_index: 0,
+                        target_index: i,
+                    });
+                }
+                SourceTag::Trace(src) if i > src + 1 => {
+                    // Segment of len 1 vs trace distance i - src.
+                    // Win iff i > src + 1.
+                    return Some(ShortcutResult::Found {
+                        replacement_segment: vec![state],
+                        source_index: src,
+                        target_index: i,
+                    });
+                }
+                _ => {}
+            }
+        }
+        queue.push_back((state, fp, 0, tag));
+        None
+    };
+
+    // Plant init seeds first (Phase A baseline).
+    for init in model.initial_states() {
+        if let Some(hit) = plant_seed(init, SourceTag::Init, &mut visited, &mut parent, &mut queue)
+        {
+            return hit;
+        }
+    }
+
+    // Plant T9.2 interior seeds.
+    for seed in interior_seeds {
+        if let Seed::Trace {
+            state,
+            trace_index: idx,
+        } = seed
+        {
+            if let Some(hit) = plant_seed(
+                state.clone(),
+                SourceTag::Trace(*idx),
+                &mut visited,
+                &mut parent,
+                &mut queue,
+            ) {
+                return hit;
+            }
+        }
     }
 
     if trace_index.is_empty() {
         return ShortcutResult::None;
     }
 
-    // Layered BFS from init states.  Each layer = one transition deeper.
-    // We track parent pointers (by fingerprint) so we can reconstruct the
-    // replacement prefix on first hit.
-    let mut visited: HashSet<u64> = HashSet::new();
-    // parent[fp] = (parent_fp, depth, state_clone).  We store the full
-    // state so we can reconstruct without re-traversing the model.
-    let mut parent: HashMap<u64, (Option<u64>, usize, M::State)> = HashMap::new();
-    let mut queue: VecDeque<(M::State, u64, usize)> = VecDeque::new();
-
-    for init in model.initial_states() {
-        let fp = model.fingerprint(&init);
-        if !visited.insert(fp) {
-            continue;
-        }
-        parent.insert(fp, (None, 0, init.clone()));
-        // If an initial state itself matches a later-trace state, that's
-        // an immediate win (replacement prefix = [init], length 1).
-        if let Some(&i) = trace_index.get(&fp) {
-            if i > 0 {
-                let mut prefix = Vec::with_capacity(1);
-                prefix.push(init);
-                return ShortcutResult::Found {
-                    replacement_prefix: prefix,
-                    target_index: i,
-                };
-            }
-        }
-        queue.push_back((init, fp, 0));
-    }
-
     let mut successors_buf: Vec<M::State> = Vec::new();
-    while let Some((state, state_fp, depth)) = queue.pop_front() {
+    while let Some((state, state_fp, depth, tag)) = queue.pop_front() {
         // Budget check — cheap to do per-pop.
         if start.elapsed() >= budget {
             return ShortcutResult::BudgetExhausted;
@@ -263,34 +385,41 @@ fn find_shortcut<M: Model>(
                 continue;
             }
             let next_depth = depth + 1;
-            parent.insert(next_fp, (Some(state_fp), next_depth, next.clone()));
-            // Check for a hit — any later-trace state whose BFS depth
-            // (`next_depth`) is strictly less than its trace index.
+            parent.insert(next_fp, (Some(state_fp), next_depth, next.clone(), tag));
+            // Check for a hit — depends on this node's source tag.
             if let Some(&i) = trace_index.get(&next_fp) {
-                if next_depth < i {
-                    // Reconstruct prefix from `next_fp` back to an init.
-                    let prefix = reconstruct_prefix::<M>(&parent, next_fp);
+                let win = match tag {
+                    SourceTag::Init => i > 0 && next_depth < i,
+                    SourceTag::Trace(src) => i > src + 1 && next_depth < i - src,
+                };
+                if win {
+                    let segment = reconstruct_segment::<M>(&parent, next_fp);
+                    let (source_index, target_index) = match tag {
+                        SourceTag::Init => (0, i),
+                        SourceTag::Trace(src) => (src, i),
+                    };
                     return ShortcutResult::Found {
-                        replacement_prefix: prefix,
-                        target_index: i,
+                        replacement_segment: segment,
+                        source_index,
+                        target_index,
                     };
                 }
             }
-            queue.push_back((next, next_fp, next_depth));
+            queue.push_back((next, next_fp, next_depth, tag));
         }
     }
 
     ShortcutResult::None
 }
 
-fn reconstruct_prefix<M: Model>(
-    parent: &std::collections::HashMap<u64, (Option<u64>, usize, M::State)>,
+fn reconstruct_segment<M: Model>(
+    parent: &HashMap<u64, (Option<u64>, usize, M::State, impl Copy)>,
     leaf_fp: u64,
 ) -> Vec<M::State> {
     let mut chain: Vec<M::State> = Vec::new();
     let mut cur = Some(leaf_fp);
     while let Some(fp) = cur {
-        let (parent_fp, _depth, state) = parent
+        let (parent_fp, _depth, state, _tag) = parent
             .get(&fp)
             .expect("parent map should contain every visited state");
         chain.push(state.clone());
@@ -919,6 +1048,97 @@ mod tests {
         );
         let found = extract_invariant_variables_transitive(inv, &vars, &ops);
         assert!(!found.contains("x"));
+    }
+
+    // ------------------------------------------------------------------
+    // T9.2 — smarter BFS seed (median-state seeding for long traces)
+    // ------------------------------------------------------------------
+
+    /// Long-trace model: states are integers 0..=N.  Init = {0}.
+    /// Transitions: s -> s+1 always, plus s -> s+10 every 5 steps
+    /// (a "fast-forward" shortcut).  This gives the trace minimizer a
+    /// chance to find an interior shortcut that's only discoverable
+    /// starting from a non-initial state.
+    struct ForwardSkipModel {
+        n: i64,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+    struct FsState(i64);
+
+    impl Model for ForwardSkipModel {
+        type State = FsState;
+        fn name(&self) -> &'static str {
+            "forward-skip"
+        }
+        fn initial_states(&self) -> Vec<Self::State> {
+            vec![FsState(0)]
+        }
+        fn next_states(&self, state: &Self::State, out: &mut Vec<Self::State>) {
+            if state.0 < self.n {
+                out.push(FsState(state.0 + 1));
+            }
+            // Skip-by-10 shortcut at every multiple of 5
+            if state.0 % 5 == 0 && state.0 + 10 <= self.n {
+                out.push(FsState(state.0 + 10));
+            }
+        }
+        fn check_invariants(&self, state: &Self::State) -> Result<(), String> {
+            if state.0 < self.n {
+                Ok(())
+            } else {
+                Err(format!("violated at {}", state.0))
+            }
+        }
+    }
+
+    #[test]
+    fn t92_build_seeds_includes_median_for_long_traces() {
+        // Direct unit test of build_seeds: should emit one Trace seed
+        // for traces of length >= 8, none for shorter.
+        let short: Vec<i32> = (0..7).collect();
+        let long: Vec<i32> = (0..16).collect();
+        assert!(
+            build_seeds(&short).is_empty(),
+            "short traces should not get interior seeds"
+        );
+        let seeds = build_seeds(&long);
+        assert_eq!(seeds.len(), 1);
+        match &seeds[0] {
+            Seed::Trace { trace_index, .. } => {
+                assert_eq!(*trace_index, 8, "median of 16-state trace is index 8");
+            }
+            _ => panic!("expected Trace seed"),
+        }
+    }
+
+    #[test]
+    fn t92_long_trace_minimizes_via_skip_shortcut() {
+        // 30-step trace 0,1,2,...,30 (length 31).  State 30 violates.
+        // The skip transitions allow paths like 0->10->20->30 (length 4),
+        // 0->5->15->25->30 (length 5), etc.  Optimal is 4.
+        // This is a regression test: with median seeding, the BFS finds
+        // the shortcut even when the trace is much longer.
+        let model = ForwardSkipModel { n: 30 };
+        let trace: Vec<FsState> = (0..=30).map(FsState).collect();
+        let result = minimize_trace(&model, trace, Duration::from_secs(5));
+        // Optimal path uses the +10 shortcut 3 times: 0->10->20->30.
+        // That's 4 states.
+        assert_eq!(
+            result.trace.len(),
+            4,
+            "expected length-4 path 0->10->20->30, got {:?}",
+            result.trace.iter().map(|s| s.0).collect::<Vec<_>>()
+        );
+        assert_eq!(result.trace.first().unwrap().0, 0);
+        assert_eq!(result.trace.last().unwrap().0, 30);
+        // Validate transitions.
+        let mut buf = Vec::new();
+        for pair in result.trace.windows(2) {
+            buf.clear();
+            model.next_states(&pair[0], &mut buf);
+            assert!(buf.contains(&pair[1]), "invalid transition in minimized");
+        }
     }
 
     #[test]
