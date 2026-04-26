@@ -1,12 +1,16 @@
 name: diff-tlc
 
-# Differential testing of tlaplusplus against the reference TLC checker.
-# Catches silent semantic divergence (e.g. a refactor changes a state count
-# without us noticing) by running a curated subset of small, fast specs under
-# both checkers and comparing distinct-state counts and violation status.
+# Differential testing of tlaplusplus against the reference TLC checker,
+# plus the compiled-vs-interpreted proptest gate, run as a cross-architecture
+# matrix. Catches:
+#   * silent semantic divergence (a refactor changes a state count without us
+#     noticing) by running a curated subset of small, fast specs under both
+#     checkers and comparing distinct-state counts and violation status; and
+#   * architecture-specific issues (endianness, atomic-ordering, feature gates)
+#     by running the same suite on aarch64 (Graviton) and x86_64 runners.
 #
-# This workflow only builds a debug binary — release-perf is exercised
-# elsewhere. The whole job should finish in a few minutes.
+# This workflow only builds debug binaries — release-perf is exercised
+# elsewhere. The whole job should finish in a few minutes per arch.
 
 on:
   push:
@@ -16,9 +20,20 @@ on:
 
 jobs:
   diff-tlc:
-    name: tlaplusplus vs TLC
-    runs-on: ubuntu-latest
+    name: tlaplusplus vs TLC (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+
+    strategy:
+      # Run both architectures even if one fails — we want to see the full
+      # cross-arch picture for any single push.
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
 
     steps:
       - name: Checkout
@@ -37,9 +52,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-diff-tlc-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-diff-tlc-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-diff-tlc-${{ runner.os }}-
+            cargo-diff-tlc-${{ runner.os }}-${{ matrix.arch }}-
 
       - name: Verify tla2tools.jar is vendored
         run: |
@@ -52,8 +67,19 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Show host arch
+        run: |
+          uname -a
+          rustc -vV
+
       - name: Build tlaplusplus (debug)
         run: cargo build --bin tlaplusplus
+
+      - name: Run lib + bin test suite (debug)
+        # T12: cross-arch CI matrix — exercise the unit + bin test suite on
+        # both aarch64 and x86_64 runners. Debug build keeps both jobs under
+        # the 15-minute budget; release-perf runs are exercised elsewhere.
+        run: cargo test --lib --bins
 
       - name: Run differential test harness
         env:
@@ -63,18 +89,19 @@ jobs:
         run: ./scripts/diff_tlc.sh
 
       # T2 — proptest equivalence between the interpreted and compiled
-      # TLA+ expression evaluators. Pinned to PROPTEST_CASES=256 so CI is
-      # deterministic and finishes quickly; local devs can crank higher.
+      # TLA+ expression evaluators. Lowered to PROPTEST_CASES=128 (from 256)
+      # so the cross-arch matrix stays inside the per-PR CI budget while
+      # still covering both architectures; local devs can crank higher.
       - name: Run compiled-vs-interpreted proptest equivalence (T2)
         env:
-          PROPTEST_CASES: "256"
+          PROPTEST_CASES: "128"
         run: cargo test --test compiled_vs_interpreted
 
       - name: Upload diff harness logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: diff-tlc-logs
+          name: diff-tlc-logs-${{ matrix.arch }}
           path: .diff-tlc-out/
           if-no-files-found: ignore
           retention-days: 7
