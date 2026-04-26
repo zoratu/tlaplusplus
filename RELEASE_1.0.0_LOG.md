@@ -777,6 +777,36 @@ going forward.
 
 **Commit:** `c6ab53f`.
 
+### T2.4 — unary minus swallows binary subtraction (silent wrong-result on common arithmetic shapes)
+
+**Date:** 2026-04-26.
+
+**Status:** closed. Soundness regression for the compiled evaluator. Surfaced repeatedly by the T16a swarm proptest at `PROPTEST_CASES=2048` across multiple seeds; original report cited `<<(-1 - (r).a), 0>>` from a saved seed; this run shrunk to `(LET __t1 == y IN ((-((LET __t1 == 0 IN (0 + __t1)))) + __t1))` which fails the same way (compiler returned `Int(0)`, interpreter `Int(7)`).
+
+**Root cause.** `compile_expr`'s binary-`-` arm called `split_binary_op(expr, "-")`, which returns the FIRST top-level `-` in the expression and stops. The T2.1+T2.2 fix added a `left_ends_with_value` guard so a leading `-` (`left = ""`) would be rejected, but the caller did NOT keep scanning — it just abandoned the split. Two failure modes followed:
+
+1. **Binary minus lost to leading unary minus.** For `-1 - (r).a`, `split_binary_op` returned `("", "1 - (r).a")`. The guard rejected it. The compiler then fell through every remaining arithmetic op, every structural matcher, and finally hit `find_record_access_dot`, which sliced at the `.` in `(r).a` and produced `RecordAccess(Unparsed("-1 - (r)"), "a")`. At eval time the compiler returned the *whole record* `r`, not `-4`.
+
+2. **No rule for unary minus on a non-literal subexpression.** `-((LET __t1 == 0 IN ...))` had no compile arm: the `-N` literal path at line 456 only handles bare integers; the binary-`-` path rejected the leading unary; nothing else matched. The whole expression became `Unparsed`, which (under `Add`/`Neg`-style contexts) silently evaluated to `Int(0)`.
+
+**Fix location.** `src/tla/compiled_expr.rs`:
+- New helper `find_binary_minus_split` (replaces the inline `split_binary_op(expr, "-") + left_ends_with_value` check at line 725) that scans ALL top-level `-` positions and returns the first one whose preceding text actually ends in a value-producing token. Skips leading unary `-`.
+- New unary-minus arm right after the `^` (Pow) split: if the expression starts with `-` AND no binary subtraction split was found above, wrap as `CompiledExpr::Neg(compile_expr(rest))`. Order matters: this runs AFTER all binary arithmetic ops have been ruled out, so `1 - 2` still parses as `Sub`, not `Neg`.
+
+The existing `Neg` variant in `CompiledExpr` (and its evaluator at `src/tla/compiled_eval.rs:318`) was already wired up for the `~` boolean negation path; we now also produce it for unary `-`. The original `left_ends_with_value` whitelist is unchanged — no edge case widening.
+
+**Regression test.** `t2_4_unary_minus_does_not_swallow_binary_minus` in `src/tla/compiled_expr.rs::tests` (5 assertions): `(-1 - (r).a)` and `-1 - (r).a` both compile to `Sub(Int(-1), RecordAccess(...))`; `-((LET __t1 == 0 IN (0 + __t1)))` compiles to `Neg(Let(...))`; `(x * -3)` still compiles to `Mul` (T2.1+T2.2 not regressed); `1 - 2` still compiles to `Sub`.
+
+**Validation.**
+- `t2_4_unary_minus_does_not_swallow_binary_minus`: pass.
+- 5 independent runs of `cargo test --release --test compiled_vs_interpreted compiled_matches_interpreted` at `PROPTEST_CASES=2048` (uniform + swarm = 20,480 randomly-sampled expressions): all 5 green. Pre-fix, every run hit a divergence within the first 700 cases.
+- `cargo test --release` (full suite on spot `REDACTED-INSTANCE`, c8g.metal-24xl, 96 cores): **727 tests pass**, 0 fail (was 726 before; net +1 from new regression test).
+- `scripts/diff_tlc.sh`: 13/13 with `--workers 8` (default `--workers auto` flake on 96-core AWS box affects 2 specs identically with and without this fix — confirmed by reverting to upstream `compiled_expr.rs` and re-running, same 2 timeouts).
+
+**Wider scope discovered:** None new. The shrunk LET-shape divergence has the same root cause as the originally-reported tuple-shape divergence; no fresh T2.5 follow-up needed.
+
+**Commit:** `<filled-after-commit>`.
+
 ### T3 — State-graph snapshot tests (Phase 1)
 
 **Date:** 2026-04-25.

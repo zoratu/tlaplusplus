@@ -722,19 +722,16 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
     if let Some((left, right)) = split_binary_op(expr, "+") {
         return CompiledExpr::Add(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
     }
-    if let Some((left, right)) = split_binary_op(expr, "-") {
-        // Be careful not to match negative numbers. The `-` is unary
-        // (i.e. forms a negative literal / negation of `right`) when it
-        // either has nothing before it or is preceded by another binary
-        // operator or open-delimiter. T2.1+T2.2 follow-up: previously
-        // this only checked `!left.is_empty()`, so `(x * -3)` was sliced
-        // as `Sub(Mul(x, ""), 3)` (empty Mul RHS → "empty expression"
-        // at eval time). Now we also require the trimmed left to end in
-        // a value-producing character (digit, identifier, `)`, `]`,
-        // `>>`, `}`).
-        if !left.is_empty() && left_ends_with_value(left) {
-            return CompiledExpr::Sub(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
-        }
+    // Binary subtraction `-` is tricky because the same character also
+    // serves as unary minus. `split_binary_op` returns the FIRST top-level
+    // `-` it encounters, but for inputs like `-1 - (r).a` the FIRST `-` is
+    // the leading unary one (left = ""), and the actual binary `-` sits
+    // later in the string. T2.4 fix: scan ALL top-level `-` positions and
+    // pick the first one where the preceding text ends in a value-producing
+    // token. The `left_ends_with_value` guard (T2.1+T2.2) still rules out
+    // operator-adjacent `-` like `x * -3`.
+    if let Some((left, right)) = find_binary_minus_split(expr) {
+        return CompiledExpr::Sub(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
     }
     if let Some((left, right)) = split_binary_op(expr, "*") {
         return CompiledExpr::Mul(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
@@ -753,6 +750,21 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
     }
     if let Some((left, right)) = split_binary_op(expr, "^") {
         return CompiledExpr::Pow(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
+    }
+
+    // Unary minus on a non-literal subexpression: `-(expr)`, `-Op(...)`,
+    // `-x.field`, etc. The `-N` literal case is already handled near the
+    // top (line ~456). T2.4 fix: previously `-((LET ... IN ...))` and
+    // `-(r).a` fell through every binary-operator split (no binary `-`
+    // found because the leading `-` is unary), then through structural
+    // matchers, and ended up as `Unparsed`. Wrap as `Neg(rest)`. We only
+    // do this when binary subtraction has already been ruled out (above)
+    // so we don't mis-compile `1 - 2` as `Neg(2)`.
+    if let Some(rest) = expr.strip_prefix('-') {
+        let rest = rest.trim_start();
+        if !rest.is_empty() {
+            return CompiledExpr::Neg(Box::new(compile_expr(rest)));
+        }
     }
 
     // Set literal: {a, b, c}
@@ -1443,6 +1455,36 @@ fn left_ends_with_value(left: &str) -> bool {
     // brackets/parens/braces, and the quote at the end of a string
     // literal. Note: `>>` (sequence end) ends in `>` so we accept `>`.
     matches!(last, ')' | ']' | '}' | '"' | '>') || last.is_alphanumeric() || last == '_'
+}
+
+/// Find a binary subtraction `-` split point at top level. Walks past
+/// leading unary `-` positions (where `left` is empty or doesn't end in a
+/// value-producing token) so that, e.g., `-1 - (r).a` correctly splits at
+/// the SECOND `-`, not the first.
+///
+/// T2.4 fix: previously `compile_expr` called `split_binary_op(expr, "-")`
+/// which returns the FIRST top-level `-`; if that first match was a unary
+/// minus, the binary split was abandoned entirely (and the expression was
+/// later misparsed as e.g. `RecordAccess(Unparsed("-1 - (r)"), "a")`).
+/// Now we keep scanning until we find a `-` whose preceding text actually
+/// ends in a value (digit, identifier, `)`, `]`, `>>`, `}`, or `"`).
+fn find_binary_minus_split(expr: &str) -> Option<(&str, &str)> {
+    let mut search_from = 0usize;
+    loop {
+        let candidate = &expr[search_from..];
+        let (left_rel, right) = split_binary_op(candidate, "-")?;
+        let left_abs_end = search_from + left_rel.len();
+        let left = &expr[..left_abs_end];
+        if !left.is_empty() && left_ends_with_value(left) {
+            return Some((left, right));
+        }
+        // This `-` is unary (or otherwise not a valid binary split point).
+        // Advance past it and look for the next one.
+        search_from = left_abs_end + 1;
+        if search_from >= expr.len() {
+            return None;
+        }
+    }
 }
 
 fn split_binary_op<'a>(expr: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
@@ -4053,6 +4095,76 @@ fn t2_3_dotdot_binds_tighter_than_set_ops() {
             lhs
         );
     }
+}
+
+#[test]
+fn t2_4_unary_minus_does_not_swallow_binary_minus() {
+    // T2.4 SOUNDNESS regression: shapes like `(-1 - (r).a)` were silently
+    // mis-compiled. `split_binary_op(expr, "-")` returned the FIRST
+    // top-level `-`, which is the leading unary minus (left = ""). The
+    // existing `left_ends_with_value` guard rejected that split but the
+    // caller didn't keep scanning, so the binary `-` was lost. The whole
+    // expression then fell through to `find_record_access_dot`, which
+    // sliced off `.a` and produced
+    //   `RecordAccess(Unparsed("-1 - (r)"), "a")`
+    // — the compiler returned the record `r` itself instead of `-4`.
+    //
+    // T2.1+T2.2 fixed `(x * -3)`; T2.4 extends the fix so the cascade
+    // also handles `unary-minus on the LEFT, binary-minus later`.
+    let expr = compile_expr("(-1 - (r).a)");
+    match &expr {
+        CompiledExpr::Sub(lhs, rhs) => {
+            assert!(
+                matches!(**lhs, CompiledExpr::Int(-1)),
+                "LHS should be Int(-1), got: {:?}",
+                lhs
+            );
+            assert!(
+                matches!(**rhs, CompiledExpr::RecordAccess(_, _)),
+                "RHS should be RecordAccess, got: {:?}",
+                rhs
+            );
+        }
+        other => panic!(
+            "(-1 - (r).a) should compile to Sub(Int(-1), RecordAccess(...)), got: {:?}",
+            other
+        ),
+    }
+
+    // Same shape without the outer parens — must still split correctly.
+    let expr = compile_expr("-1 - (r).a");
+    assert!(
+        matches!(expr, CompiledExpr::Sub(_, _)),
+        "-1 - (r).a should be Sub(Int(-1), RecordAccess(...)), got: {:?}",
+        expr
+    );
+
+    // Unary minus on a parenthesized non-literal subexpression. Pre-fix
+    // this was Unparsed because there was no rule to wrap `-(expr)` as
+    // Neg when `expr` isn't a bare integer literal.
+    let expr = compile_expr("-((LET __t1 == 0 IN (0 + __t1)))");
+    assert!(
+        matches!(expr, CompiledExpr::Neg(_)),
+        "-((LET ...)) should be Neg(Let(...)), got: {:?}",
+        expr
+    );
+
+    // Make sure we did NOT regress the T2.1+T2.2 case: `(x * -3)` must
+    // still parse as Mul(Var(x), Int(-3)), not Sub(...).
+    let expr = compile_expr("(x * -3)");
+    assert!(
+        matches!(expr, CompiledExpr::Mul(_, _)),
+        "(x * -3) should be Mul(Var(x), Int(-3)), got: {:?}",
+        expr
+    );
+
+    // And ordinary binary subtraction: `1 - 2` is Sub, not Neg.
+    let expr = compile_expr("1 - 2");
+    assert!(
+        matches!(expr, CompiledExpr::Sub(_, _)),
+        "1 - 2 should be Sub(Int(1), Int(2)), got: {:?}",
+        expr
+    );
 }
 
 #[test]
