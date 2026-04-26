@@ -805,7 +805,7 @@ The existing `Neg` variant in `CompiledExpr` (and its evaluator at `src/tla/comp
 
 **Wider scope discovered:** None new. The shrunk LET-shape divergence has the same root cause as the originally-reported tuple-shape divergence; no fresh T2.5 follow-up needed.
 
-**Commit:** `<filled-after-commit>`.
+**Commit:** `e928400`.
 
 ### T3 — State-graph snapshot tests (Phase 1)
 
