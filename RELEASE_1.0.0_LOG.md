@@ -1674,7 +1674,7 @@ RESULT: clean — no divergences, no hangs.
 - Control run distinct = chaos run distinct (identical `26,344`) — verified per-iteration.
 - Verdict (`ok`/`violation`) matches control on every iteration that returns exit-0.
 - Permanent failpoints either complete identically (failpoint never reaches its trigger condition during the run, e.g., the spec doesn't trigger an FP-store resize) or terminate gracefully with a non-zero exit and a logged error — never hang or panic-without-recovery.
-- All in-tree tests still pass under `--features failpoints`: 564 lib tests passed (`cargo test --release --features failpoints --lib -- --test-threads=2` on the spot — default thread count OOM-killed on the 8 GB instance, reduced parallelism is sufficient).
+- All in-tree tests still pass under `--features failpoints`. Full suite on the c8g.xlarge spot (`cargo test --release --features failpoints --bins --tests -- --test-threads 1`): **740 passed, 0 failed, 3 ignored** across 16 test binaries. Default thread count OOM-killed on the 8 GB instance once; serial run is clean. Test count is unchanged from T10's 720 plus the failpoint-feature-gated tests in `runtime::failpoint_tests` and chaos integration modules; T11 itself adds no unit tests (the soak is shell-driven).
 
 **Caveats / follow-ups (parked).**
 
