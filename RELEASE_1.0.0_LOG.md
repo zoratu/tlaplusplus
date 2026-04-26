@@ -1501,7 +1501,7 @@ Trace minimization: 4 -> 4 steps in 82.696µs (0 iters)
 - **T9.2. Smarter shortcut seed.** Phase A's BFS visits every state up to `current.len() - 1` deep. For long traces this could become expensive; an alternative is to limit the BFS by a per-iteration node budget and revisit on next iteration. Not pursued because the 30 s wall-budget is already a hard cap.
 - **T9.3. Suffix shortening.** We currently truncate at the *earliest* violating state. We do not try to find an alternate, shorter suffix from an earlier non-violating state to a different violating state. The cheap form would be to apply Phase A recursively on each `[0..=k]` slice; not pursued because the use case (a bug in a suffix that disappears under truncation) is rare.
 
-**Commit:** TODO
+**Commit:** `66869ad` — `feat(t9): trace minimization on violation — Phase A shortening + Phase B variable highlighting`
 
 #### Recommended next
 
