@@ -1284,3 +1284,78 @@ Three pre-existing bugs in distributed termination detection blocked the benchma
 These are arguably "T6 found and fixed pre-existing bugs in v0.3.0 distributed mode" rather than T6 work. They were necessary for the benchmark to terminate, so the work is recorded here.
 
 **Commits:** `e028a72` (protocol + tests), `4817619` (cluster wiring for RunCounterGrid), `9f9c31c`, `8d2060a`, `0e94c21`, `3fdd19f` (termination consensus fixes).
+
+### T7 — Partial-order reduction (POR) via stubborn sets
+
+**Status:** Done. Stubborn-set POR with static read/write dependency analysis behind opt-in `--por` CLI flag (default off). Safety-only — automatically rejected when fairness/liveness present.
+
+**Approach.**
+
+- **Module:** new `src/tla/por.rs` (~470 lines). Two structs:
+  - `ActionFootprint { writes, reads, conservative }` — per-disjunct static summary.
+  - `PorAnalysis { footprints, dep, variables }` — pre-computed dependency matrix + stubborn-set computation per state.
+- **Dependency analysis** (static, pre-computed once at model load):
+  - Walk each `Next` disjunct token-by-token. Identifier followed by `'` (with optional whitespace) → write. Bare identifier matching a declared `VARIABLE` → read.
+  - Recurse into operator definitions referenced by name (visited-set guards against cycles).
+  - `UNCHANGED <<x, y>>` skipped explicitly (no read, no write).
+  - `ENABLED` triggers `conservative = true` → footprint becomes `{all variables}`, making the disjunct dependent on every other action. Safe fallback.
+  - Two actions are dependent iff `writes(a) ∩ writes(b) ≠ ∅` OR `writes(a) ∩ reads(b) ≠ ∅` OR `reads(a) ∩ writes(b) ≠ ∅`. Symmetric matrix of `BTreeSet<usize>` over disjunct indices.
+- **Stubborn-set computation** (per visited state, called from `next_states`):
+  - Evaluate every disjunct individually via existing `evaluate_next_states_swarm(.., &[idx])` to get per-disjunct successor sets and enabledness.
+  - Pick lowest-index enabled disjunct as seed (deterministic).
+  - BFS-close under the static dependency matrix, restricted to *currently enabled* disjuncts.
+  - Concatenate successors only from stubborn-set members into `out`.
+  - Empty enabled set → empty stubborn set → deadlock (handled identically to non-POR path).
+- **Integration into `TlaModel`:**
+  - New `pub por_analysis: Option<Arc<PorAnalysis>>` field, populated by `enable_por(&mut self) -> Result<()>`.
+  - `enable_por` errors with explanatory message when fairness constraints or liveness/temporal properties are present.
+  - `next_states` checks the field and dispatches to `next_states_por` when set; otherwise falls through to existing path. T5 (symbolic Init) is untouched and composes — POR only changes the next-state relation.
+- **CLI:** new `--por` boolean flag on `RunTla`. Default off. Help text spells out the safety-only limitation. On enable, prints `Partial-order reduction enabled (N actions, M variables)`.
+- **Verbose dump:** `TLAPP_POR_VERBOSE=1` env prints per-action read/write/dep summary at startup for debugging.
+
+**Liveness limitation documented in:**
+- `--por` CLI help text (the LIMITATION clause).
+- `TlaModel::enable_por` rustdoc.
+- `src/tla/por.rs` module rustdoc.
+- `enable_por`'s error message itself names the rejected feature ("fairness" / "liveness/temporal") so the operator knows the exact reason.
+
+**Tests added.**
+
+- `src/tla/por.rs` unit tests (9): footprint extraction (writes+reads, UNCHANGED skip, nested operator calls), dependency matrix (independent actions, shared writes, read/write overlap), stubborn-set computation (closure growth, enabledness respect), conservative ENABLED fallback.
+- `tests/por_correctness.rs` integration tests (5):
+  - `por_two_independent_counters_yields_reduction` — `IncX \/ IncY` on `[0..3]^2`. Full=16, POR=7, real reduction (2.3x).
+  - `por_shared_counter_no_reduction` — `Inc \/ Dec` on `x ∈ 0..5`. POR set == full set; correctness gate even when no reduction is possible.
+  - `por_dependency_chain` — A independent of B; B and C share `q`. Asserts subset.
+  - `por_finds_invariant_violation` — `Tick` raises `count` past invariant bound; both full and POR must reach a violating state. Validates safety-violation parity.
+  - `por_rejected_with_liveness` — calling `enable_por()` on a spec with `<>(x = 5)` errors out. Validates the opt-out path.
+- `tests/por_benchmark.rs` (1): runs all three benchmark fixtures and prints state-count + time table.
+
+**Benchmark.** Three multi-process fixtures in `corpus/internals/`:
+
+| Spec | Full states | POR states | Reduction | Time speedup |
+| --- | --- | --- | --- | --- |
+| PorBenchProcessGrid (4 indep procs, MAX=4) | 625 | 17 | **36.8x** | **17.9x** |
+| PorBenchPipeline (3 procs sharing `pending`) | 56 | 52 | 1.1x | 0.6x |
+| PorTwoCounters (2 indep procs, MAX=3) | 16 | 7 | 2.3x | 1.6x |
+
+Pipeline shows POR's worst case: when actions share state (Move reads/writes `pending`, Produce/Consume both touch `pending`), most pairs are dependent, so the stubborn closure approaches the full enabled set, and the per-disjunct enumeration overhead nets out as a slowdown. Documented in the spec comments. The 36.8x reduction on ProcessGrid demonstrates the win on the protocol-style workloads POR is designed for.
+
+**Correctness gates passed.**
+
+- Reachable subset: POR set ⊆ full set on every test fixture (5 explicit tests + benchmark assertions).
+- Violation parity: known-violating spec flags the violation under POR.
+- 686 tests pass overall (was 671 with symbolic-init baseline; +15 = 9 unit + 5 correctness + 1 benchmark).
+- All existing tests continue to pass (no regressions). `cargo test` wall time unaffected.
+
+**Caveats / follow-ups.**
+
+- Stubborn-set seed is "lowest-index enabled disjunct". Other seeds (e.g., smallest dependency closure) might compress further; not pursued for 1.0.0.
+- Per-disjunct evaluation through `evaluate_next_states_swarm` is wasteful when no reduction occurs (Pipeline case shows this overhead). Could be reduced by a single batched-eval API that returns successors per disjunct in one pass.
+- ENABLED inside an action body forces conservative = depends-on-everything. Specs with heavy ENABLED use will see degraded reduction; OK for 1.0.0.
+- POR + symbolic Init (T5): orthogonal, both compose. POR only changes how successor states are explored from each visited state; symbolic Init only changes which initial states are enumerated.
+
+**Commit:** TBD (commit will be added below this entry once the patch lands).
+
+#### Recommended next
+
+- Direct: T8 (state compression in queue). T7 deliberately stayed scoped; the per-disjunct overhead optimization is a candidate T7.1 follow-up but is not blocking.

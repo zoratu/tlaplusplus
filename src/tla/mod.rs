@@ -6,6 +6,7 @@ pub mod compiled_expr;
 pub mod eval;
 pub mod formula;
 pub mod module;
+pub mod por;
 pub mod scan;
 pub mod symbolic_init;
 pub mod temporal;
@@ -36,6 +37,7 @@ pub use formula::{
     split_top_level,
 };
 pub use module::{TlaDefinition, TlaModule, parse_tla_module_file, parse_tla_module_text};
+pub use por::{ActionFootprint, PorAnalysis};
 pub use scan::{ModuleScan, ScanAggregate, scan_module_closure};
 pub use temporal::TemporalFormula;
 pub use value::{TlaState, TlaValue, tla_state};

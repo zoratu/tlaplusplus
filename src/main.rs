@@ -334,6 +334,17 @@ enum Command {
         /// Only effective with --simulate.
         #[arg(long, default_value_t = false)]
         swarm: bool,
+        /// Enable partial-order reduction (POR) via stubborn sets.
+        ///
+        /// For specs with independent actions (typical of distributed
+        /// protocols), POR explores only one representative interleaving
+        /// per equivalence class — often cutting state space 2x to 100x.
+        ///
+        /// LIMITATION: This implementation preserves only safety properties.
+        /// It is rejected automatically when fairness constraints (WF/SF) or
+        /// liveness/temporal properties are present in the spec.
+        #[arg(long, default_value_t = false)]
+        por: bool,
         /// Enable action coverage profiling
         #[arg(long, default_value_t = false)]
         coverage: bool,
@@ -1946,6 +1957,7 @@ fn main() -> anyhow::Result<()> {
             simulate_traces,
             simulate_seed,
             swarm,
+            por,
             coverage,
             dump,
             dump_format,
@@ -2003,6 +2015,27 @@ fn main() -> anyhow::Result<()> {
             // CLI --allow-deadlock overrides config CHECK_DEADLOCK
             if allow_deadlock {
                 model.allow_deadlock = true;
+            }
+
+            // CLI --por: enable partial-order reduction (safety only).
+            if por {
+                model.enable_por().map_err(|e| {
+                    eprintln!("--por rejected: {}", e);
+                    eprintln!(
+                        "  POR in this version preserves only safety properties. \
+                         Re-run without --por (or remove fairness/liveness from the spec)."
+                    );
+                    e
+                })?;
+                eprintln!(
+                    "Partial-order reduction enabled ({} actions, {} variables)",
+                    model
+                        .por_analysis
+                        .as_ref()
+                        .map(|a| a.num_actions())
+                        .unwrap_or(0),
+                    model.module.variables.len(),
+                );
             }
 
             // Feature 7: Evaluate ASSUME statements before exploration

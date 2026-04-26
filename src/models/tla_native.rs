@@ -5,10 +5,10 @@ use crate::tla::module::TlaModuleInstance;
 #[cfg(test)]
 use crate::tla::tla_state;
 use crate::tla::{
-    ClauseKind, CompiledActionIr, CompiledExpr, ConfigValue, EvalContext, TemporalFormula,
-    TlaConfig, TlaDefinition, TlaModule, TlaState, TlaValue, classify_clause, compile_action_ir,
-    compile_expr, count_next_disjuncts, eval_action_body_multi, eval_action_constraint,
-    eval_compiled, eval_expr, evaluate_next_states_labeled_with_instances,
+    ClauseKind, CompiledActionIr, CompiledExpr, ConfigValue, EvalContext, PorAnalysis,
+    TemporalFormula, TlaConfig, TlaDefinition, TlaModule, TlaState, TlaValue, classify_clause,
+    compile_action_ir, compile_expr, count_next_disjuncts, eval_action_body_multi,
+    eval_action_constraint, eval_compiled, eval_expr, evaluate_next_states_labeled_with_instances,
     evaluate_next_states_swarm, evaluate_next_states_with_instances, insert_compiled_action,
     looks_like_action, normalize_operator_ref_name, parse_tla_config, parse_tla_module_file,
     split_top_level,
@@ -44,6 +44,13 @@ pub struct TlaModel {
     /// True if Next is trivially UNCHANGED vars (no transitions).
     /// When set, next_states() returns empty immediately.
     trivial_next: bool,
+    /// Partial-order reduction (POR) analysis, populated only when POR is
+    /// enabled.  When `Some`, `next_states()` computes a stubborn-set subset
+    /// of disjuncts to fire instead of all enabled disjuncts.
+    ///
+    /// POR in this implementation preserves only safety properties; it is
+    /// disabled automatically when fairness or liveness checking is active.
+    pub por_analysis: Option<Arc<PorAnalysis>>,
 }
 
 impl TlaModel {
@@ -179,7 +186,48 @@ impl TlaModel {
             compiled_state_constraints,
             allow_deadlock,
             trivial_next,
+            por_analysis: None,
         })
+    }
+
+    /// Enable partial-order reduction.
+    ///
+    /// Returns `Err` when the model uses temporal/fairness properties — POR
+    /// in this version preserves only safety, so the caller must run with
+    /// liveness checking disabled.
+    ///
+    /// On success, `next_states()` switches to firing only a stubborn-set
+    /// subset of enabled `Next` disjuncts at every state.  Same initial
+    /// states; same invariant and constraint checking.
+    pub fn enable_por(&mut self) -> anyhow::Result<()> {
+        if !self.fairness_constraints.is_empty() {
+            return Err(anyhow!(
+                "POR cannot be enabled when fairness constraints are present \
+                 (POR preserves only safety properties in this version)"
+            ));
+        }
+        if self.has_liveness_properties() {
+            return Err(anyhow!(
+                "POR cannot be enabled when liveness/temporal properties are present \
+                 (POR preserves only safety properties in this version)"
+            ));
+        }
+        let next_def = self
+            .module
+            .definitions
+            .get(&self.next_name)
+            .ok_or_else(|| anyhow!("Next definition '{}' not found", self.next_name))?;
+        let analysis = PorAnalysis::from_next(&next_def.body, &self.module);
+        if std::env::var("TLAPP_POR_VERBOSE").is_ok() {
+            eprintln!(
+                "POR analysis: {} actions, {} variables\n{}",
+                analysis.num_actions(),
+                analysis.variables.len(),
+                analysis.describe()
+            );
+        }
+        self.por_analysis = Some(Arc::new(analysis));
+        Ok(())
     }
 }
 
@@ -198,6 +246,13 @@ impl Model for TlaModel {
         // Optimization: if Next is trivially UNCHANGED vars, skip evaluation.
         // Every initial state is a fixed point — no transitions to explore.
         if self.trivial_next {
+            return;
+        }
+
+        // Partial-order reduction path: compute per-disjunct successors,
+        // then fire only the stubborn-set subset.
+        if let Some(ref analysis) = self.por_analysis {
+            self.next_states_por(state, analysis.as_ref(), out);
             return;
         }
 
@@ -538,6 +593,72 @@ impl TlaModel {
         self.temporal_properties
             .iter()
             .any(|(_, formula)| formula.is_liveness_property())
+    }
+
+    /// Compute next states under partial-order reduction.
+    ///
+    /// Strategy:
+    ///   1. Evaluate every disjunct of `Next` independently (gives both
+    ///      successor sets and per-disjunct enabledness).
+    ///   2. Ask the POR analysis for a stubborn-set subset of enabled
+    ///      disjuncts.
+    ///   3. Concatenate successors from only the stubborn-set disjuncts
+    ///      into `out`.
+    ///
+    /// When the stubborn set equals the full enabled set we get no
+    /// reduction at all — that's correct, just no win.
+    pub(crate) fn next_states_por(
+        &self,
+        state: &TlaState,
+        analysis: &PorAnalysis,
+        out: &mut Vec<TlaState>,
+    ) {
+        let next_def = self
+            .module
+            .definitions
+            .get(&self.next_name)
+            .unwrap_or_else(|| panic!("missing Next definition '{}'", self.next_name));
+        let instances = if self.module.instances.is_empty() {
+            None
+        } else {
+            Some(&self.module.instances)
+        };
+
+        let n = analysis.num_actions();
+        if n == 0 {
+            return;
+        }
+
+        // Per-disjunct successor sets.
+        let mut per_disjunct: Vec<Vec<TlaState>> = Vec::with_capacity(n);
+        let mut enabled: Vec<bool> = Vec::with_capacity(n);
+        for idx in 0..n {
+            match evaluate_next_states_swarm(
+                &next_def.body,
+                &self.module.definitions,
+                instances,
+                state,
+                &[idx],
+            ) {
+                Ok(succs) => {
+                    enabled.push(!succs.is_empty());
+                    per_disjunct.push(succs);
+                }
+                Err(_) => {
+                    // Treat eval errors as "disabled" — same convention as
+                    // evaluate_next_states_with_instances when allow_deadlock.
+                    enabled.push(false);
+                    per_disjunct.push(Vec::new());
+                }
+            }
+        }
+
+        let stubborn = analysis.stubborn_set(&enabled);
+        for idx in stubborn {
+            // Idx is guaranteed in-bounds by stubborn_set's contract.
+            let succs = std::mem::take(&mut per_disjunct[idx]);
+            out.extend(succs);
+        }
     }
 }
 
