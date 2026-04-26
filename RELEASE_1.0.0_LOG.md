@@ -574,5 +574,5 @@ constraint extractor. The pre-existing `BuchiChecker` API in
 `src/liveness.rs` (only used by unit tests) was left on the original
 `check_fairness_on_scc` entry point — no changes needed there.
 
-**Commit:** `08c7ec8`.
+**Commit:** `19a5abf`.
 
