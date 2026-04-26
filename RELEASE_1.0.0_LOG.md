@@ -1597,5 +1597,5 @@ Linear scaling vs N=8 (3x states → 3-4x phase time). The pre-T10 baseline at N
 - **T10.3. Single-state SCC filtering before Tarjan.** Many real specs have many trivial SCCs (a single state, no self-loop). Detecting these in a single pass over transitions and excluding them from Tarjan input cuts the work further on highly-disjoint state graphs. Not pursued because Tarjan's time on the bench spec is already 24 ms / 21 % of the post-processing budget — sub-dominant.
 - **T10.4. Per-action transition shard.** When the spec has many subaction fairness constraints (e.g. `\A t \in Threads : WF_vars(StealItem(t))`), we still iterate every transition for every constraint. A per-action label index `HashMap<&str, Vec<edge_id>>` would let each constraint scan only its own edges. Not pursued because for our N=8 bench (6 constraints) the constraint-check phase is already 3.7 ms.
 
-**Commit:** _to be filled in by the commit step below._
+**Commit:** `66535ac` — `perf(t10): liveness post-processing 550x faster — iterative Tarjan + fingerprint-keyed fairness check`
 
