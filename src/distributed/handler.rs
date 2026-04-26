@@ -214,6 +214,14 @@ pub fn spawn_bloom_and_termination_task(
                 }
             }
 
+            // Self-trigger global termination if our local view says all
+            // nodes are idle. Otherwise we'd wait for an inbound
+            // TerminationToken from a peer who has already exited, which
+            // never arrives.
+            if stealer.all_nodes_idle() {
+                stealer.set_globally_terminated();
+            }
+
             round += 1;
         }
     });
