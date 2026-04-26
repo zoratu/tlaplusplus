@@ -1653,10 +1653,8 @@ Linear scaling vs N=8 (3x states → 3-4x phase time). The pre-T10 baseline at N
 **Soak result (1-hour wall-clock, 3600 s budget).**
 
 ```
-============================================================
-CHAOS SOAK SUMMARY
-============================================================
-started:       2026-04-26T15:57:40Z
+=====================================================CHAOS SOAK SUMMARY
+=====================================================started:       2026-04-26T15:57:40Z
 ended:         2026-04-26T16:57:41Z
 wall:          3601s (target: 3600s)
 iterations:    387
@@ -1791,10 +1789,8 @@ Existing T11 single-failpoint callers (`scripts/chaos_soak.sh --duration 3600`) 
 **Validation.** 30-min `--swarm-mode auto` soak on `corpus/internals/CheckpointDrain.tla` (control: 26,344 distinct, verdict=ok), workers=2, ckpt-int=2s, per-iter timeout=60s.
 
 ```
-============================================================
-CHAOS SOAK SUMMARY
-============================================================
-started:       2026-04-26T17:30:51Z
+=====================================================CHAOS SOAK SUMMARY
+=====================================================started:       2026-04-26T17:30:51Z
 ended:         2026-04-26T18:00:53Z
 wall:          1802s (target: 1800s)
 iterations:    204
@@ -1843,8 +1839,7 @@ TOTALS
   swarm-mode:      auto
   swarm-max:       4
 RESULT: clean — no divergences, no hangs.
-============================================================
-```
+=====================================================```
 
 **Coverage observations.**
 
@@ -2039,9 +2034,11 @@ regression.
 
 | Item | Decision | One-line reason |
 |------|----------|-----------------|
-| T5.1 sequence-set Init | DEFER 1.1.0 | Einstein still falls back to brute-force; only public corpus spec affected. |
-| T5.2 permutation symmetry | DEFER 1.1.0 | Symbolic-init opt-in; perm acceleration is additive. |
-| T5.3 projection-based all-SAT | DEFER 1.1.0 | 10-41x already achieved on supported shapes. |
+| T5.1 sequence-set Init | DONE post-1.0.0 | Translator now handles `[Dom -> Range]` + FunAsSeq wrapper; Einstein per-clause Init instant. See log T5.1+5.2+5.3 entry. |
+| T5.2 permutation symmetry | DONE post-1.0.0 | `Distinct` shortcut on chained-set-difference shape. See log T5.1+5.2+5.3 entry. |
+| T5.3 projection-based all-SAT | PARTIAL post-1.0.0 | Block-and-resolve kept; near-tautology covered by existing constraint-propagation. T5.5 parks the architectural Joint Init+Inv work. |
+| T5.4 cross-product wall on Einstein | DEFER 1.1.0 | 199M cross-product needs streaming Init or eager invariant filter — runtime-layer work. |
+| T5.5 joint Init+Solution symbolic | DEFER 1.1.0 | One Z3 query for all 5 vars + Solution rules; would unblock Einstein. Substantial wiring. |
 | T6.1 cross-node re-benchmark | DONE | See benchmark below. Cluster default-OFF. |
 | T7.1 batched per-disjunct eval | DEFER 1.1.0 | POR opt-in; 36.8x reduction on supported workload. |
 | T7.2 smarter stubborn-set seed | DEFER 1.1.0 | Deterministic seed is sound; smarter seed is tuning. |
@@ -2295,3 +2292,164 @@ files; no runtime, storage, or model-trait code touched.
 git log on that branch (single commit `fix(t1.6): handle <=>
 biconditional in interpreter and compiler`). NOT pushed to origin per
 the brief; merged centrally.
+---
+
+## 2026-04-26
+
+### T5.1+T5.2+T5.3 — Symbolic Init: sequence-set / permutation-Distinct extensions
+
+**Status.** Shipped on `worktree-agent-a28c3380773a5a150`. T5.1 done, T5.2 done,
+T5.3 partial (block-and-resolve kept; near-tautology already covered upstream
+by the v0.3.0 sum-range constraint propagator). Cross-product wall on the
+Einstein spec remains the documented gap — promoted to T5.4/T5.5.
+
+**Translator extensions (`src/tla/symbolic_init.rs`).**
+
+- `try_symbolic_function_set_enumerate(pred, var_name, seq_len, range, ctx)`
+  is the new public entry point. Encodes `var` as `seq_len` per-position Z3
+  Int variables, with each variable constrained to the range (enum-coded
+  for non-int values). Predicate translator (`SeqTranslator::translate_*`)
+  mirrors the record-set translator's surface but interprets `var[i]`
+  (with `i` a literal in 1..=seq_len) as a position projection instead of
+  `var.f` field projection.
+- T5.2 — `Distinct` shortcut. When `seq_len == range.len()` AND the
+  predicate text contains the chained `\ {var[i], ...}` set-difference
+  shape, an explicit Z3 `Distinct(...)` constraint is added across all
+  position vars. Sound (it's implied by the predicate). Pairwise `var[i]
+  # var[j]` shape is also supported but the Distinct shortcut is
+  conservatively skipped for it (the heuristic returns false to avoid
+  unsoundness on partial pairwise clauses); pairwise distinctness is
+  still fast in practice — see `function_set_pairwise_inequality_distinctness`.
+- New helpers in the backend module: `build_range_encoding`,
+  `contains_permutation_indicator`, `find_top_level_set_diff`,
+  `SeqTranslator::translate_membership` (with set-difference recognition),
+  and `SeqTranslator::lookup_position`.
+
+**Wiring (`src/tla/eval.rs::eval_set_expression`).** Three new fast paths,
+all gated on `cfg(feature = "symbolic-init")`:
+
+1. **Direct function-set Init.** `{ var \in [Domain -> Range] : pred(var) }`
+   where Domain evaluates to `1..n` (contiguous, starting at 1, n ≤ 32) and
+   Range is finite. Bypasses the existing record-set bracket check and
+   routes straight to the function-set translator.
+2. **FunAsSeq map-set wrapper.** `{ FunAsSeq(p, n, n) : p \in <inner-set> }`
+   where `<inner-set>` is a function-set comprehension. Recognized via
+   `try_funasseq_wrapper_symbolic` + `try_destructure_function_set_comprehension`
+   (the latter resolves names through the definition scope and substitutes
+   parameter values into operator bodies up to a depth-4 fixpoint).
+3. **Composed FunAsSeq + outer filter.** `{ x \in <name-resolving-to-FunAsSeq-set> : outer_pred(x) }`.
+   This is the canonical Einstein shape. The new `try_resolve_funasseq_permutation_set`
+   resolves the named domain (e.g. `DRINKS == Permutation({...})`) to its
+   underlying function-set comprehension, then the outer pred is rewritten
+   `outer_pred[x:=p]` and conjoined with the inner distinctness predicate
+   before SMT.
+
+**Helpers (`src/tla/eval.rs`).** `try_resolve_sequence_domain`,
+`try_resolve_funasseq_permutation_set`, `try_destructure_function_set_comprehension`,
+`parse_funasseq_comprehension`, `substitute_identifier_owned`. All
+`#[cfg(feature = "symbolic-init")]`-gated.
+
+**Einstein result (the headline target).**
+
+```
+Spec: corpus/Einstein.tla / Einstein.cfg
+       (5 vars × 5-element permutations + 15 Solution rules + UNCHANGED Next)
+
+Per-clause Init enumeration:
+  drinks (1 filter)        : 24 sequences (instant — symbolic)
+  nationality (1 filter)   : 24 sequences (instant — symbolic)
+  colors (1 filter)        : 24 sequences (instant — symbolic)
+  pets (no filter)         : 120 sequences (instant — symbolic)
+  cigars (no filter)       : 120 sequences (instant — symbolic)
+
+Joint cross-product:        199,065,600 init states  ← the wall
+  Generation rate:          ~75 K states/sec per worker
+  Estimated wall-time:      ~44 minutes (just to materialize)
+  Plus invariant eval:      ~1-2× materialization cost
+  TLC for comparison:       also unable to finish in our 5-min timeout
+                            (TLC stalls at ~33M init states computed)
+```
+
+The per-variable Init bottleneck is **completely eliminated** by T5.1+T5.2.
+The remaining 199M-state cross-product is a runtime-layer architecture
+issue, not a symbolic-init issue, and is parked as **T5.4** (streaming
+Init / eager invariant filter) and **T5.5** (joint Init+Solution as one
+Z3 query).
+
+**Smaller demo (proof of correctness).** `MiniPermutation.tla` — 3-element
+permutation set with `p[1] = 1` filter, invariant `~Solution` where
+`Solution = p = <<1,2,3>>`:
+
+```
+TLC + tlaplusplus both report:
+  - 2 distinct init states ({<<1,2,3>>, <<1,3,2>>})
+  - violation found at <<1,2,3>>
+  - tlaplusplus wall-time: <1s with --features symbolic-init
+```
+
+`MidEinstein.tla` — 3 vars × 4-element permutations (24³ = 13,824 init
+states): tlaplusplus completes in 1s with the symbolic path firing on all
+3 clauses. (Without `--features symbolic-init`: existing brute-force
+record-set path also finishes in 1s — Mid scale is below the symbolic
+break-even point.)
+
+**Correctness gate.**
+
+- `tests/symbolic_init_equivalence.rs` — new proptest
+  `symbolic_sequence_matches_brute_force_int_range` (64 random cases,
+  3 distinct seeds, all pass). Asserts: when symbolic returns Some, the
+  set agrees exactly with a Rust-native brute-force enumerator over the
+  same predicate space.
+- `src/tla/symbolic_init.rs::tests` — 10 new unit tests covering: Int
+  range with position filter, enum range with chained-set-difference
+  distinctness, constant single-position fix, 4-element permutation full
+  agreement with brute-force, zero-length / empty-range edge cases,
+  unsupported-pred fallback, pairwise-inequality distinctness, plus a
+  dedicated brute-force agreement gate.
+- `function_set_correctness_gate_brute_force_agrees` — the canonical
+  brute-force-vs-symbolic equivalence test on a non-trivial predicate
+  (`p[1] # p[2] /\ p[1] + p[2] = 5 /\ p[3] = 1`).
+
+**Test counts.**
+
+```
+cargo test --release                          : 553 lib + 90 bin + ... = 727 (baseline)
+cargo test --release --features symbolic-init : 568 lib + 90 bin + ... = 744 (+17)
+                                                (+10 unit + 1 proptest + 6 other regen)
+
+scripts/diff_tlc.sh : 13/13 pass (no regression)
+```
+
+**Compatibility.** Every new path is `#[cfg(feature = "symbolic-init")]`
+gated. Default builds are byte-for-byte identical to v1.0.0 in this
+module's surface. The fallback to brute-force (record-set fast path,
+binder-filter generic path, FunAsSeq wrapper map-set generic path) is
+preserved unchanged when symbolic returns None.
+
+**Other corpus specs that now hit the fast path.** `MiniPermutation`,
+`MidEinstein` (synthetic, this work), and per-clause Init in Einstein
+itself. CoffeeCan-large continues to use the v0.3.0 sum-range constraint
+propagator (which beats both symbolic and brute-force on near-tautology
+predicates — see T5.3 entry). MCBinarySearch was not in the immediate
+test loop; expected to fall back gracefully if outside the supported
+shape.
+
+**T5.3 stance.** Block-and-resolve kept. Two reasons:
+1. On Einstein-shape, per-clause solution counts are small (24 / 120),
+   so block-and-resolve overhead is negligible (the dominant cost is
+   the first `solver.check()` which builds the assertion stack; subsequent
+   checks reuse it).
+2. The near-tautology case (CoffeeCan) is already detected and short-
+   circuited upstream by `eval.rs::extract_sum_range_constraint` /
+   constraint propagation, which produces results in pure Rust faster
+   than any SMT-detector layer would. T5.3-style projection-based all-SAT
+   would only matter when (a) solution count is large AND (b) the existing
+   constraint propagator misses the shape. We didn't hit that case in
+   this work — T5.5 covers the bigger architectural lever (joint
+   Init+Inv) which would subsume T5.3.
+
+**Branch.** `worktree-agent-a28c3380773a5a150`.
+
+**New T5.N parked.** T5.4 (cross-product wall — runtime-layer streaming
+or eager invariant filtering). T5.5 (joint Init+Solution symbolic
+encoding for Einstein).
