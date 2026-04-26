@@ -2009,12 +2009,19 @@ where
     numa_diagnostics.print_startup_info();
     pause.set_numa_diagnostics(numa_diagnostics);
 
-    // --- Distributed mode: spawn inbound message handler and bloom/termination task ---
+    // --- Distributed mode: spawn inbound message handler, bloom/termination task,
+    //     and cross-node steal-trigger task ---
     if let Some(ref stealer) = config.distributed_stealer {
         let handler_transport = Arc::clone(stealer.transport());
         let handler_stealer = Arc::clone(stealer);
         let handler_stop = Arc::clone(&stop);
         let tokio_handle = stealer.tokio_handle();
+
+        // Closure used by both the inbound handler (to honor the steal-victim
+        // threshold) and the steal-trigger task (to detect a starved local queue).
+        let queue_for_pending = Arc::clone(&queue);
+        let local_pending_fn: crate::distributed::handler::LocalPendingFn =
+            Arc::new(move || queue_for_pending.pending_count());
 
         // Spawn inbound handler with the steal/donate channels
         if let (Some(stolen_tx), Some(donate_rx)) =
@@ -2027,16 +2034,30 @@ where
                 stolen_tx.clone(),
                 donate_rx.clone(),
                 handler_stop.clone(),
+                Arc::clone(&local_pending_fn),
             );
         }
 
         // Spawn bloom exchange and termination broadcaster
         crate::distributed::handler::spawn_bloom_and_termination_task(
             &tokio_handle,
+            handler_transport.clone(),
+            handler_stealer.clone(),
+            handler_stop.clone(),
+            100, // check every 100ms
+        );
+
+        // Spawn the cross-node steal-trigger (T6).
+        // Only meaningful when the cluster has >1 node, but the trigger
+        // itself short-circuits in `should_initiate_steal` for singleton
+        // clusters, so spawning unconditionally is harmless.
+        crate::distributed::handler::spawn_steal_trigger_task(
+            &tokio_handle,
             handler_transport,
             handler_stealer,
             handler_stop,
-            100, // check every 100ms
+            local_pending_fn,
+            100, // poll every 100ms; 250ms idle window before firing
         );
     }
 
@@ -2288,6 +2309,12 @@ where
                         &worker_stats,
                     );
                     last_stats_flush = Instant::now();
+                    // Distributed mode: tell the steal trigger that we're
+                    // actively processing work, so it doesn't fire a remote
+                    // steal while we're busy.
+                    if let Some(ref stealer) = worker_distributed_stealer {
+                        stealer.note_local_work();
+                    }
                 }
 
                 if let Err(message) = worker_model.check_invariants(&state) {
