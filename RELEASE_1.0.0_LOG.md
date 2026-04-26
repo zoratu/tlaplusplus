@@ -1170,4 +1170,4 @@ Two paths from here:
 
 Recommend **option 2**: move on to T6. T5.1 is parked on the plan as a follow-up.
 
-**Commit:** TBD (this entry to be amended with the actual SHA once committed).
+**Commit:** `53a3e78`.
