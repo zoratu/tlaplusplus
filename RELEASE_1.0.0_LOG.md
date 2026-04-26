@@ -588,7 +588,7 @@ constraint extractor. The pre-existing `BuchiChecker` API in
 - 10 sanity tests (`sanity_*`) execute the equivalence checker on hand-written expressions covering each construct so a generator regression doesn't hide a basic break.
 - `.github/workflows/diff-tlc.yml` runs `cargo test --test compiled_vs_interpreted` with `PROPTEST_CASES=256` after the diff-TLC step. CI is deterministic at this case count; local devs can crank higher via env.
 
-**Commit:** `<TBD>` — `test: compiled-vs-interpreted proptest equivalence harness (T2)`.
+**Commit:** `b7e6729` — `test: compiled-vs-interpreted proptest equivalence harness (T2)`.
 
 **End-to-end validation (spot instance `REDACTED-INSTANCE`, c8g.xlarge, us-west-2):**
 - `cargo build` ~36s (warm `target/`), test build trivial. The 10 `sanity_*` tests pass.
