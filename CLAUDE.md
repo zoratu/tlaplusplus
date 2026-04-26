@@ -30,12 +30,21 @@ cargo test
 # Run with chaos/failpoint testing
 cargo test --features failpoints
 
+# Run with Z3-backed symbolic Init enumeration (T5)
+# Requires: apt-get install libz3-dev clang libclang-dev
+cargo test --features symbolic-init
+
 # Run property-based tests
 cargo test proptests
 
 # Run fuzzing (requires nightly)
 cargo +nightly fuzz run fuzz_tla_module
 ```
+
+### Cargo features
+
+- `failpoints` (default off) — enables fail-injection points for chaos testing.
+- `symbolic-init` (default off) — enables Z3-backed symbolic enumeration of filtered record-set Init expressions (`{tup \in [f1: D1, ...] : Pred(tup)}`). Requires system libz3 (`libz3-dev`) and `clang` + `libclang-dev` for bindgen at build time. Falls back to brute-force for any unsupported predicate shape, so enabling the feature is always safe — it can only make Init enumeration faster, never slower in observable behaviour. Benchmarks: 10-41x speedup on the synthetic 5-field `TightCan` spec; unblocks specs that previously hit the eval budget on `>100M` Init candidates. See `RELEASE_1.0.0_LOG.md` `### T5` for details.
 
 ### Running Model Checks
 

@@ -2258,9 +2258,31 @@ fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
             let var_name = lhs[..in_idx].trim();
             let domain_expr = lhs[in_idx + "\\in".len()..].trim();
 
+            // Resolve the domain expression: it may be a literal bracket
+            // expression `[f1: D1, ...]` or a name that resolves through
+            // the definition scope to one. We unwrap the latter so the
+            // record-set fast path (and the symbolic Init enumerator
+            // below) can still match the shape.
+            let mut resolved_domain_owned: String = domain_expr.to_string();
+            if !(domain_expr.starts_with('[') && domain_expr.ends_with(']')) {
+                if is_valid_identifier(domain_expr) {
+                    if let Some(defs) = ctx.definitions {
+                        if let Some(def) = defs.get(domain_expr) {
+                            if def.params.is_empty() {
+                                let body = def.body.trim();
+                                if body.starts_with('[') && body.ends_with(']') {
+                                    resolved_domain_owned = body.to_string();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let domain_expr_resolved = resolved_domain_owned.as_str();
+
             // Check if domain is a bracket expression (potential record set)
-            if domain_expr.starts_with('[') && domain_expr.ends_with(']') {
-                let bracket_inner = &domain_expr[1..domain_expr.len() - 1];
+            if domain_expr_resolved.starts_with('[') && domain_expr_resolved.ends_with(']') {
+                let bracket_inner = &domain_expr_resolved[1..domain_expr_resolved.len() - 1];
                 // Try record set pattern: field1: Set1, field2: Set2
                 if let Some(colon) = find_top_level_char(bracket_inner, ':') {
                     let field_name = bracket_inner[..colon].trim();
@@ -2361,6 +2383,36 @@ fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
                                             .collect();
                                         return Ok(TlaValue::Seq(Arc::new(records)));
                                     }
+                                }
+                            }
+
+                            // Symbolic Init enumeration via SMT (T5).
+                            // Try translating the predicate into Z3; if
+                            // it succeeds, return the enumerated record
+                            // set directly. Falls back to brute force
+                            // when the predicate is outside the supported
+                            // subset or the SMT path bails out.
+                            #[cfg(feature = "symbolic-init")]
+                            {
+                                if let Some(records) =
+                                    crate::tla::symbolic_init::try_symbolic_record_set_enumerate(
+                                        rhs,
+                                        var_name,
+                                        &field_specs,
+                                        ctx,
+                                    )
+                                {
+                                    if std::env::var("TLAPLUSPLUS_DEBUG_SYMBOLIC_INIT").is_ok() {
+                                        eprintln!(
+                                            "Symbolic Init enumeration: {} records (brute-force candidate count: {})",
+                                            records.len(),
+                                            field_specs
+                                                .iter()
+                                                .map(|(_, v)| v.len() as u64)
+                                                .product::<u64>()
+                                        );
+                                    }
+                                    return Ok(TlaValue::Seq(Arc::new(records)));
                                 }
                             }
 
@@ -2695,7 +2747,7 @@ fn try_eval_record_set(
 }
 
 /// Check if a string is a valid TLA+ identifier
-fn is_valid_identifier(s: &str) -> bool {
+pub(crate) fn is_valid_identifier(s: &str) -> bool {
     if s.is_empty() {
         return false;
     }
@@ -5231,11 +5283,11 @@ fn take_keyword_prefix<'a>(expr: &'a str, kw: &str) -> Option<(&'a str, &'a str)
     Some((before, rest.trim_start()))
 }
 
-fn split_top_level_symbol(expr: &str, delim: &str) -> Vec<String> {
+pub(crate) fn split_top_level_symbol(expr: &str, delim: &str) -> Vec<String> {
     split_top_level(expr, delim, false)
 }
 
-fn split_top_level_keyword(expr: &str, delim: &str) -> Vec<String> {
+pub(crate) fn split_top_level_keyword(expr: &str, delim: &str) -> Vec<String> {
     split_top_level(expr, delim, true)
 }
 
@@ -6413,7 +6465,7 @@ fn is_user_defined_infix_operator(name: &str) -> bool {
             .any(|ch| !(ch.is_ascii_alphanumeric() || ch == '_'))
 }
 
-fn find_top_level_keyword_index(expr: &str, keyword: &str) -> Option<usize> {
+pub(crate) fn find_top_level_keyword_index(expr: &str, keyword: &str) -> Option<usize> {
     let mut i = 0usize;
     let mut paren = 0usize;
     let mut bracket = 0usize;
@@ -6492,7 +6544,7 @@ fn contains_top_level_keyword(expr: &str, keyword: &str) -> bool {
     find_top_level_keyword_index(expr, keyword).is_some()
 }
 
-fn find_top_level_char(expr: &str, target: char) -> Option<usize> {
+pub(crate) fn find_top_level_char(expr: &str, target: char) -> Option<usize> {
     find_top_level_char_from(expr, target, 0)
 }
 

@@ -7,6 +7,9 @@ edition = "2024"
 default = []
 # Enable fail points for chaos/fault injection testing
 failpoints = ["fail/failpoints"]
+# Enable Z3-backed symbolic Init enumeration (T5).
+# Requires libz3-dev / clang to build the z3-sys bindgen step.
+symbolic-init = ["dep:z3"]
 
 [dependencies]
 # Chaos testing - only active with failpoints feature
@@ -32,6 +35,11 @@ sled = "0.34.7"
 tokio = { version = "1.41", features = ["rt-multi-thread", "fs", "io-util", "net", "time", "macros", "signal", "sync"] }
 twox-hash = "2.1.2"
 zstd = "0.13"
+
+# Optional Z3 backend for symbolic Init enumeration (T5). Behind the
+# `symbolic-init` feature flag because the z3 build requires libz3-dev
+# and clang for bindgen.
+z3 = { version = "0.12", default-features = false, optional = true }
 
 # AWS SDK for S3 persistence (built-in for spot instance checkpoint/resume)
 aws-sdk-s3 = "1.65"

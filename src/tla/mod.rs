@@ -7,6 +7,7 @@ pub mod eval;
 pub mod formula;
 pub mod module;
 pub mod scan;
+pub mod symbolic_init;
 pub mod temporal;
 pub mod value;
 pub mod var_table;

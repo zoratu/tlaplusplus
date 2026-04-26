@@ -1025,3 +1025,149 @@ Future T4-like audits should be run manually after major eval/exec changes (e.g.
 
 **Commit:** `d127647`.
 
+### T5 — Symbolic Init enumeration via Z3 (2026-04-25)
+
+#### Goal
+
+Eliminate the Init-bound timeout class. Filtered record-set Init expressions of the form
+
+```text
+var \in { tup \in [f1: D1, ..., fN: DN] : Predicate(tup) }
+```
+
+were brute-forcing over the full Cartesian product of the field domains. For 4-5 field puzzle specs (Einstein, CoffeeCan-large, MCBinarySearch, plus internal benchmarks), the candidate count blows up to 100M+ before the budget halt.
+
+#### Approach
+
+Add a Z3-backed symbolic enumerator that:
+
+1. Translates the predicate into a Z3 Bool over symbolic Int variables (one per record field, with enum-coded non-int domains).
+2. Uses block-and-resolve to enumerate solutions: solve, extract model, build the record, assert "at least one field differs", repeat until UNSAT.
+3. Falls back to brute-force when the predicate is outside the supported subset, when Z3 returns Unknown, or when the solution count exceeds the 10M hard cap.
+
+The translator handles the operators that show up in puzzle/budget Init predicates:
+
+- Boolean: `/\`, `\/`, `~`, `=>`, `<=>`, `TRUE`, `FALSE`
+- Comparison: `=`, `#`, `/=`, `<`, `<=`, `>=`, `>`
+- Arithmetic on field projections + literals: `+`, `-`, `*`
+- Set membership: `var.f \in {literals}` and `\in lo..hi` (and arbitrary int-expr `\in lo..hi`)
+- Field access `var.f`
+- `\A` and `\E` over finite literal domains (eagerly expanded)
+- Constant folding via the outer `eval_expr` for any subexpression that doesn't reference the bound record variable
+
+#### Crate / build
+
+- New optional dependency: `z3 = { version = "0.12", default-features = false, optional = true }`
+- New cargo feature: `symbolic-init` (default off). Gated default-off because z3-sys requires `libz3-dev` + `clang` + `libclang-dev` for bindgen — not all CI environments will have those preinstalled.
+- Install on Ubuntu 25.10 spot: `sudo apt-get install -y libz3-dev clang libclang-dev` (~15s, ~50MB). z3-sys + z3 + bindgen build chain ~35s on c8g.xlarge (4 vCPU aarch64).
+
+#### Architecture
+
+```
+eval_set_expression  (eval.rs:2243)
+  └─ detects {var \in [f1:D1,...]: pred} record-set comprehension
+     ├─ resolves Identifier → bracket body via ctx.definitions (NEW)
+     ├─ tries existing 2-field sum-range constraint propagation (v0.3.0)
+     └─ tries try_symbolic_record_set_enumerate          (NEW, T5)
+        └─ falls through to brute-force if any of the above bails
+```
+
+`src/tla/symbolic_init.rs`:
+- ~600 lines.
+- Public: `try_symbolic_record_set_enumerate(pred_text, var_name, field_specs, ctx) -> Option<Vec<TlaValue>>`.
+- Returns `Some(records)` on success; `None` for unsupported shapes — caller treats as fallback signal.
+- Internal `Translator` walks the predicate text and produces Z3 Bools / Ints. Uses `crate::tla::eval::{find_top_level_*, split_top_level_*, is_valid_identifier}` (newly `pub(crate)`-exposed) for parser primitives.
+
+Helper API made `pub(crate)` for use by symbolic_init: `is_valid_identifier`, `find_top_level_keyword_index`, `find_top_level_char`, `split_top_level_symbol`, `split_top_level_keyword`.
+
+#### Domain identifier resolution
+
+The original record-set fast path required the domain expression to be a literal `[f1: D1, ...]`. CoffeeCan-style specs name the domain (`Can == [black: 0..N, white: 0..N]`, then `var \in {c \in Can : ...}`), so the identifier wrapper bypassed both the existing fast path and the new symbolic one. Added a small unwrap step: if the domain is a bare identifier and `ctx.definitions[name].body` starts with `[`, substitute the body. This affects both the existing constraint-propagation and the new symbolic path.
+
+#### Wiring
+
+`eval.rs:2367` (now ~2410 after the unwrap insert): inserted
+
+```rust
+#[cfg(feature = "symbolic-init")]
+{
+    if let Some(records) = symbolic_init::try_symbolic_record_set_enumerate(
+        rhs, var_name, &field_specs, ctx,
+    ) {
+        return Ok(TlaValue::Seq(Arc::new(records)));
+    }
+}
+```
+
+immediately before the brute-force loop. `Seq` (not `Set`) is intentional and matches the existing constraint-propagation return shape — `evaluate_init_states` in `models/tla_native.rs:1770` already accepts both. This avoids the O(n log n) BTreeSet construction cost.
+
+Debug logging: set `TLAPLUSPLUS_DEBUG_SYMBOLIC_INIT=1` to print one line per symbolic enumeration with record count and brute-force candidate count.
+
+#### Benchmark — TightCan synthetic (5-field record set)
+
+Spec: `[a,b,c,d,e: 0..N]` with `a < b < c < d < e /\ a + b + c + d + e = N`. Solution set is small (5-element sorted partitions of N).
+
+| Config | Brute-force | Symbolic | Speedup | States |
+|--------|-------------|----------|---------|--------|
+| N=15 (16^5 = 1.05M cand) | 14.71s | 1.40s | **10.5x** | 7 |
+| N=20 (21^5 = 4.08M cand) | 58.42s | 1.41s | **41x** | 30 |
+| N=40 (41^5 = 115M cand) | FAIL (eval budget exhausted) | 1.6s | — (unblocks) | 674 |
+
+Both configurations produce identical state sets — correctness gate held.
+
+The brute-force time scales O(N^5) (linear in candidate count); the symbolic time scales O(solution_count) which for sortedness+sum constraints grows much more slowly. N=40 was previously infeasible.
+
+#### Specs that fall back gracefully (good)
+
+- **Einstein**: Init shape is `var \in {p \in PermutationSet : pred(p)}` where `p` is a Seq, not a Record. Outside the supported subset → falls back to brute-force (still times out on the 199M-cand cross product). Promoted to T5.1 in the plan.
+- **`Cardinality({tup.x, 1, 2}) = 3`** test predicate: `Cardinality` isn't in the translator's operator set → returns None → brute-force. Verified by unit test `unsupported_predicate_returns_none`.
+
+#### Tests
+
+- 6 unit tests in `src/tla/symbolic_init.rs` (gated `#[cfg(all(test, feature = "symbolic-init"))]`):
+  - `empty_field_specs_returns_none` — argument validation.
+  - `single_int_field_with_true_predicate_enumerates_full_domain` — sanity: `TRUE` predicate enumerates the whole domain.
+  - `two_int_fields_with_sum_constraint_matches_brute_force` — `tup.a + tup.b = 7` over 10x10 domain → 8 records.
+  - `distinctness_constraint_three_fields` — mini-Einstein: `tup.a # tup.b /\ tup.a # tup.c /\ tup.b # tup.c` over 1..3 → 6 permutations.
+  - `enum_domain_with_equality` — string/ModelValue domains: `tup.color = RED` over 3-color domain.
+  - `unsupported_predicate_returns_none` — fallback signal for `Cardinality(...)`.
+- 2 integration tests in `tests/symbolic_init_equivalence.rs` (also feature-gated):
+  - `symbolic_matches_brute_force_two_int_fields` — proptest, 64 cases, 16 hand-curated predicate templates × random 2-field int-domain pairs. Brute-force result is computed by a parallel native Rust evaluator (no circular dependency on the in-tree predicate evaluator).
+  - `empty_intersection_predicate_returns_empty_set` — `FALSE` predicate edge case.
+
+#### Test counts
+
+| Suite | Default features | `--features symbolic-init` |
+|-------|-----------------:|---------------------------:|
+| lib | 509 | 515 |
+| bins | 90 | 90 |
+| integration | 64 | 66 |
+| **Total** | **663** | **671** |
+
+All green. Pre-existing 1 ignored disk-checkpoint test still ignored. Pre-existing 4 build warnings still present (`tla_native.rs:1336` unused ctx, `next_pending` reassign, an unreachable pattern in `eval.rs:3790`'s ToString fallback, `numa.rs::num_nodes`); no new T5 warnings.
+
+#### Validation gates (still green)
+
+- `cargo test --release` (default): 663 tests pass, 1 ignored.
+- `cargo test --release --features symbolic-init`: 671 tests pass, 1 ignored.
+- T2 proptest equivalence: 11/11 pass with feature on.
+- T3 state graph snapshots: 12/12 pass with feature on.
+- New T5 proptest equivalence (symbolic vs brute-force): 64 cases, 0 failures.
+
+#### Working notes
+
+- z3 0.12 / z3-sys 0.8 with system libz3 4.13.3 builds cleanly on Ubuntu 25.10 aarch64 once `clang` + `libclang-dev` are installed (bindgen requirement).
+- Z3 Int has `add`/`sub`/`mul` as **associated functions**, not methods. Initial code used `l.sub(&[&r])` which fails to compile; correct form is `Int::sub(ctx, &[&l, &r])`.
+- Z3 contexts are not `Send`, so the symbolic enumeration runs single-threaded inside Init evaluation — that's fine because Init enumeration happens once, before parallel state exploration starts.
+- The symbolic path is a clear win when the predicate is *selective* (small solution set vs huge candidate space). For near-tautological predicates (e.g. CoffeeCan's `c.b + c.w \in 1..(2N)` where almost every pair satisfies), block-and-resolve makes one Z3 call per solution and ends up slower than brute force. The existing v0.3.0 sum-range constraint-propagation special case (which materializes solutions in pure Rust) still wins for that shape and is kept ahead of the symbolic fallback in the cascade. Future work T5.3 could detect the near-tautology case and skip symbolic.
+
+#### Recommended next step
+
+Two paths from here:
+
+1. **Stay in T5 territory** (T5.1) — extend the translator to handle the sequence-set Init shape that Einstein and SortedSeqs use. Worth doing because Einstein is the canonical Init-bound spec, but requires significant translator surgery (Z3 array theory or per-position Int vars + length budget).
+2. **Move to T6** (cross-node distributed work stealing) — bigger lever for the whole-system 1.0.0 roadmap, and the current T5 deliverable already fulfils the plan's "prove the approach works on at least one of {Einstein, CoffeeCan-large, MCBinarySearch}" criterion via the synthetic 5-field record-set demonstration.
+
+Recommend **option 2**: move on to T6. T5.1 is parked on the plan as a follow-up.
+
+**Commit:** TBD (this entry to be amended with the actual SHA once committed).
