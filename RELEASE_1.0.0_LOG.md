@@ -885,5 +885,5 @@ equivalence + reachable-set fixpoint), mutation testing has a strong
 oracle to score against; surviving mutants will pinpoint the
 remaining test-coverage gaps in the eval/exec hot paths.
 
-**Commit:** TBD (filled in by post-commit edit).
+**Commit:** `2a070c3`.
 
