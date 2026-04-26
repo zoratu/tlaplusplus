@@ -2172,11 +2172,12 @@ without depending on inner-pop returning `None`.
 caps. Wall-time at cap=2000 (~9.4 s) is comparable to the default 50 M
 cap (~11.5 s) on this 2-worker spec.
 
-Test counts:
-- `cargo test --release` on remote: **728 passed, 0 failed, 8 ignored**
-  across 18 binaries (was 727 — net +1 from the new
-  `t11_1_inflight_items_keep_has_pending_work_true` unit test).
-- `cargo test --release --features failpoints`: TBD, see commit log.
+Test counts on remote (c8g.xlarge):
+- `cargo test --release`: **728 passed, 0 failed** (was 727 — net +1
+  from the new `t11_1_inflight_items_keep_has_pending_work_true` unit
+  test).
+- `cargo test --release --features failpoints`: **748 passed, 0 failed**
+  (was 746 — net +2).
 
 Regression test: `t11_1_inflight_items_keep_has_pending_work_true` in
 `src/storage/spillable_work_stealing.rs::tests`. Asserts the
@@ -2219,8 +2220,58 @@ CheckpointDrain at cap=2000 now completes in 16.5 s with 26,344
 distinct (was 120 s timeout). 5 baseline runs (no failpoints) at caps
 2000 and 50000 still all return 26,344 distinct.
 
-**T11.2 re-soak.** Once both T11.1 fixes landed, ran a 30-min swarm
-chaos soak with `--queue-max-inmem 2000` so the spill path actually
-engages under fault injection. See its own commit `test(t11.2)` for
-the iter count, divergences, and downstream fire counts of
-`queue_spill_fail` / `queue_load_fail`.
+**T11.2 re-soak (commit `test(t11.2)`).** Once both T11.1 fixes landed,
+ran the 30-min swarm chaos soak with `--queue-max-inmem 2000` so the
+spill path actually engages under fault injection. Command:
+
+```
+scripts/chaos_soak.sh --duration 1800 --queue-max-inmem 2000 \
+                       --swarm-mode auto --workers 2
+```
+
+Results on c8g.xlarge (REDACTED-INSTANCE, 22:55-23:25 UTC):
+
+```
+iterations:    166
+divergences:    0
+hangs/timeouts: 0
+distinct concurrent pairs observed: 65
+RESULT: clean.
+```
+
+Swarm size distribution: n=1: 45 iters; n=2: 43; n=3: 42; n=4: 36.
+
+Per-failpoint downstream fire counts (all "exit_ok" in the soak's
+column, meaning the failpoint reached its `fail_point!()` site AND
+the runtime recovered to a normal exit-0 with the baseline distinct
+count):
+
+```
+queue_spill_fail        37 fires, 37 ok, 0 hangs, 0 diverge
+queue_load_fail         34 fires, 34 ok, 0 hangs, 0 diverge
+worker_panic            30 fires, 30 ok, 0 hangs, 0 diverge
+fp_store_shard_full     37 fires, 37 ok
+checkpoint_disk_write_fail   36, 36 ok
+checkpoint_fp_flush_fail     36, 36 ok
+checkpoint_rename_fail       36, 36 ok
+checkpoint_queue_flush_fail  35, 35 ok
+checkpoint_write_fail        35, 35 ok
+quiescence_timeout      32, 32 ok
+fp_switch_slow          29, 29 ok
+worker_pause_delay      24, 24 ok
+```
+
+This is what T11.2 was waiting on: with `--queue-max-inmem 2000` the
+spill path engages on every iter, the failpoints' downstream code
+paths are exercised, and the runtime survives every concurrent-fault
+combination the swarm threw at it. Note that the in-memory
+compressed ring (default-on) absorbs the majority of spill batches
+before they reach disk; `queue_spill_fail` fires anyway when the ring
+momentarily fills and a batch falls through to `overflow.push`. See
+**T11.4** in the plan for a follow-up about the silent-loss path on a
+permanent `queue_spill_fail` injection — out of scope for this fix.
+
+Worker_panic iters now complete in ~16s (panic recovery, vs ~10s
+baseline) instead of timing out at 120s — confirms the second T11.1
+commit (the spill-coordinator disconnect fix) is doing its job in the
+real soak environment.
