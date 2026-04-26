@@ -242,6 +242,8 @@ enum Command {
         storage: StorageArgs,
         #[command(flatten)]
         s3: S3Args,
+        #[command(flatten)]
+        cluster: ClusterArgs,
     },
     RunFlurmLifecycle {
         #[arg(long, default_value_t = 3)]
@@ -1157,6 +1159,108 @@ fn fetch_s3_file(uri: &str) -> anyhow::Result<std::path::PathBuf> {
     Ok(local_path)
 }
 
+/// Wire up an `EngineConfig` for distributed cluster mode: bind the listener,
+/// connect to peers, create the work stealer, and install the steal/donate
+/// channels.
+///
+/// Mutates `engine_config` in place. Leaks the tokio runtime so it stays
+/// alive for the lifetime of the process (the transport's async tasks need it).
+///
+/// No-op (returns Ok) when `cluster.cluster_listen` is None.
+fn maybe_setup_cluster(
+    cluster: &ClusterArgs,
+    engine_config: &mut EngineConfig,
+) -> anyhow::Result<()> {
+    let Some(ref listen_addr_str) = cluster.cluster_listen else {
+        return Ok(());
+    };
+    let listen_addr: std::net::SocketAddr = listen_addr_str.parse().map_err(|e| {
+        anyhow::anyhow!(
+            "invalid --cluster-listen address '{}': {}",
+            listen_addr_str,
+            e
+        )
+    })?;
+    let peers: Vec<std::net::SocketAddr> = cluster
+        .cluster_peers
+        .iter()
+        .map(|s| {
+            s.parse()
+                .map_err(|e| anyhow::anyhow!("invalid peer address '{}': {}", s, e))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let cluster_config = ClusterConfig {
+        node_id: cluster.node_id,
+        listen_addr,
+        peers: peers.clone(),
+    };
+    let num_nodes = cluster_config.num_nodes();
+
+    // Build tokio runtime for cluster transport
+    let tokio_rt = tokio::runtime::Runtime::new()
+        .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {}", e))?;
+    let tokio_handle = tokio_rt.handle().clone();
+
+    // Start transport (bind listener)
+    let transport =
+        tokio_handle.block_on(async { ClusterTransport::new(cluster_config.clone()).await })?;
+
+    // Connect to peers (retry with brief delay for startup ordering)
+    println!(
+        "[cluster] node {} listening on {}, connecting to {} peers...",
+        cluster.node_id,
+        listen_addr,
+        peers.len()
+    );
+    tokio_handle.block_on(async {
+        for attempt in 0..30 {
+            match transport.connect_to_peers().await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if attempt < 29 {
+                        eprintln!(
+                            "[cluster] peer connection attempt {} failed: {}, retrying...",
+                            attempt + 1,
+                            e
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        unreachable!()
+    })?;
+    println!("[cluster] connected to all peers");
+
+    let stealer = Arc::new(DistributedWorkStealer::new(
+        cluster.node_id,
+        num_nodes,
+        Arc::clone(&transport),
+        tokio_handle.clone(),
+    ));
+
+    let (stolen_tx, stolen_rx) = crossbeam_channel::bounded::<StolenState>(65_536);
+    let (donate_tx, donate_rx) = crossbeam_channel::bounded::<Vec<u8>>(65_536);
+
+    engine_config.distributed_stealer = Some(Arc::clone(&stealer));
+    engine_config.stolen_states_rx = Some(stolen_rx);
+    engine_config.donate_states_tx = Some(donate_tx);
+    engine_config.donate_states_rx = Some(donate_rx);
+    engine_config.stolen_states_tx = Some(stolen_tx);
+
+    // Leak the tokio runtime so it stays alive for the duration of the process.
+    std::mem::forget(tokio_rt);
+
+    println!(
+        "[cluster] distributed mode active: node {}, {} total nodes",
+        cluster.node_id, num_nodes
+    );
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -1168,10 +1272,14 @@ fn main() -> anyhow::Result<()> {
             runtime,
             storage,
             s3,
+            cluster,
         } => {
             run_system_checks(runtime.skip_system_checks);
             let model = CounterGridModel::new(max_x, max_y, max_sum);
-            let config = build_engine_config(&runtime, &storage, s3.s3_bucket.is_some())?;
+            let mut config = build_engine_config(&runtime, &storage, s3.s3_bucket.is_some())?;
+            // Wire distributed-cluster mode if --cluster-listen was passed.
+            // T6: enables cross-node work stealing across the cluster.
+            maybe_setup_cluster(&cluster, &mut config)?;
             let outcome = run_model_with_s3(model, config, &s3)?;
             print_stats("counter-grid", &outcome.stats);
             if let Some(violation) = outcome.violation {
