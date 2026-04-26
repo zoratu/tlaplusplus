@@ -625,3 +625,30 @@ constraint extractor. The pre-existing `BuchiChecker` API in
 
 **Recommended next step:** triage T2.1 first (highest prevalence; nested EXCEPT is a real-world pattern in many specs) before proceeding to T3.
 
+---
+
+## 2026-04-26
+
+### T2.1 + T2.2 — nested / record-field EXCEPT compiler parser fixes
+
+**Status:** closed. Single shared root cause as suspected. One additional masked bug surfaced after the T2.1+T2.2 fix and was patched in the same commit (see "Wider scope" below). Proptest harness now fails-fast only on T2.3-style cases.
+
+**Root cause (shared T2.1 + T2.2):** `try_parse_except` (`src/tla/compiled_expr.rs`) located the EXCEPT keyword via a naive `inner.find(" EXCEPT ")` that did not respect bracket depth. Whenever the outer `[...]` enclosed another `[... EXCEPT ...]` (T2.1) or a `[... EXCEPT ...]` inside a record-literal field value (T2.2), the search hooked the *inner* keyword and produced a malformed `base` that then failed downstream — surfacing as `"missing closing ']' in expression: [r"` for T2.1 and `"unexpected trailing tokens in expr: a |"` for T2.2.
+
+**Fix:** new helper `find_top_level_except` (`src/tla/compiled_expr.rs:1825`) tracks `()`, `[]`, `{}`, and `<<>>` depth and returns the first top-level (`depth == 0`) ` EXCEPT ` / ` EXCEPT\n` occurrence. `try_parse_except` (`src/tla/compiled_expr.rs:1809`) was rewritten to call it. Same fix closes both bugs without further changes to `try_parse_except`'s update parser, the bracket-tokeniser entry point, or the surrounding record-literal / function-construct dispatch.
+
+**Wider scope (one additional bug found and patched in the same commit):** after the EXCEPT fix the proptest reliably surfaced a previously-masked arithmetic parser bug — `(x * -3)` was being sliced by `split_binary_op` for `-` before `*`, producing `Sub(Mul(x, Unparsed("")), 3)` and failing at eval-time with `"empty expression"`. Same shape: any `expr * -N`, `expr + -N`, `expr \div -N`, etc. inside a parenthesised arithmetic term. Patched at `src/tla/compiled_expr.rs:633` (the `-` arm in `compile_expr`) by adding a new helper `left_ends_with_value` (`src/tla/compiled_expr.rs:1411`) that requires the trimmed left side to end in a value-producing character (alphanumeric, `_`, `)`, `]`, `}`, `>`, `"`) — otherwise the `-` is treated as a unary minus and the next operator is tried. Without this, the freshly-unmasked arithmetic bug would have prevented the proptest from settling on T2.3 only. (Verified with 10 random seeds at `PROPTEST_CASES=128`: 7 fail on T2.3, 3 pass; **0 fail on EXCEPT or arithmetic shapes**.)
+
+**Regression tests:** added 4 unit tests in `src/tla/compiled_expr.rs::tests`:
+- `test_t2_1_nested_except_compiles_as_funcexcept` — asserts `[[r EXCEPT !.a = 0] EXCEPT !.b = 0]` compiles to nested `FuncExcept`.
+- `test_t2_2_except_inside_record_field_value` — asserts `[a |-> 0, b |-> ([r EXCEPT !.a = 0]).a]` compiles to `RecordLiteral` with the inner field as `(FuncExcept).a`.
+- `test_t2_1_t2_2_evaluation_matches_interpreter` — end-to-end equivalence check (compiler ≡ interpreter) on both shapes; both evaluate to `[a |-> 0, b |-> 0]`.
+- `test_top_level_except_ignores_func_application_arg` — asserts `find_top_level_except("f[[r EXCEPT !.a = 0]]")` returns `None` (sanity check on the helper).
+
+**Validation evidence:**
+- `cargo test --release -- --skip compiled_matches_interpreted` on spot `REDACTED-INSTANCE` (c8g.xlarge, us-west-2): **625 tests pass** (484 lib + 90 bin + 15+11+10+2+5+6+2 across `tests/`, 1+2 ignored, 1 filtered, 0 failed). Net +4 from the new T2.1/T2.2 regression tests (was 621 after T2 landed).
+- `cargo test --release --test compiled_vs_interpreted` (proptest enabled, `PROPTEST_CASES=128`, 10 distinct `PROPTEST_RNG_SEED` values): **3/10 seeds pass entirely; 7/10 fail-fast on T2.3** (`(IF (1..3 \subseteq S) ...)`-shaped expressions, `[a |-> ..., b |-> CASE (1..3 \subseteq S) ...]`, `\A __q : ... (1..3 \subseteq S) ...`). **0 seeds fail on EXCEPT or arithmetic shapes.** Confirms the harness now fails *only* on T2.3 as required.
+- `scripts/diff_tlc.sh` on spot: **13/13 pass**, 0 divergences, 0 allowlist hits.
+
+**Commit:** `<TBD>` — `fix: top-level EXCEPT and unary-minus disambiguation in compiled-expr parser (T2.1 + T2.2)`.
+

@@ -635,8 +635,16 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
         return CompiledExpr::Add(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
     }
     if let Some((left, right)) = split_binary_op(expr, "-") {
-        // Be careful not to match negative numbers
-        if !left.is_empty() {
+        // Be careful not to match negative numbers. The `-` is unary
+        // (i.e. forms a negative literal / negation of `right`) when it
+        // either has nothing before it or is preceded by another binary
+        // operator or open-delimiter. T2.1+T2.2 follow-up: previously
+        // this only checked `!left.is_empty()`, so `(x * -3)` was sliced
+        // as `Sub(Mul(x, ""), 3)` (empty Mul RHS → "empty expression"
+        // at eval time). Now we also require the trimmed left to end in
+        // a value-producing character (digit, identifier, `)`, `]`,
+        // `>>`, `}`).
+        if !left.is_empty() && left_ends_with_value(left) {
             return CompiledExpr::Sub(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
         }
     }
@@ -1408,6 +1416,26 @@ fn matches_keyword_at(chars: &[char], i: usize, keyword: &str) -> bool {
     true
 }
 
+/// Helper for disambiguating a `-` token: returns true if the trimmed
+/// left-hand side ends in a character that can plausibly produce a
+/// value (so the `-` is a binary subtraction). Returns false if the
+/// left ends in a binary operator or open delimiter (so the `-` is a
+/// unary minus and we should not split here).
+///
+/// Used by the binary-`-` split site in `compile_expr`. Without this
+/// guard, `(x * -3)` was sliced as `Sub(Mul(x, ""), 3)` because
+/// `split_binary_op` happily reported `left = "x * "` and `right = "3"`.
+fn left_ends_with_value(left: &str) -> bool {
+    let trimmed = left.trim_end();
+    let Some(last) = trimmed.chars().last() else {
+        return false;
+    };
+    // Value-producing terminators: identifier chars, digits, closing
+    // brackets/parens/braces, and the quote at the end of a string
+    // literal. Note: `>>` (sequence end) ends in `>` so we accept `>`.
+    matches!(last, ')' | ']' | '}' | '"' | '>') || last.is_alphanumeric() || last == '_'
+}
+
 fn split_binary_op<'a>(expr: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
     let mut bracket_depth = 0i32;
     let mut let_depth = 0usize;
@@ -1806,16 +1834,24 @@ fn find_top_level_arrow(s: &str) -> Option<usize> {
 /// - `f EXCEPT ![k1][k2] = val` (nested path)
 /// - `f EXCEPT ![k1] = val, ![k2] = val2` (multiple updates)
 /// - `f EXCEPT ![k] = @ + 1` (@ refers to original value)
+///
+/// **T2.1 + T2.2 fix:** the EXCEPT keyword must be matched at top-level
+/// bracket depth. Previously this used `inner.find(" EXCEPT ")`, which
+/// also matched EXCEPT keywords nested inside `[... EXCEPT ...]`
+/// sub-expressions. That caused two failure modes:
+///   - `[[r EXCEPT !.a = 0] EXCEPT !.b = 0]` was sliced as
+///     `base = "[r"` + EXCEPT + ... → "missing closing ']'".
+///   - `[a |-> 0, b |-> ([r EXCEPT !.a = 0]).a]` matched the inner EXCEPT
+///     (inside the record-literal field value), producing a malformed
+///     base like `"a |-> 0, b |-> ([r"` → "unexpected trailing tokens".
+/// Both surface only on the compiled fast path; the interpreter handles
+/// both shapes correctly. See `RELEASE_1.0.0_LOG.md` § T2.1 + T2.2.
 fn try_parse_except(inner: &str) -> Option<CompiledExpr> {
-    // Find "EXCEPT" keyword (may be followed by space or newline)
-    // Try " EXCEPT " first, then " EXCEPT\n"
-    let (except_pos, keyword_len) = if let Some(pos) = inner.find(" EXCEPT ") {
-        (pos, 8) // " EXCEPT " is 8 characters
-    } else if let Some(pos) = inner.find(" EXCEPT\n") {
-        (pos, 8) // " EXCEPT\n" is also 8 characters
-    } else {
-        return None;
-    };
+    // Find "EXCEPT" keyword at top-level bracket/paren/brace depth, with a
+    // mandatory leading space and a trailing space or newline. Anything
+    // inside `(...)`, `[...]`, `{...}`, or `<<...>>` is ignored.
+    let (except_pos, keyword_len) = find_top_level_except(inner)?;
+
     let base = inner[..except_pos].trim();
     let updates_str = inner[except_pos + keyword_len..].trim();
 
@@ -1830,6 +1866,55 @@ fn try_parse_except(inner: &str) -> Option<CompiledExpr> {
         Box::new(compile_expr(base)),
         updates,
     ))
+}
+
+/// Locate the first top-level (bracket-depth-0) occurrence of the EXCEPT
+/// keyword surrounded by ` EXCEPT ` or ` EXCEPT\n`. Returns the byte
+/// offset of the leading space and the keyword-with-delimiters length
+/// (always 8: 1 lead space + "EXCEPT" + 1 trail char).
+///
+/// Tracks `(`, `[`, `{`, `<<` depth so that EXCEPT keywords inside
+/// nested expressions (record literals, sub-EXCEPTs, function
+/// applications, etc.) are not mistaken for the outer separator.
+fn find_top_level_except(s: &str) -> Option<(usize, usize)> {
+    let bytes = s.as_bytes();
+    let mut depth: i32 = 0;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        // Track `<<` / `>>` as bracket pairs (TLA+ tuple syntax).
+        if b == b'<' && i + 1 < bytes.len() && bytes[i + 1] == b'<' {
+            depth += 1;
+            i += 2;
+            continue;
+        }
+        if b == b'>' && i + 1 < bytes.len() && bytes[i + 1] == b'>' {
+            depth = (depth - 1).max(0);
+            i += 2;
+            continue;
+        }
+        match b {
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                i += 1;
+                continue;
+            }
+            b')' | b']' | b'}' => {
+                depth = (depth - 1).max(0);
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        if depth == 0 && b == b' ' && i + 8 <= bytes.len() && &bytes[i + 1..i + 7] == b"EXCEPT" {
+            let trail = bytes[i + 7];
+            if trail == b' ' || trail == b'\n' {
+                return Some((i, 8));
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Parse EXCEPT update clauses: ![k1][k2] = val, ![k3] = val2
@@ -3346,6 +3431,122 @@ IN
                 value
             );
         }
+    }
+
+    /// T2.1 regression: outer `[... EXCEPT ...]` whose base is itself a
+    /// `[r EXCEPT !.f = v]` must be recognised as a nested EXCEPT, not
+    /// have its inner EXCEPT keyword swallowed by `try_parse_except`.
+    /// Before the fix, `try_parse_except` did `inner.find(" EXCEPT ")`
+    /// which matched the FIRST EXCEPT — the one inside the nested
+    /// brackets — producing `base = "[r"` and bubbling up
+    /// `missing closing ']' in expression: [r`.
+    #[test]
+    fn test_t2_1_nested_except_compiles_as_funcexcept() {
+        let expr = "[[r EXCEPT !.a = 0] EXCEPT !.b = 0]";
+        let compiled = compile_expr(expr);
+        assert!(
+            matches!(compiled, CompiledExpr::FuncExcept(_, _)),
+            "nested EXCEPT should compile to FuncExcept, got: {:?}",
+            compiled
+        );
+        // Outer EXCEPT must update field `b`; its base must itself be a
+        // FuncExcept that updates field `a`.
+        if let CompiledExpr::FuncExcept(base, updates) = &compiled {
+            assert_eq!(updates.len(), 1, "outer should have 1 update");
+            assert!(
+                matches!(base.as_ref(), CompiledExpr::FuncExcept(_, _)),
+                "outer base should be the inner FuncExcept, got: {:?}",
+                base
+            );
+            if let CompiledExpr::FuncExcept(inner_base, inner_updates) = base.as_ref() {
+                assert!(
+                    matches!(inner_base.as_ref(), CompiledExpr::Var(name) if name == "r"),
+                    "innermost base should be Var(r), got: {:?}",
+                    inner_base
+                );
+                assert_eq!(inner_updates.len(), 1, "inner should have 1 update");
+            }
+        }
+    }
+
+    /// T2.2 regression: a record literal whose field value contains a
+    /// `[... EXCEPT ...]` sub-expression must compile as a RecordLiteral.
+    /// Before the fix, the outer `[`-block's `try_parse_except` matched
+    /// the EXCEPT inside the nested bracket and tried to slice the whole
+    /// `inner` on it, producing a malformed base like
+    /// `"a |-> 0, b |-> ([r"` and surfacing as
+    /// `unexpected trailing tokens in expr: a |`.
+    #[test]
+    fn test_t2_2_except_inside_record_field_value() {
+        let expr = "[a |-> 0, b |-> ([r EXCEPT !.a = 0]).a]";
+        let compiled = compile_expr(expr);
+        assert!(
+            matches!(compiled, CompiledExpr::RecordLiteral(_)),
+            "record literal with EXCEPT in a field value should compile to RecordLiteral, got: {:?}",
+            compiled
+        );
+        if let CompiledExpr::RecordLiteral(fields) = &compiled {
+            assert_eq!(fields.len(), 2, "should have 2 fields");
+            assert_eq!(fields[0].0, "a");
+            assert_eq!(fields[1].0, "b");
+            // Field b's value should be a RecordAccess on a FuncExcept.
+            assert!(
+                matches!(&fields[1].1, CompiledExpr::RecordAccess(inner, fname)
+                    if fname == "a" && matches!(inner.as_ref(), CompiledExpr::FuncExcept(_, _))),
+                "field b should be (FuncExcept).a, got: {:?}",
+                fields[1].1
+            );
+        }
+    }
+
+    /// T2.1 + T2.2 end-to-end: the compiled value must equal the
+    /// interpreter's value. Both shapes should evaluate to
+    /// `[a |-> 0, b |-> 0]`.
+    #[test]
+    fn test_t2_1_t2_2_evaluation_matches_interpreter() {
+        use crate::tla::eval::{EvalContext, eval_expr};
+        use crate::tla::value::TlaValue;
+        use crate::tla::{TlaState, tla_state};
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        // Build a state with `r = [a |-> 1, b |-> 2]`.
+        let mut rec: BTreeMap<String, TlaValue> = BTreeMap::new();
+        rec.insert("a".to_string(), TlaValue::Int(1));
+        rec.insert("b".to_string(), TlaValue::Int(2));
+        let state: TlaState = tla_state([("r", TlaValue::Record(Arc::new(rec)))]);
+        let defs: BTreeMap<String, crate::tla::TlaDefinition> = BTreeMap::new();
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        for expr in &[
+            "[[r EXCEPT !.a = 0] EXCEPT !.b = 0]",
+            "[a |-> 0, b |-> ([r EXCEPT !.a = 0]).a]",
+        ] {
+            let interp = eval_expr(expr, &ctx).unwrap_or_else(|e| {
+                panic!("interpreter failed on `{expr}`: {e}");
+            });
+            let compiled = compile_expr(expr);
+            let comp_val = crate::tla::compiled_eval::eval_compiled(&compiled, &ctx)
+                .unwrap_or_else(|e| panic!("compiler failed on `{expr}`: {e}"));
+            assert_eq!(
+                interp, comp_val,
+                "interpreter / compiler disagree on `{expr}`"
+            );
+        }
+    }
+
+    /// EXCEPT inside a function-application argument must not confuse
+    /// the outer parser. e.g. `f[[r EXCEPT !.a = 0]]` should be parsed
+    /// as `FuncApply(f, [FuncExcept(r, ...)])`, not have the inner
+    /// EXCEPT keyword promoted to top level.
+    #[test]
+    fn test_top_level_except_ignores_func_application_arg() {
+        // No top-level EXCEPT here — the only EXCEPT is inside `f[ ... ]`.
+        let inner = "f[[r EXCEPT !.a = 0]]";
+        // try_parse_except is called on the *inner* of an outer `[...]`,
+        // but here we just want to confirm find_top_level_except sees
+        // nothing at depth 0.
+        assert_eq!(super::find_top_level_except(inner), None);
     }
 }
 
