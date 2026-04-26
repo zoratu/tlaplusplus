@@ -1995,9 +1995,9 @@ regression.
 | T7.1 batched per-disjunct eval | DEFER 1.1.0 | POR opt-in; 36.8x reduction on supported workload. |
 | T7.2 smarter stubborn-set seed | DEFER 1.1.0 | Deterministic seed is sound; smarter seed is tuning. |
 | T7.3 POR for liveness | DEFER 1.1.0 | T10 already shipped 550x liveness speedup. |
-| T9.1 transitive variable relevance | DEFER 1.1.0 | Conservative over-marking, never under-marks. |
-| T9.2 smarter BFS seed | DEFER 1.1.0 | 30s budget rarely hit. |
-| T9.3 suffix shortening | DEFER 1.1.0 | BFS shortcut already optimal-length prefix. |
+| T9.1 transitive variable relevance | DONE (post-1.0 worktree) | Operator inlining wired in; see log entry below. |
+| T9.2 smarter BFS seed | DONE (post-1.0 worktree) | Multi-source BFS (init + median); see log entry below. |
+| T9.3 suffix shortening | DONE (post-1.0 worktree) | Alternate-suffix BFS to any violating state; see log entry below. |
 | T10.1 parallel Tarjan | DEFER 1.1.0 | Sub-second already on N=10. |
 | T10.2 streaming SCC | DEFER 1.1.0 | Substantial redesign for 100M+ states. |
 | T10.3 single-state SCC pre-filter | DEFER 1.1.0 | Tarjan already 21% of post-processing budget. |
@@ -2091,3 +2091,119 @@ that's tracked for v1.1+.
 **T15 — tag and push.** Local v1.0.0 tag created via
 `git tag -a v1.0.0 -m "..."`. **Tag NOT pushed** — that and
 `gh release create` are user-triggered per the brief.
+
+### T9.1 + T9.2 + T9.3 — Trace minimization extensions (post-1.0 worktree)
+
+Three follow-ups to T9 originally parked as DEFER 1.1.0 in the closeout
+sweep. Re-evaluated and shipped on the worktree branch
+`worktree-agent-a450b3a7dd143916c`. All three are additive — Phase A
+correctness gates (initial state, valid Next, final violates) are
+preserved across every iteration, and Phase B output remains
+presentation-only.
+
+**T9.1 — Transitive variable relevance.** Today's `extract_invariant_variables`
+tokenizes the invariant body and matches against the variable list. An
+invariant of the form `Inv == IsBad(s)` where `IsBad(s) == s.x > 5`
+fails to flag `x`. Added `extract_invariant_variables_transitive(text,
+vars, operators)` which recursively follows operator-call chains:
+- Tokenize → match against variable set AND operator set
+- Recurse into each matched-operator's body (cycle-safe via visited set,
+  recursion depth bound 64)
+- Strip TLA+ comments at every level so identifiers in `\* ...` /
+  `(* ... *)` blocks don't accidentally trigger recursion
+- New `OperatorBody { name, body }` carrier struct so the trace
+  minimizer doesn't depend on the full TLA module-loading layer
+
+Wired in `src/main.rs::main()` — the violation-printing block now
+builds an `OperatorBody` registry from `model_for_liveness.module.definitions`
+and calls the transitive variant. Falls back to syntactic behaviour
+when the registry is empty (other call sites unchanged via the existing
+`extract_invariant_variables` symbol kept for back-compat).
+
+**T9.2 — Smarter BFS seed.** Today's `find_shortcut` does single-source
+BFS from the model's initial states only; for very long traces the
+`depth_cap = current.len() - 1` budget can be exhausted before reaching
+the back half of the trace. Made it multi-source:
+- Always plants seeds at all initial states (Phase A baseline preserved)
+- For traces of length ≥ 8, also plants a seed at the median trace
+  state via `build_seeds`
+- BFS roots are tagged (`Init` vs `Trace { trace_index: src }`) so the
+  win condition adapts: from an Init seed, depth `d` to `current[i]` is
+  a win iff `d < i`; from a Trace seed at `src`, hit at `current[j]` is
+  a win iff `j > src + 1` and `d < j - src`
+- On hit, the parent chain is reconstructed up to the seed, producing
+  a `replacement_segment` with `source_index` and `target_index`. The
+  splice replaces `current[source_index..=target_index]` with the
+  segment, which generalizes the previous prefix-only splice
+  (`source_index == 0` recovers the old behaviour).
+
+Forward BFS from the trace's *final* state was intentionally omitted:
+the final state already violates the invariant, so any forward path
+from it leaves the violation invariant. The brief calls for "endpoint
+seeding" but only the start endpoint is actually useful for forward
+BFS — and that's already covered by the always-on Init seeds.
+
+**T9.3 — Suffix shortening.** After the prefix-shortening loop reaches
+fixpoint, runs `try_suffix_shortening`:
+- For each non-violating, non-final trace state at index `i`, BFS
+  forward looking for *any* state where `check_invariants` returns
+  `Err` (possibly a different violation than the trace's tail)
+- If found at depth `d` with `(i + 1) + d < current.len()`, splice:
+  keep `current[0..=i]` and append the BFS-reconstructed suffix
+- Greedy: takes the first improvement found (caller invokes once;
+  re-running the whole minimizer would compose, but isn't needed for
+  the v1.0 use cases)
+- Bounded cost: per-call pop cap of `max_depth × 64 + 1024` plus the
+  outer wall-budget, so pathologically branchy state spaces don't
+  starve the rest of the minimizer
+- Iterates split points from the latest non-final state backwards, so
+  the smallest-cost split is tried first (greedy match)
+
+The suffix BFS is deliberately *not* rerun inside the prefix loop —
+that would risk cascade growth of the trace if the suffix splice
+introduced a state reachable from earlier in the trace via an even
+shorter path. Composing the two phases is sound but more expensive;
+deferred to a future micro-bench-driven optimization if a corpus spec
+demands it.
+
+**Tests.** 9 new unit tests under `src/trace_minimize.rs`:
+
+- T9.1: `t91_transitive_picks_up_variable_through_one_operator`,
+  `t91_transitive_chains_through_multiple_operators`,
+  `t91_transitive_handles_recursive_operators_without_looping`,
+  `t91_transitive_falls_back_to_syntactic_when_no_operators`,
+  `t91_transitive_does_not_match_operators_inside_comments`
+- T9.2: `t92_build_seeds_includes_median_for_long_traces`,
+  `t92_long_trace_minimizes_via_skip_shortcut` (uses a
+  `ForwardSkipModel` with skip-by-10 transitions; canonical 31-state
+  trace minimizes to 4 states `0->10->20->30`)
+- T9.3: `t93_suffix_shortening_picks_shorter_alternate_violation`
+  (uses a `TwoViolationModel` with an alternate violation 100 reachable
+  in one step from state 5; trace [0..20] of length 21 minimizes to
+  length 7), `t93_suffix_shortening_no_op_when_no_alternate_exists`
+  (LinearModel sanity check)
+
+**Validation (spot c8g.metal-48xl aarch64, Tailscale 100.77.185.76):**
+
+| Gate | Result |
+|------|--------|
+| `cargo test --release` | **736 passed, 0 failed, 5 ignored** (was 727, +9 from T9.1/2/3 tests) |
+| `cargo test --release --lib trace_minimize` | 24 passed (was 15) |
+| `cargo test --release --test trace_minimization_t9` | 5 passed (existing integration suite unchanged) |
+| Diamond fixture re-test | 9 → 6 steps in 821 µs (was 375 µs on baseline x86_64 box; aarch64 spot is ~2x slower for this micro-bench) |
+
+`scripts/diff_tlc.sh` — not re-run on this 192-core ARM spot due to a
+pre-existing infra hang in `--workers 0` NUMA-auto path on this box
+(reproduced on stashed baseline code; worker-id underflow in NUMA
+diagnostic output suggests a NUMA-detection regression unrelated to
+T9). Confirmed individual spec runs pass with `--workers 4`:
+SimpleCounterViolation produces 12 states / 9 distinct / 2 violations
+in 1 s with trace minimization output `4 -> 4 steps in 112 µs (0
+iters)` — the BFS-optimal trace is correctly recognized as already
+minimal.
+
+**Commits (worktree branch, NOT pushed to origin):**
+- `feat(t9.1): transitive variable relevance through operator inlining` — `e9e019f`
+- `perf(t9.2): multi-source BFS seed (init + median) for long-trace minimization` — `f0a5da4`
+- `feat(t9.3): suffix shortening to alternate violations` — `03466bb`
+

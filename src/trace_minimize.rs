@@ -172,6 +172,27 @@ pub fn minimize_trace<M: Model>(
         }
     }
 
+    // T9.3: suffix shortening — for each non-violating state on the
+    // trace, try to find a shorter alternate suffix to *some* (possibly
+    // different) violating state.  Runs once after the prefix-shortening
+    // loop has reached fixpoint.  Conservative: if no improvement, the
+    // trace is unchanged.
+    if !budget_exhausted && current.len() >= 2 {
+        if let Some(shorter) = try_suffix_shortening(model, &current, start, budget) {
+            // Validate one more time: starts at an init, every transition
+            // valid, final state violates.  We trust the helper but
+            // double-check the cheapest predicate (final violation).
+            if model.check_invariants(shorter.last().unwrap()).is_err()
+                && shorter.len() < current.len()
+            {
+                current = shorter;
+                iterations += 1;
+            }
+        } else if start.elapsed() >= budget {
+            budget_exhausted = true;
+        }
+    }
+
     MinimizeResult {
         trace: current,
         original_len,
@@ -427,6 +448,190 @@ fn reconstruct_segment<M: Model>(
     }
     chain.reverse();
     chain
+}
+
+// ============================================================================
+// T9.3 — Suffix shortening
+// ============================================================================
+
+/// Try to find an alternate, shorter suffix from some non-final
+/// non-violating state on the trace to *some* (possibly different)
+/// violating state.
+///
+/// Algorithm: from each non-violating prefix endpoint
+/// `current[i]` (i ranges over `1..len-1`, then `0`), do bounded
+/// forward BFS looking for any state where `check_invariants` returns
+/// `Err`.  If we find one at depth `d` such that the new total length
+/// `(i + 1) + d < current.len()`, return the spliced trace.
+///
+/// We bound BFS expansion per iteration to keep total cost bounded; the
+/// outer wall-budget still applies.  Conservative — returns `None` if
+/// no improvement found OR if the budget elapsed (caller distinguishes
+/// by re-checking `start.elapsed() >= budget`).
+///
+/// The returned trace is guaranteed to:
+/// - share its `[0..=i]` prefix with `current` (so initial-state and
+///   transition-validity invariants are preserved over that range);
+/// - have valid transitions in its appended suffix (BFS reconstruction);
+/// - end in a violating state (the BFS hit condition).
+fn try_suffix_shortening<M: Model>(
+    model: &M,
+    current: &[M::State],
+    start: Instant,
+    budget: Duration,
+) -> Option<Vec<M::State>> {
+    if current.len() < 2 {
+        return None;
+    }
+
+    // For each candidate split-point `i`, the maximum useful BFS depth
+    // is `current.len() - i - 2`: anything deeper would yield a trace
+    // no shorter than the existing one.  We try split points from the
+    // *latest* non-final state backwards, since later splits give the
+    // smallest BFS budget and so cost the least.  A win at any earlier
+    // split point would have to be very dramatic to beat a near-end
+    // split.
+    //
+    // Iterate from the latest-feasible split point down to 0.  Stop as
+    // soon as we find any improvement (greedy — caller will re-run the
+    // full minimizer if it wants to compose multiple shortenings).
+    let n = current.len();
+    let mut best: Option<Vec<M::State>> = None;
+    let best_len: usize = n;
+
+    // i = split index; we keep current[0..=i] and synthesize a new suffix.
+    // Start at i = n - 2 (latest non-final state).
+    let mut i = n.saturating_sub(2);
+    loop {
+        if start.elapsed() >= budget {
+            break;
+        }
+        // Skip if current[i] is itself a violation — then the trace
+        // could be truncated at i, which is strictly the prefix-loop's
+        // job and not suffix shortening.  Phase A's truncation pass
+        // already handled that case before we got here.
+        if model.check_invariants(&current[i]).is_err() {
+            if i == 0 {
+                break;
+            }
+            i -= 1;
+            continue;
+        }
+        let max_useful_depth = best_len.saturating_sub(i + 2); // d such that (i+1)+d < best_len
+        if max_useful_depth == 0 {
+            if i == 0 {
+                break;
+            }
+            i -= 1;
+            continue;
+        }
+
+        if let Some(suffix) = bfs_to_violation(model, &current[i], max_useful_depth, start, budget)
+        {
+            let new_len = (i + 1) + suffix.len();
+            if new_len < best_len {
+                let mut spliced: Vec<M::State> = Vec::with_capacity(new_len);
+                spliced.extend(current.iter().take(i + 1).cloned());
+                spliced.extend(suffix.into_iter());
+                best = Some(spliced);
+                let _ = new_len; // value carried into the spliced trace; loop breaks below
+                // Greedy: take the first win.  Re-running the minimizer
+                // would compose, but the caller only invokes us once.
+                break;
+            }
+        }
+        if i == 0 {
+            break;
+        }
+        i -= 1;
+    }
+
+    best
+}
+
+/// BFS forward from `start_state` looking for any state where the
+/// invariant fails.  Returns the suffix starting at the first successor
+/// of `start_state` (so it does NOT include `start_state` itself), with
+/// the violating state as its last element.  Bounded by `max_depth`
+/// (at most that many transitions) and by the wall budget.
+///
+/// Returns `None` if no violation is reachable within the depth cap or
+/// the budget expires during search.
+///
+/// Note: per-iteration node-expansion limit — we cap the number of
+/// pop operations at ~`max_depth.saturating_mul(64) + 1024` to avoid
+/// blowing the budget on pathologically branchy state spaces.  The
+/// outer wall-budget is the hard limit; this is just a soft per-call
+/// cap so long traces with many split points don't get starved.
+fn bfs_to_violation<M: Model>(
+    model: &M,
+    start_state: &M::State,
+    max_depth: usize,
+    start_time: Instant,
+    budget: Duration,
+) -> Option<Vec<M::State>> {
+    if max_depth == 0 {
+        return None;
+    }
+    let start_fp = model.fingerprint(start_state);
+    let mut visited: HashSet<u64> = HashSet::new();
+    visited.insert(start_fp);
+    // parent[fp] = (parent_fp, state_clone)
+    let mut parent: HashMap<u64, (Option<u64>, M::State)> = HashMap::new();
+    parent.insert(start_fp, (None, start_state.clone()));
+    let mut queue: VecDeque<(u64, usize)> = VecDeque::new();
+    queue.push_back((start_fp, 0));
+
+    let mut successors_buf: Vec<M::State> = Vec::new();
+    let pop_cap: usize = max_depth.saturating_mul(64).saturating_add(1024);
+    let mut pops: usize = 0;
+    while let Some((state_fp, depth)) = queue.pop_front() {
+        pops += 1;
+        if pops > pop_cap {
+            return None;
+        }
+        if start_time.elapsed() >= budget {
+            return None;
+        }
+        if depth >= max_depth {
+            continue;
+        }
+        // We need to clone the state out of the parent map to call
+        // next_states — small cost, and keeps the queue lightweight.
+        let state = parent
+            .get(&state_fp)
+            .expect("queue entries always have parent entry")
+            .1
+            .clone();
+        successors_buf.clear();
+        model.next_states(&state, &mut successors_buf);
+        for next in successors_buf.drain(..) {
+            let next_fp = model.fingerprint(&next);
+            if !visited.insert(next_fp) {
+                continue;
+            }
+            parent.insert(next_fp, (Some(state_fp), next.clone()));
+            // Hit condition: any successor that violates the invariant.
+            if model.check_invariants(&next).is_err() {
+                // Reconstruct suffix from `next_fp` back to (but not
+                // including) the start state.
+                let mut chain: Vec<M::State> = Vec::new();
+                let mut cur = Some(next_fp);
+                while let Some(fp) = cur {
+                    let (pfp, st) = parent.get(&fp).unwrap();
+                    if fp == start_fp {
+                        break;
+                    }
+                    chain.push(st.clone());
+                    cur = *pfp;
+                }
+                chain.reverse();
+                return Some(chain);
+            }
+            queue.push_back((next_fp, depth + 1));
+        }
+    }
+    None
 }
 
 // ============================================================================
@@ -1139,6 +1344,110 @@ mod tests {
             model.next_states(&pair[0], &mut buf);
             assert!(buf.contains(&pair[1]), "invalid transition in minimized");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // T9.3 — suffix shortening (alternate suffix to a different violation)
+    // ------------------------------------------------------------------
+
+    /// Two-violation model: states 0..=20.  Init = {0}.
+    /// Transitions: linear 0->1->2->...->20.  Plus a side branch:
+    /// 5 -> 100 (a violating "fast" state).  Invariant: state != 100
+    /// AND state != 20.
+    ///
+    /// A trace that goes 0,1,...,20 (length 21) ending at violation 20
+    /// can be replaced by 0,1,2,3,4,5,100 (length 7) — same prefix
+    /// 0..=5, then alternate suffix [100] of length 1.
+    struct TwoViolationModel;
+
+    #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+    struct TvState(i64);
+
+    impl Model for TwoViolationModel {
+        type State = TvState;
+        fn name(&self) -> &'static str {
+            "two-violation"
+        }
+        fn initial_states(&self) -> Vec<Self::State> {
+            vec![TvState(0)]
+        }
+        fn next_states(&self, state: &Self::State, out: &mut Vec<Self::State>) {
+            if state.0 < 20 {
+                out.push(TvState(state.0 + 1));
+            }
+            if state.0 == 5 {
+                out.push(TvState(100));
+            }
+        }
+        fn check_invariants(&self, state: &Self::State) -> Result<(), String> {
+            if state.0 == 100 || state.0 == 20 {
+                Err(format!("violated at {}", state.0))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn t93_suffix_shortening_picks_shorter_alternate_violation() {
+        let model = TwoViolationModel;
+        // Hand-built trace ending at violation 20 (the long path).
+        let trace: Vec<TvState> = (0..=20).map(TvState).collect();
+        let original_len = trace.len(); // 21
+        let result = minimize_trace(&model, trace, Duration::from_secs(5));
+        // First, the prefix BFS-shortcut step (Phase A) won't help
+        // because the trace IS already the BFS-shortest path to 20
+        // (no skip available to 20 directly).  But suffix shortening
+        // should find: 0,1,2,3,4,5,100 — length 7.
+        assert!(
+            result.trace.len() <= 7,
+            "suffix shortening should reduce 21 to <= 7, got {} ({:?})",
+            result.trace.len(),
+            result.trace.iter().map(|s| s.0).collect::<Vec<_>>()
+        );
+        assert_eq!(result.trace.first().unwrap().0, 0);
+        assert!(
+            model
+                .check_invariants(result.trace.last().unwrap())
+                .is_err(),
+            "minimized trace must still violate"
+        );
+        assert_eq!(result.original_len, original_len);
+        // Validate transitions.
+        let mut buf = Vec::new();
+        for pair in result.trace.windows(2) {
+            buf.clear();
+            model.next_states(&pair[0], &mut buf);
+            assert!(
+                buf.contains(&pair[1]),
+                "invalid transition {:?} -> {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        // Initial state preserved.
+        assert!(
+            model
+                .initial_states()
+                .contains(result.trace.first().unwrap()),
+            "minimized trace must start at an initial state"
+        );
+    }
+
+    #[test]
+    fn t93_suffix_shortening_no_op_when_no_alternate_exists() {
+        // Linear model with single violation — no alternate suffix
+        // possible.  Suffix shortening must be a no-op.
+        let model = LinearModel { n: 4 };
+        let trace = vec![
+            LinState(0),
+            LinState(1),
+            LinState(2),
+            LinState(3),
+            LinState(4),
+        ];
+        let result = minimize_trace(&model, trace.clone(), Duration::from_secs(5));
+        assert_eq!(result.trace, trace);
     }
 
     #[test]
