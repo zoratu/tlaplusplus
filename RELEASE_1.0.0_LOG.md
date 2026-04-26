@@ -576,3 +576,52 @@ constraint extractor. The pre-existing `BuchiChecker` API in
 
 **Commit:** `19a5abf`.
 
+---
+
+### T2 — Compiled-vs-interpreted proptest equivalence (Phase 1)
+
+**Status:** harness landed, CI workflow wired, end-to-end validated on spot. **3 distinct divergence classes uncovered** (parked as T2.1–T2.3 in the plan; not patched per agent rules).
+
+**Artifacts:**
+- `tests/compiled_vs_interpreted.rs` (612 lines) — proptest harness. Generators are tagged-typed (`Typed::{Int, Bool, SetInt, SeqInt, RecAB, Str}`) so composition stays well-typed-with-high-probability without burning cases on `prop_assume!` rejects. Coverage: int arithmetic (`+ - * \div %` and unary neg), bool connectives (`/\ \/ => <=> ~`), comparisons (`= # < > <= >=`), set ops (`\union \intersect \ \in \notin \subseteq` and `1..n` ranges), filter `{x \in S : P}` and map `{f(x) : x \in S}` set-builders, sequence ops (`Append Tail Head Len <<...>>`), record literals + `.field` access + nested `[r EXCEPT !.f = v]`, function application `f[i]`, `IF/THEN/ELSE`, `LET`, `CASE`, `\E`/`\A` over fixed `1..3`, and parameterised operator calls (`Inc(n)`, `Add2(a,b)`, `IsPos(n)`). Default depth 3.
+- The harness asserts the *equivalence* relation: both Ok(equal value) OR both Err. Both-error is treated as equal so divergent error texts on e.g. div-by-zero don't fail the harness.
+- 10 sanity tests (`sanity_*`) execute the equivalence checker on hand-written expressions covering each construct so a generator regression doesn't hide a basic break.
+- `.github/workflows/diff-tlc.yml` runs `cargo test --test compiled_vs_interpreted` with `PROPTEST_CASES=256` after the diff-TLC step. CI is deterministic at this case count; local devs can crank higher via env.
+
+**Commit:** `<TBD>` — `test: compiled-vs-interpreted proptest equivalence harness (T2)`.
+
+**End-to-end validation (spot instance `REDACTED-INSTANCE`, c8g.xlarge, us-west-2):**
+- `cargo build` ~36s (warm `target/`), test build trivial. The 10 `sanity_*` tests pass.
+- `cargo test --release --test compiled_vs_interpreted` with `PROPTEST_CASES=256`: proptest fails-fast on the first generated counter-example (this is the design — the parking policy says we *want* it to fail loudly when a divergence exists). Running with five different seeds (deleting `tests/compiled_vs_interpreted.proptest-regressions` between runs) consistently surfaces minimised counter-examples after 4–117 successes — i.e. the divergence rate is high enough that 256 cases reliably finds at least one.
+
+**Divergences uncovered (3 classes, all parked as T2.N follow-ups):**
+
+1. **T2.1 — compiler parser fails on nested `[r EXCEPT !.f = v]`**, e.g.
+   - Expr: `[[r EXCEPT !.a = 0] EXCEPT !.b = 0]`
+   - Interpreter: `Ok(Record({"a": 0, "b": 0}))`
+   - Compiler: `Err(missing closing ']' in expression: [r)`
+   - Variants seen on multiple seeds (`!.a = 0` on outer, `!.b = Inc(0)`, etc.). Highest-prevalence class.
+   - Suspected location: `compile_expr` `[`-aware tokeniser in `src/tla/compiled_expr.rs`. Bracket-depth tracking appears to not handle a `[... EXCEPT ...]` LHS inside an outer `[...]`.
+
+2. **T2.2 — compiler parser fails on EXCEPT inside a record-literal field value**, e.g.
+   - Expr: `[a |-> 0, b |-> ([r EXCEPT !.a = 0]).a]`
+   - Interpreter: `Ok(Record({"a": 0, "b": 0}))`
+   - Compiler: `Err(unexpected trailing tokens in expr: a |)`
+   - Suspected location: same `[`-handling in `src/tla/compiled_expr.rs` as T2.1; possibly the same root cause manifesting differently because the outer context is a record literal with `|->` separators.
+
+3. **T2.3 — interpreter type-errors on `<range> \subseteq <set>` and `\intersect`**, e.g.
+   - Expr: `(1..3 \subseteq {0, 0})`
+   - Interpreter: `Err(expected Set, got Int(3))` (treats `1..3` as `Int(3)` — the range is not being constructed)
+   - Compiler: `Ok(Bool(false))` (correct)
+   - Also surfaces nested in filter-set bodies: `({__e \in 1..4 : ((1..3 \subseteq S)) \/ (__e > 0)} \intersect {0, 0})` — same root cause.
+   - This is the *opposite* polarity from T2.1/T2.2: here the *interpreter* is wrong and the compiler is right.
+   - Suspected location: `eval_expr` operator-precedence handling for `..` versus set operators (`\subseteq`, `\intersect`), in `src/tla/eval.rs`. `..` is binding looser than the set operator when paren-wrapped, so `1..3 \subseteq X` is being parsed as `1 .. (3 \subseteq X)` and then `3 \subseteq X` fails as int-vs-set.
+
+**Test counts after T2 lands:**
+- `cargo test --release -- --skip compiled_matches_interpreted` on spot: **621 tests pass** (480 lib + 90 bin + 15+11+10+2+5+6+2 across `tests/`, 1+2 ignored, 1 filtered, 0 failed). Net +10 from the new sanity tests in `tests/compiled_vs_interpreted.rs` (was 611 after T1.3).
+- `cargo test --release --test compiled_vs_interpreted` (with proptest enabled): **fails by design** until T2.1–T2.3 are fixed. The CI workflow runs this and will go red — that's intentional, this is a regression gate. Once T2.1–T2.3 are addressed individually the gate will go green and stay green.
+
+**Wider scope:** None — harness changes are confined to a new test file + workflow integration + `Cargo.lock` (one `tempfile` entry, already declared in `Cargo.toml [dev-dependencies]`). No production code changed.
+
+**Recommended next step:** triage T2.1 first (highest prevalence; nested EXCEPT is a real-world pattern in many specs) before proceeding to T3.
+

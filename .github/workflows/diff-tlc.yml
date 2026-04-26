@@ -62,6 +62,14 @@ jobs:
           DIFF_TIMEOUT_SECS: "120"
         run: ./scripts/diff_tlc.sh
 
+      # T2 — proptest equivalence between the interpreted and compiled
+      # TLA+ expression evaluators. Pinned to PROPTEST_CASES=256 so CI is
+      # deterministic and finishes quickly; local devs can crank higher.
+      - name: Run compiled-vs-interpreted proptest equivalence (T2)
+        env:
+          PROPTEST_CASES: "256"
+        run: cargo test --test compiled_vs_interpreted
+
       - name: Upload diff harness logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
