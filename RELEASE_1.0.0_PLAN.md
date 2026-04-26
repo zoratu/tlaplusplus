@@ -107,9 +107,9 @@ These come first because every later change needs a regression gate.
 
 ### Follow-ups (T13 deferred to v1.1.0+)
 
-- [ ] **T13.4. Production-code Verus annotations.** Annotate `FingerprintShard` with `Tracked<PointsTo<HashTableEntry>>` and thread the permissions through `contains`, `contains_or_insert`, `rehash_batch_counted`, `finalize_resize`. Estimated 1-2 agent-weeks of careful Rust + Verus work. Prerequisite: tier A spec-level CAS soundness (T13.2 above) — done.
-- [ ] **T13.5. Unbounded-fairness reader liveness.** Re-cast the proof from step relations into Verus's `state_machines!` macro and discharge "writer cannot starve reader" with a temporal fairness assumption. Research-grade.
-- [ ] **T13.6. CI gate.** Once Verus is `cargo`-driven and ships an aarch64 Linux Z3, wire `verification/verus/run_proof.sh tier-a` into `.github/workflows/`. Currently the proof requires Verus from source (~10 min build) plus aarch64 Z3 apt workaround, neither of which is CI-friendly out of the box.
+- [ ] **T13.4. DEFER TO 1.1.0.** Production-code Verus annotations. Annotate `FingerprintShard` with `Tracked<PointsTo<HashTableEntry>>` and thread the permissions through `contains`, `contains_or_insert`, `rehash_batch_counted`, `finalize_resize`. Estimated 1-2 agent-weeks of careful Rust + Verus work. Prerequisite: tier A spec-level CAS soundness (T13.2 above) — done.
+- [ ] **T13.5. DEFER TO 1.1.0.** Unbounded-fairness reader liveness. Re-cast the proof from step relations into Verus's `state_machines!` macro and discharge "writer cannot starve reader" with a temporal fairness assumption. Research-grade.
+- [ ] **T13.6. DEFER TO 1.1.0.** CI gate. Once Verus is `cargo`-driven and ships an aarch64 Linux Z3, wire `verification/verus/run_proof.sh tier-a` into `.github/workflows/`. Currently the proof requires Verus from source (~10 min build) plus aarch64 Z3 apt workaround, neither of which is CI-friendly out of the box.
 
 ## Phase 5 — Release
 
