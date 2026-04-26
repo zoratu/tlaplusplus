@@ -276,3 +276,96 @@ handles inner disjunctions correctly per conjunct.
 inner `\/`. Once that lands, ViewTest's 106-distinct count should fall out
 automatically and the diff harness can re-include it.
 
+### T1.5 — SOUNDNESS fix: Next splitter sliced `/\ guard /\ \/A \/B /\ shared` on the inner `\/`
+
+**Date:** 2026-04-26.
+
+**Symptom:** `corpus/language/ViewTest.tla` reported 121 distinct states under
+tlaplusplus vs TLC's 106. The Next body has the canonical "guarded branches
+with a shared post-step update" shape:
+
+```
+Next ==
+    /\ x + y < 15
+    /\ \/ /\ x < 10 /\ x' = x + 1 /\ y' = y
+       \/ /\ y < 10 /\ y' = y + 1 /\ x' = x
+    /\ timestamp' = timestamp + 1
+```
+
+The outer connective is `/\` and the inner disjunction has two branches; the
+correct semantics is "exactly two successors per state, each carrying both
+the outer guard and the shared `timestamp' = timestamp + 1` post-condition."
+Pre-fix, tlaplusplus produced THREE bogus "branches" (a stutter, a branch
+missing `timestamp' = timestamp + 1`, and a branch with it), inflating the
+state graph and masking VIEW projection collapsing.
+
+**Root cause (3 collaborating bugs):**
+
+1. `src/tla/action_ir.rs:141 split_action_body_disjuncts` — when
+   `split_indented_action_disjuncts` returned `None` (no line *starts* with
+   `\/` after dedent because every meaningful line starts with `/\`), the code
+   fell through to `split_top_level(trimmed, "\\/")`, which greedily slices
+   on every top-level `\/` regardless of whether it sits inside a top-level
+   conjunction. **Fix:** before falling through, call
+   `split_action_body_clauses(trimmed)`; if it returns ≥ 2 conjuncts, the
+   outer connective is `/\` (not `\/`) and we return `vec![trimmed]` — the
+   whole body is one action with a nested disjunction. Downstream IR
+   compilation expands the nested disjunction with the shared clauses
+   correctly.
+
+2. `src/tla/action_exec.rs::normalize_branch_expr` — was stripping ALL
+   leading `/\` in a loop. For a list-style conjunction
+   `/\ guard /\ \/ A \/ B /\ shared`, this made the first conjunct lose its
+   delimiter while later conjuncts kept theirs, so `split_top_level("/\\")`
+   in the inline-action body path silently produced a corrupt clause split.
+   **Fix:** only strip the leading `/\` if the body has no further top-level
+   `/\` conjunct (i.e. the body is shaped `/\ X` with a single conjunct).
+   Added `has_top_level_conjunct` helper that scans byte-by-byte respecting
+   bracket / paren / brace / angle / string nesting.
+
+3. `src/tla/compiled_eval.rs::eval_compiled_clause_to_branch` Guard arm —
+   when `compile_action_ir` produces a flat IR for `/\ guard /\ DISJ /\ shared`,
+   the disjunctive sub-clause `\/ /\ x' = ... \/ /\ y' = ...` is wrapped as
+   a single `Guard { expr, text }` clause. `eval_compiled_guard` evaluated
+   `text` as a *boolean* (true because at least one disjunct was satisfied
+   in the current state) and then returned the existing branch unchanged —
+   silently discarding the inner primed assignments. **Fix:** added
+   `guard_text_is_action_body` heuristic — when the guard text is a top-level
+   `\/` containing primed identifiers (`X'`) or `UNCHANGED`, dispatch through
+   `crate::tla::eval::eval_action_body_multi` (the interpreted action
+   evaluator) instead of the boolean guard, then merge the resulting branches
+   back into the compiled-IR branch state.
+
+**Why all 3 changes were needed:** fix (1) alone caused ViewTest to spin
+forever at 1 distinct state because the inline action body path then
+compiled the body via the broken `normalize_branch_expr`, which yielded a
+mangled clause split that the compiled IR evaluated as a stutter. Fix (2)
+plus (1) made the interpreted IR see the correct conjunctive structure but
+the compiled-IR fast path still took the boolean-guard route on the
+disjunctive sub-clause and produced a stutter successor. Fix (3) closes the
+loop so the compiled-IR fast path produces the same successors as the
+interpreted IR.
+
+**Files changed:**
+- `src/tla/action_ir.rs:141` `split_action_body_disjuncts` (early-return
+  when body is a top-level conjunction).
+- `src/tla/action_exec.rs:845` `normalize_branch_expr` + new
+  `has_top_level_conjunct` helper.
+- `src/tla/compiled_eval.rs:2039` Guard arm + new
+  `guard_text_is_action_body` helper at line ~2168.
+
+**Regression tests added:**
+- Unit: `src/tla/action_ir.rs::split_action_body_disjuncts_does_not_split_nested_disjunction_inside_outer_conjunction` — asserts the splitter returns 1 disjunct for the canonical body and that `compile_action_ir_branches` expands it into 2 branches each carrying outer guard + shared post.
+- Unit (end-to-end): `src/tla/action_exec.rs::evaluates_conjunctive_next_with_inner_disjunction_and_shared_post` — calls `evaluate_next_states` and asserts exactly 2 successors with `timestamp' = 1` in both.
+- Integration: `tests/next_splitter_t1_5.rs` — minimal 15-line spec exercising the pattern, plus a multi-step test confirming `timestamp' = timestamp + 1` persists across 5 successor steps.
+
+**Validation:**
+- `./target/release/tlaplusplus run-tla --module corpus/language/ViewTest.tla --config corpus/language/ViewTest.cfg --workers 2` → **191 generated, 106 distinct, 0 violation** (matches TLC exactly, was 121 before).
+- `cargo test --release` → **603 tests passing, 0 failing** (476 lib + 90 bin + 15 + 11 + 5 + 6 across tests/, 2 ignored). New unit + integration tests both green.
+- `scripts/diff_tlc.sh` → **12/12 PASS, 0 fail, 0 allowlisted** (ViewTest now in active list, 106 vs 106).
+- Sample corpus parity (29 of 32 internal corpus specs run to completion under 30s timeout each, the other 3 are expected-large `Combined`, `BloomAutoSwitch`, `FingerprintResize`): **all 29 produce identical distinct counts to baseline, 0 panics, 0 errors**. Notably WorkQueue=15003, CheckpointDrain=26344, NegativeIntTest=10360, EnabledTest=121, LivenessTest=157 all match prior runs.
+
+**Wider scope discovered:** None — the fix is narrowly contained. T1.2 (VIEW projection) was a misdiagnosis whose symptom was actually T1.5; this fix closes both. The `compile_action_ir_branches` path was already correct (it's used by analyze-tla); only the runtime `evaluate_next_states` path needed the three-part fix above.
+
+**Commit:** _to be filled in after `git commit`_.
+

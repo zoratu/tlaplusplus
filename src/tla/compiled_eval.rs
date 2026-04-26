@@ -2052,6 +2052,34 @@ fn eval_compiled_clause_to_branch<'a>(
             if let Some(branches) = try_eval_compiled_guard_as_action(text, &branch)? {
                 return Ok(branches);
             }
+            // T1.5 soundness fix: a "guard" whose text is itself an action body
+            // (e.g. a top-level disjunction containing primed assignments, as
+            // produced by `compile_action_ir` when a top-level conjunct is
+            // `\/ /\ x' = ... \/ /\ y' = ...`) must NOT be evaluated as a
+            // boolean — that would silently discard the inner primed
+            // assignments and report a stutter as a "successful" transition.
+            // Route through the interpreted action evaluator so each inner
+            // disjunct stages its primes and produces a real successor branch.
+            if guard_text_is_action_body(text) {
+                let interpreted_branches =
+                    crate::tla::eval::eval_action_body_multi(text, &branch.ctx, &branch.staged)?;
+                let outer_ctx = branch.ctx.clone();
+                let mut out = Vec::with_capacity(interpreted_branches.len());
+                for (staged, unchanged_vars) in interpreted_branches {
+                    let mut merged_unchanged = branch.unchanged_vars.clone();
+                    for var in unchanged_vars {
+                        if !merged_unchanged.contains(&var) {
+                            merged_unchanged.push(var);
+                        }
+                    }
+                    out.push(CompiledActionBranch {
+                        ctx: outer_ctx.clone(),
+                        staged,
+                        unchanged_vars: merged_unchanged,
+                    });
+                }
+                return Ok(out);
+            }
             if eval_compiled_guard(expr, &eval_ctx)? {
                 Ok(vec![branch])
             } else {
@@ -2163,6 +2191,70 @@ fn eval_compiled_clause_to_branch<'a>(
             )
         }
     }
+}
+
+/// Heuristic: detect when a compiled `Guard`'s text is actually an action body
+/// rather than a pure boolean. Specifically, when the text is a top-level
+/// disjunction (or conjunction-of-disjunctions, normalised to start with `\/`
+/// after dedent) whose branches contain primed assignments or `UNCHANGED`,
+/// `compile_action_ir` will have wrapped the whole thing as a single Guard
+/// clause — but the correct semantics is to expand each disjunct as a
+/// successor-producing branch. Returns true when the text needs the
+/// interpreted action-body evaluator instead of the boolean guard evaluator.
+fn guard_text_is_action_body(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    if !trimmed.starts_with("\\/") {
+        return false;
+    }
+    // Quick scan for a primed identifier (`X'`) or an UNCHANGED clause that
+    // appears outside double-quoted strings. Both indicate an action body.
+    let bytes = trimmed.as_bytes();
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let ch = bytes[i];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == b'\\' {
+                escaped = true;
+            } else if ch == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if ch == b'"' {
+            in_string = true;
+            i += 1;
+            continue;
+        }
+        // Detect `IDENT'` (a primed identifier). The apostrophe must follow an
+        // identifier character to avoid matching string contents or set
+        // displays (already filtered by the `in_string` check above).
+        if ch == b'\'' && i > 0 {
+            let prev = bytes[i - 1];
+            if prev.is_ascii_alphanumeric() || prev == b'_' {
+                return true;
+            }
+        }
+        if ch == b'U'
+            && trimmed[i..].starts_with("UNCHANGED")
+            && (i == 0 || !is_ident_byte(bytes[i - 1]))
+        {
+            let after = i + "UNCHANGED".len();
+            if after >= bytes.len() || !is_ident_byte(bytes[after]) {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 /// Detect when a compiled `Guard` is actually an action call to a

@@ -815,10 +815,80 @@ fn strip_outer_parens(expr: &str) -> &str {
 
 fn normalize_branch_expr(expr: &str) -> &str {
     let mut current = expr.trim();
+    // T1.5 soundness: only strip a leading `/\` if it is the *only* top-level
+    // conjunct (i.e. the body has the shape `/\ X` where X has no further
+    // top-level `/\` lines). When the body is a list-style conjunction such as
+    //   /\ guard
+    //   /\ \/ A \/ B
+    //   /\ shared
+    // stripping just the first `/\` corrupts subsequent splitting because the
+    // first conjunct loses its delimiter while later ones keep theirs.
     while let Some(rest) = current.strip_prefix("/\\") {
-        current = rest.trim_start();
+        let candidate = rest.trim_start();
+        if has_top_level_conjunct(candidate) {
+            return current;
+        }
+        current = candidate;
     }
     current
+}
+
+/// True when `expr` contains a `/\` at top-level (not inside parens, brackets,
+/// braces, angle-brackets, or strings) — i.e. when it is itself part of a
+/// list-style conjunction that the caller still needs to split on.
+fn has_top_level_conjunct(expr: &str) -> bool {
+    let bytes = expr.as_bytes();
+    let mut paren = 0i32;
+    let mut bracket = 0i32;
+    let mut brace = 0i32;
+    let mut angle = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let ch = bytes[i];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == b'\\' {
+                escaped = true;
+            } else if ch == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if ch == b'"' {
+            in_string = true;
+            i += 1;
+            continue;
+        }
+        match ch {
+            b'(' => paren += 1,
+            b')' => paren = (paren - 1).max(0),
+            b'[' => bracket += 1,
+            b']' => bracket = (bracket - 1).max(0),
+            b'{' => brace += 1,
+            b'}' => brace = (brace - 1).max(0),
+            b'<' if bytes.get(i + 1) == Some(&b'<') => {
+                angle += 1;
+                i += 2;
+                continue;
+            }
+            b'>' if bytes.get(i + 1) == Some(&b'>') => {
+                angle = (angle - 1).max(0);
+                i += 2;
+                continue;
+            }
+            _ => {}
+        }
+        let at_top = paren == 0 && bracket == 0 && brace == 0 && angle == 0;
+        if at_top && ch == b'/' && bytes.get(i + 1) == Some(&b'\\') {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Check if expression contains a top-level disjunction (\\/)
@@ -2749,6 +2819,91 @@ SPECIFICATION
             x_values,
             vec![1, 2, 3],
             "expected x' values 1, 2, 3 (one per binding)"
+        );
+    }
+
+    #[test]
+    fn evaluates_conjunctive_next_with_inner_disjunction_and_shared_post() {
+        // T1.5 soundness regression: a Next of the shape
+        //   /\ guard
+        //   /\ \/ A \/ B
+        //   /\ shared_post
+        // must produce exactly the successors of A and B, each with the outer
+        // guard enforced and the shared_post applied. The previous splitter
+        // bug both fabricated a stutter "successor" and dropped `shared_post`
+        // from one branch — yielding 3 disjuncts instead of 1 conjunctive
+        // action with 2 inner disjuncts.
+        let defs = BTreeMap::from([(
+            "Next".to_string(),
+            TlaDefinition {
+                name: "Next".to_string(),
+                params: vec![],
+                body: r#"
+                    /\ x + y < 15
+                    /\ \/ /\ x < 10
+                          /\ x' = x + 1
+                          /\ y' = y
+                       \/ /\ y < 10
+                          /\ y' = y + 1
+                          /\ x' = x
+                    /\ timestamp' = timestamp + 1
+                "#
+                .to_string(),
+                is_recursive: false,
+            },
+        )]);
+
+        let state = tla_state([
+            ("x", TlaValue::Int(0)),
+            ("y", TlaValue::Int(0)),
+            ("timestamp", TlaValue::Int(0)),
+        ]);
+
+        let next_body = &defs.get("Next").expect("Next defined").body;
+        let result = evaluate_next_states(next_body, &defs, &state)
+            .expect("conjunctive next with inner disjunction must evaluate");
+
+        assert_eq!(
+            result.len(),
+            2,
+            "expected exactly 2 successors (inner disjunction has 2 branches), \
+             got {}: {result:#?}",
+            result.len()
+        );
+
+        // Every successor must carry the shared post-condition: timestamp' = 1.
+        for st in &result {
+            let ts = st
+                .get("timestamp")
+                .and_then(|v| v.as_int().ok())
+                .expect("timestamp must be assigned in every successor");
+            assert_eq!(
+                ts, 1,
+                "shared post-condition `timestamp' = timestamp + 1` was dropped \
+                 from a successor: {st:?}"
+            );
+        }
+
+        // The two successors should differ in which axis advanced (x or y).
+        let mut xs: Vec<i64> = result
+            .iter()
+            .map(|s| s.get("x").and_then(|v| v.as_int().ok()).unwrap_or(-99))
+            .collect();
+        xs.sort();
+        let mut ys: Vec<i64> = result
+            .iter()
+            .map(|s| s.get("y").and_then(|v| v.as_int().ok()).unwrap_or(-99))
+            .collect();
+        ys.sort();
+        assert_eq!(
+            xs,
+            vec![0, 1],
+            "expected x' values [0, 1] (one branch advances x), got {xs:?}"
+        );
+        assert_eq!(
+            ys,
+            vec![0, 1],
+            "expected y' values [0, 1] (one branch advances y), got {ys:?}"
         );
     }
 }

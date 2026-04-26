@@ -186,6 +186,23 @@ pub fn split_action_body_disjuncts(expr: &str) -> Vec<String> {
         }
     }
 
+    // SOUNDNESS: If the body parses as a top-level conjunction (e.g.
+    //   /\ guard
+    //   /\ \/ A
+    //      \/ B
+    //   /\ shared_post
+    // ), the outer connective is `/\`, NOT `\/`. Splitting on `\/` here would
+    // (a) fabricate spurious successors that drop the surrounding guards and
+    // shared post-conditions, and (b) mangle the structure with a stutter
+    // half-clause from the first `/\`. The whole body is one action — return
+    // it as a single disjunct and let downstream IR compilation
+    // (`compile_action_ir_branches` / `apply_compiled_action_ir_multi`) expand
+    // the nested disjunction with the shared clauses correctly.
+    let conjunctive_clauses = split_action_body_clauses(trimmed);
+    if conjunctive_clauses.len() > 1 {
+        return vec![trimmed.to_string()];
+    }
+
     split_top_level(trimmed, "\\/")
         .into_iter()
         .filter_map(|part| {
@@ -1413,6 +1430,101 @@ mod tests {
         assert!(disjuncts[0].starts_with("grid' = [p \\in Pos |-> IF"));
         assert!(disjuncts[0].contains(r#"(~grid[p] /\ score(p) = 3)"#));
         assert!(disjuncts[0].ends_with("ELSE FALSE]"));
+    }
+
+    #[test]
+    fn split_action_body_disjuncts_does_not_split_nested_disjunction_inside_outer_conjunction() {
+        // Regression for T1.5 soundness bug. The body is a top-level conjunction
+        //   /\ guard
+        //   /\ \/ A
+        //      \/ B
+        //   /\ shared_post
+        // where the inner `\/` is NOT the outer connective. Splitting on `\/` here
+        // would (a) fabricate a stutter half-clause (`/\` with no body), (b) drop the
+        // surrounding `guard` from one branch, and (c) drop the `shared_post`
+        // from another. The whole body must be returned as ONE disjunct so
+        // downstream IR compilation can expand the nested disjunction with the
+        // shared clauses correctly applied.
+        let body = r#"
+            /\ x + y < 15
+            /\ \/ /\ x < 10
+                  /\ x' = x + 1
+                  /\ y' = y
+               \/ /\ y < 10
+                  /\ y' = y + 1
+                  /\ x' = x
+            /\ timestamp' = timestamp + 1
+        "#;
+
+        let disjuncts = split_action_body_disjuncts(body);
+        assert_eq!(
+            disjuncts.len(),
+            1,
+            "expected exactly one disjunct (the whole conjunctive action), \
+             got {} disjuncts: {disjuncts:#?}",
+            disjuncts.len()
+        );
+
+        let only = &disjuncts[0];
+        assert!(
+            only.contains("x + y < 15"),
+            "the outer guard must be preserved in the single disjunct: {only}"
+        );
+        assert!(
+            only.contains("timestamp' = timestamp + 1"),
+            "the shared post-condition must be preserved in the single disjunct: {only}"
+        );
+        assert!(
+            only.contains("x' = x + 1"),
+            "the first inner disjunct's primed assignment must be preserved: {only}"
+        );
+        assert!(
+            only.contains("y' = y + 1"),
+            "the second inner disjunct's primed assignment must be preserved: {only}"
+        );
+        assert!(
+            !only.trim().is_empty(),
+            "the single disjunct must not collapse to empty: {only:?}"
+        );
+
+        // And via the IR pipeline, this body should expand into exactly two
+        // branches (one per inner disjunct), each carrying both the outer guard
+        // and the shared post-condition.
+        let def = TlaDefinition {
+            name: "Next".to_string(),
+            params: vec![],
+            body: body.to_string(),
+            is_recursive: false,
+        };
+        let branches = compile_action_ir_branches(&def);
+        assert_eq!(
+            branches.len(),
+            2,
+            "expected two compiled branches from inner disjunction, got {}: {branches:#?}",
+            branches.len()
+        );
+        for branch in &branches {
+            let exprs: Vec<String> = branch
+                .clauses
+                .iter()
+                .map(|clause| match clause {
+                    ActionClause::Guard { expr }
+                    | ActionClause::PrimedAssignment { expr, .. }
+                    | ActionClause::PrimedMembership { set_expr: expr, .. }
+                    | ActionClause::LetWithPrimes { expr } => expr.clone(),
+                    ActionClause::Exists { body, .. } => body.clone(),
+                    ActionClause::Unchanged { vars } => vars.join(","),
+                })
+                .collect();
+            assert!(
+                exprs.iter().any(|e| e.contains("x + y < 15")),
+                "every branch must carry the outer guard: {exprs:?}"
+            );
+            assert!(
+                exprs.iter().any(|e| e.contains("timestamp + 1")),
+                "every branch must carry the shared post-condition: {exprs:?}"
+            );
+        }
     }
 
     #[test]

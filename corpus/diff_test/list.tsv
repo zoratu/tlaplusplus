@@ -28,6 +28,7 @@ multiple_extends	corpus/language/MultipleExtendsTest.tla	corpus/language/Multipl
 checkpoint_drain	corpus/internals/CheckpointDrain.tla	corpus/internals/CheckpointDrain.cfg	no	larger internal model; ~26K distinct states; ~3s under TLC
 queue_segment_sync_fixed	corpus/internals/QueueSegmentSync.tla	corpus/internals/QueueSegmentSync_Fixed.cfg	no	regression for T1.1 soundness fix; 1531 distinct states; \E segId \in S : Action(segId) inside disjunctive Next
 queue_segment_sync_buggy	corpus/internals/QueueSegmentSync.tla	corpus/internals/QueueSegmentSync_Buggy.cfg	yes	regression for T1.1 soundness fix; expected SegmentsRecoverable violation must be caught
+view_test	corpus/language/ViewTest.tla	corpus/language/ViewTest.cfg	no	regression for T1.5 splitter soundness fix; 106 distinct under VIEW <<x, y>>; pre-fix counted 121 due to spurious successor that dropped `timestamp' = timestamp + 1`
 
 # --------------------------------------------------------------------
 # KNOWN DIVERGENT SPECS (not gated; tracked for fix in follow-up work)
@@ -36,9 +37,8 @@ queue_segment_sync_buggy	corpus/internals/QueueSegmentSync.tla	corpus/internals/
 # entry 2026-04-25). They are intentionally excluded so the CI gate stays
 # meaningful. Re-add them once the underlying bug is fixed.
 #
-# corpus/language/ViewTest.tla / .cfg — VIEW projection not respected by
-#   fingerprinting; tlaplusplus reports 121 distinct, TLC 106. Investigate
-#   src/models/tla_native.rs:resolve_view and runtime fingerprint hashing.
+# (ViewTest.tla was promoted to the active list above on 2026-04-25 after the
+# T1.5 splitter fix; it now reports 106 distinct states matching TLC.)
 #
 # corpus/internals/WorkQueue.tla / .cfg — distinct state count matches
 #   (15003), but tlaplusplus's fairness checker reports an SCC fairness
