@@ -219,6 +219,12 @@ fn eval_compiled_inner(
             let rhs = eval_compiled_inner(b, ctx, depth + 1)?.as_bool()?;
             Ok(TlaValue::Bool(rhs))
         }
+        CompiledExpr::Iff(a, b) => {
+            // Logical equivalence: TRUE iff both sides agree.
+            let lhs = eval_compiled_inner(a, ctx, depth + 1)?.as_bool()?;
+            let rhs = eval_compiled_inner(b, ctx, depth + 1)?.as_bool()?;
+            Ok(TlaValue::Bool(lhs == rhs))
+        }
 
         // Comparison operators
         CompiledExpr::Eq(a, b) => {
@@ -2381,6 +2387,50 @@ mod tests {
         static EMPTY_STATE: std::sync::OnceLock<TlaState> = std::sync::OnceLock::new();
         let state = EMPTY_STATE.get_or_init(TlaState::new);
         EvalContext::new(state)
+    }
+
+    /// T1.6 regression: compiled-IR evaluator must handle `<=>` (Iff) and the
+    /// compiler must not let the `=>` arm swallow the `=>` inside `<=>`. The
+    /// FingerprintStoreResize spec's `SeqlockConsistent` invariant is exactly
+    /// `(seqlock % 2 = 1) <=> resizing` and previously raised
+    /// `expected Int, got Bool(false)` at runtime.
+    #[test]
+    fn test_eval_iff_t1_6() {
+        let state = tla_state([
+            ("seqlock", TlaValue::Int(0)),
+            ("resizing", TlaValue::Bool(false)),
+        ]);
+        let ctx = EvalContext::new(&state);
+
+        assert_eq!(
+            eval_compiled(&compile_expr("(seqlock % 2 = 1) <=> resizing"), &ctx)
+                .expect("compiled <=> must evaluate without type-error"),
+            TlaValue::Bool(true)
+        );
+
+        let ctx_empty = empty_ctx();
+        for (expr, want) in [
+            ("TRUE <=> TRUE", true),
+            ("TRUE <=> FALSE", false),
+            ("FALSE <=> TRUE", false),
+            ("FALSE <=> FALSE", true),
+        ] {
+            assert_eq!(
+                eval_compiled(&compile_expr(expr), &ctx_empty).unwrap(),
+                TlaValue::Bool(want),
+                "compiled `{expr}` should be {want}"
+            );
+        }
+
+        // `=>` (without `<`) must keep working as Implies.
+        assert_eq!(
+            eval_compiled(&compile_expr("FALSE => TRUE"), &ctx_empty).unwrap(),
+            TlaValue::Bool(true)
+        );
+        assert_eq!(
+            eval_compiled(&compile_expr("TRUE => FALSE"), &ctx_empty).unwrap(),
+            TlaValue::Bool(false)
+        );
     }
 
     #[test]
