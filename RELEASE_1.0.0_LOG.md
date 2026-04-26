@@ -31,7 +31,9 @@ Chronological log of work toward 1.0.0. Each entry: date, task ID, agent, outcom
   binary, caches cargo, uploads `.diff-tlc-out/` logs on failure. Uses
   `actions/setup-java@v4` (temurin 17) and `dtolnay/rust-toolchain@stable`.
 
-**End-to-end validation (commit pending):**
+**Commit:** `c91de88` — `test: differential testing harness vs TLC as CI gate (T1)`
+
+**End-to-end validation:**
 - Provisioned `c8g.xlarge` spot instance via `REDACTED l 72` (4 vCPU, 8GB,
   us-west-2). Tailscale hostname `REDACTED-INSTANCE`. Installed Rust stable
   (1.95) + JDK 17. Synced repo, ran `cargo build --bin tlaplusplus` (~5 min),
