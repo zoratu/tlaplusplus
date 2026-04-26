@@ -650,5 +650,5 @@ constraint extractor. The pre-existing `BuchiChecker` API in
 - `cargo test --release --test compiled_vs_interpreted` (proptest enabled, `PROPTEST_CASES=128`, 10 distinct `PROPTEST_RNG_SEED` values): **3/10 seeds pass entirely; 7/10 fail-fast on T2.3** (`(IF (1..3 \subseteq S) ...)`-shaped expressions, `[a |-> ..., b |-> CASE (1..3 \subseteq S) ...]`, `\A __q : ... (1..3 \subseteq S) ...`). **0 seeds fail on EXCEPT or arithmetic shapes.** Confirms the harness now fails *only* on T2.3 as required.
 - `scripts/diff_tlc.sh` on spot: **13/13 pass**, 0 divergences, 0 allowlist hits.
 
-**Commit:** `<TBD>` — `fix: top-level EXCEPT and unary-minus disambiguation in compiled-expr parser (T2.1 + T2.2)`.
+**Commit:** `73c2967` — `fix: top-level EXCEPT and unary-minus disambiguation in compiled-expr parser (T2.1 + T2.2)`.
 
