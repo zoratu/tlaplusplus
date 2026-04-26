@@ -9,7 +9,8 @@ use crate::tla::{
     TemporalFormula, TlaConfig, TlaDefinition, TlaModule, TlaState, TlaValue, classify_clause,
     compile_action_ir, compile_expr, count_next_disjuncts, eval_action_body_multi,
     eval_action_constraint, eval_compiled, eval_expr, evaluate_next_states_labeled_with_instances,
-    evaluate_next_states_swarm, evaluate_next_states_with_instances, insert_compiled_action,
+    evaluate_next_states_per_disjunct, evaluate_next_states_swarm,
+    evaluate_next_states_with_instances, insert_compiled_action,
     looks_like_action, normalize_operator_ref_name, parse_tla_config, parse_tla_module_file,
     split_top_level,
 };
@@ -629,30 +630,31 @@ impl TlaModel {
             return;
         }
 
-        // Per-disjunct successor sets.
-        let mut per_disjunct: Vec<Vec<TlaState>> = Vec::with_capacity(n);
-        let mut enabled: Vec<bool> = Vec::with_capacity(n);
-        for idx in 0..n {
-            match evaluate_next_states_swarm(
-                &next_def.body,
-                &self.module.definitions,
-                instances,
-                state,
-                &[idx],
-            ) {
-                Ok(succs) => {
-                    enabled.push(!succs.is_empty());
-                    per_disjunct.push(succs);
-                }
-                Err(_) => {
-                    // Treat eval errors as "disabled" — same convention as
-                    // evaluate_next_states_with_instances when allow_deadlock.
-                    enabled.push(false);
-                    per_disjunct.push(Vec::new());
-                }
+        // T7.1: batched per-disjunct evaluation — split `next_body` once
+        // and evaluate every disjunct in a single pass.  The previous code
+        // called `evaluate_next_states_swarm(.., &[idx])` once per disjunct,
+        // re-splitting the body N times and paying N function-call frames
+        // worth of overhead.  On shared-state specs (Pipeline) where the
+        // stubborn set is the full enabled set, this overhead dominated
+        // and POR was net-slower than full enumeration.
+        let mut per_disjunct = evaluate_next_states_per_disjunct(
+            &next_def.body,
+            &self.module.definitions,
+            instances,
+            state,
+        );
+
+        // Defensive: if the splitter returned a different count than the
+        // POR analysis expected, fall back to firing every successor it
+        // produced (always correct, no reduction).
+        if per_disjunct.len() != n {
+            for succs in per_disjunct {
+                out.extend(succs);
             }
+            return;
         }
 
+        let enabled: Vec<bool> = per_disjunct.iter().map(|s| !s.is_empty()).collect();
         let stubborn = analysis.stubborn_set(&enabled);
         for idx in stubborn {
             // Idx is guaranteed in-bounds by stubborn_set's contract.
