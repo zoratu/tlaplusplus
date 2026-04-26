@@ -108,6 +108,15 @@ impl PorAnalysis {
     /// Returns the indices of disjuncts whose successors should be enqueued.
     /// On the empty input or when no disjunct is enabled, returns the empty
     /// vector (signalling "deadlock — nothing to fire").
+    ///
+    /// **Seed selection (T7.2)** — among enabled disjuncts we pick the one
+    /// whose dependency closure (restricted to enabled disjuncts) is
+    /// smallest.  Ties are broken by lowest index so the reduced graph
+    /// stays deterministic across runs.  This is strictly at least as good
+    /// as the lowest-index heuristic and on Pipeline-shaped specs (one
+    /// "central" action depending on every other) it avoids picking the
+    /// central action — which would otherwise drag the entire enabled set
+    /// into the stubborn set.
     pub fn stubborn_set(&self, enabled_per_disjunct: &[bool]) -> Vec<usize> {
         // Defensive bounds check.  If the runtime hands us a mismatched
         // length we fall back to firing everything that is enabled, which is
@@ -118,11 +127,47 @@ impl PorAnalysis {
                 .collect();
         }
 
-        // Pick a seed: the lowest-index enabled disjunct.  Lowest-index is a
-        // deterministic choice that keeps the reduced graph stable across
-        // runs.
-        let seed = enabled_per_disjunct.iter().position(|b| *b);
-        let Some(seed) = seed else {
+        // Pick a seed: the enabled disjunct whose dependency closure (over
+        // enabled disjuncts only) has minimum cardinality.  Computing the
+        // closure for every candidate is O(n^2) in the worst case, but `n`
+        // is the number of `Next` disjuncts which is typically <30 even on
+        // big specs — totally fine for a per-state computation that will
+        // save us much more on enqueue overhead.
+        //
+        // Fast path: if there is exactly one enabled disjunct, skip the
+        // closure search entirely.
+        let enabled_count = enabled_per_disjunct.iter().filter(|b| **b).count();
+        if enabled_count == 0 {
+            return Vec::new();
+        }
+        if enabled_count == 1 {
+            // The single enabled disjunct is the only stubborn-set element
+            // (its dep neighbours are all disabled and thus filtered out).
+            let only = enabled_per_disjunct
+                .iter()
+                .position(|b| *b)
+                .expect("enabled_count==1 contradiction");
+            return vec![only];
+        }
+
+        let mut best_seed: Option<usize> = None;
+        let mut best_size: usize = usize::MAX;
+        for seed in 0..enabled_per_disjunct.len() {
+            if !enabled_per_disjunct[seed] {
+                continue;
+            }
+            let size = self.closure_size_from(seed, enabled_per_disjunct, best_size);
+            if size < best_size {
+                best_size = size;
+                best_seed = Some(seed);
+                // A stubborn-set of size 1 is the global optimum — no
+                // further candidate can beat it, so stop early.
+                if best_size == 1 {
+                    break;
+                }
+            }
+        }
+        let Some(seed) = best_seed else {
             return Vec::new();
         };
 
@@ -144,6 +189,39 @@ impl PorAnalysis {
         let mut out: Vec<usize> = chosen.into_iter().collect();
         out.sort_unstable();
         out
+    }
+
+    /// Compute |closure(seed) ∩ enabled| with early termination if the
+    /// running size meets or exceeds `cutoff`.  Returns `cutoff` when the
+    /// candidate is provably no better than the current best.
+    fn closure_size_from(
+        &self,
+        seed: usize,
+        enabled: &[bool],
+        cutoff: usize,
+    ) -> usize {
+        // Bitset-style chosen tracking via a Vec<bool> (cheaper than
+        // BTreeSet for n ≤ ~64; still fine for n ≤ a few hundred).
+        let n = self.footprints.len();
+        let mut chosen = vec![false; n];
+        chosen[seed] = true;
+        let mut size = 1usize;
+        let mut frontier: Vec<usize> = Vec::with_capacity(8);
+        frontier.push(seed);
+        while let Some(idx) = frontier.pop() {
+            for &dep_idx in &self.dep[idx] {
+                if !enabled[dep_idx] || chosen[dep_idx] {
+                    continue;
+                }
+                chosen[dep_idx] = true;
+                size += 1;
+                if size >= cutoff {
+                    return size; // can't be the new best, bail out early
+                }
+                frontier.push(dep_idx);
+            }
+        }
+        size
     }
 
     /// Verbose human-readable dump for debugging / logging.
@@ -691,6 +769,65 @@ mod tests {
         // analysis went conservative the result is still correct.
         let fp = &analysis.footprints[0];
         assert!(fp.writes.contains("msgs"));
+    }
+
+    #[test]
+    fn smarter_seed_picks_smallest_dependency_cluster() {
+        // Five actions partitioned into two disconnected dep clusters:
+        //   Cluster X: A1, A2 share variable x  (writes/reads conflict)
+        //   Cluster Y: B1, B2, B3 share variable y
+        //
+        // Lowest-index seed = A1, closure = {A1, A2}, size 2.
+        // Smarter seed sees: A1->2, A2->2, B1->3, B2->3, B3->3.  Min is 2,
+        // tie → lowest index → A1, stubborn = {A1, A2}.
+        // To make smarter seed strictly win we add a singleton cluster Z
+        // (one action whose only dep is itself) and put it AFTER A1 so the
+        // lowest-index heuristic ignores it.
+        let module = module_with_vars(
+            &["x", "y", "z"],
+            &[
+                ("A1", &[], "x' = x + 1 /\\ UNCHANGED <<y, z>>"),
+                ("A2", &[], "x' = x - 1 /\\ UNCHANGED <<y, z>>"),
+                ("Z", &[], "z' = z + 1 /\\ UNCHANGED <<x, y>>"),
+                ("B1", &[], "y' = y + 1 /\\ UNCHANGED <<x, z>>"),
+                ("B2", &[], "y' = y - 1 /\\ UNCHANGED <<x, z>>"),
+            ],
+        );
+        let next = "A1 \\/ A2 \\/ Z \\/ B1 \\/ B2";
+        let analysis = PorAnalysis::from_next(next, &module);
+        // Z is independent of every other action.
+        assert!(!analysis.dep[2].contains(&0));
+        assert!(!analysis.dep[2].contains(&1));
+        assert!(!analysis.dep[2].contains(&3));
+        assert!(!analysis.dep[2].contains(&4));
+
+        let stubborn = analysis.stubborn_set(&[true, true, true, true, true]);
+        // Smarter seed: Z (closure size 1) beats A1 (closure size 2).
+        // The lowest-index heuristic would have produced [0, 1] (the A
+        // cluster); smarter seed picks the singleton cluster.
+        assert_eq!(
+            stubborn,
+            vec![2],
+            "smarter seed should prefer the singleton-cluster action Z, got {:?}",
+            stubborn
+        );
+    }
+
+    #[test]
+    fn smarter_seed_falls_back_to_lowest_index_on_tie() {
+        // Two fully independent actions: both have closure size 1.  The
+        // tie-break must be lowest-index for determinism.
+        let module = module_with_vars(
+            &["x", "y"],
+            &[
+                ("Inc1", &[], "x' = x + 1 /\\ UNCHANGED y"),
+                ("Inc2", &[], "y' = y + 1 /\\ UNCHANGED x"),
+            ],
+        );
+        let next = "Inc1 \\/ Inc2";
+        let analysis = PorAnalysis::from_next(next, &module);
+        let stubborn = analysis.stubborn_set(&[true, true]);
+        assert_eq!(stubborn, vec![0]);
     }
 
     #[test]
