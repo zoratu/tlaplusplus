@@ -15,6 +15,7 @@
 /DEPLOY.md
 /.analyze-tla/
 /.claude/
+/.bench-t10/
 package.json
 package-lock.json
 tests/*.proptest-regressions

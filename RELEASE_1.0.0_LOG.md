@@ -1506,3 +1506,96 @@ Trace minimization: 4 -> 4 steps in 82.696µs (0 iters)
 #### Recommended next
 
 - Direct: T10 (liveness checking scaling). T9 closes the violation-quality story for 1.0.0.
+
+### T10 — Liveness checking scaling (Phase 3)
+
+**Date:** 2026-04-26 (1.0.0 plan).
+**Spot:** c8g.xlarge in us-west-2 (4 cores, aarch64, 7.7 GB RAM).
+**Working tree:** `~/tlapp-t10` (optimized) and `~/tlapp-baseline` (origin/main `07c5091` + a 2-line phase timer for measurement).
+
+**Problem.** v0.3.0 corpus runs include 11 timeout specs at 900 s on 192 cores; some are exploration-bound but several are state-space-bound where the SCC-based fairness post-processing is the long tail. The pre-T10 implementation had three concrete issues:
+
+1. **Recursive Tarjan.** `src/fairness.rs::strongconnect` recursed once per node, blowing the stack on long chains (~100 K nodes with the default 8 MB thread stack).
+2. **Per-transition O(scc_size) scan.** `check_fairness_on_scc_with_next` did `scc.contains(&t.from)` (linear scan over the SCC) for every transition, for every constraint, for every SCC. On a one-giant-SCC graph that's `O(scc * tx * constraints)`.
+3. **Full-state hashing in adjacency / SCC sets.** The runtime built `HashMap<State, Vec<State>>` for adjacency and recreated full `Vec<State>` per SCC, paying full structural-hash + clone cost on every visit.
+
+**Profiling spec.** `LivenessBench.tla` (synthetic, 5-coordinate grid with WF on every Step + WF on Reset). N = 8 enumerates 32 768 states / 143 361 transitions / 1 giant SCC / 6 fairness constraints — small enough to fit the 4-core box but large enough to surface the O(N²) post-processing bottleneck. Source under `.bench-t10/` (excluded from build artefacts).
+
+**Baseline measurement (origin/main + a 2-line `Instant::now()` timer wrapping the post-processing block):**
+
+```
+Total transitions collected: 143361
+Unique states in graph: 32768
+Found 1 strongly connected components
+[baseline] Liveness post-processing total: 63.39s
+Maximum resident set size (kbytes): 2592776  (~2.59 GB)
+Wall clock total: 1m 04s
+```
+
+The exploration phase finishes in ~2 s; **63.4 s out of 64.9 s wall-time was the liveness post-processing pass.** That's the bottleneck.
+
+**Optimizations applied (single commit; module scope: `src/fairness.rs` + `src/runtime.rs` only):**
+
+1. **Iterative Tarjan.** Replaced the recursive `TarjanSCC::strongconnect` with `strongconnect_iterative`, an explicit work-stack of `(node, succs, next_idx)` frames. Same algorithm, no recursion → no stack overflow risk on deep state graphs. Two new unit tests cover correctness: `test_tarjan_iterative_handles_deep_chain_without_stack_overflow` (200 K-node chain) and `test_tarjan_iterative_finds_giant_cycle` (1 K-node giant SCC). The two existing Tarjan tests continue to pass.
+2. **Fingerprint-keyed graph + fast SCC fairness check.** Added `fairness::check_fairness_on_scc_fp(&HashSet<u64>, ...)` that takes the SCC as a `HashSet<u64>` of fingerprints and iterates transitions once per `(SCC, constraint)` pair, with O(1) `contains` instead of the previous O(scc_size) linear scan. The runtime's post-processing block now (a) flattens DashMap → `Vec<(from_fp, to_fp, action_name)>` once, (b) builds adjacency in u64-space (`HashMap<u64, Vec<u64>>`), (c) runs Tarjan on `u64` nodes (one-word hash per visit instead of full state walk), (d) keeps a single `HashMap<u64, State>` for state lookup at violation-report time. State clones happen at most once per unique state (in the flatten pass), down from O(transitions) clones in the old code's `flat_map(|t| vec![t.from.clone(), t.to.clone()])` materialization. Four new unit tests cover the fast-path semantics: action-present-passes, named-action-missing-fails, wrapper-Next-counts-any-edge, ignores-out-of-SCC-transitions.
+3. **Detailed phase timing in the runtime.** Each phase (flatten, adjacency, SCC discovery, non-trivial filter, fairness check) prints `Instant::elapsed()` so we can see at a glance which phase dominates on any given spec.
+
+**Optimized measurement (same spec, same machine, same 4 workers):**
+
+```
+Total transitions collected: 143361 (flatten: 82.13ms)
+Unique states in graph: 32768
+Adjacency built in 5.66ms (143361 edges, 32768 nodes)
+Found 1 strongly connected components in 23.68ms
+Non-trivial SCCs: 1 (filter: 499.00ns)
+Fairness check: 6 constraint-on-SCC checks in 3.74ms
+All fairness constraints satisfied
+Liveness post-processing total: 115.28ms
+Maximum resident set size (kbytes): 1985144  (~1.99 GB)
+Wall clock total: 1.60s
+```
+
+**Result.**
+
+| Metric | Baseline | Optimized | Speedup |
+|---|---|---|---|
+| Liveness phase wall-time | **63.39 s** | **115.28 ms** | **~550x** |
+| Total wall-time (LivenessBench N=8) | 64.92 s | 1.60 s | ~40x |
+| Peak RSS | 2.59 GB | 1.99 GB | -23% |
+
+Top-3 hotspots in the new code (from the phase timing): flatten 82 ms (71%), Tarjan 24 ms (21%), constraint check 3.7 ms (3%). The constraint-check is no longer the bottleneck — it's now the `dashmap → Vec` flatten pass, which is essentially `O(transitions)` State-clone work that any post-processing pipeline must do.
+
+**Scaling verification (LivenessBench N = 10, 100 K states / 450 K transitions, optimized only — baseline killed after 13+ minutes still in fairness check):**
+
+```
+Total transitions collected: 450001 (flatten: 358.00ms)
+Adjacency built in 22.43ms
+Found 1 strongly connected components in 93.31ms
+Fairness check: 6 constraint-on-SCC checks in 10.70ms
+Liveness post-processing total: 484.97ms
+Wall clock total: 3.34s
+```
+
+Linear scaling vs N=8 (3x states → 3-4x phase time). The pre-T10 baseline at N=10 would have been ~10 minutes (extrapolating O(scc * tx * constraints) growth from the 63 s N=8 number).
+
+**Correctness gates.**
+
+- `cargo test --release --lib fairness` — 13/13 pass (was 7/7; +6 new tests).
+- `cargo test --release --test wrapper_next_fairness_t1_3` — 2/2 pass (T1.3 wrapper-Next regression preserved: WF_vars(Next) on a Terminated stutter does not falsely violate, AND a true-positive WF_vars(NeverFires) on a 2-state cycle is still flagged).
+- `cargo test --release` — all in-scope tests green; one unrelated proptest failure on `tests/compiled_vs_interpreted.rs::compiled_matches_interpreted` for input `<<(-1 - (r).a), 0>>` is **pre-existing** (reproduced on origin/main `07c5091` once the proptest regression file is shared) and is a T2 follow-up, not introduced by T10. Test count after T10: 720 (was 714 from T9; +6 in `fairness::tests::test_*`).
+- Corpus regression (4 fairness-using specs):
+  - `WorkQueue.tla` (15 003 distinct, 17 non-trivial SCCs) — no violation, agrees with T1.3.
+  - `CheckpointDrain.tla` (no fairness constraint extracted because `Spec` does not include `Fairness` in the cfg's SPECIFICATION reference) — no labeled-tx collection, post-processing block correctly skipped.
+  - `corpus/temporal/FairnessTest.tla` (8 distinct, 9 SCCs) — pass, post-processing 41 µs.
+  - `corpus/temporal/LivenessTest.tla` (156 distinct, 157 SCCs) — pass, post-processing 272 µs.
+- Synthetic `LivenessFail.tla` (Toggle cycle 0↔1 with `WF_vars(NeverFires)`) — fairness violation correctly detected, message `Fairness constraint may be violated: action 'NeverFires' does not occur in SCC`, trace minimized to 3 steps.
+
+**Caveats / follow-ups (parked):**
+
+- **T10.1. Parallel Tarjan.** The single biggest residual chunk (in absolute time) is now the dashmap-flatten phase (358 ms at N=10), which is trivially parallel — partition transitions by source-fingerprint shard and flatten in rayon. Not pursued because the absolute time is already small.
+- **T10.2. Streaming SCC discovery during exploration.** A truly large state-space (100M+ states) cannot afford to materialize the full transition set in memory at all. The next major lever would be on-the-fly liveness à la SPIN (nested DFS) or counter-example-guided liveness — both substantial redesigns out of scope for 1.0.0.
+- **T10.3. Single-state SCC filtering before Tarjan.** Many real specs have many trivial SCCs (a single state, no self-loop). Detecting these in a single pass over transitions and excluding them from Tarjan input cuts the work further on highly-disjoint state graphs. Not pursued because Tarjan's time on the bench spec is already 24 ms / 21 % of the post-processing budget — sub-dominant.
+- **T10.4. Per-action transition shard.** When the spec has many subaction fairness constraints (e.g. `\A t \in Threads : WF_vars(StealItem(t))`), we still iterate every transition for every constraint. A per-action label index `HashMap<&str, Vec<edge_id>>` would let each constraint scan only its own edges. Not pursued because for our N=8 bench (6 constraints) the constraint-check phase is already 3.7 ms.
+
+**Commit:** _to be filled in by the commit step below._
+

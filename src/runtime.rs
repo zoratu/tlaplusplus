@@ -1,10 +1,7 @@
 use crate::autotune::{AutoTuneConfig, AutoTuner, WorkerThrottle};
 use crate::distributed::handler::StolenState;
 use crate::distributed::work_stealer::DistributedWorkStealer;
-use crate::fairness::{
-    ActionLabel as FairnessActionLabel, LabeledTransition as FairnessLabeledTransition, TarjanSCC,
-    check_fairness_on_scc_with_next,
-};
+use crate::fairness::{TarjanSCC, check_fairness_on_scc_fp};
 use crate::model::{LabeledTransition, Model};
 use crate::storage::async_fingerprint_writer::{create_persist_channels, fingerprint_writer_task};
 use crate::storage::fingerprint_store::{
@@ -2841,115 +2838,146 @@ where
 
     // Check fairness constraints if we collected labeled transitions
     // (only if no safety violation was already found)
+    //
+    // T10 — liveness scaling. The previous implementation was O(scc_size *
+    // transitions * constraints) because the fairness check did
+    // `scc.contains(&t.from)` (a linear scan) for every transition for every
+    // constraint. On a 32K-state graph with one giant SCC, six fairness
+    // constraints, and 143K transitions that's ~27 billion comparisons. We
+    // now (a) flatten transitions once into a Vec of (from_fp, to_fp, name)
+    // triples, (b) build the adjacency / SCC graph in fingerprint-space
+    // (`HashMap<u64, Vec<u64>>` instead of `HashMap<State, Vec<State>>`) so
+    // hashing is one u64 instead of a full state walk, (c) hold a single
+    // `HashMap<u64, State>` for state lookup at violation-report time, and
+    // (d) use `check_fairness_on_scc_fp` which takes a `HashSet<u64>` of
+    // SCC fingerprints (O(1) membership) and iterates transitions once per
+    // SCC. The Tarjan implementation is also iterative now (see
+    // `fairness.rs`) so deep state graphs no longer risk stack overflow.
     if violation.is_none() {
         if let Some(transitions_map) = labeled_transitions.as_ref() {
+            let liveness_started_at = std::time::Instant::now();
             eprintln!(
                 "Checking fairness constraints on {} states with transitions...",
                 transitions_map.len()
             );
 
-            // Flatten all transitions into a single vector
-            let all_transitions: Vec<LabeledTransition<M::State>> = transitions_map
-                .iter()
-                .flat_map(|entry| entry.value().clone())
-                .collect();
-
-            if !all_transitions.is_empty() {
-                eprintln!("  Total transitions collected: {}", all_transitions.len());
-
-                // Collect all unique states from transitions
-                let mut state_set = HashSet::new();
-                for trans in &all_transitions {
-                    state_set.insert(model.fingerprint(&trans.from));
-                    state_set.insert(model.fingerprint(&trans.to));
+            // Phase 1: flatten transitions into fingerprint triples, building
+            // the state-id → state map as we go. This is one pass over the
+            // dashmap; we never clone a State more than once.
+            let phase1_start = std::time::Instant::now();
+            let mut state_by_fp: HashMap<u64, M::State> = HashMap::new();
+            // Each entry: (from_fp, to_fp, action_name).
+            let mut tx_triples: Vec<(u64, u64, String)> = Vec::new();
+            let mut total_tx = 0usize;
+            for entry in transitions_map.iter() {
+                for trans in entry.value() {
+                    total_tx += 1;
+                    let from_fp = model.fingerprint(&trans.from);
+                    let to_fp = model.fingerprint(&trans.to);
+                    state_by_fp
+                        .entry(from_fp)
+                        .or_insert_with(|| trans.from.clone());
+                    state_by_fp.entry(to_fp).or_insert_with(|| trans.to.clone());
+                    tx_triples.push((from_fp, to_fp, trans.action.name.clone()));
                 }
-                let unique_states: Vec<M::State> = all_transitions
-                    .iter()
-                    .flat_map(|t| vec![t.from.clone(), t.to.clone()])
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .filter(|s| {
-                        let fp = model.fingerprint(s);
-                        state_set.remove(&fp)
-                    })
-                    .collect();
+            }
+            eprintln!(
+                "  Total transitions collected: {} (flatten: {:.2?})",
+                total_tx,
+                phase1_start.elapsed()
+            );
 
-                eprintln!("  Unique states in graph: {}", unique_states.len());
+            if !tx_triples.is_empty() {
+                eprintln!("  Unique states in graph: {}", state_by_fp.len());
 
-                // Build adjacency map for SCC detection
-                let mut adjacency: HashMap<M::State, Vec<M::State>> = HashMap::new();
-                for trans in &all_transitions {
-                    adjacency
-                        .entry(trans.from.clone())
-                        .or_insert_with(Vec::new)
-                        .push(trans.to.clone());
+                // Phase 2: build adjacency in fingerprint space.
+                let phase2_start = std::time::Instant::now();
+                let mut adjacency_fp: HashMap<u64, Vec<u64>> =
+                    HashMap::with_capacity(state_by_fp.len());
+                for &(from, to, _) in &tx_triples {
+                    adjacency_fp.entry(from).or_insert_with(Vec::new).push(to);
                 }
+                let unique_fps: Vec<u64> = state_by_fp.keys().copied().collect();
+                eprintln!(
+                    "  Adjacency built in {:.2?} ({} edges, {} nodes)",
+                    phase2_start.elapsed(),
+                    total_tx,
+                    unique_fps.len()
+                );
 
-                // Find strongly connected components using Tarjan's algorithm
+                // Phase 3: SCC discovery via iterative Tarjan over u64 nodes.
+                let phase3_start = std::time::Instant::now();
                 let mut tarjan = TarjanSCC::new();
-                let sccs = tarjan.find_sccs(&unique_states, |state| {
-                    adjacency.get(state).cloned().unwrap_or_default()
+                let sccs_fp = tarjan.find_sccs(&unique_fps, |fp| {
+                    adjacency_fp.get(fp).cloned().unwrap_or_default()
                 });
+                eprintln!(
+                    "  Found {} strongly connected components in {:.2?}",
+                    sccs_fp.len(),
+                    phase3_start.elapsed()
+                );
 
-                eprintln!("  Found {} strongly connected components", sccs.len());
-
-                // Check fairness constraints on each non-trivial SCC
-                // (Non-trivial = has more than one state, or has a self-loop)
-                let non_trivial_sccs: Vec<_> = sccs
+                // Phase 4: filter to non-trivial SCCs (size > 1 OR self-loop).
+                let phase4_start = std::time::Instant::now();
+                let non_trivial_sccs: Vec<&Vec<u64>> = sccs_fp
                     .iter()
                     .filter(|scc| {
                         scc.len() > 1
                             || (scc.len() == 1 && {
-                                let state = &scc[0];
-                                adjacency
-                                    .get(state)
-                                    .map(|succs| succs.contains(state))
+                                let fp = scc[0];
+                                adjacency_fp
+                                    .get(&fp)
+                                    .map(|succs| succs.contains(&fp))
                                     .unwrap_or(false)
                             })
                     })
                     .collect();
+                eprintln!(
+                    "  Non-trivial SCCs: {} (filter: {:.2?})",
+                    non_trivial_sccs.len(),
+                    phase4_start.elapsed()
+                );
 
                 if !non_trivial_sccs.is_empty() {
-                    eprintln!(
-                        "  Checking fairness on {} non-trivial SCCs",
-                        non_trivial_sccs.len()
-                    );
-
                     let constraints = model.fairness_constraints();
 
                     if constraints.is_empty() {
                         eprintln!("  No fairness constraints to check");
                     } else {
                         eprintln!(
-                            "  Checking {} fairness constraints against SCCs",
-                            constraints.len()
+                            "  Checking {} fairness constraints against {} SCCs",
+                            constraints.len(),
+                            non_trivial_sccs.len()
                         );
 
-                        // Convert model::LabeledTransition to fairness::LabeledTransition
-                        let fairness_transitions: Vec<FairnessLabeledTransition<M::State>> =
-                            all_transitions
-                                .iter()
-                                .map(|t| FairnessLabeledTransition {
-                                    from: t.from.clone(),
-                                    to: t.to.clone(),
-                                    action: FairnessActionLabel {
-                                        name: t.action.name.clone(),
-                                        disjunct_index: t.action.disjunct_index,
-                                    },
-                                })
-                                .collect();
+                        let phase5_start = std::time::Instant::now();
+                        let next_name = model.next_action_name();
+                        let mut total_constraint_checks = 0usize;
 
-                        for (scc_idx, scc) in non_trivial_sccs.iter().enumerate() {
-                            let scc_states: Vec<M::State> =
-                                scc.iter().map(|s| (*s).clone()).collect();
+                        'outer: for (scc_idx, scc) in non_trivial_sccs.iter().enumerate() {
+                            // Build the SCC fingerprint set once (reused for
+                            // every constraint).
+                            let scc_fps: HashSet<u64> = scc.iter().copied().collect();
 
                             for constraint in &constraints {
-                                if let Err(e) = check_fairness_on_scc_with_next(
-                                    &scc_states,
+                                total_constraint_checks += 1;
+                                let result = check_fairness_on_scc_fp(
+                                    &scc_fps,
                                     constraint,
-                                    &fairness_transitions,
-                                    model.next_action_name(),
-                                ) {
+                                    tx_triples.iter().map(|(f, t, n)| (*f, *t, n.as_str())),
+                                    next_name,
+                                );
+                                if let Err(e) = result {
+                                    let scc_states: Vec<M::State> = scc
+                                        .iter()
+                                        .map(|fp| {
+                                            state_by_fp
+                                                .get(fp)
+                                                .expect("SCC fp must be in state map")
+                                                .clone()
+                                        })
+                                        .collect();
+
                                     eprintln!(
                                         "  Fairness violation in SCC {} ({} states): {}",
                                         scc_idx,
@@ -2957,15 +2985,12 @@ where
                                         e
                                     );
 
-                                    // Pick a representative state from the SCC for the violation
                                     let representative = scc_states
                                         .first()
                                         .cloned()
                                         .expect("non-trivial SCC has at least one state");
 
-                                    // Build a cycle trace from the SCC states
                                     let mut trace = scc_states.clone();
-                                    // Close the cycle by repeating the first state
                                     if let Some(first) = trace.first().cloned() {
                                         trace.push(first);
                                     }
@@ -2977,15 +3002,16 @@ where
                                         trace,
                                     });
 
-                                    // Stop on first fairness violation
-                                    break;
+                                    break 'outer;
                                 }
                             }
-
-                            if violation.is_some() {
-                                break;
-                            }
                         }
+
+                        eprintln!(
+                            "  Fairness check: {} constraint-on-SCC checks in {:.2?}",
+                            total_constraint_checks,
+                            phase5_start.elapsed()
+                        );
 
                         if violation.is_none() {
                             eprintln!("  All fairness constraints satisfied");
@@ -2994,6 +3020,10 @@ where
                 } else {
                     eprintln!("  No cycles detected - fairness constraints trivially satisfied");
                 }
+                eprintln!(
+                    "  Liveness post-processing total: {:.2?}",
+                    liveness_started_at.elapsed()
+                );
             }
         }
     }
