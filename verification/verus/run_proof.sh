@@ -44,10 +44,22 @@ fi
 echo "Using verus: $VERUS_BIN"
 echo
 
+# Tier selection. Default = tier B (`seqlock_resize.rs`, abstract Set<u64>).
+# Pass `tier-a` (or `a`, `tiera`) to verify the tier-A extension
+# (`seqlock_resize_tier_a.rs`, concrete linear-probe Seq<u64>).
+TIER="${1:-b}"
+case "$TIER" in
+  a|tier-a|tiera|A) PROOF_FILE="seqlock_resize_tier_a.rs" ;;
+  b|tier-b|tierb|B|"") PROOF_FILE="seqlock_resize.rs" ;;
+  *) echo "error: unknown tier '$TIER'; pass 'a' or 'b'" >&2; exit 2 ;;
+esac
+
+echo "Verifying: $PROOF_FILE"
+
 # Verus's solver-version check expects Z3 4.12.5 exactly. We commit to
 # the option even if the bundled Z3 is the right version: tlaplusplus
 # users who run this from an aarch64 spot need Z3 from apt (currently
 # 4.13.3) since upstream Verus does not yet ship an aarch64 Linux Z3.
 exec "$VERUS_BIN" \
   -V no-solver-version-check \
-  seqlock_resize.rs
+  "$PROOF_FILE"

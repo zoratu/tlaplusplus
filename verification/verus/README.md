@@ -70,26 +70,68 @@ abstracts:
    single primitive; the inductive `lemma_step_preserves_contents` over
    `step_rehash_one` covers the per-entry case faithfully.
 
-## What is left for tier A
+## Tier A (post-1.0.0): partial coverage shipped
 
-A full tier-A proof would establish:
+`seqlock_resize_tier_a.rs` extends tier B along the three axes flagged
+in the v1.1.0 backlog. The file is independently verified
+(`./run_proof.sh tier-a` => `verification results:: 31 verified, 0
+errors`, ~0.7s wall), in addition to tier B.
 
-- **Direct verification of the production Rust code**, with all `unsafe`
-  pointer arithmetic in scope. Verus supports this via `vstd::raw_ptr`
-  and `vstd::atomic_ghost` but requires substantial rewrites to make the
-  production code amenable: replacing raw `*mut HashTableEntry` with
-  Verus-tracked pointers, attaching ghost permissions to every CAS,
-  and proving the linear-probe loop invariants. Estimated effort: 2-4
-  agent-weeks for one experienced Verus user.
-- **Proving the rehash batch loop terminates**, with a decreases clause
-  bound by `rehash_cursor`.
-- **Memory safety of the file-backed fallback** (`allocate_file_backed`
-  branches in `resize`).
-- **Liveness**: a reader does not retry forever. Bounded by the maximum
-  number of concurrent resizes.
+| Property | Lemma | Status |
+|---|---|---|
+| **T13.1 — Linear-probe table model.** Replace `Set<u64>` with `Seq<u64>` (open-addressed, 0 = empty sentinel). | `Table = Seq<u64>`, `tab_lookup`, `tab_insert`, `tab_contents`, `probe_index`, `probe_terminus_at`, `probe_terminus` | Shipped. Captures the production layout exactly (`HashTableEntry { fp: AtomicU64, ... }` at lines 101-121). |
+| **T13.1 — Probe correctness.** Linear-probe insert is faithful to the abstract set. | `lemma_probe_terminus_bounded`, `lemma_probe_terminus_slot`, `lemma_probe_indices_distinct`, `lemma_probe_index_in_range`, `lemma_probe_walk_matches`, `lemma_insert_then_lookup`, `lemma_insert_preserves_contents`, `lemma_insert_adds_fp`, `lemma_lookup_implies_in_contents` | Shipped. `lemma_insert_then_lookup` is the headline: a successful linear-probe insert is observable to a subsequent lookup. The probe-distinctness lemma (`lemma_probe_indices_distinct`) is the modular-arithmetic core; proved via `vstd::arithmetic::div_mod::lemma_fundamental_div_mod` + nonlinear-arith assertions. |
+| **T13.2 — CAS soundness (spec-level).** A successful CAS at slot S transitions table contents from C to C ∪ {fp}; failure leaves the table unchanged. | `cas_step`, `lemma_cas_soundness`, `lemma_cas_failure_no_clobber`, `lemma_cas_during_resize_observable_a` | Shipped. The CAS is modeled as a pure function on `Seq<u64>`, matching the abstract semantics of `entry.fp.compare_exchange(0, fp, AcqRel, Acquire)` at production lines 723-741. **What is NOT shipped:** Verus tracked pointers on the actual `AtomicU64` field (would require rewriting `FingerprintShard` to thread `Tracked<PointsTo<...>>` through every call). What IS shipped is the spec-level proof that the CAS algorithm preserves table soundness — the prerequisite for a future production-code annotation pass. |
+| **T13.3 — Bounded-resize termination.** The reader retry loop terminates after at most `R + 1` iterations, where `R` is the number of resizes the writer performs during the reader's lifetime. | `reader_iters_bound`, `reader_step_consistent`, `lemma_reader_terminates`, `lemma_reader_progress`, `lemma_reader_consistent_snapshot` | Shipped (bounded form). **What is NOT shipped:** the unbounded-fairness case ("writers can't starve readers indefinitely") requires temporal-logic reasoning (LTL liveness with a fairness assumption on the writer's resize rate) that Verus does not yet have first-class support for. Documented as a tracked follow-up. |
+| **End-to-end conservation.** Every fp present pre-resize is observable post-resize. | `rehash_complete_a`, `lemma_resize_preserves_contents_a`, `lemma_rehash_complete_preserves_old_a`, `lemma_finalize_promotes_new_table_a`, `theorem_no_fingerprint_lost_a`, `theorem_concurrent_insert_survives_a` | Shipped. The `theorem_no_fingerprint_lost_a` lemma is the table-level analog of tier-B's `theorem_no_fingerprint_lost`. |
 
-These are tracked as follow-ups in `RELEASE_1.0.0_PLAN.md` under
-`### Follow-ups (parked)` for T13.
+### Production-code coverage now machine-checked at tier A
+
+| Production source location | Tier-A spec |
+|---|---|
+| `page_aligned_fingerprint_store.rs:101-121` (`HashTableEntry` layout, fp=0 sentinel) | `Table = Seq<u64>`, `EMPTY()` |
+| `page_aligned_fingerprint_store.rs:280-344` (`rehash_batch_counted`) | `step_rehash_one_a`, `lemma_rehash_preserves_a` |
+| `page_aligned_fingerprint_store.rs:357-390` (`finalize_resize`) | `step_finalize_resize_a`, `lemma_finalize_parity_a`, `lemma_finalize_promotes_new_table_a` |
+| `page_aligned_fingerprint_store.rs:469-497` (resize start, snapshot pointers) | `step_begin_resize_a`, `lemma_begin_resize_parity_a` |
+| `page_aligned_fingerprint_store.rs:554-650` (`contains` reader path + retry loop) | `tab_lookup`, `lemma_reader_terminates`, `lemma_reader_consistent_snapshot` |
+| `page_aligned_fingerprint_store.rs:656-839` (`contains_or_insert` resize-mode + normal-path) | `step_insert_during_resize_a`, `step_insert_stable_a`, `lemma_insert_stable_observable_a`, `lemma_cas_during_resize_observable_a` |
+| `page_aligned_fingerprint_store.rs:723-741` (resize-mode CAS slot insert) | `cas_step`, `lemma_cas_soundness` |
+| `page_aligned_fingerprint_store.rs:783-820` (normal-path CAS slot insert) | same `cas_step` model + `lemma_insert_then_lookup` |
+
+### What is STILL abstracted in tier A
+
+- Raw `slice::from_raw_parts` over `*mut HashTableEntry`. Tier A models
+  the slice as a `Seq<u64>`; the pointer-to-slice conversion is
+  axiomatic. Eliminating this would require `vstd::raw_ptr` annotations
+  on `FingerprintShard::contains_or_insert` — still an estimated 1-2
+  agent-weeks of code-rewrite work.
+- Memory orderings (`Ordering::Acquire/Release/AcqRel`). Tier A treats
+  atomics as sequentially consistent. The seqlock pattern is correct
+  under SC, and the production code uses the standard release/acquire
+  pairings — but a fully-relaxed-memory-model proof would require Verus
+  support for the C++20 memory model (research-grade, not yet
+  available).
+- `resize_lock: Mutex<()>` (line 142). Tier A models "single resize at
+  a time" via the seq parity bit. The mutex is what physically
+  enforces this in production; tier A relies on the protocol-level
+  parity invariant rather than the mutex directly.
+- `mmap(MAP_ANONYMOUS)` zero-fill. Modeled as `Seq::new(cap, |_| 0)`.
+  The kernel guarantee is axiomatic.
+
+### Genuinely deferred to v1.2.0+
+
+- **Full Verus tracked-pointer integration.** Annotating
+  `FingerprintShard` with `Tracked<PointsTo<HashTableEntry>>` and
+  threading the permissions through every call site. Estimated
+  remaining: 1-2 agent-weeks.
+- **Unbounded-fairness liveness.** "A writer cannot starve a reader
+  indefinitely" requires LTL liveness with a fairness assumption.
+  Verus's state-machine framework supports this but requires a
+  redesign of the proof structure. Bounded termination is shipped now;
+  unbounded liveness is tracked.
+- **CI gate.** Verus build is ~10 min on aarch64, requires the Z3 apt
+  workaround, and is not yet `cargo`-driven. CI integration is tracked
+  as a separate piece of tooling work.
 
 ## Honest verdict on Verus for tlaplusplus
 
@@ -161,16 +203,30 @@ the standard library's.
 
 ```
 cd verification/verus
-VERUS_DIR=/home/ubuntu/verus ./run_proof.sh
+VERUS_DIR=/home/ubuntu/verus ./run_proof.sh           # tier B (default)
+VERUS_DIR=/home/ubuntu/verus ./run_proof.sh tier-a    # tier A
 ```
 
-Successful output:
+Successful output (tier B):
 
 ```
 Using verus: /home/ubuntu/verus/source/target-verus/release/verus
+Verifying: seqlock_resize.rs
 
 verification results:: 19 verified, 0 errors
 ```
+
+Successful output (tier A):
+
+```
+Using verus: /home/ubuntu/verus/source/target-verus/release/verus
+Verifying: seqlock_resize_tier_a.rs
+
+verification results:: 31 verified, 0 errors
+```
+
+Both files verify in well under one second (after the 10-15 minute
+one-time Verus build).
 
 ### Toolchain versions used (2026-04-25)
 
