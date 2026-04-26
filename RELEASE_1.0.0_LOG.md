@@ -1972,3 +1972,122 @@ test the x86 path; the aarch64 path was the harder one and worked.
 For deeper data-structure correctness, the higher-leverage validation tools remain: differential testing vs TLC (T1), proptest equivalence (T2), corpus runs (95.6% passing), chaos soak (T11), and swarm testing (T16). Verus is a complement, not a replacement.
 
 **Commit:** see git log entry below.
+
+### T17 — Closeout sweep (Phase 5, 2026-04-26)
+
+**Status:** done. All gates green on a fresh spot. T6.1 cluster benchmark
+re-run on a real corpus spec; cluster mode kept opt-in. All `[ ]` follow-ups
+in the plan are now explicitly classified DEFER TO 1.1.0 (none dropped).
+
+**Soundness re-confirmation.** No new soundness issues since the Phase 1 bash:
+T2.4 fixed (`e928400`); T1.6 and T11.1 deferred to 1.1.0 with documented
+workarounds. The full re-validation pass below would have surfaced any
+regression.
+
+**Quality bash — triage decisions (all DEFER TO 1.1.0; 0 DROP):**
+
+| Item | Decision | One-line reason |
+|------|----------|-----------------|
+| T5.1 sequence-set Init | DEFER 1.1.0 | Einstein still falls back to brute-force; only public corpus spec affected. |
+| T5.2 permutation symmetry | DEFER 1.1.0 | Symbolic-init opt-in; perm acceleration is additive. |
+| T5.3 projection-based all-SAT | DEFER 1.1.0 | 10-41x already achieved on supported shapes. |
+| T6.1 cross-node re-benchmark | DONE | See benchmark below. Cluster default-OFF. |
+| T7.1 batched per-disjunct eval | DEFER 1.1.0 | POR opt-in; 36.8x reduction on supported workload. |
+| T7.2 smarter stubborn-set seed | DEFER 1.1.0 | Deterministic seed is sound; smarter seed is tuning. |
+| T7.3 POR for liveness | DEFER 1.1.0 | T10 already shipped 550x liveness speedup. |
+| T9.1 transitive variable relevance | DEFER 1.1.0 | Conservative over-marking, never under-marks. |
+| T9.2 smarter BFS seed | DEFER 1.1.0 | 30s budget rarely hit. |
+| T9.3 suffix shortening | DEFER 1.1.0 | BFS shortcut already optimal-length prefix. |
+| T10.1 parallel Tarjan | DEFER 1.1.0 | Sub-second already on N=10. |
+| T10.2 streaming SCC | DEFER 1.1.0 | Substantial redesign for 100M+ states. |
+| T10.3 single-state SCC pre-filter | DEFER 1.1.0 | Tarjan already 21% of post-processing budget. |
+| T10.4 per-action transition shard | DEFER 1.1.0 | 6-constraint check is 3.7 ms today. |
+| T11.2 re-soak with queue cap | DEFER 1.1.0 | Blocked on T11.1. |
+| T11.3 CI-gate variant | DEFER 1.1.0 | 1-hour soak is the release ritual. |
+| T12.1 stack-overflow on CI | DEFER 1.1.0 | Spot instances pass cleanly; CI is purely test-margin issue. |
+| T13.1 Verus tier A | DEFER 1.1.0 | Multi-week effort; tier B is the v1.0.0 deliverable. |
+| T13.2 Verus liveness | DEFER 1.1.0 | Blocked on state-machines redesign. |
+| T13.3 Verus CI gate | DEFER 1.1.0 | Verus tooling itself isn't CI-ready. |
+
+**Total: 19 deferred, 0 dropped.** Conservative pass per brief direction.
+
+**Full re-validation pass — all gates green (spot 1 c8g.xlarge aarch64,
+REDACTED-INSTANCE; spot 2 c8g.xlarge aarch64, REDACTED-INSTANCE):**
+
+| Gate | Result |
+|------|--------|
+| `cargo test --release` | **727 passed, 0 failed, 5 ignored** |
+| `cargo test --release --features failpoints` | **747 passed, 0 failed, 5 ignored** |
+| `cargo test --release --features symbolic-init` | **735 passed, 0 failed, 5 ignored** |
+| `scripts/diff_tlc.sh` | **13/13 specs match TLC v2.19** (state counts agree exactly) |
+| `cargo test --release --test compiled_vs_interpreted` PROPTEST_CASES=2048 × seeds 1, 2, 3 | **17 passed × 3 seeds, 0 failed** |
+| `cargo test --release --test state_graph_snapshots` | **12 passed, 0 failed, 1 ignored** (regen helper) |
+| `scripts/chaos_soak.sh --duration 600 --swarm-mode auto` (10-min smoke) | **71 iters, 0 divergences, 0 hangs, 63/66 distinct concurrent failpoint pairs observed across 12 failpoints** |
+
+**T6.1 — cross-node re-benchmark on a real corpus spec.**
+
+**Spec.** `corpus/internals/WorkStealingTermination.tla` (NumWorkers=3,
+NumNumaNodes=2, MaxWorkItems=4) — natural state space **64,805 distinct,
+755,002 generated**. Deliberately picked over CounterGrid because (a) it's
+real corpus, (b) it has structurally non-trivial Next, (c) it's just over
+10s independent so the steal handshake has time to fire.
+
+**Setup.** Two `c8g.xlarge` spot instances (4 vCPU, 8 GB, us-west-2)
+connected via Tailscale. node 0 = REDACTED-INSTANCE (100.114.64.126),
+node 1 = REDACTED-INSTANCE (100.68.87.61). Each node `--workers 4`,
+TCP port 7878 over the Tailscale interface. Three trials per mode.
+
+**Results.**
+
+| Mode | Trial | node 0 wall | node 1 wall | distinct (per-node) | Cluster wall |
+|------|-------|-------------|-------------|---------------------|--------------|
+| Independent (single node, baseline) | 1 | 10.40 s | — | 64,805 | **10.40 s** |
+| Independent (single node, baseline) | 2 | 10.40 s | — | 64,805 | **10.40 s** |
+| Independent (single node, baseline) | 3 | 10.39 s | — | 64,805 | **10.39 s** |
+| Cluster (2 nodes) | 1 | 17.44 s | 18.0 s | 64,805 / 64,805 | **18.0 s** |
+| Cluster (2 nodes) | 2 | 14.44 s | 21.48 s | 64,805 / 64,805 | **21.48 s** |
+| Cluster (2 nodes) | 3 | 14.44 s | 13.46 s | 64,805 / 64,805 | **14.44 s** |
+
+**Honest read.** Cluster median ≈ 18 s, independent median ≈ 10.4 s.
+**Cluster is ~1.7x slower than independent on this real spec.** Two
+contributing reasons, both consistent with the v0.3.0 design and the T6 log:
+
+1. **Each node still explores the full state space** (64,805 distinct on
+   each — i.e., no global FP synchronization). The cross-node steal protocol
+   moves work between nodes when one is starving, but it does not de-duplicate
+   the *total* exploration. With redundant exploration, two nodes do nearly 2x
+   the total work for at best 1x the wall-clock benefit.
+2. **Cluster startup overhead is non-trivial** (peer connect retries, bloom
+   alloc, periodic broadcasts, periodic termination tokens) and is amortized
+   across only ~64K distinct states, which on this size is a substantial
+   fraction of total wall time.
+
+The protocol works correctly: termination converges, both nodes finish with
+the correct distinct-state count, and the failure-mode test
+`dead_peer_steal_times_out_and_marks_down` continues to pass under
+`cargo test`. The cluster mode still has its place: structurally disjoint
+sub-problems (e.g., model-value-partitioned specs) can benefit from
+cross-node work-stealing without paying the full redundancy cost. But for
+canonical workloads it is slower.
+
+**Decision: keep `--cluster-listen` default-OFF for v1.0.0.** No code change.
+The flag is opt-in with documented use cases. Global FP partitioning (the
+fix to make cluster mode fast on canonical workloads) is multi-quarter work
+that's tracked for v1.1+.
+
+**Commits.** No code change. Documentation entries:
+
+- This log entry (T17 + T6.1 closeout).
+- `RELEASE_1.0.0_PLAN.md` updated: T6.1 marked done with the cluster default
+  decision; all other parked `[ ]` items now explicitly DEFER TO 1.1.0.
+
+**T14 — version bump and docs (this commit chain).** See git log for
+- Cargo.toml + Cargo.lock bump to 1.0.0
+- CHANGELOG.md v1.0.0 section
+- CLAUDE.md Current Status v1.0.0 update
+- README.md headline + test counts refresh
+- RELEASE_1.0.0_SUMMARY.md (new, for the GitHub release body)
+
+**T15 — tag and push.** Local v1.0.0 tag created via
+`git tag -a v1.0.0 -m "..."`. **Tag NOT pushed** — that and
+`gh release create` are user-triggered per the brief.
