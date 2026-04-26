@@ -220,6 +220,37 @@ pub fn evaluate_next_states_swarm(
     Ok(out)
 }
 
+/// Evaluate every disjunct of `next_body` independently in a single pass.
+///
+/// Returns a `Vec<Vec<TlaState>>` of length `count_next_disjuncts(next_body)`,
+/// where slot `i` holds the successors produced by disjunct `i`.  An empty
+/// inner `Vec` means the disjunct is disabled (or its evaluation errored —
+/// errors are silently treated as "disabled", matching `allow_deadlock`
+/// semantics).
+///
+/// Used by partial-order reduction (T7.1): the per-disjunct enabledness
+/// vector is exactly the input to the stubborn-set computation, and the
+/// successor sets are exactly what we want to enqueue once we know which
+/// disjuncts are in the stubborn set.  Splitting `next_body` once instead
+/// of N times eliminates the dominant cost on shared-state specs where
+/// the stubborn set is the full enabled set.
+pub fn evaluate_next_states_per_disjunct(
+    next_body: &str,
+    definitions: &BTreeMap<String, TlaDefinition>,
+    instances: Option<&BTreeMap<String, TlaModuleInstance>>,
+    state: &TlaState,
+) -> Vec<Vec<TlaState>> {
+    let disjuncts = split_action_disjuncts(next_body);
+    let mut out: Vec<Vec<TlaState>> = Vec::with_capacity(disjuncts.len());
+    for disj in &disjuncts {
+        match execute_branch(disj.trim(), &BTreeMap::new(), definitions, instances, state) {
+            Ok(successors) => out.push(successors),
+            Err(_) => out.push(Vec::new()),
+        }
+    }
+    out
+}
+
 /// Evaluate next states with action labels for fairness checking
 ///
 /// This version tracks which action (disjunct) generated each successor state,

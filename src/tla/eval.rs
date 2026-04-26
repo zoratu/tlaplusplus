@@ -2507,14 +2507,12 @@ fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
                 if let Some((inner_var, inner_dom, inner_range, inner_pred)) =
                     try_resolve_funasseq_permutation_set(domain_expr, ctx)
                 {
-                    if let Some((seq_len, range_vals)) = try_resolve_sequence_domain(
-                        &inner_dom, &inner_range, ctx, depth + 1,
-                    ) {
+                    if let Some((seq_len, range_vals)) =
+                        try_resolve_sequence_domain(&inner_dom, &inner_range, ctx, depth + 1)
+                    {
                         // Substitute outer var_name -> inner_var in `rhs`.
-                        let outer_pred =
-                            substitute_identifier_owned(rhs, var_name, &inner_var);
-                        let combined_pred =
-                            format!("({}) /\\ ({})", inner_pred, outer_pred);
+                        let outer_pred = substitute_identifier_owned(rhs, var_name, &inner_var);
+                        let combined_pred = format!("({}) /\\ ({})", inner_pred, outer_pred);
                         if let Some(seqs) =
                             crate::tla::symbolic_init::try_symbolic_function_set_enumerate(
                                 &combined_pred,
@@ -2550,15 +2548,15 @@ fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
                 && domain_expr_resolved.ends_with(']')
                 && is_valid_identifier(var_name)
             {
-                let bracket_inner =
-                    &domain_expr_resolved[1..domain_expr_resolved.len() - 1];
-                if let Some((dom_text, range_text)) =
-                    split_once_top_level(bracket_inner, "->")
-                {
+                let bracket_inner = &domain_expr_resolved[1..domain_expr_resolved.len() - 1];
+                if let Some((dom_text, range_text)) = split_once_top_level(bracket_inner, "->") {
                     if !dom_text.contains("|") {
-                        if let Some((seq_len, range_vals)) =
-                            try_resolve_sequence_domain(dom_text.trim(), range_text.trim(), ctx, depth + 1)
-                        {
+                        if let Some((seq_len, range_vals)) = try_resolve_sequence_domain(
+                            dom_text.trim(),
+                            range_text.trim(),
+                            ctx,
+                            depth + 1,
+                        ) {
                             if let Some(seqs) =
                                 crate::tla::symbolic_init::try_symbolic_function_set_enumerate(
                                     rhs,
@@ -2608,10 +2606,7 @@ fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
         #[cfg(feature = "symbolic-init")]
         if let Some(seqs) = try_funasseq_wrapper_symbolic(lhs, rhs, ctx, depth + 1) {
             if std::env::var("TLAPLUSPLUS_DEBUG_SYMBOLIC_INIT").is_ok() {
-                eprintln!(
-                    "Symbolic Init (FunAsSeq wrapper): {} sequences",
-                    seqs.len()
-                );
+                eprintln!("Symbolic Init (FunAsSeq wrapper): {} sequences", seqs.len());
             }
             return Ok(TlaValue::Set(Arc::new(seqs.into_iter().collect())));
         }
@@ -2787,11 +2782,7 @@ fn try_destructure_function_set_comprehension(
                             if def.params.len() == args.len() {
                                 let mut body = def.body.trim().to_string();
                                 for (param, arg) in def.params.iter().zip(args.iter()) {
-                                    body = substitute_identifier_owned(
-                                        &body,
-                                        param,
-                                        arg.trim(),
-                                    );
+                                    body = substitute_identifier_owned(&body, param, arg.trim());
                                 }
                                 text = body;
                                 continue;
@@ -2827,7 +2818,12 @@ fn try_destructure_function_set_comprehension(
     if dom_text.contains("|") {
         return None;
     }
-    Some((var_name, dom_text.trim().to_string(), range_text.trim().to_string(), pred))
+    Some((
+        var_name,
+        dom_text.trim().to_string(),
+        range_text.trim().to_string(),
+        pred,
+    ))
 }
 
 /// T5.1 — try to resolve `domain_expr` (a name or operator call like
@@ -2875,11 +2871,7 @@ fn try_resolve_funasseq_permutation_set(
                             if def.params.len() == args.len() {
                                 let mut body = def.body.trim().to_string();
                                 for (param, arg) in def.params.iter().zip(args.iter()) {
-                                    body = substitute_identifier_owned(
-                                        &body,
-                                        param,
-                                        arg.trim(),
-                                    );
+                                    body = substitute_identifier_owned(&body, param, arg.trim());
                                 }
                                 text = body;
                                 continue;
@@ -2915,8 +2907,14 @@ fn parse_funasseq_comprehension(
     if !is_valid_identifier(p_name) {
         return None;
     }
-    let n2 = eval_expr_inner(parts[1].trim(), ctx, 0).ok()?.as_int().ok()?;
-    let n3 = eval_expr_inner(parts[2].trim(), ctx, 0).ok()?.as_int().ok()?;
+    let n2 = eval_expr_inner(parts[1].trim(), ctx, 0)
+        .ok()?
+        .as_int()
+        .ok()?;
+    let n3 = eval_expr_inner(parts[2].trim(), ctx, 0)
+        .ok()?
+        .as_int()
+        .ok()?;
     if n2 != n3 || n2 < 1 {
         return None;
     }
@@ -2944,8 +2942,7 @@ fn substitute_identifier_owned(source: &str, name: &str, replacement: &str) -> S
     let mut i = 0;
     while i < bytes.len() {
         if i + needle.len() <= bytes.len() && &bytes[i..i + needle.len()] == needle {
-            let prev_ok =
-                i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            let prev_ok = i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
             let next_idx = i + needle.len();
             let next_ok = next_idx == bytes.len()
                 || !(bytes[next_idx].is_ascii_alphanumeric() || bytes[next_idx] == b'_');

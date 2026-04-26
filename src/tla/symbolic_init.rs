@@ -1549,9 +1549,7 @@ mod backend {
                         // r may be var[k] (another position) or a constant.
                         if let Some(other) = self.lookup_position(r) {
                             clauses.push(var._eq(&other).not());
-                        } else if let Ok(elem_val) =
-                            crate::tla::eval_expr(r, self.eval_ctx)
-                        {
+                        } else if let Ok(elem_val) = crate::tla::eval_expr(r, self.eval_ctx) {
                             let coded = encode_value_as_int(&elem_val, &self.range_enc)?;
                             clauses.push(var._eq(&Int::from_i64(self.z3, coded)).not());
                         } else {
@@ -1579,11 +1577,7 @@ mod backend {
             None
         }
 
-        fn constant_set_membership(
-            &self,
-            var: &Int<'ctx>,
-            set_text: &str,
-        ) -> Option<Bool<'ctx>> {
+        fn constant_set_membership(&self, var: &Int<'ctx>, set_text: &str) -> Option<Bool<'ctx>> {
             let val = crate::tla::eval_expr(set_text, self.eval_ctx).ok()?;
             let set = val.as_set().ok()?;
             let mut eqs: Vec<Bool<'ctx>> = Vec::with_capacity(set.len());
@@ -1598,11 +1592,7 @@ mod backend {
             Some(Bool::or(self.z3, &refs))
         }
 
-        fn brace_set_membership(
-            &self,
-            var: &Int<'ctx>,
-            inner: &str,
-        ) -> Option<Bool<'ctx>> {
+        fn brace_set_membership(&self, var: &Int<'ctx>, inner: &str) -> Option<Bool<'ctx>> {
             let parts = split_top_level_symbol(inner, ",");
             let mut eqs: Vec<Bool<'ctx>> = Vec::with_capacity(parts.len());
             for part in &parts {
@@ -1652,9 +1642,7 @@ mod backend {
                     Some(var._eq(&Int::from_i64(self.z3, coded)))
                 }
                 (None, None) => {
-                    if let (Some(l), Some(r)) =
-                        (self.translate_int(lhs), self.translate_int(rhs))
-                    {
+                    if let (Some(l), Some(r)) = (self.translate_int(lhs), self.translate_int(rhs)) {
                         return Some(l._eq(&r));
                     }
                     if !mentions_record_var(lhs, self.var_name)

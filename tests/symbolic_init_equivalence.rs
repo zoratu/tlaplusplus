@@ -184,15 +184,10 @@ fn brute_force_seqs(n: usize, range_max: i64, pred: &str) -> std::collections::B
                 n >= 3 && idx[2] != idx[0] && (1..=3).contains(&idx[2])
             }
             "p[3] \\in {1,2,3} \\ {p[1], p[2]}" => {
-                n >= 3
-                    && idx[2] != idx[0]
-                    && idx[2] != idx[1]
-                    && (1..=3).contains(&idx[2])
+                n >= 3 && idx[2] != idx[0] && idx[2] != idx[1] && (1..=3).contains(&idx[2])
             }
             "p[1] = 1 \\/ p[2] = 1" => n >= 2 && (idx[0] == 1 || idx[1] == 1),
-            "(p[1] + p[3] = 4) /\\ (p[2] = 2)" => {
-                n >= 3 && idx[0] + idx[2] == 4 && idx[1] == 2
-            }
+            "(p[1] + p[3] = 4) /\\ (p[2] = 2)" => n >= 3 && idx[0] + idx[2] == 4 && idx[1] == 2,
             _ => unreachable!("unhandled seq predicate {pred}"),
         };
         if satisfies {
