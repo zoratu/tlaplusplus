@@ -341,6 +341,10 @@ impl DistributedWorkStealer {
     /// in-flight `StealRequest` outstanding. Otherwise we could declare
     /// global termination while a `StealResponse` is in transit, dropping
     /// states.
+    ///
+    /// A peer that is currently in the down-cooldown window is treated as
+    /// idle for the purpose of this check — otherwise a node whose peer
+    /// crashed (or already terminated) could never reach global termination.
     pub fn all_nodes_idle(&self) -> bool {
         if !self.locally_idle.load(Ordering::Acquire) {
             return false;
@@ -361,9 +365,15 @@ impl DistributedWorkStealer {
             if i as u32 == self.node_id {
                 continue;
             }
-            if !flag.load(Ordering::Acquire) {
-                return false;
+            if flag.load(Ordering::Acquire) {
+                continue;
             }
+            // Treat down peers as idle for termination — they're either dead
+            // or already exited; we don't want to wait forever for them.
+            if self.is_peer_down(i as u32) {
+                continue;
+            }
+            return false;
         }
         true
     }
@@ -441,13 +451,20 @@ impl DistributedWorkStealer {
 
     /// Mark a peer as down for `peer_down_cooldown_ms` after a failed steal.
     pub fn mark_peer_down(&self, peer_id: u32) {
+        self.mark_peer_down_without_steal_count(peer_id);
+        self.steal_requests_failed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Mark a peer down without bumping the steal-failure counter.
+    /// Used when a non-steal RPC (termination broadcast, bloom exchange)
+    /// fails and we want to remove the peer from the live-peer set.
+    pub fn mark_peer_down_without_steal_count(&self, peer_id: u32) {
         let cooldown_ms = self.peer_down_cooldown_ms.load(Ordering::Relaxed);
         let until_ns =
             self.started_at.elapsed().as_nanos() as u64 + (cooldown_ms * 1_000_000).max(1);
         if let Some(slot) = self.peer_down_until_ns.get(peer_id as usize) {
             slot.store(until_ns, Ordering::Release);
         }
-        self.steal_requests_failed.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Is the named peer currently in the down-cooldown window?

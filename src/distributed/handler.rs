@@ -186,17 +186,32 @@ pub fn spawn_bloom_and_termination_task(
             // Trigger bloom exchange if enough time has elapsed
             stealer.maybe_exchange_bloom();
 
-            // Broadcast OUR local idle status. The peer uses this to compute
-            // ITS view of `all_nodes_idle`. (Earlier versions broadcast the
-            // global view, which is circular and prevents convergence.)
+            // Send OUR local idle status to each non-down peer. Sending
+            // per-peer (rather than `transport.broadcast`) lets us mark a
+            // peer down when the send fails, so `all_nodes_idle()` doesn't
+            // wait forever for a peer that has already exited or crashed.
             let token = Message::TerminationToken {
                 initiator: stealer.node_id(),
                 round,
                 all_idle: stealer.is_locally_idle(),
             };
 
-            if let Err(e) = transport.broadcast(&token).await {
-                eprintln!("[cluster] failed to broadcast termination token: {}", e);
+            for peer_id in 0..stealer.num_nodes() {
+                if peer_id == stealer.node_id() {
+                    continue;
+                }
+                if stealer.is_peer_down(peer_id) {
+                    continue;
+                }
+                if let Err(e) = transport.send(peer_id, &token).await {
+                    // Peer is unreachable — mark it down for the cooldown
+                    // window so termination consensus can advance.
+                    eprintln!(
+                        "[cluster] failed to send termination token to node {}: {} (marking down)",
+                        peer_id, e
+                    );
+                    stealer.mark_peer_down_without_steal_count(peer_id);
+                }
             }
 
             round += 1;
