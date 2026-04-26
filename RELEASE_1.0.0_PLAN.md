@@ -70,7 +70,13 @@ These come first because every later change needs a regression gate.
 
 ## Phase 4 — Verification
 
-- [ ] **T13. Verus on fingerprint store.** Pick the seqlock resize protocol — the most consequential lock-free invariant. Prove "no fingerprint lost across resize" and "every fingerprint inserted is observable to subsequent readers." Scope: one module, not the whole codebase.
+- [x] **T13. Verus on fingerprint store.** Done — **tier B**. `verification/verus/seqlock_resize.rs` (600 lines) is a Verus proof of an abstract model of the seqlock resize protocol. 19 lemmas verified by Z3, including the headline theorem `theorem_no_fingerprint_lost`: in any well-formed execution of the protocol, every inserted fingerprint remains observable from then on. Proof is at the protocol abstraction layer (table = `Set<u64>`, atomic step semantics); it does NOT verify the production code's pointer arithmetic, memory orderings, or linear-probe collision behavior. See `verification/verus/README.md` for what is proved, what is assumed, and the tier-A roadmap. Toolchain: Verus HEAD on Ubuntu 25.10 aarch64, Z3 4.13.3 from apt with `-V no-solver-version-check`. Run with `verification/verus/run_proof.sh`. See `RELEASE_1.0.0_LOG.md` `### T13` for full writeup.
+
+### Follow-ups (parked)
+
+- [ ] **T13.1. Tier A — verify production Rust directly.** Replace the abstract `Set<u64>` model with a concrete `Seq<Option<u64>>` to capture linear-probe collisions, then attach Verus tracked pointers + ghost permissions to every CAS in `page_aligned_fingerprint_store.rs`. Estimated 2-4 agent-weeks.
+- [ ] **T13.2. Liveness.** Prove the reader retry loop terminates (decreases on the maximum number of concurrent resizes).
+- [ ] **T13.3. CI gate.** Once tier A or a leaner cargo-verus integration is feasible, wire the proof check into `.github/workflows/`. Currently the proof requires Verus from source (~10 min build) plus aarch64 Z3 workaround, neither of which is CI-friendly.
 
 ## Phase 5 — Release
 

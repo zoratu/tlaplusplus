@@ -1875,3 +1875,100 @@ RESULT: clean — no divergences, no hangs.
 **T16.N follow-ups parked.** None new from this task. T16a's reproductions of T2.4 are tracked under existing T2.4. T16b's queue-spill underexercise is tracked under existing T11.2.
 
 **Commit:** see git log entry below.
+
+---
+
+## 2026-04-26
+
+### T13 — Verus on fingerprint store (Phase 4)
+
+**Status:** Tier B landed. 19 lemmas verified, 0 errors. Headline soundness theorem (`theorem_no_fingerprint_lost`) machine-checked.
+
+**Tier achieved:** **B** — proof of an abstract model of the seqlock resize protocol, NOT direct verification of the unsafe production Rust.
+
+**What was proven (in plain English).** All 19 obligations discharged by Z3:
+
+- **P1. Monotonic seq.** The seq counter never decreases across any of the five protocol primitives (insert-stable, begin-resize, insert-during-resize, rehash-one, finalize-resize).
+- **P2. Parity discipline.** seq is even iff no resize is in progress. begin_resize flips even -> odd. finalize_resize flips odd -> even. Inserts and rehash steps preserve parity.
+- **P3. Conservation across one resize cycle.** Every fingerprint observable to a reader before begin_resize is observable after finalize_resize.
+- **P3'. Concurrent insert during resize survives.** A fingerprint inserted while resize is in flight survives the rehash union and the table swap.
+- **Reader consistency.** If the seqlock value before and after a read is equal, the parity (and thus the read path) is consistent across the two reads — justifies the seqlock retry loop's correctness.
+- **Step monotonicity (lemma_step_preserves_contents).** Every transition in the protocol's state machine preserves `effective_contents` (the set of observable fingerprints) as a superset, with the single exception of finalize_resize, which is guarded by the rehash-completion precondition `s.old_table.subset_of(s.new_table)`.
+- **MAIN THEOREM (theorem_no_fingerprint_lost).** In any well-formed execution of the protocol, every fingerprint present at any state remains observable from then on — i.e. **no resize event can cause the model checker to silently lose a fingerprint**.
+
+**What was assumed.** The proof is at the protocol abstraction layer. Deliberately abstracted (NOT proven, axiomatised by the model):
+
+1. Pointer arithmetic and open-addressed linear probing — production stores entries in a flat array indexed by `fp % capacity` with linear probing on collisions; the proof models the table as `Set<u64>`. A bug like "linear probe wraps incorrectly" would not be caught by this proof.
+2. Memory orderings of atomic operations — proof treats each protocol step as atomic; production uses AcqRel/Acquire pairings. Standard seqlock-pattern assumption.
+3. Single ongoing resize — production enforces via `resize_lock: Mutex<()>`; proof models "resize in progress" via the parity bit.
+4. Mmap zero-fill — production uses MAP_ANONYMOUS; proof models begin_resize as setting new_table to the empty set.
+5. Rehash completion as a ghost step — production migrates one bucket at a time over many CAS calls; proof models per-entry rehash via `step_rehash_one` (covered inductively by `lemma_step_preserves_contents`) plus a `step_rehash_complete` ghost step that asserts the union.
+
+**Verus toolchain version + install steps (so we can reproduce).**
+
+- Verus: HEAD of `main` branch at clone time, release tag `release/0.2026.04.19.6f7d4de`.
+- Rust: pinned to 1.95.0 via `verus/rust-toolchain.toml`.
+- Z3: 4.13.3 (Ubuntu 25.10 apt) — used with `-V no-solver-version-check` because Verus prefers Z3 4.12.5.
+- Spot instance: c8g.xlarge, Ubuntu 25.10 aarch64, 4 vCPU / 8GB RAM. Build time: ~5 min for Verus + vstd.
+
+Install steps (aarch64 Linux, derived from Verus BUILD.md plus a Z3 workaround):
+
+```bash
+# 1. Rust + apt prereqs
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+sudo apt-get install -y git build-essential pkg-config cmake clang lld unzip jq z3
+. ~/.cargo/env
+
+# 2. Clone Verus
+git clone --depth 1 https://github.com/verus-lang/verus.git
+cd verus/source
+
+# 3. Z3 4.12.5 — upstream's get-z3.sh hits a broken aarch64 zip
+#    (the upstream "arm64-glibc" zip ships an x86_64 binary by mistake).
+#    Workaround: use Z3 from apt and skip the version check.
+cp /usr/bin/z3 ./z3
+
+# 4. Build Verus + vstd. --vstd-no-verify is required when using a
+#    non-pinned Z3 because the vstd proofs themselves go through cleanly
+#    only on Z3 4.12.5. This does not affect *our* proof's soundness.
+. ../tools/activate
+vargo --no-solver-version-check build --release --vstd-no-verify
+```
+
+x86_64 Linux is much simpler — just download the prebuilt zip from
+https://github.com/verus-lang/verus/releases/latest. We did not need to
+test the x86 path; the aarch64 path was the harder one and worked.
+
+**Files added (proof artifact location).**
+
+- `verification/verus/seqlock_resize.rs` — 600 lines, 19 verified lemmas. Each protocol step is documented with the corresponding production line numbers in `src/storage/page_aligned_fingerprint_store.rs` so a future reader can see the spec-to-code correspondence.
+- `verification/verus/run_proof.sh` — one-line invocation with the right Verus flags and environment handling for both `VERUS_DIR` and `verus`-on-PATH cases.
+- `verification/verus/README.md` — what is proved, what is assumed, install steps, honest verdict, tier-A roadmap.
+
+**Validation.**
+
+- `verus -V no-solver-version-check seqlock_resize.rs` -> `verification results:: 19 verified, 0 errors` on the spot instance.
+- `./run_proof.sh` -> identical output.
+- No production source files modified -> existing 727-test suite is unaffected by construction; T1 diff harness 13/13 unchanged.
+- The proof artifact lives in a new top-level `verification/` directory; `.gitignore` already covers `target/` so no build outputs leak.
+
+**Remaining work for tier A (clear roadmap).** Tracked in `RELEASE_1.0.0_PLAN.md` under T13.1–T13.3:
+
+- **T13.1.** Replace the abstract `Set<u64>` model with a concrete `Seq<Option<u64>>` to capture linear-probe collisions, then attach Verus tracked pointers + ghost permissions to every CAS in `page_aligned_fingerprint_store.rs`. Estimated 2-4 agent-weeks for an experienced Verus user.
+- **T13.2.** Liveness — prove the reader retry loop terminates (decreases on the maximum number of concurrent resizes).
+- **T13.3.** CI gate — once T13.1 or a leaner cargo-verus integration is feasible, wire the proof check into `.github/workflows/`. Currently the proof requires Verus from source (~10 min build) plus the aarch64 Z3 workaround, neither of which is CI-friendly out of the box.
+
+**Honest verdict: is Verus useful for tlaplusplus going forward?**
+
+**Yes — at the protocol/algorithm level, with bounded cost.** What we shipped today is real value: the seqlock resize *algorithm* is now machine-checked-sound. If a future refactor changes the protocol shape (e.g. adds a "cancel resize mid-flight" path), the proof will fail when the abstract model is updated to match — that's a useful regression gate for the most consequential lock-free invariant in the codebase.
+
+**No — at the unsafe-Rust level, the cost is too high for 1.0.0.** Direct verification (tier A) would require multi-week rewrites of the production code: replacing raw `*mut HashTableEntry` with Verus-tracked pointers, attaching ghost permissions to every CAS, proving linear-probe loop invariants. The risk/value tradeoff for 1.0.0 favors keeping the production code idiomatic.
+
+**Recommendation for v1.1+.** Two tractable extensions don't require rewriting production code:
+
+1. Model linear-probe collision behavior as a concrete `Seq<Option<u64>>` instead of `Set<u64>`, and prove the abstract `contains`/`insert` spec. Catches probe-sequence bugs without touching production code.
+2. Model worker-thread interleavings explicitly via Verus's `state_machines!` macro, so reader retries can be proved live (not just safe).
+
+For deeper data-structure correctness, the higher-leverage validation tools remain: differential testing vs TLC (T1), proptest equivalence (T2), corpus runs (95.6% passing), chaos soak (T11), and swarm testing (T16). Verus is a complement, not a replacement.
+
+**Commit:** see git log entry below.
