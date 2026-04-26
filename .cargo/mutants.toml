@@ -1,0 +1,46 @@
+# cargo-mutants configuration for tlaplusplus
+#
+# Mutation testing audits whether the existing test suite catches deliberate
+# code changes. T4 of the 1.0.0 plan scoped this to the TLA+ evaluator hot
+# paths (see RELEASE_1.0.0_PLAN.md).
+#
+# The 1.0.0 audit was run as:
+#
+#   RUST_MIN_STACK=16777216 cargo mutants \
+#       --file src/tla/eval.rs --file src/tla/action_exec.rs \
+#       --jobs 12 --timeout 180 --baseline=skip
+#
+# On a c8g.metal-48xl (192 vCPU, 377GB RAM, 365G NVMe) the audit takes
+# roughly 60-90 minutes wall clock for ~3.3K mutants on the two scoped files.
+#
+# `RUST_MIN_STACK=16777216` is required because the
+# `recursive_operator_respects_depth_limit` test exercises a 256-deep call
+# stack which exceeds the default debug-build 8MB thread stack.
+#
+# `--baseline=skip` is safe iff `cargo test --lib --bins` is green at HEAD
+# with the inflated stack.
+
+# Per-mutant timeout multiplier. The full debug-mode test suite is ~14s
+# baseline, so give a 5x cushion for slow paths (eval / action exec proptest).
+timeout_multiplier = 5.0
+
+# Restrict mutant-killing to tests that exercise the targeted files. We use
+# --lib (catches all unit tests in the crate including the test modules in
+# eval.rs and action_exec.rs themselves) plus --bins. Integration tests
+# under tests/ are slow and only marginally help here, so they are excluded
+# from the per-mutant test runs to keep the audit under an hour.
+additional_cargo_test_args = [
+    "--lib",
+    "--bins",
+]
+
+# Skip mutants in error-message strings: replacing the string with `""` or
+# `"xyzzy"` is structurally a "viable" mutant but tests almost never assert
+# on error wording, so they dominate the survivor list without indicating
+# real coverage gaps.
+exclude_re = [
+    "replace .* -> &str with \"\"",
+    "replace .* -> &str with \"xyzzy\"",
+    "replace .* -> String with String::new",
+    "replace .* -> String with \"xyzzy\"\\.into",
+]

@@ -2901,4 +2901,521 @@ SPECIFICATION
             "expected y' values [0, 1] (one branch advances y), got {ys:?}"
         );
     }
+
+    // --- T4 mutation-kill tests -------------------------------------------
+    //
+    // The tests below close consequential coverage gaps surfaced by the
+    // cargo-mutants audit (RELEASE_1.0.0_LOG.md, T4). Each test is annotated
+    // with the line(s) of the mutant(s) it kills.
+
+    #[test]
+    fn t4_extract_action_name_returns_identifier_for_action_call() {
+        // Kills survivors at action_exec.rs:276:5 (extract_action_name -> None / "" / "xyzzy")
+        // and the surrounding identifier-stride math (line 282:42 +1 vs *,/-).
+        // No prior test exercised extract_action_name directly; a mis-extracted
+        // action name corrupts every fairness/coverage label produced by
+        // evaluate_next_states_labeled_*.
+        assert_eq!(
+            extract_action_name("SendMsg(m)"),
+            Some("SendMsg".to_string())
+        );
+        assert_eq!(extract_action_name("Tick"), Some("Tick".to_string()));
+        // \E quantifier wrapper: name lives after the colon.
+        assert_eq!(
+            extract_action_name("\\E i \\in S : Inc(i)"),
+            Some("Inc".to_string())
+        );
+        // Nested \E.
+        assert_eq!(
+            extract_action_name("\\E i \\in S : \\E j \\in T : Pair(i, j)"),
+            Some("Pair".to_string())
+        );
+        // No identifier => None (kills the "Some(\"xyzzy\")" mutant).
+        assert_eq!(extract_action_name("(1 + 2)"), None);
+        // Fairness regression: result must be the *exact* identifier, not
+        // empty string. A blank action name collides every disjunct into one
+        // ActionLabel, breaking weak/strong fairness on labeled SCCs.
+        let name = extract_action_name("DoStuff(x, y)").expect("identifier present");
+        assert_eq!(name, "DoStuff");
+        assert!(
+            !name.is_empty(),
+            "extract_action_name must not return empty"
+        );
+    }
+
+    #[test]
+    fn t4_split_top_level_cdot_recognises_action_composition() {
+        // Kills survivors at action_exec.rs:713 (split_top_level_cdot -> None)
+        // and the byte-counter/equality mutants on lines 725, 731, 734, 736,
+        // 739, 746, 748, 752–764. Without this test no integration-level
+        // assertion observes that A \cdot B actually splits in two.
+        let parts = split_top_level_cdot("A \\cdot B").expect("plain composition must split");
+        assert_eq!(parts, vec!["A ", " B"]);
+
+        // Composition inside parens at top level (the inner `\cdot` is still
+        // top-level after stripping outer parens upstream — but at the raw
+        // string level, parens guard it; the function should NOT split).
+        assert!(
+            split_top_level_cdot("(A \\cdot B)").is_none(),
+            "composition inside parens must not split at top level"
+        );
+
+        // Three-way composition.
+        let parts3 =
+            split_top_level_cdot("A \\cdot B \\cdot C").expect("three-way composition must split");
+        assert_eq!(parts3.len(), 3);
+        assert_eq!(parts3[0].trim(), "A");
+        assert_eq!(parts3[1].trim(), "B");
+        assert_eq!(parts3[2].trim(), "C");
+
+        // No \cdot anywhere => None.
+        assert!(split_top_level_cdot("A /\\ B").is_none());
+        assert!(split_top_level_cdot("A \\/ B").is_none());
+
+        // \cdot inside a string literal must not split.
+        assert!(
+            split_top_level_cdot(r#""A \cdot B""#).is_none(),
+            "\\cdot inside a string literal must not be recognised"
+        );
+
+        // \cdot inside <<>> tuple brackets must not split.
+        assert!(
+            split_top_level_cdot("<<A \\cdot B>>").is_none(),
+            "\\cdot inside <<>> tuple brackets must not split"
+        );
+    }
+
+    #[test]
+    fn t4_action_composition_executes_left_then_right() {
+        // Kills the "split_top_level_cdot -> None" mutant via end-to-end
+        // semantics: if the splitter doesn't recognise \cdot, the composition
+        // never runs and we'd get the wrong x' / y' assignments.
+        let defs = BTreeMap::from([
+            (
+                "Step1".to_string(),
+                TlaDefinition {
+                    name: "Step1".to_string(),
+                    params: vec![],
+                    body: "/\\ x' = x + 1 /\\ UNCHANGED y".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Step2".to_string(),
+                TlaDefinition {
+                    name: "Step2".to_string(),
+                    params: vec![],
+                    body: "/\\ y' = y + x /\\ UNCHANGED x".to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+
+        let state = tla_state([("x", TlaValue::Int(1)), ("y", TlaValue::Int(0))]);
+
+        // Step1 \cdot Step2 first executes Step1 (x: 1 -> 2), then Step2 reads
+        // the *intermediate* x' = 2 to set y' = 0 + 2 = 2.
+        let result = evaluate_next_states("Step1 \\cdot Step2", &defs, &state)
+            .expect("\\cdot composition must evaluate");
+
+        assert_eq!(
+            result.len(),
+            1,
+            "expected 1 successor from deterministic composition, got {}: {result:#?}",
+            result.len()
+        );
+        let next = &result[0];
+        assert_eq!(next.get("x"), Some(&TlaValue::Int(2)), "x' from Step1");
+        assert_eq!(
+            next.get("y"),
+            Some(&TlaValue::Int(2)),
+            "y' from Step2 must read the intermediate x' = 2 (composition order)"
+        );
+    }
+
+    #[test]
+    fn t4_evaluate_next_states_with_instances_does_not_propagate_branch_error_in_multi_branch_next()
+    {
+        // Kills action_exec.rs:169:66 ("disjuncts.len() == 1" -> "!= 1" in
+        // evaluate_next_states_with_instances). Original: only propagate the
+        // last error if there was a *single* branch and it errored. Mutated:
+        // propagate when there are multiple branches and any errored — which
+        // would mask the real "this branch is disabled at this state" semantics
+        // and convert benign empty results into hard errors mid-exploration.
+        //
+        // Setup: a 2-branch Next where the first branch evaluates *some*
+        // operator that errors at this particular state, and the second
+        // branch runs cleanly. Original behaviour: return the second branch's
+        // successor with no error. Mutated behaviour: propagate the first
+        // branch's error.
+        let defs = BTreeMap::from([(
+            "Next".to_string(),
+            TlaDefinition {
+                name: "Next".to_string(),
+                params: vec![],
+                // First disjunct accesses a function key that does not exist
+                // at this state and errors; second disjunct just stutters x.
+                body: "\\/ /\\ broken[\"missing\"] = 1
+                          /\\ x' = 99 /\\ UNCHANGED y
+                       \\/ /\\ x' = x + 1 /\\ UNCHANGED y"
+                    .to_string(),
+                is_recursive: false,
+            },
+        )]);
+
+        let state = tla_state([
+            ("x", TlaValue::Int(0)),
+            ("y", TlaValue::Int(0)),
+            ("broken", TlaValue::Function(Arc::new(BTreeMap::new()))),
+        ]);
+
+        let next_body = &defs.get("Next").expect("Next defined").body;
+        let result = evaluate_next_states(next_body, &defs, &state)
+            .expect("multi-branch Next with one disabled branch must succeed");
+
+        // Exactly one successor — from the second branch.
+        assert_eq!(
+            result.len(),
+            1,
+            "multi-branch error tolerance: expected 1 successor (from clean branch), got {}: {result:#?}",
+            result.len()
+        );
+        assert_eq!(result[0].get("x"), Some(&TlaValue::Int(1)));
+
+        // Companion: every branch errors. The mutation `disjuncts.len() == 1`
+        // -> `!= 1` fires *here* (len is 2, condition `2 != 1` is true), so
+        // the mutated code propagates the error while the original returns
+        // Ok([]). The original behaviour is required because most "errors" in
+        // practice are guards that just don't apply at this state.
+        let defs_all_err = BTreeMap::from([(
+            "Next".to_string(),
+            TlaDefinition {
+                name: "Next".to_string(),
+                params: vec![],
+                body: "\\/ /\\ broken[\"a\"] = 1
+                          /\\ x' = 99 /\\ UNCHANGED y
+                       \\/ /\\ broken[\"b\"] = 2
+                          /\\ x' = 99 /\\ UNCHANGED y"
+                    .to_string(),
+                is_recursive: false,
+            },
+        )]);
+        let next_body_all = &defs_all_err.get("Next").expect("Next defined").body;
+        let result_all = evaluate_next_states(next_body_all, &defs_all_err, &state)
+            .expect("multi-branch Next where every branch errors must return Ok([]) not Err");
+        assert!(
+            result_all.is_empty(),
+            "multi-branch with all-disabled branches must yield Ok([]), got {result_all:#?}"
+        );
+    }
+
+    #[test]
+    fn t4_count_next_disjuncts_returns_actual_disjunct_count() {
+        // Kills action_exec.rs:179:5 ("count_next_disjuncts -> 0" / "1").
+        // The swarm-mode + analyze-tla disjunct-counter has no direct tests.
+        assert_eq!(count_next_disjuncts("A"), 1);
+        assert_eq!(count_next_disjuncts("A \\/ B"), 2);
+        assert_eq!(count_next_disjuncts("A \\/ B \\/ C"), 3);
+        assert_eq!(
+            count_next_disjuncts(
+                "\\/ /\\ x' = 1 /\\ UNCHANGED y
+                 \\/ /\\ y' = 1 /\\ UNCHANGED x
+                 \\/ /\\ x' = x /\\ y' = y"
+            ),
+            3
+        );
+    }
+
+    #[test]
+    fn t4_evaluate_next_states_swarm_respects_enabled_index_subset() {
+        // Kills action_exec.rs:195 (swarm -> Ok(vec![]) / Ok(vec![Default]))
+        // and the bounds-check at 199:16 (`>=` -> `<` in `if idx >= disjuncts.len()`).
+        // Also kills 216:23/47/72 (the all-branches-error propagation guard).
+        // Swarm mode had zero direct test coverage prior to T4.
+        let defs = BTreeMap::from([(
+            "Next".to_string(),
+            TlaDefinition {
+                name: "Next".to_string(),
+                params: vec![],
+                body: "\\/ /\\ x' = x + 1 /\\ UNCHANGED y
+                       \\/ /\\ y' = y + 1 /\\ UNCHANGED x
+                       \\/ /\\ x' = x + 10 /\\ UNCHANGED y"
+                    .to_string(),
+                is_recursive: false,
+            },
+        )]);
+
+        let state = tla_state([("x", TlaValue::Int(0)), ("y", TlaValue::Int(0))]);
+        let next_body = &defs.get("Next").expect("Next defined").body;
+
+        // Enable only disjunct 0 (x' = x + 1): one successor.
+        let r0 = evaluate_next_states_swarm(next_body, &defs, None, &state, &[0])
+            .expect("swarm with single disjunct must succeed");
+        assert_eq!(r0.len(), 1);
+        assert_eq!(r0[0].get("x"), Some(&TlaValue::Int(1)));
+
+        // Enable disjuncts 0 and 2 (x' = x+1, x' = x+10): two successors.
+        let r02 = evaluate_next_states_swarm(next_body, &defs, None, &state, &[0, 2])
+            .expect("swarm with two disjuncts must succeed");
+        assert_eq!(r02.len(), 2);
+        let mut xs: Vec<i64> = r02
+            .iter()
+            .map(|s| s.get("x").and_then(|v| v.as_int().ok()).unwrap_or(-1))
+            .collect();
+        xs.sort();
+        assert_eq!(xs, vec![1, 10]);
+
+        // Out-of-range index is silently skipped (kills the bounds-check
+        // mutant `>=` -> `<` which would either panic or include nothing).
+        let r_oor = evaluate_next_states_swarm(next_body, &defs, None, &state, &[99])
+            .expect("out-of-range disjunct index must be skipped, not panic");
+        assert!(
+            r_oor.is_empty(),
+            "out-of-range index must yield no successor"
+        );
+
+        // Enable nothing: empty vector, not an error.
+        let r_empty = evaluate_next_states_swarm(next_body, &defs, None, &state, &[])
+            .expect("empty enabled set must yield Ok([])");
+        assert!(r_empty.is_empty());
+
+        // The "default-state" mutant Ok(vec![Default::default()]) returns a
+        // single empty TlaState, which we explicitly reject by checking the
+        // x-value of every returned successor matches a real disjunct.
+        for st in &r02 {
+            let x = st.get("x").and_then(|v| v.as_int().ok()).expect("x set");
+            assert!(
+                x == 1 || x == 10,
+                "swarm successor must come from a real disjunct, got x = {x}"
+            );
+        }
+    }
+
+    #[test]
+    fn t4_evaluate_next_states_labeled_with_instances_assigns_disjunct_indices_for_multi_branch_next()
+     {
+        // Kills action_exec.rs:233 / 244 (labeled -> Ok(vec![])) and 254:40
+        // (`disjuncts.len() > 1` -> `<`/`==`/`>=`). The fairness checker reads
+        // these labels to decide which actions are enabled in an SCC; mutating
+        // the comparator collapses or inflates the label set.
+        let defs = BTreeMap::from([(
+            "Next".to_string(),
+            TlaDefinition {
+                name: "Next".to_string(),
+                params: vec![],
+                body: "\\/ /\\ x' = x + 1 /\\ UNCHANGED y
+                       \\/ /\\ y' = y + 1 /\\ UNCHANGED x"
+                    .to_string(),
+                is_recursive: false,
+            },
+        )]);
+
+        let state = tla_state([("x", TlaValue::Int(0)), ("y", TlaValue::Int(0))]);
+        let next_body = &defs.get("Next").expect("Next defined").body;
+
+        let labeled = evaluate_next_states_labeled(next_body, "Next", &defs, &state)
+            .expect("labeled evaluation must succeed");
+
+        // Two transitions, one per disjunct.
+        assert_eq!(labeled.len(), 2, "{labeled:#?}");
+
+        // Each transition must carry a non-empty action name (kills the
+        // extract_action_name -> Some(String::new()) mutant transitively).
+        for tr in &labeled {
+            assert!(
+                !tr.action.name.is_empty(),
+                "fairness label must carry a non-empty action name, got {tr:?}"
+            );
+        }
+
+        // Multi-branch: each transition must be tagged with its disjunct
+        // index. If the comparator at 254:40 mutates from `>` to `==` / `<`
+        // / `>=`, the disjunct indices either disappear or duplicate, both
+        // of which break SCC-based fairness checks.
+        let mut disjunct_indices: Vec<Option<usize>> =
+            labeled.iter().map(|tr| tr.action.disjunct_index).collect();
+        disjunct_indices.sort();
+        assert_eq!(
+            disjunct_indices,
+            vec![Some(0), Some(1)],
+            "multi-branch labeled transitions must each carry a distinct disjunct_index, got {disjunct_indices:?}"
+        );
+    }
+
+    #[test]
+    fn t4_evaluate_next_states_labeled_single_disjunct_omits_index() {
+        // Companion to the multi-branch test above: the single-disjunct case
+        // must NOT assign a disjunct_index, so the comparator at 254:40 must
+        // be `>` (not `>=`, which would label single-disjunct transitions).
+        let defs = BTreeMap::from([(
+            "Next".to_string(),
+            TlaDefinition {
+                name: "Next".to_string(),
+                params: vec![],
+                body: "/\\ x' = x + 1 /\\ UNCHANGED y".to_string(),
+                is_recursive: false,
+            },
+        )]);
+
+        let state = tla_state([("x", TlaValue::Int(0)), ("y", TlaValue::Int(0))]);
+        let next_body = &defs.get("Next").expect("Next defined").body;
+
+        let labeled = evaluate_next_states_labeled(next_body, "Next", &defs, &state)
+            .expect("labeled evaluation must succeed");
+        assert_eq!(labeled.len(), 1);
+        assert_eq!(
+            labeled[0].action.disjunct_index, None,
+            "single-disjunct Next must not carry a disjunct_index, got {:?}",
+            labeled[0].action.disjunct_index
+        );
+    }
+
+    #[test]
+    fn t4_parse_binders_handles_multi_binder_with_top_level_comma() {
+        // Kills action_exec.rs:640:43, 645:37, 649:59 (`comma_idx + 1` -> `*` / `-`).
+        // Multi-binder \E quantifiers like `\E x \in S, y \in T : ...` rely on
+        // the comma-byte-offset arithmetic; mutating it either underflows the
+        // slice (panic) or feeds the wrong substring to the second binder
+        // (returning the wrong domain). Single-binder tests don't reach this
+        // code path.
+        let defs = BTreeMap::from([(
+            "Next".to_string(),
+            TlaDefinition {
+                name: "Next".to_string(),
+                params: vec![],
+                body: "\\E i \\in {1, 2}, j \\in {10, 20} : /\\ x' = i + j /\\ UNCHANGED y"
+                    .to_string(),
+                is_recursive: false,
+            },
+        )]);
+
+        let state = tla_state([("x", TlaValue::Int(0)), ("y", TlaValue::Int(0))]);
+        let next_body = &defs.get("Next").expect("Next defined").body;
+
+        let result = evaluate_next_states(next_body, &defs, &state)
+            .expect("multi-binder \\E must enumerate the cartesian product");
+
+        // Cartesian product {1,2} x {10,20} = 4 binding pairs => 4 successors.
+        assert_eq!(
+            result.len(),
+            4,
+            "expected 4 successors (|S|*|T|), got {}: {result:#?}",
+            result.len()
+        );
+
+        let mut xs: Vec<i64> = result
+            .iter()
+            .map(|s| s.get("x").and_then(|v| v.as_int().ok()).unwrap_or(-1))
+            .collect();
+        xs.sort();
+        assert_eq!(
+            xs,
+            vec![11, 12, 21, 22],
+            "expected x' = i + j for every (i, j) in {{1,2}} x {{10,20}}, got {xs:?}"
+        );
+    }
+
+    #[test]
+    fn t4_execute_branch_disjunction_split_decision_does_not_break_t1_5_shape() {
+        // Kills action_exec.rs:312 (`||` <-> `&&`, `<= 1` -> `> 1`) and 316
+        // (`disjuncts.len() > 1` -> `<` / `==` / `>=`, `disjuncts[0] != trimmed`
+        // -> `==`) — the disjunction-splitting decision in execute_branch.
+        //
+        // The existing T1.5 test only covers the `/\ guard /\ \/ A \/ B /\ post`
+        // shape (which falls through whether or not should_split flips). This
+        // additional test exercises the `\E x \in S : F(x) \/ G(x)` shape,
+        // where the splitter MUST keep the disjunction inside the quantifier
+        // body — splitting it eagerly would either panic on the bare second
+        // disjunct or generate garbage successors with `x` unbound.
+        let defs = BTreeMap::from([(
+            "Next".to_string(),
+            TlaDefinition {
+                name: "Next".to_string(),
+                params: vec![],
+                body: "\\E i \\in {1, 2} : \\/ /\\ x' = i /\\ UNCHANGED y
+                                              \\/ /\\ y' = i /\\ UNCHANGED x"
+                    .to_string(),
+                is_recursive: false,
+            },
+        )]);
+
+        let state = tla_state([("x", TlaValue::Int(0)), ("y", TlaValue::Int(0))]);
+        let next_body = &defs.get("Next").expect("Next defined").body;
+
+        let result = evaluate_next_states(next_body, &defs, &state)
+            .expect("\\E with inner disjunction must evaluate");
+
+        // 2 bindings x 2 inner disjuncts = 4 successors.
+        assert_eq!(
+            result.len(),
+            4,
+            "expected 4 successors (|S| * 2 inner disjuncts), got {}: {result:#?}",
+            result.len()
+        );
+
+        let mut x_y_pairs: Vec<(i64, i64)> = result
+            .iter()
+            .map(|s| {
+                let x = s.get("x").and_then(|v| v.as_int().ok()).unwrap_or(-1);
+                let y = s.get("y").and_then(|v| v.as_int().ok()).unwrap_or(-1);
+                (x, y)
+            })
+            .collect();
+        x_y_pairs.sort();
+        // Possible (x', y') pairs:
+        //   i=1, branch1: (1, 0); i=1, branch2: (0, 1)
+        //   i=2, branch1: (2, 0); i=2, branch2: (0, 2)
+        assert_eq!(x_y_pairs, vec![(0, 1), (0, 2), (1, 0), (2, 0)]);
+    }
+
+    #[test]
+    fn t4_execute_branch_inline_action_falls_back_to_interpreted_when_compiled_returns_empty() {
+        // Kills action_exec.rs:550:27 (match guard `!successors.is_empty()` ->
+        // `true` / `false` / delete `!`).
+        // Original: the inline-action fast path uses the compiled IR's result
+        // only when it produced at least one successor; otherwise it falls
+        // back to the interpreted IR. This exists because the compiled path
+        // sometimes silently returns `Ok(vec![])` for shapes it does not
+        // support (e.g. quantified inline bodies with EXCEPT-deep updates),
+        // when the interpreted IR would correctly enumerate them.
+        //
+        // We construct an inline body where the compiled IR is conservative
+        // (returns Ok([])) but the interpreted IR enumerates 2 successors:
+        // a quantifier over a 2-element set that primes a single variable.
+        let defs: BTreeMap<String, TlaDefinition> = BTreeMap::new();
+        let state = tla_state([("flip", TlaValue::String("H".to_string()))]);
+
+        // Inline action body — no Next definition wraps it. evaluate_next_states
+        // calls execute_branch directly with this string. The shape forces
+        // the inline-action code path at action_exec.rs:548-552.
+        let body = "\\E v \\in {\"H\", \"T\"} : flip' = v";
+
+        let result = evaluate_next_states(body, &defs, &state)
+            .expect("quantified inline body must enumerate both flips");
+
+        // We expect both H and T as successors. If the match-guard mutates so
+        // we *always* trust the compiled path (mutant `true`), we'd see 0
+        // (compiled returns empty) and the test would fail. If the mutant
+        // `false` flips us to *always* fall back, we still get the right
+        // answer (just slower) — but the `delete !` mutant inverts the guard
+        // so we trust compiled when it IS empty (i.e. always), which would
+        // also yield 0 successors.
+        assert_eq!(
+            result.len(),
+            2,
+            "expected both H and T successors, got {}: {result:#?}",
+            result.len()
+        );
+        let mut flips: Vec<String> = result
+            .iter()
+            .filter_map(|s| {
+                s.get("flip").and_then(|v| match v {
+                    TlaValue::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+            })
+            .collect();
+        flips.sort();
+        assert_eq!(flips, vec!["H".to_string(), "T".to_string()]);
+    }
 }

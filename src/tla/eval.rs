@@ -10663,4 +10663,240 @@ Buffer == INSTANCE RingBuffer
         .expect("nested range \\subseteq inside filter body should evaluate");
         assert_eq!(v, TlaValue::Set(Arc::new(BTreeSet::new())));
     }
+
+    // --- T4 mutation-kill tests -------------------------------------------
+    //
+    // The tests below close consequential coverage gaps surfaced by the
+    // cargo-mutants audit (RELEASE_1.0.0_LOG.md, T4). Each test is annotated
+    // with the line(s) of the mutant(s) it kills.
+
+    #[test]
+    fn t4_apply_comparison_kills_int_match_arm_deletion() {
+        // Kills eval.rs:457:9 (`delete match arm (TlaValue::Int(a), TlaValue::Int(b))`),
+        // 458:23 (`>=` -> `<`) and the surrounding integer comparison ops.
+        // apply_comparison is the transition-context comparison evaluator used
+        // by eval_action_constraint(); a soundness regression there silently
+        // mis-evaluates action constraints in temporal/fairness checks.
+        let current = tla_state([("x", TlaValue::Int(0)), ("y", TlaValue::Int(0))]);
+        let next = tla_state([("x", TlaValue::Int(5)), ("y", TlaValue::Int(3))]);
+
+        // x' >= x  : 5 >= 0  -> true (kills `>= -> <`).
+        assert!(
+            eval_action_constraint("x' >= x", &current, &next, None)
+                .expect("primed >= unprimed must evaluate"),
+            "primed integer comparison `x' >= x` must succeed when 5 >= 0"
+        );
+        // x' < x  : 5 < 0  -> false (kills `< -> >`).
+        assert!(
+            !eval_action_constraint("x' < x", &current, &next, None)
+                .expect("primed < unprimed must evaluate"),
+            "primed integer comparison `x' < x` must be false when 5 < 0"
+        );
+        // y' = y  : 3 = 0  -> false (kills the integer-arm deletion mutant).
+        assert!(
+            !eval_action_constraint("y' = y", &current, &next, None)
+                .expect("primed = must evaluate for ints"),
+            "primed integer equality `y' = y` must be false when 3 != 0"
+        );
+
+        // Equal values, equal comparison.
+        let current = tla_state([("z", TlaValue::Int(7))]);
+        let next = tla_state([("z", TlaValue::Int(7))]);
+        assert!(
+            eval_action_constraint("z' = z", &current, &next, None)
+                .expect("primed = must evaluate for equal ints"),
+            "z' = z must be true when both are 7"
+        );
+        assert!(
+            eval_action_constraint("z' >= z", &current, &next, None)
+                .expect("primed >= must evaluate for equal ints"),
+            "z' >= z must be true when both are 7"
+        );
+        assert!(
+            !eval_action_constraint("z' > z", &current, &next, None)
+                .expect("primed > must evaluate for equal ints"),
+            "z' > z must be false when both are 7"
+        );
+    }
+
+    #[test]
+    fn t4_is_identifier_rejects_non_identifier_starts() {
+        // Kills eval.rs:429:8 (`delete !` in `!(first.is_alphanumeric() || first == '_')`)
+        // and 438:31 (`|=` -> `&=` in `saw_identifier_marker |= ...`).
+        // is_identifier gates the transition evaluator's atom recognition;
+        // accepting a bare digit or symbol as an identifier silently coerces
+        // numeric literals into ModelValues during constraint checking.
+        assert!(is_identifier("x"));
+        assert!(is_identifier("foo_bar"));
+        assert!(is_identifier("x'"), "primed identifier must be accepted");
+        assert!(is_identifier("_internal"));
+
+        // Bare digits are NOT identifiers — kills the `delete !` mutant which
+        // would invert the leading-char check and accept "1" as an identifier.
+        assert!(!is_identifier("1"));
+        assert!(!is_identifier("123"));
+        assert!(!is_identifier("9'"));
+        // All-digit-with-underscore is also not an identifier — kills the
+        // `|=` -> `&=` mutant, because saw_identifier_marker must remain
+        // monotonically true once any letter / `_` is seen.
+        // "x1" must succeed (`x` sets the marker; `1` doesn't clear it under
+        // `|=` but would clear it under `&=`).
+        assert!(
+            is_identifier("x1"),
+            "alphanumeric identifier must be accepted; `|=` -> `&=` mutant breaks this"
+        );
+        assert!(is_identifier("a1b2c3"));
+
+        // Empty string => false.
+        assert!(!is_identifier(""));
+        // Symbol-leading => false.
+        assert!(!is_identifier("+x"));
+        assert!(!is_identifier("?"));
+    }
+
+    #[test]
+    fn t4_check_budget_decrements_not_increments() {
+        // Kills eval.rs:191:34 (`-` -> `+` in EvalContext::check_budget).
+        // The eval budget protects against exponential blowup in set
+        // construction. Mutating the decrement to an increment makes the
+        // budget unbounded, which would let probes / Init enumeration spend
+        // unbounded CPU on bad inputs.
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let state = TlaState::new();
+        let budget = Rc::new(Cell::new(10usize));
+        let ctx = EvalContext {
+            state: &state,
+            locals: Rc::new(BTreeMap::new()),
+            local_definitions: Rc::new(BTreeMap::new()),
+            definitions: None,
+            instances: None,
+            eval_budget: Some(Rc::clone(&budget)),
+        };
+
+        // First call: spend 5, leaving 5.
+        ctx.check_budget(5).expect("budget 5 of 10 should succeed");
+        assert_eq!(budget.get(), 5, "budget must decrement, not increment");
+        // Second: spend 5 more, leaving 0.
+        ctx.check_budget(5).expect("budget 5 of 5 should succeed");
+        assert_eq!(budget.get(), 0, "budget must hit zero after exact spend");
+        // Third: any non-zero spend must fail.
+        let err = ctx
+            .check_budget(1)
+            .expect_err("budget exhausted must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("budget") || msg.contains("Budget"),
+            "exhausted-budget error must mention 'budget', got {msg}"
+        );
+    }
+
+    #[test]
+    fn t4_split_top_level_set_minus_distinguishes_set_difference_from_backslash_operators() {
+        // Kills eval.rs:5681:.. (`!starts_with_tla_backslash_operator` mutants
+        // and `is_whitespace`/`!=` mutants in split_top_level_set_minus).
+        // The set-minus splitter walks the string char-by-char and must
+        // distinguish a bare `\` (set difference) from a `\` that introduces a
+        // TLA+ operator like `\union` / `\subseteq` / `\E`. No prior test
+        // exercised whitespace-boundary detection.
+
+        let parts = split_top_level_set_minus("S \\ T");
+        assert_eq!(
+            parts.len(),
+            2,
+            "S \\ T must split into [S, T], got {parts:?}"
+        );
+        assert_eq!(parts[0].trim(), "S");
+        assert_eq!(parts[1].trim(), "T");
+
+        // \union must NOT trigger a set-minus split.
+        let parts = split_top_level_set_minus("S \\union T");
+        assert_eq!(
+            parts,
+            vec!["S \\union T".to_string()],
+            "\\union must not be split as set-minus"
+        );
+        // \subseteq must NOT trigger.
+        let parts = split_top_level_set_minus("S \\subseteq T");
+        assert_eq!(parts, vec!["S \\subseteq T".to_string()]);
+        // \E quantifier must NOT trigger.
+        let parts = split_top_level_set_minus("\\E i \\in S : P(i)");
+        assert_eq!(parts, vec!["\\E i \\in S : P(i)".to_string()]);
+        // No backslash at all => single element.
+        let parts = split_top_level_set_minus("S \\union T \\union U");
+        assert_eq!(parts.len(), 1);
+        // Set difference inside a set literal is *not* top-level (kills the
+        // `match ch '{' / '}' brace-tracker mutants).
+        let parts = split_top_level_set_minus("{1 \\ 2}");
+        assert_eq!(parts, vec!["{1 \\ 2}".to_string()]);
+    }
+
+    #[test]
+    fn t4_split_top_level_range_distinguishes_dotdot_from_dotdotdot() {
+        // Kills mutants in eval.rs:5935 split_top_level_range — particularly
+        // the `i > 0` check guarding a non-empty LHS, and the `after == Some('.')`
+        // check that prevents `...` from being parsed as `..`.
+        let r = split_top_level_range("1..5").expect("simple range must split");
+        assert_eq!(r, ("1", "5"));
+
+        // Range with whitespace.
+        let r = split_top_level_range("a + 1 .. b - 1").expect("range with spaces must split");
+        assert_eq!(r.0.trim(), "a + 1");
+        assert_eq!(r.1.trim(), "b - 1");
+
+        // No `..` => None.
+        assert!(split_top_level_range("a + b").is_none());
+        // `..` inside parens does not split at top level.
+        assert!(
+            split_top_level_range("(1..3)").is_none(),
+            "`..` inside parens must not be top-level"
+        );
+        // `..` inside braces does not split at top level.
+        assert!(
+            split_top_level_range("{x \\in 1..5 : x > 2}").is_none(),
+            "`..` inside braces must not be top-level"
+        );
+        // `..` inside square brackets does not split.
+        assert!(
+            split_top_level_range("[i \\in 1..3 |-> i*i]").is_none(),
+            "`..` inside `[]` must not be top-level"
+        );
+    }
+
+    #[test]
+    fn t4_split_top_level_comparison_recognises_subseteq_and_distinguishes_set_ops() {
+        // Kills mutants in eval.rs:5736 split_top_level_comparison — most
+        // importantly the `pattern == "="` / `pattern.starts_with('\\')` /
+        // `has_word_boundaries` mutants. T2.3 fixed `..` precedence relative
+        // to set ops; this test pins that fix so it can't regress via mutation.
+        let (lhs, op, rhs) = split_top_level_comparison("1..3 \\subseteq S")
+            .expect("range \\subseteq set must split");
+        assert_eq!(lhs.trim(), "1..3");
+        assert_eq!(op, "\\subseteq");
+        assert_eq!(rhs.trim(), "S");
+
+        // `=` must not trigger inside `==` (although TLA+ doesn't use `==`,
+        // the disambiguation guard at 5871 protects against `<>` / `>=`).
+        let (_lhs, op, _rhs) = split_top_level_comparison("a >= b").expect("a >= b must split");
+        assert_eq!(op, ">=");
+
+        // `<=` and `=<` are both accepted (TLA+ leq).
+        let (_lhs, op, _rhs) = split_top_level_comparison("a <= b").expect("a <= b must split");
+        assert_eq!(op, "<=");
+        let (_lhs, op, _rhs) = split_top_level_comparison("a =< b").expect("a =< b must split");
+        assert_eq!(op, "=<");
+
+        // `\notin` distinct from `\in`.
+        let (_lhs, op, _rhs) =
+            split_top_level_comparison("x \\notin S").expect("\\notin must split");
+        assert_eq!(op, "\\notin");
+
+        // Membership inside a function-application bracket is NOT top-level.
+        // f[1] = 2  parses as f[1] = 2 (the `=` is at top-level despite the
+        // `[]` wrapper around `1`).
+        let (_lhs, op, _rhs) =
+            split_top_level_comparison("f[1] = 2").expect("f[1] = 2 must split on top-level `=`");
+        assert_eq!(op, "=");
+    }
 }
