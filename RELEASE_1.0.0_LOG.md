@@ -369,3 +369,114 @@ interpreted IR.
 
 **Commit:** `2881d8b`.
 
+### T1.4 — SOUNDNESS fix: compiled expr mis-split LET body on indented `\/`, silently TRUE for `\A x : \E m \in {} : ...`
+
+**Date:** 2026-04-26.
+
+**Symptom:** the parked test
+`src/tla/action_exec.rs::tests::parsed_paxos_style_probe_keeps_let_locals_in_scope_with_operator_overrides`
+asserted only `>= 3` Phase2a successors instead of the correct exact `3`,
+because the compiled-expression evaluator returned TRUE for the guard
+
+```tla
+\A a \in Q : \E m \in Q1b : m.acc = a
+```
+
+at an initial Paxos state where `Q1b = {}` (no `1b` messages yet). Since
+`\E m \in {} : ...` is FALSE for any body, the universal must be FALSE
+for any non-empty `Q` — but the compiled fast path silently returned
+TRUE, over-counting Phase2a successors by `|Quorum| × |Value| = 6` per
+ballot (21 instead of 3). Any Paxos-style or distributed-protocol spec
+using the universally-quantified-existential pattern would silently pass
+invariants it should fail.
+
+**Root cause:** in `src/tla/compiled_expr.rs::compile_expr` the multi-line
+LET body inside `Phase2a`,
+
+```text
+/\ \A a \in Q : \E m \in Q1b : m.acc = a
+/\ \/ Q1bv = {}
+   \/ \E m \in Q1bv : ...
+```
+
+is dispatched to `formula::split_top_level(body, "\\/")` BEFORE the
+`/\` split. `formula::split_top_level` is body-delimiter aware (it
+correctly treats `\\E m \\in S : body` as one unit) but is **not**
+indentation-aware: once `in_quantifier_body` becomes true after `\\E m
+\\in Q1b :` the splitter's only short-circuit for `\\/` is "did the
+quantifier body itself start with `\\/`?" — for our shape it didn't, so
+the splitter happily sliced on the indented inner `\\/` lines and
+returned **three** disjuncts, producing `Or([Forall, Eq(Q1bv, {}),
+Exists])` instead of the correct nested `And([Forall, Or([Eq,
+Exists])])`. The flat `Or` includes `Q1bv = {}` which is TRUE at the
+initial state, so the entire compiled expression evaluated TRUE and
+silently masked the Paxos guard.
+
+The interpreted evaluator was unaffected — it has a separate
+`split_indented_top_level_boolean` pre-pass (`src/tla/eval.rs:5478`).
+Only the compiled fast path lacked it.
+
+**Fix location:** `src/tla/compiled_expr.rs:557-578` plus a new helper
+`split_indented_top_level_boolean` (~line 1000) and its companion
+`normalize_multiline_boolean_indentation`. Before falling through to the
+symbol-based `\\/` and `/\\` splits, `compile_expr` now tries
+indentation-based splitting on `/\\` first, then on `\\/`. The helper
+finds the smallest indent at which a line begins with the delimiter and
+splits only at that level — inner indented `\\/` and `/\\` are kept as
+part of the current clause for recursive `compile_expr` calls. After the
+fix the same Phase2a body compiles to `And([Forall { ... }, Or([Eq,
+Exists])])`, the universal correctly evaluates to FALSE at the initial
+state, and Phase2a is disabled (the only enabled action is Phase1a).
+
+**Regression tests added** (all in `src/tla/compiled_eval.rs::forall_tests`):
+- `t1_4_exists_over_empty_set_is_false` — minimal `\\E m \\in {} : TRUE`
+  must be FALSE.
+- `t1_4_forall_over_inner_empty_exists_is_false` — outer `\\A a \\in {1,
+  2, 3}` over inner empty `\\E` must be FALSE.
+- `t1_4_forall_over_inner_exists_with_let_bound_empty_set_is_false` —
+  same shape but with the inner-`\\E` domain bound by a LET.
+- `t1_4_paxos_phase2a_guard_with_empty_msgs_is_false` — exact Phase2a
+  guard shape with `msgs = {}` and a non-empty `Q`.
+
+Plus updated two existing tests to assert the (now correct) exact counts
+instead of the buggy over-counts:
+- `tests::parsed_paxos_style_probe_keeps_let_locals_in_scope_with_operator_overrides`
+  — strengthened from `>= 3` to exactly `3` (Phase1a per ballot in
+  `Ballot = 0..2`); removed the TODO comment.
+- `tests::parsed_module_probe_matches_model_state_for_phase2a_let_guards`
+  — corrected from `2` to `1` (the buggy `2` came from the same `Or`
+  mis-shape; the correct semantics for a single Quorum × single Value ×
+  single Ballot Phase2a is one new `2a` message).
+
+**Validation:**
+- `cargo test --release` → **609 tests passing, 0 failing** (480 lib +
+  90 bin + 15 + 11 + 5 + 6 + 2 across `tests/`, 1 ignored). The four new
+  T1.4 unit tests are part of the 480.
+- `scripts/diff_tlc.sh` → **12/12 PASS, 0 fail, 0 allowlisted**. No
+  regressions; CheckpointDrain (26344 distinct), QueueSegmentSync
+  (1531/32 distinct), ViewTest (106 distinct) all still match TLC.
+- Sample corpus parity (5 internal specs with quantifiers, run on the
+  spot under `--workers 4`): **WorkStealingTermination → 64,805 distinct
+  (matches TLC 64,805)**, CheckpointDrain matched in the diff harness,
+  FingerprintStoreResize produces the same pre-existing
+  `expected Int, got Bool(false)` invariant evaluation issue **before
+  and after the fix** (so it is unrelated to T1.4 and does not
+  regress). BloomAutoSwitch and FingerprintResize did not finish under
+  the 2-min timeout but reached the same per-progress-line state counts
+  as baseline runs; no panics, no `\E`/`\A` divergences observed.
+- Phase2a probe count: was `21` (over-counted, `|Quorum| × |Value| × 3
+  ballots`), now exactly `3` (Phase1a per ballot, Phase2a correctly
+  disabled).
+
+**Wider scope discovered:** None new. The fix is contained to
+`compile_expr` and is symmetric with the long-existing
+`split_indented_top_level_boolean` in the interpreted evaluator. The
+old indentation-aware splitter `split_top_level_old` in
+`src/tla/compiled_expr.rs` (still marked `#[allow(dead_code)]`) attempted
+this logic via column tracking but was disabled because trimming the
+expression broke its first-line indent calculation; the new helper sits
+strictly above the body-delimiter splitter and complements rather than
+replaces it.
+
+**Commit:** `a7dfa1a`.
+
