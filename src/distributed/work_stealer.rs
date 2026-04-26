@@ -309,6 +309,14 @@ impl DistributedWorkStealer {
         self.locally_idle.store(idle, Ordering::Release);
     }
 
+    /// Is this node currently locally idle?
+    /// Used by the termination broadcaster — peers consume this to compute
+    /// their own `all_nodes_idle()`. Earlier versions broadcast the global
+    /// view, which is circular and prevents convergence.
+    pub fn is_locally_idle(&self) -> bool {
+        self.locally_idle.load(Ordering::Acquire)
+    }
+
     /// Record that a peer reported itself as idle.
     pub fn set_peer_idle(&self, peer_node_id: u32, idle: bool) {
         if let Some(flag) = self.peer_idle.get(peer_node_id as usize) {

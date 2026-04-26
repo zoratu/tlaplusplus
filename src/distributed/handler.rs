@@ -186,11 +186,13 @@ pub fn spawn_bloom_and_termination_task(
             // Trigger bloom exchange if enough time has elapsed
             stealer.maybe_exchange_bloom();
 
-            // Broadcast termination status
+            // Broadcast OUR local idle status. The peer uses this to compute
+            // ITS view of `all_nodes_idle`. (Earlier versions broadcast the
+            // global view, which is circular and prevents convergence.)
             let token = Message::TerminationToken {
                 initiator: stealer.node_id(),
                 round,
-                all_idle: stealer.all_nodes_idle(),
+                all_idle: stealer.is_locally_idle(),
             };
 
             if let Err(e) = transport.broadcast(&token).await {
