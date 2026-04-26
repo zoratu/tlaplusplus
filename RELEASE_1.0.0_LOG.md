@@ -2091,3 +2091,60 @@ that's tracked for v1.1+.
 **T15 — tag and push.** Local v1.0.0 tag created via
 `git tag -a v1.0.0 -m "..."`. **Tag NOT pushed** — that and
 `gh release create` are user-triggered per the brief.
+
+### T12.1 — explicit stack-size for recursive depth-limit test
+
+**Symptom.** `cargo test --lib` on Actions x86_64 runners overflowed the
+stack inside `tla::eval::tests::recursive_operator_respects_depth_limit`.
+The test defines `Forever(n) == Forever(n + 1)` and calls `Forever(0)`
+to assert the eval engine returns a "recursion depth exceeded" error
+rather than hanging. The eval recursion is allowed to climb to
+`MAX_EVAL_DEPTH = 256` before the guard fires, and on x86_64 Linux
+release builds each `eval_expr → eval_operator_call → eval_expr` round
+of frames is large enough that the cumulative stack footprint exceeds
+Actions' default 2 MB per-test thread stack — but only on x86_64, not
+on aarch64 (where frames are tighter under the C8G micro-arch).
+
+**Fix shape.** Option 1 from the brief: wrap the test body in a
+dedicated `std::thread::Builder::new().stack_size(8 * 1024 * 1024)`
+thread and `.join()` it. The test is now self-contained: it gets an
+8 MB stack on any host, so the assertion is independent of the runner's
+default thread stack. Production code (`MAX_EVAL_DEPTH`,
+`eval_operator_call`, the recursion guard itself) is untouched —
+soundness margin and depth limit are unchanged. Option 2 (lower the
+constant) was rejected because it would weaken what we're testing.
+Option 3 (`#[cfg]` skip on x86) was rejected because it loses CI
+coverage on the dominant CI architecture.
+
+**File touched.** `src/tla/eval.rs:8967-9009` (test body only).
+
+**Validation.**
+
+- `aarch64` spot (c8g.xlarge, Ubuntu 25.10, `RUST_MIN_STACK` left at
+  default) — `cargo test --release --lib
+  recursive_operator_respects_depth_limit` passes; `1 passed; 0 failed`.
+- `x86_64` spot (inf1.2xlarge, Ubuntu 25.10) reproducing the Actions
+  constraint with `RUST_MIN_STACK=2097152` (mirrors the 2 MB Actions
+  default) — `cargo test --release --lib
+  recursive_operator_respects_depth_limit` passes; `1 passed; 0 failed`.
+  Same command on the unfixed test reproduces the stack overflow at
+  `RUST_MIN_STACK=2097152` (confirmed by the brief's CI evidence;
+  not re-tested here because the fix has already been applied to the
+  worktree being validated).
+
+**Why this is safe under the v1.0.0 freeze.** Test-only change in a
+single file; production code paths (`eval_expr`, `eval_operator_call`,
+`MAX_EVAL_DEPTH`) are untouched. Existing aarch64 spot regression
+(727-test default suite) is the surrounding reference — only the one
+test changes shape; the assertions are byte-identical, just executed
+from a 8 MB-stacked helper thread.
+
+**Plan & log.** `RELEASE_1.0.0_PLAN.md` T12.1 flipped from
+`[ ] DEFER TO 1.1.0` to `[x] Done`; the deferred-summary table row at
+~line 2007 is left as historical record (it captured the pre-fix
+posture). No other plan/log lines touched, to minimize merge conflict
+surface with concurrent v1.1.0 follow-up worktrees.
+
+**Commit.** Worktree branch `worktree-agent-a059824b3cada5666`,
+single commit `fix(t12.1): explicit stack-size for recursive depth-limit test`.
+Not pushed (per brief).

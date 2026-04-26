@@ -8966,32 +8966,45 @@ IN
 
     #[test]
     fn recursive_operator_respects_depth_limit() {
-        // Define a recursive operator that never terminates (no base case)
-        let defs = BTreeMap::from([(
-            "Forever".to_string(),
-            TlaDefinition {
-                name: "Forever".to_string(),
-                params: vec!["n".to_string()],
-                body: "Forever(n + 1)".to_string(),
-                is_recursive: true,
-            },
-        )]);
+        // Run the recursive evaluation on a dedicated thread with an explicit
+        // 8 MB stack. The eval recursion is allowed to climb to MAX_EVAL_DEPTH
+        // (256) before the depth-limit error fires, and each frame on x86_64
+        // Linux release-with-debug builds can exceed what fits in GitHub
+        // Actions' default 2 MB thread stack. A larger fixed budget makes the
+        // test self-contained on any host (T12.1).
+        let handle = std::thread::Builder::new()
+            .name("recursive_operator_depth_limit_test".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                // Define a recursive operator that never terminates (no base case)
+                let defs = BTreeMap::from([(
+                    "Forever".to_string(),
+                    TlaDefinition {
+                        name: "Forever".to_string(),
+                        params: vec!["n".to_string()],
+                        body: "Forever(n + 1)".to_string(),
+                        is_recursive: true,
+                    },
+                )]);
 
-        let state = TlaState::new();
-        let ctx = EvalContext::with_definitions(&state, &defs);
+                let state = TlaState::new();
+                let ctx = EvalContext::with_definitions(&state, &defs);
 
-        // This should fail with a depth limit error, not hang forever
-        let result = eval_expr("Forever(0)", &ctx);
-        assert!(
-            result.is_err(),
-            "Forever should fail with recursion depth limit"
-        );
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("recursion depth") || err_msg.contains("depth limit"),
-            "Error should mention recursion depth: {}",
-            err_msg
-        );
+                // This should fail with a depth limit error, not hang forever
+                let result = eval_expr("Forever(0)", &ctx);
+                assert!(
+                    result.is_err(),
+                    "Forever should fail with recursion depth limit"
+                );
+                let err_msg = result.unwrap_err().to_string();
+                assert!(
+                    err_msg.contains("recursion depth") || err_msg.contains("depth limit"),
+                    "Error should mention recursion depth: {}",
+                    err_msg
+                );
+            })
+            .expect("spawn recursive-depth-limit test thread");
+        handle.join().expect("recursive-depth-limit test thread");
     }
 
     #[test]
