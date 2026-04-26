@@ -19,7 +19,9 @@ use std::sync::Arc;
 use proptest::prelude::*;
 use tlaplusplus::tla::eval::EvalContext;
 use tlaplusplus::tla::module::TlaModuleInstance;
-use tlaplusplus::tla::symbolic_init::try_symbolic_record_set_enumerate;
+use tlaplusplus::tla::symbolic_init::{
+    try_symbolic_function_set_enumerate, try_symbolic_record_set_enumerate,
+};
 use tlaplusplus::tla::value::TlaValue;
 
 fn arb_int_domain() -> impl Strategy<Value = Vec<TlaValue>> {
@@ -136,6 +138,113 @@ proptest! {
                 &sym_set, &bf,
                 "symbolic vs brute_force mismatch on predicate `{}`",
                 pred
+            );
+        }
+    }
+}
+
+// ============================================================================
+// T5.1 — sequence-set / function-set equivalence (symbolic vs brute force)
+// ============================================================================
+
+fn arb_seq_predicate(_seq_len: usize) -> impl Strategy<Value = String> {
+    prop_oneof![
+        Just("TRUE".to_string()),
+        Just("p[1] = 1".to_string()),
+        Just("p[1] # p[2]".to_string()),
+        Just("p[1] + p[2] = 4".to_string()),
+        Just("p[1] < p[2]".to_string()),
+        Just("p[2] \\in {1,2}".to_string()),
+        Just("p[1] # p[2] /\\ p[2] # p[3]".to_string()),
+        Just("p[1] # p[2] /\\ p[1] # p[3] /\\ p[2] # p[3]".to_string()),
+        Just("p[3] \\in {1,2,3} \\ {p[1]}".to_string()),
+        Just("p[3] \\in {1,2,3} \\ {p[1], p[2]}".to_string()),
+        Just("p[1] = 1 \\/ p[2] = 1".to_string()),
+        Just("(p[1] + p[3] = 4) /\\ (p[2] = 2)".to_string()),
+    ]
+}
+
+/// Brute-force predicate evaluator over int sequences of length n in 1..=k.
+fn brute_force_seqs(n: usize, range_max: i64, pred: &str) -> std::collections::BTreeSet<TlaValue> {
+    let mut out = std::collections::BTreeSet::new();
+    let mut idx = vec![1i64; n];
+    loop {
+        let satisfies = match pred {
+            "TRUE" => true,
+            "p[1] = 1" => idx[0] == 1,
+            "p[1] # p[2]" => n >= 2 && idx[0] != idx[1],
+            "p[1] + p[2] = 4" => n >= 2 && idx[0] + idx[1] == 4,
+            "p[1] < p[2]" => n >= 2 && idx[0] < idx[1],
+            "p[2] \\in {1,2}" => n >= 2 && (idx[1] == 1 || idx[1] == 2),
+            "p[1] # p[2] /\\ p[2] # p[3]" => n >= 3 && idx[0] != idx[1] && idx[1] != idx[2],
+            "p[1] # p[2] /\\ p[1] # p[3] /\\ p[2] # p[3]" => {
+                n >= 3 && idx[0] != idx[1] && idx[0] != idx[2] && idx[1] != idx[2]
+            }
+            "p[3] \\in {1,2,3} \\ {p[1]}" => {
+                n >= 3 && idx[2] != idx[0] && (1..=3).contains(&idx[2])
+            }
+            "p[3] \\in {1,2,3} \\ {p[1], p[2]}" => {
+                n >= 3
+                    && idx[2] != idx[0]
+                    && idx[2] != idx[1]
+                    && (1..=3).contains(&idx[2])
+            }
+            "p[1] = 1 \\/ p[2] = 1" => n >= 2 && (idx[0] == 1 || idx[1] == 1),
+            "(p[1] + p[3] = 4) /\\ (p[2] = 2)" => {
+                n >= 3 && idx[0] + idx[2] == 4 && idx[1] == 2
+            }
+            _ => unreachable!("unhandled seq predicate {pred}"),
+        };
+        if satisfies {
+            let s: Vec<TlaValue> = idx.iter().map(|&v| TlaValue::Int(v)).collect();
+            out.insert(TlaValue::Seq(Arc::new(s)));
+        }
+        // Increment odometer (1..=range_max).
+        let mut carry = true;
+        for i in (0..n).rev() {
+            if carry {
+                idx[i] += 1;
+                if idx[i] <= range_max {
+                    carry = false;
+                } else {
+                    idx[i] = 1;
+                }
+            }
+        }
+        if carry {
+            break;
+        }
+    }
+    out
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 64,
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn symbolic_sequence_matches_brute_force_int_range(
+        n in 2usize..=4,
+        range_max in 2i64..=4,
+        pred in arb_seq_predicate(3),
+    ) {
+        let state = BTreeMap::new();
+        let defs = BTreeMap::new();
+        let instances = BTreeMap::new();
+        let ctx = make_ctx(&state, &defs, &instances);
+        let range: Vec<TlaValue> = (1..=range_max).map(TlaValue::Int).collect();
+
+        let symbolic = try_symbolic_function_set_enumerate(&pred, "p", n, &range, &ctx);
+        let bf = brute_force_seqs(n, range_max, &pred);
+
+        if let Some(sym) = symbolic {
+            let sym_set: BTreeSet<TlaValue> = sym.into_iter().collect();
+            prop_assert_eq!(
+                &sym_set, &bf,
+                "symbolic vs brute_force mismatch (n={}, range={}, pred={})",
+                n, range_max, pred
             );
         }
     }
