@@ -2205,5 +2205,5 @@ minimal.
 **Commits (worktree branch, NOT pushed to origin):**
 - `feat(t9.1): transitive variable relevance through operator inlining` — `e9e019f`
 - `perf(t9.2): multi-source BFS seed (init + median) for long-trace minimization` — `f0a5da4`
-- `feat(t9.3): suffix shortening to alternate violations` — `03466bb`
+- `feat(t9.3): suffix shortening to alternate violations` — `8252eb8`
 
