@@ -1023,5 +1023,5 @@ Decided to **NOT** wire mutation testing into PR CI: the full audit takes 3.5 ho
 
 Future T4-like audits should be run manually after major eval/exec changes (e.g. before tagging a 1.x release), not on every PR. A weekly cron-style GitHub workflow could be added but is not part of T4's scope.
 
-**Commit:** _pending_ (filled in after `git push`).
+**Commit:** `d127647`.
 
