@@ -1454,14 +1454,6 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
                 let rhs_set = right.as_set()?;
                 Ok(TlaValue::Bool(lhs_set.iter().all(|v| rhs_set.contains(v))))
             }
-            ".." => {
-                // Range operator: a..b creates set {a, a+1, ..., b}
-                let right = eval_expr_inner(rhs, ctx, depth + 1)?;
-                let start = left.as_int()?;
-                let end = right.as_int()?;
-                let range_set: BTreeSet<TlaValue> = (start..=end).map(TlaValue::Int).collect();
-                Ok(TlaValue::Set(Arc::new(range_set)))
-            }
             _ => Err(anyhow!("unsupported comparison operator {op}")),
         };
     }
@@ -1603,6 +1595,24 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
         let left = eval_expr_inner(lhs, ctx, depth + 1)?.as_int()?;
         let right = eval_expr_inner(rhs, ctx, depth + 1)?.as_int()?;
         return Ok(TlaValue::Int(left ^ right));
+    }
+
+    // Range operator `a..b` (precedence 9-9 in TLA+). Slotted between the
+    // set-op tier (8-8: `\union`, `\intersect`, `\\`) above and the additive
+    // tier (10-10: `+`, `-`) below — `..` binds tighter than set ops/relops
+    // but looser than `+`/`-`. So `1+2..n*3 \subseteq S` parses as
+    // `((1+2) .. (n*3)) \subseteq S`.
+    if let Some((lhs, rhs)) = split_top_level_range(expr) {
+        let left = eval_expr_inner(lhs, ctx, depth + 1)?;
+        let right = eval_expr_inner(rhs, ctx, depth + 1)?;
+        let start = left.as_int()?;
+        let end = right.as_int()?;
+        let range_set: BTreeSet<TlaValue> = if start <= end {
+            (start..=end).map(TlaValue::Int).collect()
+        } else {
+            BTreeSet::new()
+        };
+        return Ok(TlaValue::Set(Arc::new(range_set)));
     }
 
     if let Some((lhs, op, rhs)) = split_top_level_additive(expr) {
@@ -5724,11 +5734,21 @@ fn starts_with_tla_backslash_operator(expr: &str) -> bool {
 }
 
 fn split_top_level_comparison(expr: &str) -> Option<(&str, &'static str, &str)> {
+    // NOTE: `..` is intentionally NOT in this list. The TLA+ range operator
+    // `..` has precedence 9-9 in the official TLA+ grammar (Lamport's
+    // "Specifying Systems", cheat sheet), which is *tighter* than the
+    // relational/comparison tier (5-5: `\subseteq`, `\in`, `=`, `<`, ...) and
+    // tighter than the set-op tier (8-8: `\union`, `\intersect`, `\` ...).
+    // Splitting on `..` here would cause `1..3 \subseteq S` to parse as
+    // `1 .. (3 \subseteq S)` — a soundness bug that silently misparses any
+    // spec writing `n..m \subseteq S` (or `\union`, `\intersect`, `\\`)
+    // without paren-wrapping the range. `..` is split separately below in
+    // `split_top_level_range`, slotted between the set-op tier and the
+    // additive tier (10-10) in the operator-precedence cascade.
     let patterns = [
         "\\subseteq",
         "\\notin",
         "\\in",
-        "..",
         "\\leq",
         "\\geq",
         "=<",
@@ -5893,6 +5913,98 @@ fn split_top_level_comparison(expr: &str) -> Option<(&str, &'static str, &str)> 
                     continue;
                 }
                 return Some((lhs, pattern, rhs));
+            }
+        }
+
+        i += ch_len;
+    }
+
+    None
+}
+
+/// Split a top-level `..` range operator (TLA+ precedence 9-9). Looks for the
+/// first `..` at top bracket depth (not inside parens/brackets/braces/angles)
+/// and not inside a string literal. Care taken to:
+///   - skip leading `..` if it appears at the very start (e.g. inside `[..` --
+///     defensive; nothing legal starts with `..`),
+///   - require both sides non-empty after trimming.
+///
+/// `..` is left-associative but rarely chained; we split at the *first*
+/// occurrence so `a..b..c` (uncommon) parses as `a .. (b..c)`. Either choice
+/// is fine; the recursive call on `b..c` will then split there.
+fn split_top_level_range(expr: &str) -> Option<(&str, &str)> {
+    let bytes = expr.as_bytes();
+    let mut i = 0usize;
+    let mut paren = 0usize;
+    let mut bracket = 0usize;
+    let mut brace = 0usize;
+    let mut angle = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    while i + 1 < bytes.len() {
+        let ch = expr[i..].chars().next().expect("char at byte index");
+        let ch_len = ch.len_utf8();
+        let next = expr[i + ch_len..].chars().next();
+
+        if in_string {
+            if escaped {
+                escaped = false;
+                i += ch_len;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                i += ch_len;
+                continue;
+            }
+            if ch == '"' {
+                in_string = false;
+            }
+            i += ch_len;
+            continue;
+        }
+
+        if ch == '"' {
+            in_string = true;
+            i += ch_len;
+            continue;
+        }
+
+        if ch == '<' && next == Some('<') {
+            angle += 1;
+            i += 2;
+            continue;
+        }
+        if ch == '>' && next == Some('>') {
+            angle = angle.saturating_sub(1);
+            i += 2;
+            continue;
+        }
+
+        match ch {
+            '(' => paren += 1,
+            ')' => paren = paren.saturating_sub(1),
+            '[' => bracket += 1,
+            ']' => bracket = bracket.saturating_sub(1),
+            '{' => brace += 1,
+            '}' => brace = brace.saturating_sub(1),
+            _ => {}
+        }
+
+        let at_top = paren == 0 && bracket == 0 && brace == 0 && angle == 0;
+        if at_top && ch == '.' && next == Some('.') && i > 0 {
+            // Avoid mistaking `...` (e.g. in record `[f : Set, ...]`) for `..`.
+            // TLA+ doesn't really use `...` but be defensive.
+            let after = expr.get(i + 2..).and_then(|s| s.chars().next());
+            if after == Some('.') {
+                i += ch_len;
+                continue;
+            }
+            let lhs = expr[..i].trim();
+            let rhs = expr[i + 2..].trim();
+            if !lhs.is_empty() && !rhs.is_empty() {
+                return Some((lhs, rhs));
             }
         }
 
@@ -10399,5 +10511,156 @@ Buffer == INSTANCE RingBuffer
         let value = eval_expr("Transition[\"s0\"][\"H\"]", &ctx)
             .expect("zero-arg operator result should be indexable");
         assert_eq!(value, TlaValue::String("1".to_string()));
+    }
+
+    // T2.3 SOUNDNESS regression: `..` (TLA+ precedence 9-9) must bind tighter
+    // than the set-op tier (8-8: `\union`, `\intersect`, `\\`) and tighter
+    // than the relational/comparison tier (5-5: `\subseteq`, `=`, etc.).
+    // Previously `1..3 \subseteq S` was misparsed as `1 .. (3 \subseteq S)`,
+    // typically surfacing as `Err(expected Set, got Int(3))`. This silently
+    // misparses any spec writing `n..m \subseteq S` (or with `\union`,
+    // `\intersect`, `\\`) without paren-wrapping the range.
+    //
+    // These tests exercise both forms (paren-wrapped and bare) for each
+    // set-op pairing. All must succeed and return the same value.
+    #[test]
+    fn t2_3_dotdot_binds_tighter_than_subseteq() {
+        let state = TlaState::new();
+        let defs = BTreeMap::new();
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        let paren = eval_expr("(1..3) \\subseteq {0, 0}", &ctx)
+            .expect("paren-wrapped range \\subseteq set should evaluate");
+        assert_eq!(paren, TlaValue::Bool(false));
+
+        let bare = eval_expr("1..3 \\subseteq {0, 0}", &ctx)
+            .expect("bare range \\subseteq set should evaluate (not type-error)");
+        assert_eq!(bare, TlaValue::Bool(false));
+
+        let true_case = eval_expr("1..3 \\subseteq {1, 2, 3, 4}", &ctx)
+            .expect("range subset of larger set should be true");
+        assert_eq!(true_case, TlaValue::Bool(true));
+    }
+
+    #[test]
+    fn t2_3_dotdot_binds_tighter_than_union() {
+        let state = TlaState::new();
+        let defs = BTreeMap::new();
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        let paren = eval_expr("(1..3) \\union {5}", &ctx)
+            .expect("paren-wrapped range \\union set should evaluate");
+        let bare =
+            eval_expr("1..3 \\union {5}", &ctx).expect("bare range \\union set should evaluate");
+        let expected = TlaValue::Set(Arc::new(BTreeSet::from([
+            TlaValue::Int(1),
+            TlaValue::Int(2),
+            TlaValue::Int(3),
+            TlaValue::Int(5),
+        ])));
+        assert_eq!(paren, expected);
+        assert_eq!(bare, expected);
+    }
+
+    #[test]
+    fn t2_3_dotdot_binds_tighter_than_intersect() {
+        let state = TlaState::new();
+        let defs = BTreeMap::new();
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        let paren = eval_expr("(1..3) \\intersect {2, 7}", &ctx)
+            .expect("paren-wrapped range \\intersect set should evaluate");
+        let bare = eval_expr("1..3 \\intersect {2, 7}", &ctx)
+            .expect("bare range \\intersect set should evaluate");
+        let expected = TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(2)])));
+        assert_eq!(paren, expected);
+        assert_eq!(bare, expected);
+    }
+
+    #[test]
+    fn t2_3_dotdot_binds_tighter_than_set_minus() {
+        let state = TlaState::new();
+        let defs = BTreeMap::new();
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        let paren = eval_expr("(1..5) \\ {2, 4}", &ctx)
+            .expect("paren-wrapped range \\ set should evaluate");
+        let bare = eval_expr("1..5 \\ {2, 4}", &ctx).expect("bare range \\ set should evaluate");
+        let expected = TlaValue::Set(Arc::new(BTreeSet::from([
+            TlaValue::Int(1),
+            TlaValue::Int(3),
+            TlaValue::Int(5),
+        ])));
+        assert_eq!(paren, expected);
+        assert_eq!(bare, expected);
+    }
+
+    #[test]
+    fn t2_3_dotdot_binds_tighter_than_equality() {
+        let state = TlaState::new();
+        let defs = BTreeMap::new();
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        let paren = eval_expr("(1..3) = {1, 2, 3}", &ctx)
+            .expect("paren-wrapped range = set should evaluate");
+        let bare = eval_expr("1..3 = {1, 2, 3}", &ctx).expect("bare range = set should evaluate");
+        assert_eq!(paren, TlaValue::Bool(true));
+        assert_eq!(bare, TlaValue::Bool(true));
+    }
+
+    #[test]
+    fn t2_3_dotdot_still_looser_than_addition() {
+        // Sanity check the OTHER direction: `..` is at precedence 9, `+`/`-` at
+        // 10, so `+`/`-` binds tighter. `0 .. N-1` must parse as `0 .. (N-1)`,
+        // NOT `(0 .. N) - 1`. Same for `+`.
+        let state = TlaState::new();
+        let defs = BTreeMap::new();
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        let v = eval_expr("0 .. 5-1", &ctx).expect("0 .. 5-1 should evaluate");
+        let expected = TlaValue::Set(Arc::new(BTreeSet::from([
+            TlaValue::Int(0),
+            TlaValue::Int(1),
+            TlaValue::Int(2),
+            TlaValue::Int(3),
+            TlaValue::Int(4),
+        ])));
+        assert_eq!(v, expected);
+
+        let v = eval_expr("1+1 .. 2+2", &ctx).expect("1+1 .. 2+2 should evaluate");
+        let expected = TlaValue::Set(Arc::new(BTreeSet::from([
+            TlaValue::Int(2),
+            TlaValue::Int(3),
+            TlaValue::Int(4),
+        ])));
+        assert_eq!(v, expected);
+    }
+
+    #[test]
+    fn t2_3_dotdot_inside_filter_set_body() {
+        // The original T2.3 minimised case from the proptest harness, exercised
+        // nested in a filter-set body: `({__e \in 1..4 : ((1..3 \subseteq S))
+        // \/ (__e > 0)} \intersect {0, 0})`. With `S = {1, 2, 3}` the inner
+        // `1..3 \subseteq S` is TRUE so the filter body is TRUE for every
+        // element, yielding `{1, 2, 3, 4}`; intersect with `{0, 0}` = `{}`.
+        let state = TlaState::new();
+        let defs = BTreeMap::new();
+        let mut state = state;
+        state.insert(
+            Arc::from("S"),
+            TlaValue::Set(Arc::new(BTreeSet::from([
+                TlaValue::Int(1),
+                TlaValue::Int(2),
+                TlaValue::Int(3),
+            ]))),
+        );
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        let v = eval_expr(
+            "({__e \\in 1..4 : ((1..3 \\subseteq S)) \\/ (__e > 0)} \\intersect {0, 0})",
+            &ctx,
+        )
+        .expect("nested range \\subseteq inside filter body should evaluate");
+        assert_eq!(v, TlaValue::Set(Arc::new(BTreeSet::new())));
     }
 }

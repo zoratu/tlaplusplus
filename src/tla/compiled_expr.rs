@@ -623,53 +623,9 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
         };
     }
 
-    // Set/sequence range: a..b (TLA+ precedence 9-9, lower than arithmetic)
-    // Must be parsed before +/- so that "0 .. N-1" parses as "0 .. (N-1)"
-    // rather than "(0 .. N) - 1".
-    if let Some((left, right)) = split_binary_op(expr, "..") {
-        return CompiledExpr::SetRange(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
-    }
-
-    // Arithmetic operators (TLA+ precedence: + is 10, - is 11, * is 13)
-    if let Some((left, right)) = split_binary_op(expr, "+") {
-        return CompiledExpr::Add(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
-    }
-    if let Some((left, right)) = split_binary_op(expr, "-") {
-        // Be careful not to match negative numbers. The `-` is unary
-        // (i.e. forms a negative literal / negation of `right`) when it
-        // either has nothing before it or is preceded by another binary
-        // operator or open-delimiter. T2.1+T2.2 follow-up: previously
-        // this only checked `!left.is_empty()`, so `(x * -3)` was sliced
-        // as `Sub(Mul(x, ""), 3)` (empty Mul RHS → "empty expression"
-        // at eval time). Now we also require the trimmed left to end in
-        // a value-producing character (digit, identifier, `)`, `]`,
-        // `>>`, `}`).
-        if !left.is_empty() && left_ends_with_value(left) {
-            return CompiledExpr::Sub(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
-        }
-    }
-    if let Some((left, right)) = split_binary_op(expr, "*") {
-        return CompiledExpr::Mul(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
-    }
-    if let Some((left, right)) = split_binary_op(expr, "\\div") {
-        return CompiledExpr::Div(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
-    }
-    if let Some((left, right)) = split_binary_op(expr, "%") {
-        return CompiledExpr::Mod(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
-    }
-    if let Some((left, right)) = split_binary_op(expr, "^^") {
-        return CompiledExpr::OpCall {
-            name: "^^".to_string(),
-            args: vec![compile_expr(left), compile_expr(right)],
-        };
-    }
-    if let Some((left, right)) = split_binary_op(expr, "^") {
-        return CompiledExpr::Pow(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
-    }
-
-    // TLC module: Function override operator @@
+    // TLC module: Function override operator @@ (precedence 6-6)
     // f @@ g merges two functions, with g taking precedence on overlapping keys
-    // Lower precedence than :> so parse it first
+    // Lower precedence than :> so parse it first.
     if let Some((left, right)) = split_binary_op(expr, "@@") {
         return CompiledExpr::FuncOverride(
             Box::new(compile_expr(left)),
@@ -677,7 +633,20 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
         );
     }
 
-    // Set operations
+    // TLC module: Function pair constructor :> (precedence 7-7)
+    // a :> b creates a function mapping a to b (single mapping {a -> b})
+    if let Some((left, right)) = split_binary_op(expr, ":>") {
+        return CompiledExpr::FuncPair(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
+    }
+
+    // Set operations (TLA+ precedence 8-8 for \union, \cup, \intersect, \cap,
+    // \\ set minus). MUST be split before `..` (9-9) and `+`/`-` (10-10) and
+    // `*`/`\div`/`%` (13-13) so that `S \union 1..3` parses as
+    // `S \union (1..3)` rather than `(S \union 1)..3`. T2.3 fix — see
+    // `RELEASE_1.0.0_LOG.md`. Note: `\o`/`\circ` (concat, 13-13) and
+    // `\X`/`\times` (cartesian, 10-13) are kept in this block only to avoid
+    // `\` set-minus matching `\o`/`\X`/`\times`; `\` itself is a set op at
+    // 8-8 so its placement is correct.
     if let Some((left, right)) = split_binary_op(expr, "\\union") {
         return CompiledExpr::Union(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
     }
@@ -696,15 +665,15 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
             Box::new(compile_expr(right)),
         );
     }
-    // Handle \o (concatenation) BEFORE \ (set minus) since \ would match \o
+    // Handle \o (concatenation) BEFORE \ (set minus) since \ would match \o.
     if let Some((left, right)) = split_binary_op(expr, "\\o") {
         return CompiledExpr::Concat(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
     }
     if let Some((left, right)) = split_binary_op(expr, "\\circ") {
         return CompiledExpr::Concat(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
     }
-    // Handle cartesian product: \X and \times are synonyms
-    // Must be before \ (set minus) since \ would match \X or \times
+    // Handle cartesian product: \X and \times are synonyms.
+    // Must be before \ (set minus) since \ would match \X or \times.
     if let Some((left, right)) = split_binary_op(expr, "\\X") {
         return CompiledExpr::CartesianProduct(
             Box::new(compile_expr(left)),
@@ -739,11 +708,51 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
         }
     }
 
-    // TLC module: Function pair constructor :>
-    // a :> b creates a function mapping a to b (single mapping {a -> b})
-    // Higher precedence than @@, so parse it after set operations
-    if let Some((left, right)) = split_binary_op(expr, ":>") {
-        return CompiledExpr::FuncPair(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
+    // Set/sequence range: a..b (TLA+ precedence 9-9). MUST be split BEFORE
+    // arithmetic (`+`/`-` at 10) so `0 .. N-1` parses as `0 .. (N-1)`
+    // rather than `(0 .. N) - 1`. AND MUST be split AFTER set ops (above)
+    // so `S \union 1..3` parses as `S \union (1..3)` rather than
+    // `(S \union 1)..3`. See `test_dotdot_has_lower_precedence_than_arithmetic`
+    // and `test_dotdot_binds_tighter_than_set_ops` for the regression gates.
+    if let Some((left, right)) = split_binary_op(expr, "..") {
+        return CompiledExpr::SetRange(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
+    }
+
+    // Arithmetic operators (TLA+ precedence: + is 10-10, - is 11-11, * is 13-13)
+    if let Some((left, right)) = split_binary_op(expr, "+") {
+        return CompiledExpr::Add(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
+    }
+    if let Some((left, right)) = split_binary_op(expr, "-") {
+        // Be careful not to match negative numbers. The `-` is unary
+        // (i.e. forms a negative literal / negation of `right`) when it
+        // either has nothing before it or is preceded by another binary
+        // operator or open-delimiter. T2.1+T2.2 follow-up: previously
+        // this only checked `!left.is_empty()`, so `(x * -3)` was sliced
+        // as `Sub(Mul(x, ""), 3)` (empty Mul RHS → "empty expression"
+        // at eval time). Now we also require the trimmed left to end in
+        // a value-producing character (digit, identifier, `)`, `]`,
+        // `>>`, `}`).
+        if !left.is_empty() && left_ends_with_value(left) {
+            return CompiledExpr::Sub(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
+        }
+    }
+    if let Some((left, right)) = split_binary_op(expr, "*") {
+        return CompiledExpr::Mul(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
+    }
+    if let Some((left, right)) = split_binary_op(expr, "\\div") {
+        return CompiledExpr::Div(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
+    }
+    if let Some((left, right)) = split_binary_op(expr, "%") {
+        return CompiledExpr::Mod(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
+    }
+    if let Some((left, right)) = split_binary_op(expr, "^^") {
+        return CompiledExpr::OpCall {
+            name: "^^".to_string(),
+            args: vec![compile_expr(left), compile_expr(right)],
+        };
+    }
+    if let Some((left, right)) = split_binary_op(expr, "^") {
+        return CompiledExpr::Pow(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
     }
 
     // Set literal: {a, b, c}
@@ -3974,6 +3983,74 @@ fn test_dotdot_has_lower_precedence_than_arithmetic() {
             matches!(**hi, CompiledExpr::Sub(_, _)),
             "high bound should be Sub, got: {:?}",
             hi
+        );
+    }
+}
+
+#[test]
+fn t2_3_dotdot_binds_tighter_than_set_ops() {
+    // T2.3 SOUNDNESS regression: in TLA+ `..` has precedence 9-9, set ops
+    // (`\union`, `\intersect`, `\\`) have precedence 8-8. So `..` binds
+    // *tighter*: `S \union 1..3` parses as `S \union (1..3)` -- NOT
+    // `(S \union 1)..3`. Pre-fix the compiled-expr cascade had `..` split
+    // before `\union`/etc., producing the wrong shape.
+    let expr = compile_expr("S \\union 1..3");
+    assert!(
+        matches!(expr, CompiledExpr::Union(_, _)),
+        "S \\union 1..3 should be Union(S, SetRange(1, 3)), got: {:?}",
+        expr
+    );
+    if let CompiledExpr::Union(_lhs, rhs) = &expr {
+        assert!(
+            matches!(**rhs, CompiledExpr::SetRange(_, _)),
+            "RHS of Union should be SetRange(1, 3), got: {:?}",
+            rhs
+        );
+    }
+
+    let expr = compile_expr("S \\intersect 1..n");
+    assert!(
+        matches!(expr, CompiledExpr::Intersect(_, _)),
+        "S \\intersect 1..n should be Intersect(S, SetRange(1, n)), got: {:?}",
+        expr
+    );
+    if let CompiledExpr::Intersect(_lhs, rhs) = &expr {
+        assert!(
+            matches!(**rhs, CompiledExpr::SetRange(_, _)),
+            "RHS of Intersect should be SetRange, got: {:?}",
+            rhs
+        );
+    }
+
+    // Set minus is also at 8-8.
+    let expr = compile_expr("S \\ 1..3");
+    assert!(
+        matches!(expr, CompiledExpr::SetMinus(_, _)),
+        "S \\ 1..3 should be SetMinus(S, SetRange(1, 3)), got: {:?}",
+        expr
+    );
+    if let CompiledExpr::SetMinus(_lhs, rhs) = &expr {
+        assert!(
+            matches!(**rhs, CompiledExpr::SetRange(_, _)),
+            "RHS of SetMinus should be SetRange, got: {:?}",
+            rhs
+        );
+    }
+
+    // \subseteq is at the relational/comparison tier (5-5), so `..` binds
+    // tighter than that as well. `1..3 \subseteq S` parses as
+    // `(1..3) \subseteq S`.
+    let expr = compile_expr("1..3 \\subseteq S");
+    assert!(
+        matches!(expr, CompiledExpr::Subset(_, _)),
+        "1..3 \\subseteq S should be Subset(SetRange(1, 3), S), got: {:?}",
+        expr
+    );
+    if let CompiledExpr::Subset(lhs, _rhs) = &expr {
+        assert!(
+            matches!(**lhs, CompiledExpr::SetRange(_, _)),
+            "LHS of Subset should be SetRange, got: {:?}",
+            lhs
         );
     }
 }
