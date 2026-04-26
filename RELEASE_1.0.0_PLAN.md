@@ -6,7 +6,15 @@ Working through these in order. Each task is delegated to an agent. Builds/tests
 
 These come first because every later change needs a regression gate.
 
-- [ ] **T1. Differential testing against TLC as CI gate.** Pick a curated subset of corpus specs (small, fast), run both tlaplusplus and TLC, diff state counts and violation reports. Make it a CI step that fails the build on divergence.
+- [x] **T1. Differential testing against TLC as CI gate.** Done — `scripts/diff_tlc.sh` + `.github/workflows/diff-tlc.yml`. 9 curated specs, 100% parity on active list. Surfaced 3 real divergences (T1.1–T1.3 below).
+
+### Bugs uncovered by T1 (block 1.0.0; fix before T2/T3)
+
+- [x] **T1.1. SOUNDNESS: compiled `\E x \in S : ActionCall(x)` inside a wrapper definition silently produced zero successors.** Fixed: compiled-IR `Guard` arm now detects action-call shape at runtime and dispatches to the interpreted action evaluator. QueueSegmentSync_Buggy now reports the correct violation; QueueSegmentSync_Fixed now reports 1531 distinct states (matches TLC). Both back in active diff list. Regression test in `src/tla/action_exec.rs::tests::exists_wrapping_action_call_in_compiled_ir_enumerates_all_bindings`. See `RELEASE_1.0.0_LOG.md` for root cause / commit.
+- [ ] **T1.2. VIEW projection ignored in fingerprinting.** `corpus/language/ViewTest.tla`: tlaplusplus 121 distinct, TLC 106. `VIEW <<x, y>>` should collapse states differing only in elided fields. Look at `src/models/tla_native.rs::resolve_view` and how the projection feeds the fp store.
+- [ ] **T1.3. Fairness SCC false positive.** `corpus/internals/WorkQueue.tla`: state counts agree (15003) but tlaplusplus reports an SCC fairness violation TLC accepts. `src/fairness.rs` SCC handling when SCC has only the implicit Next action.
+- [ ] **T1.4. Compiled `LET ... IN /\ \A a \in Q : \E m \in {} : ... /\ ...` incorrectly evaluates to TRUE for non-empty Q.** Surfaced by T1.1 fix when the compiled `Guard` previously masked it via a downstream Send-call drop. Reproduces in the Paxos-style probe test (`src/tla/action_exec.rs::tests::parsed_paxos_style_probe_keeps_let_locals_in_scope_with_operator_overrides` — currently asserts ≥3 with a TODO comment). Likely a quantifier-scope or `\A`-over-empty-`\E` bug in `src/tla/compiled_eval.rs::CompiledExpr::Forall` when the body itself contains an `\E` over a LET-bound set.
+
 - [ ] **T2. Compiled-vs-interpreted proptest equivalence.** proptest generator for TLA+ expressions. For each: evaluate via `eval_expr` and `compile_expr` + `eval_compiled`, assert equality. Catches silent drift in the compiled fast path.
 - [ ] **T3. Snapshot tests for state graphs.** Small specs whose full reachable fingerprint set we pin. Catches off-by-one errors in successor generation that pure count-checks miss.
 - [ ] **T4. Mutation testing audit.** Run `cargo-mutants` on `src/tla/eval.rs` and `src/tla/action_exec.rs`. Identify surviving mutants → file gaps → write tests to kill them.

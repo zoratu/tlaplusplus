@@ -2381,6 +2381,14 @@ pub enum CompiledActionClause {
     },
     Guard {
         expr: CompiledExpr,
+        /// Original source text of the guard expression.
+        ///
+        /// Retained so the runtime can detect when a "guard" is actually an
+        /// action call to a user-defined operator (with primed assignments)
+        /// and fall back to the interpreted action evaluator. Without this,
+        /// `\E x \in S : ActionCall(x)` silently produces zero successors —
+        /// a soundness bug that hides invariant violations.
+        text: String,
     },
     Exists {
         binders: String,
@@ -2500,6 +2508,7 @@ fn compile_action_clause_text(expr: &str) -> CompiledActionClause {
             } else {
                 CompiledActionClause::Guard {
                     expr: compile_expr(trimmed),
+                    text: trimmed.to_string(),
                 }
             }
         }

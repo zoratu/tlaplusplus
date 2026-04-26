@@ -2036,7 +2036,22 @@ fn eval_compiled_clause_to_branch<'a>(
 ) -> Result<Vec<CompiledActionBranch<'a>>> {
     let eval_ctx = ctx_with_staged_primes(&branch.ctx, &branch.staged);
     match clause {
-        CompiledActionClause::Guard { expr } => {
+        CompiledActionClause::Guard { expr, text } => {
+            // Soundness fix: a "guard" whose text is an action call to a
+            // user-defined action (e.g. inside `\E x \in S : ActionCall(x)`)
+            // must be expanded as an action — not evaluated as a boolean.
+            // The compiled IR cannot recognise an action call at compile time
+            // because operator definitions aren't in scope, so this fallback
+            // routes through the interpreted action evaluator which handles
+            // primed assignments correctly.
+            //
+            // Without this, `Next == \/ \E x \in S : Action(x) \/ ...` (or any
+            // wrapper definition reducing to that shape) silently drops every
+            // successor from the existential branch — masking real invariant
+            // violations as false negatives.
+            if let Some(branches) = try_eval_compiled_guard_as_action(text, &branch)? {
+                return Ok(branches);
+            }
             if eval_compiled_guard(expr, &eval_ctx)? {
                 Ok(vec![branch])
             } else {
@@ -2148,6 +2163,71 @@ fn eval_compiled_clause_to_branch<'a>(
             )
         }
     }
+}
+
+/// Detect when a compiled `Guard` is actually an action call to a
+/// user-defined action and dispatch through the interpreted action evaluator.
+///
+/// Returns `Ok(Some(branches))` if `text` resolves to such an action and was
+/// expanded successfully. Returns `Ok(None)` if `text` is not an action call
+/// (in which case the caller should fall back to ordinary boolean guard
+/// evaluation). Returns `Err` only when interpreted evaluation itself fails.
+fn try_eval_compiled_guard_as_action<'a>(
+    text: &str,
+    branch: &CompiledActionBranch<'a>,
+) -> Result<Option<Vec<CompiledActionBranch<'a>>>> {
+    let Some((name, _args)) = crate::tla::eval::parse_action_call_expr(text) else {
+        return Ok(None);
+    };
+
+    // Resolve through instance scope first (e.g. `Inst!Action(x)`), then
+    // ordinary definitions. We only need to know whether the target is an
+    // action — the interpreted evaluator handles the actual call.
+    let def_opt = if let Some((alias, op)) = name.split_once('!') {
+        branch
+            .ctx
+            .instances
+            .and_then(|insts| insts.get(alias))
+            .and_then(|inst| inst.module.as_ref())
+            .and_then(|m| m.definitions.get(op).cloned())
+    } else {
+        lookup_definition(&name, &branch.ctx)
+    };
+
+    let Some(def) = def_opt else {
+        return Ok(None);
+    };
+    if !crate::tla::looks_like_action(&def) {
+        return Ok(None);
+    }
+    // Avoid infinite recursion when the body is the call itself (already
+    // protected by the interpreted path, but mirror the same check here).
+    if def.body.trim() == text.trim() {
+        return Ok(None);
+    }
+
+    let outer_ctx = branch.ctx.clone();
+    let interpreted_branches =
+        crate::tla::eval::eval_action_body_multi(text, &branch.ctx, &branch.staged)?;
+
+    // Merge interpreted branches with the existing compiled branch's
+    // unchanged_vars (interpreted starts with an empty set; we must preserve
+    // any prior `UNCHANGED` clauses that ran in the compiled sequence).
+    let mut out = Vec::with_capacity(interpreted_branches.len());
+    for (staged, unchanged_vars) in interpreted_branches {
+        let mut merged_unchanged = branch.unchanged_vars.clone();
+        for var in unchanged_vars {
+            if !merged_unchanged.contains(&var) {
+                merged_unchanged.push(var);
+            }
+        }
+        out.push(CompiledActionBranch {
+            ctx: outer_ctx.clone(),
+            staged,
+            unchanged_vars: merged_unchanged,
+        });
+    }
+    Ok(Some(out))
 }
 
 fn expand_compiled_exists_branches<'a>(

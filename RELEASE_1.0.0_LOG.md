@@ -90,3 +90,91 @@ fails CI immediately. Re-add divergent specs to the active list when fixed.
 - Per-spec timeout set to 60s by default, 120s in CI to absorb cold-cache
   variance on Actions runners.
 
+### Decision: insert bug-fix tasks before T2
+
+Plan amended to add T1.1 (soundness, QueueSegmentSync), T1.2 (VIEW), T1.3
+(fairness SCC) as blockers for 1.0.0. Doing them before T2 because (a) T1.1 is
+a soundness bug — silent false-pass — which blocks any release, and (b) T2's
+proptest equivalence would re-surface the same eval/exec issues, so fixing
+first avoids wasted parallel investigation. Spawning T1.1 next.
+
+### T1.1 — SOUNDNESS fix: compiled `Exists`-over-action-call silently dropped successors
+
+**Status:** fixed, validated against TLC, regression test added, both
+QueueSegmentSync configs back in the active diff harness (11/11 specs pass).
+
+**Symptom:** `corpus/internals/QueueSegmentSync.tla` with both `_Fixed.cfg`
+and `_Buggy.cfg` produced only 5 distinct states under tlaplusplus vs 1531
+under TLC. The Buggy cfg, which TLC reports an invariant violation on,
+silently passed under tlaplusplus — the dangerous shape: false confidence in
+correctness.
+
+**Root cause:** in `src/tla/compiled_expr.rs::compile_action_clause` the
+`ActionClause::Exists { binders, body }` variant was lowered to
+`CompiledActionClause::Exists` with `body_clauses = compile_action_body_clauses(body)`.
+When `body` is a bare action call like `ConsumeSegment(segId)`, it doesn't
+parse as `\E`/IF/primed-anything, so `compile_action_clause_text` falls
+through to `CompiledActionClause::Guard { expr: compile_expr(call) }`. The
+runtime `Guard` handler then evaluated the call as a *boolean expression* —
+it inlined the action body (which contains primed assignments) and tried to
+treat `consumedSegments' = ...` as an equality predicate. The variable
+`consumedSegments'` was undefined in scope, so the guard returned `false`
+and the existential branch silently produced zero successors.
+
+This pattern is widespread: any `Action == \E x \in S : OtherAction(x)`
+wrapper definition (or any `Next` body that contains one) was affected.
+Standalone `\E x \in S : Action(x)` written directly inside a top-level
+disjunction was *not* affected because the outer execution path reaches
+`execute_branch` → `execute_exists_branch` → recursive `execute_branch` on
+the body, which correctly hits `parse_action_call` and dispatches via
+`compile_action_ir`. The bug only triggered when the existential was
+wrapped inside a definition whose body was itself compiled via
+`compile_action_ir` → `CompiledActionIr::from_ir` → `Exists` clause.
+
+**Fix:** `src/tla/compiled_eval.rs:2039` (`eval_compiled_clause_to_branch`,
+`Guard` arm). Added a runtime check via the new helper
+`try_eval_compiled_guard_as_action`. If the guard's text parses as an
+identifier-style call to a definition that `looks_like_action`, we route
+through `eval_action_body_multi` (the interpreted action evaluator), which
+already handles action calls correctly via `expand_action_call_multi`. The
+new `text` field on `CompiledActionClause::Guard` carries the original
+source so the runtime can do this discrimination — compile-time can't
+because operator definitions aren't in scope yet. Non-action expressions
+(plain guards like `Cardinality(S) > 0`) parse-fail or lookup-fail and
+fall through to ordinary boolean evaluation, so the perf hot path is
+unchanged for normal guards.
+
+**Validation:**
+- `cargo run --release -- run-tla --module corpus/internals/QueueSegmentSync.tla --config corpus/internals/QueueSegmentSync_Buggy.cfg --allow-deadlock --skip-system-checks` →
+  `violation=true (1 violations found)`, invariant `SegmentsRecoverable`
+  violated, 4-step trace printed (matches TLC's discovery shape).
+- Same on `_Fixed.cfg` → `1,531 distinct states found, violation=false`.
+  Distinct count matches TLC exactly.
+- `cargo test --release` → all 601 tests pass (474 lib + 90 bin + 37 integration).
+- `scripts/diff_tlc.sh` → 11/11 specs pass (the 9 prior + both new
+  QueueSegmentSync entries).
+
+**Regression test:** `src/tla/action_exec.rs::tests::exists_wrapping_action_call_in_compiled_ir_enumerates_all_bindings`
+constructs the minimal repro (Inc(i), IncAny == \E i \in S : Inc(i),
+Next == IncAny over S = {1,2,3}) and asserts 3 successors with x' values
+{1, 2, 3}. Pre-fix this returned 0; post-fix it returns 3.
+
+**Diff list update:** moved both `queue_segment_sync_*` entries out of the
+KNOWN DIVERGENT SPECS comment into the active list in
+`corpus/diff_test/list.tsv`. The buggy variant gates on the violation
+being detected; the fixed variant gates on the 1531-state count.
+
+**Discovered (not patched):** the Paxos-style probe test now produces 21
+successors instead of 0/3. Tracing showed that with my fix dispatching
+`Send(...)` correctly, a *separate* pre-existing bug in `compile_expr`
+becomes visible: the LET-wrapping-Forall expression
+`LET Q1b == {} ; Q1bv == {} IN /\ \A a \in Q : \E m \in Q1b : m.acc = a /\ ...`
+incorrectly evaluates to `true` for non-empty Q (where the `\A` body should
+make it false). Filed as **T1.4** (in plan) — symptom only; not the same
+bug as T1.1 and not in scope here. The Paxos test's assertion was already
+permissive (accepted 0 OR 3) to mask the original bug; updated to assert a
+floor of ≥3 (catches regression that re-drops Send) with a comment
+pointing at T1.4.
+
+**Commit:** (will be appended after `git commit`)
+

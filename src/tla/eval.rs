@@ -762,7 +762,7 @@ fn eval_stuttering_action_multi(
     Ok(out)
 }
 
-fn parse_action_call_expr(expr: &str) -> Option<(String, Vec<String>)> {
+pub(crate) fn parse_action_call_expr(expr: &str) -> Option<(String, Vec<String>)> {
     let trimmed = expr.trim_start();
     let mut chars = trimmed.char_indices();
     let (_, first) = chars.next()?;
