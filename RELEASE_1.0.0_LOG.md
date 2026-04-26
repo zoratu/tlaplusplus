@@ -1354,7 +1354,7 @@ Pipeline shows POR's worst case: when actions share state (Move reads/writes `pe
 - ENABLED inside an action body forces conservative = depends-on-everything. Specs with heavy ENABLED use will see degraded reduction; OK for 1.0.0.
 - POR + symbolic Init (T5): orthogonal, both compose. POR only changes how successor states are explored from each visited state; symbolic Init only changes which initial states are enumerated.
 
-**Commit:** TBD (commit will be added below this entry once the patch lands).
+**Commit:** `1db742c` — `feat(t7): partial-order reduction via stubborn sets behind --por flag`
 
 #### Recommended next
 
