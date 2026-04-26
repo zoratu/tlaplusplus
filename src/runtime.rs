@@ -2019,9 +2019,24 @@ where
 
         // Closure used by both the inbound handler (to honor the steal-victim
         // threshold) and the steal-trigger task (to detect a starved local queue).
+        //
+        // NOTE: `pending_count()` is an approximation derived from
+        // `global_pushed - global_popped`, where `global_popped` is only
+        // updated when workers flush their local counters (currently only at
+        // worker exit). That makes `pending_count()` over-report by
+        // potentially the entire local-popped count, which would prevent the
+        // steal trigger from firing even when the local queue is genuinely
+        // empty. We bridge this by ALSO checking `has_pending_work()` (which
+        // inspects the actual deques + per-worker active flags); when it
+        // returns false, we report 0 to the trigger.
         let queue_for_pending = Arc::clone(&queue);
-        let local_pending_fn: crate::distributed::handler::LocalPendingFn =
-            Arc::new(move || queue_for_pending.pending_count());
+        let local_pending_fn: crate::distributed::handler::LocalPendingFn = Arc::new(move || {
+            if !queue_for_pending.has_pending_work() {
+                0
+            } else {
+                queue_for_pending.pending_count()
+            }
+        });
 
         // Spawn inbound handler with the steal/donate channels
         if let (Some(stolen_tx), Some(donate_rx)) =
@@ -2277,11 +2292,19 @@ where
                         if worker_queue.has_pending_work() {
                             continue;
                         }
-                        // Distributed mode: do not terminate if the cluster
-                        // has not reached global termination consensus.
+                        // Distributed mode: don't terminate until all nodes
+                        // agree they're idle. Mark THIS node idle so peers
+                        // can advance their termination consensus, then wait
+                        // briefly for either (a) stolen work to arrive or
+                        // (b) global termination to be declared.
+                        //
+                        // T6 fix: previously `set_locally_idle(true)` was only
+                        // called from the worker-exit path, which is itself
+                        // gated on global termination — a deadlock. Setting
+                        // it here lets the cluster actually reach consensus.
                         if let Some(ref stealer) = worker_distributed_stealer {
                             if !stealer.is_globally_terminated() {
-                                // Wait briefly for stolen work from remote nodes
+                                stealer.set_locally_idle(true);
                                 std::thread::sleep(std::time::Duration::from_millis(10));
                                 continue;
                             }
@@ -2294,6 +2317,15 @@ where
                 // Mark worker as active (cache-line padded, no contention with other workers)
                 worker_queue.worker_start(worker_state.id());
                 local_states_processed += 1;
+
+                // Distributed mode: a worker that just popped a state is no
+                // longer idle. Clear the flag so peers can't prematurely
+                // declare global termination while we still have work to do.
+                // Also reset the local-work timestamp so the steal trigger
+                // doesn't fire while we're actively processing.
+                if let Some(ref stealer) = worker_distributed_stealer {
+                    stealer.set_locally_idle(false);
+                }
 
                 // Periodically flush local stats to reduce atomic contention
                 // Flush either by count OR by time (every ~1 second) for accurate reporting

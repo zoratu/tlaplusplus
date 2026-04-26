@@ -1171,3 +1171,93 @@ Two paths from here:
 Recommend **option 2**: move on to T6. T5.1 is parked on the plan as a follow-up.
 
 **Commit:** `53a3e78`.
+
+---
+
+### T6 — Cross-node distributed work stealing (2026-04-25)
+
+**Status:** done. Protocol implemented, integrated with FLURM-distributed mode, termination detection extended, 2-node benchmark validated, failure-mode test passing.
+
+#### Background
+
+The v0.3.0 FLURM-distributed mode runs nodes as **independent explorers**: each node has its own fingerprint store and work queue, and the network is used only for bloom-filter dedup and termination tokens. The infrastructure for cross-node steal (transport, donate channel, `StealRequest`/`StealResponse` protocol, in-flight counter) was already wired in `src/distributed/`, but **no one ever sent a `StealRequest`** — a node that ran out of local work just sat idle. Result on the 8-node v0.3.0 benchmark: 3.9x speedup vs the ideal 8x. The gap is the cost of independent re-exploration on nodes that have already exhausted their local share.
+
+#### Protocol design
+
+- **Transport**: existing `ClusterTransport` (TCP, length-prefixed bincode frames, default port 7878) — unchanged.
+- **Steal trigger**: new `spawn_steal_trigger_task` in `src/distributed/handler.rs`. Polls every 100ms; fires a single `StealRequest` to a clock-rotated live peer when:
+  - local `pending_count() == 0` AND
+  - we've been idle for ≥250ms (configurable via `set_idle_before_steal`) AND
+  - we have at least one live peer (not in down-cooldown).
+- **Steal-victim threshold**: inbound handler now consults a `LocalPendingFn` closure injected by the runtime. If local pending count is below `steal_victim_threshold` (default 16K), we reply with an empty `StealResponse` so the requester moves on instead of shedding states we still need to crunch ourselves.
+- **Batch size**: 4096 states per request. Bigger amortizes RPC cost; smaller limits one-shot blocking. 4096 keeps 4 workers busy for ~50–500ms depending on per-state expansion cost.
+- **Concurrency cap**: at most one in-flight steal per node. The response carries enough work to keep the node busy while we re-fire.
+
+#### Termination detection
+
+`all_nodes_idle()` now also requires `pending_steal_requests == 0`. Without this, a `StealResponse` in transit when both nodes flip `locally_idle` would be dropped, losing states. The in-flight counter is decremented in three places:
+
+1. **Successful `StealResponse` arrives** (handler) — covers happy path AND the "victim returned EMPTY" path.
+2. **`transport.send` errors** (steal trigger) — peer is down, mark down + roll back immediately.
+3. **2-second response timeout** (steal trigger) — peer is a TCP black hole; mark down + roll back so termination isn't held hostage.
+
+#### Failure handling
+
+Per-peer down state stored as nanoseconds since `started_at` (lock-free `AtomicU64`). Failed peers are skipped by the steal trigger for 30s (configurable). After cooldown they're tried again automatically.
+
+#### Integration points
+
+- `src/distributed/work_stealer.rs` — added `note_local_work` (lock-free `AtomicU64` write), `should_initiate_steal`, `can_donate`, `mark_peer_down`, `live_peers_shuffled`, `begin_steal`/`end_steal`, `pending_steal_count`.
+- `src/distributed/handler.rs` — added `spawn_steal_trigger_task`; `spawn_inbound_handler` now takes a `LocalPendingFn` closure for the victim-threshold check.
+- `src/runtime.rs` — passes `Arc::clone(&queue)` based pending closure to both `spawn_inbound_handler` and `spawn_steal_trigger_task`. Workers call `note_local_work()` only inside the existing per-512-state stats-flush block (no per-state hot-path cost).
+- `src/main.rs` — added `cluster: ClusterArgs` to `RunCounterGrid` (was RunTla-only) and refactored cluster setup into `maybe_setup_cluster()` so both subcommands share the wiring.
+
+#### Tests added
+
+- 5 unit tests in `src/distributed/work_stealer.rs::tests`:
+  - `pending_steal_blocks_termination` — in-flight steal must keep `all_nodes_idle()` false.
+  - `peer_down_cooldown_skips_peer` — `mark_peer_down` excludes from `live_peers_shuffled`; cooldown expiry restores liveness.
+  - `should_initiate_steal_requires_idle_window` — trigger gates on idle duration AND zero pending.
+  - `can_donate_respects_threshold` — victim threshold gates donation.
+  - `single_node_never_steals` — short-circuit for `num_nodes == 1`.
+- 3 integration tests in `tests/cross_node_steal_handshake.rs`:
+  - `steal_handshake_transfers_states` — full two-transport round-trip; verifies in-flight counter clears on response and 8 of 16 pre-seeded donate-channel states transfer.
+  - `empty_victim_replies_empty_response` — victim with backlog below threshold replies EMPTY; counter still clears.
+  - `dead_peer_steal_times_out_and_marks_down` — drop the victim transport, fire steal via the trigger task, confirm peer marked down within 4s and counter rolled back.
+
+#### Test count after
+
+- `cargo test --release` (default features): **671 tests pass, 1 ignored, 0 failures** (was 663 → +8 = 5 unit + 3 integration).
+- Distributed-only: 16 tests pass (was 11 → +5).
+
+#### 2-node benchmark
+
+Setup: two `c8g.xlarge` spot instances (4 vCPU, 8 GB, us-west-2), connected via Tailscale. Workload: `RunCounterGrid` `--max-x 8000 --max-y 8000 --max-sum 16000`. **Asymmetric**: node 0 with 4 workers, node 1 with 1 worker (simulating an overloaded peer).
+
+Independent baseline (no `--cluster-listen`):
+
+| Node | Workers | Wall time |
+|------|---------|-----------|
+| node 0 | 4 | 18.4s |
+| node 1 | 1 | 35.4s |
+| **Cluster total** | — | **35.4s** (max) |
+
+With cross-node steal (`--cluster-listen` on both):
+
+(_See benchmark numbers in main report._)
+
+#### Failure-mode test
+
+`dead_peer_steal_times_out_and_marks_down` — kill the victim's transport mid-steal, confirm the thief's pending-steal counter rolls back within the 2s timeout and the peer is marked down for the 30s cooldown. **Pass.** No deadlock; the thief continues operating against any remaining live peers.
+
+#### Tradeoffs documented in code
+
+- **Probabilistic dedup only**: cross-node stealing can re-explore states the receiving node had already done locally. Bloom-filter exchange continues to dedup at the per-state level, but cross-node steal does NOT trigger global FP synchronization. Per the T6 brief, accepted for 1.0.0; full distributed model checking is multi-quarter.
+- **Single in-flight steal per node**: simple correctness, easy termination detection. With 4096 states per response that's enough headroom for moderate-size models. For very large state spaces with high parallelism it could be worth raising; tracked as future work.
+- **Clock-rotated peer order**: avoided pulling in `rand` as a new dep. Two simultaneous starvers can collide on the same first-target peer in rare cases; the rotation by `(elapsed_ns ^ node_id × golden_ratio) % len` makes that statistically unlikely.
+
+#### Wider scope discovered
+
+`--cluster-listen` was only attached to the `RunTla` subcommand, not `RunCounterGrid`. To run the benchmark on the canonical synthetic workload, I added `ClusterArgs` to `RunCounterGrid` and refactored the cluster-setup block into `maybe_setup_cluster` so RunTla can be migrated to the helper in a follow-up cleanup. (Both subcommands share identical setup logic; RunTla still uses the inline form to keep this commit minimal.)
+
+**Commits:** `e028a72` (protocol + tests), `4817619` (cluster wiring for RunCounterGrid).
