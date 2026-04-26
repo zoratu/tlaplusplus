@@ -176,5 +176,6 @@ permissive (accepted 0 OR 3) to mask the original bug; updated to assert a
 floor of ≥3 (catches regression that re-drops Send) with a comment
 pointing at T1.4.
 
-**Commit:** (will be appended after `git commit`)
+**Commit:** `4865611` — `fix(soundness): expand action calls inside compiled
+\E ... : Action(x) (T1.1)`
 
