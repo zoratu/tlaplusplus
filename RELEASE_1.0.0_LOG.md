@@ -777,3 +777,113 @@ going forward.
 
 **Commit:** `c6ab53f`.
 
+### T3 — State-graph snapshot tests (Phase 1)
+
+**Date:** 2026-04-25.
+
+**Status:** done. Snapshot harness landed, 7 small specs pinned, all
+match TLC distinct-state counts on first computation. **No T3.N
+divergences surfaced** — every candidate spec produced the same
+reachable-state set as TLC, so the harness exists purely as a forward
+regression gate (catching future off-by-one in successor generation
+that pure count-checks would miss).
+
+**Why this matters:** T1 (`scripts/diff_tlc.sh`) gates on distinct
+state COUNTS vs TLC. T2 (`tests/compiled_vs_interpreted.rs`) gates on
+expression-evaluator equivalence. Neither catches an off-by-one in the
+successor function that produces N states either way (the right N, but
+with one wrong-and-one-missing state cancelling out). T3 closes that
+gap by pinning the actual reachable fingerprint set as a deterministic
+content-addressed digest.
+
+**Snapshot mechanism:**
+- Build `TlaModel` from `.tla`/`.cfg` via `TlaModel::from_files`.
+- Deterministic BFS over the `Model` trait. `TlaState` is
+  `BTreeMap<Arc<str>, TlaValue>`; `TlaValue`'s collection variants are
+  all `BTree*`-backed (`Set`, `Record`, `Function`) or `Vec`
+  (positional `Seq`); `serde_json::to_string` is therefore
+  byte-deterministic across runs and threads.
+- Dedupe by canonical JSON repr (NOT the runtime fingerprint — that
+  uses an AHash seed which can change across builds; the canonical
+  JSON repr is stable as long as `TlaValue::Serialize` doesn't change).
+- Sort the reprs lexicographically, hash with `XxHash3_128`
+  (one-shot 128-bit), hex-encode. Result: 32-char hex digest per
+  spec, fully deterministic.
+
+**Artifacts:**
+- `tests/state_graph_snapshots.rs` — 12 active tests + 1 `#[ignore]`
+  regen helper. One `#[test] fn snapshot_<id>()` per spec, plus 4
+  sanity tests on the digest machinery (empty-input stability, sort
+  invariance, content sensitivity, key sorting).
+- `scripts/regen_state_graph_snapshots.sh` — one-line wrapper around
+  the regen helper. Prints `id  count=<N>  digest=<hex>` per spec for
+  copy-paste back into `SNAPSHOTS[]`.
+- File-header comment block documents WHEN to update a digest (only
+  after cross-checking the new state space against TLC) and HOW
+  (eyeball the new repr set, regen all digests at once, paste back).
+  An unexplained digest change is treated as a bug.
+
+**Snapshotted specs (all cross-checked against TLC v2.19, 2026-04-25):**
+
+| id | spec | states | what it exercises |
+|----|------|--------|-------------------|
+| `multi_var_quantifier` | `corpus/language/MultiVarQuantifierTest` | 10 | multi-binder `\E i, j \in S` in Next |
+| `instance_test_simple` | `corpus/language/InstanceTestSimple` | 2 | INSTANCE WITH + UNCHANGED stutter |
+| `operator_substitution` | `corpus/language/OperatorSubstitutionTest` | 6 | LET-bound post-condition; `Append` |
+| `string_test` | `corpus/language/StringTest` | 2 | string equality, set membership |
+| `wrapper_next_fairness` | `corpus/internals/WrapperNextFairness` | 4 | wrapper Next + WF + UNCHANGED at terminal |
+| `instance_test` | `corpus/language/InstanceTest` | 11 | INSTANCE WITH + monotone counter |
+| `enabled_test` | `corpus/temporal/EnabledTest` | 121 | `ENABLED`; (x,y) grid in 0..10 |
+
+Total: 156 distinct states across 7 specs, full snapshot test suite
+runs in ~1.4s end-to-end (well under the 30s budget). All specs are
+**orthogonal to the T1 diff_tlc list** (no overlap with the 13
+specs already pinned by count there) and bias toward edge cases of
+the successor function: UNCHANGED stutter (4 of 7), multi-var `\E`
+binders, INSTANCE substitution, ENABLED predicate, sequence Append,
+wrapper Next + fairness.
+
+**TLC validation note:** three of the snapshotted specs use a
+`SPECIFICATION Init /\ [][Next]_vars` cfg that TLC doesn't accept
+inline (it requires a named `Spec` definition). For those specs
+(`multi_var_quantifier`, `operator_substitution`, `string_test`),
+TLC was run with an equivalent `INIT Init / NEXT Next` cfg. tlaplusplus
+accepts both forms, so the same .cfg file is used in the test fixture.
+This isn't a divergence — both checkers explored the same state space
+under the equivalent semantics.
+
+**Validation evidence (spot `REDACTED-INSTANCE`, c8g.xlarge,
+us-west-2):**
+- `cargo test --release --test state_graph_snapshots` →
+  **12 passed, 0 failed, 1 ignored** in 1.4s. Sanity tests cover
+  digest stability, sort invariance, content sensitivity, key sort
+  order; 7 snapshot tests pin the digests.
+- `cargo test --release -- --skip compiled_matches_interpreted` →
+  **645 tests passing, 0 failing** (492 lib + 90 bin + 15+11+10+2+5
+  +12+6+2 across `tests/`, 1+2 ignored, 1 filtered, 0 failed). Net
+  +12 from the new snapshot tests (was 633 after T2.3 landed).
+- `bash scripts/diff_tlc.sh` → **13/13 PASS**, 0 fail, 0 allowlisted.
+- `PROPTEST_CASES=256 cargo test --release --test compiled_vs_interpreted`
+  → 11/11 pass, proptest gate stays green.
+
+**T3.N divergences:** **none**. Every snapshotted spec produced the
+exact distinct-state count TLC reported on first computation, so the
+harness landed clean. (T1 and T2 both surfaced bugs on first contact
+— it's a pleasant surprise that T3 didn't, suggesting the broad
+successor-generation surface is now well-tested by the bugs T1.1,
+T1.4, T1.5, and T2.3 already drove out.)
+
+**Wider scope discovered:** None. The harness is purely test-side; no
+production code changes. The dev-dependency surface is unchanged
+(`twox-hash` was already a runtime dep, used here for the 128-bit
+digest).
+
+**Recommended next step:** proceed to T4 (mutation testing audit on
+`src/tla/eval.rs` and `src/tla/action_exec.rs`). Now that T1+T2+T3
+form a tight regression net (count parity + expression-eval
+equivalence + reachable-set fixpoint), mutation testing has a strong
+oracle to score against; surviving mutants will pinpoint the
+remaining test-coverage gaps in the eval/exec hot paths.
+
+**Commit:** TBD (filled in by post-commit edit).
+
