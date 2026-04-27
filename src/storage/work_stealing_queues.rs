@@ -295,6 +295,18 @@ impl<T: 'static> WorkStealingQueues<T> {
         let my_numa = worker_state.numa_node;
 
         loop {
+            // CRITICAL: Check `finished` early so that pop_slow_path exits as
+            // soon as the runtime signals shutdown (e.g. violation detected,
+            // run cancelled, error). Without this, workers can spin forever
+            // when other workers exit early leaving orphan items in their
+            // local deques: `should_terminate` would keep returning false
+            // because `Stealer::is_empty()` reports those orphaned items,
+            // and the limited (max-8) per-NUMA steal attempts can fail to
+            // reach the orphan deques. See T11.5.
+            if self.finished.load(Ordering::Acquire) {
+                return None;
+            }
+
             // CRITICAL: Check pause_requested early in the loop.
             // This ensures workers can exit even if Steal::Retry keeps looping.
             if self.pause_requested.load(Ordering::Acquire) {

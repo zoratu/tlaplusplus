@@ -2410,6 +2410,13 @@ where
                         worker_stop_on_violation && (prev_count + 1) >= worker_max_violations;
                     if should_stop {
                         worker_stop.store(true, Ordering::Release);
+                        // T11.5: tell the queue to stop too, so other workers
+                        // currently spinning in `pop_slow_path` exit promptly.
+                        // Without this, orphan items left in *this* worker's
+                        // local deque (siblings of the violating state, not
+                        // yet popped) keep `should_terminate` returning false
+                        // for everyone else, causing a hang.
+                        worker_queue.finish();
                     }
                     worker_queue.worker_idle(worker_state.id());
                     if should_stop {
