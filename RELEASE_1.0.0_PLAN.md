@@ -111,6 +111,12 @@ These come first because every later change needs a regression gate.
 - [ ] **T13.5. DEFER TO 1.1.0.** Unbounded-fairness reader liveness. Re-cast the proof from step relations into Verus's `state_machines!` macro and discharge "writer cannot starve reader" with a temporal fairness assumption. Research-grade.
 - [ ] **T13.6. DEFER TO 1.1.0.** CI gate. Once Verus is `cargo`-driven and ships an aarch64 Linux Z3, wire `verification/verus/run_proof.sh tier-a` into `.github/workflows/`. Currently the proof requires Verus from source (~10 min build) plus aarch64 Z3 apt workaround, neither of which is CI-friendly out of the box.
 
+
+### Bugs uncovered by final integration validation (block v1.0.0)
+
+- [ ] **T5.6. SOUNDNESS: symbolic-init `Distinct` heuristic over-restricts.** Fires for chained set-difference predicates that constrain only ONE position. Repro: `pred = "p[3] \in {1,2,3} \ {p[1], p[2]}"`, n=3, range_max=3. Brute force = 12 sequences. Symbolic = 6 (only strict permutations of {1,2,3}). proptest seed `cc bf0e5929a57584b6c92ad21d8d13b87617487b7ff162301b86525bced49ca844`. T5.2 `Distinct` shortcut should only fire when the chain pins ALL positions, not just one.
+- [ ] **T11.5. Hang under `timeout --foreground` wrapper at default worker count.** 2 specs (`simple_counter_violation`, `queue_segment_sync_buggy`) hang past 60s timeout when invoked via `timeout --foreground 60s ./tlaplusplus run-tla --allow-deadlock --skip-system-checks ...`. Manual runs (no timeout wrapper, or `--workers N` explicit) complete in 1-2s. Hung process burns CPU continuously — live spinning, not idle. Suspect SIGALRM/SIGINT race in NUMA worker init, or auto-tune deadlock when warmup is interrupted by signal forwarding.
+
 ## Phase 5 — Release
 
 - [ ] **T17. Closeout sweep.** Before T14/T15:
