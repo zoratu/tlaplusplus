@@ -114,18 +114,26 @@ These come first because every later change needs a regression gate.
 - [ ] **T13.6. DEFER TO 1.1.0.** CI gate. Once Verus is `cargo`-driven and ships an aarch64 Linux Z3, wire `verification/verus/run_proof.sh tier-a` into `.github/workflows/`. Currently the proof requires Verus from source (~10 min build) plus aarch64 Z3 apt workaround, neither of which is CI-friendly out of the box.
 
 
-### Bugs uncovered by final integration validation (block v1.0.0)
+### Bugs uncovered by final integration validation (fixed before v1.0.0)
 
-- [ ] **T5.6. SOUNDNESS: symbolic-init `Distinct` heuristic over-restricts.** Fires for chained set-difference predicates that constrain only ONE position. Repro: `pred = "p[3] \in {1,2,3} \ {p[1], p[2]}"`, n=3, range_max=3. Brute force = 12 sequences. Symbolic = 6 (only strict permutations of {1,2,3}). proptest seed `cc bf0e5929a57584b6c92ad21d8d13b87617487b7ff162301b86525bced49ca844`. T5.2 `Distinct` shortcut should only fire when the chain pins ALL positions, not just one.
-- [ ] **T11.5. Hang under `timeout --foreground` wrapper at default worker count.** 2 specs (`simple_counter_violation`, `queue_segment_sync_buggy`) hang past 60s timeout when invoked via `timeout --foreground 60s ./tlaplusplus run-tla --allow-deadlock --skip-system-checks ...`. Manual runs (no timeout wrapper, or `--workers N` explicit) complete in 1-2s. Hung process burns CPU continuously — live spinning, not idle. Suspect SIGALRM/SIGINT race in NUMA worker init, or auto-tune deadlock when warmup is interrupted by signal forwarding.
+Both shipped — see the per-task entries above (T5.6 + T11.5) and
+`RELEASE_1.0.0_LOG.md` for root-cause writeups. Final-pass validation on
+c8g.metal-24xl re-confirmed both fixes with all 12 gates green.
 
 ## Phase 5 — Release
 
-- [ ] **T17. Closeout sweep.** Before T14/T15:
-  1. **Soundness bash** — done at decision time: T2.4 fixed (`e928400`); T1.6 and T11.1 deferred to 1.1.0 with documented justification (see entries above). Re-confirm at this stage that no new soundness issues have surfaced.
-  2. **Quality bash** — walk every other parked `[ ]` follow-up (T5.1–3, T6.1, T7.1–3, T9.1–3, T10.1–4, T11.2–3) and decide ship / defer-to-1.1 / drop. Most defer; plan keeps them as the post-1.0 roadmap.
-  3. **Full re-validation pass** on a fresh spot: T1 13/13, T2 proptest 2048×N seeds, T3 snapshots, T4 mutation kill-rate stable, T11 short soak smoke. Full external corpus run vs v0.3.0 baseline (regression check + show wins). T6.1 cross-node re-benchmark on a real corpus spec to decide cluster default.
-- [ ] **T14. Update CHANGELOG.md, CLAUDE.md, README.** Bump version to 1.0.0.
+- [x] **T17. Closeout sweep.** Done. Final integration validation 2nd attempt
+  on c8g.metal-24xl: all 12 gates green (cargo test 756/776/774 across
+  default/failpoints/symbolic-init; diff_tlc 13/13; proptest 3 seeds × 2048;
+  state-graph snapshots 12/12; trace-minimization 5/5; POR correctness 6/6 +
+  benchmark 1/1; T1.6 reproducer exact match 52,376/15,970/0; T11.1 5-run
+  determinism each = 26,344; chaos soak 63 iters / 0 divergences / 0 hangs /
+  61 distinct concurrent pairs; Verus tier-A 31 verified, 0 errors). The
+  first attempt found T5.6 + T11.5; both fixed before the rerun.
+- [x] **T14. Update CHANGELOG.md, CLAUDE.md, README, RELEASE_1.0.0_SUMMARY,
+  RELEASE_1.0.0_PLAN.** Done. Test counts updated to 756/776/774, T1.6/T11.1/
+  T11.5/T5.6 moved out of "Deferred", v1.1.0 backlog tightened to T5.4/T5.5/
+  T10.2/T11.3/T11.4/T13.4-6.
 - [ ] **T15. Tag, push, and prepare gh release.** User triggers the actual `gh release create`.
 
 ## Working rules

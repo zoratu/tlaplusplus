@@ -1,6 +1,6 @@
 # Changelog
 
-## v1.0.0 (2026-04-26)
+## v1.0.0 (2026-04-27)
 
 First stable release. The 1.0 cycle focused on correctness foundations,
 high-leverage performance wins, polish, and a Verus-checked proof of the
@@ -11,9 +11,8 @@ fingerprint store's resize protocol.
 - **Differential testing vs TLC as a CI gate.** `scripts/diff_tlc.sh` plus
   `.github/workflows/diff-tlc.yml` runs 13 curated specs under both TLC and
   tlaplusplus on every push. State counts agree exactly; the harness uncovered
-  five real divergences (T1.1, T1.3, T1.4, T1.5, T2.4) that were all fixed
-  before the release. Two divergences (T1.6, T11.1) are documented and deferred
-  to v1.1.0 with workarounds.
+  seven real divergences (T1.1, T1.3, T1.4, T1.5, T1.6, T2.4, T11.5) that
+  were all fixed before the release.
 - **Compiled-vs-interpreted proptest equivalence.**
   `tests/compiled_vs_interpreted.rs` generates well-typed
   Int/Bool/Set/Seq/Record/Str expressions and asserts the text evaluator and
@@ -42,6 +41,11 @@ fingerprint store's resize protocol.
   on the inner `\/`, so shared post-conditions are no longer dropped and
   spurious successors are no longer fabricated. Closes the VIEW projection
   mismatch on `ViewTest`.
+- **T1.6.** `<=>` (logical equivalence) was silently mis-parsed as `<= >`
+  because the `=>` splitter consumed the `=>` *inside* `<=>`. Fixed in both
+  interpreter (`eval_expr_inner` now splits `<=>` before `=>`) and compiled
+  evaluator (new `CompiledExpr::Iff` variant placed before `Implies`).
+  `FingerprintStoreResize.tla` now matches TLC exactly.
 - **T2.1, T2.2.** Compiled-expr parser now scans for top-level `EXCEPT` only
   at bracket depth 0, so nested record-EXCEPT and EXCEPT-inside-record-literal
   shapes compile correctly.
@@ -131,47 +135,82 @@ fingerprint store's resize protocol.
   opt-in (`--cluster-listen`). Global FP partitioning is multi-quarter work
   out of scope for v1.0.0; tracked in the v1.1.0 backlog.
 
+### Soundness fixes shipped in the final integration validation
+
+- **T1.6.** `<=>` (logical equivalence) was silently mis-parsed because the
+  `=>` splitter consumed the `=>` *inside* `<=>`. Fixed in both interpreter
+  and compiled-IR paths; `FingerprintStoreResize.tla` now matches TLC exactly
+  (52,376 generated, 15,970 distinct, 0 violations).
+- **T11.1.** `--queue-max-inmem-items` below natural state count caused the
+  spill path to drop states. Root cause: items in the spill pipeline were
+  invisible to `has_pending_work()`/`should_terminate()`. Fixed via
+  `inflight_spilled` AtomicU64 counter; 5 deterministic runs at cap=2000 now
+  return exactly 26,344 distinct each.
+- **T11.5.** Violation-exit hang under timeout-wrapper at NUMA-auto worker
+  counts. Workers spinning in `pop_slow_path` did not observe `queue.finish()`
+  so they never exited after a violation set `worker_stop=true`. Two-line fix:
+  pop_slow_path now checks `self.finished` alongside `pause_requested`, and
+  the violation handler calls `worker_queue.finish()`.
+
+### Quality follow-ups shipped
+
+- **T5.1+T5.2+T5.3** — Symbolic Init handles sequence-set comprehensions and
+  Distinct-shortcut permutation symmetry; near-tautology detection covered by
+  the existing v0.3.0 sum-range constraint propagation.
+- **T5.6** — Tightened the symbolic-init `Distinct` shortcut to require
+  per-position chain evidence (proptest divergence fix).
+- **T7.1+T7.2+T7.3** — POR enhancements: batched per-disjunct evaluation
+  (PorBenchProcessGrid 19.7x → 39.2x), smarter stubborn-set seed, POR for
+  liveness via Peled (1994) visible-action proviso.
+- **T9.1+T9.2+T9.3** — Trace minimization: transitive variable relevance
+  through operator inlining, multi-source BFS seed, suffix shortening.
+- **T10.1+T10.3+T10.4** — Liveness scaling: parallel-flatten via dashmap raw
+  shards (~20% on N=10), trivial-SCC pre-filter for sparse graphs,
+  per-action transition shard (~6x per-constraint check).
+- **T11.2** — Re-soak validated T11.1 fix at cap=2000 driving the spill path
+  under fault injection (166 iters, 0 divergences).
+- **T12.1** — Cross-arch CI stack-overflow on the deliberate unbounded
+  recursion test fixed by allocating an 8 MB thread stack for that test only.
+- **T13.1+T13.2+T13.3** — Verus tier A: 31 lemmas verified including
+  `theorem_no_fingerprint_lost_a` over a `Seq<u64>` linear-probe model,
+  spec-level CAS soundness, and bounded reader-retry termination. Lives at
+  `verification/verus/seqlock_resize_tier_a.rs`.
+
 ### Test suite
 
-- **727 default tests** (release, no extra features), 0 failures,
-  3 ignored (one disk-checkpoint test pending serializable queue, two
-  doc-tests for chaos/S3).
-- **746 tests with `--features failpoints`**, 0 failures, 3 ignored.
-- **Symbolic-init feature** adds 8 tests when `--features symbolic-init` is
-  enabled (Z3-backed equivalence + brute-force-on-small).
+- **756 default tests** (release, no extra features), 0 failures,
+  8 ignored (disk-checkpoint round-trip pending serializable queue + per-test
+  ignores for chaos/S3 doctests + a few env-dependent integration ignores).
+- **776 tests with `--features failpoints`**, 0 failures.
+- **774 tests with `--features symbolic-init`**, 0 failures.
 - 13/13 specs pass `scripts/diff_tlc.sh` (state counts agree exactly with
   TLC v2.19 on every spec).
 - 12 active state-graph snapshot tests, all match.
 - T2 proptest equivalence harness clean across 9 seeds at
-  `PROPTEST_CASES=2048`.
-- Single ignored test: disk-checkpoint round-trip (needs serializable queue
-  metadata, deferred to v1.1.0).
+  `PROPTEST_CASES=2048` (validated on 3 fresh seeds: 1, 7, 42).
+- 10-minute swarm-mode chaos soak: 63 iterations, 0 divergences, 0 hangs;
+  61 distinct concurrent failpoint pairs observed.
+- Verus tier-A: 31 lemmas verified, 0 errors.
 
 ### Deferred to v1.1.0
 
-The following items were classified during the T17 closeout sweep. Detail in
+The following items remain on the post-1.0.0 roadmap. Detail in
 `RELEASE_1.0.0_PLAN.md` (each entry begins with `**DEFER TO 1.1.0.**`).
 
-- **T1.6** — `FingerprintStoreResize` invariant evaluator returns `Bool(false)`
-  instead of computing. Pre-existing, single-spec, low-impact.
-- **T11.1** — `--queue-max-inmem-items` below natural state count causes the
-  spill path to drop states. Documented workaround: keep cap above natural
-  state count (default 50M is safe for ~all users).
-- **T5.1, T5.2, T5.3** — symbolic Init enhancements (sequence-set Init,
-  permutation symmetry, projection-based all-SAT).
-- **T7.1, T7.2, T7.3** — POR enhancements (batched per-disjunct evaluation,
-  smarter stubborn-set seed, POR for liveness).
-- **T9.1, T9.2, T9.3** — trace minimization enhancements (transitive variable
-  relevance, smarter BFS seed, suffix shortening).
-- **T10.1–T10.4** — liveness scaling enhancements (parallel Tarjan, streaming
-  SCC discovery, single-state SCC pre-filter, per-action transition shard).
-- **T11.2, T11.3** — chaos soak follow-ups (re-soak with queue cap once T11.1
-  fixed, CI-gate variant).
-- **T12.1** — CI surfaced a stack-overflow on the deliberate
-  unbounded-recursion test on GitHub Actions' default 2 MB thread stack;
-  spot instances pass cleanly.
-- **T13.1, T13.2, T13.3** — Verus tier A roadmap (verify production Rust
-  directly, liveness, CI gate).
+- **T5.4** — Streaming Init enumeration / eager invariant filtering during
+  cross-product (Einstein-class workloads).
+- **T5.5** — Joint Init+Solution symbolic encoding (single-shot Z3 query for
+  full Einstein-style specs).
+- **T10.2** — Streaming SCC discovery during exploration (on-the-fly liveness
+  for 100M+ state spaces).
+- **T11.3** — CI-gate variant of the chaos soak (~5 min nightly form).
+- **T11.4** — `route_spill_batch` inflight-counter accounting on disk-overflow
+  push errors.
+- **T13.4** — Production-code Verus annotations
+  (`Tracked<PointsTo<HashTableEntry>>` threaded through `FingerprintShard`).
+- **T13.5** — Unbounded-fairness reader liveness via Verus
+  `state_machines!` macro.
+- **T13.6** — CI gate for Verus tier-A run.
 
 ## v0.3.0 (2026-03-25)
 

@@ -24,10 +24,10 @@ Key performance features:
 # Build release binary
 cargo build --release
 
-# Run all tests (727 tests)
+# Run all tests (756 tests)
 cargo test --release
 
-# Run with chaos/failpoint testing (746 tests)
+# Run with chaos/failpoint testing (776 tests)
 cargo test --release --features failpoints
 
 # Run with Z3-backed symbolic Init enumeration (T5)
@@ -405,8 +405,9 @@ Periodic checkpoints (`--checkpoint-interval-secs`) persist state for crash reco
 **Working (TLC feature parity + 1.0.0 additions)**:
 
 Test suite & gates:
-- **727 default tests**, 0 failures, 5 ignored (`cargo test --release`)
-- **746 tests with `--features failpoints`**, 0 failures
+- **756 default tests**, 0 failures, 8 ignored (`cargo test --release`)
+- **776 tests with `--features failpoints`**, 0 failures
+- **774 tests with `--features symbolic-init`**, 0 failures
 - **13/13 differential-vs-TLC specs** pass via `scripts/diff_tlc.sh` (state counts agree exactly with TLC v2.19); CI gate via `.github/workflows/diff-tlc.yml` runs on a `[ubuntu-latest, ubuntu-24.04-arm]` cross-arch matrix
 - **T2 proptest equivalence**: compiled-vs-interpreted on Int/Bool/Set/Seq/Record/Str expressions, clean across 9 seeds at `PROPTEST_CASES=2048`; CI runs at 128
 - **T16a swarm proptest**: random subset of 17 shape categories per case (Regehr-style); kept alongside the uniform regression
@@ -442,16 +443,19 @@ Distributed:
 - Cross-node TCP work-stealing protocol (T6); opt-in `--cluster-listen`. Cluster mode kept opt-in for v1.0.0 — see `RELEASE_1.0.0_LOG.md` `### T6.1` for the cluster-vs-independent benchmark and the rationale.
 
 Verification:
-- Verus tier-B proof of the seqlock resize protocol (T13). 19 lemmas verified by Z3, including the headline `theorem_no_fingerprint_lost`. Lives at `verification/verus/seqlock_resize.rs`; run via `verification/verus/run_proof.sh`. Tier A (verify production Rust directly) tracked in v1.1.0 backlog.
+- Verus tier-B proof of the seqlock resize protocol (T13). 19 lemmas verified by Z3, including the headline `theorem_no_fingerprint_lost`. Lives at `verification/verus/seqlock_resize.rs`; run via `verification/verus/run_proof.sh`.
+- Verus tier-A extension (T13.1-T13.3). 31 lemmas verified over a `Seq<u64>` linear-probe model with spec-level CAS soundness and bounded reader-retry termination. Lives at `verification/verus/seqlock_resize_tier_a.rs`; run via `verification/verus/run_proof.sh tier-a`. Production-code annotations (T13.4) and unbounded-fairness liveness (T13.5) tracked in v1.1.0 backlog.
 
 Chaos & swarm:
 - 1-hour chaos soak (`scripts/chaos_soak.sh`) covers all 12 failpoints in `src/chaos.rs`; 0 divergences, 0 hangs in the v1.0.0 release run.
 - Swarm-mode chaos (`--swarm-mode N|auto`, T16b) injects 1-4 concurrent failpoints per iteration; runtime tolerates 4-fold simultaneous fault injection.
 
-Deferred to v1.1.0 (with workarounds):
-- T1.6: `FingerprintStoreResize` invariant evaluator returns `Bool(false)` (single-spec, low-impact).
-- T11.1: `--queue-max-inmem-items` below natural state count drops states (workaround: keep cap above natural state count; default 50M is safe).
-- See `RELEASE_1.0.0_PLAN.md` for the full v1.1.0 backlog (T5/7/9/10/11/12/13 follow-ups).
+Deferred to v1.1.0:
+- T5.4, T5.5: Streaming Init enumeration, joint Init+Solution symbolic encoding (Einstein-class workloads).
+- T10.2: Streaming SCC discovery for 100M+ liveness.
+- T11.3, T11.4: CI-gate chaos variant, route_spill_batch inflight accounting on disk-overflow errors.
+- T13.4-T13.6: Verus production-code annotations, unbounded-fairness reader liveness, CI gate.
+- See `RELEASE_1.0.0_PLAN.md` for the full v1.1.0 backlog.
 
 ## Key Implementation Notes
 

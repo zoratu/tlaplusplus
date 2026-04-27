@@ -5,22 +5,23 @@ exploration on many-core systems. v1.0.0 is the first stable release.
 
 ## Headline numbers
 
-- **727 default tests, 747 with failpoints, 0 failures**
+- **756 default tests, 776 with failpoints, 774 with symbolic-init, 0 failures**
 - **13/13** specs match TLC exactly via the diff CI gate
   ([scripts/diff_tlc.sh](scripts/diff_tlc.sh))
 - **174/182 (95.6%)** of [tlaplus/Examples](https://github.com/tlaplus/Examples)
   pass full model checking at 60s; 182/182 pass analysis
 - **10.7x faster** than Java TLC on the synthetic counter-grid benchmark
   (128-core AMD EPYC); up to 22x on NUMA-optimized configs
-- **Verus tier-B proof** of the seqlock resize protocol — 19 lemmas verified,
-  including the headline soundness theorem `theorem_no_fingerprint_lost`
+- **Verus tier-B + tier-A proofs** of the seqlock resize protocol — 19 + 31
+  lemmas verified, including `theorem_no_fingerprint_lost` and the
+  linear-probe-table soundness extension
 
 ## What's new since v0.3.0
 
 ### Correctness
 - **Differential CI gate vs TLC** (T1) — 13 curated specs run under both
-  checkers on every push; uncovered and fixed five soundness bugs (T1.1, T1.3,
-  T1.4, T1.5, T2.4)
+  checkers on every push; uncovered and fixed seven soundness bugs (T1.1,
+  T1.3, T1.4, T1.5, T1.6, T2.4, T11.5)
 - **Compiled-vs-interpreted proptest equivalence** (T2) — well-typed
   expression generator, 17 proptest cases, clean across 9 seeds at
   `PROPTEST_CASES=2048`
@@ -57,24 +58,27 @@ exploration on many-core systems. v1.0.0 is the first stable release.
   failpoint in `src/chaos.rs` fired ≥23 times; 0 divergences, 0 hangs
 
 ### Verification
-- **Verus tier-B proof of the seqlock resize protocol** (T13). 19 lemmas
-  verified by Z3; `theorem_no_fingerprint_lost` machine-checks that no
-  inserted fingerprint is ever lost during a resize. See
-  [verification/verus/README.md](verification/verus/README.md).
+- **Verus tier-B + tier-A proofs of the seqlock resize protocol** (T13 +
+  T13.1-T13.3). 19 lemmas at the abstract `Set<u64>` layer (tier B,
+  `seqlock_resize.rs`); 31 lemmas at the concrete `Seq<u64>` linear-probe
+  layer (tier A, `seqlock_resize_tier_a.rs`). Together they
+  machine-check that no inserted fingerprint is ever lost during a resize,
+  the spec-level CAS soundness theorem, and bounded reader-retry termination.
+  See [verification/verus/README.md](verification/verus/README.md).
 
 ## Deferred to v1.1.0
 
-Two soundness items have documented workarounds and are tracked for v1.1.0:
+Eight quality follow-ups are parked as the v1.1.0 roadmap (detail in
+[RELEASE_1.0.0_PLAN.md](RELEASE_1.0.0_PLAN.md), each entry begins with
+`**DEFER TO 1.1.0.**`):
 
-- **T1.6** — `FingerprintStoreResize` invariant evaluator returns
-  `Bool(false)` instead of computing. Pre-existing, single-spec, low-impact.
-- **T11.1** — `--queue-max-inmem-items` below natural state count causes the
-  spill path to drop states. Workaround: keep cap above natural state count
-  (default 50M is safe).
-
-A further 16 quality follow-ups (T5/7/9/10/11/12/13.* enhancements) are
-parked in [RELEASE_1.0.0_PLAN.md](RELEASE_1.0.0_PLAN.md) as the v1.1.0
-roadmap.
+- **T5.4, T5.5** — Streaming Init enumeration / joint Init+Solution symbolic
+  encoding (Einstein-class workloads).
+- **T10.2** — Streaming SCC discovery for 100M+ liveness.
+- **T11.3, T11.4** — CI-gate chaos variant; `route_spill_batch` inflight
+  accounting on disk-overflow push errors.
+- **T13.4, T13.5, T13.6** — Verus production-code annotations,
+  unbounded-fairness reader liveness, CI gate.
 
 ## Try it
 

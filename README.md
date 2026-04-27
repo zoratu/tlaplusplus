@@ -2,8 +2,8 @@
 
 A Rust implementation of TLA+ model checking with TLC feature parity, achieving **10.7x faster** state exploration than Java TLC on many-core systems. 182/182 (100%) of the [tlaplus/Examples](https://github.com/tlaplus/Examples) corpus passes analysis; **174/182 (95.6%)** also pass full model checking at 60s.
 
-**v1.0.0 (2026-04-26)** ships with:
-- 727 default tests + 747 with failpoints, 0 failures
+**v1.0.0 (2026-04-27)** ships with:
+- 756 default tests + 776 with failpoints + 774 with symbolic-init, 0 failures
 - Differential CI gate vs TLC (13/13 specs match exactly)
 - Compiled-vs-interpreted proptest equivalence (clean across 9 seeds at 2048 cases)
 - State-graph snapshot tests (12 specs pinned to 128-bit XxHash3 digests)
@@ -145,10 +145,10 @@ cargo build --release
 ## Testing
 
 ```bash
-# Run all tests (727 tests)
+# Run all tests (756 tests)
 cargo test --release
 
-# Run with chaos/failpoint testing (747 tests)
+# Run with chaos/failpoint testing (776 tests)
 cargo test --release --features failpoints
 
 # Run with Z3-backed symbolic Init enumeration (T5)
@@ -169,8 +169,9 @@ cargo +nightly fuzz run fuzz_tla_module
 ```
 
 The test suite includes:
-- **727 unit/integration tests** covering runtime, storage, TLA+ evaluation, and model checking correctness
-- **747 tests with `--features failpoints`** (adds chaos/fault-injection coverage)
+- **756 unit/integration tests** covering runtime, storage, TLA+ evaluation, and model checking correctness
+- **776 tests with `--features failpoints`** (adds chaos/fault-injection coverage)
+- **774 tests with `--features symbolic-init`** (adds Z3-backed enumeration coverage)
 - **17 proptest cases** in the compiled-vs-interpreted equivalence harness (uniform + Regehr-style swarm mask), plus 19 set-algebra/serialization property tests
 - **23 chaos/failpoint tests** for single-fault-path correctness
 - **8 fuzz targets** for parser robustness
