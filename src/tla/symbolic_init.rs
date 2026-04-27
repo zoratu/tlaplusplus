@@ -1279,51 +1279,101 @@ mod backend {
     }
 
     /// Cheap textual scan for permutation indicators. Conservative — only
-    /// returns true if it sees one of the canonical Einstein-shape patterns.
-    /// False negatives are fine (we just miss the Distinct shortcut and
-    /// fall back to pairwise inequalities expressed in the predicate).
+    /// returns true if it sees one of the canonical Einstein-shape patterns
+    /// AND every position 1..=seq_len is constrained to be distinct from the
+    /// others. False negatives are fine (we just miss the Distinct shortcut
+    /// and fall back to pairwise inequalities expressed in the predicate).
+    ///
+    /// T5.6 fix: previously this returned `true` whenever `var[` occurred
+    /// >= seq_len times alongside any `\ {`. That was unsound for predicates
+    /// like `p[3] \in {1,2,3} \ {p[1], p[2]}` where only one position is
+    /// constrained — Distinct would wrongly force ALL positions distinct,
+    /// dropping legal solutions where p[1] = p[2]. The corrected check
+    /// requires evidence that every position 1..=seq_len participates in
+    /// the distinctness chain (either as the LHS of a chain entry, or via
+    /// pairwise `#` covering all pairs).
     fn contains_permutation_indicator(pred: &str, var_name: &str, seq_len: usize) -> bool {
-        // Pattern 1: `var[i] \in S \ {var[j], ...}` — Einstein's
-        // distinctness clauses.
-        // Pattern 2: chained `var[i] # var[j]` for all (i,j) pairs.
         let needle1 = format!("{}[", var_name);
         if !pred.contains(&needle1) {
             return false;
         }
-        // Cheap heuristic: look for `\ {var[` (set-difference with var-indexed
-        // singletons), which only appears in distinctness chains.
+
+        // Pattern 1: chained `var[i] \in S \ {var[1], ..., var[i-1]}` for
+        // every i in 1..=seq_len (i=1 may omit the difference clause if the
+        // domain alone constrains it). To keep this textual but sound,
+        // require that for every i in 2..=seq_len we see *both*:
+        //   (a) `var[i]` appearing somewhere as the LHS of `\in` (i.e.
+        //       `var[i] \in` substring), and
+        //   (b) within that chain entry, a `\ {` set-difference referencing
+        //       at least i-1 prior var[k] occurrences.
+        // Cheap approximation: scan for each `var[i] \in` substring and
+        // walk forward to find the matching `\ {` and count `var[` inside
+        // its braces.
         if pred.contains("\\ {") || pred.contains("\\{") {
-            // crude count of how often we see `var[` inside set-difference.
-            let var_index_marker = format!("{}[", var_name);
-            // If the pred mentions n-1 distinct var[k] indices in difference
-            // contexts, it's almost certainly a distinctness chain.
-            let occurrences = pred.matches(var_index_marker.as_str()).count();
-            if occurrences >= seq_len {
+            let mut chain_ok = true;
+            for i in 2..=seq_len {
+                let lhs = format!("{}[{}]", var_name, i);
+                let lhs_in = format!("{} \\in", lhs);
+                let lhs_in_no_space = format!("{}\\in", lhs);
+                let start = pred
+                    .find(lhs_in.as_str())
+                    .or_else(|| pred.find(lhs_in_no_space.as_str()));
+                let Some(start) = start else {
+                    chain_ok = false;
+                    break;
+                };
+                // Look for a `\ {` after this LHS within a reasonable window
+                // (until the next top-level conjunction marker; we use a
+                // simple heuristic of scanning until the next `/\` or end).
+                let rest = &pred[start..];
+                let end = rest
+                    .find("/\\")
+                    .or_else(|| rest.find("\\/"))
+                    .unwrap_or(rest.len());
+                let segment = &rest[..end];
+                let Some(diff_idx) = segment.find("\\ {").or_else(|| segment.find("\\{")) else {
+                    chain_ok = false;
+                    break;
+                };
+                // Find the closing brace and count var[ inside.
+                let after_open = &segment[diff_idx..];
+                let Some(close_rel) = after_open.find('}') else {
+                    chain_ok = false;
+                    break;
+                };
+                let inside = &after_open[..close_rel];
+                let inside_count = inside.matches(needle1.as_str()).count();
+                if inside_count < i - 1 {
+                    chain_ok = false;
+                    break;
+                }
+            }
+            if chain_ok && seq_len >= 2 {
                 return true;
             }
         }
-        // Pairwise: at least n*(n-1)/2 `#` operators between var[i]/var[j].
-        let hash_count = pred.matches('#').count();
-        let needed_pairs = seq_len * (seq_len - 1) / 2;
-        if hash_count >= needed_pairs && hash_count >= 1 {
-            // Rough heuristic only. Even if wrong, asserting Distinct is
-            // unsound only if the predicate didn't actually require
-            // distinctness — we add an extra constraint that filters out
-            // legal solutions. To stay safe we additionally require that
-            // the seq_len equals range_size (already checked at call site).
-            // Combined with seq_len == range_size, Distinct becomes a
-            // permutation requirement; if the user's predicate doesn't
-            // require this, we'd miss solutions. Be more conservative:
-            // require that the variable name appears on both sides of every
-            // `#`. We approximate by counting `var[..] # var[..]` patterns.
-            let pat = format!("{}[", var_name);
-            let combined_needle = format!("{} # {}", pat, pat).replace("{}[", &pat);
-            // Cheap: count adjacent occurrences via splits — best-effort.
-            let _ = combined_needle;
-            // Be conservative — only emit Distinct if we ALSO see the
-            // set-difference pattern above. Otherwise return false here.
-            return false;
+
+        // Pattern 2: pairwise `var[i] # var[j]` for every (i,j) pair.
+        // Require literal substrings `var[i] # var[j]` for every i<j; this
+        // is the only sound textual witness that all positions are pairwise
+        // distinct.
+        if seq_len >= 2 && pred.contains('#') {
+            let mut all_pairs_ok = true;
+            'outer: for i in 1..=seq_len {
+                for j in (i + 1)..=seq_len {
+                    let p1 = format!("{}[{}] # {}[{}]", var_name, i, var_name, j);
+                    let p2 = format!("{}[{}] # {}[{}]", var_name, j, var_name, i);
+                    if !pred.contains(p1.as_str()) && !pred.contains(p2.as_str()) {
+                        all_pairs_ok = false;
+                        break 'outer;
+                    }
+                }
+            }
+            if all_pairs_ok {
+                return true;
+            }
         }
+
         false
     }
 
