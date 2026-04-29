@@ -103,6 +103,29 @@ fn t101_compiled_expr_indexed_op_call_non_ascii_trailer_does_not_panic() {
     }
 }
 
+/// T101: a different family — not UTF-8, but unchecked subtraction. The
+/// LET-binding parser at `parse_let_bindings` (and its sibling in
+/// `parse_local_let`) computed the value slice as
+/// `defs_str[*eq_pos + 2..body_end]` under the assumption that the next
+/// `==` always follows the previous one with a normal body in between. A
+/// pathological input that packs two `==` markers adjacently makes
+/// `body_end < eq_pos + 2`, panicking with:
+///   `byte range starts at 7 but ends at 0`
+#[test]
+fn t101_let_back_to_back_equals_does_not_panic() {
+    let state = TlaState::new();
+    let ctx = EvalContext::new(&state);
+    for expr in &[
+        "LET A == B == 1 IN A",
+        "LET F[i \\in {}]==G==1 IN G",
+        "LET\nA==B==C==1\nIN A",
+        "LET ====== IN 1",
+    ] {
+        let _ = compile_expr(expr);
+        let _ = eval_compiled(&compile_expr(expr), &ctx);
+    }
+}
+
 /// T101: defence-in-depth — an empty-ish module with stray non-ASCII bytes
 /// in places where the parser is normally relaxed (between declarations,
 /// inside comments, after `====`, etc.) must never panic.

@@ -2424,8 +2424,15 @@ fn try_parse_let(expr: &str) -> Option<CompiledExpr> {
             defs_str.len()
         };
 
+        // Defensive: malformed input may put two `==` markers right next to
+        // each other (e.g. `Op==Op==`), making `body_end < eq_pos + 2`. Skip
+        // such definitions instead of panicking.
+        let value_start = *eq_pos + 2;
+        if value_start > body_end {
+            continue;
+        }
         let name = trim_let_edge_comments(&defs_str[name_start..*eq_pos]);
-        let value = trim_let_edge_comments(&defs_str[*eq_pos + 2..body_end]);
+        let value = trim_let_edge_comments(&defs_str[value_start..body_end]);
 
         // Skip comments (lines starting with \*)
         let name = name.lines().last().unwrap_or("").trim();
@@ -2956,8 +2963,14 @@ fn parse_let_bindings(defs_text: &str) -> Option<Vec<(String, String)>> {
             defs_text.len()
         };
 
+        // Defensive: malformed input may pack two `==` markers adjacently,
+        // making `body_end < eq_pos + 2`. Skip rather than panic.
+        let body_start = *eq_pos + 2;
+        if body_start > body_end {
+            continue;
+        }
         let name = trim_let_edge_comments(&defs_text[name_start..*eq_pos]);
-        let body = trim_let_edge_comments(&defs_text[*eq_pos + 2..body_end]);
+        let body = trim_let_edge_comments(&defs_text[body_start..body_end]);
 
         // Name should be a simple identifier (possibly with params, but we ignore those for now)
         let name = if let Some(_paren) = name.find('(') {
