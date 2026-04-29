@@ -60,6 +60,9 @@ impl NumaTopology {
         if let Ok(entries) = fs::read_dir(node_dir) {
             for entry in entries.filter_map(|e| e.ok()) {
                 let name = entry.file_name();
+                // SAFE: lossy is fine — `/sys/devices/system/node/` is kernel-managed
+                // and only contains ASCII `nodeN` directories. Non-matching names are
+                // rejected by the prefix and integer parse below.
                 let name_str = name.to_string_lossy();
 
                 // Look for node0, node1, etc.

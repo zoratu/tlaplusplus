@@ -2624,6 +2624,10 @@ fn list_checkpoints(
                 .context("failed reading checkpoints directory")?
                 .filter_map(|e| e.ok())
                 .filter(|e| {
+                    // SAFE: lossy fine here — we only match the ASCII prefix of
+                    // checkpoint files we generate ourselves. A non-UTF-8 sibling
+                    // file would get U+FFFD-converted and fail the prefix match,
+                    // so it is correctly skipped (not enumerated as a checkpoint).
                     e.path()
                         .file_name()
                         .map(|n| n.to_string_lossy().starts_with("checkpoint-"))

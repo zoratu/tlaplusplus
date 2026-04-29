@@ -172,6 +172,9 @@ fn discover_numa_nodes() -> Vec<Vec<usize>> {
     let mut nodes_with_id: Vec<(usize, Vec<usize>)> = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name();
+        // SAFE: lossy is fine — `/sys/devices/system/node/` contains only
+        // kernel-controlled ASCII directory names of the form `nodeN`. Anything
+        // that doesn't match the prefix or fails the integer parse is rejected.
         let name = name.to_string_lossy();
         if !name.starts_with("node") {
             continue;
@@ -702,8 +705,13 @@ pub fn get_disk_stats(path: &Path) -> DiskStats {
     {
         use std::ffi::CString;
         use std::mem::MaybeUninit;
+        use std::os::unix::ffi::OsStrExt;
 
-        let path_cstr = match CString::new(path.to_string_lossy().as_bytes()) {
+        // Pass the raw OsStr bytes to libc::statvfs without a UTF-8 round-trip.
+        // Unix paths can be arbitrary non-UTF-8 byte sequences; `to_string_lossy`
+        // would silently substitute U+FFFD for invalid bytes, causing statvfs
+        // to syscall against the wrong path (or a path that does not exist).
+        let path_cstr = match CString::new(path.as_os_str().as_bytes()) {
             Ok(s) => s,
             Err(_) => return DiskStats::default(),
         };

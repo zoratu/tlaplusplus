@@ -844,6 +844,10 @@ fn prune_old_checkpoints(checkpoint_dir: &Path, keep_count: usize) -> Result<()>
         .filter_map(|entry| entry.ok())
         .filter(|entry| {
             let name = entry.file_name();
+            // SAFE: lossy is fine here — checkpoint files are written by us with
+            // ASCII-only names ("checkpoint-{timestamp}.json"). A non-UTF-8 sibling
+            // file in the dir simply gets U+FFFD-converted and won't match the
+            // ASCII prefix below, so it is correctly excluded from pruning.
             let name_str = name.to_string_lossy();
             // Match checkpoint-{timestamp}.json but NOT latest.json
             name_str.starts_with("checkpoint-") && name_str.ends_with(".json")
