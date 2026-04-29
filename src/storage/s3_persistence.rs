@@ -994,11 +994,25 @@ async fn collect_pending_uploads(
     let entries = collect_files(local_dir).await?;
 
     for entry_path in entries {
-        let rel_path = entry_path
+        let rel_path_buf = entry_path
             .strip_prefix(local_dir)
-            .unwrap_or(&entry_path)
-            .to_string_lossy()
-            .to_string();
+            .unwrap_or(&entry_path);
+        // S3 object keys must be valid UTF-8. We refuse to silently lossy-convert:
+        // a non-UTF-8 local filename would otherwise become an S3 key with U+FFFD
+        // substitutions, corrupting the on-S3 layout and breaking the round-trip
+        // through `uploaded_offsets` (the rel_path is keyed in a `DashMap<String, u64>`).
+        // All filenames we generate (segments, manifests, fingerprint dumps) are ASCII;
+        // a non-UTF-8 path here indicates the caller pointed us at an unexpected dir.
+        let rel_path = match rel_path_buf.to_str() {
+            Some(s) => s.to_string(),
+            None => {
+                eprintln!(
+                    "S3: skipping non-UTF-8 path during upload scan: {:?}",
+                    rel_path_buf
+                );
+                continue;
+            }
+        };
 
         if rel_path == "manifest.json" {
             continue;
@@ -1574,6 +1588,53 @@ mod tests {
         assert_eq!(ranges.first().unwrap().1, 0);
         let total_len: u64 = ranges.iter().map(|(_, _, len)| *len as u64).sum();
         assert_eq!(total_len, file_size);
+    }
+
+    /// T103 regression: `collect_pending_uploads` must not silently lossy-convert
+    /// non-UTF-8 local filenames into S3 keys. A non-UTF-8 path could otherwise
+    /// become an S3 key with U+FFFD substitutions, breaking the `uploaded_offsets`
+    /// round-trip (DashMap key derived from the same path) and corrupting the
+    /// on-S3 layout.
+    ///
+    /// Invariant under test: any file whose `rel_path` (relative to `local_dir`)
+    /// is non-UTF-8 is *skipped* with a warning rather than enumerated as a
+    /// `PendingUpload` carrying a U+FFFD-substituted key.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn collect_pending_uploads_skips_non_utf8_paths() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let local_dir = temp.path();
+
+        // ASCII file — should be enumerated.
+        let ok_path = local_dir.join("segment-0000000000000001.bin");
+        tokio::fs::write(&ok_path, b"abc").await.expect("write ok");
+
+        // Non-UTF-8 filename: a single 0xFF byte is invalid UTF-8 in any
+        // position. We construct it via OsStr::from_bytes (Unix-only).
+        let bad_name = OsStr::from_bytes(b"segment-bad-\xff\xfe.bin");
+        let bad_path = local_dir.join(bad_name);
+        tokio::fs::write(&bad_path, b"def").await.expect("write bad");
+
+        let uploaded = DashMap::new();
+        let pending = collect_pending_uploads(local_dir, "prefix", &uploaded)
+            .await
+            .expect("scan");
+
+        // Only the ASCII file should be enumerated. The non-UTF-8 file is
+        // skipped (not silently uploaded under a U+FFFD-corrupted key).
+        assert_eq!(
+            pending.len(),
+            1,
+            "expected 1 pending upload (ASCII only), got {}: {:?}",
+            pending.len(),
+            pending.iter().map(|p| &p.rel_path).collect::<Vec<_>>()
+        );
+        assert_eq!(pending[0].rel_path, "segment-0000000000000001.bin");
+        // S3 key must be plain UTF-8, no replacement chars leaked through.
+        assert!(!pending[0].s3_key.contains('\u{FFFD}'));
     }
 
     proptest! {
