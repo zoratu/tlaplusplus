@@ -80,6 +80,29 @@ fn t101_compiled_expr_non_ascii_label_does_not_panic() {
     }
 }
 
+/// T101: another sibling of the same family. `parse_indexed_op_call` in the
+/// compiled expression compiler had `expr[i + 1..expr.len() - 1]` with the
+/// implicit assumption that the trailing byte was `]` (ASCII). With a
+/// fuzz-mutated trailing non-ASCII rune (e.g. `¢` U+00A2 = 2 bytes) the
+/// `expr.len() - 1` slice landed inside a UTF-8 codepoint:
+///   `end byte index 152 is not a char boundary;
+///    it is inside '¢' (bytes 151..153 of string)`
+#[test]
+fn t101_compiled_expr_indexed_op_call_non_ascii_trailer_does_not_panic() {
+    let state = TlaState::new();
+    let ctx = EvalContext::new(&state);
+    // `f[1, 2¢` — looks like an indexed op call but ends mid-codepoint.
+    for expr in &[
+        "f[1, 2\u{00A2}",
+        "g[h\u{00A2}]",
+        "Foo[\u{00A2}",
+        "Bar[\u{00A2}\u{00A2}",
+    ] {
+        let _ = compile_expr(expr);
+        let _ = eval_compiled(&compile_expr(expr), &ctx);
+    }
+}
+
 /// T101: defence-in-depth — an empty-ish module with stray non-ASCII bytes
 /// in places where the parser is normally relaxed (between declarations,
 /// inside comments, after `====`, etc.) must never panic.

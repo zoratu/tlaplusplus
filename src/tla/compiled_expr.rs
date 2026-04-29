@@ -1701,10 +1701,17 @@ fn parse_func_apply(expr: &str) -> Option<(&str, Vec<String>)> {
         return None;
     }
 
-    // Find the last [ at depth 0
-    let mut depth = 0;
+    // Find the last [ at depth 0. The trailing `]` we want to strip MUST be
+    // ASCII for this caller's grammar; if the expression ends in something
+    // else (a non-ASCII rune the fuzzer mutated in), bail out instead of
+    // panicking on a sub-byte slice.
     let bytes = expr.as_bytes();
+    let trim_end = match bytes.last() {
+        Some(b']') => bytes.len() - 1,
+        _ => return None,
+    };
 
+    let mut depth = 0;
     for i in (0..bytes.len()).rev() {
         match bytes[i] {
             b')' | b'}' => depth += 1,
@@ -1716,7 +1723,7 @@ fn parse_func_apply(expr: &str) -> Option<(&str, Vec<String>)> {
                 if func.trim().is_empty() {
                     return None;
                 }
-                let args_str = &expr[i + 1..expr.len() - 1];
+                let args_str = &expr[i + 1..trim_end];
                 let args = split_top_level(args_str, ",");
                 return Some((func, args));
             }
