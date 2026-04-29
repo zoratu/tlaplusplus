@@ -961,12 +961,15 @@ fn strip_label_prefix(expr: &str) -> &str {
         Some(c) if c.is_alphabetic() || c == '_' => c,
         _ => return expr,
     };
-    // Find end of identifier
-    let id_end = 1 + s[first.len_utf8()..]
-        .chars()
-        .take_while(|c| c.is_alphanumeric() || *c == '_')
-        .map(|c| c.len_utf8())
-        .sum::<usize>();
+    // Find end of identifier — sum the byte length of the leading char and
+    // each subsequent identifier-continuation char so id_end always lands on
+    // a UTF-8 boundary (a non-ASCII first char is `len_utf8() > 1`).
+    let id_end = first.len_utf8()
+        + s[first.len_utf8()..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .map(|c| c.len_utf8())
+            .sum::<usize>();
     let after_id = &s[id_end..];
     // Check for optional parameter list: (x) or (x, y)
     let after_params = if after_id.starts_with('(') {
