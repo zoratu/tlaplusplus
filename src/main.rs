@@ -656,6 +656,10 @@ where
 
             eprintln!("Signal handler: Waiting for signals...");
 
+            // All `let _ = stderr/stdout.flush()` calls in this signal handler
+            // are best-effort: we're racing a 2-minute spot-preemption budget
+            // and the worst case (closed/broken stdio) means dropping a banner
+            // line, never losing checkpoint data.
             let is_spot_preemption = tokio::select! {
                 _ = sigterm.recv() => {
                     use std::io::Write;
@@ -1500,9 +1504,13 @@ fn main() -> anyhow::Result<()> {
             let config = build_engine_config(&runtime, &storage, false)?;
             let outcome = run_model(model, config)?;
 
-            // Signal monitor thread to stop
+            // Signal monitor thread to stop. The monitor is read-only stats
+            // collection; a panic here doesn't compromise the run result we're
+            // about to print, but log it so it's not invisible.
             done.store(true, Ordering::Relaxed);
-            let _ = monitor_thread.join();
+            if let Err(panic) = monitor_thread.join() {
+                eprintln!("warning: adaptive-branching monitor thread panicked: {panic:?}");
+            }
 
             print_stats("adaptive-branching", &outcome.stats);
             if let Some(violation) = outcome.violation {

@@ -440,7 +440,9 @@ impl FingerprintShard {
             new_memory_size / (1024 * 1024)
         );
 
-        // Set NUMA preference for new allocation
+        // Set NUMA preference for new allocation. Best-effort: failure on
+        // non-Linux or NUMA-less kernels is fine — the resize still proceeds,
+        // just without NUMA-locality on the new table.
         let _ = crate::storage::numa::set_preferred_node(self.numa_node);
 
         // Allocate new table (file-backed or anonymous)
@@ -1484,10 +1486,13 @@ impl PageAlignedFingerprintStore {
         } else {
             self.stats.inserts.fetch_add(1, Ordering::Relaxed);
 
-            // If persistence enabled, try to send (non-blocking)
+            // If persistence enabled, try to send (non-blocking).
+            // Drop on full is intentional: the fingerprint is already in the
+            // in-memory shard, so correctness is preserved. The persist worker
+            // pulls a snapshot of the live table at checkpoint time; the only
+            // cost of dropping here is a slightly less-incremental S3 stream.
             if let Some(ref persist_tx) = self.persist_tx {
                 let _ = persist_tx[shard_id].try_send(FingerprintPersistMsg { fp });
-                // If channel full, fingerprint is still in memory (safe)
             }
         }
 
@@ -1556,7 +1561,9 @@ impl PageAlignedFingerprintStore {
                 seen[idx] = existed;
 
                 if !existed {
-                    // If persistence enabled, try to send (non-blocking)
+                    // Drop on full is intentional: the fingerprint already
+                    // landed in the in-memory shard, so correctness holds.
+                    // See contains_or_insert above for the full rationale.
                     if let Some(ref persist_tx) = self.persist_tx {
                         let _ = persist_tx[shard_id].try_send(FingerprintPersistMsg { fp });
                     }

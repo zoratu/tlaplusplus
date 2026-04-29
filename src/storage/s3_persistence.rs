@@ -1154,13 +1154,23 @@ async fn multipart_upload_file(
     if let Some(err) = upload_error {
         join_set.abort_all();
         while join_set.join_next().await.is_some() {}
-        let _ = client
+        // Best-effort multipart cleanup: we're already returning the original
+        // error. If the abort itself fails (network flake, expired creds),
+        // the orphaned upload is left for the bucket lifecycle policy to GC.
+        // Log so operators can see leaked-multipart-cost surprises.
+        if let Err(abort_err) = client
             .abort_multipart_upload()
             .bucket(bucket)
             .key(s3_key)
             .upload_id(&upload_id)
             .send()
-            .await;
+            .await
+        {
+            eprintln!(
+                "warning: failed to abort orphaned S3 multipart upload {} (bucket {}): {}",
+                upload_id, bucket, abort_err
+            );
+        }
         return Err(err);
     }
 

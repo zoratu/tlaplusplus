@@ -105,15 +105,34 @@ pub fn spawn_inbound_handler(
                     } else {
                         stealer.note_empty_steal_response();
                     }
+                    // Bounded `stolen_tx`: when full we drop the surplus.
+                    // Track the *delivered* count so `states_stolen` matches
+                    // what local workers will actually consume — silently
+                    // double-counting dropped donations would mask real
+                    // throughput regressions.
+                    let mut delivered = 0u64;
+                    let mut dropped = 0u64;
                     for compressed in states {
-                        let _ = stolen_tx.try_send(StolenState {
+                        match stolen_tx.try_send(StolenState {
                             compressed_state: compressed,
-                        });
+                        }) {
+                            Ok(()) => delivered += 1,
+                            Err(_) => dropped += 1,
+                        }
                     }
-                    if count > 0 {
+                    if dropped > 0 {
+                        // Operator-visible: usually means local workers can't
+                        // keep up with donations — tune --workers or the
+                        // stolen_tx capacity if this is frequent.
+                        eprintln!(
+                            "warning: dropped {} cross-node stolen states (channel full); delivered {}",
+                            dropped, delivered
+                        );
+                    }
+                    if delivered > 0 {
                         stealer
                             .states_stolen
-                            .fetch_add(count as u64, Ordering::Relaxed);
+                            .fetch_add(delivered, Ordering::Relaxed);
                     }
                     // ALWAYS decrement pending-steal counter when we get a
                     // response (empty or not). Otherwise termination detection

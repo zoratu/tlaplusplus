@@ -336,8 +336,12 @@ impl AutoTuner {
         if let Some(thread) = self.thread_handle.read().as_ref() {
             thread.unpark();
         }
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+        // Auto-tuner is best-effort throughput optimization; logging a panic
+        // here is enough — we're shutting down anyway.
+        if let Some(handle) = self.handle.take()
+            && let Err(panic) = handle.join()
+        {
+            eprintln!("warning: auto-tuner thread panicked during shutdown: {panic:?}");
         }
     }
 }

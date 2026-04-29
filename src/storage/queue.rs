@@ -348,7 +348,9 @@ where
 
         if self.try_reserve_inmem_slot() {
             self.push_inmem_reserved(item);
-            // Wake up one waiting worker - efficient channel notification
+            // notify_tx is unbounded; try_send only fails if all receivers
+            // dropped, which only happens at struct teardown. Wakes that
+            // arrive after the receiver dropped are harmless.
             let _ = self.notify_tx.try_send(());
             return Ok(());
         }
@@ -370,7 +372,7 @@ where
             return self.check_error();
         }
 
-        // Wake up one worker after spilling
+        // Wake-up after spill — see push() for the unbounded-channel rationale.
         let _ = self.notify_tx.try_send(());
         Ok(())
     }
@@ -434,7 +436,11 @@ where
                 return Ok(None);
             }
 
-            // Block efficiently on channel - much faster than Condvar
+            // Block efficiently on channel — much faster than Condvar.
+            // recv() returns Err only if all senders dropped, which only
+            // happens during shutdown after `finish()` was called. In that
+            // case the next loop iteration sees `finished == true` and
+            // returns Ok(None) cleanly, so the discarded Err is safe.
             self.num_waiting.fetch_add(1, Ordering::Release);
             let _ = self.notify_rx.recv();
             self.num_waiting.fetch_sub(1, Ordering::Release);
@@ -837,8 +843,9 @@ where
     /// Mark queue as finished - wakes up all blocked workers
     pub fn finish(&self) {
         self.finished.store(true, Ordering::Release);
-        // Send many notifications to wake all waiting workers
-        // Unbounded channel means this won't block
+        // Idempotent batch wakeup. notify_tx is unbounded so try_send only
+        // fails after teardown; we cap iterations at 1000 to bound the wake
+        // storm in degenerate worker-count cases.
         for _ in 0..1000 {
             let _ = self.notify_tx.try_send(());
         }
@@ -847,8 +854,10 @@ where
     pub fn shutdown(&self) -> Result<()> {
         self.finish(); // Wake up any blocked workers before shutdown
         self.spill_tx.lock().take();
-        if let Some(handle) = self.writer_handle.lock().take() {
-            let _ = handle.join();
+        if let Some(handle) = self.writer_handle.lock().take()
+            && let Err(panic) = handle.join()
+        {
+            eprintln!("warning: queue writer thread panicked during shutdown: {panic:?}");
         }
         // Clean up consumed segments on graceful shutdown
         self.delete_consumed_segments();
