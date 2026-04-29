@@ -1153,11 +1153,22 @@ where
         self.hot.finish();
         self.overflow.finish();
 
-        if let Some(handle) = self.coordinator_handle.take() {
-            let _ = handle.join();
+        // Background spill coordinator and loader threads — we've already
+        // signaled stop_signal and finished the queues, so a normal exit is
+        // expected. A panic here is rare but should be visible in logs (it
+        // indicates a bug in the spill/load loops that the caller can't react
+        // to anyway since shutdown is in progress).
+        if let Some(handle) = self.coordinator_handle.take()
+            && let Err(panic) = handle.join()
+        {
+            eprintln!(
+                "warning: spill coordinator thread panicked during shutdown: {panic:?}"
+            );
         }
-        if let Some(handle) = self.loader_handle.take() {
-            let _ = handle.join();
+        if let Some(handle) = self.loader_handle.take()
+            && let Err(panic) = handle.join()
+        {
+            eprintln!("warning: spill loader thread panicked during shutdown: {panic:?}");
         }
 
         self.overflow.shutdown()

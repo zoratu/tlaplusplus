@@ -96,7 +96,8 @@ fn steal_handshake_transfers_states() {
         let (stolen1_tx, _stolen1_rx) = bounded::<StolenState>(1024);
         let (donate1_tx, donate1_rx) = bounded::<Vec<u8>>(1024);
         let _ = donate0_tx; // unused on thief side
-        let _ = stolen1_tx.clone();
+        // stolen1_tx is bound at line 96 and kept alive for spawn_inbound_handler;
+        // we don't need an extra clone here.
 
         // Pre-seed the victim's donate channel with 16 fake state blobs.
         for i in 0..16u8 {

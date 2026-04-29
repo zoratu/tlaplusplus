@@ -30,6 +30,9 @@ impl<T> ChannelQueue<T> {
     /// Push an item - lock-free except for sender access
     pub fn push(&self, item: T) {
         if let Some(sender) = self.sender.lock().as_ref() {
+            // Unbounded crossbeam channel; send only fails if the receiver
+            // dropped. The receiver is owned by `self`, so any caller holding
+            // `&self` keeps the receiver alive — send is infallible here.
             let _ = sender.send(item);
             self.pushed.fetch_add(1, Ordering::Relaxed);
         }

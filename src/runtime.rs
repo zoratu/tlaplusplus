@@ -818,8 +818,17 @@ fn write_validated_rolling_checkpoint(
         || readback_manifest.states_generated != manifest.states_generated
         || readback_manifest.states_distinct != manifest.states_distinct
     {
-        // Validation failed - remove the corrupt checkpoint and return error
-        let _ = std::fs::remove_file(&timestamped_path);
+        // Validation failed — best-effort cleanup of the corrupt checkpoint.
+        // We're already returning Err to the caller; if the unlink fails (e.g.
+        // race with another process), the prune step on the next successful
+        // checkpoint will eventually evict it.
+        if let Err(e) = std::fs::remove_file(&timestamped_path) {
+            eprintln!(
+                "warning: failed to remove invalid checkpoint {}: {}",
+                timestamped_path.display(),
+                e
+            );
+        }
         return Err(anyhow::anyhow!(
             "checkpoint validation failed: read-back data does not match written data"
         ));
@@ -1476,7 +1485,13 @@ where
     let max_violations = config.max_violations.max(1);
     let (violation_tx, violation_rx) = crossbeam_channel::bounded(max_violations + 1);
     let violation_count = Arc::new(AtomicUsize::new(0));
-    let (error_tx, error_rx) = crossbeam_channel::bounded::<String>(1);
+    // Error channel: workers send fatal errors here. Bounded(1) here would
+    // be a deadlock — if two workers race to fail and only one slot exists,
+    // the second worker's `send()` (a blocking call) would wait forever for
+    // a receiver that doesn't drain until after all workers are joined. The
+    // T6 termination-detection bugs taught us this exact shape. Use unbounded
+    // so a `send()` from a failing worker can never block.
+    let (error_tx, error_rx) = crossbeam_channel::unbounded::<String>();
 
     // Auto-tuning: create throttle for dynamic worker count adjustment
     let throttle = Arc::new(WorkerThrottle::new(worker_plan.worker_count));
@@ -2136,12 +2151,16 @@ where
             if let Some(cpu) = worker_cpu
                 && let Err(err) = pin_current_thread_to_cpu(cpu)
             {
+                // Unbounded channel; send only fails if receiver dropped, which
+                // can't happen here — the receiver is read after all workers join.
                 let _ = worker_error_tx.send(format!("cpu pinning failed on core {cpu}: {err}"));
                 worker_stop.store(true, Ordering::Release);
             }
 
-            // Set NUMA memory policy - all allocations on this thread will prefer the local node
-            // This reduces cross-NUMA memory access which causes high kernel time
+            // Set NUMA memory policy — all allocations on this thread will prefer
+            // the local node. Best-effort: returns Err on non-Linux or kernels
+            // without NUMA support; in that case the worker still runs, just
+            // without NUMA-locality (the article's "graceful degradation" path).
             let _ = set_preferred_node(worker_numa_node);
 
             // Register this worker's thread handle for lock-free checkpoint unparking
@@ -2403,6 +2422,11 @@ where
                         .unwrap_or_else(|| vec![state.clone()])
                     };
 
+                    // Channel is bounded(max_violations + 1); when it overflows
+                    // we've already captured enough violations to satisfy the
+                    // user's --max-violations cap, so dropping the surplus here
+                    // matches the documented "stop after N" semantics. The
+                    // worker_violation_count atomic still tracks the true count.
                     let _ = worker_violation_tx.try_send(Violation {
                         message,
                         state,
@@ -2606,6 +2630,11 @@ where
 
                         // Distributed mode: donate some states for remote steal requests.
                         // Push every 8th new state to the donation channel (low overhead).
+                        // try_send dropping on full is intentional — if the donate
+                        // channel is full there's already plenty of work pending for
+                        // remote stealers; dropping a sample doesn't lose state
+                        // (the producer keeps it in its own queue too) and never
+                        // blocks the producer's hot path.
                         if let Some(ref donate_tx) = worker_donate_tx {
                             for (idx, (state, _)) in states_with_home_numa.iter().enumerate() {
                                 if idx % 8 == 0 {
@@ -2649,6 +2678,8 @@ where
                             &mut local_fp_cache_hits,
                         )
                     {
+                        // Unbounded channel; send is infallible until error_rx drops
+                        // (after worker join), so the discarded Err is unreachable.
                         let _ = worker_error_tx.send(err.to_string());
                         worker_stop.store(true, Ordering::Release);
                         break;
@@ -2664,6 +2695,8 @@ where
                         &mut local_fp_cache_hits,
                     )
                 {
+                    // Unbounded channel; send is infallible until error_rx drops
+                    // (after worker join), so the discarded Err is unreachable.
                     let _ = worker_error_tx.send(err.to_string());
                     worker_stop.store(true, Ordering::Release);
                 }
@@ -2727,9 +2760,12 @@ where
         );
     }
 
-    // Stop progress reporting
+    // Stop progress reporting. Log if the progress thread panicked but don't
+    // fail the whole run over a reporting-only thread.
     stop.store(true, Ordering::Release);
-    let _ = progress_thread.join();
+    if let Err(panic) = progress_thread.join() {
+        eprintln!("warning: progress thread panicked during shutdown: {panic:?}");
+    }
 
     // Stop auto-tuner if running
     if let Some(tuner) = auto_tuner.take() {
@@ -2745,8 +2781,10 @@ where
     if let Some(thread) = mem_monitor_thread_handle.read().as_ref() {
         thread.unpark();
     }
-    if let Some(handle) = mem_monitor_thread {
-        let _ = handle.join();
+    if let Some(handle) = mem_monitor_thread
+        && let Err(panic) = handle.join()
+    {
+        eprintln!("warning: memory monitor thread panicked during shutdown: {panic:?}");
     }
     checkpoint_thread_stop.store(true, Ordering::Release);
     pause.resume();
@@ -2815,8 +2853,13 @@ where
         }
     }
 
-    // Queue cleanup happens automatically
-    let _ = fp_store.flush();
+    // Queue cleanup happens automatically. Final FP-store flush is best-effort:
+    // we already wrote the manifest above, and any flush failure here would
+    // not change the verdict we're about to return — but it should be visible
+    // in logs so operators notice persistence problems.
+    if let Err(e) = fp_store.flush() {
+        eprintln!("warning: fingerprint store flush at shutdown failed: {e}");
+    }
 
     if let Some(snap) = queue.compression_stats() {
         if snap.segments_compressed > 0 || snap.segments_decompressed > 0 {
@@ -2834,8 +2877,13 @@ where
         }
     }
 
-    if let Ok(err) = error_rx.try_recv() {
-        return Err(anyhow!(err));
+    // Drain all worker errors. We log secondary errors (so they show up in
+    // the run log) and surface only the first one as the run-level error.
+    if let Ok(first_err) = error_rx.try_recv() {
+        while let Ok(more) = error_rx.try_recv() {
+            eprintln!("Additional worker error: {more}");
+        }
+        return Err(anyhow!(first_err));
     }
 
     // Collect all violations from the channel.
@@ -3705,6 +3753,54 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(work_dir);
         Ok(())
+    }
+
+    /// T102 regression: when multiple workers fail concurrently, the worker
+    /// error channel must not block any sender. Earlier the channel was
+    /// `bounded(1)` — the second worker to call `error_tx.send()` would
+    /// block forever waiting for a receiver that doesn't drain until after
+    /// every worker has joined. We now use `unbounded`. This test reproduces
+    /// the scenario directly against the channel pattern used in `run_model`.
+    #[test]
+    fn t102_concurrent_worker_errors_do_not_deadlock() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        // Mirror the channel construction from run_model exactly.
+        let (error_tx, error_rx) = crossbeam_channel::unbounded::<String>();
+
+        // Spawn N "workers" that all race to send an error simultaneously.
+        // With the old bounded(1) channel only the first send would succeed;
+        // the rest would block forever. With unbounded, all complete.
+        let n = 16;
+        let barrier = Arc::new(Barrier::new(n));
+        let mut handles = Vec::with_capacity(n);
+        for i in 0..n {
+            let tx = error_tx.clone();
+            let b = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                b.wait();
+                let _ = tx.send(format!("worker {i} error"));
+            }));
+        }
+
+        // Each worker must complete its send within a short bound. If we
+        // regressed to a bounded channel, joining would hang indefinitely.
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+
+        // Drain all errors — the run_model fix collects every error so
+        // operators see secondary failures, not just the first one.
+        drop(error_tx);
+        let mut collected = 0usize;
+        while error_rx.try_recv().is_ok() {
+            collected += 1;
+        }
+        assert_eq!(
+            collected, n,
+            "all {n} worker errors must be drained; lost some"
+        );
     }
 }
 
