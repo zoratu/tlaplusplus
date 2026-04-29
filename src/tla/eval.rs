@@ -4852,8 +4852,15 @@ fn parse_let_definitions(defs_text: &str) -> Result<BTreeMap<String, TlaDefiniti
             defs_text.len()
         };
 
+        // Defensive: malformed input may pack two `==` markers adjacently,
+        // making `next_head_start < eq_pos + 2`. Skip rather than panic.
+        let body_start = *eq_pos + 2;
+        if body_start > next_head_start {
+            cursor = next_head_start;
+            continue;
+        }
         let head = trim_let_edge_comments(&defs_text[cursor..*eq_pos]);
-        let body = trim_let_edge_comments(&defs_text[*eq_pos + 2..next_head_start]);
+        let body = trim_let_edge_comments(&defs_text[body_start..next_head_start]);
         let (name, params) = parse_local_def_head(head);
 
         if !name.is_empty() {

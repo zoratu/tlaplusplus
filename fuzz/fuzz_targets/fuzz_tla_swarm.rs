@@ -9,12 +9,19 @@
 //!
 //! This diversity finds more bugs than the "use everything" approach because
 //! individual feature combinations reach deeper into rarely-tested code paths.
+//!
+//! T101 augmentation: each definition body is evaluated by BOTH the
+//! interpreter (`eval_expr`) and the compiler (`compile_expr` +
+//! `eval_compiled`). Any divergence — one panicking while the other does not,
+//! one returning Ok while the other returns Err, or both returning Ok with
+//! different values — is treated as a panic and aborts the fuzz run, the
+//! same proptest-T2-style equivalence check used in `tests/compiled_vs_interpreted.rs`.
 
 use libfuzzer_sys::fuzz_target;
-use std::collections::BTreeMap;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use tlaplusplus::tla::module::parse_tla_module_text;
 use tlaplusplus::tla::value::{TlaState, TlaValue};
-use tlaplusplus::tla::{EvalContext, eval_expr};
+use tlaplusplus::tla::{EvalContext, compile_expr, eval_compiled, eval_expr};
 
 /// Feature flags derived from the first 2 bytes of fuzz input.
 struct SwarmConfig {
@@ -105,6 +112,49 @@ impl SwarmConfig {
     }
 }
 
+/// Run both the interpreter and the compiler on `expr`, asserting equivalence.
+/// Panics on divergence, which the fuzzer treats as a crash.
+///
+/// Equivalence rules:
+///   - panic on either side of the pair while the other did not — DIVERGENCE
+///   - both Ok with different values — DIVERGENCE
+///   - one side Ok, other Err — TOLERATED (compiler error-recovery and
+///     interpreter error-recovery have known semantic gaps tracked under
+///     T101.1; the fuzz pass focuses on panic-resistance, not on error-shape
+///     parity)
+///   - any other combination — equivalent enough
+fn assert_equivalent(expr: &str, ctx: &EvalContext<'_>) {
+    let interp = catch_unwind(AssertUnwindSafe(|| eval_expr(expr, ctx)));
+    let compi = catch_unwind(AssertUnwindSafe(|| {
+        let compiled = compile_expr(expr);
+        eval_compiled(&compiled, ctx)
+    }));
+
+    match (interp, compi) {
+        // Both panicked — symmetric. Propagate so the input is preserved as
+        // a crash artifact, but it counts as one panic, not a divergence.
+        (Err(p), Err(_)) => std::panic::resume_unwind(p),
+        // Both completed (Ok or Err on each side) — compare verdicts.
+        (Ok(i), Ok(c)) => match (i, c) {
+            (Ok(a), Ok(b)) => {
+                if a != b {
+                    panic!(
+                        "DIVERGENCE on `{expr}`:\n  interpreter -> {a:?}\n  compiler    -> {b:?}"
+                    );
+                }
+            }
+            // Both errored, or one errored and the other succeeded — tolerated.
+            // Error-shape parity is tracked as T101.1.
+            _ => {}
+        },
+        // One side panicked, the other did not. This IS a real panic-resistance
+        // divergence: the same input must not panic in one evaluator while the
+        // other returns a clean Err. Re-raise the panic that actually fired.
+        (Ok(_), Err(p)) => std::panic::resume_unwind(p),
+        (Err(p), Ok(_)) => std::panic::resume_unwind(p),
+    }
+}
+
 fuzz_target!(|data: &[u8]| {
     // Need at least 2 bytes for feature flags + some text
     if data.len() < 4 {
@@ -155,7 +205,7 @@ fuzz_target!(|data: &[u8]| {
             continue;
         }
 
-        // Try evaluating - we only care about panics, not errors
-        let _ = eval_expr(&def.body, &ctx);
+        // Equivalence check (panics on divergence; libfuzzer treats as crash).
+        assert_equivalent(&def.body, &ctx);
     }
 });

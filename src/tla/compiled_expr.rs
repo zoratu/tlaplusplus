@@ -961,12 +961,15 @@ fn strip_label_prefix(expr: &str) -> &str {
         Some(c) if c.is_alphabetic() || c == '_' => c,
         _ => return expr,
     };
-    // Find end of identifier
-    let id_end = 1 + s[first.len_utf8()..]
-        .chars()
-        .take_while(|c| c.is_alphanumeric() || *c == '_')
-        .map(|c| c.len_utf8())
-        .sum::<usize>();
+    // Find end of identifier — sum the byte length of the leading char and
+    // each subsequent identifier-continuation char so id_end always lands on
+    // a UTF-8 boundary (a non-ASCII first char is `len_utf8() > 1`).
+    let id_end = first.len_utf8()
+        + s[first.len_utf8()..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .map(|c| c.len_utf8())
+            .sum::<usize>();
     let after_id = &s[id_end..];
     // Check for optional parameter list: (x) or (x, y)
     let after_params = if after_id.starts_with('(') {
@@ -1698,10 +1701,17 @@ fn parse_func_apply(expr: &str) -> Option<(&str, Vec<String>)> {
         return None;
     }
 
-    // Find the last [ at depth 0
-    let mut depth = 0;
+    // Find the last [ at depth 0. The trailing `]` we want to strip MUST be
+    // ASCII for this caller's grammar; if the expression ends in something
+    // else (a non-ASCII rune the fuzzer mutated in), bail out instead of
+    // panicking on a sub-byte slice.
     let bytes = expr.as_bytes();
+    let trim_end = match bytes.last() {
+        Some(b']') => bytes.len() - 1,
+        _ => return None,
+    };
 
+    let mut depth = 0;
     for i in (0..bytes.len()).rev() {
         match bytes[i] {
             b')' | b'}' => depth += 1,
@@ -1713,7 +1723,7 @@ fn parse_func_apply(expr: &str) -> Option<(&str, Vec<String>)> {
                 if func.trim().is_empty() {
                     return None;
                 }
-                let args_str = &expr[i + 1..expr.len() - 1];
+                let args_str = &expr[i + 1..trim_end];
                 let args = split_top_level(args_str, ",");
                 return Some((func, args));
             }
@@ -2414,8 +2424,15 @@ fn try_parse_let(expr: &str) -> Option<CompiledExpr> {
             defs_str.len()
         };
 
+        // Defensive: malformed input may put two `==` markers right next to
+        // each other (e.g. `Op==Op==`), making `body_end < eq_pos + 2`. Skip
+        // such definitions instead of panicking.
+        let value_start = *eq_pos + 2;
+        if value_start > body_end {
+            continue;
+        }
         let name = trim_let_edge_comments(&defs_str[name_start..*eq_pos]);
-        let value = trim_let_edge_comments(&defs_str[*eq_pos + 2..body_end]);
+        let value = trim_let_edge_comments(&defs_str[value_start..body_end]);
 
         // Skip comments (lines starting with \*)
         let name = name.lines().last().unwrap_or("").trim();
@@ -2946,8 +2963,14 @@ fn parse_let_bindings(defs_text: &str) -> Option<Vec<(String, String)>> {
             defs_text.len()
         };
 
+        // Defensive: malformed input may pack two `==` markers adjacently,
+        // making `body_end < eq_pos + 2`. Skip rather than panic.
+        let body_start = *eq_pos + 2;
+        if body_start > body_end {
+            continue;
+        }
         let name = trim_let_edge_comments(&defs_text[name_start..*eq_pos]);
-        let body = trim_let_edge_comments(&defs_text[*eq_pos + 2..body_end]);
+        let body = trim_let_edge_comments(&defs_text[body_start..body_end]);
 
         // Name should be a simple identifier (possibly with params, but we ignore those for now)
         let name = if let Some(_paren) = name.find('(') {

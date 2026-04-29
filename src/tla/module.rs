@@ -1095,33 +1095,36 @@ fn instance_with_clause_is_incomplete(with_clause: &str) -> bool {
     }
 
     let mut depth: usize = 0;
-    let mut start = 0usize;
-    let chars: Vec<char> = with_clause.chars().collect();
-    let n = chars.len();
+    let mut start: usize = 0; // byte offset
+    // Walk char_indices so depth-balancing operates on chars while slice
+    // indices stay on UTF-8 boundaries.
+    let bytes: Vec<(usize, char)> = with_clause.char_indices().collect();
+    let n = bytes.len();
     let mut i = 0usize;
 
     while i < n {
-        match chars[i] {
+        let (bi, c) = bytes[i];
+        match c {
             '{' | '[' | '(' => depth += 1,
             '}' | ']' | ')' => depth = depth.saturating_sub(1),
             '<' => {
-                if i + 1 < n && chars[i + 1] == '<' {
+                if i + 1 < n && bytes[i + 1].1 == '<' {
                     depth += 1;
                     i += 1;
                 }
             }
             '>' => {
-                if i + 1 < n && chars[i + 1] == '>' {
+                if i + 1 < n && bytes[i + 1].1 == '>' {
                     depth = depth.saturating_sub(1);
                     i += 1;
                 }
             }
             ',' if depth == 0 => {
-                let segment = with_clause[start..i].trim();
+                let segment = with_clause[start..bi].trim();
                 if instance_substitution_segment_incomplete(segment) {
                     return true;
                 }
-                start = i + 1;
+                start = bi + c.len_utf8();
             }
             _ => {}
         }
@@ -1795,23 +1798,23 @@ fn parse_with_substitutions(with_clause: Option<&str>) -> BTreeMap<String, Strin
     // Split on commas at the top level (not inside brackets)
     // But be careful: `<` followed by `-` is the substitution operator, not a bracket
     let mut depth: usize = 0;
-    let mut start = 0;
-    let chars: Vec<char> = with_str.chars().collect();
-    let n = chars.len();
+    let mut start: usize = 0; // byte offset into with_str
+    let bytes: Vec<(usize, char)> = with_str.char_indices().collect();
+    let n = bytes.len();
 
     let mut i = 0;
     while i < n {
-        let c = chars[i];
+        let (bi, c) = bytes[i];
         match c {
             '{' | '[' | '(' => depth += 1,
             '}' | ']' | ')' => depth = depth.saturating_sub(1),
             '<' => {
                 // Check if this is `<-` (substitution) or `<<` (tuple) or just `<`
-                if i + 1 < n && chars[i + 1] == '<' {
+                if i + 1 < n && bytes[i + 1].1 == '<' {
                     // `<<` - tuple opening, increase depth
                     depth += 1;
                     i += 1; // skip the second `<`
-                } else if i + 1 < n && chars[i + 1] == '-' {
+                } else if i + 1 < n && bytes[i + 1].1 == '-' {
                     // `<-` - substitution operator, NOT a bracket
                     // Just skip the `-` next iteration
                 } else {
@@ -1820,7 +1823,7 @@ fn parse_with_substitutions(with_clause: Option<&str>) -> BTreeMap<String, Strin
             }
             '>' => {
                 // Check if this is `>>` (tuple closing)
-                if i + 1 < n && chars[i + 1] == '>' {
+                if i + 1 < n && bytes[i + 1].1 == '>' {
                     depth = depth.saturating_sub(1);
                     i += 1; // skip the second `>`
                 }
@@ -1828,11 +1831,11 @@ fn parse_with_substitutions(with_clause: Option<&str>) -> BTreeMap<String, Strin
             }
             ',' if depth == 0 => {
                 // Found a top-level comma - this separates substitutions
-                let subst = &with_str[start..i];
+                let subst = &with_str[start..bi];
                 if let Some((param, value)) = subst.split_once("<-") {
                     substitutions.insert(param.trim().to_string(), value.trim().to_string());
                 }
-                start = i + 1;
+                start = bi + c.len_utf8();
             }
             _ => {}
         }
@@ -1916,11 +1919,9 @@ fn parse_unnamed_instance_declaration(line: &str) -> Option<TlaModuleInstance> {
 fn parse_recursive_declarations(text: &str, recursive_names: &mut BTreeSet<String>) {
     // Split on commas at the top level (not inside parentheses)
     let mut depth: usize = 0;
-    let mut start = 0;
-    let chars: Vec<char> = text.chars().collect();
-
-    for i in 0..chars.len() {
-        match chars[i] {
+    let mut start = 0; // byte offset into text
+    for (i, ch) in text.char_indices() {
+        match ch {
             '(' | '[' | '{' => depth += 1,
             ')' | ']' | '}' => depth = depth.saturating_sub(1),
             ',' if depth == 0 => {
@@ -1928,7 +1929,7 @@ fn parse_recursive_declarations(text: &str, recursive_names: &mut BTreeSet<Strin
                 if let Some(name) = extract_recursive_op_name(part) {
                     recursive_names.insert(name);
                 }
-                start = i + 1;
+                start = i + ch.len_utf8();
             }
             _ => {}
         }
