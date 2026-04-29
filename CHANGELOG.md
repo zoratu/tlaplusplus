@@ -1,5 +1,60 @@
 # Changelog
 
+## v1.0.1 (2026-04-25)
+
+Patch release covering the **"Bugs Rust Won't Catch"** audit — three
+sub-audits (T101 / T102 / T103) targeting the classes of defects that the
+Rust type system cannot catch on its own: parser/compiler panics on
+adversarial input, silently-discarded `Result` values, and lossy UTF-8
+conversions.
+
+### T101 — Parser/evaluator panic-resistance (fuzz audit)
+
+- Stood up `cargo-fuzz` targets across the TLA+ parser and the compiled-IR
+  evaluator and ran them long enough to drive crash counts to zero.
+- Fixed **four panic classes** in the parser/compiler, all stemming from
+  `&str[..]` slicing on non-character boundaries when the input contains
+  non-ASCII bytes — affected sites included the indexed-op-call parser,
+  recursive-decl parser, INSTANCE substitution, CFG comment stripping, and
+  two LET-binding range computations in `compiled_expr` and `eval`.
+- Added **7 regression tests** in `tests/fuzz_panic_regressions_t101.rs`
+  pinning each crash so a future regression is caught immediately.
+- Wired the swarm-equivalence fuzz target so symmetry-reduced and
+  un-reduced runs are diff-checked on every fuzz iteration.
+
+### T102 — `Result`-discard audit (silent-error audit)
+
+- Audited every `let _ = ...`, `.ok()`, and `#[must_use]`-bypass in the
+  codebase and classified each as intentional (logged channel-closed,
+  best-effort cleanup) or a real bug.
+- **Headline fix:** the runtime's per-worker `error_tx` could deadlock
+  under concurrent send when the receiver had already drained — converted
+  to a non-blocking try-send with an explicit drop-on-full path so
+  workers never block on error reporting.
+- Fixed **9 additional propagation sites** where I/O errors,
+  checkpoint-write failures, and parser warnings were being swallowed
+  silently; each now either propagates upstream or logs a structured
+  warning.
+
+### T103 — Lossy UTF-8 conversion audit
+
+- Audited every `String::from_utf8_lossy` and `OsStr::to_string_lossy`
+  call site to confirm none were on a soundness-critical path
+  (state hashing, fingerprint identity, action equality).
+- **Two fixes,** both on defensive observability paths:
+  - S3 checkpoint key construction was using `_lossy` on a borrowed
+    `OsStr` derived from a checkpoint path, which could corrupt the key
+    on filesystems with non-UTF-8 path components. Switched to a strict
+    UTF-8 conversion that returns an error rather than silently uploading
+    to a mangled key.
+  - The disk-stats code path that reports spilled-segment sizes used
+    `_lossy` on a path it then logged; switched to strict UTF-8 so a
+    non-UTF-8 path triggers a warning rather than producing a corrupt log
+    line.
+- **No state-path soundness issue was found** — the audit confirmed the
+  hot path (state serialization, fingerprinting) never goes through a
+  lossy conversion.
+
 ## v1.0.0 (2026-04-27)
 
 First stable release. The 1.0 cycle focused on correctness foundations,
