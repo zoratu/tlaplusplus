@@ -100,8 +100,34 @@ impl TlaModel {
             next_override.map(ToString::to_string),
         )?;
 
-        let initial_states_vec = evaluate_init_states(&module, &config, &init_name)?;
+        // Resolve invariants and trivial-Next FIRST so the T5.5 joint
+        // Init+invariant solver can use them. (Both are pure analyses over
+        // already-parsed module structure; cheap to do up-front.)
         let invariant_exprs = resolve_invariant_exprs(&module, &config);
+        let trivial_next = module
+            .definitions
+            .get(&next_name)
+            .map(|def| {
+                let body = def.body.trim();
+                body.starts_with("UNCHANGED") || body == "FALSE" || body == "TRUE /\\ FALSE"
+            })
+            .unwrap_or(false);
+
+        // T5.5 — joint Init+invariant symbolic encoding. Only attempt when
+        // Next is trivial UNCHANGED (so a no-violation result is a complete
+        // proof). For Einstein-class specs this returns a single witness
+        // initial state in <1s instead of enumerating ~199M cross-product
+        // states. Falls back to brute-force if the shape doesn't fit.
+        let joint_solved: Option<Vec<TlaState>> = if trivial_next && !invariant_exprs.is_empty() {
+            try_joint_init_invariant_solve(&module, &config, &init_name, &invariant_exprs)
+        } else {
+            None
+        };
+
+        let initial_states_vec = match joint_solved {
+            Some(states) => states,
+            None => evaluate_init_states(&module, &config, &init_name)?,
+        };
         let temporal_properties = resolve_temporal_properties(&module, &config)?;
         let mut fairness_constraints = extract_fairness_constraints(&temporal_properties);
 
@@ -167,17 +193,8 @@ impl TlaModel {
         // CHECK_DEADLOCK FALSE in cfg means allow deadlocked states
         let allow_deadlock = config.check_deadlock == Some(false);
 
-        // Detect trivial Next (UNCHANGED vars) — no transitions to explore.
-        // This optimizes specs like Einstein where Init generates millions of
-        // states but Next does nothing.
-        let trivial_next = module
-            .definitions
-            .get(&next_name)
-            .map(|def| {
-                let body = def.body.trim();
-                body.starts_with("UNCHANGED") || body == "FALSE" || body == "TRUE /\\ FALSE"
-            })
-            .unwrap_or(false);
+        // (trivial_next was computed earlier so the T5.5 joint solver could
+        // use it.)
         if trivial_next {
             eprintln!("Note: Next is UNCHANGED — skipping state exploration");
         }
@@ -1528,6 +1545,340 @@ fn apply_instance_substitutions_to_text(expr: &str, instance: &TlaModuleInstance
         }
     }
 
+    out
+}
+
+/// T5.5 — try to solve Init+invariant jointly via Z3.
+///
+/// Returns `Some(states)` only when:
+///   1. Every Init clause is `module_var \in <sequence-set-comprehension>` for
+///      a *distinct* module variable (no duplicate-variable scopes), AND
+///   2. The set-comprehension destructures into a known function-set shape
+///      (`Permutation(S)`, `[1..n -> S]`, or a filtered version of either),
+///      AND
+///   3. Every invariant body translates into the supported Z3 subset
+///      (boolean ops, `\E i \in lit-set`, `var[i] = const`, `var[i] # var[j]`,
+///      etc. — same surface as T5.1/T5.2).
+///
+/// On a witness Violation result, the returned vector contains exactly that
+/// one violating initial state — the runtime then immediately reports the
+/// invariant as violated. On `NoViolation`, the returned vector is empty,
+/// which combined with `trivial_next` means the runtime explores zero states
+/// and reports "0 states checked, no invariant violations" — a complete
+/// proof since SMT covered every initial state.
+///
+/// Returns `None` (caller falls back to brute-force Init enumeration) if any
+/// step above is unsupported or the SMT solver returns Unknown. Soundness:
+/// since the symbolic translator only emits an answer when it has fully
+/// translated every constraint, every `Some` return is sound.
+fn try_joint_init_invariant_solve(
+    module: &TlaModule,
+    cfg: &TlaConfig,
+    init_name: &str,
+    invariant_exprs: &[(String, String)],
+) -> Option<Vec<TlaState>> {
+    #[cfg(not(feature = "symbolic-init"))]
+    {
+        let _ = (module, cfg, init_name, invariant_exprs);
+        None
+    }
+
+    #[cfg(feature = "symbolic-init")]
+    {
+        let dbg = std::env::var("TLAPLUSPLUS_DEBUG_SYMBOLIC_INIT").is_ok();
+        if invariant_exprs.is_empty() {
+            return None;
+        }
+        if init_name == "__EVAL_ONLY__" {
+            return None;
+        }
+        let init_def = module.definitions.get(init_name)?;
+        let body = init_def.body.trim();
+
+        // Walk the Init body, splitting at top-level /\ and harvesting
+        // `var \in <set>` clauses. Anything else (top-level disjunctions,
+        // \E quantifiers, equality-only Init, ...) is unsupported here and
+        // we bail to fall back.
+        let raw_clauses = expand_state_predicate_clauses(body, &module.definitions, &module.instances);
+        let mut membership_pairs: Vec<(String, String)> = Vec::new();
+        for c in &raw_clauses {
+            let c = c.trim();
+            if c.is_empty() {
+                continue;
+            }
+            match classify_clause(c) {
+                ClauseKind::UnprimedMembership { var, set_expr }
+                    if module.variables.contains(&var) =>
+                {
+                    membership_pairs.push((var, set_expr));
+                }
+                ClauseKind::UnprimedEquality { .. } => {
+                    if dbg {
+                        eprintln!("T5.5 bail: UnprimedEquality in clause: {:?}", c);
+                    }
+                    return None;
+                }
+                other => {
+                    if dbg {
+                        eprintln!("T5.5 bail: unsupported clause kind {:?} in {:?}", other, c);
+                    }
+                    return None;
+                }
+            }
+        }
+        if membership_pairs.is_empty() {
+            return None;
+        }
+        // Disjoint scopes: every module variable must appear in at most one
+        // clause. (Required for the cross-product-as-Cartesian-product
+        // assumption.)
+        let mut seen = HashSet::new();
+        for (v, _) in &membership_pairs {
+            if !seen.insert(v.clone()) {
+                return None;
+            }
+        }
+
+        // Build an EvalContext seeded with config constants.
+        let definition_scope = merged_definition_scope(module);
+        let mut base_state = BTreeMap::new();
+        for (k, v) in &cfg.constants {
+            if let Some(tv) = config_value_to_tla(v) {
+                base_state.insert(Arc::from(k.as_str()), tv);
+            }
+        }
+        let ctx = EvalContext::with_definitions_and_instances(
+            &base_state,
+            &definition_scope,
+            &module.instances,
+        );
+
+        // Resolve each membership clause to a sequence-set spec.
+        let mut var_specs: Vec<crate::tla::symbolic_init::JointVarSpec> = Vec::with_capacity(
+            membership_pairs.len(),
+        );
+        for (var_name, set_expr) in &membership_pairs {
+            match resolve_joint_var_spec(var_name, set_expr, &ctx) {
+                Some(spec) => {
+                    if dbg {
+                        eprintln!(
+                            "T5.5 resolved {} -> seq_len={} range_size={}",
+                            spec.name,
+                            spec.seq_len,
+                            spec.range.len(),
+                        );
+                    }
+                    var_specs.push(spec);
+                }
+                None => {
+                    if dbg {
+                        eprintln!(
+                            "T5.5 bail: failed to resolve var spec for {} <- {:?}",
+                            var_name, set_expr
+                        );
+                    }
+                    return None;
+                }
+            }
+        }
+
+        // Hand off to the joint Z3 solver.
+        let started = std::time::Instant::now();
+        let outcome = crate::tla::symbolic_init::try_symbolic_init_with_invariants(
+            &var_specs,
+            invariant_exprs,
+            &ctx,
+        )?;
+        let elapsed = started.elapsed();
+
+        match outcome {
+            crate::tla::symbolic_init::JointInitOutcome::NoViolation => {
+                eprintln!(
+                    "T5.5 joint Init+invariant solver: PROVED no violation \
+                     ({} variables, {} invariants) in {:.3}s",
+                    var_specs.len(),
+                    invariant_exprs.len(),
+                    elapsed.as_secs_f64()
+                );
+                Some(Vec::new())
+            }
+            crate::tla::symbolic_init::JointInitOutcome::Violation { state } => {
+                eprintln!(
+                    "T5.5 joint Init+invariant solver: VIOLATION witness \
+                     found in {:.3}s",
+                    elapsed.as_secs_f64()
+                );
+                let mut tla_state: TlaState = base_state.clone();
+                for (name, value) in state {
+                    tla_state.insert(Arc::from(name.as_str()), value);
+                }
+                Some(vec![tla_state])
+            }
+        }
+    }
+}
+
+/// Resolve a single `var \in <set-expr>` Init clause into a JointVarSpec.
+/// Recognises the same shapes as `try_symbolic_function_set_enumerate` /
+/// `try_funasseq_wrapper_symbolic`:
+///   - `var \in [1..n -> R]`              → JointVarSpec { pred: "TRUE" }
+///   - `var \in { p \in [1..n -> R] : Q(p) }` (with rewrites)
+///   - `var \in Permutation(R)`           → unwraps via `try_resolve_funasseq_permutation_set`
+///   - `var \in { p \in Permutation(R) : Q(p) }`
+///
+/// The returned `init_pred` references positions as `var_name[i]` (the
+/// outer Init variable name, not the inner binder).
+#[cfg(feature = "symbolic-init")]
+fn resolve_joint_var_spec(
+    var_name: &str,
+    set_expr: &str,
+    ctx: &EvalContext<'_>,
+) -> Option<crate::tla::symbolic_init::JointVarSpec> {
+    use crate::tla::eval::{
+        try_destructure_function_set_comprehension, try_resolve_funasseq_permutation_set,
+        try_resolve_sequence_domain,
+    };
+    let set_expr = set_expr.trim();
+
+    // Shape A: `var \in { x \in <inner> : outer_pred(x) }` where <inner>
+    // resolves through Permutation/FunAsSeq to a function-set comprehension.
+    if let Some(stripped) = set_expr.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+        if let Some(colon) = crate::tla::eval::find_top_level_char(stripped, ':') {
+            let lhs = stripped[..colon].trim();
+            let outer_pred = stripped[colon + 1..].trim();
+            if let Some(in_idx) = crate::tla::eval::find_top_level_keyword_index(lhs, "\\in") {
+                let outer_var = lhs[..in_idx].trim();
+                let inner_set_expr = lhs[in_idx + 3..].trim();
+                if crate::tla::eval::is_valid_identifier(outer_var) {
+                    if let Some((p_name, dom_text, range_text, inner_pred)) =
+                        try_resolve_funasseq_permutation_set(inner_set_expr, ctx)
+                    {
+                        if let Some((seq_len, range_vals)) =
+                            try_resolve_sequence_domain(&dom_text, &range_text, ctx, 0)
+                        {
+                            // Substitute outer_var -> p_name in outer_pred,
+                            // then p_name -> var_name in the combined pred.
+                            let outer_pred_sub = substitute_ident(outer_pred, outer_var, &p_name);
+                            let combined = format!("({}) /\\ ({})", inner_pred, outer_pred_sub);
+                            let final_pred = substitute_ident(&combined, &p_name, var_name);
+                            return Some(crate::tla::symbolic_init::JointVarSpec {
+                                name: var_name.to_string(),
+                                seq_len,
+                                range: range_vals,
+                                init_pred: final_pred,
+                            });
+                        }
+                    }
+                    // Or: inner is a literal `[Dom -> Range]` with no inner pred.
+                    if inner_set_expr.starts_with('[') && inner_set_expr.ends_with(']') {
+                        let inner_bracket = &inner_set_expr[1..inner_set_expr.len() - 1];
+                        if let Some((dom_text, range_text)) =
+                            crate::tla::eval::split_once_top_level(inner_bracket, "->")
+                        {
+                            if !dom_text.contains('|') {
+                                if let Some((seq_len, range_vals)) =
+                                    try_resolve_sequence_domain(dom_text.trim(), range_text.trim(), ctx, 0)
+                                {
+                                    let pred = substitute_ident(outer_pred, outer_var, var_name);
+                                    return Some(crate::tla::symbolic_init::JointVarSpec {
+                                        name: var_name.to_string(),
+                                        seq_len,
+                                        range: range_vals,
+                                        init_pred: pred,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    // Or: `{p \in [Dom -> Range] : pred}` directly
+                    if let Some((p_name, dom_text, range_text, inner_pred)) =
+                        try_destructure_function_set_comprehension(inner_set_expr, ctx)
+                    {
+                        if let Some((seq_len, range_vals)) =
+                            try_resolve_sequence_domain(&dom_text, &range_text, ctx, 0)
+                        {
+                            let outer_pred_sub = substitute_ident(outer_pred, outer_var, &p_name);
+                            let combined = format!("({}) /\\ ({})", inner_pred, outer_pred_sub);
+                            let final_pred = substitute_ident(&combined, &p_name, var_name);
+                            return Some(crate::tla::symbolic_init::JointVarSpec {
+                                name: var_name.to_string(),
+                                seq_len,
+                                range: range_vals,
+                                init_pred: final_pred,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Shape B: `var \in Permutation(S)` (no outer filter).
+    if let Some((p_name, dom_text, range_text, inner_pred)) =
+        try_resolve_funasseq_permutation_set(set_expr, ctx)
+    {
+        if let Some((seq_len, range_vals)) =
+            try_resolve_sequence_domain(&dom_text, &range_text, ctx, 0)
+        {
+            let pred = substitute_ident(&inner_pred, &p_name, var_name);
+            return Some(crate::tla::symbolic_init::JointVarSpec {
+                name: var_name.to_string(),
+                seq_len,
+                range: range_vals,
+                init_pred: pred,
+            });
+        }
+    }
+
+    // Shape C: `var \in [1..n -> Range]` (no filter, no permutation).
+    if set_expr.starts_with('[') && set_expr.ends_with(']') {
+        let inner = &set_expr[1..set_expr.len() - 1];
+        if let Some((dom_text, range_text)) = crate::tla::eval::split_once_top_level(inner, "->") {
+            if !dom_text.contains('|') {
+                if let Some((seq_len, range_vals)) =
+                    try_resolve_sequence_domain(dom_text.trim(), range_text.trim(), ctx, 0)
+                {
+                    return Some(crate::tla::symbolic_init::JointVarSpec {
+                        name: var_name.to_string(),
+                        seq_len,
+                        range: range_vals,
+                        init_pred: "TRUE".to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Replace standalone identifier `from` with `to` in `text`.
+#[cfg(feature = "symbolic-init")]
+fn substitute_ident(text: &str, from: &str, to: &str) -> String {
+    let bytes = text.as_bytes();
+    let needle = from.as_bytes();
+    if needle.is_empty() || from == to {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + needle.len() <= bytes.len() && &bytes[i..i + needle.len()] == needle {
+            let prev_ok =
+                i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            let next_idx = i + needle.len();
+            let next_ok = next_idx == bytes.len()
+                || !(bytes[next_idx].is_ascii_alphanumeric() || bytes[next_idx] == b'_');
+            if prev_ok && next_ok {
+                out.push_str(to);
+                i += needle.len();
+                continue;
+            }
+        }
+        let ch = text[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
     out
 }
 

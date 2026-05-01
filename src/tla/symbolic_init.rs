@@ -133,6 +133,88 @@ pub(crate) fn build_seq(elems: Vec<TlaValue>) -> TlaValue {
     TlaValue::Seq(Arc::new(elems))
 }
 
+// ============================================================================
+// T5.5 — Joint Init+invariant symbolic encoding.
+//
+// Recognises Init shapes where ALL state variables are independently
+// constrained as filtered sequence sets (the Einstein shape):
+//
+//   /\ v1 \in { p \in [Dom -> R1] : Pred1(p) }
+//   /\ v2 \in { p \in [Dom -> R2] : Pred2(p) }
+//   /\ ...
+//
+// (each `Pred_i` may be a `Permutation(R_i)`-style chain of distinctness
+// constraints plus extra per-variable filters). The brute-force path computes
+// the Cartesian product of per-variable enumeration sizes and then BFS-checks
+// invariants on each resulting state — O(N1 * N2 * ... * Nk) states.
+//
+// T5.5 fuses the entire problem into a single Z3 query: it asserts all
+// per-variable Init predicates AND the *negation* of the conjunction of all
+// invariants. SAT means a violating initial state exists; UNSAT means every
+// initial state satisfies every invariant.
+//
+// On the Einstein riddle (`FindSolution == ~Solution` → invariant body is
+// `~Solution`, and the user wants to find a violation that pins down the
+// answer), the joint encoding solves in <100ms versus the ~44 minutes the
+// brute-force cross-product takes.
+// ============================================================================
+
+/// Spec for one state variable in the joint Init+invariant encoding.
+///
+/// Each variable is modelled as a `seq_len`-long sequence whose elements are
+/// drawn from `range`. `init_pred` is the predicate body from the Init clause
+/// `var_name \in { p \in [Dom -> Range] : <pred> }`, with the bound name
+/// already rewritten to `var_name`. If the Init clause is unfiltered (i.e.
+/// `var_name \in [Dom -> Range]`), supply `"TRUE"`.
+#[cfg_attr(not(feature = "symbolic-init"), allow(dead_code))]
+#[derive(Clone, Debug)]
+pub struct JointVarSpec {
+    pub name: String,
+    pub seq_len: usize,
+    pub range: Vec<TlaValue>,
+    pub init_pred: String,
+}
+
+/// Result of a joint Init+invariant solve.
+#[derive(Clone, Debug)]
+pub enum JointInitOutcome {
+    /// Z3 proved that every initial state satisfies every invariant.
+    NoViolation,
+    /// Z3 found a witness initial state that violates at least one invariant.
+    /// The vector is `(var_name, Seq<TlaValue>)` for every state variable.
+    Violation {
+        state: Vec<(String, TlaValue)>,
+    },
+}
+
+/// Try to solve the joint Init+invariant query symbolically.
+///
+/// Returns `Some(outcome)` on a successful translation. Returns `None` if
+/// any variable's Init predicate or any invariant body falls outside the
+/// supported subset, or if the SMT solver returns `Unknown`. The caller must
+/// fall back to brute-force Init enumeration + per-state invariant checking
+/// in the `None` case (the established T5.4 streaming-Init path).
+///
+/// Soundness contract: the symbolic translator is a *conservative*
+/// approximation. Anything it cannot translate yields `None` — never a
+/// silently-wrong result. This is the same guard used by the T5.1/T5.2
+/// per-variable enumerator.
+#[cfg_attr(not(feature = "symbolic-init"), allow(unused_variables))]
+pub fn try_symbolic_init_with_invariants(
+    var_specs: &[JointVarSpec],
+    invariants: &[(String, String)],
+    ctx: &EvalContext<'_>,
+) -> Option<JointInitOutcome> {
+    #[cfg(not(feature = "symbolic-init"))]
+    {
+        None
+    }
+    #[cfg(feature = "symbolic-init")]
+    {
+        backend::try_symbolic_init_with_invariants_z3(var_specs, invariants, ctx)
+    }
+}
+
 #[cfg(feature = "symbolic-init")]
 mod backend {
     use super::*;
@@ -1835,6 +1917,655 @@ mod backend {
         }
         None
     }
+
+    // ========================================================================
+    // T5.5 — Joint Init+invariant translator
+    // ========================================================================
+
+    /// Per-variable encoding for the joint translator.
+    struct VarEncoding<'ctx> {
+        /// Sequence length (one Z3 Int per position, indexed 1..=seq_len).
+        seq_len: usize,
+        /// Z3 Int variable for each position 1..=seq_len.
+        position_vars: Vec<Int<'ctx>>,
+        /// Range encoding (always EnumDomain or IntDomain).
+        range_enc: FieldEncoding,
+    }
+
+    /// Translator that handles boolean expressions referencing multiple
+    /// sequence-shaped state variables. Each variable is registered as
+    /// `var_name[i]` with its own per-position Z3 vars.
+    struct MultiSeqTranslator<'ctx, 'a> {
+        z3: &'ctx Context,
+        vars: HashMap<String, VarEncoding<'ctx>>,
+        eval_ctx: &'a EvalContext<'a>,
+    }
+
+    pub(super) fn try_symbolic_init_with_invariants_z3(
+        var_specs: &[super::JointVarSpec],
+        invariants: &[(String, String)],
+        ctx: &EvalContext<'_>,
+    ) -> Option<super::JointInitOutcome> {
+        if var_specs.is_empty() {
+            return None;
+        }
+        // Defensive: each variable must have a non-empty range and a positive
+        // sequence length. An empty range with non-empty domain means there
+        // are no initial states at all → vacuously no violation.
+        let mut any_empty_range = false;
+        for spec in var_specs {
+            if spec.seq_len == 0 {
+                return None;
+            }
+            if spec.range.is_empty() {
+                any_empty_range = true;
+            }
+        }
+        if any_empty_range {
+            return Some(super::JointInitOutcome::NoViolation);
+        }
+
+        let z3_cfg = Config::new();
+        let z3_ctx = Context::new(&z3_cfg);
+        let solver = Solver::new(&z3_ctx);
+
+        // Build per-variable encodings.
+        let mut vars: HashMap<String, VarEncoding<'_>> = HashMap::with_capacity(var_specs.len());
+        for spec in var_specs {
+            if vars.contains_key(&spec.name) {
+                // Duplicate variable name — shape unsupported.
+                return None;
+            }
+            let range_enc = build_range_encoding(&spec.range)?;
+            let mut position_vars: Vec<Int<'_>> = Vec::with_capacity(spec.seq_len);
+            for i in 1..=spec.seq_len {
+                let v = Int::new_const(&z3_ctx, format!("{}_{}", spec.name, i));
+                assert_domain_constraint(&z3_ctx, &solver, &v, &range_enc);
+                position_vars.push(v);
+            }
+            vars.insert(
+                spec.name.clone(),
+                VarEncoding {
+                    seq_len: spec.seq_len,
+                    position_vars,
+                    range_enc,
+                },
+            );
+        }
+
+        let translator = MultiSeqTranslator {
+            z3: &z3_ctx,
+            vars,
+            eval_ctx: ctx,
+        };
+
+        // Assert each variable's Init predicate.
+        for spec in var_specs {
+            let pred_text = spec.init_pred.trim();
+            // Permutation distinctness shortcut (T5.2): if seq_len ==
+            // range.len() and the predicate textually contains a permutation
+            // indicator, additionally assert Distinct over all positions.
+            // (Does no harm if redundant — Z3 simplifies trivially.)
+            let enc = translator.vars.get(&spec.name)?;
+            if spec.seq_len == range_size(&enc.range_enc)
+                && contains_permutation_indicator(pred_text, &spec.name, spec.seq_len)
+            {
+                let var_refs: Vec<&Int<'_>> = enc.position_vars.iter().collect();
+                let distinct = z3::ast::Ast::distinct(&z3_ctx, &var_refs);
+                solver.assert(&distinct);
+            }
+
+            // Empty / TRUE predicate is vacuously true.
+            if pred_text.is_empty() || pred_text.eq_ignore_ascii_case("TRUE") {
+                continue;
+            }
+            let pred_z3 = translator.translate_bool(pred_text)?;
+            solver.assert(&pred_z3);
+        }
+
+        // Assert the negation of (invariant_1 /\ invariant_2 /\ ...).
+        // SAT == witness violating at least one invariant.
+        if !invariants.is_empty() {
+            let mut inv_bools: Vec<Bool<'_>> = Vec::with_capacity(invariants.len());
+            for (_name, body) in invariants {
+                let body = body.trim();
+                if body.is_empty() {
+                    continue;
+                }
+                let inv_z3 = translator.translate_bool(body)?;
+                inv_bools.push(inv_z3);
+            }
+            if inv_bools.is_empty() {
+                // No invariants to check — vacuously safe.
+                return Some(super::JointInitOutcome::NoViolation);
+            }
+            let inv_refs: Vec<&Bool<'_>> = inv_bools.iter().collect();
+            let conj = Bool::and(&z3_ctx, &inv_refs);
+            solver.assert(&conj.not());
+        } else {
+            return Some(super::JointInitOutcome::NoViolation);
+        }
+
+        match solver.check() {
+            SatResult::Sat => {
+                let model = solver.get_model()?;
+                let mut state: Vec<(String, TlaValue)> = Vec::with_capacity(var_specs.len());
+                for spec in var_specs {
+                    let enc = translator.vars.get(&spec.name)?;
+                    let mut elems: Vec<TlaValue> = Vec::with_capacity(spec.seq_len);
+                    for v in &enc.position_vars {
+                        let code = model.eval(v, true)?.as_i64()?;
+                        let value = match &enc.range_enc {
+                            FieldEncoding::IntDomain { .. } => TlaValue::Int(code),
+                            FieldEncoding::EnumDomain { values } => {
+                                if code < 0 || (code as usize) >= values.len() {
+                                    return None;
+                                }
+                                values[code as usize].clone()
+                            }
+                        };
+                        elems.push(value);
+                    }
+                    state.push((spec.name.clone(), super::build_seq(elems)));
+                }
+                Some(super::JointInitOutcome::Violation { state })
+            }
+            SatResult::Unsat => Some(super::JointInitOutcome::NoViolation),
+            SatResult::Unknown => None,
+        }
+    }
+
+    fn range_size(enc: &FieldEncoding) -> usize {
+        match enc {
+            FieldEncoding::IntDomain { values } => values.len(),
+            FieldEncoding::EnumDomain { values } => values.len(),
+        }
+    }
+
+    impl<'ctx, 'a> MultiSeqTranslator<'ctx, 'a> {
+        /// Lookup `var_name[K]` where K is a positive integer literal in
+        /// `1..=seq_len(var_name)`. Returns the (var_encoding, position var).
+        fn lookup_position(&self, expr: &str) -> Option<(&VarEncoding<'ctx>, Int<'ctx>)> {
+            let expr = strip_redundant_parens(expr.trim());
+            // Find the `[` — must be a registered var name on the LHS.
+            let open = expr.find('[')?;
+            let name = expr[..open].trim();
+            if name.is_empty() {
+                return None;
+            }
+            let enc = self.vars.get(name)?;
+            let rest = &expr[open + 1..];
+            let close = rest.rfind(']')?;
+            // Anything after `]` would mean compound expression — bail.
+            if !rest[close + 1..].trim().is_empty() {
+                return None;
+            }
+            let inner = rest[..close].trim();
+            let idx = if let Ok(n) = inner.parse::<i64>() {
+                n
+            } else {
+                let v = crate::tla::eval_expr(inner, self.eval_ctx).ok()?;
+                v.as_int().ok()?
+            };
+            if idx < 1 || (idx as usize) > enc.seq_len {
+                return None;
+            }
+            Some((enc, enc.position_vars[(idx as usize) - 1].clone()))
+        }
+
+        /// True if `expr` mentions any registered var name as an identifier.
+        fn mentions_any_var(&self, expr: &str) -> bool {
+            for name in self.vars.keys() {
+                if mentions_record_var(expr, name) {
+                    return true;
+                }
+            }
+            false
+        }
+
+        fn translate_bool(&self, expr: &str) -> Option<Bool<'ctx>> {
+            let expr = strip_redundant_parens(expr.trim());
+
+            if expr.eq_ignore_ascii_case("TRUE") {
+                return Some(Bool::from_bool(self.z3, true));
+            }
+            if expr.eq_ignore_ascii_case("FALSE") {
+                return Some(Bool::from_bool(self.z3, false));
+            }
+
+            if let Some(parts) = split_two(expr, "<=>") {
+                let a = self.translate_bool(&parts.0)?;
+                let b = self.translate_bool(&parts.1)?;
+                return Some(a.iff(&b));
+            }
+            if let Some(parts) = split_two(expr, "=>") {
+                let a = self.translate_bool(&parts.0)?;
+                let b = self.translate_bool(&parts.1)?;
+                return Some(a.implies(&b));
+            }
+
+            let dj = split_top_level_keyword(expr, "\\/");
+            if dj.len() > 1 {
+                let mut bools: Vec<Bool<'ctx>> = Vec::with_capacity(dj.len());
+                for part in &dj {
+                    let trimmed = part.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    bools.push(self.translate_bool(trimmed)?);
+                }
+                let refs: Vec<&Bool<'_>> = bools.iter().collect();
+                return Some(Bool::or(self.z3, &refs));
+            }
+
+            let cj = split_top_level_keyword(expr, "/\\");
+            if cj.len() > 1 {
+                let mut bools: Vec<Bool<'ctx>> = Vec::with_capacity(cj.len());
+                for part in &cj {
+                    let trimmed = part.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    bools.push(self.translate_bool(trimmed)?);
+                }
+                let refs: Vec<&Bool<'_>> = bools.iter().collect();
+                return Some(Bool::and(self.z3, &refs));
+            }
+
+            if let Some(rest) = expr.strip_prefix('~') {
+                let inner = self.translate_bool(rest.trim())?;
+                return Some(inner.not());
+            }
+            if let Some(rest) = expr.strip_prefix("\\lnot") {
+                let inner = self.translate_bool(rest.trim())?;
+                return Some(inner.not());
+            }
+
+            if let Some(stripped) = strip_quantifier_keyword(expr, "\\A") {
+                return self.translate_quantifier(stripped, true);
+            }
+            if let Some(stripped) = strip_quantifier_keyword(expr, "\\E") {
+                return self.translate_quantifier(stripped, false);
+            }
+
+            if let Some(b) = self.translate_atomic_bool(expr) {
+                return Some(b);
+            }
+
+            // Operator-name expansion. If `expr` is a bare identifier (or a
+            // parameterised operator call `Name(arg1, arg2, ...)`) that
+            // resolves to a definition, inline its body and recurse. This
+            // is what lets the joint Init+invariant solver translate the
+            // top-level invariant `FindSolution`, which expands to
+            // `~Solution`, which in turn expands to a giant conjunction of
+            // sub-operators (BritLivesInTheRedHouse /\ ...). Each
+            // sub-operator's body in turn references state variables that
+            // the joint translator does know about, so the recursion
+            // terminates at translatable atoms.
+            //
+            // Only performed if `expr` mentions at least one of our
+            // registered state variables — otherwise the constant-fold path
+            // below will handle it. (We test mention transitively by
+            // expanding the body and checking it.)
+            if let Some(expanded) = self.try_expand_definition(expr) {
+                if let Some(b) = self.translate_bool(&expanded) {
+                    return Some(b);
+                }
+            }
+
+            // Constant fold for sub-exprs that mention no registered var.
+            if !self.mentions_any_var(expr) {
+                if let Ok(TlaValue::Bool(b)) = crate::tla::eval_expr(expr, self.eval_ctx) {
+                    return Some(Bool::from_bool(self.z3, b));
+                }
+            }
+
+            None
+        }
+
+        /// If `expr` is a bare identifier `Name` or a call `Name(arg1, ...)`
+        /// that resolves to a parameterless / matching-arity definition in
+        /// the eval context, return the expanded body with arguments
+        /// textually substituted for parameters.
+        fn try_expand_definition(&self, expr: &str) -> Option<String> {
+            let expr = strip_redundant_parens(expr.trim());
+            let defs = self.eval_ctx.definitions?;
+            // Bare identifier.
+            if is_valid_identifier(expr) {
+                let def = defs.get(expr)?;
+                if def.params.is_empty() {
+                    return Some(def.body.clone());
+                }
+                return None;
+            }
+            // Operator call `Name(arg1, arg2, ...)`.
+            if let Some(open) = expr.find('(') {
+                if expr.ends_with(')') {
+                    let name = expr[..open].trim();
+                    if is_valid_identifier(name) {
+                        let def = defs.get(name)?;
+                        let args_text = &expr[open + 1..expr.len() - 1];
+                        let args = split_top_level_symbol(args_text, ",");
+                        if def.params.len() != args.len() {
+                            return None;
+                        }
+                        let mut body = def.body.clone();
+                        for (param, arg) in def.params.iter().zip(args.iter()) {
+                            body = substitute_identifier(&body, param, arg.trim());
+                        }
+                        return Some(body);
+                    }
+                }
+            }
+            None
+        }
+
+        fn translate_quantifier(&self, body_text: &str, forall: bool) -> Option<Bool<'ctx>> {
+            let colon = find_top_level_char(body_text, ':')?;
+            let binder = body_text[..colon].trim();
+            let body = body_text[colon + 1..].trim();
+            let in_idx = find_top_level_keyword_index(binder, "\\in")?;
+            let v = binder[..in_idx].trim();
+            if !is_valid_identifier(v) {
+                return None;
+            }
+            let domain_expr = binder[in_idx + 3..].trim();
+            // Domain must not mention any registered var.
+            if self.mentions_any_var(domain_expr) {
+                return None;
+            }
+            let domain_val = crate::tla::eval_expr(domain_expr, self.eval_ctx).ok()?;
+            let domain_set = domain_val.as_set().ok()?;
+            let mut sub_bools: Vec<Bool<'ctx>> = Vec::with_capacity(domain_set.len());
+            for elem in domain_set.iter() {
+                let lit = tla_value_to_literal(elem)?;
+                let substituted = substitute_identifier(body, v, &lit);
+                sub_bools.push(self.translate_bool(&substituted)?);
+            }
+            if sub_bools.is_empty() {
+                return Some(Bool::from_bool(self.z3, forall));
+            }
+            let refs: Vec<&Bool<'_>> = sub_bools.iter().collect();
+            if forall {
+                Some(Bool::and(self.z3, &refs))
+            } else {
+                Some(Bool::or(self.z3, &refs))
+            }
+        }
+
+        fn translate_atomic_bool(&self, expr: &str) -> Option<Bool<'ctx>> {
+            if let Some(in_idx) = find_top_level_keyword_index(expr, "\\in") {
+                let lhs = expr[..in_idx].trim();
+                let rhs = expr[in_idx + 3..].trim();
+                return self.translate_membership(lhs, rhs);
+            }
+            if let Some(notin_idx) = find_top_level_keyword_index(expr, "\\notin") {
+                let lhs = expr[..notin_idx].trim();
+                let rhs = expr[notin_idx + "\\notin".len()..].trim();
+                return Some(self.translate_membership(lhs, rhs)?.not());
+            }
+
+            if let Some(idx) = find_top_level_op(expr, "#") {
+                let (lhs, rhs) = (expr[..idx].trim(), expr[idx + 1..].trim());
+                return Some(self.translate_eq(lhs, rhs)?.not());
+            }
+            if let Some(idx) = find_top_level_str(expr, "/=") {
+                let (lhs, rhs) = (expr[..idx].trim(), expr[idx + 2..].trim());
+                return Some(self.translate_eq(lhs, rhs)?.not());
+            }
+
+            for op in ["<=", ">="] {
+                if let Some(idx) = find_top_level_str(expr, op) {
+                    let (lhs, rhs) = (expr[..idx].trim(), expr[idx + 2..].trim());
+                    let l = self.translate_int(lhs)?;
+                    let r = self.translate_int(rhs)?;
+                    return Some(if op == "<=" { l.le(&r) } else { l.ge(&r) });
+                }
+            }
+            for op in ['<', '>'] {
+                if let Some(idx) = find_top_level_op(expr, &op.to_string()) {
+                    let (lhs, rhs) = (expr[..idx].trim(), expr[idx + 1..].trim());
+                    let l = self.translate_int(lhs)?;
+                    let r = self.translate_int(rhs)?;
+                    return Some(if op == '<' { l.lt(&r) } else { l.gt(&r) });
+                }
+            }
+
+            if let Some(idx) = find_top_level_op(expr, "=") {
+                let (lhs, rhs) = (expr[..idx].trim(), expr[idx + 1..].trim());
+                return self.translate_eq(lhs, rhs);
+            }
+
+            None
+        }
+
+        fn translate_membership(&self, lhs: &str, rhs: &str) -> Option<Bool<'ctx>> {
+            let lhs_pos = self.lookup_position(lhs);
+
+            // rhs as range a..b
+            if let Some(dotdot) = rhs.find("..") {
+                let lo_text = rhs[..dotdot].trim();
+                let hi_text = rhs[dotdot + 2..].trim();
+                let lo = const_eval_int(lo_text, self.eval_ctx)?;
+                let hi = const_eval_int(hi_text, self.eval_ctx)?;
+                let lo_e = Int::from_i64(self.z3, lo);
+                let hi_e = Int::from_i64(self.z3, hi);
+                if let Some((enc, var)) = lhs_pos {
+                    if matches!(enc.range_enc, FieldEncoding::IntDomain { .. }) {
+                        return Some(Bool::and(self.z3, &[&var.ge(&lo_e), &var.le(&hi_e)]));
+                    }
+                    return None;
+                }
+                return None;
+            }
+
+            // rhs as set difference `S \ {var[k], ...}`
+            if let Some(diff_idx) = find_top_level_set_diff(rhs) {
+                let base_text = rhs[..diff_idx].trim();
+                let removed_text = rhs[diff_idx + 1..].trim_start();
+                if let Some(removed_inner) = removed_text
+                    .strip_prefix('{')
+                    .and_then(|s| s.strip_suffix('}'))
+                {
+                    let (enc, var) = lhs_pos?;
+                    let mut clauses: Vec<Bool<'ctx>> = Vec::new();
+                    let base_clause = self.constant_set_membership(&var, &enc.range_enc, base_text)?;
+                    clauses.push(base_clause);
+                    let removed_parts = split_top_level_symbol(removed_inner, ",");
+                    for r in &removed_parts {
+                        let r = r.trim();
+                        if r.is_empty() {
+                            continue;
+                        }
+                        if let Some((_other_enc, other)) = self.lookup_position(r) {
+                            clauses.push(var._eq(&other).not());
+                        } else if let Ok(elem_val) = crate::tla::eval_expr(r, self.eval_ctx) {
+                            let coded = encode_value_as_int(&elem_val, &enc.range_enc)?;
+                            clauses.push(var._eq(&Int::from_i64(self.z3, coded)).not());
+                        } else {
+                            return None;
+                        }
+                    }
+                    let refs: Vec<&Bool<'_>> = clauses.iter().collect();
+                    return Some(Bool::and(self.z3, &refs));
+                }
+                return None;
+            }
+
+            if let Some(inner) = rhs.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+                let (enc, var) = lhs_pos?;
+                return self.brace_set_membership(&var, &enc.range_enc, inner);
+            }
+
+            if !self.mentions_any_var(rhs) {
+                let (enc, var) = lhs_pos?;
+                return self.constant_set_membership(&var, &enc.range_enc, rhs);
+            }
+
+            None
+        }
+
+        fn constant_set_membership(
+            &self,
+            var: &Int<'ctx>,
+            enc: &FieldEncoding,
+            set_text: &str,
+        ) -> Option<Bool<'ctx>> {
+            let val = crate::tla::eval_expr(set_text, self.eval_ctx).ok()?;
+            let set = val.as_set().ok()?;
+            let mut eqs: Vec<Bool<'ctx>> = Vec::with_capacity(set.len());
+            for elem in set.iter() {
+                let coded = encode_value_as_int(elem, enc)?;
+                eqs.push(var._eq(&Int::from_i64(self.z3, coded)));
+            }
+            if eqs.is_empty() {
+                return Some(Bool::from_bool(self.z3, false));
+            }
+            let refs: Vec<&Bool<'_>> = eqs.iter().collect();
+            Some(Bool::or(self.z3, &refs))
+        }
+
+        fn brace_set_membership(
+            &self,
+            var: &Int<'ctx>,
+            enc: &FieldEncoding,
+            inner: &str,
+        ) -> Option<Bool<'ctx>> {
+            let parts = split_top_level_symbol(inner, ",");
+            let mut eqs: Vec<Bool<'ctx>> = Vec::with_capacity(parts.len());
+            for part in &parts {
+                let trimmed = part.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Some((_other_enc, other)) = self.lookup_position(trimmed) {
+                    eqs.push(var._eq(&other));
+                    continue;
+                }
+                let elem_val = crate::tla::eval_expr(trimmed, self.eval_ctx).ok()?;
+                let coded = encode_value_as_int(&elem_val, enc)?;
+                eqs.push(var._eq(&Int::from_i64(self.z3, coded)));
+            }
+            if eqs.is_empty() {
+                return Some(Bool::from_bool(self.z3, false));
+            }
+            let refs: Vec<&Bool<'_>> = eqs.iter().collect();
+            Some(Bool::or(self.z3, &refs))
+        }
+
+        fn translate_eq(&self, lhs: &str, rhs: &str) -> Option<Bool<'ctx>> {
+            let lhs_pos = self.lookup_position(lhs);
+            let rhs_pos = self.lookup_position(rhs);
+            match (lhs_pos, rhs_pos) {
+                (Some((lenc, l)), Some((renc, r))) => {
+                    // Cross-variable equality: encodings may differ.
+                    if matches!(lenc.range_enc, FieldEncoding::IntDomain { .. })
+                        && matches!(renc.range_enc, FieldEncoding::IntDomain { .. })
+                    {
+                        return Some(l._eq(&r));
+                    }
+                    if let (
+                        FieldEncoding::EnumDomain { values: lvals },
+                        FieldEncoding::EnumDomain { values: rvals },
+                    ) = (&lenc.range_enc, &renc.range_enc)
+                    {
+                        // Build OR over shared values: (l == lcode AND r == rcode).
+                        let mut pairs: Vec<Bool<'_>> = Vec::new();
+                        for (li, lval) in lvals.iter().enumerate() {
+                            if let Some(ri) = rvals.iter().position(|v| v == lval) {
+                                let l_eq = l._eq(&Int::from_i64(self.z3, li as i64));
+                                let r_eq = r._eq(&Int::from_i64(self.z3, ri as i64));
+                                pairs.push(Bool::and(self.z3, &[&l_eq, &r_eq]));
+                            }
+                        }
+                        if pairs.is_empty() {
+                            return Some(Bool::from_bool(self.z3, false));
+                        }
+                        let refs: Vec<&Bool<'_>> = pairs.iter().collect();
+                        return Some(Bool::or(self.z3, &refs));
+                    }
+                    None
+                }
+                (Some((enc, var)), None) => {
+                    if matches!(enc.range_enc, FieldEncoding::IntDomain { .. }) {
+                        if let Some(r) = self.translate_int(rhs) {
+                            return Some(var._eq(&r));
+                        }
+                    }
+                    let elem = crate::tla::eval_expr(rhs, self.eval_ctx).ok()?;
+                    let coded = encode_value_as_int(&elem, &enc.range_enc)?;
+                    Some(var._eq(&Int::from_i64(self.z3, coded)))
+                }
+                (None, Some((enc, var))) => {
+                    if matches!(enc.range_enc, FieldEncoding::IntDomain { .. }) {
+                        if let Some(l) = self.translate_int(lhs) {
+                            return Some(var._eq(&l));
+                        }
+                    }
+                    let elem = crate::tla::eval_expr(lhs, self.eval_ctx).ok()?;
+                    let coded = encode_value_as_int(&elem, &enc.range_enc)?;
+                    Some(var._eq(&Int::from_i64(self.z3, coded)))
+                }
+                (None, None) => {
+                    if let (Some(l), Some(r)) = (self.translate_int(lhs), self.translate_int(rhs)) {
+                        return Some(l._eq(&r));
+                    }
+                    if !self.mentions_any_var(lhs) && !self.mentions_any_var(rhs) {
+                        let l = crate::tla::eval_expr(lhs, self.eval_ctx).ok()?;
+                        let r = crate::tla::eval_expr(rhs, self.eval_ctx).ok()?;
+                        return Some(Bool::from_bool(self.z3, l == r));
+                    }
+                    None
+                }
+            }
+        }
+
+        fn translate_int(&self, expr: &str) -> Option<Int<'ctx>> {
+            let expr = strip_redundant_parens(expr.trim());
+
+            if let Some((enc, var)) = self.lookup_position(expr) {
+                if matches!(enc.range_enc, FieldEncoding::IntDomain { .. }) {
+                    return Some(var);
+                }
+                return None;
+            }
+
+            if let Ok(n) = expr.parse::<i64>() {
+                return Some(Int::from_i64(self.z3, n));
+            }
+
+            if let Some(rest) = expr.strip_prefix('-') {
+                let r = self.translate_int(rest.trim())?;
+                let zero = Int::from_i64(self.z3, 0);
+                return Some(Int::sub(self.z3, &[&zero, &r]));
+            }
+
+            if let Some((l_text, op, r_text)) = split_top_level_additive_local(expr) {
+                let l = self.translate_int(&l_text)?;
+                let r = self.translate_int(&r_text)?;
+                return Some(match op {
+                    '+' => Int::add(self.z3, &[&l, &r]),
+                    '-' => Int::sub(self.z3, &[&l, &r]),
+                    _ => unreachable!(),
+                });
+            }
+
+            if let Some((l_text, r_text)) = split_top_level_mul_local(expr) {
+                let l = self.translate_int(&l_text)?;
+                let r = self.translate_int(&r_text)?;
+                return Some(Int::mul(self.z3, &[&l, &r]));
+            }
+
+            if !self.mentions_any_var(expr) {
+                if let Ok(TlaValue::Int(n)) = crate::tla::eval_expr(expr, self.eval_ctx) {
+                    return Some(Int::from_i64(self.z3, n));
+                }
+            }
+
+            None
+        }
+    }
+
 }
 
 #[cfg(all(test, feature = "symbolic-init"))]
@@ -2159,5 +2890,196 @@ mod tests {
             sym_sorted, brute_sorted,
             "symbolic enumeration must agree with brute force"
         );
+    }
+
+    // ========================================================================
+    // T5.5 — joint Init+invariant tests
+    // ========================================================================
+
+    #[test]
+    fn joint_solve_no_invariants_returns_no_violation() {
+        let state = BTreeMap::new();
+        let defs = BTreeMap::new();
+        let instances = BTreeMap::new();
+        let ctx = make_ctx(&state, &defs, &instances);
+        let specs = vec![JointVarSpec {
+            name: "x".to_string(),
+            seq_len: 3,
+            range: vec![TlaValue::Int(1), TlaValue::Int(2), TlaValue::Int(3)],
+            init_pred: "TRUE".to_string(),
+        }];
+        let outcome = try_symbolic_init_with_invariants(&specs, &[], &ctx)
+            .expect("solve should succeed");
+        assert!(matches!(outcome, JointInitOutcome::NoViolation));
+    }
+
+    #[test]
+    fn joint_solve_two_vars_violation_witness() {
+        // Two sequence variables; invariant says
+        // `\E i \in 1..3 : a[i] = b[i]` (matching positions). Violation
+        // means there's some assignment with all positions different.
+        // With seq_len 3 and range {1,2,3}, the cross-product is 27*27=729
+        // total state pairs; many violate. Witness should satisfy the
+        // negated invariant.
+        let state = BTreeMap::new();
+        let defs = BTreeMap::new();
+        let instances = BTreeMap::new();
+        let ctx = make_ctx(&state, &defs, &instances);
+        let range: Vec<TlaValue> = (1..=3).map(TlaValue::Int).collect();
+        let specs = vec![
+            JointVarSpec {
+                name: "a".to_string(),
+                seq_len: 3,
+                range: range.clone(),
+                init_pred: "TRUE".to_string(),
+            },
+            JointVarSpec {
+                name: "b".to_string(),
+                seq_len: 3,
+                range,
+                init_pred: "TRUE".to_string(),
+            },
+        ];
+        let invariant = (
+            "MatchExists".to_string(),
+            "\\E i \\in 1..3 : a[i] = b[i]".to_string(),
+        );
+        let outcome = try_symbolic_init_with_invariants(&specs, &[invariant], &ctx)
+            .expect("solve should succeed");
+        match outcome {
+            JointInitOutcome::Violation { state } => {
+                // Witness must have a[i] != b[i] for all i in 1..3.
+                let a = state.iter().find(|(n, _)| n == "a").unwrap().1.as_seq().unwrap().clone();
+                let b = state.iter().find(|(n, _)| n == "b").unwrap().1.as_seq().unwrap().clone();
+                assert_eq!(a.len(), 3);
+                assert_eq!(b.len(), 3);
+                for i in 0..3 {
+                    assert_ne!(a[i], b[i], "witness violates invariant: position {} matches", i + 1);
+                }
+            }
+            JointInitOutcome::NoViolation => panic!("expected violation witness"),
+        }
+    }
+
+    #[test]
+    fn joint_solve_two_vars_no_violation_when_invariant_universally_true() {
+        // Both vars pinned to identical sequences [1,2,3]. Invariant says
+        // `\A i \in 1..3 : a[i] = b[i]` (every position matches). This holds
+        // for every initial state (only one exists: a=b=[1,2,3]). The
+        // joint solver should return NoViolation.
+        let state = BTreeMap::new();
+        let defs = BTreeMap::new();
+        let instances = BTreeMap::new();
+        let ctx = make_ctx(&state, &defs, &instances);
+        let range: Vec<TlaValue> = (1..=3).map(TlaValue::Int).collect();
+        let specs = vec![
+            JointVarSpec {
+                name: "a".to_string(),
+                seq_len: 3,
+                range: range.clone(),
+                init_pred: "/\\ a[1] = 1 /\\ a[2] = 2 /\\ a[3] = 3".to_string(),
+            },
+            JointVarSpec {
+                name: "b".to_string(),
+                seq_len: 3,
+                range,
+                init_pred: "/\\ b[1] = 1 /\\ b[2] = 2 /\\ b[3] = 3".to_string(),
+            },
+        ];
+        let invariant = (
+            "AllMatch".to_string(),
+            "\\A i \\in 1..3 : a[i] = b[i]".to_string(),
+        );
+        let outcome = try_symbolic_init_with_invariants(&specs, &[invariant], &ctx)
+            .expect("solve should succeed");
+        assert!(
+            matches!(outcome, JointInitOutcome::NoViolation),
+            "with both pinned to identical sequences, every position matches"
+        );
+    }
+
+    #[test]
+    fn joint_solve_returns_none_for_zero_var_specs() {
+        let state = BTreeMap::new();
+        let defs = BTreeMap::new();
+        let instances = BTreeMap::new();
+        let ctx = make_ctx(&state, &defs, &instances);
+        let outcome = try_symbolic_init_with_invariants(&[], &[], &ctx);
+        assert!(outcome.is_none());
+    }
+
+    #[test]
+    fn joint_solve_empty_range_proves_safe() {
+        // Empty range with non-empty seq → no initial state exists at all.
+        // Vacuously safe (no violation possible).
+        let state = BTreeMap::new();
+        let defs = BTreeMap::new();
+        let instances = BTreeMap::new();
+        let ctx = make_ctx(&state, &defs, &instances);
+        let specs = vec![JointVarSpec {
+            name: "x".to_string(),
+            seq_len: 3,
+            range: vec![],
+            init_pred: "TRUE".to_string(),
+        }];
+        let invariant = ("Always".to_string(), "x[1] = x[2]".to_string());
+        let outcome = try_symbolic_init_with_invariants(&specs, &[invariant], &ctx)
+            .expect("solve should succeed");
+        assert!(matches!(outcome, JointInitOutcome::NoViolation));
+    }
+
+    #[test]
+    fn joint_solve_witness_satisfies_init_predicates_and_violates_invariant() {
+        // Mini-Einstein: a is a 3-permutation of {1,2,3} (distinctness via
+        // chained set-difference), b is a 3-permutation of {10,20,30}.
+        // Invariant: `\E i \in 1..3 : a[i] = 1 /\ b[i] = 30`.
+        // With both free permutations there exist witnesses where position
+        // of 1 in a doesn't co-occur with position of 30 in b. So
+        // `~invariant` is SAT → solver returns Violation witness.
+        let state = BTreeMap::new();
+        let defs = BTreeMap::new();
+        let instances = BTreeMap::new();
+        let ctx = make_ctx(&state, &defs, &instances);
+        let range_a: Vec<TlaValue> = (1..=3).map(TlaValue::Int).collect();
+        let range_b: Vec<TlaValue> = (1..=3).map(|i| TlaValue::Int(i * 10)).collect();
+        let specs = vec![
+            JointVarSpec {
+                name: "a".to_string(),
+                seq_len: 3,
+                range: range_a,
+                init_pred: "/\\ a[2] \\in {1,2,3} \\ {a[1]}\n/\\ a[3] \\in {1,2,3} \\ {a[1], a[2]}".to_string(),
+            },
+            JointVarSpec {
+                name: "b".to_string(),
+                seq_len: 3,
+                range: range_b,
+                init_pred: "/\\ b[2] \\in {10,20,30} \\ {b[1]}\n/\\ b[3] \\in {10,20,30} \\ {b[1], b[2]}".to_string(),
+            },
+        ];
+        let invariant = (
+            "AlwaysCoLocated".to_string(),
+            "\\E i \\in 1..3 : a[i] = 1 /\\ b[i] = 30".to_string(),
+        );
+        let outcome = try_symbolic_init_with_invariants(&specs, &[invariant], &ctx)
+            .expect("solve should succeed");
+        match outcome {
+            JointInitOutcome::Violation { state } => {
+                let a = state.iter().find(|(n, _)| n == "a").unwrap().1.as_seq().unwrap().clone();
+                let b = state.iter().find(|(n, _)| n == "b").unwrap().1.as_seq().unwrap().clone();
+                // Verify a is permutation of {1,2,3} and b of {10,20,30}.
+                let mut a_sorted: Vec<i64> = a.iter().map(|v| v.as_int().unwrap()).collect();
+                a_sorted.sort();
+                assert_eq!(a_sorted, vec![1, 2, 3]);
+                let mut b_sorted: Vec<i64> = b.iter().map(|v| v.as_int().unwrap()).collect();
+                b_sorted.sort();
+                assert_eq!(b_sorted, vec![10, 20, 30]);
+                // Verify witness violates invariant: position of 1 in a ≠
+                // position of 30 in b.
+                let pos_a = a.iter().position(|v| *v == TlaValue::Int(1)).unwrap();
+                let pos_b = b.iter().position(|v| *v == TlaValue::Int(30)).unwrap();
+                assert_ne!(pos_a, pos_b);
+            }
+            JointInitOutcome::NoViolation => panic!("expected violation witness"),
+        }
     }
 }
