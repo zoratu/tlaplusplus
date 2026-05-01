@@ -180,6 +180,11 @@ reader indefinitely" under a temporal weak-fairness assumption that
 writers do not perpetually block in a resize. Run via
 `./run_proof.sh liveness`.
 
+This file is preserved as the bounded-form fallback. The headline
+T13.3 + T13.5 result lives in `reader_liveness_v2.rs` (see below),
+which discharges all three axioms with explicit finite-prefix
+witnesses.
+
 | Property | Lemma | Status |
 |---|---|---|
 | **Parity discipline** | `lemma_begin_resize_parity_seq`, `lemma_finalize_resize_parity_seq`, `lemma_stutter_parity_seq` | Proved (no axioms). |
@@ -195,13 +200,47 @@ writers do not perpetually block in a resize. Run via
 | **MAIN THEOREM** | `theorem_reader_eventually_succeeds` | Proved (modulo the three axioms). |
 | **No-starvation corollary** | `theorem_no_starvation` | Proved (modulo the three axioms). |
 
-**Honest outcome:** the safety side is fully mechanical; the liveness
-side is shipped as the "Good" tier from the T13.5 brief — a temporal
-trace model with the three protocol-shape axioms documented inline,
-each with a concrete discharge plan estimating the work needed to
-remove it. The discharge plans together total roughly 4-6 agent-days
-of further Verus work, OR a port to `state_machines!` (~5-7 agent-
-days) which subsumes all three. Track in v1.2.0+.
+### Tier-A.6 (T13.3 + T13.5, constructive): axiom-free reader liveness
+
+`reader_liveness_v2.rs` is the constructive sibling of
+`reader_liveness.rs`. It proves the same headline statements
+(`theorem_reader_eventually_succeeds`, `theorem_no_starvation`) with
+**zero axioms**. Run via `./run_proof.sh reader-liveness-v2`
+(also accepts `liveness-v2`, `live-v2`, `l2`).
+
+Each of the original three axioms is replaced by a constructive
+lemma whose witness is an explicit short `seq!` literal:
+
+| Original axiom | Replacement lemma | Witness |
+|---|---|---|
+| `axiom_writer_eventually_finalizes` | `lemma_writer_eventually_finalizes` | `seq![s, finalize(s)]` — the resizing tail finalised |
+| `axiom_reader_can_observe_stutter` | `lemma_reader_can_observe_stutter` | `seq![s, s]` — the stable tail stuttered once |
+| `axiom_extension_composes` | `lemma_extension_composes` | `seq![s, finalize(s), finalize(s)]` — finalize then stutter |
+
+`wf_prefix` over a 2- or 3-element literal reduces to a small number
+of `step_relation` checks that the SMT solver discharges by case
+analysis on `step_relation`'s three disjuncts. The composition
+witness inlines the case-2-then-case-1 reasoning that was previously
+admitted as `axiom_extension_composes`, so all three discharge in a
+single file with no temporal-logic machinery beyond the
+finite-prefix `Seq<ShardSeqState>` model.
+
+| Property | Lemma | Status |
+|---|---|---|
+| All safety properties from `reader_liveness.rs` | (same names) | Proved (no axioms). |
+| **Writer-fairness witness** | `lemma_writer_eventually_finalizes` | Proved (constructive 2-step witness). |
+| **Reader-progress witness** | `lemma_reader_can_observe_stutter` | Proved (constructive 2-step stutter witness). |
+| **Composition** | `lemma_extension_composes` | Proved (constructive 3-step finalize+stutter witness). |
+| **MAIN THEOREM** | `theorem_reader_eventually_succeeds` | Proved (no axioms). |
+| **No-starvation corollary** | `theorem_no_starvation` | Proved (no axioms). |
+
+`./run_proof.sh reader-liveness-v2` reports
+`verification results:: 17 verified, 0 errors` in well under one second.
+
+The original `reader_liveness.rs` is intentionally kept as the
+bounded-form fallback; it documents the temporal-logic shape and
+its axiom-discharge plan, both of which remain useful reference
+material for the eventual `state_machines!` port.
 
 ### Genuinely deferred to v1.2.0+
 

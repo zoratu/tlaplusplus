@@ -474,7 +474,7 @@ Verification:
 - Verus tier-B proof of the seqlock resize protocol (T13). 19 lemmas verified by Z3, including the headline `theorem_no_fingerprint_lost`. Lives at `verification/verus/seqlock_resize.rs`; run via `verification/verus/run_proof.sh`.
 - Verus tier-A extension (T13.1-T13.3). 31 lemmas verified over a `Seq<u64>` linear-probe model with spec-level CAS soundness and bounded reader-retry termination. Lives at `verification/verus/seqlock_resize_tier_a.rs`; run via `verification/verus/run_proof.sh tier-a`.
 - Verus tier-A.5 production-shape shadow (T13.4 partial). 17 verified items modeling `FingerprintShard`'s hot-path methods with real Verus tracked permissions (`PAtomicU64` + `Tracked<&PermissionU64>`). Lives at `verification/verus/shard_methods.rs`; run via `verification/verus/run_proof.sh shard-methods`.
-- Verus reader-liveness (T13.5). Unbounded-fairness liveness theorem `theorem_no_starvation` over a temporal trace model; safety side fully proved, liveness side admits 3 protocol-shape axioms with documented discharge plans. Lives at `verification/verus/reader_liveness.rs`; run via `verification/verus/run_proof.sh liveness`.
+- Verus reader-liveness (T13.3 + T13.5). Unbounded-fairness liveness theorem `theorem_no_starvation` over a temporal trace model; both safety and liveness sides fully proved with 0 axioms. The constructive proof (`verification/verus/reader_liveness_v2.rs`, 17 verified, 0 errors via `./run_proof.sh reader-liveness-v2`) replaces the three previous protocol-shape axioms with explicit short-`seq!` witnesses (2- and 3-element extensions). The original `verification/verus/reader_liveness.rs` (14 verified plus 3 documented `external_body` axioms) is preserved as the bounded-form temporal-trace fallback and reference for the eventual `state_machines!` port.
 - CI gate (T13.6). `scripts/REDACTED` (run on a fresh EC2 spot per push) builds Verus from source on `ubuntu-latest`, caches the build keyed on the pinned upstream ref, and runs all four proof files (tier-B, tier-A, shard-methods, liveness) on push to main + PR. Aarch64 runs as a manual `workflow_dispatch` job (informational, not a gate) due to upstream Z3 packaging issues on hosted aarch64 runners.
 
 Chaos & swarm:
@@ -496,7 +496,7 @@ Deferred to v1.1.x:
 >>>>>>> worktree-agent-ad795be698325d7cd
 - T10.2: Streaming SCC discovery for 100M+ liveness.
 - T13.4 (full): Verus tracked-pointer integration of the production `FingerprintShard` (the shadow methods in `shard_methods.rs` are the working blueprint).
-- T13.5 (full discharge): convert the three `axiom_*` lemmas in `reader_liveness.rs` to mechanical proofs, OR port to Verus's `state_machines!` macro for native LTL liveness.
+- T13.5 (`state_machines!` port): the constructive proof in `reader_liveness_v2.rs` discharges the headline `theorem_no_starvation` with 0 axioms; an LTL-native restatement via `state_machines!` is optional polish, no longer load-bearing.
 - See `RELEASE_1.0.0_PLAN.md` for the full v1.1.x backlog.
 
 ## Key Implementation Notes
