@@ -47,11 +47,14 @@ echo
 # Tier selection. Default = tier B (`seqlock_resize.rs`, abstract Set<u64>).
 # Pass `tier-a` (or `a`, `tiera`) to verify the tier-A extension
 # (`seqlock_resize_tier_a.rs`, concrete linear-probe Seq<u64>).
+# Pass `shadow` to verify the production-shape shadow methods
+# (`shard_methods.rs`, real PAtomicU64 + Tracked permissions).
 TIER="${1:-b}"
 case "$TIER" in
   a|tier-a|tiera|A) PROOF_FILE="seqlock_resize_tier_a.rs" ;;
   b|tier-b|tierb|B|"") PROOF_FILE="seqlock_resize.rs" ;;
-  *) echo "error: unknown tier '$TIER'; pass 'a' or 'b'" >&2; exit 2 ;;
+  shadow|tier-a-shadow|s) PROOF_FILE="shard_methods.rs" ;;
+  *) echo "error: unknown tier '$TIER'; pass 'a', 'b', or 'shadow'" >&2; exit 2 ;;
 esac
 
 echo "Verifying: $PROOF_FILE"
