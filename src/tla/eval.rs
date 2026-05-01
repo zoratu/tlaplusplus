@@ -1628,6 +1628,17 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
         let start = left.as_int()?;
         let end = right.as_int()?;
         let range_set: BTreeSet<TlaValue> = if start <= end {
+            // T201: charge the range size against the eval budget BEFORE
+            // allocating. Without this, fuzz / probe paths that hit a giant
+            // range like `1..1_000_000_000` would OOM before any per-element
+            // check fires.
+            let span = (end - start).saturating_add(1);
+            let cost = if span <= 0 || span as u64 > usize::MAX as u64 {
+                usize::MAX
+            } else {
+                span as usize
+            };
+            ctx.check_budget(cost)?;
             (start..=end).map(TlaValue::Int).collect()
         } else {
             BTreeSet::new()
@@ -5200,6 +5211,9 @@ fn collect_function_mapping(
     depth: usize,
 ) -> Result<()> {
     if idx >= binders.len() {
+        // T201: charge one budget unit per inner iteration so
+        // `[x \in <huge> |-> body]` cannot allocate without bound.
+        ctx.check_budget(1)?;
         let mut child = ctx.clone();
         {
             let locals_mut = std::rc::Rc::make_mut(&mut child.locals);
@@ -5234,6 +5248,10 @@ fn collect_binder_filter_set(
     depth: usize,
 ) -> Result<()> {
     if idx >= binders.len() {
+        // T201: charge one element per inner iteration to keep
+        // `{ x \in <huge> : <pred> }` from allocating without bound
+        // when the budget is set (e.g., from fuzz harnesses or probes).
+        ctx.check_budget(1)?;
         let mut child = ctx.clone();
         {
             let locals_mut = std::rc::Rc::make_mut(&mut child.locals);
@@ -5277,6 +5295,11 @@ fn collect_binder_map_set(
     depth: usize,
 ) -> Result<()> {
     if idx >= binders.len() {
+        // T201: charge ONE element against the eval budget per inner
+        // iteration. Without this, set comprehensions of shape
+        // `{ <expr> : x \in <huge> }` allocated values in a loop with no
+        // per-element accounting and were a known OOM hot path under fuzz.
+        ctx.check_budget(1)?;
         let mut child = ctx.clone();
         {
             let locals_mut = std::rc::Rc::make_mut(&mut child.locals);

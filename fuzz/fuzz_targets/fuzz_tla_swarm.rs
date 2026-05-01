@@ -21,7 +21,18 @@ use libfuzzer_sys::fuzz_target;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use tlaplusplus::tla::module::parse_tla_module_text;
 use tlaplusplus::tla::value::{TlaState, TlaValue};
-use tlaplusplus::tla::{EvalContext, compile_expr, eval_compiled, eval_expr};
+use tlaplusplus::tla::{
+    EvalContext, compile_expr, eval_compiled, eval_expr, restore_eval_budget,
+    set_active_eval_budget,
+};
+
+/// T201: thread-local evaluation budget for fuzz inputs. Without this,
+/// inputs that synthesize unbounded set / sequence / function constructions
+/// (e.g. `[i \in 1..1000000 |-> i]`, `{ <expr> : i \in 1..N }`, or `1..N`
+/// for huge N) allocate gigabytes before any other guard fires and the
+/// fuzz process OOM-aborts. The probe path in `src/main.rs` uses the same
+/// 100_000-element limit for the same reason.
+const FUZZ_EVAL_BUDGET: usize = 100_000;
 
 /// Feature flags derived from the first 2 bytes of fuzz input.
 struct SwarmConfig {
@@ -180,6 +191,14 @@ fuzz_target!(|data: &[u8]| {
         Err(_) => return, // parse errors are fine, panics are not
     };
 
+    // T201: install a thread-local eval budget for the duration of this
+    // input so that unbounded set/sequence/function constructions return
+    // `Err` instead of consuming gigabytes and OOM-aborting the fuzzer.
+    // The budget is restored before we return; both the Ok and panic paths
+    // are covered (libfuzzer re-runs in the same process).
+    let prev_budget = set_active_eval_budget(FUZZ_EVAL_BUDGET);
+    let _budget_guard = scopeguard_restore(prev_budget);
+
     // Phase 2: Try to evaluate each definition body as an expression
     // Build a minimal EvalContext with the parsed definitions
     let state = TlaState::new();
@@ -209,3 +228,18 @@ fuzz_target!(|data: &[u8]| {
         assert_equivalent(&def.body, &ctx);
     }
 });
+
+/// Tiny RAII guard so the thread-local eval budget is restored when the
+/// fuzz iteration returns, even if `assert_equivalent` panics. We avoid
+/// pulling in a `scopeguard` dep — this 6-line type does the job.
+struct BudgetRestore(Option<std::rc::Rc<std::cell::Cell<usize>>>);
+impl Drop for BudgetRestore {
+    fn drop(&mut self) {
+        restore_eval_budget(self.0.take());
+    }
+}
+fn scopeguard_restore(
+    prev: Option<std::rc::Rc<std::cell::Cell<usize>>>,
+) -> BudgetRestore {
+    BudgetRestore(prev)
+}
