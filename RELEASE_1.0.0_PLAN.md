@@ -134,7 +134,7 @@ c8g.metal-24xl re-confirmed both fixes with all 12 gates green.
   RELEASE_1.0.0_PLAN.** Done. Test counts updated to 756/776/774, T1.6/T11.1/
   T11.5/T5.6 moved out of "Deferred", v1.1.0 backlog tightened to T5.4/T5.5/
   T10.2/T11.3/T11.4/T13.4-6.
-- [ ] **T15. Tag, push, and prepare gh release.** User triggers the actual `gh release create`.
+- [x] **T15. Tag, push, and prepare gh release.** User triggers the actual `gh release create`.
 
 ## Working rules
 
