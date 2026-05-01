@@ -33,6 +33,19 @@ pub struct TlaModel {
     pub symmetry: Option<SymmetrySpec>,
     pub view: Option<String>,
     pub initial_states_vec: Vec<TlaState>,
+    /// If true, [`Model::initial_states_streaming`] re-runs Init enumeration in
+    /// a background thread instead of returning `initial_states_vec` directly.
+    ///
+    /// This is the T5.4 streaming path: the runtime spawns its own producer
+    /// thread that pulls from the iterator and pushes to the global queue, so
+    /// workers can begin invariant evaluation on partially-enumerated Init.
+    /// For Init predicates whose enumeration dominates wall time (Einstein-class
+    /// puzzles), this cuts time-to-first-invariant-check from "Init-eval-time"
+    /// to "first-state-arrival-time".
+    ///
+    /// Defaults to `false` for back-compat. Toggle via
+    /// [`TlaModel::with_streaming_init`].
+    pub streaming_init: bool,
     /// Pre-compiled action definitions for fast execution
     pub compiled_actions: BTreeMap<String, Arc<CompiledActionIr>>,
     /// Pre-compiled invariant expressions (name, compiled expr)
@@ -188,7 +201,23 @@ impl TlaModel {
             allow_deadlock,
             trivial_next,
             por_analysis: None,
+            streaming_init: false,
         })
+    }
+
+    /// Enable the T5.4 streaming Init path. When set, `initial_states_streaming`
+    /// re-runs Init enumeration in a producer thread instead of returning the
+    /// pre-computed `initial_states_vec`. The runtime then begins invariant
+    /// checking on initial states as they arrive, instead of waiting for Init
+    /// enumeration to complete.
+    ///
+    /// Note: with the current implementation, Init evaluation itself is still
+    /// synchronous within the producer thread — true incremental yielding from
+    /// the symbolic SMT loop is tracked as T5.5. The producer-thread shape is
+    /// the architectural prerequisite.
+    pub fn with_streaming_init(mut self, on: bool) -> Self {
+        self.streaming_init = on;
+        self
     }
 
     /// Enable partial-order reduction.

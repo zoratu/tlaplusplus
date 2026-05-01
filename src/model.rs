@@ -27,6 +27,29 @@ pub trait Model: Send + Sync + 'static {
 
     fn initial_states(&self) -> Vec<Self::State>;
 
+    /// Streaming variant of [`Model::initial_states`].
+    ///
+    /// Returns an iterator that yields initial states as they are produced.
+    /// This lets the runtime begin invariant checking and successor exploration
+    /// **before** Init enumeration completes — useful for specs whose Init
+    /// predicate is expensive to enumerate (e.g. Einstein-class puzzles where
+    /// Init enumeration alone can take tens of minutes while the reachable
+    /// state graph is small).
+    ///
+    /// The default implementation defers to [`Model::initial_states`] and
+    /// returns its `Vec`'s `into_iter()`. Models with cheap Init enumeration
+    /// (counter-grid, hand-rolled Rust models) need not override this — the
+    /// runtime treats the eager and streaming paths identically when the
+    /// iterator yields all states immediately.
+    ///
+    /// Models that can produce initial states lazily (e.g. by spawning a
+    /// background thread that enumerates Init and pushes through a channel)
+    /// should override this method to return an iterator that yields states
+    /// as they become available.
+    fn initial_states_streaming(&self) -> Box<dyn Iterator<Item = Self::State> + Send + '_> {
+        Box::new(self.initial_states().into_iter())
+    }
+
     fn next_states(&self, state: &Self::State, out: &mut Vec<Self::State>);
 
     /// Generate labeled next states for fairness checking
