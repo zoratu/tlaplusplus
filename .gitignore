@@ -21,3 +21,5 @@ package.json
 package-lock.json
 tests/*.proptest-regressions
 scripts/REDACTED
+notes/
+.ci/last-analysis.txt
