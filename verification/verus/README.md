@@ -118,12 +118,71 @@ errors`, ~0.7s wall), in addition to tier B.
 - `mmap(MAP_ANONYMOUS)` zero-fill. Modeled as `Seq::new(cap, |_| 0)`.
   The kernel guarantee is axiomatic.
 
+### Tier-A.5 (T13.4 partial): production-shape shadow methods
+
+`shard_methods.rs` ships **17 verified items**, ~0.7s wall
+(`./run_proof.sh shadow`). It is the production-shape annotated shadow
+of `FingerprintShard`'s hot-path methods, using real Verus tracked-
+permission machinery (`PAtomicU64` + `Tracked<&PermissionU64>` +
+`Tracked<&mut PermissionU64>`) on real per-slot atomic cells.
+
+| Production method | Shadow function (verified) | Production lines covered |
+|---|---|---|
+| `contains` slot probe | `probe_slot_for_contains` | 634 (atomic load + 3-way fork) |
+| `contains` 2-iteration unroll | `two_probe_contains` | 626-643 (loop body x2) |
+| `contains` 3-iteration unroll | `three_probe_contains` | 626-643 (loop body x3) |
+| `contains_or_insert` normal-path CAS | `cas_insert_or_observe` | 805-823 (CAS + 3-way result) |
+| `contains_or_insert` per-iteration | `contains_or_insert_step` | 789-828 (load + CAS dispatch) |
+| `rehash_batch_counted` per-slot step | `rehash_one_step` | 312-340 (CAS-or-skip) |
+
+Bridge lemmas (production-shape -> tier-A spec):
+
+| Bridge | Lemma |
+|---|---|
+| shadow CAS Inserted -> tier-A `cas_step` Some(...) | `lemma_cas_inserted_matches_tier_a` |
+| shadow CAS preserves other slots | `lemma_cas_preserves_other_slots` |
+| shadow probe Hit -> tier-A `tab_contents.contains(fp)` | `lemma_probe_hit_matches_tier_a` |
+| shadow probe Empty -> tier-A `EMPTY` precondition | `lemma_probe_empty_matches_tier_a` |
+| CAS-then-probe sees fp (production-shape `lemma_insert_then_lookup`) | `lemma_cas_then_probe_observes_fp` |
+| `(fp + i) % cap` is in [0, cap) | `lemma_probe_index_in_bounds` |
+
+What this tier gives beyond tier A:
+1. **Real Verus permissions on real atomic cells.** Tier A modeled the
+   table as `Seq<u64>`; this file uses `Vec<PAtomicU64>` plus a
+   `Tracked<Map<int, PermissionU64>>` permission map — the same
+   machinery a full T13.4 production rewrite would use.
+2. **`requires`/`ensures` clauses tied to tier-A predicates.** Each
+   shadow method's post-condition references tier-A's `tab_lookup`,
+   `cas_step`, and `tab_insert` semantics via the bridge lemmas.
+3. **Drop-in template for the production rewrite.** When the full
+   multi-week T13.4 work happens, the rewrite team has a working
+   blueprint for permission threading and contract shapes.
+
+What the shadow file does NOT do:
+- Does not replace the production `FingerprintShard`. Production
+  `cargo build` is unchanged; the shadow file lives only under
+  `verification/verus/` and is verified by `verus`, not compiled by
+  `rustc` into the binary.
+- Does not lift the outer probe loop into a single bounded-iteration
+  Verus exec function. The 2- and 3-step unrolls demonstrate the
+  shape; a fully-bounded `for probes in 0..cap` form requires a Verus
+  loop with an inductive invariant and a per-slot permission swap.
+  Tier A's `lemma_probe_terminus_bounded` already discharges
+  termination at the spec level.
+- Does not model the seqlock retry loop in production-shape. Tier A's
+  `lemma_reader_terminates` covers that at the spec level.
+
 ### Genuinely deferred to v1.2.0+
 
-- **Full Verus tracked-pointer integration.** Annotating
-  `FingerprintShard` with `Tracked<PointsTo<HashTableEntry>>` and
-  threading the permissions through every call site. Estimated
-  remaining: 1-2 agent-weeks.
+- **Full Verus tracked-pointer integration of the production
+  `FingerprintShard` itself.** Annotating the production code with
+  `Tracked<PointsToArray<HashTableEntry>>` and threading the
+  permissions through every call site (vs the shadow approach which
+  ships annotated mirror methods). Requires rewriting
+  `allocate_huge_pages`, `allocate_file_backed`, the resize swap, and
+  every `unsafe { std::slice::from_raw_parts(...) }` to use
+  `vstd::raw_ptr::PPtr` — multi-week work. The shadow methods in
+  `shard_methods.rs` are the working blueprint for this rewrite.
 - **Unbounded-fairness liveness.** "A writer cannot starve a reader
   indefinitely" requires LTL liveness with a fairness assumption.
   Verus's state-machine framework supports this but requires a
@@ -205,6 +264,7 @@ the standard library's.
 cd verification/verus
 VERUS_DIR=/home/ubuntu/verus ./run_proof.sh           # tier B (default)
 VERUS_DIR=/home/ubuntu/verus ./run_proof.sh tier-a    # tier A
+VERUS_DIR=/home/ubuntu/verus ./run_proof.sh shadow    # tier-A.5 (production-shape shadow)
 ```
 
 Successful output (tier B):
