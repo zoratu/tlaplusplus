@@ -1,6 +1,7 @@
 pub mod autotune;
 pub mod canon;
 pub mod chaos;
+pub mod cli;
 pub mod coverage;
 pub mod distributed;
 pub mod fairness;
