@@ -130,10 +130,10 @@ production-shape proof tier.
 |---|---|
 | `cargo test --release` | 786 pass / 0 fail / 8 ignored |
 | `cargo test --release --features failpoints` | 808 pass / 0 fail / 8 ignored |
-| `cargo test --release --features symbolic-init` | TBD |
-| `scripts/diff_tlc.sh` (vs TLC v1.7.4) | TBD / 13 |
-| `cargo test --release --test compiled_vs_interpreted` (PROPTEST_CASES=2048) | TBD |
-| `cargo test --release --test joint_init_invariant_t5_5` | TBD |
+| `cargo test --release --features symbolic-init` | 813 pass / 0 fail / 8 ignored |
+| `scripts/diff_tlc.sh` (vs TLC v1.7.4) | 13 / 13 |
+| `cargo test --release --test compiled_vs_interpreted` (PROPTEST_CASES=2048) | 17 pass / 0 fail |
+| `cargo test --release --features symbolic-init --test joint_init_invariant_t5_5` | 3 pass / 0 fail |
 
 ### Compatibility
 
