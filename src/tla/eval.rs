@@ -1639,8 +1639,16 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
         let left = eval_expr_inner(lhs, ctx, depth + 1)?.as_int()?;
         let right = eval_expr_inner(rhs, ctx, depth + 1)?.as_int()?;
         return match op {
-            '+' => Ok(TlaValue::Int(left + right)),
-            '-' => Ok(TlaValue::Int(left - right)),
+            // T101.1: use checked_add/sub so overflow becomes Err instead
+            // of a Rust panic. Mirror in `compiled_eval.rs`.
+            '+' => left
+                .checked_add(right)
+                .map(TlaValue::Int)
+                .ok_or_else(|| anyhow!("integer overflow: {} + {}", left, right)),
+            '-' => left
+                .checked_sub(right)
+                .map(TlaValue::Int)
+                .ok_or_else(|| anyhow!("integer overflow: {} - {}", left, right)),
             _ => Err(anyhow!("unsupported additive operator '{op}'")),
         };
     }
@@ -1649,19 +1657,32 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
         let left = eval_expr_inner(lhs, ctx, depth + 1)?.as_int()?;
         let right = eval_expr_inner(rhs, ctx, depth + 1)?.as_int()?;
         return match op {
-            "*" => Ok(TlaValue::Int(left * right)),
+            // T101.1: use checked_mul so overflow becomes an Err instead of
+            // a Rust panic — the fuzz pass surfaced one case where a
+            // 3-term `*` chain overflowed `i64` and aborted the process
+            // (`attempt to multiply with overflow`). Mirror in
+            // `compiled_eval.rs::CompiledExpr::Mul`.
+            "*" => left
+                .checked_mul(right)
+                .map(TlaValue::Int)
+                .ok_or_else(|| anyhow!("integer overflow: {} * {}", left, right)),
             "\\div" => {
                 if right == 0 {
                     Err(anyhow!("division by zero"))
                 } else {
-                    Ok(TlaValue::Int(left / right))
+                    // i64::MIN / -1 also overflows; use checked_div.
+                    left.checked_div(right)
+                        .map(TlaValue::Int)
+                        .ok_or_else(|| anyhow!("integer overflow: {} \\div {}", left, right))
                 }
             }
             "%" => {
                 if right == 0 {
                     Err(anyhow!("modulo by zero"))
                 } else {
-                    Ok(TlaValue::Int(left % right))
+                    left.checked_rem(right)
+                        .map(TlaValue::Int)
+                        .ok_or_else(|| anyhow!("integer overflow: {} % {}", left, right))
                 }
             }
             _ => Err(anyhow!("unsupported multiplicative operator {op}")),
@@ -5747,13 +5768,12 @@ pub(crate) fn split_top_level_keyword(expr: &str, delim: &str) -> Vec<String> {
 }
 
 fn split_top_level(expr: &str, delim: &str, keyword: bool) -> Vec<String> {
-    if expr.contains("PositionLimits") && delim == "/\\" {
-        eprintln!(
-            "[split_top_level] Called with delim=/\\, expr len={}, expr start: {}",
-            expr.len(),
-            &expr[..60.min(expr.len())]
-        );
-    }
+    // Stale debug instrumentation removed — the previous `if expr.contains("PositionLimits")`
+    // branch sliced `&expr[..60]` by byte index, which panicked when byte 60
+    // landed inside a multi-byte char (a fuzz-discoverable UTF-8 boundary
+    // bug). The eprintln was leftover from one-off model debugging; safe to
+    // drop entirely. (T101.1 fuzz pass surfaced this; same bug class as the
+    // T101 char-boundary fixes in compiled_expr.rs / module.rs.)
     let mut out = Vec::new();
     let mut start = 0usize;
 

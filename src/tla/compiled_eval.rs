@@ -279,20 +279,29 @@ fn eval_compiled_inner(
         }
 
         // Arithmetic
+        // T101.1: use checked_* so overflow becomes an Err instead of a Rust
+        // panic. Mirror in `eval.rs::split_top_level_additive` /
+        // `split_top_level_multiplicative`.
         CompiledExpr::Add(a, b) => {
             let left = eval_compiled_inner(a, ctx, depth + 1)?.as_int()?;
             let right = eval_compiled_inner(b, ctx, depth + 1)?.as_int()?;
-            Ok(TlaValue::Int(left + right))
+            left.checked_add(right)
+                .map(TlaValue::Int)
+                .ok_or_else(|| anyhow!("integer overflow: {} + {}", left, right))
         }
         CompiledExpr::Sub(a, b) => {
             let left = eval_compiled_inner(a, ctx, depth + 1)?.as_int()?;
             let right = eval_compiled_inner(b, ctx, depth + 1)?.as_int()?;
-            Ok(TlaValue::Int(left - right))
+            left.checked_sub(right)
+                .map(TlaValue::Int)
+                .ok_or_else(|| anyhow!("integer overflow: {} - {}", left, right))
         }
         CompiledExpr::Mul(a, b) => {
             let left = eval_compiled_inner(a, ctx, depth + 1)?.as_int()?;
             let right = eval_compiled_inner(b, ctx, depth + 1)?.as_int()?;
-            Ok(TlaValue::Int(left * right))
+            left.checked_mul(right)
+                .map(TlaValue::Int)
+                .ok_or_else(|| anyhow!("integer overflow: {} * {}", left, right))
         }
         CompiledExpr::Pow(a, b) => {
             let left = eval_compiled_inner(a, ctx, depth + 1)?.as_int()?;
@@ -311,7 +320,10 @@ fn eval_compiled_inner(
             if right == 0 {
                 return Err(anyhow!("division by zero"));
             }
-            Ok(TlaValue::Int(left / right))
+            // i64::MIN / -1 also overflows; checked_div handles that.
+            left.checked_div(right)
+                .map(TlaValue::Int)
+                .ok_or_else(|| anyhow!("integer overflow: {} \\div {}", left, right))
         }
         CompiledExpr::Mod(a, b) => {
             let left = eval_compiled_inner(a, ctx, depth + 1)?.as_int()?;
@@ -319,7 +331,9 @@ fn eval_compiled_inner(
             if right == 0 {
                 return Err(anyhow!("modulo by zero"));
             }
-            Ok(TlaValue::Int(left % right))
+            left.checked_rem(right)
+                .map(TlaValue::Int)
+                .ok_or_else(|| anyhow!("integer overflow: {} % {}", left, right))
         }
         CompiledExpr::Neg(a) => {
             let val = eval_compiled_inner(a, ctx, depth + 1)?.as_int()?;
@@ -1270,20 +1284,27 @@ fn eval_with_self_ref_inner(
         CompiledExpr::SelfRef => Ok(self_val.clone()),
 
         // For binary operations, recursively handle SelfRef
+        // T101.1: use checked_* to mirror eval_compiled_inner's overflow safety.
         CompiledExpr::Add(a, b) => {
             let left = eval_with_self_ref_inner(a, self_val, ctx, depth + 1)?.as_int()?;
             let right = eval_with_self_ref_inner(b, self_val, ctx, depth + 1)?.as_int()?;
-            Ok(TlaValue::Int(left + right))
+            left.checked_add(right)
+                .map(TlaValue::Int)
+                .ok_or_else(|| anyhow!("integer overflow: {} + {}", left, right))
         }
         CompiledExpr::Sub(a, b) => {
             let left = eval_with_self_ref_inner(a, self_val, ctx, depth + 1)?.as_int()?;
             let right = eval_with_self_ref_inner(b, self_val, ctx, depth + 1)?.as_int()?;
-            Ok(TlaValue::Int(left - right))
+            left.checked_sub(right)
+                .map(TlaValue::Int)
+                .ok_or_else(|| anyhow!("integer overflow: {} - {}", left, right))
         }
         CompiledExpr::Mul(a, b) => {
             let left = eval_with_self_ref_inner(a, self_val, ctx, depth + 1)?.as_int()?;
             let right = eval_with_self_ref_inner(b, self_val, ctx, depth + 1)?.as_int()?;
-            Ok(TlaValue::Int(left * right))
+            left.checked_mul(right)
+                .map(TlaValue::Int)
+                .ok_or_else(|| anyhow!("integer overflow: {} * {}", left, right))
         }
 
         // For all other expressions, fall back to regular evaluation
