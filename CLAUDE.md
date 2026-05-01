@@ -472,7 +472,10 @@ Distributed:
 
 Verification:
 - Verus tier-B proof of the seqlock resize protocol (T13). 19 lemmas verified by Z3, including the headline `theorem_no_fingerprint_lost`. Lives at `verification/verus/seqlock_resize.rs`; run via `verification/verus/run_proof.sh`.
-- Verus tier-A extension (T13.1-T13.3). 31 lemmas verified over a `Seq<u64>` linear-probe model with spec-level CAS soundness and bounded reader-retry termination. Lives at `verification/verus/seqlock_resize_tier_a.rs`; run via `verification/verus/run_proof.sh tier-a`. Production-code annotations (T13.4) and unbounded-fairness liveness (T13.5) tracked in v1.1.0 backlog.
+- Verus tier-A extension (T13.1-T13.3). 31 lemmas verified over a `Seq<u64>` linear-probe model with spec-level CAS soundness and bounded reader-retry termination. Lives at `verification/verus/seqlock_resize_tier_a.rs`; run via `verification/verus/run_proof.sh tier-a`.
+- Verus tier-A.5 production-shape shadow (T13.4 partial). 17 verified items modeling `FingerprintShard`'s hot-path methods with real Verus tracked permissions (`PAtomicU64` + `Tracked<&PermissionU64>`). Lives at `verification/verus/shard_methods.rs`; run via `verification/verus/run_proof.sh shard-methods`.
+- Verus reader-liveness (T13.5). Unbounded-fairness liveness theorem `theorem_no_starvation` over a temporal trace model; safety side fully proved, liveness side admits 3 protocol-shape axioms with documented discharge plans. Lives at `verification/verus/reader_liveness.rs`; run via `verification/verus/run_proof.sh liveness`.
+- CI gate (T13.6). `.github/workflows/verus.yml` builds Verus from source on `ubuntu-latest`, caches the build keyed on the pinned upstream ref, and runs all four proof files (tier-B, tier-A, shard-methods, liveness) on push to main + PR. Aarch64 runs as a manual `workflow_dispatch` job (informational, not a gate) due to upstream Z3 packaging issues on hosted aarch64 runners.
 
 Chaos & swarm:
 - 1-hour chaos soak (`scripts/chaos_soak.sh`) covers all 12 failpoints in `src/chaos.rs`; 0 divergences, 0 hangs in the v1.0.0 release run.
@@ -492,7 +495,8 @@ Deferred to v1.1.x:
 - T5.4, T5.5: Streaming Init enumeration, joint Init+Solution symbolic encoding (Einstein-class workloads).
 >>>>>>> worktree-agent-ad795be698325d7cd
 - T10.2: Streaming SCC discovery for 100M+ liveness.
-- T13.4-T13.6: Verus production-code annotations, unbounded-fairness reader liveness, CI gate.
+- T13.4 (full): Verus tracked-pointer integration of the production `FingerprintShard` (the shadow methods in `shard_methods.rs` are the working blueprint).
+- T13.5 (full discharge): convert the three `axiom_*` lemmas in `reader_liveness.rs` to mechanical proofs, OR port to Verus's `state_machines!` macro for native LTL liveness.
 - See `RELEASE_1.0.0_PLAN.md` for the full v1.1.x backlog.
 
 ## Key Implementation Notes

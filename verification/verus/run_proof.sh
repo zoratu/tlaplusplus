@@ -49,12 +49,15 @@ echo
 # (`seqlock_resize_tier_a.rs`, concrete linear-probe Seq<u64>).
 # Pass `shadow` to verify the production-shape shadow methods
 # (`shard_methods.rs`, real PAtomicU64 + Tracked permissions).
+# Pass `liveness` to verify the unbounded-fairness reader liveness
+# proof (`reader_liveness.rs`, T13.5 — temporal trace + fairness).
 TIER="${1:-b}"
 case "$TIER" in
   a|tier-a|tiera|A) PROOF_FILE="seqlock_resize_tier_a.rs" ;;
   b|tier-b|tierb|B|"") PROOF_FILE="seqlock_resize.rs" ;;
-  shadow|tier-a-shadow|s) PROOF_FILE="shard_methods.rs" ;;
-  *) echo "error: unknown tier '$TIER'; pass 'a', 'b', or 'shadow'" >&2; exit 2 ;;
+  shadow|tier-a-shadow|s|shard-methods|shard_methods) PROOF_FILE="shard_methods.rs" ;;
+  liveness|tier-liveness|live|l) PROOF_FILE="reader_liveness.rs" ;;
+  *) echo "error: unknown tier '$TIER'; pass 'a', 'b', 'shadow', or 'liveness'" >&2; exit 2 ;;
 esac
 
 echo "Verifying: $PROOF_FILE"
