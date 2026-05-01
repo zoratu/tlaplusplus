@@ -234,47 +234,8 @@ pub struct RunStats {
     pub fingerprints: FingerprintStats,
 }
 
-#[derive(Default)]
-struct AtomicRunStats {
-    states_generated: AtomicU64,
-    states_processed: AtomicU64,
-    states_distinct: AtomicU64,
-    duplicates: AtomicU64,
-    enqueued: AtomicU64,
-    checkpoints: AtomicU64,
-}
-
-impl AtomicRunStats {
-    /// Create stats initialized from checkpoint values (for resume)
-    fn from_checkpoint(
-        states_generated: u64,
-        states_processed: u64,
-        states_distinct: u64,
-        duplicates: u64,
-        enqueued: u64,
-        checkpoints: u64,
-    ) -> Self {
-        Self {
-            states_generated: AtomicU64::new(states_generated),
-            states_processed: AtomicU64::new(states_processed),
-            states_distinct: AtomicU64::new(states_distinct),
-            duplicates: AtomicU64::new(duplicates),
-            enqueued: AtomicU64::new(enqueued),
-            checkpoints: AtomicU64::new(checkpoints),
-        }
-    }
-
-    fn snapshot(&self) -> (u64, u64, u64, u64, u64, u64) {
-        (
-            self.states_generated.load(Ordering::Relaxed),
-            self.states_processed.load(Ordering::Relaxed),
-            self.states_distinct.load(Ordering::Relaxed),
-            self.duplicates.load(Ordering::Relaxed),
-            self.enqueued.load(Ordering::Relaxed),
-            self.checkpoints.load(Ordering::Relaxed),
-        )
-    }
-}
+mod stats;
+use stats::AtomicRunStats;
 
 mod pause;
 
