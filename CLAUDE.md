@@ -451,7 +451,7 @@ Chaos & swarm:
 - Swarm-mode chaos (`--swarm-mode N|auto`, T16b) injects 1-4 concurrent failpoints per iteration; runtime tolerates 4-fold simultaneous fault injection.
 
 Deferred to v1.1.0:
-- T5.4, T5.5: Streaming Init enumeration, joint Init+Solution symbolic encoding (Einstein-class workloads).
+- T5.5: Joint Init+Solution symbolic encoding (Einstein-class workloads). T5.4 (streaming Init enumeration) landed in v1.1.0.
 - T10.2: Streaming SCC discovery for 100M+ liveness.
 - T11.3, T11.4: CI-gate chaos variant, route_spill_batch inflight accounting on disk-overflow errors.
 - T13.4-T13.6: Verus production-code annotations, unbounded-fairness reader liveness, CI gate.
