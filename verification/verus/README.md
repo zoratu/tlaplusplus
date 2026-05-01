@@ -172,6 +172,37 @@ What the shadow file does NOT do:
 - Does not model the seqlock retry loop in production-shape. Tier A's
   `lemma_reader_terminates` covers that at the spec level.
 
+### Tier-A.6 (T13.5): unbounded-fairness reader liveness
+
+`reader_liveness.rs` extends tier A's bounded `lemma_reader_terminates`
+with the unbounded-liveness statement: "a writer cannot starve a
+reader indefinitely" under a temporal weak-fairness assumption that
+writers do not perpetually block in a resize. Run via
+`./run_proof.sh liveness`.
+
+| Property | Lemma | Status |
+|---|---|---|
+| **Parity discipline** | `lemma_begin_resize_parity_seq`, `lemma_finalize_resize_parity_seq`, `lemma_stutter_parity_seq` | Proved (no axioms). |
+| **Step monotonicity** | `lemma_seq_monotonic_seq`, `lemma_step_relation_monotonic` | Proved. |
+| **Reader-attempt soundness** | `lemma_reader_attempt_soundness` | Proved. |
+| **Finite-prefix monotonicity** | `theorem_prefix_seq_monotonic`, `theorem_prefix_seq_growth_bounded` | Proved by induction over `j - i`. |
+| **Equal-seq implies stutter** | `theorem_equal_seq_implies_stutter` | Proved. |
+| **Reader success is stutter** | `theorem_reader_success_is_stutter` | Proved. |
+| **Writer-step parity in prefix** | `theorem_writer_step_parity_in_prefix` | Proved. |
+| **Writer eventually finalizes** | `axiom_writer_eventually_finalizes` | Axiom (discharge plan in file). |
+| **Reader can observe stutter** | `axiom_reader_can_observe_stutter` | Axiom (discharge plan in file). |
+| **Extension composes** | `axiom_extension_composes` | Axiom (sequence-arithmetic glue). |
+| **MAIN THEOREM** | `theorem_reader_eventually_succeeds` | Proved (modulo the three axioms). |
+| **No-starvation corollary** | `theorem_no_starvation` | Proved (modulo the three axioms). |
+
+**Honest outcome:** the safety side is fully mechanical; the liveness
+side is shipped as the "Good" tier from the T13.5 brief — a temporal
+trace model with the three protocol-shape axioms documented inline,
+each with a concrete discharge plan estimating the work needed to
+remove it. The discharge plans together total roughly 4-6 agent-days
+of further Verus work, OR a port to `state_machines!` (~5-7 agent-
+days) which subsumes all three. Track in v1.2.0+.
+
 ### Genuinely deferred to v1.2.0+
 
 - **Full Verus tracked-pointer integration of the production
@@ -183,14 +214,9 @@ What the shadow file does NOT do:
   every `unsafe { std::slice::from_raw_parts(...) }` to use
   `vstd::raw_ptr::PPtr` — multi-week work. The shadow methods in
   `shard_methods.rs` are the working blueprint for this rewrite.
-- **Unbounded-fairness liveness.** "A writer cannot starve a reader
-  indefinitely" requires LTL liveness with a fairness assumption.
-  Verus's state-machine framework supports this but requires a
-  redesign of the proof structure. Bounded termination is shipped now;
-  unbounded liveness is tracked.
-- **CI gate.** Verus build is ~10 min on aarch64, requires the Z3 apt
-  workaround, and is not yet `cargo`-driven. CI integration is tracked
-  as a separate piece of tooling work.
+- **Discharge of the three reader-liveness axioms.** See the
+  discharge plans inside `reader_liveness.rs`. Estimated 4-6 agent-
+  days, OR ~5-7 days to port the file to `state_machines!`.
 
 ## Honest verdict on Verus for tlaplusplus
 
@@ -262,10 +288,14 @@ the standard library's.
 
 ```
 cd verification/verus
-VERUS_DIR=/home/ubuntu/verus ./run_proof.sh           # tier B (default)
-VERUS_DIR=/home/ubuntu/verus ./run_proof.sh tier-a    # tier A
-VERUS_DIR=/home/ubuntu/verus ./run_proof.sh shadow    # tier-A.5 (production-shape shadow)
+VERUS_DIR=/home/ubuntu/verus ./run_proof.sh                 # tier B (default)
+VERUS_DIR=/home/ubuntu/verus ./run_proof.sh tier-a          # tier A
+VERUS_DIR=/home/ubuntu/verus ./run_proof.sh shard-methods   # tier-A.5 (production-shape shadow)
+VERUS_DIR=/home/ubuntu/verus ./run_proof.sh liveness        # T13.5 reader liveness
 ```
+
+Or run all four under CI; see `.github/workflows/verus.yml` for the
+complete gate (T13.6).
 
 Successful output (tier B):
 
