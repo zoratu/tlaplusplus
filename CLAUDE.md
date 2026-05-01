@@ -46,6 +46,12 @@ cargo test --release --test state_graph_snapshots
 # Chaos soak (T11) — 1-hour release ritual, opt-in via --features failpoints
 scripts/chaos_soak.sh --duration 3600 --swarm-mode auto
 
+# Chaos smoke (T11.3) — 5-min CI-gate variant of the soak; runs on every
+# PR + push to main via .github/workflows/chaos-smoke.yml. Same harness,
+# shorter duration, fails CI on any divergence/hang or if < 6 of the 12
+# failpoints fire.
+scripts/chaos_smoke.sh
+
 # Run fuzzing (requires nightly)
 cargo +nightly fuzz run fuzz_tla_module
 ```
@@ -272,6 +278,28 @@ queue spill and FP-store resize); swarm mode reproduces this by enabling
 fire counts and a top-N concurrent-pair coverage matrix so you can see
 which failure combinations were exercised.
 
+### Chaos Smoke (T11.3, per-PR CI gate)
+
+The hour-long soak is a release ritual; it does not catch chaos
+regressions on per-PR commits. `scripts/chaos_smoke.sh` is a thin
+wrapper that delegates to `chaos_soak.sh` with smoke parameters
+(5-minute duration, 30-second per-iter timeout, swarm-mode auto,
+2 workers) and adds a coverage gate: it parses
+`.chaos-smoke/iterations.tsv` and fails CI unless `>= 6` of the 12
+catalog failpoints actually fire. Wired into
+`.github/workflows/chaos-smoke.yml` to run on every PR + push to main.
+
+```bash
+cargo build --release --features failpoints
+scripts/chaos_smoke.sh                          # 5 min, gate >= 6 failpoints
+scripts/chaos_smoke.sh --min-failpoints 10      # tighter gate
+scripts/chaos_smoke.sh --duration 600           # longer smoke
+```
+
+Validated on a 2-vCPU spot: 5m17s wall, 21 iterations, 12/12 failpoints
+exercised, 0 divergences, 0 hangs. Total CI budget ~10 min including
+the failpoints build.
+
 Wired in `src/main.rs::main()` under `cfg(feature = "failpoints")`:
 `fail::FailScenario::setup()` is called so the standard `FAILPOINTS` env
 var configures failpoints for the spawned process. The `fail` crate
@@ -450,12 +478,17 @@ Chaos & swarm:
 - 1-hour chaos soak (`scripts/chaos_soak.sh`) covers all 12 failpoints in `src/chaos.rs`; 0 divergences, 0 hangs in the v1.0.0 release run.
 - Swarm-mode chaos (`--swarm-mode N|auto`, T16b) injects 1-4 concurrent failpoints per iteration; runtime tolerates 4-fold simultaneous fault injection.
 
-Deferred to v1.1.0:
+Landed in v1.1.0:
+- T11.3: per-PR chaos smoke (`scripts/chaos_smoke.sh`, `.github/workflows/chaos-smoke.yml`).
+- T11.4: `route_spill_batch` Err-branch inflight leak fix; permanent disk failures
+  (real or `queue_spill_fail=return` failpoint) now release `inflight_spilled`
+  and account dropped items in `QueueStats::spill_lost_permanently`.
+
+Deferred to v1.1.x:
 - T5.4, T5.5: Streaming Init enumeration, joint Init+Solution symbolic encoding (Einstein-class workloads).
 - T10.2: Streaming SCC discovery for 100M+ liveness.
-- T11.3, T11.4: CI-gate chaos variant, route_spill_batch inflight accounting on disk-overflow errors.
 - T13.4-T13.6: Verus production-code annotations, unbounded-fairness reader liveness, CI gate.
-- See `RELEASE_1.0.0_PLAN.md` for the full v1.1.0 backlog.
+- See `RELEASE_1.0.0_PLAN.md` for the full v1.1.x backlog.
 
 ## Key Implementation Notes
 

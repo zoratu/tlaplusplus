@@ -189,6 +189,24 @@ in a tight loop with random failpoint injection — covers every failpoint in
 match a control run. This is expensive (~1 hour wall time on a small spot
 instance) and is run manually as a release ritual, not per PR.
 
+### Per-PR chaos smoke (T11.3, CI gate)
+
+`scripts/chaos_smoke.sh` is the per-PR variant of the soak — same harness,
+shorter duration. It runs in ~5 minutes, gates on `>= 6` of the 12
+failpoints actually firing, and is wired into
+`.github/workflows/chaos-smoke.yml` so every push to `main` and every PR
+exercises the chaos path. Total CI budget ~10 min including the failpoint
+build. Locally:
+
+```bash
+cargo build --release --features failpoints
+scripts/chaos_smoke.sh                # 5 min, swarm-mode auto, gate >= 6 failpoints
+scripts/chaos_smoke.sh --duration 600 # longer smoke, same gate
+```
+
+Validated on a 2-vCPU spot: 5m17s wall, 21 iterations, 12/12 failpoints
+exercised, 0 divergences, 0 hangs.
+
 ```bash
 # Build with failpoints support
 cargo build --release --features failpoints
