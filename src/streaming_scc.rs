@@ -67,7 +67,7 @@
 //!   for the verification of temporal properties." (1992).
 //! - Holzmann, Peled, Yannakakis. "On nested depth first search." (1996).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::hash::Hash;
 
@@ -256,19 +256,23 @@ fn enter<S: Clone + Eq + Hash>(
     blue_path.push(s);
 }
 
-/// Red DFS searching for any state currently on the blue stack
-/// (`Color::Cyan`). Returns the witness state plus the trail from `seed`
-/// to the witness when found.
+/// Red DFS searching for any state currently on the blue stack.
+///
+/// Identifying blue-stack members by `colors[w] == Cyan` (instead of
+/// re-hashing `blue_path` into a `HashSet` on every call) is the
+/// difference between O(N) and O(N²) for the deep-chain case: blue
+/// DFS launches one red DFS per accepting state, and on the deep
+/// chain that's N calls; each call must therefore be O(amortized
+/// successors-touched), not O(blue_path.len()).
+///
+/// Returns the witness state plus the trail from `seed` to the
+/// witness when found.
 fn red_dfs<G: LivenessGraph>(
     graph: &G,
     seed: &G::State,
     colors: &mut HashMap<G::State, Color>,
-    blue_path: &[G::State],
+    _blue_path: &[G::State],
 ) -> Option<(G::State, Vec<G::State>)> {
-    // Iterative DFS. The trail is the path from seed → current. When we
-    // see a Cyan successor we report (cyan, trail+cyan).
-    let blue_set: HashSet<&G::State> = blue_path.iter().collect();
-
     // Frame: (state, successors, idx). We track `trail` separately so we
     // can return it when we hit a Cyan node.
     let seed_succs = graph.successors(seed);
@@ -285,20 +289,19 @@ fn red_dfs<G: LivenessGraph>(
         while i < succs.len() {
             let w = succs[i].clone();
             i += 1;
+            // Color check first (O(1) vs HashSet rebuild).
+            let cw = colors.get(&w).copied().unwrap_or(Color::White);
             // Detect cyan back-edge — accepting cycle witness.
-            if blue_set.contains(&w) {
+            if cw == Color::Cyan {
                 let mut tail = trail.clone();
-                // The cycle goes seed → ... → v → w; trail[0] == seed
-                // and seed must equal blue_path's tail. The lasso back to
-                // an earlier blue-stack node `w` proves the cycle.
                 tail.push(w.clone());
                 return Some((w, tail[1..].to_vec()));
             }
-            // Check color; recurse on non-Red.
-            let cw = colors.get(&w).copied().unwrap_or(Color::White);
             if cw == Color::Red {
                 continue;
             }
+            // Paint Red and recurse on White/Blue. We never paint Cyan
+            // nodes Red — those are caught by the cyan check above.
             colors.insert(w.clone(), Color::Red);
             let w_succs = graph.successors(&w);
             stack.push((v.clone(), succs, i));
