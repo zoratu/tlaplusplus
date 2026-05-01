@@ -2656,7 +2656,7 @@ fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
 /// `range_text` evaluates to a finite set. Returns None if the shape
 /// doesn't match.
 #[cfg(feature = "symbolic-init")]
-fn try_resolve_sequence_domain(
+pub(crate) fn try_resolve_sequence_domain(
     dom_text: &str,
     range_text: &str,
     ctx: &EvalContext<'_>,
@@ -2766,7 +2766,7 @@ fn try_funasseq_wrapper_symbolic(
 ///
 /// Returns `(p_name, dom_text, range_text, pred_text)` on success.
 #[cfg(feature = "symbolic-init")]
-fn try_destructure_function_set_comprehension(
+pub(crate) fn try_destructure_function_set_comprehension(
     expr: &str,
     ctx: &EvalContext<'_>,
 ) -> Option<(String, String, String, String)> {
@@ -2855,7 +2855,7 @@ fn try_destructure_function_set_comprehension(
 /// On success the caller may treat `{ x \in <domain_expr> : outer_pred(x) }`
 /// as `{ FunAsSeq(p, n, n) : p \in {p \in [Dom -> Range] : pred /\ outer_pred[x:=p]}}`.
 #[cfg(feature = "symbolic-init")]
-fn try_resolve_funasseq_permutation_set(
+pub(crate) fn try_resolve_funasseq_permutation_set(
     domain_expr: &str,
     ctx: &EvalContext<'_>,
 ) -> Option<(String, String, String, String)> {
@@ -6724,7 +6724,7 @@ fn split_top_level_multiplicative(expr: &str) -> Option<(&str, &'static str, &st
     }
 }
 
-fn split_once_top_level<'a>(expr: &'a str, delim: &str) -> Option<(&'a str, &'a str)> {
+pub(crate) fn split_once_top_level<'a>(expr: &'a str, delim: &str) -> Option<(&'a str, &'a str)> {
     let mut i = 0usize;
     let mut paren = 0usize;
     let mut bracket = 0usize;
