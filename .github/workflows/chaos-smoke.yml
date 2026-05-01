@@ -1,0 +1,96 @@
+name: chaos-smoke
+
+# T11.3 — per-PR smoke variant of the 1-hour chaos soak.
+#
+# The full release-ritual soak (`scripts/chaos_soak.sh --duration 3600
+# --swarm-mode auto`) is a manual pre-release step. That cadence misses
+# regressions that land between releases. This workflow runs the same
+# harness for 5 minutes on every PR + push to main so any chaos
+# regression is caught at PR-review time instead of pre-release crunch.
+#
+# Total CI budget: ~10 min (build ~5 min cached, soak ~5 min). The
+# acceptance bar is:
+#   * smoke completes in < 10 min
+#   * 0 divergences, 0 hangs (chaos_soak.sh exit 0)
+#   * >= 6 of the 12 failpoints in the catalog actually fired
+#     (chaos_smoke.sh enforces this gate from iterations.tsv)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  chaos-smoke:
+    name: chaos smoke (failpoint coverage)
+    runs-on: ubuntu-latest
+    # Hard ceiling well above expected ~10 min so a runaway run fails
+    # loudly rather than silently consuming GHA minutes.
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # Distinct cache key from diff-tlc.yml to avoid the failpoints
+          # build polluting the debug-build cache used elsewhere.
+          key: cargo-chaos-smoke-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-chaos-smoke-${{ runner.os }}-
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Show host info
+        run: |
+          uname -a
+          rustc -vV
+          nproc
+
+      - name: Build release binary with failpoints enabled
+        # `failpoints` is a Cargo feature that wires the `fail` crate's
+        # runtime configuration into every fail_point! macro call. The
+        # smoke needs this to inject the FAILPOINTS env var into the
+        # spawned model-check process.
+        run: cargo build --release --features failpoints
+
+      - name: Run chaos smoke (5 min, swarm-mode auto, gate >= 6 failpoints)
+        env:
+          # Be explicit so a future change to the script default doesn't
+          # silently change CI behaviour.
+          DURATION_SECS: "300"
+          PER_ITER_TIMEOUT: "30"
+        run: |
+          ./scripts/chaos_smoke.sh \
+            --duration "${DURATION_SECS}" \
+            --per-iter-timeout "${PER_ITER_TIMEOUT}" \
+            --workers 2 \
+            --workdir "${GITHUB_WORKSPACE}/.chaos-smoke" \
+            --binary "${GITHUB_WORKSPACE}/target/release/tlaplusplus" \
+            --summary-out "${GITHUB_WORKSPACE}/.chaos-smoke/smoke-summary.txt" \
+            --min-failpoints 6
+
+      - name: Print smoke summary on success
+        if: success()
+        run: |
+          if [[ -f "${GITHUB_WORKSPACE}/.chaos-smoke/smoke-summary.txt" ]]; then
+            cat "${GITHUB_WORKSPACE}/.chaos-smoke/smoke-summary.txt"
+          fi
+
+      - name: Upload smoke artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-smoke-logs
+          path: |
+            .chaos-smoke/
+          if-no-files-found: ignore
+          retention-days: 7

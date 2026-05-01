@@ -539,6 +539,19 @@ fn print_stats(model_name: &str, stats: &tlaplusplus::RunStats) {
     println!("queue.loaded_segments={}", stats.queue.loaded_segments);
     println!("queue.loaded_items={}", stats.queue.loaded_items);
     println!("queue.max_inmem_len={}", stats.queue.max_inmem_len);
+    // T11.4 — non-zero indicates the spill pipeline dropped N states on
+    // the floor (permanent disk failure, queue_spill_fail=return failpoint,
+    // etc.). Result is unsound under that condition.
+    println!(
+        "queue.spill_lost_permanently={}",
+        stats.queue.spill_lost_permanently
+    );
+    if stats.queue.spill_lost_permanently > 0 {
+        eprintln!(
+            "WARNING: {} states were silently dropped by the spill pipeline — model-check result is UNSOUND",
+            stats.queue.spill_lost_permanently
+        );
+    }
 }
 
 /// Run a model with optional S3 persistence
