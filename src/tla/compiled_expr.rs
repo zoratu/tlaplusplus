@@ -339,43 +339,41 @@ fn parse_string_literal(expr: &str) -> Option<(String, &str)> {
 
     let mut out = String::new();
     let mut escaped = false;
-    let mut i = 1; // Skip opening quote
+    let mut i = 1; // Skip opening quote (always 1 byte — '"' is ASCII)
 
-    let bytes = expr.as_bytes();
-    while i < bytes.len() {
-        let ch = bytes[i] as char;
+    // T101.1: walk by char (not byte) so non-ASCII content inside the
+    // string is preserved code-point-faithfully instead of being torn
+    // mid-rune. The previous byte-based loop also only handled the C-style
+    // escapes `\n` `\t` `\r` `\\` `\"` and kept `\X` literal for any other
+    // X — but the interpreter (`eval.rs::parse_string_literal_prefix`)
+    // implements TLA+ escapes more bluntly: every `\X` collapses to just
+    // `X`, regardless of whether X is `n`/`t`/etc. (so e.g. `"\\n"` is a
+    // two-char string `\n` and `"\n"` is the one-char string `n`). The
+    // fuzz pass surfaced four divergence cases on `"...\G..."`-shaped
+    // inputs where the compiler kept the leading `\` and the interpreter
+    // dropped it. Mirror the interpreter exactly: `\X` → `X` for all X.
+    let mut chars = expr[1..].char_indices().peekable();
+    while let Some((rel_idx, ch)) = chars.next() {
+        let abs_after = 1 + rel_idx + ch.len_utf8();
+        i = abs_after;
 
         if escaped {
-            // Handle escape sequences
-            match ch {
-                'n' => out.push('\n'),
-                't' => out.push('\t'),
-                'r' => out.push('\r'),
-                '\\' => out.push('\\'),
-                '"' => out.push('"'),
-                _ => {
-                    out.push('\\');
-                    out.push(ch);
-                }
-            }
+            out.push(ch);
             escaped = false;
-            i += 1;
             continue;
         }
 
         if ch == '\\' {
             escaped = true;
-            i += 1;
             continue;
         }
 
         if ch == '"' {
-            // Found closing quote
-            return Some((out, &expr[i + 1..]));
+            // Found closing quote — i already points one past it.
+            return Some((out, &expr[i..]));
         }
 
         out.push(ch);
-        i += 1;
     }
 
     // Unterminated string
@@ -479,6 +477,18 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
         return CompiledExpr::SelfRef;
     }
 
+    // T101.1 fix: bare `UNCHANGED` (with no operand) is an always-enabled
+    // stuttering step in TLA+. The interpreter returns Bool(true). The
+    // compiler used to fall through to `is_identifier(...)` below and emit
+    // `Var("UNCHANGED")`, which `eval_compiled` then resolved to
+    // `ModelValue("UNCHANGED")` — diverging from the interpreter on every
+    // `UNCHANGED`-only expression body. The keyword check below at line ~550
+    // already handles the `UNCHANGED <vars>` form; this special-case covers
+    // the bare-token case before the identifier path swallows it.
+    if expr == "UNCHANGED" {
+        return CompiledExpr::Bool(true);
+    }
+
     // Primed variable (e.g., x')
     if expr.ends_with('\'') {
         let base = &expr[..expr.len() - 1];
@@ -547,9 +557,13 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
     // \/ Action1(self) \/ UNCHANGED vars), the action IR layer handles the
     // actual variable-preservation semantics. In expression context, UNCHANGED
     // represents an always-enabled stuttering step, so we compile it as TRUE.
-    if expr.starts_with("UNCHANGED ") || expr == "UNCHANGED" {
-        return CompiledExpr::Bool(true);
-    }
+    //
+    // T101.1: the `expr == "UNCHANGED"` bare-token case is handled earlier
+    // (above the identifier path); only the `UNCHANGED <vars>` form is
+    // matched here. Even so, deferring to AFTER the binary / comparison
+    // split below would let an outer `=` in `UNCHANGED x = y` win — but
+    // that's exactly what the interpreter does, so we MUST defer too.
+    // Move the prefix check to the bottom of the precedence cascade.
 
     // Logical operators (in precedence order)
 
@@ -731,7 +745,10 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
     }
 
     // Arithmetic operators (TLA+ precedence: + is 10-10, - is 11-11, * is 13-13)
-    if let Some((left, right)) = split_binary_op(expr, "+") {
+    // T101.1: arithmetic is left-associative, so we use *_last to take the
+    // RIGHTMOST top-level operator. This makes `a + b + c` parse as
+    // `(a + b) + c`, matching the interpreter (`split_top_level_additive`).
+    if let Some((left, right)) = split_binary_op_last(expr, "+") {
         return CompiledExpr::Add(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
     }
     // Binary subtraction `-` is tricky because the same character also
@@ -745,13 +762,15 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
     if let Some((left, right)) = find_binary_minus_split(expr) {
         return CompiledExpr::Sub(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
     }
-    if let Some((left, right)) = split_binary_op(expr, "*") {
+    // T101.1: multiplicative ops are left-associative; use *_last so
+    // `a * b * c` parses as `(a * b) * c` (matches `split_top_level_multiplicative`).
+    if let Some((left, right)) = split_binary_op_last(expr, "*") {
         return CompiledExpr::Mul(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
     }
-    if let Some((left, right)) = split_binary_op(expr, "\\div") {
+    if let Some((left, right)) = split_binary_op_last(expr, "\\div") {
         return CompiledExpr::Div(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
     }
-    if let Some((left, right)) = split_binary_op(expr, "%") {
+    if let Some((left, right)) = split_binary_op_last(expr, "%") {
         return CompiledExpr::Mod(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
     }
     if let Some((left, right)) = split_binary_op(expr, "^^") {
@@ -909,6 +928,17 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
                 };
             }
         }
+    }
+
+    // T101.1: deferred `UNCHANGED <vars>` match. Sits at the bottom of the
+    // precedence cascade so an outer comparison / boolean op binds first.
+    // Mirrors `eval.rs` where `if starts_with_keyword(expr, "UNCHANGED")`
+    // sits below `split_top_level_comparison`. Without this deferral, the
+    // compiler matched on the prefix and returned `Bool(true)` for inputs
+    // like `UNCHANGED x = y` where the interpreter correctly evaluated the
+    // `=` comparison first.
+    if expr.starts_with("UNCHANGED ") || expr.starts_with("UNCHANGED\n") {
+        return CompiledExpr::Bool(true);
     }
 
     // Fallback: unparsed
@@ -1483,26 +1513,63 @@ fn left_ends_with_value(left: &str) -> bool {
 /// later misparsed as e.g. `RecordAccess(Unparsed("-1 - (r)"), "a")`).
 /// Now we keep scanning until we find a `-` whose preceding text actually
 /// ends in a value (digit, identifier, `)`, `]`, `>>`, `}`, or `"`).
+///
+/// T101.1 fix: subtraction is **left-associative** in TLA+, so for `a-b-c`
+/// we want the LAST top-level binary `-`, not the first. We scan all
+/// candidates and return the rightmost one whose left side is a value
+/// expression. This makes `0 - 6 - 555555555` parse as
+/// `(0 - 6) - 555555555 = -555555561`, matching the interpreter.
 fn find_binary_minus_split(expr: &str) -> Option<(&str, &str)> {
     let mut search_from = 0usize;
+    let mut last: Option<(usize, usize)> = None;
     loop {
         let candidate = &expr[search_from..];
-        let (left_rel, right) = split_binary_op(candidate, "-")?;
+        let Some((left_rel, right)) = split_binary_op(candidate, "-") else {
+            break;
+        };
         let left_abs_end = search_from + left_rel.len();
+        let right_abs_start = expr.len() - right.len();
         let left = &expr[..left_abs_end];
         if !left.is_empty() && left_ends_with_value(left) {
-            return Some((left, right));
+            last = Some((left_abs_end, right_abs_start));
         }
-        // This `-` is unary (or otherwise not a valid binary split point).
-        // Advance past it and look for the next one.
-        search_from = left_abs_end + 1;
+        // Always advance past this `-` and keep looking for a later one.
+        // We use `right_abs_start` (= position after the `-`) rather than
+        // `left_abs_end + 1` so we step past the operator regardless of
+        // whether this candidate was unary or binary.
+        if right_abs_start <= search_from {
+            // No forward progress — bail out to avoid an infinite loop.
+            break;
+        }
+        search_from = right_abs_start;
         if search_from >= expr.len() {
-            return None;
+            break;
         }
     }
+    last.map(|(left_end, right_start)| (&expr[..left_end], &expr[right_start..]))
 }
 
 fn split_binary_op<'a>(expr: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
+    split_binary_op_with(expr, op, false)
+}
+
+/// Like `split_binary_op`, but returns the LAST top-level match instead of
+/// the first. Use for left-associative operators (additive `+`/`-`,
+/// multiplicative `*`/`\div`/`%`, range `..`) so that
+/// `a OP b OP c` parses as `(a OP b) OP c` instead of `a OP (b OP c)`.
+///
+/// T101.1 fix: `0 - 6 - 555555555` was returning `Sub(0, Sub(6, 555555555))`
+/// (= 555555549) under first-match splitting, while the interpreter (which
+/// scans left-to-right and keeps the LAST top-level operator position, see
+/// `eval.rs::split_top_level_additive`) correctly returned
+/// `Sub(Sub(0, 6), 555555555)` (= -555555561). This was a soundness bug on
+/// well-formed input, not just on garbage; any 3+-term arithmetic chain
+/// without explicit parens was silently mis-evaluated by the compiler.
+fn split_binary_op_last<'a>(expr: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
+    split_binary_op_with(expr, op, true)
+}
+
+fn split_binary_op_with<'a>(expr: &'a str, op: &str, prefer_last: bool) -> Option<(&'a str, &'a str)> {
     let mut bracket_depth = 0i32;
     let mut let_depth = 0usize;
     let mut if_depth = 0usize; // Track IF...THEN nesting (protects conditions from split)
@@ -1512,6 +1579,7 @@ fn split_binary_op<'a>(expr: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
     let chars: Vec<char> = expr.chars().collect();
     let op_chars: Vec<char> = op.chars().collect();
     let mut i = 0;
+    let mut last_match: Option<(usize, usize)> = None;
 
     while i < chars.len() {
         let c = chars[i];
@@ -1640,17 +1708,39 @@ fn split_binary_op<'a>(expr: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
                     .iter()
                     .map(|c| c.len_utf8())
                     .sum();
+                if prefer_last {
+                    last_match = Some((left_byte_end, right_byte_start));
+                    // Skip past the matched operator and keep scanning for a
+                    // later occurrence. We deliberately don't advance the
+                    // bracket-depth tracking inside the operator chars
+                    // (single-char ops in the LIST ABOVE — `+`, `-`, `*`,
+                    // `%`, `..` — are not parens; multi-char arithmetic
+                    // ops like `\\div` are word-bounded and the inner chars
+                    // are alphabetic, harmless to skip).
+                    i += op_chars.len().max(1);
+                    continue;
+                }
                 return Some((&expr[..left_byte_end], &expr[right_byte_start..]));
             }
         }
         i += 1;
     }
-    None
+    last_match.map(|(left_end, right_start)| (&expr[..left_end], &expr[right_start..]))
 }
 
 fn split_comparison(expr: &str) -> Option<(&str, &str, &str)> {
-    // Order matters: check longer operators first
-    for op in &[
+    // T101.1: scan left-to-right and split at the FIRST top-level comparison
+    // operator we encounter, regardless of which one. The previous
+    // implementation iterated patterns in priority order and ran a
+    // whole-expression scan per pattern, which silently preferred the later
+    // `=` in `CAE#S = i` over the earlier `#`. The interpreter
+    // (`eval.rs::split_top_level_comparison`) walks the string once and
+    // returns at the first relop hit, so the compiler must match.
+    //
+    // Order within `OPS` only matters when two operators share a prefix at
+    // the same position (e.g. `<=` vs `<`); we list longer-first so the
+    // longest match wins. Once a position is decided, scanning stops.
+    const OPS: &[&str] = &[
         "\\subseteq",
         "\\notin",
         "\\in",
@@ -1660,14 +1750,195 @@ fn split_comparison(expr: &str) -> Option<(&str, &str, &str)> {
         "=<",
         "<=",
         "/=",
+        "#",
         "=",
         ">",
         "<",
-        "#",
-    ] {
-        if let Some((left, right)) = split_binary_op(expr, op) {
-            return Some((left.trim(), *op, right.trim()));
+    ];
+    split_first_top_level_op(expr, OPS).map(|(left, op, right)| (left.trim(), op, right.trim()))
+}
+
+/// Walk `expr` left-to-right at top bracket-depth and return the FIRST
+/// top-level position at which any of `ops` matches (longest-match-first
+/// at that position). Mirrors the interpreter's
+/// `split_top_level_comparison` so chained relops like `CAE # S = i` split
+/// at the leftmost relop (`#`) instead of jumping ahead to a later `=`.
+///
+/// The bracket / LET / IF / CASE / quantifier scoping logic is the same as
+/// `split_binary_op`'s — kept inlined here rather than refactored because
+/// `split_binary_op` returns on the first match of a single operator and
+/// we'd otherwise have to call it once per op (each scan is O(n), so the
+/// composite was O(n*|ops|); this is O(n*max(|op|))).
+fn split_first_top_level_op<'a>(
+    expr: &'a str,
+    ops: &'static [&'static str],
+) -> Option<(&'a str, &'static str, &'a str)> {
+    let mut bracket_depth = 0i32;
+    let mut let_depth = 0usize;
+    let mut if_depth = 0usize;
+    let mut case_depth = 0usize;
+    let mut quantifier_depth = 0usize;
+    let mut in_string = false;
+    let chars: Vec<char> = expr.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        let c = chars[i];
+
+        if c == '"' && (i == 0 || chars[i - 1] != '\\') {
+            in_string = !in_string;
+            i += 1;
+            continue;
         }
+        if in_string {
+            i += 1;
+            continue;
+        }
+
+        if i + 1 < chars.len() {
+            if c == '<' && chars[i + 1] == '<' {
+                bracket_depth += 1;
+                i += 2;
+                continue;
+            }
+            if c == '>' && chars[i + 1] == '>' {
+                bracket_depth -= 1;
+                i += 2;
+                continue;
+            }
+        }
+
+        match c {
+            '(' | '[' | '{' => bracket_depth += 1,
+            ')' | ']' | '}' => bracket_depth -= 1,
+            _ => {}
+        }
+
+        if bracket_depth == 0 {
+            if matches_keyword_at(&chars, i, "LET") {
+                let_depth += 1;
+                i += 3;
+                continue;
+            }
+            if matches_keyword_at(&chars, i, "IN") && let_depth > 0 {
+                let_depth -= 1;
+                i += 2;
+                continue;
+            }
+            if matches_keyword_at(&chars, i, "IF") {
+                if_depth += 1;
+                i += 2;
+                continue;
+            }
+            if matches_keyword_at(&chars, i, "THEN") && if_depth > 0 {
+                if_depth -= 1;
+                i += 4;
+                continue;
+            }
+            if matches_keyword_at(&chars, i, "CASE") {
+                case_depth += 1;
+                i += 4;
+                continue;
+            }
+            if c == '\\' && i + 2 < chars.len() {
+                let next = chars[i + 1];
+                let after = chars[i + 2];
+                if (next == 'A' || next == 'E') && (after.is_whitespace() || after == '(') {
+                    let mut j = i + 2;
+                    let mut inner_depth = 0i32;
+                    while j < chars.len() {
+                        match chars[j] {
+                            '(' | '[' | '{' => inner_depth += 1,
+                            ')' | ']' | '}' => inner_depth -= 1,
+                            ':' if inner_depth == 0 => {
+                                quantifier_depth += 1;
+                                i = j + 1;
+                                break;
+                            }
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    if j < chars.len() {
+                        continue;
+                    }
+                }
+            }
+        }
+
+        let at_top = bracket_depth == 0
+            && let_depth == 0
+            && if_depth == 0
+            && case_depth == 0
+            && quantifier_depth == 0;
+
+        if at_top {
+            for &op in ops {
+                let op_chars: Vec<char> = op.chars().collect();
+                if i + op_chars.len() > chars.len() {
+                    continue;
+                }
+                if !op_chars.iter().enumerate().all(|(j, &oc)| chars[i + j] == oc) {
+                    continue;
+                }
+                // Word-boundary check for backslash-prefixed names like \in.
+                if op.chars().last().map_or(false, |c| c.is_alphabetic()) {
+                    let next_idx = i + op_chars.len();
+                    if next_idx < chars.len() && chars[next_idx].is_alphabetic() {
+                        continue;
+                    }
+                }
+                // Disambiguate `=` from longer ops with `=` somewhere — never
+                // split mid-`=>`/`<=>`/`>=`/`<=`/`/=`/`=<`. The longer ops
+                // are listed earlier in OPS so they get matched first; this
+                // guard catches the case where the longer op is _not_ in the
+                // ops list but its prefix coincides with a shorter one.
+                if op == "=" {
+                    let prev = (i > 0).then(|| chars[i - 1]);
+                    let next = chars.get(i + 1).copied();
+                    if prev == Some('=')
+                        || prev == Some('<')
+                        || prev == Some('>')
+                        || prev == Some('/')
+                    {
+                        continue;
+                    }
+                    if next == Some('>') || next == Some('=') {
+                        continue;
+                    }
+                }
+                if op == "<" {
+                    let next = chars.get(i + 1).copied();
+                    if next == Some('=') || next == Some('<') {
+                        continue;
+                    }
+                }
+                if op == ">" {
+                    let prev = (i > 0).then(|| chars[i - 1]);
+                    let next = chars.get(i + 1).copied();
+                    if next == Some('=') || next == Some('>') {
+                        continue;
+                    }
+                    if prev == Some(':') {
+                        continue;
+                    }
+                }
+
+                let left_byte_end: usize = chars[..i].iter().map(|c| c.len_utf8()).sum();
+                let right_byte_start: usize = chars[..i + op_chars.len()]
+                    .iter()
+                    .map(|c| c.len_utf8())
+                    .sum();
+                let left = &expr[..left_byte_end];
+                let right = &expr[right_byte_start..];
+                if left.is_empty() || right.is_empty() {
+                    continue;
+                }
+                return Some((left, op, right));
+            }
+        }
+
+        i += 1;
     }
     None
 }
