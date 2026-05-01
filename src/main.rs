@@ -153,6 +153,17 @@ struct RuntimeArgs {
     /// valid counter-example; never longer than the original).
     #[arg(long, default_value_t = 30)]
     minimize_trace_budget_secs: u64,
+    /// T10.2 — opt-in streaming-SCC liveness oracle (nested DFS).
+    ///
+    /// When set, after the parallel BFS exploration finishes, the runtime runs
+    /// a nested-DFS pass over the same fingerprint adjacency map and
+    /// cross-validates against the existing Tarjan-based fairness check.
+    /// Reports a diagnostic line if the two diverge. This is the staging
+    /// flag for the v1.1.0 in-exploration streaming variant; it does not
+    /// (yet) affect memory usage during BFS — see
+    /// `docs/T10.2-streaming-scc-design.md` for the full design.
+    #[arg(long, default_value_t = false)]
+    liveness_streaming: bool,
 }
 
 #[derive(Args, Clone, Debug)]
@@ -483,6 +494,11 @@ fn build_engine_config(
         donate_states_tx: None,
         donate_states_rx: None,
         stolen_states_tx: None,
+        // T10.2 — opt-in streaming-SCC liveness oracle. When enabled, the
+        // post-exploration phase runs nested-DFS over the same fingerprint
+        // adjacency and cross-validates against Tarjan-based fairness.
+        // Defaults to off (set via --liveness-streaming).
+        liveness_streaming: runtime.liveness_streaming,
     })
 }
 
