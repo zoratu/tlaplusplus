@@ -3432,6 +3432,45 @@ where
                                      The Tarjan result is authoritative."
                                 );
                             }
+
+                            // Independent self-test: with `accepting = true`
+                            // for all states, nested-DFS must find a cycle
+                            // iff a non-trivial SCC exists. This is a
+                            // structural sanity check that doesn't depend
+                            // on Tarjan's verdict — a divergence here
+                            // would mean the DFS itself is broken (e.g.
+                            // missed back-edge detection).
+                            let always_accept = |_: u64| true;
+                            let always_graph = crate::streaming_scc::FingerprintAdjacencyGraph {
+                                initial_fps: state_by_fp.keys().copied().collect(),
+                                adjacency: &adjacency_fp,
+                                accepting: &always_accept,
+                            };
+                            let always_result =
+                                crate::streaming_scc::nested_dfs(&always_graph);
+                            let always_found =
+                                matches!(
+                                    always_result,
+                                    crate::streaming_scc::NestedDfsResult::AcceptingCycle { .. }
+                                );
+                            let any_nontrivial_scc = !non_trivial_sccs.is_empty();
+                            if always_found != any_nontrivial_scc {
+                                eprintln!(
+                                    "  [T10.2 oracle] STRUCTURAL DIVERGENCE — \
+                                     nested-DFS with always-accept reports cycle={} \
+                                     but Tarjan finds {} non-trivial SCC(s). The \
+                                     nested-DFS algorithm itself is broken.",
+                                    always_found,
+                                    non_trivial_sccs.len()
+                                );
+                            } else {
+                                eprintln!(
+                                    "  [T10.2 oracle] structural self-test OK \
+                                     (always-accept cycle={}, non-trivial-SCCs={})",
+                                    always_found,
+                                    non_trivial_sccs.len()
+                                );
+                            }
                         }
                     }
                 } else {
