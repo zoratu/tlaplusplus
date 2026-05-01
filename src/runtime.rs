@@ -234,6 +234,7 @@ pub struct RunStats {
     pub fingerprints: FingerprintStats,
 }
 
+mod init_producer;
 mod stats;
 use stats::AtomicRunStats;
 
@@ -736,122 +737,18 @@ where
     // For specs where Init enumeration dominates wall time (Einstein-class
     // puzzles where the symbolic SMT loop runs for tens of minutes), workers
     // begin invariant evaluation on partial results within seconds.
-    let init_producer: Option<std::thread::JoinHandle<Result<u64>>> = if !resumed_from_checkpoint {
-        let producer_model = Arc::clone(&model);
-        let producer_queue = Arc::clone(&queue);
-        let producer_fp_store = Arc::clone(&fp_store);
-        let producer_run_stats = Arc::clone(&run_stats);
-        let producer_state_map = state_map.clone();
-        let producer_trace_count = Arc::clone(&trace_state_count);
-        let producer_stop = Arc::clone(&stop);
-        let producer_error_tx = error_tx.clone();
-        let producer_done_flag = Arc::clone(&init_producing);
-        Some(
-            std::thread::Builder::new()
-                .name("tlapp-init-producer".into())
-                .spawn(move || -> Result<u64> {
-                    // Drop guard ensures `init_producing` is cleared even if
-                    // the producer panics or returns Err early — workers will
-                    // not hang waiting for an Init stream that has died.
-                    struct Guard(Arc<AtomicBool>);
-                    impl Drop for Guard {
-                        fn drop(&mut self) {
-                            self.0.store(false, Ordering::Release);
-                        }
-                    }
-                    let _guard = Guard(producer_done_flag);
-
-                    // Batch initial states for fingerprint-store insertion to
-                    // amortize CAS overhead. The batch size mirrors the worker
-                    // batch path; small enough that producers feed workers
-                    // promptly, large enough to keep CAS amortized.
-                    const INIT_BATCH_SIZE: usize = 256;
-                    let mut local_dedup: HashSet<u64> =
-                        HashSet::with_capacity(INIT_BATCH_SIZE * 4);
-                    let mut batch_fps: Vec<u64> = Vec::with_capacity(INIT_BATCH_SIZE);
-                    let mut batch_states: Vec<M::State> = Vec::with_capacity(INIT_BATCH_SIZE);
-                    let mut seen_flags: Vec<bool> = Vec::with_capacity(INIT_BATCH_SIZE);
-                    let mut distinct_initial: u64 = 0;
-
-                    let mut flush = |batch_states: &mut Vec<M::State>,
-                                     batch_fps: &mut Vec<u64>,
-                                     seen_flags: &mut Vec<bool>,
-                                     distinct_initial: &mut u64|
-                     -> Result<()> {
-                        if batch_fps.is_empty() {
-                            return Ok(());
-                        }
-                        producer_fp_store.contains_or_insert_batch(batch_fps, seen_flags)?;
-                        for (idx, state) in batch_states.drain(..).enumerate() {
-                            if seen_flags[idx] {
-                                producer_run_stats.duplicates.fetch_add(1, Ordering::Relaxed);
-                            } else {
-                                if let Some(ref sm) = producer_state_map {
-                                    let fp = batch_fps[idx];
-                                    sm.insert(fp, state.clone());
-                                    producer_trace_count.fetch_add(1, Ordering::Relaxed);
-                                }
-                                producer_run_stats
-                                    .states_distinct
-                                    .fetch_add(1, Ordering::Relaxed);
-                                producer_queue.push_global(state);
-                                producer_run_stats.enqueued.fetch_add(1, Ordering::Relaxed);
-                                *distinct_initial += 1;
-                            }
-                        }
-                        batch_fps.clear();
-                        seen_flags.clear();
-                        Ok(())
-                    };
-
-                    for state in producer_model.initial_states_streaming() {
-                        if producer_stop.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        producer_run_stats
-                            .states_generated
-                            .fetch_add(1, Ordering::Relaxed);
-                        let state = producer_model.canonicalize(state);
-                        let fp = producer_model.fingerprint(&state);
-                        if !local_dedup.insert(fp) {
-                            producer_run_stats.duplicates.fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        }
-                        batch_fps.push(fp);
-                        batch_states.push(state);
-                        if batch_fps.len() >= INIT_BATCH_SIZE {
-                            flush(
-                                &mut batch_states,
-                                &mut batch_fps,
-                                &mut seen_flags,
-                                &mut distinct_initial,
-                            )?;
-                        }
-                    }
-                    // Final flush
-                    flush(
-                        &mut batch_states,
-                        &mut batch_fps,
-                        &mut seen_flags,
-                        &mut distinct_initial,
-                    )?;
-
-                    // Print TLC-compatible message
-                    let now = chrono::Local::now();
-                    let timestamp = now.format("%Y-%m-%d %H:%M:%S");
-                    let plural = if distinct_initial == 1 { "state" } else { "states" };
-                    eprintln!(
-                        "Finished computing initial states: {} distinct {} generated at {}.",
-                        distinct_initial, plural, timestamp
-                    );
-                    let _ = producer_error_tx; // keep alive even if no errors
-                    Ok(distinct_initial)
-                })
-                .expect("Failed to spawn Init producer thread"),
-        )
-    } else {
-        None
-    };
+    let init_producer = init_producer::spawn_init_producer(
+        resumed_from_checkpoint,
+        Arc::clone(&model),
+        Arc::clone(&queue),
+        Arc::clone(&fp_store),
+        Arc::clone(&run_stats),
+        state_map.clone(),
+        Arc::clone(&trace_state_count),
+        Arc::clone(&stop),
+        error_tx.clone(),
+        Arc::clone(&init_producing),
+    );
     // We can't early-exit on 0-initial-states here without first joining the
     // producer thread, but that would defeat the point of streaming. Instead,
     // termination detection in the main loop handles the 0-initial-states case
