@@ -351,6 +351,18 @@ fn eval_compiled_inner(
         CompiledExpr::SetRange(a, b) => {
             let start = eval_compiled_inner(a, ctx, depth + 1)?.as_int()?;
             let end = eval_compiled_inner(b, ctx, depth + 1)?.as_int()?;
+            // T201: charge the range size against the budget BEFORE allocating.
+            // Mirrors the fix in `eval.rs`. Without this, a giant `1..N` in
+            // fuzz / probe contexts allocates O(N) before any other check.
+            if start <= end {
+                let span = (end - start).saturating_add(1);
+                let cost = if span <= 0 || span as u64 > usize::MAX as u64 {
+                    usize::MAX
+                } else {
+                    span as usize
+                };
+                ctx.check_budget(cost)?;
+            }
             let set: BTreeSet<TlaValue> = (start..=end).map(TlaValue::Int).collect();
             Ok(TlaValue::Set(Arc::new(set)))
         }
@@ -862,6 +874,8 @@ fn eval_compiled_inner(
             let domain_set = domain_val.as_set()?;
             let mut result = BTreeSet::new();
             for elem in domain_set.iter() {
+                // T201: charge one budget unit per inner iteration.
+                ctx.check_budget(1)?;
                 let new_ctx = ctx.with_local_value(var, elem.clone());
                 if let Some(filter_expr) = filter {
                     if !eval_compiled_inner(filter_expr, &new_ctx, depth + 1)?.as_bool()? {
@@ -880,6 +894,10 @@ fn eval_compiled_inner(
             let domain_set = domain_val.as_set()?;
             let mut func = BTreeMap::new();
             for elem in domain_set.iter() {
+                // T201: charge one budget unit per inner iteration so
+                // function construction `[x \in <huge> |-> ...]` cannot
+                // allocate without bound under a configured budget.
+                ctx.check_budget(1)?;
                 let new_ctx = ctx.with_local_value(var, elem.clone());
                 let val = eval_compiled_inner(body, &new_ctx, depth + 1)?;
                 func.insert(elem.clone(), val);
