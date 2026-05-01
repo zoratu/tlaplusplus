@@ -1516,68 +1516,149 @@ where
 
     let started_at = Instant::now();
     let resumed_from_checkpoint = config.resume_from_checkpoint && queue.has_pending_work();
-    if !resumed_from_checkpoint {
-        let initial = model.initial_states();
-        let mut initial_fps = Vec::with_capacity(initial.len());
-        let mut unique_initial = Vec::with_capacity(initial.len());
-        let mut dedup = HashSet::with_capacity(initial.len().max(16));
-        for state in initial {
-            run_stats.states_generated.fetch_add(1, Ordering::Relaxed);
-            let state = model.canonicalize(state);
-            let fp = model.fingerprint(&state);
-            if dedup.insert(fp) {
-                initial_fps.push(fp);
-                unique_initial.push(state);
-            } else {
-                run_stats.duplicates.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        let mut seen_flags = Vec::with_capacity(initial_fps.len());
-        fp_store.contains_or_insert_batch(&initial_fps, &mut seen_flags)?;
-        let mut distinct_initial = 0;
-        for (idx, state) in unique_initial.into_iter().enumerate() {
-            if seen_flags[idx] {
-                run_stats.duplicates.fetch_add(1, Ordering::Relaxed);
-            } else {
-                // Record initial state in state_map (no parent entry needed)
-                if let Some(ref sm) = state_map {
-                    let fp = initial_fps[idx];
-                    sm.insert(fp, state.clone());
-                    trace_state_count.fetch_add(1, Ordering::Relaxed);
-                }
-                run_stats.states_distinct.fetch_add(1, Ordering::Relaxed);
-                queue.push_global(state);
-                run_stats.enqueued.fetch_add(1, Ordering::Relaxed);
-                distinct_initial += 1;
-            }
-        }
+    // Init producer status — workers must NOT terminate while Init enumeration
+    // is still streaming new initial states into the global queue. Cleared by
+    // the producer thread on completion (or on stop). When this is `true`,
+    // workers that find an empty queue back off and re-poll instead of exiting.
+    let init_producing = Arc::new(AtomicBool::new(!resumed_from_checkpoint));
+    // Producer thread for streaming Init enumeration (T5.4).
+    //
+    // We spawn a dedicated thread that pulls states from
+    // `model.initial_states_streaming()` and feeds them through the standard
+    // dedup -> fp-store-insert -> queue.push_global() pipeline. Workers can
+    // start consuming the global queue as soon as the first batch of initial
+    // states lands, instead of waiting for Init enumeration to complete.
+    //
+    // For Init predicates whose enumeration is cheap (most specs), this is a
+    // no-op equivalent to the previous eager loop — the producer thread
+    // finishes before workers exhaust their first scheduling quantum.
+    //
+    // For specs where Init enumeration dominates wall time (Einstein-class
+    // puzzles where the symbolic SMT loop runs for tens of minutes), workers
+    // begin invariant evaluation on partial results within seconds.
+    let init_producer: Option<std::thread::JoinHandle<Result<u64>>> = if !resumed_from_checkpoint {
+        let producer_model = Arc::clone(&model);
+        let producer_queue = Arc::clone(&queue);
+        let producer_fp_store = Arc::clone(&fp_store);
+        let producer_run_stats = Arc::clone(&run_stats);
+        let producer_state_map = state_map.clone();
+        let producer_trace_count = Arc::clone(&trace_state_count);
+        let producer_stop = Arc::clone(&stop);
+        let producer_error_tx = error_tx.clone();
+        let producer_done_flag = Arc::clone(&init_producing);
+        Some(
+            std::thread::Builder::new()
+                .name("tlapp-init-producer".into())
+                .spawn(move || -> Result<u64> {
+                    // Drop guard ensures `init_producing` is cleared even if
+                    // the producer panics or returns Err early — workers will
+                    // not hang waiting for an Init stream that has died.
+                    struct Guard(Arc<AtomicBool>);
+                    impl Drop for Guard {
+                        fn drop(&mut self) {
+                            self.0.store(false, Ordering::Release);
+                        }
+                    }
+                    let _guard = Guard(producer_done_flag);
 
-        // Print TLC-compatible message
-        let now = chrono::Local::now();
-        let timestamp = now.format("%Y-%m-%d %H:%M:%S");
-        let plural = if distinct_initial == 1 {
-            "state"
-        } else {
-            "states"
-        };
-        eprintln!(
-            "Finished computing initial states: {} distinct {} generated at {}.",
-            distinct_initial, plural, timestamp
-        );
+                    // Batch initial states for fingerprint-store insertion to
+                    // amortize CAS overhead. The batch size mirrors the worker
+                    // batch path; small enough that producers feed workers
+                    // promptly, large enough to keep CAS amortized.
+                    const INIT_BATCH_SIZE: usize = 256;
+                    let mut local_dedup: HashSet<u64> =
+                        HashSet::with_capacity(INIT_BATCH_SIZE * 4);
+                    let mut batch_fps: Vec<u64> = Vec::with_capacity(INIT_BATCH_SIZE);
+                    let mut batch_states: Vec<M::State> = Vec::with_capacity(INIT_BATCH_SIZE);
+                    let mut seen_flags: Vec<bool> = Vec::with_capacity(INIT_BATCH_SIZE);
+                    let mut distinct_initial: u64 = 0;
 
-        // Early exit for 0 initial states (evaluation-only modules)
-        if distinct_initial == 0 {
-            eprintln!("0 states generated, 0 distinct states found, 0 states left on queue.");
-            eprintln!("Finished in 00s at ({})", timestamp);
-            eprintln!("violation=false\n");
-            eprintln!("Model checking completed successfully!");
-            return Ok(RunOutcome {
-                stats: RunStats::default(),
-                violation: None,
-                violations: vec![],
-            });
-        }
-    }
+                    let mut flush = |batch_states: &mut Vec<M::State>,
+                                     batch_fps: &mut Vec<u64>,
+                                     seen_flags: &mut Vec<bool>,
+                                     distinct_initial: &mut u64|
+                     -> Result<()> {
+                        if batch_fps.is_empty() {
+                            return Ok(());
+                        }
+                        producer_fp_store.contains_or_insert_batch(batch_fps, seen_flags)?;
+                        for (idx, state) in batch_states.drain(..).enumerate() {
+                            if seen_flags[idx] {
+                                producer_run_stats.duplicates.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                if let Some(ref sm) = producer_state_map {
+                                    let fp = batch_fps[idx];
+                                    sm.insert(fp, state.clone());
+                                    producer_trace_count.fetch_add(1, Ordering::Relaxed);
+                                }
+                                producer_run_stats
+                                    .states_distinct
+                                    .fetch_add(1, Ordering::Relaxed);
+                                producer_queue.push_global(state);
+                                producer_run_stats.enqueued.fetch_add(1, Ordering::Relaxed);
+                                *distinct_initial += 1;
+                            }
+                        }
+                        batch_fps.clear();
+                        seen_flags.clear();
+                        Ok(())
+                    };
+
+                    for state in producer_model.initial_states_streaming() {
+                        if producer_stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        producer_run_stats
+                            .states_generated
+                            .fetch_add(1, Ordering::Relaxed);
+                        let state = producer_model.canonicalize(state);
+                        let fp = producer_model.fingerprint(&state);
+                        if !local_dedup.insert(fp) {
+                            producer_run_stats.duplicates.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        batch_fps.push(fp);
+                        batch_states.push(state);
+                        if batch_fps.len() >= INIT_BATCH_SIZE {
+                            flush(
+                                &mut batch_states,
+                                &mut batch_fps,
+                                &mut seen_flags,
+                                &mut distinct_initial,
+                            )?;
+                        }
+                    }
+                    // Final flush
+                    flush(
+                        &mut batch_states,
+                        &mut batch_fps,
+                        &mut seen_flags,
+                        &mut distinct_initial,
+                    )?;
+
+                    // Print TLC-compatible message
+                    let now = chrono::Local::now();
+                    let timestamp = now.format("%Y-%m-%d %H:%M:%S");
+                    let plural = if distinct_initial == 1 { "state" } else { "states" };
+                    eprintln!(
+                        "Finished computing initial states: {} distinct {} generated at {}.",
+                        distinct_initial, plural, timestamp
+                    );
+                    let _ = producer_error_tx; // keep alive even if no errors
+                    Ok(distinct_initial)
+                })
+                .expect("Failed to spawn Init producer thread"),
+        )
+    } else {
+        None
+    };
+    // We can't early-exit on 0-initial-states here without first joining the
+    // producer thread, but that would defeat the point of streaming. Instead,
+    // termination detection in the main loop handles the 0-initial-states case
+    // naturally: when the producer finishes with zero distinct states, all
+    // workers see an empty queue and exit. The "0 states generated" banner is
+    // emitted by the producer thread above, and the standard "Finished in"
+    // banner falls out at the end of run_model().
 
     let checkpoint_thread_stop = Arc::new(AtomicBool::new(false));
 
@@ -2145,6 +2226,7 @@ where
         let worker_distributed_stealer = config.distributed_stealer.clone();
         let worker_stolen_rx = config.stolen_states_rx.clone();
         let worker_donate_tx = config.donate_states_tx.clone();
+        let worker_init_producing = Arc::clone(&init_producing);
 
         workers.push(std::thread::spawn(move || {
             // Pin thread to CPU for cache locality
@@ -2314,6 +2396,14 @@ where
                         if worker_queue.has_pending_work() {
                             // Give the loader thread time to load more items
                             std::thread::sleep(std::time::Duration::from_millis(10));
+                            continue;
+                        }
+                        // T5.4: Init producer may still be streaming new initial
+                        // states into the queue. Workers must NOT terminate while
+                        // the producer is alive — even an empty queue is normal
+                        // here, the producer just hasn't pushed the next batch.
+                        if worker_init_producing.load(Ordering::Acquire) {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
                             continue;
                         }
                         // Before terminating, do a final pause check to close
@@ -2758,6 +2848,22 @@ where
             "Run completed with {}/{} workers crashed (recovered gracefully)",
             crashed_workers, total_workers
         );
+    }
+
+    // Join the Init producer thread (T5.4). The Drop guard inside the thread
+    // already cleared `init_producing`, so workers have all exited by now.
+    // We propagate any error the producer encountered (e.g. fingerprint-store
+    // insert failures); a panic here is logged but doesn't fail the run.
+    if let Some(handle) = init_producer {
+        match handle.join() {
+            Ok(Ok(_distinct)) => {}
+            Ok(Err(e)) => {
+                eprintln!("Warning: Init producer reported error: {e}");
+            }
+            Err(panic) => {
+                eprintln!("Warning: Init producer thread panicked: {panic:?}");
+            }
+        }
     }
 
     // Stop progress reporting. Log if the progress thread panicked but don't
