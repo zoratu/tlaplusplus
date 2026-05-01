@@ -10,6 +10,7 @@ pub mod models;
 pub mod runtime;
 pub mod simulation;
 pub mod storage;
+pub mod streaming_scc;
 pub mod symmetry;
 pub mod system;
 pub mod tla;
@@ -23,6 +24,9 @@ pub use fairness::{
 pub use liveness::{BuchiChecker, CycleDetector, LivenessChecker};
 pub use model::Model;
 pub use runtime::{EngineConfig, PropertyType, RunOutcome, RunStats, Violation, run_model};
+pub use streaming_scc::{
+    Color, FingerprintAdjacencyGraph, LivenessGraph, NestedDfsResult, nested_dfs,
+};
 pub use simulation::{SimulationConfig, SimulationOutcome, run_simulation};
 pub use trace_minimize::{
     MinimizeResult, OperatorBody, extract_invariant_variables,

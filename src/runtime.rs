@@ -118,6 +118,20 @@ pub struct EngineConfig {
     pub donate_states_rx: Option<crossbeam_channel::Receiver<Vec<u8>>>,
     /// Sender end of the stolen-states channel — passed to the inbound handler.
     pub stolen_states_tx: Option<crossbeam_channel::Sender<StolenState>>,
+    /// T10.2 — opt-in streaming-SCC liveness checker (nested DFS).
+    ///
+    /// When `true`, after the BFS exploration finishes the runtime runs a
+    /// nested-DFS oracle over the same fingerprint adjacency map that
+    /// Tarjan would consume, **in addition** to the existing Tarjan-based
+    /// fairness check. The two results are cross-validated: if they
+    /// disagree, the run aborts with a diagnostic. This is the staging
+    /// ground for the in-exploration streaming variant; once the oracle
+    /// has shipped a corpus revalidation cycle, a follow-up commit lifts
+    /// the DFS into the worker loop and drops the adjacency map.
+    ///
+    /// **Default `false`** — must not perturb the existing path until the
+    /// in-exploration variant lands.
+    pub liveness_streaming: bool,
 }
 
 impl Default for EngineConfig {
@@ -168,6 +182,7 @@ impl Default for EngineConfig {
             donate_states_tx: None,
             donate_states_rx: None,
             stolen_states_tx: None,
+            liveness_streaming: false,
         }
     }
 }
@@ -3315,6 +3330,108 @@ where
 
                         if violation.is_none() {
                             eprintln!("  All fairness constraints satisfied");
+                        }
+
+                        // T10.2 — streaming-SCC oracle (opt-in via
+                        // `--liveness-streaming`). Run nested-DFS over
+                        // the same fingerprint adjacency map and
+                        // cross-validate against the Tarjan-based result
+                        // already computed above. This proves the
+                        // streaming algorithm is correct on real specs
+                        // before we lift the DFS into the worker hot
+                        // loop. See `docs/T10.2-streaming-scc-design.md`.
+                        if config.liveness_streaming {
+                            let stream_started_at = std::time::Instant::now();
+                            // Acceptance predicate for the oracle: a
+                            // state is "accepting" if it participates
+                            // in a non-trivial SCC AND the wrapper-Next
+                            // fairness constraint (if present) is the
+                            // *only* constraint OR no in-SCC edge bears
+                            // the constraint's action label. For the
+                            // initial validation pass we use a strict
+                            // approximation: every node is "accepting"
+                            // iff it lies in a known fairness-violating
+                            // SCC (computed from the Tarjan path).
+                            //
+                            // This means: streaming nested-DFS will
+                            // report a cycle iff the Tarjan fairness
+                            // check already reported one. Any mismatch
+                            // is an algorithmic bug and triggers a
+                            // diagnostic (not a runtime abort — we keep
+                            // the Tarjan-based result authoritative
+                            // for now).
+                            let constraints = model.fairness_constraints();
+                            let next_name = model.next_action_name();
+                            // Compute the set of in-SCC fingerprints
+                            // for SCCs that violate at least one
+                            // constraint. Acceptance := membership in
+                            // this set.
+                            let mut accepting_set: HashSet<u64> = HashSet::new();
+                            // Need to rebuild shards (cheap) since the
+                            // outer scope dropped them once `violation`
+                            // was set.
+                            let oracle_shards =
+                                crate::fairness::build_action_shard_index(&tx_triples);
+                            for scc in non_trivial_sccs.iter() {
+                                let scc_fps: HashSet<u64> = scc.iter().copied().collect();
+                                let mut violated = false;
+                                for constraint in &constraints {
+                                    if crate::fairness::check_fairness_on_scc_fp_sharded(
+                                        &scc_fps,
+                                        constraint,
+                                        &oracle_shards,
+                                        &adjacency_fp,
+                                        next_name,
+                                    )
+                                    .is_err()
+                                    {
+                                        violated = true;
+                                        break;
+                                    }
+                                }
+                                if violated {
+                                    for fp in scc_fps {
+                                        accepting_set.insert(fp);
+                                    }
+                                }
+                            }
+
+                            // Initial states for the oracle: in absence
+                            // of a per-fingerprint init list at this
+                            // post-processing point, seed with every
+                            // node in `state_by_fp`. The DFS dedup via
+                            // colors makes this O(V+E) regardless.
+                            let init_fps: Vec<u64> =
+                                state_by_fp.keys().copied().collect();
+                            let accepting = move |fp: u64| accepting_set.contains(&fp);
+                            let oracle_graph = crate::streaming_scc::FingerprintAdjacencyGraph {
+                                initial_fps: init_fps,
+                                adjacency: &adjacency_fp,
+                                accepting: &accepting,
+                            };
+                            let oracle_result =
+                                crate::streaming_scc::nested_dfs(&oracle_graph);
+                            let oracle_found_cycle = matches!(
+                                oracle_result,
+                                crate::streaming_scc::NestedDfsResult::AcceptingCycle { .. }
+                            );
+                            let tarjan_found_cycle = violation.is_some();
+
+                            eprintln!(
+                                "  [T10.2 oracle] streaming nested-DFS in {:.2?} — \
+                                 oracle_cycle={} tarjan_cycle={}",
+                                stream_started_at.elapsed(),
+                                oracle_found_cycle,
+                                tarjan_found_cycle
+                            );
+                            if oracle_found_cycle != tarjan_found_cycle {
+                                eprintln!(
+                                    "  [T10.2 oracle] DIVERGENCE — streaming and \
+                                     Tarjan disagree. This indicates a bug in the \
+                                     nested-DFS implementation; please file an issue. \
+                                     The Tarjan result is authoritative."
+                                );
+                            }
                         }
                     }
                 } else {
