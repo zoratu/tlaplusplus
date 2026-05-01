@@ -2,7 +2,6 @@
 //!
 //! Extracted from `src/main.rs` as part of the cli/ refactor.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::distributed::ClusterConfig;
@@ -10,14 +9,7 @@ use crate::distributed::handler::StolenState;
 use crate::distributed::transport::ClusterTransport;
 use crate::distributed::work_stealer::DistributedWorkStealer;
 use crate::models::tla_native::TlaModel;
-use crate::tla::{
-    ActionClause, ClauseKind, ConfigValue, EvalContext, TlaConfig, TlaDefinition, TlaModule,
-    TlaState, TlaValue, classify_clause, compile_action_ir, compile_action_ir_branches,
-    eval_action_body_multi, eval_expr, eval_let_action_multi, looks_like_action,
-    normalize_operator_ref_name, normalize_param_name, parse_action_exists,
-    parse_stuttering_action_expr, parse_tla_config, parse_tla_module_file, restore_eval_budget,
-    scan_module_closure, set_active_eval_budget, split_action_body_disjuncts, split_top_level,
-};
+use crate::tla::{TlaValue, eval_expr};
 use crate::{SimulationConfig, run_simulation};
 
 use super::probe::build_probe_eval_context;
@@ -25,9 +17,8 @@ use super::run_model::{
     collect_coverage, dump_state_graph, evaluate_assumes, run_model_with_s3,
 };
 use super::shared::{
-    build_engine_config, fetch_s3_file, format_num, inject_constants_into_definitions,
-    maybe_setup_cluster, model_fingerprint, print_difftrace, print_difftrace_with_relevance,
-    print_stats, run_system_checks,
+    build_engine_config, fetch_s3_file, print_difftrace, print_difftrace_with_relevance,
+    run_system_checks,
 };
 
 pub(crate) fn handle(

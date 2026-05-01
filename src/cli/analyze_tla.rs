@@ -8,18 +8,14 @@ use std::sync::Arc;
 use crate::models::tla_native::TlaModel;
 use crate::tla::action_exec::probe_next_disjuncts_with_instances;
 use crate::tla::{
-    ActionClause, ClauseKind, ConfigValue, EvalContext, TlaConfig, TlaDefinition, TlaModule,
-    TlaState, TlaValue, classify_clause, compile_action_ir, compile_action_ir_branches,
-    eval_action_body_multi, eval_expr, eval_let_action_multi, looks_like_action,
-    normalize_operator_ref_name, normalize_param_name, parse_action_exists,
-    parse_stuttering_action_expr, parse_tla_config, parse_tla_module_file, restore_eval_budget,
-    scan_module_closure, set_active_eval_budget, split_action_body_disjuncts, split_top_level,
+    ActionClause, ClauseKind, ConfigValue, TlaState, TlaValue, classify_clause,
+    compile_action_ir, compile_action_ir_branches, eval_expr, normalize_operator_ref_name,
+    parse_tla_config, parse_tla_module_file, restore_eval_budget, scan_module_closure,
+    set_active_eval_budget, split_top_level,
 };
 
 use super::probe::*;
-use super::shared::{
-    config_value_to_tla, format_num, inject_constants_into_definitions,
-};
+use super::shared::{config_value_to_tla, inject_constants_into_definitions};
 
 pub(crate) fn handle(
     module: std::path::PathBuf,

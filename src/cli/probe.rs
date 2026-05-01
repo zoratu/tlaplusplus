@@ -10,20 +10,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::tla::module::TlaModuleInstance;
-#[cfg(test)]
-use crate::tla::tla_state;
 use crate::tla::{
-    ActionClause, ClauseKind, ConfigValue, EvalContext, TlaConfig, TlaDefinition, TlaModule,
-    TlaState, TlaValue, classify_clause, compile_action_ir, compile_action_ir_branches,
+    ActionClause, ClauseKind, EvalContext, TlaConfig, TlaDefinition, TlaModule,
+    TlaState, TlaValue, classify_clause, compile_action_ir,
     eval_action_body_multi, eval_expr, eval_let_action_multi, looks_like_action,
-    normalize_operator_ref_name, normalize_param_name, parse_action_exists,
-    parse_stuttering_action_expr, parse_tla_config, parse_tla_module_file, restore_eval_budget,
-    scan_module_closure, set_active_eval_budget, split_action_body_disjuncts, split_top_level,
-};
-
-use super::shared::{
-    config_value_to_expr, config_value_to_tla, inject_constants_into_definitions,
-    inject_constants_into_module_tree,
+    normalize_param_name, parse_action_exists,
+    parse_stuttering_action_expr,
+    split_action_body_disjuncts, split_top_level,
 };
 
 pub(crate) fn build_probe_eval_context<'a>(
@@ -3043,8 +3036,13 @@ mod tests {
     use clap::Parser;
     use std::fs;
     use crate::cli::{args::Command, Cli};
+    use crate::cli::shared::{config_value_to_tla, inject_constants_into_definitions};
     use crate::models::tla_native::TlaModel;
-    use crate::tla::{parse_tla_module_file, parse_tla_module_text};
+    use crate::tla::tla_state;
+    use crate::tla::{
+        ConfigValue, compile_action_ir_branches, normalize_operator_ref_name,
+        parse_tla_config, parse_tla_module_file, parse_tla_module_text,
+    };
 
     fn parsed_two_pc_with_btm_probe_module() -> TlaModule {
         parse_tla_module_text(
