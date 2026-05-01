@@ -1,6 +1,13 @@
 # `src/runtime.rs` Refactor Plan
 
-Status: **DESIGN ONLY (Path B)** — no code moved in this commit.
+Status: **PARTIALLY LANDED (Path A, chunks 1-7 of 8)** — see "Landed
+chunks" appendix at the bottom of this file. Chunk 7 (worker spawn loop)
+and chunk 8 (shutdown orchestration) remain inline in `runtime.rs`
+pending a follow-up that introduces the `WorkerCtx<M>` struct from the
+"Concurrency-coupling analysis" section. The worker loop in particular
+requires bundling 27 captured Arcs into a single context type so the
+extraction does not regress the T5.4 producer / T6 cluster steal /
+T11.5 violation-finish ordering invariants documented below.
 
 `src/runtime.rs` is 4,323 lines. It accreted T5.4 (init producer thread),
 T6 (cluster steal trigger wiring), T10/T10.1-T10.4 (parallel liveness
@@ -457,3 +464,70 @@ Bugs and code-smell I noticed while reading; **none are fixed inline**:
 
 `f161249` (`chore: remove extracted Java class files, update .gitignore`)
 on branch `worktree-agent-a6e9544466376a95d`.
+
+## Landed chunks (Path A, partial)
+
+Six commits on top of `f161249` extract the easy + medium chunks. The
+file shrinks from 4,323 LOC to 2,451 LOC (-43%); the bulk of what
+remains is the worker spawn loop (587 LOC, chunk 7) and the 13-step
+shutdown phase (chunk 8). All gates (790 default tests, 812 failpoint,
+817 symbolic-init, 13/13 diff_tlc, chaos smoke 12/12) remain green.
+
+| Chunk | File(s) | LOC moved | Notes |
+|---|---|---:|---|
+| 1 | `runtime/pause.rs` | 526 | PauseController + 5 inline tests |
+| 2 | `runtime/checkpoint.rs` | 315 | Manifest schema + writer + dead `checkpoint_once` |
+| 3 | `runtime/memory.rs` + `runtime/shards.rs` | 130 + 83 | Budget + 2 inline tests; shard heuristic |
+| 4 | `runtime/stats.rs` | 50 | AtomicRunStats |
+| 5 | `runtime/init_producer.rs` | 174 | T5.4 producer thread + Drop guard |
+| 6 | `runtime/progress.rs` + `runtime/distributed.rs` | 226 + 100 | Progress thread + T6 handler wiring |
+| 7 | `runtime/liveness.rs` | 598 | T10/T10.1-T10.4 + T10.2 oracle |
+
+Total: ~2,202 LOC moved across 9 new files (one of which is `liveness.rs`
+at 598 LOC, almost entirely a verbatim move of the post-BFS fairness
+pipeline). `runtime.rs` retains the orchestration scaffold + worker
+spawn loop + shutdown.
+
+### Not landed (deferred to a follow-up session)
+
+**Chunk 7 (worker spawn loop, 587 LOC).** The worker thread closure
+captures 27 distinct `Arc<...>` clones plus the per-worker `WorkerState`
+by value. Internal `flush_local_stats` and `process_batch` closures
+themselves close over 12+ `&mut` locals. The "Closures over local
+flush_local_stats and process_batch" section above describes the two
+options: a 12-param free function or a `WorkerLocalState` struct with
+~120 LOC of plumbing. Either is doable but each option needs a focused
+session that can iterate quickly on the spot host (compile errors will
+cascade through the worker body), and the T6 idle-flag handshake plus
+T11.5 violation-finish ordering must be re-validated against
+`wrapper_next_fairness_t1_3`, `streaming_init_t5_4`, and
+`cross_node_steal_handshake` after each iteration.
+
+**Chunk 8 (shutdown.rs, ~250 LOC).** The 13-step shutdown phase
+(worker join → init join → progress stop → auto-tuner join → queue
+finish → mem monitor stop+unpark+join → checkpoint stop+resume+join
+→ exit checkpoint write → fp_store flush → compression stats →
+worker error drain → violation collection) is currently 13 sequential
+fragments interleaved with state collection. Extracting it requires
+either a wide-signature `shutdown::orchestrate(...)` function or a
+ShutdownContext struct. The signature is wide because the function
+needs Arc clones of every shared atomic, every JoinHandle, every
+queue/fp_store handle, plus `&config` and `started_at`.
+
+### Validation snapshot at the chunk-7 head
+
+- `cargo build --release` — clean.
+- `cargo build --release --features failpoints` — clean.
+- `cargo test --release` — 790 pass, 0 fail, 8 ignored.
+- `cargo test --release --features failpoints --test-threads=2` — 812
+  pass, 0 fail, 8 ignored.
+- `cargo test --release --features symbolic-init` — 817 pass, 0 fail,
+  8 ignored.
+- `scripts/diff_tlc.sh` — 13/13 specs match TLC v2.19 state counts.
+- `scripts/chaos_smoke.sh` — 12/12 failpoints exercised, 0 divergences.
+- `cargo test --release --test wrapper_next_fairness_t1_3` — 2/2 pass
+  (T1.3 fairness regression).
+- `cargo test --release --test streaming_init_t5_4` — 1/1 pass (T5.4
+  producer regression).
+- `cargo test --release --test cross_node_steal_handshake` — 3/3 pass
+  (T6 handshake).
