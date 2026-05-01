@@ -21,3 +21,7 @@ These are correctness audits, not features. The premise of v1.0.0 was "we shippe
 - Use `--no-verify` on commits (the local pre-commit hook is intentionally disabled).
 - **NEVER** put infra command names, AWS profile names, instance IDs, or IPs into tracked files, commit messages, or agent prompts that get committed back. See `~/.claude/projects/-Volumes-OWC-1M2-Users-isaiah-src-tlaplusplus/memory/feedback_no_infra_secrets_in_commits.md`.
 - Do tasks in parallel via worktrees where they don't share code paths.
+
+## Follow-ups parked for v1.1.0
+
+- [ ] **T101.1. DEFER TO 1.1.0.** ~8 compiled-vs-interpreted Ok-vs-Err divergences surfaced by the new swarm-fuzz equivalence check. These are NOT panics (T101 closed all of those) — they are cases where the interpreter returns `Err(...)` and the compiler returns `Ok(...)` (or vice versa) on malformed inputs like `[id |,> 3, ...]` or factorial-against-empty-state. Soundness-relevant only if the discrepancy is observable on well-formed inputs; the surfaced cases are all pathological. Fix: tighten the compiler's parser to mirror the interpreter's stricter validation, so both reject the same set of malformed expressions.
