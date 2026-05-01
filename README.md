@@ -194,7 +194,7 @@ instance) and is run manually as a release ritual, not per PR.
 `scripts/chaos_smoke.sh` is the per-PR variant of the soak — same harness,
 shorter duration. It runs in ~5 minutes, gates on `>= 6` of the 12
 failpoints actually firing, and is wired into
-`.github/workflows/chaos-smoke.yml` so every push to `main` and every PR
+`scripts/REDACTED` (run on a fresh EC2 spot per push) so every push to `main` and every PR
 exercises the chaos path. Total CI budget ~10 min including the failpoint
 build. Locally:
 
