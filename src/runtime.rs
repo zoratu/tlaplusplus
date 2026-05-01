@@ -234,7 +234,9 @@ pub struct RunStats {
     pub fingerprints: FingerprintStats,
 }
 
+mod distributed;
 mod init_producer;
+mod progress;
 mod stats;
 use stats::AtomicRunStats;
 
@@ -982,198 +984,14 @@ where
     // No need for separate monitor thread
 
     // Progress reporting thread - prints stats every 10 seconds
-    let progress_run_stats = Arc::clone(&run_stats);
-    let progress_stop = Arc::clone(&stop);
-    let progress_fp_store = Arc::clone(&fp_store);
-    let progress_queue = Arc::clone(&queue);
-    let progress_throttle = Arc::clone(&throttle);
-    let progress_worker_count = worker_plan.worker_count;
-    let progress_thread = std::thread::spawn(move || {
-        let mut progress_counter = 1u64;
-        let mut last_generated = 0u64;
-        let mut last_distinct = 0u64;
-        let mut last_queue_pending = 0u64;
-        let mut last_time = std::time::Instant::now();
-
-        // Memory monitor - check periodically and throttle if needed
-        let memory_monitor = MemoryMonitor::default();
-        let mut memory_warned = false;
-        let mut memory_throttled = false;
-
-        loop {
-            // Check for emergency checkpoint request every second
-            for _ in 0..10 {
-                std::thread::sleep(std::time::Duration::from_secs(1));
-
-                if progress_stop.load(Ordering::Relaxed) {
-                    return;
-                }
-
-                // Check memory pressure and throttle workers if needed
-                let mem_status = memory_monitor.check();
-                match mem_status {
-                    MemoryStatus::Critical {
-                        rss_bytes,
-                        limit_bytes,
-                        ratio,
-                    } => {
-                        if !memory_throttled {
-                            let rss_gb = rss_bytes as f64 / 1024.0 / 1024.0 / 1024.0;
-                            let limit_gb = limit_bytes as f64 / 1024.0 / 1024.0 / 1024.0;
-                            eprintln!(
-                                "MEMORY CRITICAL: {:.1}GB / {:.1}GB ({:.0}%) - throttling to 25% workers",
-                                rss_gb,
-                                limit_gb,
-                                ratio * 100.0
-                            );
-                            // Throttle to 25% of workers
-                            let reduced = (progress_worker_count / 4).max(1);
-                            progress_throttle.set_active_target(reduced);
-                            memory_throttled = true;
-                            memory_warned = true;
-                        }
-                    }
-                    MemoryStatus::Warning {
-                        rss_bytes,
-                        limit_bytes,
-                        ratio,
-                    } => {
-                        if !memory_warned {
-                            let rss_gb = rss_bytes as f64 / 1024.0 / 1024.0 / 1024.0;
-                            let limit_gb = limit_bytes as f64 / 1024.0 / 1024.0 / 1024.0;
-                            eprintln!(
-                                "MEMORY WARNING: {:.1}GB / {:.1}GB ({:.0}%) - consider reducing workers",
-                                rss_gb,
-                                limit_gb,
-                                ratio * 100.0
-                            );
-                            // Throttle to 50% of workers
-                            let reduced = (progress_worker_count / 2).max(1);
-                            progress_throttle.set_active_target(reduced);
-                            memory_warned = true;
-                        }
-                    }
-                    MemoryStatus::Ok { ratio, .. } => {
-                        // If we were throttled and now OK, gradually restore
-                        if memory_throttled && ratio < 0.60 {
-                            eprintln!(
-                                "Memory pressure relieved ({:.0}%) - restoring workers",
-                                ratio * 100.0
-                            );
-                            progress_throttle.set_active_target(progress_worker_count);
-                            memory_throttled = false;
-                            memory_warned = false;
-                        }
-                    }
-                }
-
-                // Handle emergency checkpoint request
-                if crate::chaos::is_emergency_checkpoint_requested() {
-                    eprintln!("Emergency checkpoint: flushing fingerprint store...");
-                    if let Err(e) = progress_fp_store.flush() {
-                        eprintln!("Emergency checkpoint: fingerprint flush failed: {}", e);
-                    } else {
-                        eprintln!("Emergency checkpoint: fingerprint store flushed successfully");
-                    }
-                    let (generated, _, distinct, _, _, _) = progress_run_stats.snapshot();
-                    eprintln!(
-                        "Emergency checkpoint: {} states generated, {} distinct at time of failure",
-                        generated, distinct
-                    );
-                    crate::chaos::clear_emergency_checkpoint();
-                }
-            }
-
-            if progress_stop.load(Ordering::Relaxed) {
-                break;
-            }
-
-            let (states_generated, _states_processed, states_distinct, _, _, _) =
-                progress_run_stats.snapshot();
-            // Use total_pending_count to include spilled items on disk
-            let queue_pending = progress_queue.total_pending_count();
-
-            // Calculate rates per minute
-            let now = std::time::Instant::now();
-            let elapsed_secs = now.duration_since(last_time).as_secs_f64();
-            let elapsed_mins = elapsed_secs / 60.0;
-
-            let generated_rate = if elapsed_mins > 0.0 {
-                ((states_generated - last_generated) as f64 / elapsed_mins) as u64
-            } else {
-                0
-            };
-
-            let distinct_rate = if elapsed_mins > 0.0 {
-                ((states_distinct - last_distinct) as f64 / elapsed_mins) as u64
-            } else {
-                0
-            };
-
-            // Format timestamp in TLC style: YYYY-MM-DD HH:MM:SS
-            let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-
-            // Format numbers with commas (TLC style)
-            fn format_with_commas(n: u64) -> String {
-                let s = n.to_string();
-                let mut result = String::new();
-                for (i, c) in s.chars().rev().enumerate() {
-                    if i > 0 && i % 3 == 0 {
-                        result.push(',');
-                    }
-                    result.push(c);
-                }
-                result.chars().rev().collect()
-            }
-
-            // Calculate ETA based on queue drain rate
-            let eta_str = if progress_counter > 1 && elapsed_secs > 0.0 {
-                let queue_delta = last_queue_pending as i64 - queue_pending as i64;
-                let drain_rate = queue_delta as f64 / elapsed_secs; // states/sec
-
-                if drain_rate > 10.0 {
-                    // Queue is draining - estimate completion time
-                    let eta_secs = queue_pending as f64 / drain_rate;
-                    if eta_secs < 60.0 {
-                        format!(" ETA: {:.0}s", eta_secs)
-                    } else if eta_secs < 3600.0 {
-                        format!(" ETA: {:.1}m", eta_secs / 60.0)
-                    } else if eta_secs < 86400.0 {
-                        format!(" ETA: {:.1}h", eta_secs / 3600.0)
-                    } else {
-                        format!(" ETA: {:.1}d", eta_secs / 86400.0)
-                    }
-                } else if drain_rate < -10.0 {
-                    // Queue is growing
-                    " ETA: queue growing".to_string()
-                } else {
-                    // Queue is stable
-                    " ETA: stabilizing".to_string()
-                }
-            } else {
-                String::new()
-            };
-
-            // Match TLC format with ETA
-            eprintln!(
-                "Progress({}) at {}: {} states generated ({} s/min), {} distinct states found ({} ds/min), {} states left on queue.{}",
-                progress_counter,
-                timestamp,
-                format_with_commas(states_generated),
-                format_with_commas(generated_rate),
-                format_with_commas(states_distinct),
-                format_with_commas(distinct_rate),
-                format_with_commas(queue_pending),
-                eta_str
-            );
-
-            progress_counter += 1;
-            last_generated = states_generated;
-            last_distinct = states_distinct;
-            last_queue_pending = queue_pending;
-            last_time = now;
-        }
-    });
+    let progress_thread = progress::spawn_progress_thread(
+        Arc::clone(&run_stats),
+        Arc::clone(&stop),
+        Arc::clone(&fp_store),
+        Arc::clone(&queue),
+        Arc::clone(&throttle),
+        worker_plan.worker_count,
+    );
 
     // Check if we need to collect labeled transitions for fairness checking
     let collect_labeled_transitions = model.has_fairness_constraints();
@@ -1227,70 +1045,7 @@ where
 
     // --- Distributed mode: spawn inbound message handler, bloom/termination task,
     //     and cross-node steal-trigger task ---
-    if let Some(ref stealer) = config.distributed_stealer {
-        let handler_transport = Arc::clone(stealer.transport());
-        let handler_stealer = Arc::clone(stealer);
-        let handler_stop = Arc::clone(&stop);
-        let tokio_handle = stealer.tokio_handle();
-
-        // Closure used by both the inbound handler (to honor the steal-victim
-        // threshold) and the steal-trigger task (to detect a starved local queue).
-        //
-        // NOTE: `pending_count()` is an approximation derived from
-        // `global_pushed - global_popped`, where `global_popped` is only
-        // updated when workers flush their local counters (currently only at
-        // worker exit). That makes `pending_count()` over-report by
-        // potentially the entire local-popped count, which would prevent the
-        // steal trigger from firing even when the local queue is genuinely
-        // empty. We bridge this by ALSO checking `has_pending_work()` (which
-        // inspects the actual deques + per-worker active flags); when it
-        // returns false, we report 0 to the trigger.
-        let queue_for_pending = Arc::clone(&queue);
-        let local_pending_fn: crate::distributed::handler::LocalPendingFn = Arc::new(move || {
-            if !queue_for_pending.has_pending_work() {
-                0
-            } else {
-                queue_for_pending.pending_count()
-            }
-        });
-
-        // Spawn inbound handler with the steal/donate channels
-        if let (Some(stolen_tx), Some(donate_rx)) =
-            (&config.stolen_states_tx, &config.donate_states_rx)
-        {
-            crate::distributed::handler::spawn_inbound_handler(
-                &tokio_handle,
-                handler_transport.clone(),
-                handler_stealer.clone(),
-                stolen_tx.clone(),
-                donate_rx.clone(),
-                handler_stop.clone(),
-                Arc::clone(&local_pending_fn),
-            );
-        }
-
-        // Spawn bloom exchange and termination broadcaster
-        crate::distributed::handler::spawn_bloom_and_termination_task(
-            &tokio_handle,
-            handler_transport.clone(),
-            handler_stealer.clone(),
-            handler_stop.clone(),
-            100, // check every 100ms
-        );
-
-        // Spawn the cross-node steal-trigger (T6).
-        // Only meaningful when the cluster has >1 node, but the trigger
-        // itself short-circuits in `should_initiate_steal` for singleton
-        // clusters, so spawning unconditionally is harmless.
-        crate::distributed::handler::spawn_steal_trigger_task(
-            &tokio_handle,
-            handler_transport,
-            handler_stealer,
-            handler_stop,
-            local_pending_fn,
-            100, // poll every 100ms; 250ms idle window before firing
-        );
-    }
+    distributed::spawn_handlers_if_any(&config, &queue, &stop);
 
     let mut workers = Vec::with_capacity(worker_plan.worker_count);
     for (worker_id, mut worker_state) in worker_states.into_iter().enumerate() {
