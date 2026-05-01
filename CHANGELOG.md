@@ -103,10 +103,20 @@ production-shape proof tier.
   shape gap between the tier-A model and the production code without
   yet threading `Tracked<PointsTo<HashTableEntry>>` through the real
   type. Phase-2 (production-code annotations) tracked for v1.2.0.
-- **T13.5 — Reader liveness via Verus `state_machines!`.** A new
-  proof at `verification/verus/reader_liveness.rs` discharges
-  bounded-reader-retry termination under the unbounded-fairness
-  semantics that tier-A could not express directly.
+- **T13.3 + T13.5 — Constructive reader-liveness proof, axiom-free.** A
+  new proof at `verification/verus/reader_liveness_v2.rs` discharges the
+  unbounded-fairness reader-liveness theorem `theorem_no_starvation` with
+  **0 axioms** (17 verified, 0 errors via `./run_proof.sh
+  reader-liveness-v2`, ~0.8s wall). The three previous protocol-shape
+  axioms (`axiom_writer_eventually_finalizes`,
+  `axiom_reader_can_observe_stutter`, `axiom_extension_composes`) are
+  replaced by constructive lemmas with explicit short-`seq!` witnesses
+  (2- and 3-element extensions); `wf_prefix` over each short literal
+  reduces to a small case-split on `step_relation`'s three disjuncts that
+  the SMT solver discharges automatically. The original
+  `verification/verus/reader_liveness.rs` (14 verified plus 3 documented
+  `external_body` axioms) is preserved as the bounded-form temporal-trace
+  fallback and reference for the eventual `state_machines!` port.
 - **T13.6 — CI gate for the Verus tier-A run.** A workflow gate that
   runs the full Verus tier-A proof on every push so a regression in
   the model-level guarantees fails the build rather than silently

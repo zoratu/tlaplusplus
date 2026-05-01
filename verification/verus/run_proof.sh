@@ -17,9 +17,18 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 cd "$SCRIPT_DIR"
 
 if [ -n "${VERUS_DIR:-}" ]; then
-  VERUS_BIN="$VERUS_DIR/source/target-verus/release/verus"
+  # Prefer the source-built layout, then the unzipped-prebuilt layout.
+  if [ -x "$VERUS_DIR/source/target-verus/release/verus" ]; then
+    VERUS_BIN="$VERUS_DIR/source/target-verus/release/verus"
+  elif [ -x "$VERUS_DIR/verus" ]; then
+    VERUS_BIN="$VERUS_DIR/verus"
+  else
+    echo "error: VERUS_DIR=$VERUS_DIR does not contain a verus binary at" >&2
+    echo "       source/target-verus/release/verus or verus" >&2
+    exit 2
+  fi
 elif command -v verus >/dev/null 2>&1; then
-  VERUS_BIN=verus
+  VERUS_BIN="$(command -v verus)"
 else
   echo "error: cannot find a verus binary." >&2
   echo "       Set VERUS_DIR=/path/to/verus or put 'verus' on PATH." >&2
@@ -49,15 +58,20 @@ echo
 # (`seqlock_resize_tier_a.rs`, concrete linear-probe Seq<u64>).
 # Pass `shadow` to verify the production-shape shadow methods
 # (`shard_methods.rs`, real PAtomicU64 + Tracked permissions).
-# Pass `liveness` to verify the unbounded-fairness reader liveness
-# proof (`reader_liveness.rs`, T13.5 — temporal trace + fairness).
+# Pass `liveness` to verify the (axiom-bearing) unbounded-fairness reader
+# liveness proof (`reader_liveness.rs`, T13.5 — temporal trace +
+# 3 protocol-shape axioms; preserved as the bounded-form fallback).
+# Pass `liveness-v2` to verify the constructive variant
+# (`reader_liveness_v2.rs`, T13.5 with the three axioms discharged via
+# explicit finite-prefix witnesses).
 TIER="${1:-b}"
 case "$TIER" in
   a|tier-a|tiera|A) PROOF_FILE="seqlock_resize_tier_a.rs" ;;
   b|tier-b|tierb|B|"") PROOF_FILE="seqlock_resize.rs" ;;
   shadow|tier-a-shadow|s|shard-methods|shard_methods) PROOF_FILE="shard_methods.rs" ;;
   liveness|tier-liveness|live|l) PROOF_FILE="reader_liveness.rs" ;;
-  *) echo "error: unknown tier '$TIER'; pass 'a', 'b', 'shadow', or 'liveness'" >&2; exit 2 ;;
+  liveness-v2|tier-liveness-v2|live-v2|l2|reader-liveness-v2) PROOF_FILE="reader_liveness_v2.rs" ;;
+  *) echo "error: unknown tier '$TIER'; pass 'a', 'b', 'shadow', 'liveness', or 'liveness-v2'" >&2; exit 2 ;;
 esac
 
 echo "Verifying: $PROOF_FILE"
