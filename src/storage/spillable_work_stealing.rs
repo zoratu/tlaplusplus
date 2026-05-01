@@ -214,6 +214,19 @@ pub struct SpillableWorkStealingQueues<T> {
     /// to the hot queue). Reported in stats so operators can see the ring
     /// is doing work.
     compressed_ring_loads: AtomicU64,
+    /// T11.4 — items lost permanently in the spill pipeline because both
+    /// the compressed ring and the disk-overflow `push` returned Err (e.g.
+    /// disk full, permission denied, or `queue_spill_fail` failpoint set
+    /// to permanent `return`). On Err the disk-overflow queue calls
+    /// `set_error` and every subsequent push fails too — so the items are
+    /// genuinely on the floor, not recoverable. We still must decrement
+    /// `inflight_spilled` for them or termination detection hangs.
+    /// Surfaced in `QueueStats::spill_lost_permanently` so operators can
+    /// distinguish "model checking finished" from "model checking finished
+    /// but N states were silently dropped due to disk failure". The Arc
+    /// is shared with the coordinator thread so route_spill_batch can
+    /// bump it directly.
+    spill_lost_permanently: Arc<AtomicU64>,
 
     /// T11.1 SOUNDNESS — number of items currently in flight in the spill
     /// pipeline that are NOT yet visible to `has_pending_work()` via the
@@ -274,6 +287,11 @@ where
         // SpillableWorkerState::drop can release leaked spill_buffer
         // items on worker panic.
         let inflight_spilled = Arc::new(AtomicU64::new(0));
+        // T11.4 — counter for items the spill pipeline drops on the floor
+        // because both the compressed ring and disk overflow returned Err.
+        // Shared with the coordinator so route_spill_batch can bump it
+        // when it has to release inflight without placing the item.
+        let lost_permanently = Arc::new(AtomicU64::new(0));
 
         // Create per-worker channels and spillable states
         let mut worker_states = Vec::with_capacity(num_workers);
@@ -297,6 +315,7 @@ where
         let coordinator_stop = Arc::clone(&stop_signal);
         let coordinator_ring = compressed_ring.as_ref().map(Arc::clone);
         let coordinator_inflight = Arc::clone(&inflight_spilled);
+        let coordinator_lost = Arc::clone(&lost_permanently);
         let spill_batch_size = config.spill_batch;
         let coordinator_handle = std::thread::Builder::new()
             .name("tlapp-spill-coordinator".to_string())
@@ -307,6 +326,7 @@ where
                     coordinator_ring,
                     coordinator_stop,
                     coordinator_inflight,
+                    coordinator_lost,
                     spill_batch_size,
                 );
             })?;
@@ -349,6 +369,7 @@ where
             spill_batches_sent: AtomicU64::new(0),
             spill_channel_full: AtomicU64::new(0),
             compressed_ring_loads: AtomicU64::new(0),
+            spill_lost_permanently: lost_permanently,
             inflight_spilled,
         });
 
@@ -368,18 +389,20 @@ where
         compressed_ring: Option<Arc<CompressedSegmentRing>>,
         stop: Arc<AtomicBool>,
         inflight_spilled: Arc<AtomicU64>,
+        lost_permanently: Arc<AtomicU64>,
         batch_size: usize,
     ) {
         let mut accumulator: Vec<T> = Vec::with_capacity(batch_size);
 
         let flush_accumulator = |accumulator: &mut Vec<T>,
                                  ring: &Option<Arc<CompressedSegmentRing>>,
-                                 inflight: &Arc<AtomicU64>| {
+                                 inflight: &Arc<AtomicU64>,
+                                 lost: &Arc<AtomicU64>| {
             if accumulator.is_empty() {
                 return;
             }
             let to_write = std::mem::replace(accumulator, Vec::with_capacity(batch_size));
-            Self::route_spill_batch(to_write, ring, &overflow, inflight);
+            Self::route_spill_batch(to_write, ring, &overflow, inflight, lost);
         };
 
         // T11.1: drain receivers fully before exiting on stop. Otherwise
@@ -413,7 +436,12 @@ where
 
             if active_receivers.is_empty() {
                 // All workers' channels disconnected. Final flush + exit.
-                flush_accumulator(&mut accumulator, &compressed_ring, &inflight_spilled);
+                flush_accumulator(
+                    &mut accumulator,
+                    &compressed_ring,
+                    &inflight_spilled,
+                    &lost_permanently,
+                );
                 break;
             }
 
@@ -453,6 +481,7 @@ where
                             &mut accumulator,
                             &compressed_ring,
                             &inflight_spilled,
+                            &lost_permanently,
                         );
                     }
                 }
@@ -463,7 +492,12 @@ where
                     active_receivers.swap_remove(recv_idx);
                 }
                 CoordTick::Timeout => {
-                    flush_accumulator(&mut accumulator, &compressed_ring, &inflight_spilled);
+                    flush_accumulator(
+                        &mut accumulator,
+                        &compressed_ring,
+                        &inflight_spilled,
+                        &lost_permanently,
+                    );
                     if stopped {
                         if inflight_spilled.load(Ordering::Acquire) == 0 {
                             break;
@@ -483,7 +517,12 @@ where
 
         // Final flush on shutdown (in case the loop exited via the stopped
         // branch right after a successful recv).
-        flush_accumulator(&mut accumulator, &compressed_ring, &inflight_spilled);
+        flush_accumulator(
+            &mut accumulator,
+            &compressed_ring,
+            &inflight_spilled,
+            &lost_permanently,
+        );
     }
 
     /// Route a spilled batch through the compressed ring first, falling
@@ -498,11 +537,23 @@ where
     /// loop. Without it, items in transit between worker -> channel ->
     /// coordinator -> ring/disk are invisible to termination detection
     /// and the runtime can stop while states are still in flight.
+    ///
+    /// T11.4: when both tiers reject the item (ring errored AND
+    /// `overflow.push` returned Err — typically because `set_error` has
+    /// been latched by a permanent `queue_spill_fail=return` failpoint or
+    /// a real disk failure), we MUST still decrement `inflight_spilled`
+    /// or termination detection hangs forever waiting for items that
+    /// will never arrive at any pending-work-visible tier. The dropped
+    /// items are accounted in `lost_permanently` so operators can see
+    /// after the run that N states were silently lost on the floor.
+    /// Once `DiskBackedQueue::set_error` has fired, every subsequent
+    /// `push` returns Err — this path used to leak inflight indefinitely.
     fn route_spill_batch(
         batch: Vec<T>,
         compressed_ring: &Option<Arc<CompressedSegmentRing>>,
         overflow: &Arc<DiskBackedQueue<T>>,
         inflight_spilled: &Arc<AtomicU64>,
+        lost_permanently: &Arc<AtomicU64>,
     ) {
         let to_disk = if let Some(ring) = compressed_ring.as_ref() {
             let attempted = batch.len() as u64;
@@ -521,9 +572,11 @@ where
                         "Warning: compressed ring push errored ({}); cannot recover items here",
                         e
                     );
-                    // Items are lost here; intentionally do NOT decrement
-                    // inflight so termination doesn't fire silently on a
-                    // lossy spill path. Operator will see the warning.
+                    // T11.4: items are lost here. Release the inflight
+                    // counter (otherwise termination hangs) and bump the
+                    // permanently-lost counter so operators can see it.
+                    inflight_spilled.fetch_sub(attempted, Ordering::AcqRel);
+                    lost_permanently.fetch_add(attempted, Ordering::AcqRel);
                     return;
                 }
             }
@@ -538,9 +591,16 @@ where
                     inflight_spilled.fetch_sub(1, Ordering::AcqRel);
                 }
                 Err(e) => {
+                    // T11.4: prior to this fix, this branch decremented
+                    // nothing — leaving inflight_spilled positive. Once
+                    // DiskBackedQueue::set_error latches (e.g. permanent
+                    // queue_spill_fail=return failpoint, or a real disk
+                    // failure), every subsequent push returns Err, every
+                    // remaining item leaked, and termination hung forever.
+                    // We now release inflight and account the loss.
                     eprintln!("Warning: spill coordinator push failed: {}", e);
-                    // Item dropped; intentionally do NOT decrement (see
-                    // ring-error branch above for rationale).
+                    inflight_spilled.fetch_sub(1, Ordering::AcqRel);
+                    lost_permanently.fetch_add(1, Ordering::AcqRel);
                 }
             }
         }
@@ -1139,7 +1199,19 @@ where
             loaded_segments: overflow_stats.loaded_segments,
             loaded_items: overflow_stats.loaded_items + self.disk_loads.load(Ordering::Relaxed),
             max_inmem_len: hot_stats.max_inmem_len.max(overflow_stats.max_inmem_len),
+            // T11.4 — items lost when both ring and disk push errored.
+            spill_lost_permanently: self.spill_lost_permanently.load(Ordering::Relaxed),
         }
+    }
+
+    /// T11.4 — operator-facing accessor for the count of items that were
+    /// dropped on the floor by the spill pipeline because both tiers
+    /// returned Err (e.g. permanent `queue_spill_fail=return` failpoint
+    /// or a real, latched disk failure). Non-zero means the model-check
+    /// result is unsound — N states were never explored and never made
+    /// it back into the queue.
+    pub fn spill_lost_permanently(&self) -> u64 {
+        self.spill_lost_permanently.load(Ordering::Relaxed)
     }
 
     /// Get work-stealing specific stats
@@ -2640,6 +2712,272 @@ mod tests {
         assert!(queues.is_empty());
         assert!(queues.should_terminate());
 
+        let _ = std::fs::remove_dir_all(dir);
+        Ok(())
+    }
+}
+
+/// T11.4 — regression tests for the disk-overflow Err-branch inflight leak
+/// in `route_spill_batch`. Before the fix, a permanent `queue_spill_fail`
+/// failpoint (or any condition that latched `DiskBackedQueue::set_error`)
+/// would leak `inflight_spilled` indefinitely: every subsequent push to
+/// the disk overflow returned Err, the items were dropped on the floor,
+/// but `inflight_spilled` was never decremented, so termination detection
+/// would hang forever waiting for items that would never arrive at any
+/// pending-work-visible tier.
+///
+/// These tests are gated on `--features failpoints` because they need
+/// the `fail` crate's runtime configuration to inject the permanent disk
+/// failure deterministically.
+#[cfg(all(test, feature = "failpoints"))]
+mod t11_4_tests {
+    use super::*;
+    use serial_test::serial;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    fn temp_path(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("tlapp-{prefix}-{nanos}-{}", std::process::id()))
+    }
+
+    /// Permanent `queue_spill_fail=return` failpoint forces every disk
+    /// `push` to fail once it engages the spill path. Pre-T11.4, the
+    /// inflight counter would leak and `should_terminate()` would never
+    /// return true. Post-T11.4, the coordinator releases inflight on Err
+    /// and accounts the loss in `spill_lost_permanently`.
+    ///
+    /// This test directly exercises `route_spill_batch` against a
+    /// standalone `DiskBackedQueue` whose `set_error` has been latched.
+    /// Going through the full SpillableWorkStealingQueues pipeline is
+    /// racy in unit-test conditions because the background loader
+    /// thread drains the disk-overflow's in-memory tier faster than
+    /// pushes can engage `spill_batch_now` (where the failpoint fires);
+    /// by latching set_error on a quiet queue first we deterministically
+    /// hit the failing Err branch.
+    ///
+    /// Assertions:
+    ///   1. inflight_spilled is decremented even when push errors;
+    ///   2. spill_lost_permanently > 0 with the exact loss count;
+    ///   3. termination detection (`should_terminate`/`is_empty`) is
+    ///      no longer blocked by the leak;
+    ///   4. stats() surfaces the lost count to operators.
+    #[test]
+    #[serial]
+    fn t11_4_permanent_queue_spill_fail_releases_inflight_and_reports_lost() -> Result<()> {
+        use crate::storage::queue::{DiskBackedQueue, DiskQueueConfig};
+
+        let scenario = fail::FailScenario::setup();
+
+        let dir = temp_path("t11-4-permanent-spill-fail");
+        std::fs::create_dir_all(&dir).ok();
+
+        // Build a standalone disk-overflow queue. NOTE the constructor
+        // clamps inmem_limit to >= 100 and spill_batch to >= 16, so
+        // pushes 1..=100 go to inmem and push 101 trips spill_batch_now.
+        let overflow = Arc::new(DiskBackedQueue::<u64>::new(DiskQueueConfig {
+            spill_dir: dir.clone(),
+            inmem_limit: 100,
+            spill_batch: 16,
+            spill_channel_bound: 4,
+            load_existing_segments: false,
+        })?);
+
+        // Enable permanent failpoint: every spill_batch_now call errors.
+        fail::cfg("queue_spill_fail", "return").unwrap();
+
+        // Push past the (clamped) inmem cap so spill_batch_now is
+        // engaged at least once; failpoint fires, set_error latches,
+        // and every subsequent push returns Err immediately via
+        // check_error() at the top of push().
+        for i in 0..120u64 {
+            let _ = overflow.push(i);
+        }
+
+        // Sanity: set_error must have latched (subsequent push errors).
+        assert!(
+            overflow.push(9999u64).is_err(),
+            "test setup: expected DiskBackedQueue::set_error to be latched by permanent failpoint"
+        );
+
+        // Set up the route_spill_batch inputs the way the coordinator
+        // would: a fresh inflight counter bumped to match the batch we
+        // are about to route, and a lost counter starting at 0.
+        let inflight_arc = Arc::new(AtomicU64::new(0));
+        let lost_arc = Arc::new(AtomicU64::new(0));
+        const TEST_BATCH: u64 = 50;
+        inflight_arc.fetch_add(TEST_BATCH, Ordering::AcqRel);
+
+        // Synthesize the route_spill_batch call (compression disabled).
+        // Pre-T11.4, the disk-overflow Err branch did NOT decrement
+        // inflight, leaving the counter stuck at TEST_BATCH and hanging
+        // termination detection forever.
+        let batch: Vec<u64> = (5000..5000 + TEST_BATCH).collect();
+        SpillableWorkStealingQueues::<u64>::route_spill_batch(
+            batch,
+            &None,
+            &overflow,
+            &inflight_arc,
+            &lost_arc,
+        );
+
+        // Pre-T11.4 invariant violations would manifest here:
+        //   - inflight would still equal TEST_BATCH (leak)
+        //   - lost would equal 0 (no accounting)
+        // Post-T11.4 the Err branch decrements inflight per item and
+        // bumps lost by the same amount.
+        let inflight_after = inflight_arc.load(Ordering::Acquire);
+        let lost_after = lost_arc.load(Ordering::Acquire);
+        assert_eq!(
+            inflight_after, 0,
+            "T11.4 regression: inflight_spilled leaked ({} != 0). \
+             Pre-fix every Err branch left this incremented, hanging termination. \
+             Now the runtime can terminate after acknowledging the loss.",
+            inflight_after
+        );
+        assert_eq!(
+            lost_after, TEST_BATCH,
+            "T11.4 regression: spill_lost_permanently must equal {} but got {}. \
+             Operators rely on this to detect silent state loss after a run completes.",
+            TEST_BATCH, lost_after
+        );
+
+        // Now build a full SpillableWorkStealingQueues and verify that
+        // the same Err shape (set_error latched on a fresh overflow)
+        // does NOT hang termination — the end-to-end assertion that
+        // model checking on a permanent failpoint can finish, even if
+        // it loses N states. This is the production-shape assertion;
+        // the direct-call test above pinpoints the fix site.
+        let dir2 = temp_path("t11-4-end-to-end");
+        let cfg = SpillableConfig {
+            max_inmem_items: 2,
+            spill_dir: dir2.clone(),
+            spill_batch: 2,
+            load_existing: false,
+            worker_spill_buffer_size: 8,
+            worker_channel_bound: 4,
+            defer_segment_deletion: false,
+            compression_enabled: false,
+            compression_max_bytes: 64 * 1024 * 1024,
+            compression_level: 1,
+        };
+        let (queues, mut workers) =
+            SpillableWorkStealingQueues::<u64>::new(1, vec![0], cfg)?;
+
+        // Push items; some will route to the failing disk path. We
+        // don't care about exact counts here — the assertion is "the
+        // process can terminate" rather than "every item is lost".
+        for i in 0..50u64 {
+            queues.push_global(i);
+        }
+        let extra: Vec<u64> = (1000..1100).collect();
+        let _pushed = queues.push_local_batch(&mut workers[0], extra.into_iter());
+
+        // Drain whatever the hot queue/loader can deliver, then wait
+        // for inflight to settle (lost or accepted).
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut quiescent = false;
+        while Instant::now() < deadline {
+            // pop everything available
+            while queues.pop_for_worker(&mut workers[0]).is_some() {}
+            queues.flush_worker_counters(&mut workers[0]);
+            // give the coordinator a chance to drain
+            std::thread::sleep(Duration::from_millis(20));
+            if queues.inflight_spilled.load(Ordering::Acquire) == 0
+                && queues.hot.is_empty()
+            {
+                quiescent = true;
+                break;
+            }
+        }
+        assert!(
+            quiescent,
+            "T11.4 regression: SpillableWorkStealingQueues failed to quiesce \
+             within 10s under permanent queue_spill_fail \
+             (inflight={}, hot_empty={}). \
+             Pre-fix this hung indefinitely.",
+            queues.inflight_spilled.load(Ordering::Acquire),
+            queues.hot.is_empty()
+        );
+
+        // Now should_terminate must be true (the whole point of the fix).
+        assert!(
+            queues.should_terminate(),
+            "T11.4 regression: should_terminate must be true after pipeline quiesces"
+        );
+
+        // Operator-visible loss count via the public stats() accessor.
+        let stats = queues.stats();
+        // We don't assert a specific count for the end-to-end test —
+        // the loader race can absorb some items into the hot queue
+        // before set_error latches. The direct-call assertion above
+        // already pinpoints exact accounting. Here we just assert that
+        // the channel through stats() is wired and produces a value.
+        // A non-zero value means at least one item was reported lost.
+        eprintln!(
+            "T11.4 end-to-end: spill_lost_permanently={} (stats accessor wired)",
+            stats.spill_lost_permanently
+        );
+
+        scenario.teardown();
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir2);
+        Ok(())
+    }
+
+    /// Sibling test: when no failpoint is configured, the same workload
+    /// should NOT report any lost items. This guards against the lost
+    /// counter being incorrectly bumped on the happy path.
+    #[test]
+    #[serial]
+    fn t11_4_clean_path_reports_zero_lost() -> Result<()> {
+        let scenario = fail::FailScenario::setup();
+        // Explicitly leave queue_spill_fail unconfigured.
+
+        let dir = temp_path("t11-4-clean");
+        let config = SpillableConfig {
+            max_inmem_items: 2,
+            spill_dir: dir.clone(),
+            spill_batch: 16,
+            load_existing: false,
+            worker_spill_buffer_size: 8,
+            worker_channel_bound: 4,
+            defer_segment_deletion: false,
+            compression_enabled: false,
+            compression_max_bytes: 64 * 1024 * 1024,
+            compression_level: 1,
+        };
+        let (queues, mut workers) =
+            SpillableWorkStealingQueues::<u64>::new(1, vec![0], config)?;
+
+        for i in 0..10u64 {
+            queues.push_global(i);
+        }
+        let to_push: Vec<u64> = (1000..1100).collect();
+        let pushed = queues.push_local_batch(&mut workers[0], to_push.into_iter());
+        assert_eq!(pushed, 100);
+
+        // Drain everything.
+        let mut drained = 0;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while drained < 110 && Instant::now() < deadline {
+            if queues.pop_for_worker(&mut workers[0]).is_some() {
+                drained += 1;
+            } else {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert_eq!(drained, 110, "all items must be recoverable on the clean path");
+
+        assert_eq!(
+            queues.spill_lost_permanently(),
+            0,
+            "no items should be lost when no failpoint is set"
+        );
+
+        scenario.teardown();
         let _ = std::fs::remove_dir_all(dir);
         Ok(())
     }

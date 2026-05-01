@@ -71,6 +71,13 @@ pub struct QueueStats {
     pub loaded_segments: u64,
     pub loaded_items: u64,
     pub max_inmem_len: u64,
+    /// T11.4 — items the spill pipeline could not place into either the
+    /// compressed ring or disk overflow (e.g. permanent disk failure or
+    /// `queue_spill_fail=return` failpoint). Always zero on the happy
+    /// path. Non-zero means N states were silently lost; the model-check
+    /// result is unsound under that condition. Surfaced so operators
+    /// can post-hoc detect the loss instead of a silent hang.
+    pub spill_lost_permanently: u64,
 }
 
 #[derive(Default)]
@@ -830,6 +837,12 @@ where
             loaded_segments: self.stats.loaded_segments.load(Ordering::Relaxed),
             loaded_items: self.stats.loaded_items.load(Ordering::Relaxed),
             max_inmem_len: self.stats.max_inmem_len.load(Ordering::Relaxed),
+            // T11.4 — DiskBackedQueue tracks set_error latching but does
+            // not itself "drop" items; the spillable wrapper is the
+            // tier responsible for releasing inflight on persistent push
+            // failures, so this counter is always 0 here. See
+            // SpillableWorkStealingQueues::stats() for the populated form.
+            spill_lost_permanently: 0,
         }
     }
 

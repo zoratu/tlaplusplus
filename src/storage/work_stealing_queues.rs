@@ -636,6 +636,7 @@ impl<T: 'static> WorkStealingQueues<T> {
             loaded_segments: 0,
             loaded_items: 0,
             max_inmem_len: 0, // Not tracked for work-stealing
+            spill_lost_permanently: 0, // Not applicable; only the spillable wrapper drops items.
         }
     }
 

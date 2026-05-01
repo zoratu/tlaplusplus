@@ -3358,6 +3358,7 @@ where
                     loaded_segments: 0,
                     loaded_items: 0,
                     max_inmem_len: 0,
+                    spill_lost_permanently: 0,
                 }
             },
             fingerprints: fp_store.stats(),
