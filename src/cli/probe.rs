@@ -9,7 +9,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use crate::tla::action_exec::probe_next_disjuncts_with_instances;
 use crate::tla::module::TlaModuleInstance;
 #[cfg(test)]
 use crate::tla::tla_state;
@@ -22,7 +21,6 @@ use crate::tla::{
     scan_module_closure, set_active_eval_budget, split_action_body_disjuncts, split_top_level,
 };
 
-use super::args::Command;
 use super::shared::{
     config_value_to_expr, config_value_to_tla, inject_constants_into_definitions,
     inject_constants_into_module_tree,
@@ -3044,7 +3042,7 @@ mod tests {
     use super::*;
     use clap::Parser;
     use std::fs;
-    use crate::cli::Cli;
+    use crate::cli::{args::Command, Cli};
     use crate::models::tla_native::TlaModel;
     use crate::tla::{parse_tla_module_file, parse_tla_module_text};
 

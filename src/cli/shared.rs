@@ -2,7 +2,6 @@
 //!
 //! Extracted from `src/main.rs` as part of the cli/ refactor.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::distributed::ClusterConfig;

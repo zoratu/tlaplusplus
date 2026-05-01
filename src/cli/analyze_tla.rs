@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use crate::models::tla_native::TlaModel;
 use crate::tla::action_exec::probe_next_disjuncts_with_instances;
-use crate::tla::module::TlaModuleInstance;
 use crate::tla::{
     ActionClause, ClauseKind, ConfigValue, EvalContext, TlaConfig, TlaDefinition, TlaModule,
     TlaState, TlaValue, classify_clause, compile_action_ir, compile_action_ir_branches,

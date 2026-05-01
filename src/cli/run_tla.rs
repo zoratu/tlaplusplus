@@ -2,7 +2,7 @@
 //!
 //! Extracted from `src/main.rs` as part of the cli/ refactor.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::distributed::ClusterConfig;
@@ -10,9 +10,6 @@ use crate::distributed::handler::StolenState;
 use crate::distributed::transport::ClusterTransport;
 use crate::distributed::work_stealer::DistributedWorkStealer;
 use crate::models::tla_native::TlaModel;
-use crate::system::{check_thp_and_warn, parse_cpu_list};
-use crate::tla::action_exec::probe_next_disjuncts_with_instances;
-use crate::tla::module::TlaModuleInstance;
 use crate::tla::{
     ActionClause, ClauseKind, ConfigValue, EvalContext, TlaConfig, TlaDefinition, TlaModule,
     TlaState, TlaValue, classify_clause, compile_action_ir, compile_action_ir_branches,
@@ -21,7 +18,7 @@ use crate::tla::{
     parse_stuttering_action_expr, parse_tla_config, parse_tla_module_file, restore_eval_budget,
     scan_module_closure, set_active_eval_budget, split_action_body_disjuncts, split_top_level,
 };
-use crate::{EngineConfig, SimulationConfig, run_model, run_simulation};
+use crate::{SimulationConfig, run_simulation};
 
 use super::probe::build_probe_eval_context;
 use super::run_model::{
