@@ -547,6 +547,8 @@ fn eval_let_action_multi_branch(
     let (defs_text, body_text) =
         split_outer_let(expr).ok_or_else(|| anyhow!("invalid LET expression in action: {expr}"))?;
     let defs = parse_let_definitions(defs_text)?;
+    // T203: charge budget for clone-on-write.
+    ctx.check_budget(ctx.local_definitions.len().saturating_add(defs.len()))?;
     let child_ctx = ctx.with_local_definitions(defs);
     eval_action_body_text_multi(body_text, &child_ctx, branch)
 }
@@ -2001,6 +2003,9 @@ fn eval_let_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
     let (defs_text, body_text) =
         split_outer_let(expr).ok_or_else(|| anyhow!("invalid LET expression: {expr}"))?;
     let defs = parse_let_definitions(defs_text)?;
+    // T203: charge budget for the clone-on-write of local_definitions.
+    // Pathological nested LET inputs allocate O(N x M) without this.
+    ctx.check_budget(ctx.local_definitions.len().saturating_add(defs.len()))?;
     let child = ctx.with_local_definitions(defs);
     eval_expr_inner(body_text, &child, depth + 1)
 }
