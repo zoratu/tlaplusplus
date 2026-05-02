@@ -538,11 +538,20 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
     }
 
     // LAMBDA (must check before logical operators)
-    // LAMBDA binds loosely - everything after the colon is the body
-    if expr.starts_with("LAMBDA ") {
+    // LAMBDA binds loosely - everything after the colon is the body.
+    // T202: detect LAMBDA via word-boundary match (matching the interpreter's
+    // `starts_with_keyword`) so inputs like "LAMBDA\t..." or "LAMBDA\n..."
+    // take the LAMBDA branch here too — otherwise the literal " " check
+    // missed those cases and the compiler fell through to the comparison
+    // parser, returning `Bool(...)` while the interpreter returned `Lambda`.
+    // If the LAMBDA prefix is recognised but `try_parse_lambda` rejects the
+    // shape (e.g. non-identifier params), return `Unparsed(expr)` so the
+    // interpreter handles it and the two paths agree.
+    if starts_with_lambda_keyword(expr) {
         if let Some(lambda) = try_parse_lambda(expr) {
             return lambda;
         }
+        return CompiledExpr::Unparsed(expr.to_string());
     }
 
     // CASE expression (must check before logical operators)
@@ -2734,9 +2743,38 @@ fn try_parse_let(expr: &str) -> Option<CompiledExpr> {
     })
 }
 
+/// True when `expr` begins with `LAMBDA` followed by a non-word character
+/// (or end of string). Mirrors `eval::starts_with_keyword(expr, "LAMBDA")`
+/// so the compiler and interpreter agree on what counts as a LAMBDA prefix.
+/// T202: pre-fix the compiler used `expr.starts_with("LAMBDA ")` which
+/// missed `LAMBDA\t...`, `LAMBDA\n...` and `LAMBDA(...)`, so those inputs
+/// fell through to the comparison parser and produced `Bool(...)` while
+/// the interpreter produced `Lambda(...)`.
+fn starts_with_lambda_keyword(expr: &str) -> bool {
+    let Some(rest) = expr.strip_prefix("LAMBDA") else {
+        return false;
+    };
+    rest.chars()
+        .next()
+        .map(|c| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(true)
+}
+
+/// Strip a `LAMBDA` keyword prefix (with word-boundary check) and return
+/// the remainder. Counterpart to `starts_with_lambda_keyword`.
+fn strip_lambda_keyword(expr: &str) -> Option<&str> {
+    let rest = expr.strip_prefix("LAMBDA")?;
+    match rest.chars().next() {
+        Some(c) if c.is_alphanumeric() || c == '_' => None,
+        _ => Some(rest),
+    }
+}
+
 fn try_parse_lambda(expr: &str) -> Option<CompiledExpr> {
     // LAMBDA x: body  OR  LAMBDA x, y: body
-    let rest = expr.strip_prefix("LAMBDA ")?.trim();
+    // T202: accept any non-word boundary after `LAMBDA` (space, tab, newline,
+    // `(` etc.) — matches the interpreter's `starts_with_keyword` semantics.
+    let rest = strip_lambda_keyword(expr)?.trim();
 
     let colon_idx = find_top_level_colon(rest)?;
     let params_str = rest[..colon_idx].trim();
