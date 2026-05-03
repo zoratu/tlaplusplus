@@ -16,6 +16,23 @@
 //! one returning Ok while the other returns Err, or both returning Ok with
 //! different values — is treated as a panic and aborts the fuzz run, the
 //! same proptest-T2-style equivalence check used in `tests/compiled_vs_interpreted.rs`.
+//!
+//! T201 + T203 + T204 added eval-budget enforcement at the range / set
+//! comprehension / function constructor / LET-binding clone-on-write /
+//! per-call entry points. The budget converts unbounded eval loops into
+//! `Err(EvalBudgetExceeded)`, but it caps element count, not bytes — a
+//! single 100K-element Set still allocates ~MB. Plus the parser/splitter
+//! allocates intermediate Strings before each recursive `eval_expr_inner`
+//! call. Adversarial fuzz inputs can therefore push libFuzzer's default
+//! 2 GB RSS limit even with budget enforcement.
+//!
+//! For this reason the validation gate runs with `-rss_limit_mb=8192`
+//! (see `scripts/fuzz.sh`). This target's responsibility is to surface
+//! **panics, sanitizer trips, and compiler-vs-interpreter divergences** —
+//! i.e. soundness bugs. RSS-cap exits from adversarial inputs exploring
+//! memory consumption are noise; a high cap lets the fuzzer focus on the
+//! soundness signal. Production runs use `budget=None`; this is fuzz
+//! harness configuration only, not user-facing behavior.
 
 use libfuzzer_sys::fuzz_target;
 use std::panic::{AssertUnwindSafe, catch_unwind};

@@ -43,9 +43,21 @@ echo ""
 #   - Memory leaks
 #   - Invalid pointer operations
 
-FUZZ_ARGS=""
+# RSS cap: libFuzzer defaults to 2 GB and exits with status 71 on overflow.
+# Eval-path fuzz targets (notably fuzz_tla_swarm) can construct adversarial
+# TLA+ expressions that legally allocate gigabytes — the eval budget
+# infrastructure (`set_active_eval_budget` + `EvalContext::check_budget`)
+# bounds memory when set, but the fuzz harness uses a 100K-element budget
+# that doesn't translate to a hard byte cap. Raising the libFuzzer RSS
+# limit to 8 GB lets adversarial inputs run to completion so the fuzzer
+# focuses on what matters: panics, divergences, sanitizer trips. OOM noise
+# is suppressed; real soundness bugs still fail the run. Override with
+# `RSS_LIMIT_MB=N ./scripts/fuzz.sh ...`.
+RSS_LIMIT_MB=${RSS_LIMIT_MB:-8192}
+
+FUZZ_ARGS="-- -rss_limit_mb=$RSS_LIMIT_MB"
 if [ "$DURATION" -gt 0 ]; then
-    FUZZ_ARGS="-- -max_total_time=$DURATION"
+    FUZZ_ARGS="$FUZZ_ARGS -max_total_time=$DURATION"
 fi
 
 cargo +nightly fuzz run "$TARGET" \
