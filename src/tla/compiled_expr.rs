@@ -757,6 +757,17 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
     // T101.1: arithmetic is left-associative, so we use *_last to take the
     // RIGHTMOST top-level operator. This makes `a + b + c` parse as
     // `(a + b) + c`, matching the interpreter (`split_top_level_additive`).
+    // T206: forward chained arithmetic to the interpreter. Compiler and
+    // interpreter use different splitter cascades; they diverge on
+    // associativity for chains of 2+ binary arithmetic ops. The interpreter
+    // is the reference. Emit Unparsed here — AFTER all structural keyword
+    // handlers (IF/LET/LAMBDA/CASE/quantifiers) so those still parse into
+    // structured AST — and BEFORE the binary arithmetic split cascade so
+    // chained ops never reach the divergent splitters.
+    if has_chained_top_level_arithmetic(expr) {
+        return CompiledExpr::Unparsed(expr.to_string());
+    }
+
     if let Some((left, right)) = split_binary_op_last(expr, "+") {
         return CompiledExpr::Add(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
     }
@@ -4600,3 +4611,71 @@ fn test_txlifecycle_body_compiles_to_two_conjuncts() {
         other => panic!("Expected And, got: {:?}", other),
     }
 }
+
+/// T206: detect expressions with 3+ top-level binary `-` (or `+`) occurrences,
+/// the precise pattern where compiler/interpreter associativity diverges.
+/// Such chains return wrong answers (T206 case: `0-2--442-...^^4` →
+/// interpreter -56, compiler -48, off by 8). Caller emits `Unparsed` so
+/// the interpreter (the reference) parses it.
+///
+/// We deliberately DO NOT trigger on simple shapes like `x * -3` or
+/// `a + b` (≤2 ops including unary) — those compile correctly. The
+/// fallback only kicks in for genuine chains.
+fn has_chained_top_level_arithmetic(expr: &str) -> bool {
+    let bytes = expr.as_bytes();
+    let mut depth_paren = 0i32;
+    let mut depth_brace = 0i32;
+    let mut depth_bracket = 0i32;
+    let mut depth_angle = 0i32;
+    let mut in_string = false;
+    let mut prev_non_ws: Option<u8> = None;
+    let mut binary_minus_or_plus = 0u32;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if b == b'"' { in_string = false; }
+            i += 1; continue;
+        }
+        match b {
+            b'"' => { in_string = true; }
+            b'(' => depth_paren += 1,
+            b')' => depth_paren -= 1,
+            b'{' => depth_brace += 1,
+            b'}' => depth_brace -= 1,
+            b'[' => depth_bracket += 1,
+            b']' => depth_bracket -= 1,
+            b'<' if i + 1 < bytes.len() && bytes[i + 1] == b'<' => {
+                depth_angle += 1; i += 2; continue;
+            }
+            b'>' if i + 1 < bytes.len() && bytes[i + 1] == b'>' => {
+                depth_angle -= 1; i += 2; continue;
+            }
+            b'-' | b'+' if depth_paren == 0
+                && depth_brace == 0
+                && depth_bracket == 0
+                && depth_angle == 0 =>
+            {
+                // Binary if the previous non-whitespace char is a value-end:
+                // digit, identifier-letter, `)`, `]`, `>` (close angle).
+                if let Some(p) = prev_non_ws {
+                    if p.is_ascii_digit() || p.is_ascii_alphabetic() || p == b'_'
+                        || p == b')' || p == b']' || p == b'>'
+                    {
+                        binary_minus_or_plus += 1;
+                        if binary_minus_or_plus >= 3 {
+                            return true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        if !b.is_ascii_whitespace() {
+            prev_non_ws = Some(b);
+        }
+        i += 1;
+    }
+    false
+}
+
