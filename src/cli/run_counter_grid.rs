@@ -5,7 +5,10 @@
 use crate::models::counter_grid::CounterGridModel;
 
 use super::run_model::run_model_with_s3;
-use super::shared::{build_engine_config, maybe_setup_cluster, print_stats, run_system_checks};
+use super::shared::{
+    build_engine_config, maybe_setup_cluster, print_cluster_stats_if_any, print_stats,
+    run_system_checks,
+};
 
 pub(crate) fn handle(
     max_x: u32,
@@ -21,9 +24,11 @@ pub(crate) fn handle(
     let mut config = build_engine_config(&runtime, &storage, s3.s3_bucket.is_some())?;
     // Wire distributed-cluster mode if --cluster-listen was passed.
     // T6: enables cross-node work stealing across the cluster.
-    maybe_setup_cluster(&cluster, &mut config)?;
+    let cluster_stealer = maybe_setup_cluster(&cluster, &mut config)?;
     let outcome = run_model_with_s3(model, config, &s3)?;
     print_stats("counter-grid", &outcome.stats);
+    // T204.1: cluster runs surface protocol counters in the run summary.
+    print_cluster_stats_if_any(cluster_stealer.as_ref());
     if let Some(violation) = outcome.violation {
         println!("violation=true");
         println!("violation_message={}", violation.message);

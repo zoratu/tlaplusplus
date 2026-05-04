@@ -212,6 +212,11 @@ pub(crate) fn handle(
         build_engine_config(&runtime, &storage, s3.s3_bucket.is_some())?;
 
     // --- Distributed cluster startup ---
+    // Hoisted out of the if-let so the run-summary path below can call
+    // `print_stats()` on the stealer (T204.1). The Arc lives across the
+    // call to `run_model_with_s3` because `engine_config` only holds a
+    // clone of it.
+    let mut cluster_stealer: Option<Arc<DistributedWorkStealer>> = None;
     if let Some(ref listen_addr_str) = cluster.cluster_listen {
         let listen_addr: std::net::SocketAddr = listen_addr_str.parse().map_err(|e| {
             anyhow::anyhow!(
@@ -301,6 +306,7 @@ pub(crate) fn handle(
             "[cluster] distributed mode active: node {}, {} total nodes",
             cluster.node_id, num_nodes
         );
+        cluster_stealer = Some(stealer);
     }
 
     let mut outcome = run_model_with_s3(model, engine_config, &s3).map_err(|e| {
@@ -420,6 +426,12 @@ pub(crate) fn handle(
         duration_str,
         end_time.format("%Y-%m-%d %H:%M:%S")
     );
+
+    // T204.1: surface cluster steal-protocol counters in the run summary.
+    // No-op when --cluster-listen wasn't passed.
+    if let Some(ref s) = cluster_stealer {
+        s.print_stats();
+    }
 
     // Feature 3 & 5: Report violations (multiple if --continue or --max-violations)
     // Collect all violations: first from outcome.violation, rest from outcome.violations

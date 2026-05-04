@@ -532,9 +532,11 @@ impl DistributedWorkStealer {
         self.steal_responses_empty.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Print diagnostic stats.
-    pub fn print_stats(&self) {
-        println!(
+    /// Format the diagnostic-stats line as a String. Pulled out of
+    /// `print_stats` so the formatting (and the counter wiring) can be
+    /// asserted from a unit test without capturing stdout.
+    pub fn format_stats(&self) -> String {
+        format!(
             "[cluster] node {} stats: stolen={}, donated={}, bloom_dedup={}, bloom_exchanges={}, \
              steal_req_sent={}, steal_req_failed={}, steal_resp_empty={}",
             self.node_id,
@@ -545,7 +547,19 @@ impl DistributedWorkStealer {
             self.steal_requests_sent.load(Ordering::Relaxed),
             self.steal_requests_failed.load(Ordering::Relaxed),
             self.steal_responses_empty.load(Ordering::Relaxed),
-        );
+        )
+    }
+
+    /// Print diagnostic stats to stdout.
+    ///
+    /// Wired into the run-summary path in
+    /// `cli/shared.rs::print_cluster_stats_if_any` so cluster runs surface
+    /// the stolen / donated / steal_req_sent / steal_req_failed /
+    /// bloom_exchanges counters by default. Without this hook the
+    /// protocol counters were maintained but never rendered, leaving
+    /// operators blind to whether stealing was actually firing.
+    pub fn print_stats(&self) {
+        println!("{}", self.format_stats());
     }
 }
 
@@ -664,6 +678,69 @@ mod tests {
         assert!(!stealer.can_donate(500));
         assert!(stealer.can_donate(1000));
         assert!(stealer.can_donate(5000));
+    }
+
+    #[test]
+    fn format_stats_includes_all_protocol_counters() {
+        // T204.1: the cluster run-summary hook calls print_stats(), which
+        // renders format_stats(). The line must surface every protocol
+        // counter the operator needs to see — stolen, donated, bloom
+        // exchanges, steal-requests sent/failed/empty. Mutations that
+        // drop a counter from the format string are caught here.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let transport = dummy_transport();
+        let stealer = DistributedWorkStealer::new(
+            7, // node id we expect rendered
+            2,
+            Arc::clone(&transport),
+            rt.handle().clone(),
+        );
+
+        // Bump every counter to a distinct, recognizable value so we can
+        // assert each name->value pair is wired correctly. The exact
+        // values are arbitrary but distinct primes-ish so a swap mutation
+        // (e.g. donated and stolen accidentally formatted the same) would
+        // be visible.
+        stealer.states_stolen.store(11, Ordering::Relaxed);
+        stealer.states_donated.store(22, Ordering::Relaxed);
+        stealer.bloom_dedup_hits.store(33, Ordering::Relaxed);
+        stealer.bloom_exchanges.store(44, Ordering::Relaxed);
+        stealer.steal_requests_sent.store(55, Ordering::Relaxed);
+        stealer.steal_requests_failed.store(66, Ordering::Relaxed);
+        stealer.steal_responses_empty.store(77, Ordering::Relaxed);
+
+        let line = stealer.format_stats();
+        // node id
+        assert!(
+            line.contains("node 7"),
+            "expected node id in line, got: {line}"
+        );
+        // each counter name + value
+        assert!(line.contains("stolen=11"), "missing stolen=11 in: {line}");
+        assert!(line.contains("donated=22"), "missing donated=22 in: {line}");
+        assert!(
+            line.contains("bloom_dedup=33"),
+            "missing bloom_dedup=33 in: {line}"
+        );
+        assert!(
+            line.contains("bloom_exchanges=44"),
+            "missing bloom_exchanges=44 in: {line}"
+        );
+        assert!(
+            line.contains("steal_req_sent=55"),
+            "missing steal_req_sent=55 in: {line}"
+        );
+        assert!(
+            line.contains("steal_req_failed=66"),
+            "missing steal_req_failed=66 in: {line}"
+        );
+        assert!(
+            line.contains("steal_resp_empty=77"),
+            "missing steal_resp_empty=77 in: {line}"
+        );
     }
 
     #[test]

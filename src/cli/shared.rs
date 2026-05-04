@@ -306,9 +306,9 @@ pub(crate) fn fetch_s3_file(uri: &str) -> anyhow::Result<std::path::PathBuf> {
 pub(crate) fn maybe_setup_cluster(
     cluster: &ClusterArgs,
     engine_config: &mut EngineConfig,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<Arc<DistributedWorkStealer>>> {
     let Some(ref listen_addr_str) = cluster.cluster_listen else {
-        return Ok(());
+        return Ok(None);
     };
     let listen_addr: std::net::SocketAddr = listen_addr_str.parse().map_err(|e| {
         anyhow::anyhow!(
@@ -394,7 +394,21 @@ pub(crate) fn maybe_setup_cluster(
         "[cluster] distributed mode active: node {}, {} total nodes",
         cluster.node_id, num_nodes
     );
-    Ok(())
+    Ok(Some(stealer))
+}
+
+/// T204.1: surface cluster steal-protocol stats from the run summary.
+///
+/// `DistributedWorkStealer::print_stats` exists but was never invoked from
+/// the run path, so cluster runs completed without showing stolen /
+/// donated / steal_req_sent / steal_req_failed / bloom_exchanges. Each
+/// subcommand handler that calls `maybe_setup_cluster` should also call
+/// this on the returned `Option<Arc<DistributedWorkStealer>>` after the
+/// run completes, so cluster mode emits the protocol counters by default.
+pub(crate) fn print_cluster_stats_if_any(stealer: Option<&Arc<DistributedWorkStealer>>) {
+    if let Some(s) = stealer {
+        s.print_stats();
+    }
 }
 
 
