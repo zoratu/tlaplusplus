@@ -170,6 +170,14 @@ fn eval_compiled_inner(
                 return Ok(value);
             }
 
+            // T205: known zero-arg built-ins must be evaluated even when bare
+            // (interpreter does this in resolve_identifier). Without this the
+            // compiler returns ModelValue("IOEnv") while the interpreter
+            // returns the actual env Record — surfaced by fuzz_tla_swarm.
+            if matches!(name.as_str(), "IOEnv" | "EmptyBag") {
+                return crate::tla::eval::eval_operator_call(name, Vec::new(), ctx, depth + 1);
+            }
+
             // Fall back to model value for undefined identifiers
             if std::env::var("TLAPP_TRACE_VAR").is_ok() {
                 eprintln!("VAR {} -> ModelValue", name);
