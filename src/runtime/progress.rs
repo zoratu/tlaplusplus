@@ -19,6 +19,67 @@ use std::time::{Duration, Instant};
 
 use super::AtomicRunStats;
 
+/// Format a u64 with TLC-style comma group separators (1,234,567).
+///
+/// Pure helper, extracted from the progress-thread closure so it can be
+/// covered by unit tests. Used to format every numeric column in the
+/// `Progress(...)` line.
+pub(super) fn format_with_commas(n: u64) -> String {
+    let s = n.to_string();
+    let mut result = String::new();
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    result.chars().rev().collect()
+}
+
+/// Compute the ETA suffix shown on a Progress(...) line, given the
+/// queue drain rate in states/sec.
+///
+/// - drain_rate > 10:   queue is draining; ETA in seconds/minutes/hours/days
+///   based on `queue_pending / drain_rate`.
+/// - drain_rate < -10:  queue is growing; surfaced as "ETA: queue growing".
+/// - otherwise:          rate is in the ±10 dead-band; "ETA: stabilizing".
+///
+/// Pure helper, extracted from the progress-thread closure so it can be
+/// covered by unit tests.
+pub(super) fn format_eta_suffix(queue_pending: u64, drain_rate: f64) -> String {
+    if drain_rate > 10.0 {
+        let eta_secs = queue_pending as f64 / drain_rate;
+        if eta_secs < 60.0 {
+            format!(" ETA: {:.0}s", eta_secs)
+        } else if eta_secs < 3600.0 {
+            format!(" ETA: {:.1}m", eta_secs / 60.0)
+        } else if eta_secs < 86400.0 {
+            format!(" ETA: {:.1}h", eta_secs / 3600.0)
+        } else {
+            format!(" ETA: {:.1}d", eta_secs / 86400.0)
+        }
+    } else if drain_rate < -10.0 {
+        " ETA: queue growing".to_string()
+    } else {
+        " ETA: stabilizing".to_string()
+    }
+}
+
+/// Compute the per-minute rate (states/min) given a delta and an elapsed
+/// duration in seconds. Returns 0 when `elapsed_secs <= 0` to avoid
+/// divide-by-zero on the first tick.
+///
+/// Pure helper, extracted from the progress-thread closure so it can be
+/// covered by unit tests.
+pub(super) fn rate_per_minute(delta: u64, elapsed_secs: f64) -> u64 {
+    let elapsed_mins = elapsed_secs / 60.0;
+    if elapsed_mins > 0.0 {
+        (delta as f64 / elapsed_mins) as u64
+    } else {
+        0
+    }
+}
+
 pub(super) fn spawn_progress_thread<S>(
     run_stats: Arc<AtomicRunStats>,
     stop: Arc<AtomicBool>,
@@ -145,60 +206,20 @@ where
             // Calculate rates per minute
             let now = Instant::now();
             let elapsed_secs = now.duration_since(last_time).as_secs_f64();
-            let elapsed_mins = elapsed_secs / 60.0;
 
-            let generated_rate = if elapsed_mins > 0.0 {
-                ((states_generated - last_generated) as f64 / elapsed_mins) as u64
-            } else {
-                0
-            };
-
-            let distinct_rate = if elapsed_mins > 0.0 {
-                ((states_distinct - last_distinct) as f64 / elapsed_mins) as u64
-            } else {
-                0
-            };
+            let generated_rate =
+                rate_per_minute(states_generated - last_generated, elapsed_secs);
+            let distinct_rate =
+                rate_per_minute(states_distinct - last_distinct, elapsed_secs);
 
             // Format timestamp in TLC style: YYYY-MM-DD HH:MM:SS
             let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-
-            // Format numbers with commas (TLC style)
-            fn format_with_commas(n: u64) -> String {
-                let s = n.to_string();
-                let mut result = String::new();
-                for (i, c) in s.chars().rev().enumerate() {
-                    if i > 0 && i % 3 == 0 {
-                        result.push(',');
-                    }
-                    result.push(c);
-                }
-                result.chars().rev().collect()
-            }
 
             // Calculate ETA based on queue drain rate
             let eta_str = if progress_counter > 1 && elapsed_secs > 0.0 {
                 let queue_delta = last_queue_pending as i64 - queue_pending as i64;
                 let drain_rate = queue_delta as f64 / elapsed_secs; // states/sec
-
-                if drain_rate > 10.0 {
-                    // Queue is draining - estimate completion time
-                    let eta_secs = queue_pending as f64 / drain_rate;
-                    if eta_secs < 60.0 {
-                        format!(" ETA: {:.0}s", eta_secs)
-                    } else if eta_secs < 3600.0 {
-                        format!(" ETA: {:.1}m", eta_secs / 60.0)
-                    } else if eta_secs < 86400.0 {
-                        format!(" ETA: {:.1}h", eta_secs / 3600.0)
-                    } else {
-                        format!(" ETA: {:.1}d", eta_secs / 86400.0)
-                    }
-                } else if drain_rate < -10.0 {
-                    // Queue is growing
-                    " ETA: queue growing".to_string()
-                } else {
-                    // Queue is stable
-                    " ETA: stabilizing".to_string()
-                }
+                format_eta_suffix(queue_pending, drain_rate)
             } else {
                 String::new()
             };
@@ -223,4 +244,103 @@ where
             last_time = now;
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_eta_suffix, format_with_commas, rate_per_minute};
+
+    #[test]
+    fn format_with_commas_handles_small_numbers() {
+        assert_eq!(format_with_commas(0), "0");
+        assert_eq!(format_with_commas(1), "1");
+        assert_eq!(format_with_commas(99), "99");
+        assert_eq!(format_with_commas(999), "999");
+    }
+
+    #[test]
+    fn format_with_commas_inserts_separator_at_thousands_boundary() {
+        // Boundary kills off-by-one mutations on the `i % 3 == 0` test.
+        assert_eq!(format_with_commas(1_000), "1,000");
+        assert_eq!(format_with_commas(12_345), "12,345");
+        assert_eq!(format_with_commas(1_234_567), "1,234,567");
+        assert_eq!(format_with_commas(1_000_000_000), "1,000,000,000");
+    }
+
+    #[test]
+    fn format_with_commas_handles_u64_max() {
+        // 18,446,744,073,709,551,615 — exercise the all-the-way-up path.
+        assert_eq!(format_with_commas(u64::MAX), "18,446,744,073,709,551,615");
+    }
+
+    #[test]
+    fn rate_per_minute_zero_elapsed_returns_zero() {
+        // Avoids divide-by-zero on the first progress tick.
+        assert_eq!(rate_per_minute(1_000, 0.0), 0);
+        assert_eq!(rate_per_minute(0, 0.0), 0);
+    }
+
+    #[test]
+    fn rate_per_minute_basic_arithmetic() {
+        // 600 states in 60s → 600 states/min.
+        assert_eq!(rate_per_minute(600, 60.0), 600);
+        // 100 states in 30s → 200 states/min.
+        assert_eq!(rate_per_minute(100, 30.0), 200);
+        // 0 delta → 0 rate.
+        assert_eq!(rate_per_minute(0, 60.0), 0);
+    }
+
+    #[test]
+    fn eta_suffix_dead_band_returns_stabilizing() {
+        // |drain_rate| <= 10 (inclusive both ends → "stabilizing").
+        assert_eq!(format_eta_suffix(1_000, 0.0), " ETA: stabilizing");
+        assert_eq!(format_eta_suffix(1_000, 10.0), " ETA: stabilizing");
+        assert_eq!(format_eta_suffix(1_000, -10.0), " ETA: stabilizing");
+        assert_eq!(format_eta_suffix(1_000, 5.5), " ETA: stabilizing");
+    }
+
+    #[test]
+    fn eta_suffix_growing_below_minus_10() {
+        assert_eq!(format_eta_suffix(0, -11.0), " ETA: queue growing");
+        assert_eq!(format_eta_suffix(1_000, -1_000.0), " ETA: queue growing");
+    }
+
+    #[test]
+    fn eta_suffix_seconds_unit_under_60s() {
+        // 50 items / 100 per-sec drain = 0.5s → "1s" (rounded to 0 decimals).
+        // Use 110 / 110 = 1 for an unambiguous "1s".
+        assert_eq!(format_eta_suffix(110, 110.0), " ETA: 1s");
+    }
+
+    #[test]
+    fn eta_suffix_minutes_unit_between_60s_and_3600s() {
+        // 1200 items / 20 per-sec = 60s — boundary; the `< 60.0` test means
+        // exactly-60 falls into the minutes arm.
+        let s = format_eta_suffix(1200, 20.0);
+        assert!(s.starts_with(" ETA: ") && s.ends_with("m"), "got {s:?}");
+    }
+
+    #[test]
+    fn eta_suffix_hours_unit_between_3600s_and_86400s() {
+        // drain_rate must be > 10 to enter the draining branch.
+        // 144_000 items / 20 per-sec = 7200s = 2h.
+        let s = format_eta_suffix(144_000, 20.0);
+        assert!(s.ends_with("h"), "expected hour units, got {s:?}");
+    }
+
+    #[test]
+    fn eta_suffix_days_unit_above_86400s() {
+        // 2_000_000 items / 20 per-sec = 100_000s ≈ 1.16d. drain_rate > 10
+        // gates entry to the draining branch.
+        let s = format_eta_suffix(2_000_000, 20.0);
+        assert!(s.ends_with("d"), "expected day units, got {s:?}");
+    }
+
+    #[test]
+    fn eta_suffix_just_above_drain_threshold() {
+        // drain_rate = 10.1 (just above the 10.0 threshold) — must enter
+        // the draining branch, not the stabilizing one.
+        let s = format_eta_suffix(0, 10.1);
+        assert_ne!(s, " ETA: stabilizing");
+    }
 }

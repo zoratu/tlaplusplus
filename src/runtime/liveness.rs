@@ -596,3 +596,242 @@ where
 
     violation
 }
+
+#[cfg(test)]
+mod tests {
+    //! Behavioural coverage for the T10 liveness post-processing pipeline.
+    //!
+    //! We test the public `run_post_processing` entry by feeding tiny labeled
+    //! transition graphs through it: zero edges, a single non-cycle, a
+    //! self-loop SCC with and without a satisfying fairness constraint.
+    //! This kills mutations that flip the early-return guards or invert the
+    //! fairness verdict.
+    use super::*;
+    use crate::fairness::FairnessConstraint;
+    use crate::model::{ActionLabel, LabeledTransition};
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
+    struct LivState {
+        v: u32,
+    }
+
+    /// Test model with a configurable fairness-constraint vector and Next
+    /// action name. The graph itself is supplied externally via the
+    /// labeled_transitions DashMap.
+    struct LivModel {
+        constraints: Vec<FairnessConstraint>,
+        next_name: Option<&'static str>,
+    }
+
+    impl Model for LivModel {
+        type State = LivState;
+        fn name(&self) -> &'static str {
+            "liv-test-model"
+        }
+        fn initial_states(&self) -> Vec<Self::State> {
+            Vec::new()
+        }
+        fn next_states(&self, _state: &Self::State, _out: &mut Vec<Self::State>) {}
+        fn check_invariants(&self, _state: &Self::State) -> Result<(), String> {
+            Ok(())
+        }
+        fn fairness_constraints(&self) -> Vec<FairnessConstraint> {
+            self.constraints.clone()
+        }
+        fn next_action_name(&self) -> Option<&str> {
+            self.next_name
+        }
+    }
+
+    fn config_for_test() -> EngineConfig {
+        EngineConfig {
+            enforce_cgroups: false,
+            liveness_streaming: false,
+            ..EngineConfig::default()
+        }
+    }
+
+    /// Build a labeled-transitions DashMap keyed by `from` state (the same
+    /// shape the runtime passes to `run_post_processing`).
+    fn build_transitions(
+        edges: &[(LivState, LivState, &str)],
+    ) -> Arc<DashMap<u64, Vec<LabeledTransition<LivState>>>> {
+        let map: DashMap<u64, Vec<LabeledTransition<LivState>>> = DashMap::new();
+        // Use a default-hash-based fingerprint that matches Model::fingerprint
+        // (the Model trait uses ahash); for the runtime path the runtime
+        // computes from-fp via model.fingerprint, so the key here can be any
+        // stable hash — what matters is that we collect all edges. We key on
+        // a per-from counter to keep entries grouped.
+        use std::hash::Hasher;
+        for (from, to, action) in edges {
+            let mut h = ahash::AHasher::default();
+            std::hash::Hash::hash(from, &mut h);
+            let from_fp = h.finish();
+            map.entry(from_fp).or_default().push(LabeledTransition {
+                from: from.clone(),
+                to: to.clone(),
+                action: ActionLabel {
+                    name: action.to_string(),
+                    disjunct_index: None,
+                },
+            });
+        }
+        Arc::new(map)
+    }
+
+    #[test]
+    fn returns_none_when_existing_safety_violation() {
+        // Safety failures take precedence — fairness check is skipped
+        // entirely, so the function must return None even with a
+        // graph that would otherwise violate fairness.
+        let model = Arc::new(LivModel {
+            constraints: vec![FairnessConstraint::Weak {
+                vars: vec!["x".into()],
+                action: "Step".into(),
+            }],
+            next_name: Some("Next"),
+        });
+        let s0 = LivState { v: 0 };
+        let edges = build_transitions(&[(s0.clone(), s0.clone(), "Other")]);
+        let v = run_post_processing(true, &model, Some(&edges), &config_for_test());
+        assert!(v.is_none(), "existing_violation=true short-circuits");
+    }
+
+    #[test]
+    fn returns_none_when_labeled_transitions_missing() {
+        // No transitions map → fairness checking has nothing to do.
+        let model = Arc::new(LivModel {
+            constraints: Vec::new(),
+            next_name: None,
+        });
+        let v = run_post_processing(false, &model, None, &config_for_test());
+        assert!(v.is_none());
+    }
+
+    #[test]
+    fn returns_none_when_transitions_empty() {
+        // Empty graph → no SCCs, no cycles, no violation.
+        let model = Arc::new(LivModel {
+            constraints: Vec::new(),
+            next_name: None,
+        });
+        let edges = build_transitions(&[]);
+        let v = run_post_processing(false, &model, Some(&edges), &config_for_test());
+        assert!(v.is_none());
+    }
+
+    #[test]
+    fn returns_none_when_graph_is_dag_no_cycles() {
+        // Linear chain s0 → s1 → s2 has only trivial SCCs (size 1, no
+        // self-loop), so no fairness violation can be reported.
+        let model = Arc::new(LivModel {
+            constraints: vec![FairnessConstraint::Weak {
+                vars: vec!["x".into()],
+                action: "Step".into(),
+            }],
+            next_name: Some("Next"),
+        });
+        let s0 = LivState { v: 0 };
+        let s1 = LivState { v: 1 };
+        let s2 = LivState { v: 2 };
+        let edges = build_transitions(&[
+            (s0, s1.clone(), "Step"),
+            (s1, s2, "Step"),
+        ]);
+        let v = run_post_processing(false, &model, Some(&edges), &config_for_test());
+        assert!(v.is_none(), "DAG must not produce a fairness violation");
+    }
+
+    #[test]
+    fn returns_none_when_no_fairness_constraints() {
+        // Even with a self-loop SCC, an empty constraints list means no
+        // checks are run and no violation is emitted.
+        let model = Arc::new(LivModel {
+            constraints: Vec::new(),
+            next_name: None,
+        });
+        let s0 = LivState { v: 0 };
+        let edges = build_transitions(&[(s0.clone(), s0, "Step")]);
+        let v = run_post_processing(false, &model, Some(&edges), &config_for_test());
+        assert!(v.is_none());
+    }
+
+    #[test]
+    fn detects_violation_in_self_loop_scc_missing_fair_action() {
+        // Self-loop labeled "Other" with WF on "Step" must yield a
+        // liveness violation (Step never occurs in the SCC).
+        let model = Arc::new(LivModel {
+            constraints: vec![FairnessConstraint::Weak {
+                vars: vec!["x".into()],
+                action: "Step".into(),
+            }],
+            next_name: None, // no wrapper-Next escape
+        });
+        let s0 = LivState { v: 0 };
+        let edges = build_transitions(&[(s0.clone(), s0, "Other")]);
+        let v = run_post_processing(false, &model, Some(&edges), &config_for_test());
+        let violation = v.expect("expected fairness violation");
+        assert_eq!(violation.property_type, PropertyType::Liveness);
+        assert!(
+            violation.message.contains("Fairness"),
+            "message should mention fairness, got {:?}",
+            violation.message
+        );
+    }
+
+    #[test]
+    fn satisfied_when_self_loop_scc_carries_fair_action() {
+        // Self-loop labeled "Step" satisfies WF(Step).
+        let model = Arc::new(LivModel {
+            constraints: vec![FairnessConstraint::Weak {
+                vars: vec!["x".into()],
+                action: "Step".into(),
+            }],
+            next_name: None,
+        });
+        let s0 = LivState { v: 0 };
+        let edges = build_transitions(&[(s0.clone(), s0, "Step")]);
+        let v = run_post_processing(false, &model, Some(&edges), &config_for_test());
+        assert!(v.is_none(), "Step occurring in SCC must satisfy WF(Step)");
+    }
+
+    #[test]
+    fn wrapper_next_constraint_satisfied_by_any_edge() {
+        // When the constraint targets the wrapper-Next action name, any
+        // transition in the SCC counts. A self-loop with an unrelated
+        // label must therefore satisfy WF(Next).
+        let model = Arc::new(LivModel {
+            constraints: vec![FairnessConstraint::Weak {
+                vars: vec!["x".into()],
+                action: "Next".into(),
+            }],
+            next_name: Some("Next"),
+        });
+        let s0 = LivState { v: 0 };
+        let edges = build_transitions(&[(s0.clone(), s0, "Other")]);
+        let v = run_post_processing(false, &model, Some(&edges), &config_for_test());
+        assert!(v.is_none(), "wrapper-Next must accept any in-SCC edge");
+    }
+
+    #[test]
+    fn violation_trace_loops_back_to_first_state() {
+        // The violation trace pushes a copy of the first SCC state at the
+        // end so the lasso loop is visible. For a single-state self-loop
+        // the trace must therefore have length 2.
+        let model = Arc::new(LivModel {
+            constraints: vec![FairnessConstraint::Weak {
+                vars: vec!["x".into()],
+                action: "Step".into(),
+            }],
+            next_name: None,
+        });
+        let s0 = LivState { v: 7 };
+        let edges = build_transitions(&[(s0.clone(), s0.clone(), "Other")]);
+        let v = run_post_processing(false, &model, Some(&edges), &config_for_test());
+        let violation = v.expect("expected violation");
+        assert_eq!(violation.trace.len(), 2, "self-loop trace = state, state");
+        assert_eq!(violation.trace[0], s0);
+        assert_eq!(violation.trace[1], s0);
+    }
+}
