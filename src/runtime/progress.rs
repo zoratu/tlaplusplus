@@ -74,7 +74,7 @@ pub(super) fn format_eta_suffix(queue_pending: u64, drain_rate: f64) -> String {
 pub(super) fn rate_per_minute(delta: u64, elapsed_secs: f64) -> u64 {
     let elapsed_mins = elapsed_secs / 60.0;
     if elapsed_mins > 0.0 {
-        ((delta as f64 / elapsed_mins) as u64).min(u64::MAX)
+        (delta as f64 / elapsed_mins) as u64
     } else {
         0
     }
