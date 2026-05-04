@@ -31,6 +31,113 @@ use std::sync::Arc;
 
 use super::{EngineConfig, PropertyType, Violation};
 
+/// Phase-1 flatten: walk the dashmap serially and emit
+/// `(tx_triples, state_by_fp, total_tx)`.
+///
+/// Pulled out of `run_post_processing` so the parallel-vs-serial
+/// equivalence test can drive both paths with the same input and assert
+/// structural agreement on the output. The runtime selects parallel vs
+/// serial via the 80K-entry threshold; this helper IS the serial branch.
+pub(super) fn flatten_transitions_serial<M>(
+    transitions_map: &Arc<DashMap<u64, Vec<LabeledTransition<M::State>>>>,
+    model: &Arc<M>,
+) -> (Vec<(u64, u64, String)>, HashMap<u64, M::State>, usize)
+where
+    M: Model,
+{
+    let mut state_by_fp_local: HashMap<u64, M::State> = HashMap::new();
+    let mut tx_triples_local: Vec<(u64, u64, String)> = Vec::new();
+    let mut total_tx_local = 0usize;
+    for entry in transitions_map.iter() {
+        for trans in entry.value() {
+            total_tx_local += 1;
+            let from_fp = model.fingerprint(&trans.from);
+            let to_fp = model.fingerprint(&trans.to);
+            state_by_fp_local
+                .entry(from_fp)
+                .or_insert_with(|| trans.from.clone());
+            state_by_fp_local
+                .entry(to_fp)
+                .or_insert_with(|| trans.to.clone());
+            tx_triples_local.push((from_fp, to_fp, trans.action.name.clone()));
+        }
+    }
+    (tx_triples_local, state_by_fp_local, total_tx_local)
+}
+
+/// Phase-1 flatten: walk the dashmap shards in parallel via rayon and
+/// emit `(tx_triples, state_by_fp, total_tx)`.
+///
+/// Each shard is a `RwLock<HashMap<K, SharedValue<V>>>`; we acquire each
+/// shard's read lock on a separate rayon thread, walk its raw buckets,
+/// and produce per-shard locals that are then merged sequentially.
+/// First-write-wins on the state map (cross-shard duplicates collapse).
+///
+/// Pulled out of `run_post_processing` so the parallel-vs-serial
+/// equivalence test can drive both paths with the same input.
+pub(super) fn flatten_transitions_parallel<M>(
+    transitions_map: &Arc<DashMap<u64, Vec<LabeledTransition<M::State>>>>,
+    model: &Arc<M>,
+) -> (Vec<(u64, u64, String)>, HashMap<u64, M::State>, usize)
+where
+    M: Model,
+{
+    use dashmap::SharedValue;
+    use rayon::prelude::*;
+
+    let model_ref = model;
+    let shards = transitions_map.shards();
+    let per_shard: Vec<(Vec<(u64, u64, String)>, HashMap<u64, M::State>, usize)> = shards
+        .par_iter()
+        .map(|shard_lock| {
+            let guard = shard_lock.read();
+            let mut local_triples: Vec<(u64, u64, String)> =
+                Vec::with_capacity(guard.len() * 4);
+            let mut local_states: HashMap<u64, M::State> =
+                HashMap::with_capacity(guard.len());
+            let mut local_count = 0usize;
+            unsafe {
+                let raw_iter = guard.iter();
+                for bucket in raw_iter {
+                    let (_k, shared_val): &(
+                        u64,
+                        SharedValue<Vec<LabeledTransition<M::State>>>,
+                    ) = bucket.as_ref();
+                    let txs = shared_val.get();
+                    for trans in txs {
+                        local_count += 1;
+                        let from_fp = model_ref.fingerprint(&trans.from);
+                        let to_fp = model_ref.fingerprint(&trans.to);
+                        local_states
+                            .entry(from_fp)
+                            .or_insert_with(|| trans.from.clone());
+                        local_states
+                            .entry(to_fp)
+                            .or_insert_with(|| trans.to.clone());
+                        local_triples.push((from_fp, to_fp, trans.action.name.clone()));
+                    }
+                }
+            }
+            (local_triples, local_states, local_count)
+        })
+        .collect();
+
+    let total_tx_cap: usize = per_shard.iter().map(|(t, _, _)| t.len()).sum();
+    let unique_cap: usize = per_shard.iter().map(|(_, s, _)| s.len()).max().unwrap_or(0);
+    let mut tx_triples_local: Vec<(u64, u64, String)> = Vec::with_capacity(total_tx_cap);
+    let mut state_by_fp_local: HashMap<u64, M::State> =
+        HashMap::with_capacity(unique_cap.max(64));
+    let mut total_tx_local = 0usize;
+    for (mut triples, states, count) in per_shard {
+        total_tx_local += count;
+        tx_triples_local.append(&mut triples);
+        for (k, v) in states {
+            state_by_fp_local.entry(k).or_insert(v);
+        }
+    }
+    (tx_triples_local, state_by_fp_local, total_tx_local)
+}
+
 /// Run T10 liveness post-processing on the labeled transition graph
 /// produced by the BFS exploration phase.
 ///
@@ -76,7 +183,6 @@ where
     // chunk dispatch cost exceeds the parallel-hash win;
     // above it the parallel hash starts to pay.
     let phase1_start = std::time::Instant::now();
-    use rayon::prelude::*;
 
     // Estimate: total transitions ≈ entries * 4-5 (typical
     // labelled-Next per state). Use a threshold on entries so
@@ -93,122 +199,22 @@ where
     let parallel_flatten = transitions_map.len() >= 80_000;
 
     let (tx_triples, state_by_fp, total_tx) = if parallel_flatten {
-        // T10.1 parallel flatten via dashmap raw-api shards.
-        //
-        // Each dashmap shard is a `RwLock<HashMap<K, SharedValue<V>>>`.
-        // We acquire each shard's read lock on a separate rayon
-        // thread, walk its entries, and produce per-shard
-        // (triples, state_map). Final merge is sequential — but
-        // the state map is by-fingerprint, so each shard's
-        // unique fingerprints are nearly disjoint (collisions
-        // only happen on inter-shard duplicate states).
-        //
-        // We never materialize Vec<LabeledTransition> chunks —
-        // entries are read directly from the shard's locked
-        // hashmap, the only clone happening is the State clone
-        // for the state_by_fp map. This avoids the ~330ms
-        // dashmap → owned-Vec materialization step that the
-        // previous fallback path incurred on N=10.
-        let model_ref = model;
-        let shards = transitions_map.shards();
-        use dashmap::SharedValue;
-        let per_shard: Vec<(Vec<(u64, u64, String)>, HashMap<u64, M::State>, usize)> =
-            shards
-                .par_iter()
-                .map(|shard_lock| {
-                    let guard = shard_lock.read();
-                    let mut local_triples: Vec<(u64, u64, String)> =
-                        Vec::with_capacity(guard.len() * 4);
-                    let mut local_states: HashMap<u64, M::State> =
-                        HashMap::with_capacity(guard.len());
-                    let mut local_count = 0usize;
-                    // Iterate raw buckets of the underlying
-                    // hashbrown::raw::RawTable. Each bucket holds
-                    // &(K, SharedValue<V>); we deref via
-                    // bucket.as_ref(). This is the public
-                    // raw-api dashmap path used by their own
-                    // OwningIter.
-                    unsafe {
-                        let raw_iter = guard.iter();
-                        for bucket in raw_iter {
-                            let (_k, shared_val): &(
-                                u64,
-                                SharedValue<Vec<LabeledTransition<M::State>>>,
-                            ) = bucket.as_ref();
-                            let txs = shared_val.get();
-                            for trans in txs {
-                                local_count += 1;
-                                let from_fp = model_ref.fingerprint(&trans.from);
-                                let to_fp = model_ref.fingerprint(&trans.to);
-                                local_states
-                                    .entry(from_fp)
-                                    .or_insert_with(|| trans.from.clone());
-                                local_states
-                                    .entry(to_fp)
-                                    .or_insert_with(|| trans.to.clone());
-                                local_triples.push((
-                                    from_fp,
-                                    to_fp,
-                                    trans.action.name.clone(),
-                                ));
-                            }
-                        }
-                    }
-                    (local_triples, local_states, local_count)
-                })
-                .collect();
-
-        // Sequential merge: append triples, fold state maps.
-        let total_tx_cap: usize = per_shard.iter().map(|(t, _, _)| t.len()).sum();
-        let unique_cap: usize =
-            per_shard.iter().map(|(_, s, _)| s.len()).max().unwrap_or(0);
-        let mut tx_triples_local: Vec<(u64, u64, String)> =
-            Vec::with_capacity(total_tx_cap);
-        let mut state_by_fp_local: HashMap<u64, M::State> =
-            HashMap::with_capacity(unique_cap.max(64));
-        let mut total_tx_local = 0usize;
-        for (mut triples, states, count) in per_shard {
-            total_tx_local += count;
-            tx_triples_local.append(&mut triples);
-            // Merge: first-write-wins. Insert from each shard's
-            // state map into the global; duplicates collapse.
-            for (k, v) in states {
-                state_by_fp_local.entry(k).or_insert(v);
-            }
-        }
-
+        let out = flatten_transitions_parallel(transitions_map, model);
         eprintln!(
             "  Total transitions collected: {} (flatten: {:.2?}, parallel via {} shards)",
-            total_tx_local,
+            out.2,
             phase1_start.elapsed(),
-            shards.len()
+            transitions_map.shards().len()
         );
-        (tx_triples_local, state_by_fp_local, total_tx_local)
+        out
     } else {
-        // Serial fast path for small graphs (<1024 entries).
-        let mut state_by_fp_local: HashMap<u64, M::State> = HashMap::new();
-        let mut tx_triples_local: Vec<(u64, u64, String)> = Vec::new();
-        let mut total_tx_local = 0usize;
-        for entry in transitions_map.iter() {
-            for trans in entry.value() {
-                total_tx_local += 1;
-                let from_fp = model.fingerprint(&trans.from);
-                let to_fp = model.fingerprint(&trans.to);
-                state_by_fp_local
-                    .entry(from_fp)
-                    .or_insert_with(|| trans.from.clone());
-                state_by_fp_local
-                    .entry(to_fp)
-                    .or_insert_with(|| trans.to.clone());
-                tx_triples_local.push((from_fp, to_fp, trans.action.name.clone()));
-            }
-        }
+        let out = flatten_transitions_serial(transitions_map, model);
         eprintln!(
             "  Total transitions collected: {} (flatten: {:.2?}, serial)",
-            total_tx_local,
+            out.2,
             phase1_start.elapsed()
         );
-        (tx_triples_local, state_by_fp_local, total_tx_local)
+        out
     };
 
     let mut violation: Option<Violation<M::State>> = None;
@@ -812,6 +818,101 @@ mod tests {
         let edges = build_transitions(&[(s0.clone(), s0, "Other")]);
         let v = run_post_processing(false, &model, Some(&edges), &config_for_test());
         assert!(v.is_none(), "wrapper-Next must accept any in-SCC edge");
+    }
+
+    /// T204.4: Synthetic 80K-entry fixture exercising the
+    /// `flatten_transitions_parallel` path and asserting it produces
+    /// structurally identical output to the serial fallback.
+    ///
+    /// Builds a map of 80_000 distinct from-states (each with a single
+    /// labeled successor edge), runs both flatten branches against the
+    /// same dashmap, and compares:
+    ///
+    /// - `total_tx` counts agree
+    /// - `tx_triples` agree as sets (parallel-shard interleaving means
+    ///   the order differs, so we sort before comparing)
+    /// - `state_by_fp` agrees on key set and value at each key
+    /// - the serial output matches the input one-for-one (sanity check
+    ///   the harness itself isn't dropping edges)
+    ///
+    /// This is the smallest fixture that activates the parallel path.
+    /// The 80K threshold is a runtime tuning constant; the equivalence
+    /// invariant must hold at that boundary.
+    #[test]
+    fn flatten_parallel_and_serial_are_structurally_equivalent_at_threshold() {
+        let model: Arc<LivModel> = Arc::new(LivModel {
+            constraints: Vec::new(),
+            next_name: None,
+        });
+
+        // 80_000 distinct from-states, each with one outgoing edge to
+        // (v + 1). A handful of action labels rotate so we exercise the
+        // String clone path on `action.name` too.
+        const N: u32 = 80_000;
+        let actions = ["A", "B", "C", "D"];
+        let mut edge_input: Vec<(LivState, LivState, &'static str)> =
+            Vec::with_capacity(N as usize);
+        for i in 0..N {
+            let from = LivState { v: i };
+            let to = LivState { v: i + 1 };
+            edge_input.push((from, to, actions[(i as usize) % actions.len()]));
+        }
+        let map = build_transitions(&edge_input);
+        // Sanity check the fixture really crossed the threshold.
+        assert!(
+            map.len() >= 80_000,
+            "fixture should have >=80K dashmap entries, got {}",
+            map.len()
+        );
+
+        let (par_triples, par_states, par_total) =
+            flatten_transitions_parallel::<LivModel>(&map, &model);
+        let (ser_triples, ser_states, ser_total) =
+            flatten_transitions_serial::<LivModel>(&map, &model);
+
+        assert_eq!(
+            par_total, ser_total,
+            "total_tx mismatch: parallel={par_total}, serial={ser_total}"
+        );
+        assert_eq!(
+            par_total, N as usize,
+            "expected {N} transitions, got {par_total}"
+        );
+
+        // Triples agree as sets (shard parallelism reorders them).
+        let mut par_sorted = par_triples.clone();
+        let mut ser_sorted = ser_triples.clone();
+        par_sorted.sort();
+        ser_sorted.sort();
+        assert_eq!(
+            par_sorted, ser_sorted,
+            "tx_triples differ between parallel and serial flatten"
+        );
+
+        // state_by_fp agrees on keys.
+        let par_keys: std::collections::BTreeSet<u64> = par_states.keys().copied().collect();
+        let ser_keys: std::collections::BTreeSet<u64> = ser_states.keys().copied().collect();
+        assert_eq!(
+            par_keys, ser_keys,
+            "state_by_fp key sets differ between parallel and serial"
+        );
+        // ...and on the LivState mapped at each key (first-write-wins is
+        // deterministic per-input-state since the input has unique
+        // from-states; the to-state at v=N has only one source).
+        for k in &par_keys {
+            assert_eq!(
+                par_states.get(k),
+                ser_states.get(k),
+                "state_by_fp[{k}] differs between parallel and serial"
+            );
+        }
+
+        // Sanity: serial matches the input one-for-one. Each from-state
+        // has exactly one edge, so total = N. Each LivState appears in
+        // at least one (from, to) pair.
+        assert_eq!(ser_total, N as usize);
+        // unique from-states + their to-states. v ranges 0..=N (N+1 ids).
+        assert_eq!(ser_states.len(), (N as usize) + 1);
     }
 
     #[test]
