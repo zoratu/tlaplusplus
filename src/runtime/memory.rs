@@ -102,6 +102,165 @@ mod tests {
     }
 
     #[test]
+    fn compute_effective_memory_max_user_only() {
+        // (Some(user), None) — user cap returned verbatim. Use
+        // enforce_cgroups=false so cgroup_limit is unconditionally None
+        // and the test is platform-independent.
+        let user_cap: u64 = 4 * 1024 * 1024 * 1024;
+        let config = EngineConfig {
+            enforce_cgroups: false,
+            memory_max_bytes: Some(user_cap),
+            ..EngineConfig::default()
+        };
+        assert_eq!(compute_effective_memory_max(&config), Some(user_cap));
+    }
+
+    #[test]
+    fn compute_effective_memory_max_neither_returns_none() {
+        // (None, None) — no user cap, cgroup checks skipped.
+        let config = EngineConfig {
+            enforce_cgroups: false,
+            memory_max_bytes: None,
+            ..EngineConfig::default()
+        };
+        assert!(compute_effective_memory_max(&config).is_none());
+    }
+
+    #[test]
+    fn compute_effective_memory_max_cgroup_disabled_ignores_host() {
+        // enforce_cgroups=false → cgroup_limit is always None even on Linux,
+        // so the only signal is the user cap.
+        let user_cap: u64 = 8 * 1024 * 1024 * 1024;
+        let cfg_none = EngineConfig {
+            enforce_cgroups: false,
+            memory_max_bytes: None,
+            ..EngineConfig::default()
+        };
+        assert_eq!(compute_effective_memory_max(&cfg_none), None);
+
+        let cfg_some = EngineConfig {
+            enforce_cgroups: false,
+            memory_max_bytes: Some(user_cap),
+            ..EngineConfig::default()
+        };
+        assert_eq!(compute_effective_memory_max(&cfg_some), Some(user_cap));
+    }
+
+    #[test]
+    fn apply_memory_budget_no_cap_returns_config_defaults() {
+        // No effective cap → fp_cache and queue_limit pass through unchanged.
+        let config = EngineConfig {
+            fp_cache_capacity_bytes: 12345,
+            queue_inmem_limit: 67890,
+            ..EngineConfig::default()
+        };
+        let (fp_cache, queue_limit) = apply_memory_budget(&config, None);
+        assert_eq!(fp_cache, 12345);
+        assert_eq!(queue_limit, 67890);
+    }
+
+    #[test]
+    fn apply_memory_budget_uses_10_percent_for_fp_cache() {
+        // memory_max = 10 GiB → 10% = 1 GiB. With a config fp_cache far
+        // larger than the budget cap, the budget must win.
+        let memory_max: u64 = 10 * 1024 * 1024 * 1024;
+        let expected_fp_cache: u64 = memory_max / 10;
+        let config = EngineConfig {
+            fp_cache_capacity_bytes: u64::MAX,
+            queue_inmem_limit: usize::MAX,
+            estimated_state_bytes: 256,
+            ..EngineConfig::default()
+        };
+        let (fp_cache, _) = apply_memory_budget(&config, Some(memory_max));
+        assert_eq!(
+            fp_cache, expected_fp_cache,
+            "fp_cache should be 10% of memory_max"
+        );
+    }
+
+    #[test]
+    fn apply_memory_budget_uses_50_percent_for_queue_items() {
+        // memory_max = 10 GiB, state_bytes = 256 → queue items = 50% / 256.
+        let memory_max: u64 = 10 * 1024 * 1024 * 1024;
+        let state_bytes: u64 = 256;
+        let expected_queue: usize = ((memory_max / 2) / state_bytes) as usize;
+        let config = EngineConfig {
+            fp_cache_capacity_bytes: u64::MAX,
+            queue_inmem_limit: usize::MAX,
+            estimated_state_bytes: state_bytes as usize,
+            ..EngineConfig::default()
+        };
+        let (_, queue_limit) = apply_memory_budget(&config, Some(memory_max));
+        assert_eq!(
+            queue_limit, expected_queue,
+            "queue_limit should be 50% of memory_max ÷ state_bytes"
+        );
+    }
+
+    #[test]
+    fn apply_memory_budget_keeps_smaller_user_value() {
+        // The budget must be a CAP, not a setpoint: if the user's
+        // configured value is already smaller, keep it.
+        let memory_max: u64 = 10 * 1024 * 1024 * 1024;
+        let user_fp_cache: u64 = 32 * 1024 * 1024; // 32 MB ≪ 1 GB budget
+        let user_queue: usize = 1_000;
+        let config = EngineConfig {
+            fp_cache_capacity_bytes: user_fp_cache,
+            queue_inmem_limit: user_queue,
+            estimated_state_bytes: 256,
+            ..EngineConfig::default()
+        };
+        let (fp_cache, queue_limit) = apply_memory_budget(&config, Some(memory_max));
+        assert_eq!(fp_cache, user_fp_cache, "user-supplied fp_cache must win");
+        assert_eq!(queue_limit, user_queue, "user-supplied queue_limit must win");
+    }
+
+    #[test]
+    fn apply_memory_budget_floors_fp_cache_at_64mib() {
+        // The 10% formula has a 64 MiB floor (e.g. for tiny memory_max).
+        // memory_max = 1 MiB → 10% = ~100 KB, but the floor pushes to 64 MiB.
+        let memory_max: u64 = 1024 * 1024;
+        let config = EngineConfig {
+            fp_cache_capacity_bytes: u64::MAX,
+            queue_inmem_limit: usize::MAX,
+            estimated_state_bytes: 256,
+            ..EngineConfig::default()
+        };
+        let (fp_cache, _) = apply_memory_budget(&config, Some(memory_max));
+        assert_eq!(fp_cache, 64 * 1024 * 1024, "fp_cache floor is 64 MiB");
+    }
+
+    #[test]
+    fn apply_memory_budget_floors_queue_items_at_10_000() {
+        // The queue formula has a 10K-item floor.
+        // Tiny memory_max with huge state_bytes → 50% would be near zero.
+        let memory_max: u64 = 1024 * 1024;
+        let config = EngineConfig {
+            fp_cache_capacity_bytes: u64::MAX,
+            queue_inmem_limit: usize::MAX,
+            estimated_state_bytes: 1024 * 1024, // 1 MB per state
+            ..EngineConfig::default()
+        };
+        let (_, queue_limit) = apply_memory_budget(&config, Some(memory_max));
+        assert_eq!(queue_limit, 10_000, "queue_limit floor is 10_000 items");
+    }
+
+    #[test]
+    fn apply_memory_budget_zero_state_bytes_treated_as_one() {
+        // estimated_state_bytes is .max(1) before division — guards against
+        // divide-by-zero. 1 GiB / 2 / 1 = 512 Mi items (above floor).
+        let memory_max: u64 = 1024 * 1024 * 1024;
+        let config = EngineConfig {
+            fp_cache_capacity_bytes: u64::MAX,
+            queue_inmem_limit: usize::MAX,
+            estimated_state_bytes: 0,
+            ..EngineConfig::default()
+        };
+        let (_, queue_limit) = apply_memory_budget(&config, Some(memory_max));
+        assert_eq!(queue_limit, ((memory_max / 2) as usize));
+    }
+
+    #[test]
     fn memory_monitor_requires_file_backed_fingerprint_store() {
         let config = EngineConfig {
             use_bloom_fingerprints: false,

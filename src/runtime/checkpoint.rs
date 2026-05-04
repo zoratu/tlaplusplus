@@ -313,3 +313,223 @@ where
     ctx.pause.resume();
     checkpoint_result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::fingerprint_store::FingerprintStats as OldFingerprintStats;
+    use crate::storage::queue::QueueStats;
+
+    fn sample_manifest(version: u32, ts: u64) -> CheckpointManifest {
+        CheckpointManifest {
+            version,
+            model: "test-model".to_string(),
+            created_unix_secs: ts,
+            duration_millis: 12_345,
+            states_generated: 100,
+            states_processed: 90,
+            states_distinct: 85,
+            duplicates: 5,
+            enqueued: 10,
+            checkpoints: 1,
+            configured_workers: 8,
+            actual_workers: 8,
+            allowed_cpu_count: 16,
+            cgroup_cpuset_cores: Some(16),
+            cgroup_quota_cores: None,
+            numa_nodes_used: 2,
+            effective_memory_max_bytes: Some(8 * 1024 * 1024 * 1024),
+            resumed_from_checkpoint: false,
+            queue: QueueStats::default(),
+            fingerprints: OldFingerprintStats::default(),
+        }
+    }
+
+    fn temp_subdir(prefix: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "tlapp-runtime-checkpoint-{prefix}-{nanos}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn manifest_round_trip_preserves_all_fields() {
+        let original = sample_manifest(1, 1_700_000_000);
+        let bytes = serde_json::to_vec(&original).expect("serialize");
+        let restored: CheckpointManifest =
+            serde_json::from_slice(&bytes).expect("deserialize");
+        assert_eq!(restored.version, original.version);
+        assert_eq!(restored.model, original.model);
+        assert_eq!(restored.created_unix_secs, original.created_unix_secs);
+        assert_eq!(restored.duration_millis, original.duration_millis);
+        assert_eq!(restored.states_generated, original.states_generated);
+        assert_eq!(restored.states_processed, original.states_processed);
+        assert_eq!(restored.states_distinct, original.states_distinct);
+        assert_eq!(restored.duplicates, original.duplicates);
+        assert_eq!(restored.enqueued, original.enqueued);
+        assert_eq!(restored.checkpoints, original.checkpoints);
+        assert_eq!(restored.configured_workers, original.configured_workers);
+        assert_eq!(restored.actual_workers, original.actual_workers);
+        assert_eq!(restored.allowed_cpu_count, original.allowed_cpu_count);
+        assert_eq!(restored.cgroup_cpuset_cores, original.cgroup_cpuset_cores);
+        assert_eq!(restored.cgroup_quota_cores, original.cgroup_quota_cores);
+        assert_eq!(restored.numa_nodes_used, original.numa_nodes_used);
+        assert_eq!(
+            restored.effective_memory_max_bytes,
+            original.effective_memory_max_bytes
+        );
+        assert_eq!(
+            restored.resumed_from_checkpoint,
+            original.resumed_from_checkpoint
+        );
+    }
+
+    #[test]
+    fn write_then_load_returns_equivalent_manifest() {
+        let dir = temp_subdir("write-load");
+        let path = dir.join("checkpoint.json");
+        let m = sample_manifest(1, 1_700_000_000);
+        write_checkpoint_manifest(&path, &m).expect("write");
+        assert!(path.exists());
+        let loaded = load_checkpoint_manifest(&path).expect("load").expect("present");
+        assert_eq!(loaded.version, m.version);
+        assert_eq!(loaded.model, m.model);
+        assert_eq!(loaded.states_distinct, m.states_distinct);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_missing_file_returns_ok_none() {
+        let dir = temp_subdir("missing");
+        let path = dir.join("does-not-exist.json");
+        let loaded = load_checkpoint_manifest(&path).expect("ok");
+        assert!(loaded.is_none(), "missing file must yield Ok(None)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_creates_parent_directory() {
+        // Atomic-rename writer must create the dir tree if absent.
+        let dir = temp_subdir("nested-parent");
+        let path = dir.join("nested").join("deeper").join("checkpoint.json");
+        let m = sample_manifest(1, 1_700_000_001);
+        write_checkpoint_manifest(&path, &m).expect("write");
+        assert!(path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rolling_checkpoint_creates_timestamped_and_latest() {
+        let dir = temp_subdir("rolling-basic");
+        let latest = dir.join("latest.json");
+        let m = sample_manifest(1, 1_700_001_000);
+        write_validated_rolling_checkpoint(&latest, &m).expect("write");
+        assert!(latest.exists(), "latest.json should exist");
+        let timestamped = dir.join("checkpoint-1700001000.json");
+        assert!(
+            timestamped.exists(),
+            "timestamped checkpoint file should exist"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rolling_checkpoint_prunes_to_max_window() {
+        // Write MAX + 3 distinct timestamped checkpoints; only the most recent
+        // MAX should survive.
+        let dir = temp_subdir("rolling-prune");
+        let latest = dir.join("latest.json");
+        let total = MAX_CHECKPOINT_FILES + 3;
+        for i in 0..total {
+            let m = sample_manifest(1, 1_700_000_000 + i as u64);
+            write_validated_rolling_checkpoint(&latest, &m).expect("write");
+        }
+        let surviving: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let n = e.file_name().to_string_lossy().to_string();
+                n.starts_with("checkpoint-") && n.ends_with(".json")
+            })
+            .collect();
+        assert_eq!(
+            surviving.len(),
+            MAX_CHECKPOINT_FILES,
+            "rolling window keeps last {MAX_CHECKPOINT_FILES} timestamped files"
+        );
+        // The newest timestamp must always be retained.
+        let newest_ts = 1_700_000_000 + (total - 1) as u64;
+        let newest = dir.join(format!("checkpoint-{newest_ts}.json"));
+        assert!(newest.exists(), "newest checkpoint must survive prune");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_old_checkpoints_ignores_unrelated_files() {
+        // Only `checkpoint-*.json` is eligible — `latest.json`, plain `.json`,
+        // or unrelated names must be left alone. Use single-digit timestamps
+        // so lexicographic sort matches numeric sort.
+        let dir = temp_subdir("prune-unrelated");
+        for ts in 1..=9u64 {
+            let m = sample_manifest(1, ts);
+            write_checkpoint_manifest(&dir.join(format!("checkpoint-{ts}.json")), &m)
+                .expect("write");
+        }
+        std::fs::write(dir.join("latest.json"), b"{}").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"keep me").unwrap();
+        prune_old_checkpoints(&dir, 3).expect("prune");
+        // 3 newest checkpoint files retained (7, 8, 9).
+        let kept: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(kept.contains(&"latest.json".to_string()), "latest.json must survive");
+        assert!(kept.contains(&"notes.txt".to_string()), "unrelated file must survive");
+        assert!(kept.contains(&"checkpoint-9.json".to_string()));
+        assert!(kept.contains(&"checkpoint-8.json".to_string()));
+        assert!(kept.contains(&"checkpoint-7.json".to_string()));
+        assert!(!kept.contains(&"checkpoint-1.json".to_string()));
+        assert!(!kept.contains(&"checkpoint-6.json".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_with_keep_count_exceeding_files_is_noop() {
+        let dir = temp_subdir("prune-noop");
+        for ts in 1..=3u64 {
+            let m = sample_manifest(1, ts);
+            write_checkpoint_manifest(&dir.join(format!("checkpoint-{ts}.json")), &m)
+                .expect("write");
+        }
+        prune_old_checkpoints(&dir, 100).expect("prune");
+        let kept = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(kept, 3, "keep_count > files → nothing pruned");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn max_checkpoint_files_constant_is_5() {
+        // Pin the rolling-window default. A bump must be intentional and
+        // accompanied by a test update.
+        assert_eq!(MAX_CHECKPOINT_FILES, 5);
+    }
+
+    #[test]
+    fn manifest_version_field_is_serialized_as_u32() {
+        // Version field is wire-visible; future bumps must remain
+        // round-trippable. Exercise version 0 and the protocol-current 1.
+        for v in [0u32, 1, 7, u32::MAX] {
+            let m = sample_manifest(v, 42);
+            let bytes = serde_json::to_vec(&m).unwrap();
+            let restored: CheckpointManifest = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(restored.version, v);
+        }
+    }
+}

@@ -21,6 +21,35 @@ use std::sync::atomic::AtomicBool;
 
 use super::EngineConfig;
 
+/// Build the cross-node "local pending count" bridge closure used by both
+/// the inbound steal handler (to apply the steal-victim threshold) and the
+/// steal-trigger task (to detect a starved local queue).
+///
+/// `SpillableWorkStealingQueues::pending_count()` over-reports because
+/// workers only flush their per-worker popped counter at exit. To keep the
+/// steal trigger from firing on stale "still has work" snapshots, this
+/// closure first consults `has_pending_work()` (which inspects the actual
+/// deques + per-worker active flags) and reports 0 when the queue is
+/// genuinely empty.
+///
+/// Extracted so the bridge logic can be unit-tested without spinning up the
+/// full distributed handler.
+pub(super) fn make_local_pending_fn<S>(
+    queue: &Arc<SpillableWorkStealingQueues<S>>,
+) -> LocalPendingFn
+where
+    S: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + Clone + 'static,
+{
+    let queue_for_pending = Arc::clone(queue);
+    Arc::new(move || {
+        if !queue_for_pending.has_pending_work() {
+            0
+        } else {
+            queue_for_pending.pending_count()
+        }
+    })
+}
+
 /// Spawn distributed-mode handlers when `config.distributed_stealer` is set.
 ///
 /// This is a no-op when distributed mode is disabled.
@@ -42,24 +71,8 @@ pub(super) fn spawn_handlers_if_any<S>(
 
     // Closure used by both the inbound handler (to honor the steal-victim
     // threshold) and the steal-trigger task (to detect a starved local queue).
-    //
-    // NOTE: `pending_count()` is an approximation derived from
-    // `global_pushed - global_popped`, where `global_popped` is only
-    // updated when workers flush their local counters (currently only at
-    // worker exit). That makes `pending_count()` over-report by
-    // potentially the entire local-popped count, which would prevent the
-    // steal trigger from firing even when the local queue is genuinely
-    // empty. We bridge this by ALSO checking `has_pending_work()` (which
-    // inspects the actual deques + per-worker active flags); when it
-    // returns false, we report 0 to the trigger.
-    let queue_for_pending = Arc::clone(queue);
-    let local_pending_fn: LocalPendingFn = Arc::new(move || {
-        if !queue_for_pending.has_pending_work() {
-            0
-        } else {
-            queue_for_pending.pending_count()
-        }
-    });
+    // See `make_local_pending_fn` for the load-bearing visibility note.
+    let local_pending_fn = make_local_pending_fn(queue);
 
     // Spawn inbound handler with the steal/donate channels
     if let (Some(stolen_tx), Some(donate_rx)) =
@@ -97,4 +110,98 @@ pub(super) fn spawn_handlers_if_any<S>(
         local_pending_fn,
         100, // poll every 100ms; 250ms idle window before firing
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::spillable_work_stealing::SpillableConfig;
+    use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
+
+    fn temp_spill_dir(prefix: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "tlapp-runtime-distributed-{prefix}-{nanos}-{}",
+            std::process::id()
+        ))
+    }
+
+    fn build_queue(prefix: &str) -> Arc<SpillableWorkStealingQueues<u64>> {
+        let dir = temp_spill_dir(prefix);
+        let cfg = SpillableConfig {
+            max_inmem_items: 1_000,
+            spill_dir: dir,
+            spill_batch: 100,
+            load_existing: false,
+            worker_spill_buffer_size: 50,
+            worker_channel_bound: 4,
+            defer_segment_deletion: false,
+            compression_enabled: false,
+            compression_max_bytes: 64 * 1024 * 1024,
+            compression_level: 1,
+        };
+        let (queues, _workers) =
+            SpillableWorkStealingQueues::<u64>::new(2, vec![0, 0], cfg).expect("queue");
+        queues
+    }
+
+    #[test]
+    fn spawn_handlers_is_noop_when_distributed_stealer_is_none() {
+        // Without a configured stealer the function must early-return
+        // cleanly; constructing the queue and stop flag is enough to
+        // exercise the entire happy short-circuit path.
+        let config = EngineConfig::default();
+        assert!(config.distributed_stealer.is_none());
+        let queue = build_queue("noop");
+        let stop = Arc::new(AtomicBool::new(false));
+        // Must not panic.
+        spawn_handlers_if_any(&config, &queue, &stop);
+        // Stop flag must be left untouched.
+        assert!(!stop.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn local_pending_fn_reports_zero_on_empty_queue() {
+        // When `has_pending_work` returns false, the bridge must report 0
+        // even if `pending_count` is stale (the load-bearing invariant).
+        let queue = build_queue("empty");
+        assert!(!queue.has_pending_work(), "freshly built queue is empty");
+        let f = make_local_pending_fn(&queue);
+        assert_eq!(f(), 0, "empty queue must report 0 pending");
+    }
+
+    #[test]
+    fn local_pending_fn_reflects_pushed_items() {
+        // After pushing items, the bridge must report a nonzero count
+        // (specifically, queue.pending_count()).
+        let queue = build_queue("pushed");
+        for i in 0..32u64 {
+            queue.push_global(i);
+        }
+        let f = make_local_pending_fn(&queue);
+        // Exact value tracks `pending_count()`; we only need a positive
+        // sanity bound to kill mutations that flip the if-branch.
+        assert!(
+            f() > 0,
+            "queue with 32 items should report >0 pending, got {}",
+            f()
+        );
+    }
+
+    #[test]
+    fn local_pending_fn_is_cloneable_arc() {
+        // The closure is wrapped in an Arc so multiple handlers can hold
+        // it. Verify that calling through clones returns the same value.
+        let queue = build_queue("clone");
+        for i in 0..8u64 {
+            queue.push_global(i);
+        }
+        let f1 = make_local_pending_fn(&queue);
+        let f2 = Arc::clone(&f1);
+        assert_eq!(f1(), f2(), "Arc-cloned closures must agree");
+    }
 }
