@@ -80,6 +80,90 @@ pub(super) fn rate_per_minute(delta: u64, elapsed_secs: f64) -> u64 {
     }
 }
 
+/// Mutable per-supervisor state carried across ticks.
+///
+/// Holds the values the periodic report needs to remember from the
+/// previous tick so it can compute deltas (states/min, queue drain rate
+/// for ETA). The 1-second sub-loop in `spawn_progress_thread` does NOT
+/// mutate this — only `progress_tick` does.
+///
+/// Pulled out of the supervisor closure so the report logic can be
+/// unit-tested without spinning a real OS thread or waiting 10s.
+#[derive(Debug, Clone)]
+pub(super) struct ProgressState {
+    pub progress_counter: u64,
+    pub last_generated: u64,
+    pub last_distinct: u64,
+    pub last_queue_pending: u64,
+    pub last_time: Instant,
+}
+
+impl ProgressState {
+    pub fn new(now: Instant) -> Self {
+        Self {
+            progress_counter: 1,
+            last_generated: 0,
+            last_distinct: 0,
+            last_queue_pending: 0,
+            last_time: now,
+        }
+    }
+}
+
+/// One periodic supervisor step.
+///
+/// Returns the rendered Progress line (without trailing newline) so callers
+/// can assert against it; the live supervisor loop forwards the result to
+/// stderr. `now` is injected so tests can replay deterministic clocks.
+///
+/// Updates `state` in place: bumps `progress_counter`, snapshots the
+/// `generated`/`distinct`/`queue_pending` deltas, and records `now` as the
+/// new `last_time` for the next tick's drain-rate computation.
+pub(super) fn progress_tick(
+    state: &mut ProgressState,
+    states_generated: u64,
+    states_distinct: u64,
+    queue_pending: u64,
+    now: Instant,
+) -> String {
+    let elapsed_secs = now.duration_since(state.last_time).as_secs_f64();
+    let generated_rate =
+        rate_per_minute(states_generated.saturating_sub(state.last_generated), elapsed_secs);
+    let distinct_rate =
+        rate_per_minute(states_distinct.saturating_sub(state.last_distinct), elapsed_secs);
+
+    let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+
+    // ETA only after we have at least one prior tick to base a delta on.
+    let eta_str = if state.progress_counter > 1 && elapsed_secs > 0.0 {
+        let queue_delta = state.last_queue_pending as i64 - queue_pending as i64;
+        let drain_rate = queue_delta as f64 / elapsed_secs;
+        format_eta_suffix(queue_pending, drain_rate)
+    } else {
+        String::new()
+    };
+
+    let line = format!(
+        "Progress({}) at {}: {} states generated ({} s/min), {} distinct states found ({} ds/min), {} states left on queue.{}",
+        state.progress_counter,
+        timestamp,
+        format_with_commas(states_generated),
+        format_with_commas(generated_rate),
+        format_with_commas(states_distinct),
+        format_with_commas(distinct_rate),
+        format_with_commas(queue_pending),
+        eta_str
+    );
+
+    state.progress_counter += 1;
+    state.last_generated = states_generated;
+    state.last_distinct = states_distinct;
+    state.last_queue_pending = queue_pending;
+    state.last_time = now;
+
+    line
+}
+
 pub(super) fn spawn_progress_thread<S>(
     run_stats: Arc<AtomicRunStats>,
     stop: Arc<AtomicBool>,
@@ -99,11 +183,7 @@ where
     let progress_worker_count = worker_count;
 
     std::thread::spawn(move || {
-        let mut progress_counter = 1u64;
-        let mut last_generated = 0u64;
-        let mut last_distinct = 0u64;
-        let mut last_queue_pending = 0u64;
-        let mut last_time = Instant::now();
+        let mut state = ProgressState::new(Instant::now());
 
         // Memory monitor - check periodically and throttle if needed
         let memory_monitor = MemoryMonitor::default();
@@ -203,52 +283,24 @@ where
             // Use total_pending_count to include spilled items on disk
             let queue_pending = progress_queue.total_pending_count();
 
-            // Calculate rates per minute
-            let now = Instant::now();
-            let elapsed_secs = now.duration_since(last_time).as_secs_f64();
-
-            let generated_rate =
-                rate_per_minute(states_generated - last_generated, elapsed_secs);
-            let distinct_rate =
-                rate_per_minute(states_distinct - last_distinct, elapsed_secs);
-
-            // Format timestamp in TLC style: YYYY-MM-DD HH:MM:SS
-            let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-
-            // Calculate ETA based on queue drain rate
-            let eta_str = if progress_counter > 1 && elapsed_secs > 0.0 {
-                let queue_delta = last_queue_pending as i64 - queue_pending as i64;
-                let drain_rate = queue_delta as f64 / elapsed_secs; // states/sec
-                format_eta_suffix(queue_pending, drain_rate)
-            } else {
-                String::new()
-            };
-
-            // Match TLC format with ETA
-            eprintln!(
-                "Progress({}) at {}: {} states generated ({} s/min), {} distinct states found ({} ds/min), {} states left on queue.{}",
-                progress_counter,
-                timestamp,
-                format_with_commas(states_generated),
-                format_with_commas(generated_rate),
-                format_with_commas(states_distinct),
-                format_with_commas(distinct_rate),
-                format_with_commas(queue_pending),
-                eta_str
+            let line = progress_tick(
+                &mut state,
+                states_generated,
+                states_distinct,
+                queue_pending,
+                Instant::now(),
             );
-
-            progress_counter += 1;
-            last_generated = states_generated;
-            last_distinct = states_distinct;
-            last_queue_pending = queue_pending;
-            last_time = now;
+            eprintln!("{}", line);
         }
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{format_eta_suffix, format_with_commas, rate_per_minute};
+    use super::{
+        ProgressState, format_eta_suffix, format_with_commas, progress_tick, rate_per_minute,
+    };
+    use std::time::{Duration, Instant};
 
     #[test]
     fn format_with_commas_handles_small_numbers() {
@@ -342,5 +394,94 @@ mod tests {
         // the draining branch, not the stabilizing one.
         let s = format_eta_suffix(0, 10.1);
         assert_ne!(s, " ETA: stabilizing");
+    }
+
+    /// First tick must NOT emit an ETA (we have no prior delta to base it on)
+    /// and must bump `progress_counter` from 1 to 2 so subsequent ticks do.
+    #[test]
+    fn progress_tick_first_tick_emits_no_eta_and_advances_counter() {
+        let t0 = Instant::now();
+        let mut state = ProgressState::new(t0);
+        assert_eq!(state.progress_counter, 1);
+
+        let line = progress_tick(&mut state, 1_000, 800, 200, t0 + Duration::from_secs(10));
+        // No ETA suffix on the very first tick — the gating condition is
+        // `progress_counter > 1`, which is false here.
+        assert!(
+            !line.contains(" ETA:"),
+            "first tick should not include ETA, got: {line}"
+        );
+        // Counter advanced; deltas snapshot for next tick.
+        assert_eq!(state.progress_counter, 2);
+        assert_eq!(state.last_generated, 1_000);
+        assert_eq!(state.last_distinct, 800);
+        assert_eq!(state.last_queue_pending, 200);
+        assert!(line.starts_with("Progress(1) at "));
+    }
+
+    /// Two consecutive ticks with no progress (queue size unchanged) must
+    /// surface the "stabilizing" branch — drain rate is 0, |drain| <= 10.
+    #[test]
+    fn progress_tick_no_progress_yields_stabilizing_eta() {
+        let t0 = Instant::now();
+        let mut state = ProgressState::new(t0);
+        // Prime: first tick, no ETA expected.
+        let _ = progress_tick(&mut state, 0, 0, 5_000, t0 + Duration::from_secs(10));
+        // Second tick: queue size unchanged, so drain_rate = 0 → stabilizing.
+        let line = progress_tick(&mut state, 0, 0, 5_000, t0 + Duration::from_secs(20));
+        assert!(
+            line.contains(" ETA: stabilizing"),
+            "no-drain tick should report stabilizing, got: {line}"
+        );
+        assert_eq!(state.progress_counter, 3);
+    }
+
+    /// A queue that's draining fast (>10 states/sec) must emit a finite-time
+    /// ETA in the seconds/minutes/hours/days unit. Boundary kept simple.
+    #[test]
+    fn progress_tick_draining_queue_emits_finite_eta() {
+        let t0 = Instant::now();
+        let mut state = ProgressState::new(t0);
+        // Prime tick.
+        let _ = progress_tick(&mut state, 0, 0, 1_000, t0 + Duration::from_secs(10));
+        // Second tick: 100 items remaining, dropped 900 in 10s → 90/sec drain.
+        let line = progress_tick(&mut state, 0, 0, 100, t0 + Duration::from_secs(20));
+        assert!(
+            line.contains(" ETA: ") && !line.contains(" ETA: stabilizing")
+                && !line.contains(" ETA: queue growing"),
+            "draining queue should report finite ETA, got: {line}"
+        );
+    }
+
+    /// A queue that's growing (queue_delta is negative, drain_rate < -10) must
+    /// surface the "queue growing" branch.
+    #[test]
+    fn progress_tick_growing_queue_reports_growing_eta() {
+        let t0 = Instant::now();
+        let mut state = ProgressState::new(t0);
+        // Prime: queue_pending starts at 0.
+        let _ = progress_tick(&mut state, 0, 0, 0, t0 + Duration::from_secs(10));
+        // Second: queue jumped to 1000 over 10s → drain_rate = -100/sec.
+        let line = progress_tick(&mut state, 5_000, 4_000, 1_000, t0 + Duration::from_secs(20));
+        assert!(
+            line.contains(" ETA: queue growing"),
+            "growing queue should report growing, got: {line}"
+        );
+    }
+
+    /// Each tick monotonically advances `progress_counter` and the
+    /// rendered Progress(N) prefix tracks it. Kills mutations that
+    /// forget to bump the counter on the second-and-subsequent ticks.
+    #[test]
+    fn progress_tick_counter_in_render_advances_on_each_call() {
+        let t0 = Instant::now();
+        let mut state = ProgressState::new(t0);
+        let l1 = progress_tick(&mut state, 0, 0, 0, t0 + Duration::from_secs(10));
+        assert!(l1.starts_with("Progress(1) at "));
+        let l2 = progress_tick(&mut state, 1, 1, 1, t0 + Duration::from_secs(20));
+        assert!(l2.starts_with("Progress(2) at "));
+        let l3 = progress_tick(&mut state, 2, 2, 2, t0 + Duration::from_secs(30));
+        assert!(l3.starts_with("Progress(3) at "));
+        assert_eq!(state.progress_counter, 4);
     }
 }
