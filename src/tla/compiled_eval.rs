@@ -527,13 +527,22 @@ fn eval_compiled_inner(
         }
         CompiledExpr::SubSeq(s, a, b) => {
             let seq = eval_compiled_inner(s, ctx, depth + 1)?;
-            let start = eval_compiled_inner(a, ctx, depth + 1)?.as_int()? as usize;
-            let end = eval_compiled_inner(b, ctx, depth + 1)?.as_int()? as usize;
+            let m = eval_compiled_inner(a, ctx, depth + 1)?.as_int()?;
+            let n = eval_compiled_inner(b, ctx, depth + 1)?.as_int()?;
             let seq =
                 sequence_like_values(&seq).ok_or_else(|| anyhow!("expected Seq, got {seq:?}"))?;
-            // TLA+ uses 1-based indexing
-            let start = start.saturating_sub(1);
-            let end = end.min(seq.len());
+            // TLA+ requires 1-based start. Mirrors the OpCall path and the
+            // interpreter; without this check the compiler's typed SubSeq
+            // silently accepted m=0 and returned a result the interpreter
+            // would reject.
+            if m < 1 {
+                return Err(anyhow!("SubSeq start index must be >= 1, got {}", m));
+            }
+            let start = (m - 1) as usize;
+            let end = (n as usize).min(seq.len());
+            if start > seq.len() {
+                return Ok(TlaValue::Seq(Arc::new(vec![])));
+            }
             Ok(TlaValue::Seq(Arc::new(seq[start..end].to_vec())))
         }
 
