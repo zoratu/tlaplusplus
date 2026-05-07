@@ -3278,6 +3278,199 @@ IN
             panic!("Expected record, got {:?}", result);
         }
     }
+
+    // ============================================================
+    // T207c: direct tests on private compiled_eval.rs helpers.
+    // ============================================================
+
+    // ---- guard_text_is_action_body ----
+    // Predicate that recognises action-body shape (contains primes,
+    // /\ at indented top level, etc.). Many missed mutations are on
+    // the internal scanner state.
+
+    #[test]
+    fn t207c_guard_action_body_simple_expr_not_action() {
+        // Plain comparison — not an action body.
+        assert!(!super::guard_text_is_action_body("x = 1"));
+        assert!(!super::guard_text_is_action_body("a + b"));
+        assert!(!super::guard_text_is_action_body("TRUE"));
+    }
+
+    #[test]
+    fn t207c_guard_action_body_with_disjunct_and_prime_is_action() {
+        // Must start with `\/` AND contain a prime to be classified as
+        // a disjunctive action body.
+        assert!(super::guard_text_is_action_body("\\/ x' = 1"));
+        assert!(super::guard_text_is_action_body("\\/ x' = 1 \\/ y' = 2"));
+        // Disjunct without prime → not action body.
+        assert!(!super::guard_text_is_action_body("\\/ x = 1"));
+    }
+
+    // ---- compiled_membership_contains ----
+
+    #[test]
+    fn t207c_membership_int_in_set() {
+        let s = TlaState::new();
+        let ctx = EvalContext::new(&s);
+        let elem = TlaValue::Int(2);
+        let set_expr = compile_expr("{1, 2, 3}");
+        let r = super::compiled_membership_contains(&elem, &set_expr, &ctx, 0).unwrap();
+        assert!(r);
+    }
+    #[test]
+    fn t207c_membership_int_not_in_set() {
+        let s = TlaState::new();
+        let ctx = EvalContext::new(&s);
+        let elem = TlaValue::Int(99);
+        let set_expr = compile_expr("{1, 2, 3}");
+        let r = super::compiled_membership_contains(&elem, &set_expr, &ctx, 0).unwrap();
+        assert!(!r);
+    }
+    #[test]
+    fn t207c_membership_in_empty_set() {
+        let s = TlaState::new();
+        let ctx = EvalContext::new(&s);
+        let elem = TlaValue::Int(1);
+        let set_expr = compile_expr("{}");
+        let r = super::compiled_membership_contains(&elem, &set_expr, &ctx, 0).unwrap();
+        assert!(!r);
+    }
+    #[test]
+    fn t207c_membership_in_singleton() {
+        let s = TlaState::new();
+        let ctx = EvalContext::new(&s);
+        let elem = TlaValue::Int(7);
+        let set_expr = compile_expr("{7}");
+        let r = super::compiled_membership_contains(&elem, &set_expr, &ctx, 0).unwrap();
+        assert!(r);
+    }
+    #[test]
+    fn t207c_membership_in_range() {
+        let s = TlaState::new();
+        let ctx = EvalContext::new(&s);
+        let elem = TlaValue::Int(3);
+        let set_expr = compile_expr("1..5");
+        let r = super::compiled_membership_contains(&elem, &set_expr, &ctx, 0).unwrap();
+        assert!(r);
+    }
+    #[test]
+    fn t207c_membership_outside_range() {
+        let s = TlaState::new();
+        let ctx = EvalContext::new(&s);
+        let elem = TlaValue::Int(10);
+        let set_expr = compile_expr("1..5");
+        let r = super::compiled_membership_contains(&elem, &set_expr, &ctx, 0).unwrap();
+        assert!(!r);
+    }
+    #[test]
+    fn t207c_membership_at_range_boundaries() {
+        // Catches `<` vs `<=` mutations in range membership check.
+        let s = TlaState::new();
+        let ctx = EvalContext::new(&s);
+        let set_expr = compile_expr("1..5");
+        // Lower boundary: 1 in 1..5
+        assert!(
+            super::compiled_membership_contains(&TlaValue::Int(1), &set_expr, &ctx, 0).unwrap()
+        );
+        // Upper boundary: 5 in 1..5
+        assert!(
+            super::compiled_membership_contains(&TlaValue::Int(5), &set_expr, &ctx, 0).unwrap()
+        );
+        // Just below: 0 not in 1..5
+        assert!(
+            !super::compiled_membership_contains(&TlaValue::Int(0), &set_expr, &ctx, 0).unwrap()
+        );
+        // Just above: 6 not in 1..5
+        assert!(
+            !super::compiled_membership_contains(&TlaValue::Int(6), &set_expr, &ctx, 0).unwrap()
+        );
+    }
+
+    // ---- membership_matches_text ----
+
+    #[test]
+    fn t207c_membership_matches_text_in_named_set() {
+        // membership_matches_text resolves a named set definition and checks.
+        let mut defs = std::collections::BTreeMap::new();
+        defs.insert(
+            "S".to_string(),
+            TlaDefinition {
+                name: "S".to_string(),
+                params: vec![],
+                body: "{1, 2, 3}".to_string(),
+                is_recursive: false,
+            },
+        );
+        let s = TlaState::new();
+        let ctx = EvalContext::with_definitions(&s, &defs);
+        let r = super::membership_matches_text(&TlaValue::Int(2), "S", &ctx, 0).unwrap();
+        assert!(r);
+        let r2 = super::membership_matches_text(&TlaValue::Int(99), "S", &ctx, 0).unwrap();
+        assert!(!r2);
+    }
+
+    // ---- get_nested_value / set_nested_value ----
+
+    #[test]
+    fn t207c_get_nested_record_field() {
+        // [a |-> [b |-> 5]].a.b should give 5
+        let mut inner = std::collections::BTreeMap::new();
+        inner.insert("b".to_string(), TlaValue::Int(5));
+        let mut outer = std::collections::BTreeMap::new();
+        outer.insert("a".to_string(), TlaValue::Record(std::sync::Arc::new(inner)));
+        let val = TlaValue::Record(std::sync::Arc::new(outer));
+
+        // get_nested_value(val, &["a", "b"]) should be Int(5)
+        let path: Vec<TlaValue> = vec![
+            TlaValue::String("a".to_string()),
+            TlaValue::String("b".to_string()),
+        ];
+        let r = super::get_nested_value(&val, &path);
+        match r {
+            Ok(v) => assert_eq!(v, TlaValue::Int(5)),
+            Err(e) => panic!("get_nested_value failed: {e:?}"),
+        }
+    }
+    #[test]
+    fn t207c_get_nested_missing_field_errs() {
+        let mut rec = std::collections::BTreeMap::new();
+        rec.insert("a".to_string(), TlaValue::Int(1));
+        let val = TlaValue::Record(std::sync::Arc::new(rec));
+        let path: Vec<TlaValue> = vec![TlaValue::String("missing".to_string())];
+        assert!(super::get_nested_value(&val, &path).is_err());
+    }
+
+    #[test]
+    fn t207c_set_nested_record_field() {
+        let mut rec = std::collections::BTreeMap::new();
+        rec.insert("a".to_string(), TlaValue::Int(1));
+        rec.insert("b".to_string(), TlaValue::Int(2));
+        let val = TlaValue::Record(std::sync::Arc::new(rec));
+        let path: Vec<TlaValue> = vec![TlaValue::String("a".to_string())];
+        let r = super::set_nested_value(val, &path, TlaValue::Int(99));
+        match r {
+            Ok(TlaValue::Record(r)) => {
+                assert_eq!(r.get("a"), Some(&TlaValue::Int(99)));
+                assert_eq!(r.get("b"), Some(&TlaValue::Int(2)));
+            }
+            other => panic!("expected Record, got {other:?}"),
+        }
+    }
+
+    // ---- sequence_like_values: predicate matcher for Seq + Tuple ----
+
+    #[test]
+    fn t207c_sequence_like_values_seq() {
+        let s = TlaValue::Seq(std::sync::Arc::new(vec![TlaValue::Int(1)]));
+        let r = super::sequence_like_values(&s);
+        assert!(r.is_some());
+        assert_eq!(r.unwrap().len(), 1);
+    }
+    #[test]
+    fn t207c_sequence_like_values_int_is_none() {
+        let r = super::sequence_like_values(&TlaValue::Int(42));
+        assert!(r.is_none());
+    }
 }
 
 #[cfg(test)]
