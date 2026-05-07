@@ -6,23 +6,17 @@
 //!   - Original code increments `depth` by 1 on every recursive eval call.
 //!     At MAX_DEPTH (256) the check `if depth > MAX_DEPTH` returns Err,
 //!     gracefully aborting the recursion.
-//!   - Mutated `depth + 1 -> depth * 1`: depth never increments → recursion
-//!     is unbounded → stack overflow → process death (cargo-mutants
-//!     classifies this as "caught").
-//!   - Mutated `depth + 1 -> depth - 1`: depth becomes negative (saturates
-//!     for usize) → check fires on first call → unexpected Err → test
-//!     assertion fails.
-//!
-//! The strategy: build expressions that drive recursion through every
-//! recursive site to >= MAX_DEPTH=256 levels deep. The original code
-//! returns Err("recursion depth exceeded") gracefully. A mutated version
-//! either stack-overflows or produces a different Ok/Err shape.
+//!   - Mutated `depth + 1 -> depth * 1`: depth stays at 0 → the depth
+//!     check never fires → recursion finishes successfully with a value.
+//!     We assert Err: any Ok result fails the test, catching the mutation.
+//!   - Mutated `depth + 1 -> depth - 1`: depth underflows on first call
+//!     (usize wraps) → `depth > MAX_DEPTH` fires immediately → Err on
+//!     ANY input, even shallow ones. Shallow tests asserting Ok catch it.
 
 use tlaplusplus::tla::value::{TlaState, TlaValue};
 use tlaplusplus::tla::{EvalContext, compile_expr, eval_compiled};
 
-/// Number of nesting levels — must exceed MAX_DEPTH = 256 in compiled_eval.rs.
-/// We pick 280 so we cleanly cross the boundary.
+/// Deep nesting count — must exceed MAX_DEPTH = 256 in compiled_eval.rs.
 const DEEP: usize = 280;
 
 fn deep_eval(expr: &str) -> anyhow::Result<TlaValue> {
@@ -31,275 +25,164 @@ fn deep_eval(expr: &str) -> anyhow::Result<TlaValue> {
     eval_compiled(&compile_expr(expr), &ctx)
 }
 
+/// Assert that evaluating `expr` returns Err with a recursion-related
+/// message. Catches the `depth + 1 -> depth * 1` mutation: the mutation
+/// keeps depth at 0, the depth check never fires, and a finite-but-deep
+/// expression evaluates successfully (Ok) instead of erroring out.
+fn assert_recursion_err(expr: &str, ctx_label: &str) {
+    let r = deep_eval(expr);
+    match r {
+        Err(e)
+            if e.to_string().contains("depth")
+                || e.to_string().contains("recursion") =>
+        {
+            // Original: depth check fires at MAX_DEPTH+1 → Err. Pass.
+        }
+        Ok(v) => panic!(
+            "{ctx_label}: expected recursion-depth Err but got Ok({v:?}). \
+             Indicates the depth counter never incremented (mutated `+1` to `*1`/`*0`)."
+        ),
+        Err(e) => panic!(
+            "{ctx_label}: expected recursion-depth Err but got non-recursion Err: {e}"
+        ),
+    }
+}
+
 // ============================================================
-// Deep IF/THEN/ELSE — drives eval_compiled_inner IfThenElse path.
+// Deep recursion → assert Err. These catch `depth + 1 -> depth * 1`:
+// without depth tracking, the finite (but deep) expression completes
+// successfully; with depth tracking, the check fires at MAX_DEPTH+1.
 // ============================================================
 
 #[test]
-fn t207c_deep_if_then() {
-    // IF TRUE THEN (IF TRUE THEN (... 280 deep ... 1)) ELSE 0
+fn t207c_deep_if_then_must_hit_depth_limit() {
     let mut expr = "1".to_string();
     for _ in 0..DEEP {
         expr = format!("IF TRUE THEN ({expr}) ELSE 0");
     }
-    let r = deep_eval(&expr);
-    // Either Ok (recursion completed under MAX_DEPTH) or Err
-    // ("recursion depth exceeded"). Both indicate depth tracking
-    // works. Mutated code stack-overflows (process killed).
-    match r {
-        Ok(TlaValue::Int(1)) => {}
-        Err(e) if e.to_string().contains("depth") || e.to_string().contains("recursion") => {}
-        other => panic!("deep IF: expected Ok(1) or recursion-depth Err, got {other:?}"),
-    }
+    assert_recursion_err(&expr, "deep IF/THEN");
 }
 
 #[test]
-fn t207c_deep_if_else_branch() {
-    // ELSE branch — exercises the same IF dispatch but takes the false leg
+fn t207c_deep_if_else_must_hit_depth_limit() {
     let mut expr = "99".to_string();
     for _ in 0..DEEP {
         expr = format!("IF FALSE THEN 0 ELSE ({expr})");
     }
-    let r = deep_eval(&expr);
-    match r {
-        Ok(TlaValue::Int(99)) => {}
-        Err(e) if e.to_string().contains("depth") || e.to_string().contains("recursion") => {}
-        other => panic!("deep IF (else): got {other:?}"),
-    }
+    assert_recursion_err(&expr, "deep IF/ELSE");
 }
 
-// ============================================================
-// Deep LET — drives eval_let_expression depth+1 sites.
-// ============================================================
-
 #[test]
-fn t207c_deep_let_chain() {
-    // LET a0 == 0 IN LET a1 == 0 IN ... LET a279 == 0 IN 7
+fn t207c_deep_let_must_hit_depth_limit() {
     let mut expr = "7".to_string();
     for i in 0..DEEP {
         expr = format!("LET a{i} == 0 IN ({expr})");
     }
-    let r = deep_eval(&expr);
-    match r {
-        Ok(TlaValue::Int(7)) => {}
-        Err(e) if e.to_string().contains("depth") || e.to_string().contains("recursion") => {}
-        other => panic!("deep LET: got {other:?}"),
-    }
+    assert_recursion_err(&expr, "deep LET");
 }
 
-// ============================================================
-// Deep parens — exercises strip_outer_parens / compile_expr recursion.
-// ============================================================
-
 #[test]
-fn t207c_deep_parens() {
-    let mut expr = "42".to_string();
-    for _ in 0..DEEP {
-        expr = format!("({expr})");
-    }
-    let r = deep_eval(&expr);
-    // Parens are stripped at compile time (loop, not recursion), so this
-    // should ALWAYS succeed. Test makes sure compile_expr handles the
-    // input without recursion blowup.
-    assert_eq!(r.unwrap(), TlaValue::Int(42));
-}
-
-// ============================================================
-// Deep arithmetic — exercises eval_compiled_inner Add/Sub/Mul depth.
-// We can't chain `+` directly (T206 emits Unparsed for 3+ chains),
-// but parenthesised pairs preserve binary tree structure.
-// ============================================================
-
-#[test]
-fn t207c_deep_addition_pairs() {
-    // (1 + (1 + (1 + ... + 1)...)) — DEEP levels of nested Add
-    let mut expr = "1".to_string();
-    for _ in 0..DEEP {
-        expr = format!("(1 + ({expr}))");
-    }
-    let r = deep_eval(&expr);
-    match r {
-        Ok(TlaValue::Int(_n)) => {} // exact value depends on whether Unparsed kicks in
-        Err(e) if e.to_string().contains("depth") || e.to_string().contains("recursion") => {}
-        other => panic!("deep addition: got {other:?}"),
-    }
-}
-
-// ============================================================
-// Deep NOT — exercises eval_compiled_inner Not depth+1.
-// ============================================================
-
-#[test]
-fn t207c_deep_not_chain() {
-    // ~~~~...~~~TRUE — DEEP nested negations
+fn t207c_deep_not_must_hit_depth_limit() {
     let mut expr = "TRUE".to_string();
     for _ in 0..DEEP {
         expr = format!("~({expr})");
     }
-    let r = deep_eval(&expr);
-    // DEEP=280 even → result is TRUE
-    match r {
-        Ok(TlaValue::Bool(_b)) => {}
-        Err(e) if e.to_string().contains("depth") || e.to_string().contains("recursion") => {}
-        other => panic!("deep NOT: got {other:?}"),
-    }
+    assert_recursion_err(&expr, "deep NOT");
 }
 
-// ============================================================
-// Deep AND/OR — note these flatten in compile_expr (And takes Vec).
-// To drive recursion through And/Or we need NESTED, not flat.
-// ============================================================
-
 #[test]
-fn t207c_deep_nested_and() {
-    // (TRUE /\ (TRUE /\ (TRUE /\ ...))) — explicit parens force nesting
+fn t207c_deep_nested_and_must_hit_depth_limit() {
     let mut expr = "TRUE".to_string();
     for _ in 0..DEEP {
         expr = format!("(TRUE /\\ ({expr}))");
     }
-    let r = deep_eval(&expr);
-    match r {
-        Ok(TlaValue::Bool(true)) => {}
-        Err(e) if e.to_string().contains("depth") || e.to_string().contains("recursion") => {}
-        other => panic!("deep AND: got {other:?}"),
-    }
+    assert_recursion_err(&expr, "deep AND");
 }
 
 #[test]
-fn t207c_deep_nested_or() {
+fn t207c_deep_nested_or_must_hit_depth_limit() {
     let mut expr = "FALSE".to_string();
     for _ in 0..DEEP {
         expr = format!("(FALSE \\/ ({expr}))");
     }
-    let r = deep_eval(&expr);
-    match r {
-        Ok(TlaValue::Bool(false)) => {}
-        Err(e) if e.to_string().contains("depth") || e.to_string().contains("recursion") => {}
-        other => panic!("deep OR: got {other:?}"),
-    }
+    assert_recursion_err(&expr, "deep OR");
 }
 
-// ============================================================
-// Deep IMPLIES / IFF — separate dispatch arms in eval_compiled_inner.
-// ============================================================
-
 #[test]
-fn t207c_deep_implies() {
+fn t207c_deep_implies_must_hit_depth_limit() {
     let mut expr = "TRUE".to_string();
     for _ in 0..DEEP {
         expr = format!("(TRUE => ({expr}))");
     }
-    let r = deep_eval(&expr);
-    match r {
-        Ok(TlaValue::Bool(true)) => {}
-        Err(e) if e.to_string().contains("depth") || e.to_string().contains("recursion") => {}
-        other => panic!("deep =>: got {other:?}"),
-    }
+    assert_recursion_err(&expr, "deep =>");
 }
 
 #[test]
-fn t207c_deep_iff() {
+fn t207c_deep_iff_must_hit_depth_limit() {
     let mut expr = "TRUE".to_string();
     for _ in 0..DEEP {
         expr = format!("(TRUE <=> ({expr}))");
     }
-    let r = deep_eval(&expr);
-    match r {
-        Ok(TlaValue::Bool(_)) => {}
-        Err(e) if e.to_string().contains("depth") || e.to_string().contains("recursion") => {}
-        other => panic!("deep <=>: got {other:?}"),
-    }
+    assert_recursion_err(&expr, "deep <=>");
 }
 
-// ============================================================
-// Deep operator call chain — drives eval_compiled_opcall depth+1.
-// Uses Cardinality-of-singleton repeatedly.
-// ============================================================
-
 #[test]
-fn t207c_deep_operator_call_chain() {
-    // Cardinality({Cardinality({Cardinality({...{1}})})}) — each call
-    // recurses through eval_compiled_opcall.
-    let mut expr = "{1}".to_string();
-    for _ in 0..(DEEP / 2) {
-        // /2 because each level adds Cardinality(...) and {...}
-        expr = format!("Cardinality({{{expr}}})");
-    }
-    let r = deep_eval(&expr);
-    match r {
-        Ok(TlaValue::Int(1)) => {}
-        Err(e) if e.to_string().contains("depth") || e.to_string().contains("recursion") => {}
-        other => panic!("deep Cardinality: got {other:?}"),
-    }
-}
-
-// ============================================================
-// Deep CHOOSE — exercises eval_compiled_inner Choose depth.
-// ============================================================
-
-#[test]
-fn t207c_deep_choose() {
-    // CHOOSE x \in {0} : x = 0 nested DEEP times
-    let mut expr = "0".to_string();
-    for _ in 0..DEEP {
-        expr = format!("CHOOSE x \\in {{{expr}}} : TRUE");
-    }
-    let r = deep_eval(&expr);
-    match r {
-        Ok(TlaValue::Int(0)) => {}
-        Err(e) if e.to_string().contains("depth") || e.to_string().contains("recursion") => {}
-        other => panic!("deep CHOOSE: got {other:?}"),
-    }
-}
-
-// ============================================================
-// Deep RecordAccess + RecordLiteral — exercises Record path depth.
-// ============================================================
-
-#[test]
-fn t207c_deep_record_chain() {
-    // [a |-> [a |-> [a |-> ... 1]]].a.a.a.a... DEEP
+fn t207c_deep_record_chain_must_hit_depth_limit() {
     let mut expr = "1".to_string();
     for _ in 0..(DEEP / 2) {
         expr = format!("[a |-> {expr}].a");
     }
-    let r = deep_eval(&expr);
-    match r {
-        Ok(TlaValue::Int(1)) => {}
-        Err(e) if e.to_string().contains("depth") || e.to_string().contains("recursion") => {}
-        other => panic!("deep record: got {other:?}"),
+    assert_recursion_err(&expr, "deep record");
+}
+
+#[test]
+fn t207c_deep_choose_must_hit_depth_limit() {
+    let mut expr = "0".to_string();
+    for _ in 0..DEEP {
+        expr = format!("CHOOSE x \\in {{{expr}}} : TRUE");
     }
+    assert_recursion_err(&expr, "deep CHOOSE");
+}
+
+#[test]
+fn t207c_deep_addition_pairs_must_hit_depth_limit() {
+    let mut expr = "1".to_string();
+    for _ in 0..DEEP {
+        expr = format!("(1 + ({expr}))");
+    }
+    assert_recursion_err(&expr, "deep addition");
+}
+
+#[test]
+fn t207c_deep_operator_call_must_hit_depth_limit() {
+    let mut expr = "{1}".to_string();
+    for _ in 0..(DEEP / 2) {
+        expr = format!("Cardinality({{{expr}}})");
+    }
+    assert_recursion_err(&expr, "deep Cardinality");
 }
 
 // ============================================================
-// Deep sequence — Append wrapping.
+// Parens are stripped at compile time, no recursion at eval. This test
+// asserts ALWAYS Ok — catches mutations of strip_outer_parens.
 // ============================================================
 
 #[test]
-fn t207c_deep_append_chain() {
-    let mut expr = "<<>>".to_string();
-    for i in 0..(DEEP / 2) {
-        expr = format!("Append({expr}, {i})");
+fn t207c_deep_parens_compile_to_leaf() {
+    let mut expr = "42".to_string();
+    for _ in 0..DEEP {
+        expr = format!("({expr})");
     }
-    let r = deep_eval(&expr);
-    match r {
-        Ok(TlaValue::Seq(_)) => {}
-        Err(e) if e.to_string().contains("depth") || e.to_string().contains("recursion") => {}
-        other => panic!("deep Append: got {other:?}"),
-    }
+    assert_eq!(deep_eval(&expr).unwrap(), TlaValue::Int(42));
 }
 
 // ============================================================
-// Sub-MAX_DEPTH success cases — catch `depth + 1 -> depth - 1` mutations
-// (depth would underflow and immediately error).
+// Sub-MAX_DEPTH success cases — assert Ok. Catch `depth + 1 -> depth - 1`
+// (depth underflows for usize → check fires immediately on first call).
 // ============================================================
 
 #[test]
 fn t207c_shallow_if_chain_must_succeed() {
-    // 50 levels — well under MAX_DEPTH, must succeed under both original
-    // and `+ -> *` mutation (since mutated only stack-overflows at depth).
-    // But `+ -> -` mutation: depth decrements from 0 → underflow → errors
-    // immediately. Original: succeeds. So this test catches `+ -> -`.
     let mut expr = "1".to_string();
     for _ in 0..50 {
         expr = format!("IF TRUE THEN ({expr}) ELSE 0");
@@ -342,4 +225,18 @@ fn t207c_shallow_choose_chain_must_succeed() {
         expr = format!("CHOOSE x \\in {{{expr}}} : TRUE");
     }
     assert_eq!(deep_eval(&expr).unwrap(), TlaValue::Int(5));
+}
+
+#[test]
+fn t207c_shallow_append_chain_must_succeed() {
+    let mut expr = "<<>>".to_string();
+    for i in 0..30 {
+        expr = format!("Append({expr}, {i})");
+    }
+    let r = deep_eval(&expr).unwrap();
+    if let TlaValue::Seq(s) = &r {
+        assert_eq!(s.len(), 30);
+    } else {
+        panic!("expected Seq, got {r:?}");
+    }
 }
