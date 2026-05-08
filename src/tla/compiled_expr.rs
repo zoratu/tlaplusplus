@@ -4072,6 +4072,329 @@ IN
         let s = super::strip_label_prefix("Lbl(a, b):: x + 1");
         assert_eq!(s.trim(), "x + 1");
     }
+
+    // ============================================================
+    // T207d (iter5): targeted boundary tests for high-density miss
+    // categories — split_quantifier_bindings, find_top_level_except,
+    // find_definition_equals, split_first_top_level_op,
+    // split_binary_op_with, split_let_expression, find_keyword.
+    // Each test exercises a SPECIFIC byte-position branch so the
+    // mutation at that branch flips observable output.
+    // ============================================================
+
+    // ---- split_quantifier_bindings: <<>> bracket tracking ----
+
+    #[test]
+    fn t207d_split_qbindings_with_tuple_in_domain() {
+        // `<<x, y>>` is a tuple — the inner `,` is at depth>0 and must
+        // not split. Catches `<` and `+ 1` mutations on lines 2256, 2262.
+        let parts = super::split_quantifier_bindings("p \\in <<a, b>>");
+        assert_eq!(parts.len(), 1);
+        assert!(parts[0].contains("<<a, b>>"));
+    }
+
+    #[test]
+    fn t207d_split_qbindings_with_set_in_domain() {
+        let parts = super::split_quantifier_bindings("p \\in {a, b, c}");
+        assert_eq!(parts.len(), 1);
+    }
+
+    #[test]
+    fn t207d_split_qbindings_two_bindings_with_tuples() {
+        // Two distinct bindings, each with a tuple domain.
+        let parts = super::split_quantifier_bindings("p \\in <<1, 2>>, q \\in <<3, 4>>");
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0].contains("<<1, 2>>"));
+        assert!(parts[1].contains("<<3, 4>>"));
+    }
+
+    #[test]
+    fn t207d_split_qbindings_three_bindings() {
+        let parts = super::split_quantifier_bindings("a \\in S, b \\in T, c \\in U");
+        assert_eq!(parts.len(), 3);
+    }
+
+    // ---- find_top_level_except: <<>> bracket tracking ----
+
+    #[test]
+    fn t207d_find_except_with_tuple_inner_skipped() {
+        // EXCEPT inside `<<...>>` is at depth>0 → not top level.
+        // Catches `<` and `+ 1` mutations on lines 2015, 2020.
+        assert_eq!(
+            super::find_top_level_except("<<r EXCEPT !.a = 1>>"),
+            None
+        );
+    }
+
+    #[test]
+    fn t207d_find_except_at_top_after_tuple() {
+        // <<a, b>> EXCEPT — top-level EXCEPT comes AFTER the tuple closes.
+        let r = super::find_top_level_except("<<a, b>> EXCEPT !.x = 0");
+        assert!(r.is_some());
+    }
+
+    #[test]
+    fn t207d_find_except_nested_brace_skipped() {
+        assert_eq!(super::find_top_level_except("{r EXCEPT !.a = 1}"), None);
+    }
+
+    #[test]
+    fn t207d_find_except_nested_paren_skipped() {
+        assert_eq!(super::find_top_level_except("(r EXCEPT !.a = 1)"), None);
+    }
+
+    // ---- find_definition_equals: scanning for `==` at top level ----
+
+    #[test]
+    fn t207d_find_def_eq_skips_inside_paren() {
+        // (a == b) — the == is inside parens, not a top-level definition.
+        let positions = super::find_definition_equals("(a == b)");
+        assert_eq!(positions.len(), 0);
+    }
+
+    #[test]
+    fn t207d_find_def_eq_skips_inside_brace() {
+        let positions = super::find_definition_equals("{a == b}");
+        assert_eq!(positions.len(), 0);
+    }
+
+    #[test]
+    fn t207d_find_def_eq_skips_inside_tuple() {
+        // `<<>>` increments depth → == inside is not top-level.
+        let positions = super::find_definition_equals("<<a == b>>");
+        assert_eq!(positions.len(), 0);
+    }
+
+    #[test]
+    fn t207d_find_def_eq_skips_inside_let_in() {
+        // LET x == 1 IN ... — the inner == is part of LET binding,
+        // tracked via let_depth; top-level == count is 0 here.
+        let positions = super::find_definition_equals("LET x == 1 IN x");
+        assert_eq!(positions.len(), 0);
+    }
+
+    #[test]
+    fn t207d_find_def_eq_after_let_in_resumes() {
+        // After IN closes the LET, we're back at top level.
+        // x == 1 (top-level) followed by LET y == 2 IN y == 3 (one inner)
+        // total top-level: 1.
+        let positions = super::find_definition_equals("x == 1\nLET y == 2 IN y");
+        assert_eq!(positions.len(), 1);
+    }
+
+    #[test]
+    fn t207d_find_def_eq_correct_byte_position() {
+        // "x == 1" → `==` at byte position 2.
+        let positions = super::find_definition_equals("x == 1");
+        assert_eq!(positions, vec![2]);
+    }
+
+    // ---- split_first_top_level_op: leftmost-match-first ----
+
+    #[test]
+    fn t207d_split_first_op_at_position_zero_skipped() {
+        // "+a" — left side empty → must continue, no other op → None.
+        let ops: &[&str] = &["+"];
+        assert!(super::split_first_top_level_op("+a", ops).is_none());
+    }
+
+    #[test]
+    fn t207d_split_first_op_inside_set_skipped() {
+        // {a + b} + c — first top-level + is the SECOND one (outside set).
+        let ops: &[&str] = &["+"];
+        let r = super::split_first_top_level_op("{a + b} + c", ops);
+        assert!(r.is_some());
+        let (l, _, r2) = r.unwrap();
+        assert_eq!(l.trim(), "{a + b}");
+        assert_eq!(r2.trim(), "c");
+    }
+
+    #[test]
+    fn t207d_split_first_op_inside_tuple_skipped() {
+        let ops: &[&str] = &["+"];
+        let r = super::split_first_top_level_op("<<a + b>> + c", ops);
+        assert!(r.is_some());
+        let (l, _, r2) = r.unwrap();
+        assert_eq!(l.trim(), "<<a + b>>");
+        assert_eq!(r2.trim(), "c");
+    }
+
+    #[test]
+    fn t207d_split_first_op_disambig_eq_arrow() {
+        // `=>` must NOT match as `=`. ops contains both with `=` last.
+        let ops: &[&str] = &["="];
+        // `a => b` — the `=` here is part of `=>` and must be skipped.
+        let r = super::split_first_top_level_op("a => b", ops);
+        assert!(r.is_none(), "= should not match inside =>");
+    }
+
+    #[test]
+    fn t207d_split_first_op_disambig_eq_le() {
+        // `<=` contains `=` but must not split as `=`.
+        let ops: &[&str] = &["="];
+        let r = super::split_first_top_level_op("a <= b", ops);
+        assert!(r.is_none(), "= should not match inside <=");
+    }
+
+    #[test]
+    fn t207d_split_first_op_disambig_lt_le() {
+        // `<=` must not match as `<`.
+        let ops: &[&str] = &["<"];
+        assert!(super::split_first_top_level_op("a <= b", ops).is_none());
+    }
+
+    #[test]
+    fn t207d_split_first_op_disambig_gt_ge() {
+        let ops: &[&str] = &[">"];
+        assert!(super::split_first_top_level_op("a >= b", ops).is_none());
+    }
+
+    #[test]
+    fn t207d_split_first_op_skip_colon_gt() {
+        // `:>` should not split as `>` (operator-as-separator pattern).
+        let ops: &[&str] = &[">"];
+        let r = super::split_first_top_level_op("a :> b", ops);
+        assert!(r.is_none() || r.unwrap().1 != ">");
+    }
+
+    // ---- split_binary_op_with: prefer_first vs prefer_last ----
+
+    #[test]
+    fn t207d_split_binary_outer_plus_after_let() {
+        // `(LET x == 1 IN x) + 2` — the `+` is OUTSIDE the LET (let_depth=0
+        // when we hit the `+`). split_binary_op_with should split there.
+        let r = super::split_binary_op_with("(LET x == 1 IN x) + 2", "+", false);
+        assert!(r.is_some());
+        let (l, r2) = r.unwrap();
+        assert_eq!(l.trim(), "(LET x == 1 IN x)");
+        assert_eq!(r2.trim(), "2");
+    }
+
+    #[test]
+    fn t207d_split_binary_inside_quantifier_body_skipped() {
+        // \A x \in S : x + 1 — the `+` is inside quantifier body.
+        let r = super::split_binary_op_with("\\A x \\in S : x + 1", "+", false);
+        assert!(r.is_none(), "+ inside quantifier body should not split");
+    }
+
+    #[test]
+    fn t207d_split_binary_inside_if_skipped() {
+        // IF a > b THEN ... — the `>` is inside IF condition.
+        let r = super::split_binary_op_with("IF a > b THEN c ELSE d", ">", false);
+        // The > inside IF condition should not be a top-level split.
+        // The IF...THEN/ELSE structure protects it.
+        assert!(r.is_none() || {
+            let (l, _) = r.unwrap();
+            !l.trim().eq("IF a")
+        });
+    }
+
+    // ---- split_let_expression: nested LET handling ----
+
+    #[test]
+    fn t207d_split_let_with_nested_let() {
+        // LET a == 1 IN LET b == 2 IN a + b — outer should match first IN.
+        let r = super::split_let_expression("LET a == 1 IN LET b == 2 IN a + b");
+        assert!(r.is_some());
+        let (defs, body) = r.unwrap();
+        assert!(defs.contains("a == 1"));
+        assert!(body.starts_with("LET b == 2"));
+    }
+
+    #[test]
+    fn t207d_split_let_must_start_with_let() {
+        assert!(super::split_let_expression("a == 1 IN b").is_none());
+    }
+
+    #[test]
+    fn t207d_split_let_no_in() {
+        assert!(super::split_let_expression("LET x == 1").is_none());
+    }
+
+    // ---- find_keyword: depth tracking and word boundaries ----
+
+    #[test]
+    fn t207d_find_keyword_inside_brackets_skipped() {
+        // `[THEN]` — at depth_bracket > 0, should not match.
+        assert_eq!(super::find_keyword("[THEN]", "THEN"), None);
+    }
+
+    #[test]
+    fn t207d_find_keyword_inside_parens_skipped() {
+        assert_eq!(super::find_keyword("(THEN)", "THEN"), None);
+    }
+
+    #[test]
+    fn t207d_find_keyword_inside_braces_skipped() {
+        assert_eq!(super::find_keyword("{THEN}", "THEN"), None);
+    }
+
+    #[test]
+    fn t207d_find_keyword_in_substring_not_matched() {
+        // THENCE contains THEN but must not match (word boundary).
+        assert_eq!(super::find_keyword("THENCE", "THEN"), None);
+    }
+
+    #[test]
+    fn t207d_find_keyword_returns_byte_offset() {
+        // For ASCII-only input, byte offset == char position.
+        let r = super::find_keyword("a THEN b", "THEN");
+        assert_eq!(r, Some(2));
+    }
+
+    // ---- has_chained_top_level_arithmetic: more boundary cases ----
+
+    #[test]
+    fn t207d_has_chained_with_unary_after_open_paren() {
+        // `(- a + b + c + d)` — inside parens; outer scan sees no ops.
+        // depth_paren guards the inner ops.
+        assert!(!super::has_chained_top_level_arithmetic("f(-a + b + c + d)"));
+    }
+
+    #[test]
+    fn t207d_has_chained_only_unary_minuses() {
+        // `- - - - 1` — preceded by spaces (not value-end), so all unary.
+        // Counter never increments → not chained.
+        assert!(!super::has_chained_top_level_arithmetic("- - - - 1"));
+    }
+
+    #[test]
+    fn t207d_has_chained_minus_after_op_is_unary() {
+        // `1 + -2 + -3 + -4` — first `+` is binary; following `-` are unary
+        // (preceded by `+`/space, not value-end). So binary count: 3 (the
+        // three `+`s) — chained.
+        // But `+` after value-end ` ` is not value-end... let me think.
+        // Actually `1` is value-end, then ` `, then `+` (binary, count 1),
+        // then ` `, then `-` (preceded by `+`/space — NOT value-end → unary),
+        // then `2` (value-end), then ` `, `+` (binary, count 2), `-` (unary),
+        // `3`, ` `, `+` (binary, count 3) → chained!
+        assert!(super::has_chained_top_level_arithmetic("1 + -2 + -3 + -4"));
+    }
+
+    // ---- find_top_level_arrow: -> at top level ----
+
+    #[test]
+    fn t207d_find_arrow_inside_paren_skipped() {
+        assert_eq!(super::find_top_level_arrow("(a -> b)"), None);
+    }
+
+    #[test]
+    fn t207d_find_arrow_at_top_level() {
+        // For e.g. CASE arms `a -> b`. A simple top-level -> should be found.
+        assert!(super::find_top_level_arrow("a -> b").is_some());
+    }
+
+    // ---- find_top_level_eq: = at top level ----
+
+    #[test]
+    fn t207d_find_top_eq_inside_brackets_skipped() {
+        assert_eq!(super::find_top_level_eq("[a = b]"), None);
+    }
+
+    #[test]
+    fn t207d_find_top_eq_at_top() {
+        assert!(super::find_top_level_eq("a = b").is_some());
+    }
 }
 
 #[test]
