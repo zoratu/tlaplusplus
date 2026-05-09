@@ -21,6 +21,8 @@ use std::time::{Duration, Instant};
 
 use super::bloom::BloomFilter;
 use super::protocol::Message;
+use super::transport::Transport;
+#[cfg(test)]
 use super::transport::ClusterTransport;
 
 /// Default bloom exchange interval.
@@ -68,7 +70,7 @@ pub const DEFAULT_IDLE_BEFORE_STEAL: Duration = Duration::from_millis(250);
 pub struct DistributedWorkStealer {
     node_id: u32,
     num_nodes: u32,
-    transport: Arc<ClusterTransport>,
+    transport: Arc<dyn Transport>,
     tokio_handle: tokio::runtime::Handle,
 
     /// Local bloom filter — records fingerprints explored by this node.
@@ -134,10 +136,15 @@ pub struct DistributedWorkStealer {
 
 impl DistributedWorkStealer {
     /// Create a new distributed work stealer.
+    ///
+    /// `transport` is taken as `Arc<dyn Transport>` so tests can substitute
+    /// an in-process [`super::transport::MockTransport`] without spinning up a
+    /// real TCP listener. Production callers pass `Arc<ClusterTransport>`
+    /// (auto-coerced via `CoerceUnsized`).
     pub fn new(
         node_id: u32,
         num_nodes: u32,
-        transport: Arc<ClusterTransport>,
+        transport: Arc<dyn Transport>,
         tokio_handle: tokio::runtime::Handle,
     ) -> Self {
         // Create bloom filters — local and remote use same parameters
@@ -293,7 +300,7 @@ impl DistributedWorkStealer {
     }
 
     /// Reference to the transport (for handler spawning).
-    pub fn transport(&self) -> &Arc<ClusterTransport> {
+    pub fn transport(&self) -> &Arc<dyn Transport> {
         &self.transport
     }
 
@@ -592,7 +599,7 @@ mod tests {
             .unwrap();
         let transport = dummy_transport();
         let stealer =
-            DistributedWorkStealer::new(0, 2, Arc::clone(&transport), rt.handle().clone());
+            DistributedWorkStealer::new(0, 2, transport.clone(), rt.handle().clone());
 
         stealer.set_locally_idle(true);
         stealer.set_peer_idle(1, true);
@@ -619,7 +626,7 @@ mod tests {
             .unwrap();
         let transport = dummy_transport();
         let stealer =
-            DistributedWorkStealer::new(0, 3, Arc::clone(&transport), rt.handle().clone());
+            DistributedWorkStealer::new(0, 3, transport.clone(), rt.handle().clone());
 
         assert!(stealer.has_live_peer());
         stealer.mark_peer_down(1);
@@ -645,7 +652,7 @@ mod tests {
             .unwrap();
         let transport = dummy_transport();
         let stealer =
-            DistributedWorkStealer::new(0, 2, Arc::clone(&transport), rt.handle().clone());
+            DistributedWorkStealer::new(0, 2, transport.clone(), rt.handle().clone());
 
         // Just-noted local work: should NOT initiate.
         stealer.note_local_work();
@@ -672,7 +679,7 @@ mod tests {
             .unwrap();
         let transport = dummy_transport();
         let stealer =
-            DistributedWorkStealer::new(0, 2, Arc::clone(&transport), rt.handle().clone());
+            DistributedWorkStealer::new(0, 2, transport.clone(), rt.handle().clone());
 
         stealer.set_steal_victim_threshold(1000);
         assert!(!stealer.can_donate(500));
@@ -695,7 +702,7 @@ mod tests {
         let stealer = DistributedWorkStealer::new(
             7, // node id we expect rendered
             2,
-            Arc::clone(&transport),
+            transport.clone(),
             rt.handle().clone(),
         );
 
@@ -751,7 +758,7 @@ mod tests {
             .unwrap();
         let transport = dummy_transport();
         let stealer =
-            DistributedWorkStealer::new(0, 1, Arc::clone(&transport), rt.handle().clone());
+            DistributedWorkStealer::new(0, 1, transport.clone(), rt.handle().clone());
 
         stealer.last_local_work_ns.store(0, Ordering::Relaxed);
         stealer.set_idle_before_steal(Duration::from_millis(1));

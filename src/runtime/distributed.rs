@@ -64,6 +64,8 @@ pub(super) fn spawn_handlers_if_any<S>(
         return;
     };
 
+    // `stealer.transport()` already returns `&Arc<dyn Transport>` so the
+    // clone trivially produces the trait object the handler tasks expect.
     let handler_transport = Arc::clone(stealer.transport());
     let handler_stealer = Arc::clone(stealer);
     let handler_stop = Arc::clone(stop);

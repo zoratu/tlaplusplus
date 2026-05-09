@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crossbeam_channel::Sender;
 
 use super::protocol::Message;
-use super::transport::ClusterTransport;
+use super::transport::Transport;
 use super::work_stealer::DistributedWorkStealer;
 
 /// Inbound state received from a steal response.
@@ -45,7 +45,7 @@ pub type LocalPendingFn = Arc<dyn Fn() -> u64 + Send + Sync>;
 /// - `Stop`: Set the stop flag to halt exploration
 pub fn spawn_inbound_handler(
     handle: &tokio::runtime::Handle,
-    transport: Arc<ClusterTransport>,
+    transport: Arc<dyn Transport>,
     stealer: Arc<DistributedWorkStealer>,
     stolen_tx: Sender<StolenState>,
     donate_rx: crossbeam_channel::Receiver<Vec<u8>>,
@@ -182,7 +182,7 @@ pub fn spawn_inbound_handler(
 /// 2. Broadcasts this node's idle status for termination detection
 pub fn spawn_bloom_and_termination_task(
     handle: &tokio::runtime::Handle,
-    transport: Arc<ClusterTransport>,
+    transport: Arc<dyn Transport>,
     stealer: Arc<DistributedWorkStealer>,
     stop: Arc<AtomicBool>,
     interval_ms: u64,
@@ -268,7 +268,7 @@ pub fn spawn_bloom_and_termination_task(
 /// network request.
 pub fn spawn_steal_trigger_task(
     handle: &tokio::runtime::Handle,
-    transport: Arc<ClusterTransport>,
+    transport: Arc<dyn Transport>,
     stealer: Arc<DistributedWorkStealer>,
     stop: Arc<AtomicBool>,
     local_pending: LocalPendingFn,

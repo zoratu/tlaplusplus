@@ -278,11 +278,15 @@ pub(crate) fn handle(
         })?;
         println!("[cluster] connected to all peers");
 
-        // Create distributed work stealer (independent exploration + work stealing)
+        // Create distributed work stealer (independent exploration + work stealing).
+        // `transport.clone()` returns `Arc<ClusterTransport>` which unsize-coerces
+        // to `Arc<dyn Transport>` at the function-arg position. `Arc::clone(&t)`
+        // would not compile because the return type is constrained to the trait
+        // object by the parameter, forcing the receiver type to mismatch.
         let stealer = Arc::new(DistributedWorkStealer::new(
             cluster.node_id,
             num_nodes,
-            Arc::clone(&transport),
+            transport.clone(),
             tokio_handle.clone(),
         ));
 

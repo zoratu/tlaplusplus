@@ -371,10 +371,15 @@ pub(crate) fn maybe_setup_cluster(
     })?;
     println!("[cluster] connected to all peers");
 
+    // `transport.clone()` returns `Arc<ClusterTransport>`; the call site
+    // unsize-coerces it to `Arc<dyn Transport>` per the new constructor
+    // signature. Cannot use `Arc::clone(&transport)` here because that fixes
+    // `Self = Arc<dyn Transport>` from the parameter type, demanding a
+    // `&Arc<dyn Transport>` receiver.
     let stealer = Arc::new(DistributedWorkStealer::new(
         cluster.node_id,
         num_nodes,
-        Arc::clone(&transport),
+        transport.clone(),
         tokio_handle.clone(),
     ));
 
