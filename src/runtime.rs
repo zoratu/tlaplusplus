@@ -252,6 +252,7 @@ use pause::{
 mod checkpoint;
 mod memory;
 mod shards;
+mod shutdown;
 
 use checkpoint::{
     CheckpointManifest, MAX_CHECKPOINT_FILES, load_checkpoint_manifest,
@@ -1671,266 +1672,36 @@ where
         }));
     }
 
-    // Worker crash recovery: continue with remaining workers instead of failing immediately
-    let mut crashed_workers = 0usize;
-    let total_workers = workers.len();
-
-    for (worker_id, worker) in workers.into_iter().enumerate() {
-        if worker.join().is_err() {
-            crashed_workers += 1;
-            eprintln!(
-                "Warning: worker {} crashed ({}/{} workers still running)",
-                worker_id,
-                total_workers - crashed_workers,
-                total_workers
-            );
-
-            // If all workers crashed, we must stop
-            if crashed_workers == total_workers {
-                stop.store(true, Ordering::Release);
-                return Err(anyhow!("all {} worker threads panicked", total_workers));
-            }
-
-            // Otherwise continue - other workers may still complete the work
-            // The work-stealing queues will redistribute work from the crashed worker
-        }
+    // Shutdown phase — extracted to runtime/shutdown.rs. The 13-step
+    // sequence is documented in `docs/runtime-refactor-plan.md`
+    // "Concurrency-coupling analysis" §7; see shutdown.rs module docs
+    // for the per-step rationale and ordering invariants.
+    shutdown::ShutdownContext::<M> {
+        workers,
+        stop: Arc::clone(&stop),
+        init_producer,
+        progress_thread,
+        auto_tuner: auto_tuner.take(),
+        queue: Arc::clone(&queue),
+        mem_monitor_stop: Arc::clone(&mem_monitor_stop),
+        mem_monitor_thread_handle: Arc::clone(&mem_monitor_thread_handle),
+        mem_monitor_thread,
+        checkpoint_thread_stop: Arc::clone(&checkpoint_thread_stop),
+        pause: Arc::clone(&pause),
+        checkpoint_thread,
+        fp_store: Arc::clone(&fp_store),
+        run_stats: Arc::clone(&run_stats),
+        config: &config,
+        worker_plan: &worker_plan,
+        effective_memory_max,
+        resumed_from_checkpoint,
+        started_at,
+        error_rx,
+        violation_rx,
+        model: Arc::clone(&model),
+        labeled_transitions,
     }
-
-    if crashed_workers > 0 {
-        eprintln!(
-            "Run completed with {}/{} workers crashed (recovered gracefully)",
-            crashed_workers, total_workers
-        );
-    }
-
-    // Join the Init producer thread (T5.4). The Drop guard inside the thread
-    // already cleared `init_producing`, so workers have all exited by now.
-    // We propagate any error the producer encountered (e.g. fingerprint-store
-    // insert failures); a panic here is logged but doesn't fail the run.
-    if let Some(handle) = init_producer {
-        match handle.join() {
-            Ok(Ok(_distinct)) => {}
-            Ok(Err(e)) => {
-                eprintln!("Warning: Init producer reported error: {e}");
-            }
-            Err(panic) => {
-                eprintln!("Warning: Init producer thread panicked: {panic:?}");
-            }
-        }
-    }
-
-    // Stop progress reporting. Log if the progress thread panicked but don't
-    // fail the whole run over a reporting-only thread.
-    stop.store(true, Ordering::Release);
-    if let Err(panic) = progress_thread.join() {
-        eprintln!("warning: progress thread panicked during shutdown: {panic:?}");
-    }
-
-    // Stop auto-tuner if running
-    if let Some(tuner) = auto_tuner.take() {
-        tuner.join();
-    }
-
-    // Cleanup checkpoint thread
-    queue.finish(); // Signal completion
-
-    mem_monitor_stop.store(true, Ordering::Relaxed);
-    // Unpark the monitor thread so it wakes up immediately instead of
-    // sleeping for up to 5 seconds before checking the stop flag
-    if let Some(thread) = mem_monitor_thread_handle.read().as_ref() {
-        thread.unpark();
-    }
-    if let Some(handle) = mem_monitor_thread
-        && let Err(panic) = handle.join()
-    {
-        eprintln!("warning: memory monitor thread panicked during shutdown: {panic:?}");
-    }
-    checkpoint_thread_stop.store(true, Ordering::Release);
-    pause.resume();
-    if let Some(handle) = checkpoint_thread
-        && handle.join().is_err()
-    {
-        return Err(anyhow!("checkpoint thread panicked"));
-    }
-
-    // Write checkpoint manifest on exit if requested
-    if config.checkpoint_on_exit {
-        let checkpoint_path = config.work_dir.join("checkpoints").join("latest.json");
-        let (
-            states_generated,
-            states_processed,
-            states_distinct,
-            duplicates,
-            enqueued,
-            checkpoints,
-        ) = run_stats.snapshot();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let manifest = CheckpointManifest {
-            version: 1,
-            model: std::any::type_name::<M>().to_string(),
-            created_unix_secs: now,
-            duration_millis: started_at.elapsed().as_millis() as u64,
-            states_generated,
-            states_processed,
-            states_distinct,
-            duplicates,
-            enqueued,
-            checkpoints,
-            configured_workers: config.workers,
-            actual_workers: worker_plan.worker_count,
-            allowed_cpu_count: worker_plan.allowed_cpus.len(),
-            cgroup_cpuset_cores: worker_plan.cgroup_cpuset_cores,
-            cgroup_quota_cores: worker_plan.cgroup_quota_cores,
-            numa_nodes_used: worker_plan.numa_nodes_used,
-            effective_memory_max_bytes: effective_memory_max,
-            resumed_from_checkpoint,
-            queue: queue.stats(),
-            fingerprints: {
-                let stats = fp_store.stats();
-                OldFingerprintStats {
-                    checks: stats.checks,
-                    hits: stats.hits,
-                    inserts: stats.inserts,
-                    batch_calls: stats.batch_calls,
-                    batch_items: stats.batch_items,
-                }
-            },
-        };
-        if let Err(e) = write_validated_rolling_checkpoint(&checkpoint_path, &manifest) {
-            eprintln!(
-                "Warning: failed to write/validate checkpoint manifest: {}",
-                e
-            );
-        } else {
-            eprintln!(
-                "Exit checkpoint written and validated [keeping last {}]",
-                MAX_CHECKPOINT_FILES
-            );
-        }
-    }
-
-    // Queue cleanup happens automatically. Final FP-store flush is best-effort:
-    // we already wrote the manifest above, and any flush failure here would
-    // not change the verdict we're about to return — but it should be visible
-    // in logs so operators notice persistence problems.
-    if let Err(e) = fp_store.flush() {
-        eprintln!("warning: fingerprint store flush at shutdown failed: {e}");
-    }
-
-    if let Some(snap) = queue.compression_stats() {
-        if snap.segments_compressed > 0 || snap.segments_decompressed > 0 {
-            eprintln!(
-                "Queue compression: ratio={:.2}x compressed_bytes={} uncompressed_bytes={} segments_in/out={}/{} compress_ms={} decompress_ms={} ring_full_rejects={}",
-                snap.ratio(),
-                snap.bytes_compressed,
-                snap.bytes_uncompressed,
-                snap.segments_compressed,
-                snap.segments_decompressed,
-                snap.compress_time_us / 1000,
-                snap.decompress_time_us / 1000,
-                snap.push_rejected_full,
-            );
-        }
-    }
-
-    // Drain all worker errors. We log secondary errors (so they show up in
-    // the run log) and surface only the first one as the run-level error.
-    if let Ok(first_err) = error_rx.try_recv() {
-        while let Ok(more) = error_rx.try_recv() {
-            eprintln!("Additional worker error: {more}");
-        }
-        return Err(anyhow!(first_err));
-    }
-
-    // Collect all violations from the channel.
-    let mut all_violations: Vec<Violation<M::State>> = Vec::new();
-    while let Ok(v) = violation_rx.try_recv() {
-        all_violations.push(v);
-    }
-    let mut violation = if all_violations.is_empty() {
-        None
-    } else {
-        Some(all_violations.remove(0))
-    };
-
-    // Check fairness constraints if we collected labeled transitions
-    // (only if no safety violation was already found)
-    //
-    // T10 — liveness scaling. The previous implementation was O(scc_size *
-    // transitions * constraints) because the fairness check did
-    // `scc.contains(&t.from)` (a linear scan) for every transition for every
-    // constraint. On a 32K-state graph with one giant SCC, six fairness
-    // constraints, and 143K transitions that's ~27 billion comparisons. We
-    // now (a) flatten transitions once into a Vec of (from_fp, to_fp, name)
-    // triples, (b) build the adjacency / SCC graph in fingerprint-space
-    // (`HashMap<u64, Vec<u64>>` instead of `HashMap<State, Vec<State>>`) so
-    // hashing is one u64 instead of a full state walk, (c) hold a single
-    // `HashMap<u64, State>` for state lookup at violation-report time, and
-    // (d) use `check_fairness_on_scc_fp` which takes a `HashSet<u64>` of
-    // SCC fingerprints (O(1) membership) and iterates transitions once per
-    // SCC. The Tarjan implementation is also iterative now (see
-    // `fairness.rs`) so deep state graphs no longer risk stack overflow.
-    //
-    // T10.1 — flatten phase parallelized via rayon. Per-thread (triples,
-    // local state map) collected from chunks of the dashmap entries, then
-    // merged sequentially.
-    //
-    // T10.3 — trivial-SCC pre-filter. Iterative leaf trim cuts the input
-    // Tarjan sees on DAG-shaped graphs. No-op for one-giant-SCC specs.
-    //
-    // T10.4 — per-action transition shard. Each fairness check iterates
-    // only its own action's transitions instead of the full edge list.
-    // T10 liveness post-processing — extracted to runtime/liveness.rs.
-    if let Some(liveness_violation) = liveness::run_post_processing(
-        violation.is_some(),
-        &model,
-        labeled_transitions.as_ref(),
-        &config,
-    ) {
-        violation = Some(liveness_violation);
-    }
-
-    let (states_generated, states_processed, states_distinct, duplicates, enqueued, checkpoints) =
-        run_stats.snapshot();
-
-    Ok(RunOutcome {
-        stats: RunStats {
-            duration: started_at.elapsed(),
-            states_generated,
-            states_processed,
-            states_distinct,
-            duplicates,
-            enqueued,
-            checkpoints,
-            configured_workers: config.workers,
-            actual_workers: worker_plan.worker_count,
-            allowed_cpu_count: worker_plan.allowed_cpus.len(),
-            cgroup_cpuset_cores: worker_plan.cgroup_cpuset_cores,
-            cgroup_quota_cores: worker_plan.cgroup_quota_cores,
-            numa_nodes_used: worker_plan.numa_nodes_used,
-            effective_memory_max_bytes: effective_memory_max,
-            resumed_from_checkpoint,
-            queue: {
-                let ws_stats = queue.stats();
-                QueueStats {
-                    pushed: ws_stats.pushed,
-                    popped: ws_stats.popped,
-                    spilled_items: 0,
-                    spill_batches: 0,
-                    loaded_segments: 0,
-                    loaded_items: 0,
-                    max_inmem_len: 0,
-                    spill_lost_permanently: 0,
-                }
-            },
-            fingerprints: fp_store.stats(),
-        },
-        violation,
-        violations: all_violations, // Remaining violations (excluding the first, which is in `violation`)
-    })
+    .orchestrate()
 }
 
 /// Reconstruct trace to a violating state using post-processing
