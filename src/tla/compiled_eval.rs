@@ -126,6 +126,10 @@ fn eval_compiled_inner(
     ctx: &EvalContext<'_>,
     depth: usize,
 ) -> Result<TlaValue> {
+    // Single increment site: each frame adds 1 to depth. Recursive calls
+    // pass `depth` (not `depth + 1`); the increment happens here. Same
+    // effective tracking, but eliminates ~125 mutation surface sites.
+    let depth = depth + 1;
     if depth > MAX_DEPTH {
         return Err(anyhow!("max expression recursion depth exceeded"));
     }
@@ -152,7 +156,7 @@ fn eval_compiled_inner(
                 if def.params.is_empty() {
                     // Get or compile the operator body
                     let compiled_body = get_or_compile_operator(name, &def.body);
-                    let result = eval_compiled_inner(&compiled_body, ctx, depth + 1);
+                    let result = eval_compiled_inner(&compiled_body, ctx, depth);
                     if std::env::var("TLAPP_TRACE_VAR").is_ok() {
                         eprintln!("VAR {} (operator) -> {:?}", name, result);
                     }
@@ -201,7 +205,7 @@ fn eval_compiled_inner(
         // Logical operators with short-circuit evaluation
         CompiledExpr::And(exprs) => {
             for e in exprs {
-                if !eval_compiled_inner(e, ctx, depth + 1)?.as_bool()? {
+                if !eval_compiled_inner(e, ctx, depth)?.as_bool()? {
                     return Ok(TlaValue::Bool(false));
                 }
             }
@@ -209,66 +213,66 @@ fn eval_compiled_inner(
         }
         CompiledExpr::Or(exprs) => {
             for e in exprs {
-                if eval_compiled_inner(e, ctx, depth + 1)?.as_bool()? {
+                if eval_compiled_inner(e, ctx, depth)?.as_bool()? {
                     return Ok(TlaValue::Bool(true));
                 }
             }
             Ok(TlaValue::Bool(false))
         }
         CompiledExpr::Not(e) => {
-            let val = eval_compiled_inner(e, ctx, depth + 1)?.as_bool()?;
+            let val = eval_compiled_inner(e, ctx, depth)?.as_bool()?;
             Ok(TlaValue::Bool(!val))
         }
         CompiledExpr::Implies(a, b) => {
-            let lhs = eval_compiled_inner(a, ctx, depth + 1)?.as_bool()?;
+            let lhs = eval_compiled_inner(a, ctx, depth)?.as_bool()?;
             if !lhs {
                 return Ok(TlaValue::Bool(true));
             }
-            let rhs = eval_compiled_inner(b, ctx, depth + 1)?.as_bool()?;
+            let rhs = eval_compiled_inner(b, ctx, depth)?.as_bool()?;
             Ok(TlaValue::Bool(rhs))
         }
         CompiledExpr::Iff(a, b) => {
             // Logical equivalence: TRUE iff both sides agree.
-            let lhs = eval_compiled_inner(a, ctx, depth + 1)?.as_bool()?;
-            let rhs = eval_compiled_inner(b, ctx, depth + 1)?.as_bool()?;
+            let lhs = eval_compiled_inner(a, ctx, depth)?.as_bool()?;
+            let rhs = eval_compiled_inner(b, ctx, depth)?.as_bool()?;
             Ok(TlaValue::Bool(lhs == rhs))
         }
 
         // Comparison operators
         CompiledExpr::Eq(a, b) => {
-            let left = eval_compiled_inner(a, ctx, depth + 1)?;
-            let right = eval_compiled_inner(b, ctx, depth + 1)?;
+            let left = eval_compiled_inner(a, ctx, depth)?;
+            let right = eval_compiled_inner(b, ctx, depth)?;
             Ok(TlaValue::Bool(left == right))
         }
         CompiledExpr::Neq(a, b) => {
-            let left = eval_compiled_inner(a, ctx, depth + 1)?;
-            let right = eval_compiled_inner(b, ctx, depth + 1)?;
+            let left = eval_compiled_inner(a, ctx, depth)?;
+            let right = eval_compiled_inner(b, ctx, depth)?;
             Ok(TlaValue::Bool(left != right))
         }
         CompiledExpr::Lt(a, b) => {
-            let left = eval_compiled_inner(a, ctx, depth + 1)?.as_int()?;
-            let right = eval_compiled_inner(b, ctx, depth + 1)?.as_int()?;
+            let left = eval_compiled_inner(a, ctx, depth)?.as_int()?;
+            let right = eval_compiled_inner(b, ctx, depth)?.as_int()?;
             Ok(TlaValue::Bool(left < right))
         }
         CompiledExpr::Le(a, b) => {
-            let left = eval_compiled_inner(a, ctx, depth + 1)?.as_int()?;
-            let right = eval_compiled_inner(b, ctx, depth + 1)?.as_int()?;
+            let left = eval_compiled_inner(a, ctx, depth)?.as_int()?;
+            let right = eval_compiled_inner(b, ctx, depth)?.as_int()?;
             Ok(TlaValue::Bool(left <= right))
         }
         CompiledExpr::Gt(a, b) => {
-            let left = eval_compiled_inner(a, ctx, depth + 1)?.as_int()?;
-            let right = eval_compiled_inner(b, ctx, depth + 1)?.as_int()?;
+            let left = eval_compiled_inner(a, ctx, depth)?.as_int()?;
+            let right = eval_compiled_inner(b, ctx, depth)?.as_int()?;
             Ok(TlaValue::Bool(left > right))
         }
         CompiledExpr::Ge(a, b) => {
-            let left = eval_compiled_inner(a, ctx, depth + 1)?.as_int()?;
-            let right = eval_compiled_inner(b, ctx, depth + 1)?.as_int()?;
+            let left = eval_compiled_inner(a, ctx, depth)?.as_int()?;
+            let right = eval_compiled_inner(b, ctx, depth)?.as_int()?;
             Ok(TlaValue::Bool(left >= right))
         }
 
         // Set membership
         CompiledExpr::In(elem, set) => {
-            let elem_val = eval_compiled_inner(elem, ctx, depth + 1)?;
+            let elem_val = eval_compiled_inner(elem, ctx, depth)?;
             Ok(TlaValue::Bool(compiled_membership_contains(
                 &elem_val,
                 set,
@@ -277,7 +281,7 @@ fn eval_compiled_inner(
             )?))
         }
         CompiledExpr::NotIn(elem, set) => {
-            let elem_val = eval_compiled_inner(elem, ctx, depth + 1)?;
+            let elem_val = eval_compiled_inner(elem, ctx, depth)?;
             Ok(TlaValue::Bool(!compiled_membership_contains(
                 &elem_val,
                 set,
@@ -291,29 +295,29 @@ fn eval_compiled_inner(
         // panic. Mirror in `eval.rs::split_top_level_additive` /
         // `split_top_level_multiplicative`.
         CompiledExpr::Add(a, b) => {
-            let left = eval_compiled_inner(a, ctx, depth + 1)?.as_int()?;
-            let right = eval_compiled_inner(b, ctx, depth + 1)?.as_int()?;
+            let left = eval_compiled_inner(a, ctx, depth)?.as_int()?;
+            let right = eval_compiled_inner(b, ctx, depth)?.as_int()?;
             left.checked_add(right)
                 .map(TlaValue::Int)
                 .ok_or_else(|| anyhow!("integer overflow: {} + {}", left, right))
         }
         CompiledExpr::Sub(a, b) => {
-            let left = eval_compiled_inner(a, ctx, depth + 1)?.as_int()?;
-            let right = eval_compiled_inner(b, ctx, depth + 1)?.as_int()?;
+            let left = eval_compiled_inner(a, ctx, depth)?.as_int()?;
+            let right = eval_compiled_inner(b, ctx, depth)?.as_int()?;
             left.checked_sub(right)
                 .map(TlaValue::Int)
                 .ok_or_else(|| anyhow!("integer overflow: {} - {}", left, right))
         }
         CompiledExpr::Mul(a, b) => {
-            let left = eval_compiled_inner(a, ctx, depth + 1)?.as_int()?;
-            let right = eval_compiled_inner(b, ctx, depth + 1)?.as_int()?;
+            let left = eval_compiled_inner(a, ctx, depth)?.as_int()?;
+            let right = eval_compiled_inner(b, ctx, depth)?.as_int()?;
             left.checked_mul(right)
                 .map(TlaValue::Int)
                 .ok_or_else(|| anyhow!("integer overflow: {} * {}", left, right))
         }
         CompiledExpr::Pow(a, b) => {
-            let left = eval_compiled_inner(a, ctx, depth + 1)?.as_int()?;
-            let right = eval_compiled_inner(b, ctx, depth + 1)?.as_int()?;
+            let left = eval_compiled_inner(a, ctx, depth)?.as_int()?;
+            let right = eval_compiled_inner(b, ctx, depth)?.as_int()?;
             if right < 0 {
                 return Err(anyhow!("exponent must be non-negative, got {}", right));
             }
@@ -323,8 +327,8 @@ fn eval_compiled_inner(
             Ok(TlaValue::Int(value))
         }
         CompiledExpr::Div(a, b) => {
-            let left = eval_compiled_inner(a, ctx, depth + 1)?.as_int()?;
-            let right = eval_compiled_inner(b, ctx, depth + 1)?.as_int()?;
+            let left = eval_compiled_inner(a, ctx, depth)?.as_int()?;
+            let right = eval_compiled_inner(b, ctx, depth)?.as_int()?;
             if right == 0 {
                 return Err(anyhow!("division by zero"));
             }
@@ -334,8 +338,8 @@ fn eval_compiled_inner(
                 .ok_or_else(|| anyhow!("integer overflow: {} \\div {}", left, right))
         }
         CompiledExpr::Mod(a, b) => {
-            let left = eval_compiled_inner(a, ctx, depth + 1)?.as_int()?;
-            let right = eval_compiled_inner(b, ctx, depth + 1)?.as_int()?;
+            let left = eval_compiled_inner(a, ctx, depth)?.as_int()?;
+            let right = eval_compiled_inner(b, ctx, depth)?.as_int()?;
             if right == 0 {
                 return Err(anyhow!("modulo by zero"));
             }
@@ -344,7 +348,7 @@ fn eval_compiled_inner(
                 .ok_or_else(|| anyhow!("integer overflow: {} % {}", left, right))
         }
         CompiledExpr::Neg(a) => {
-            let val = eval_compiled_inner(a, ctx, depth + 1)?.as_int()?;
+            let val = eval_compiled_inner(a, ctx, depth)?.as_int()?;
             Ok(TlaValue::Int(-val))
         }
 
@@ -352,13 +356,13 @@ fn eval_compiled_inner(
         CompiledExpr::SetLiteral(exprs) => {
             let mut set = BTreeSet::new();
             for e in exprs {
-                set.insert(eval_compiled_inner(e, ctx, depth + 1)?);
+                set.insert(eval_compiled_inner(e, ctx, depth)?);
             }
             Ok(TlaValue::Set(Arc::new(set)))
         }
         CompiledExpr::SetRange(a, b) => {
-            let start = eval_compiled_inner(a, ctx, depth + 1)?.as_int()?;
-            let end = eval_compiled_inner(b, ctx, depth + 1)?.as_int()?;
+            let start = eval_compiled_inner(a, ctx, depth)?.as_int()?;
+            let end = eval_compiled_inner(b, ctx, depth)?.as_int()?;
             // T201: charge the range size against the budget BEFORE allocating.
             // Mirrors the fix in `eval.rs`. Without this, a giant `1..N` in
             // fuzz / probe contexts allocates O(N) before any other check.
@@ -375,16 +379,16 @@ fn eval_compiled_inner(
             Ok(TlaValue::Set(Arc::new(set)))
         }
         CompiledExpr::Union(a, b) => {
-            let left = eval_compiled_inner(a, ctx, depth + 1)?;
-            let right = eval_compiled_inner(b, ctx, depth + 1)?;
+            let left = eval_compiled_inner(a, ctx, depth)?;
+            let right = eval_compiled_inner(b, ctx, depth)?;
             let left_set = left.as_set()?;
             let right_set = right.as_set()?;
             let union: BTreeSet<TlaValue> = left_set.union(&right_set).cloned().collect();
             Ok(TlaValue::Set(Arc::new(union)))
         }
         CompiledExpr::Intersect(a, b) => {
-            let left = eval_compiled_inner(a, ctx, depth + 1)?;
-            let right = eval_compiled_inner(b, ctx, depth + 1)?;
+            let left = eval_compiled_inner(a, ctx, depth)?;
+            let right = eval_compiled_inner(b, ctx, depth)?;
             let left_set = left.as_set()?;
             let right_set = right.as_set()?;
             let intersect: BTreeSet<TlaValue> =
@@ -392,16 +396,16 @@ fn eval_compiled_inner(
             Ok(TlaValue::Set(Arc::new(intersect)))
         }
         CompiledExpr::SetMinus(a, b) => {
-            let left = eval_compiled_inner(a, ctx, depth + 1)?;
-            let right = eval_compiled_inner(b, ctx, depth + 1)?;
+            let left = eval_compiled_inner(a, ctx, depth)?;
+            let right = eval_compiled_inner(b, ctx, depth)?;
             let left_set = left.as_set()?;
             let right_set = right.as_set()?;
             let diff: BTreeSet<TlaValue> = left_set.difference(&right_set).cloned().collect();
             Ok(TlaValue::Set(Arc::new(diff)))
         }
         CompiledExpr::CartesianProduct(a, b) => {
-            let left = eval_compiled_inner(a, ctx, depth + 1)?;
-            let right = eval_compiled_inner(b, ctx, depth + 1)?;
+            let left = eval_compiled_inner(a, ctx, depth)?;
+            let right = eval_compiled_inner(b, ctx, depth)?;
             let left_set = left.as_set()?;
             let right_set = right.as_set()?;
             ctx.check_budget(left_set.len() * right_set.len())?;
@@ -415,19 +419,19 @@ fn eval_compiled_inner(
             Ok(TlaValue::Set(Arc::new(product)))
         }
         CompiledExpr::Subset(a, b) => {
-            let left = eval_compiled_inner(a, ctx, depth + 1)?;
-            let right = eval_compiled_inner(b, ctx, depth + 1)?;
+            let left = eval_compiled_inner(a, ctx, depth)?;
+            let right = eval_compiled_inner(b, ctx, depth)?;
             let left_set = left.as_set()?;
             let right_set = right.as_set()?;
             Ok(TlaValue::Bool(left_set.is_subset(&right_set)))
         }
         CompiledExpr::Cardinality(e) => {
-            let set = eval_compiled_inner(e, ctx, depth + 1)?;
+            let set = eval_compiled_inner(e, ctx, depth)?;
             let set = set.as_set()?;
             Ok(TlaValue::Int(set.len() as i64))
         }
         CompiledExpr::PowerSet(e) => {
-            let set = eval_compiled_inner(e, ctx, depth + 1)?;
+            let set = eval_compiled_inner(e, ctx, depth)?;
             let set = set.as_set()?;
             let elements: Vec<TlaValue> = set.iter().cloned().collect();
             let n = elements.len();
@@ -460,12 +464,12 @@ fn eval_compiled_inner(
         CompiledExpr::SeqLiteral(exprs) => {
             let mut seq = Vec::new();
             for e in exprs {
-                seq.push(eval_compiled_inner(e, ctx, depth + 1)?);
+                seq.push(eval_compiled_inner(e, ctx, depth)?);
             }
             Ok(TlaValue::Seq(Arc::new(seq)))
         }
         CompiledExpr::Head(e) => {
-            let seq = eval_compiled_inner(e, ctx, depth + 1)?;
+            let seq = eval_compiled_inner(e, ctx, depth)?;
             let seq =
                 sequence_like_values(&seq).ok_or_else(|| anyhow!("expected Seq, got {seq:?}"))?;
             if seq.is_empty() {
@@ -474,7 +478,7 @@ fn eval_compiled_inner(
             Ok(seq[0].clone())
         }
         CompiledExpr::Tail(e) => {
-            let seq = eval_compiled_inner(e, ctx, depth + 1)?;
+            let seq = eval_compiled_inner(e, ctx, depth)?;
             let seq =
                 sequence_like_values(&seq).ok_or_else(|| anyhow!("expected Seq, got {seq:?}"))?;
             if seq.is_empty() {
@@ -483,16 +487,16 @@ fn eval_compiled_inner(
             Ok(TlaValue::Seq(Arc::new(seq[1..].to_vec())))
         }
         CompiledExpr::Append(a, b) => {
-            let seq = eval_compiled_inner(a, ctx, depth + 1)?;
-            let elem = eval_compiled_inner(b, ctx, depth + 1)?;
+            let seq = eval_compiled_inner(a, ctx, depth)?;
+            let elem = eval_compiled_inner(b, ctx, depth)?;
             let mut seq =
                 sequence_like_values(&seq).ok_or_else(|| anyhow!("expected Seq, got {seq:?}"))?;
             seq.push(elem);
             Ok(TlaValue::Seq(Arc::new(seq)))
         }
         CompiledExpr::Concat(a, b) => {
-            let lhs = eval_compiled_inner(a, ctx, depth + 1)?;
-            let rhs = eval_compiled_inner(b, ctx, depth + 1)?;
+            let lhs = eval_compiled_inner(a, ctx, depth)?;
+            let rhs = eval_compiled_inner(b, ctx, depth)?;
             // Handle both string and sequence concatenation
             match (lhs, rhs) {
                 (TlaValue::String(mut a), TlaValue::String(b)) => {
@@ -520,15 +524,15 @@ fn eval_compiled_inner(
             }
         }
         CompiledExpr::Len(e) => {
-            let seq = eval_compiled_inner(e, ctx, depth + 1)?;
+            let seq = eval_compiled_inner(e, ctx, depth)?;
             let seq =
                 sequence_like_values(&seq).ok_or_else(|| anyhow!("expected Seq, got {seq:?}"))?;
             Ok(TlaValue::Int(seq.len() as i64))
         }
         CompiledExpr::SubSeq(s, a, b) => {
-            let seq = eval_compiled_inner(s, ctx, depth + 1)?;
-            let m = eval_compiled_inner(a, ctx, depth + 1)?.as_int()?;
-            let n = eval_compiled_inner(b, ctx, depth + 1)?.as_int()?;
+            let seq = eval_compiled_inner(s, ctx, depth)?;
+            let m = eval_compiled_inner(a, ctx, depth)?.as_int()?;
+            let n = eval_compiled_inner(b, ctx, depth)?.as_int()?;
             let seq =
                 sequence_like_values(&seq).ok_or_else(|| anyhow!("expected Seq, got {seq:?}"))?;
             // TLA+ requires 1-based start. Mirrors the OpCall path and the
@@ -550,12 +554,12 @@ fn eval_compiled_inner(
         CompiledExpr::RecordLiteral(fields) => {
             let mut rec = BTreeMap::new();
             for (name, expr) in fields {
-                rec.insert(name.clone(), eval_compiled_inner(expr, ctx, depth + 1)?);
+                rec.insert(name.clone(), eval_compiled_inner(expr, ctx, depth)?);
             }
             Ok(TlaValue::Record(Arc::new(rec)))
         }
         CompiledExpr::RecordAccess(e, field) => {
-            let rec = eval_compiled_inner(e, ctx, depth + 1)?;
+            let rec = eval_compiled_inner(e, ctx, depth)?;
             let rec = rec.as_record()?;
             rec.get(field)
                 .cloned()
@@ -565,7 +569,7 @@ fn eval_compiled_inner(
             // Evaluate each field's domain set
             let mut field_sets: Vec<(String, Vec<TlaValue>)> = Vec::new();
             for (name, expr) in fields {
-                let set_value = eval_compiled_inner(expr, ctx, depth + 1)?;
+                let set_value = eval_compiled_inner(expr, ctx, depth)?;
                 let set = set_value.as_set()?;
                 let elements: Vec<TlaValue> = set.iter().cloned().collect();
                 field_sets.push((name.clone(), elements));
@@ -629,8 +633,8 @@ fn eval_compiled_inner(
         CompiledExpr::FuncLiteral(entries) => {
             let mut func = BTreeMap::new();
             for (key_expr, val_expr) in entries {
-                let key = eval_compiled_inner(key_expr, ctx, depth + 1)?;
-                let val = eval_compiled_inner(val_expr, ctx, depth + 1)?;
+                let key = eval_compiled_inner(key_expr, ctx, depth)?;
+                let val = eval_compiled_inner(val_expr, ctx, depth)?;
                 func.insert(key, val);
             }
             Ok(TlaValue::Function(Arc::new(func)))
@@ -639,7 +643,7 @@ fn eval_compiled_inner(
             if std::env::var("TLAPP_TRACE_FUNCAPPLY").is_ok() {
                 eprintln!("FUNCAPPLY: {:?}[{:?}]", f, args);
             }
-            let func = eval_compiled_inner(f, ctx, depth + 1)?;
+            let func = eval_compiled_inner(f, ctx, depth)?;
             if std::env::var("TLAPP_TRACE_FUNCAPPLY").is_ok() {
                 eprintln!("  func evaluated to: {}", tla_value_to_string(&func));
             }
@@ -648,18 +652,18 @@ fn eval_compiled_inner(
                 TlaValue::Lambda { .. } => {
                     let arg_values = args
                         .iter()
-                        .map(|a| eval_compiled_inner(a, ctx, depth + 1))
+                        .map(|a| eval_compiled_inner(a, ctx, depth))
                         .collect::<Result<Vec<_>>>()?;
                     apply_value(&func, arg_values, ctx, depth + 1)
                 }
                 TlaValue::Function(map) => {
                     // Single argument or tuple
                     let key = if args.len() == 1 {
-                        eval_compiled_inner(&args[0], ctx, depth + 1)?
+                        eval_compiled_inner(&args[0], ctx, depth)?
                     } else {
                         let tuple: Vec<TlaValue> = args
                             .iter()
-                            .map(|a| eval_compiled_inner(a, ctx, depth + 1))
+                            .map(|a| eval_compiled_inner(a, ctx, depth))
                             .collect::<Result<_>>()?;
                         TlaValue::Seq(Arc::new(tuple))
                     };
@@ -685,7 +689,7 @@ fn eval_compiled_inner(
                     if args.len() != 1 {
                         return Err(anyhow!("sequence indexing requires exactly one argument"));
                     }
-                    let idx = eval_compiled_inner(&args[0], ctx, depth + 1)?.as_int()? as usize;
+                    let idx = eval_compiled_inner(&args[0], ctx, depth)?.as_int()? as usize;
                     if idx < 1 || idx > seq.len() {
                         return Err(anyhow!("sequence index out of bounds: {}", idx));
                     }
@@ -696,7 +700,7 @@ fn eval_compiled_inner(
                     if args.len() != 1 {
                         return Err(anyhow!("record access requires exactly one argument"));
                     }
-                    let field = match eval_compiled_inner(&args[0], ctx, depth + 1)? {
+                    let field = match eval_compiled_inner(&args[0], ctx, depth)? {
                         TlaValue::String(s) => s,
                         other => {
                             return Err(anyhow!("record field must be string, got {:?}", other));
@@ -712,7 +716,7 @@ fn eval_compiled_inner(
                     {
                         let arg_values = args
                             .iter()
-                            .map(|a| eval_compiled_inner(a, ctx, depth + 1))
+                            .map(|a| eval_compiled_inner(a, ctx, depth))
                             .collect::<Result<Vec<_>>>()?;
                         return eval_operator_call(name, arg_values, ctx, depth + 1);
                     }
@@ -738,7 +742,7 @@ fn eval_compiled_inner(
             }
         }
         CompiledExpr::Domain(e) => {
-            let val = eval_compiled_inner(e, ctx, depth + 1)?;
+            let val = eval_compiled_inner(e, ctx, depth)?;
             match &val {
                 TlaValue::Function(map) => {
                     let domain: BTreeSet<TlaValue> = map.keys().cloned().collect();
@@ -758,14 +762,14 @@ fn eval_compiled_inner(
             }
         }
         CompiledExpr::FuncExcept(base, updates) => {
-            let base_val = eval_compiled_inner(base, ctx, depth + 1)?;
+            let base_val = eval_compiled_inner(base, ctx, depth)?;
             eval_except(&base_val, updates, ctx, depth)
         }
 
         // TLC module: Function pair constructor (a :> b creates {a -> b})
         CompiledExpr::FuncPair(key_expr, val_expr) => {
-            let key = eval_compiled_inner(key_expr, ctx, depth + 1)?;
-            let val = eval_compiled_inner(val_expr, ctx, depth + 1)?;
+            let key = eval_compiled_inner(key_expr, ctx, depth)?;
+            let val = eval_compiled_inner(val_expr, ctx, depth)?;
             let mut func = BTreeMap::new();
             func.insert(key, val);
             Ok(TlaValue::Function(Arc::new(func)))
@@ -773,8 +777,8 @@ fn eval_compiled_inner(
 
         // TLC module: Function override (f @@ g merges functions, g takes precedence)
         CompiledExpr::FuncOverride(left, right) => {
-            let left_val = eval_compiled_inner(left, ctx, depth + 1)?;
-            let right_val = eval_compiled_inner(right, ctx, depth + 1)?;
+            let left_val = eval_compiled_inner(left, ctx, depth)?;
+            let right_val = eval_compiled_inner(right, ctx, depth)?;
 
             // Both operands must be functions
             let left_func = left_val.as_function()?;
@@ -805,21 +809,21 @@ fn eval_compiled_inner(
             then_branch,
             else_branch,
         } => {
-            let cond_val = eval_compiled_inner(cond, ctx, depth + 1)?.as_bool()?;
+            let cond_val = eval_compiled_inner(cond, ctx, depth)?.as_bool()?;
             if cond_val {
-                eval_compiled_inner(then_branch, ctx, depth + 1)
+                eval_compiled_inner(then_branch, ctx, depth)
             } else {
-                eval_compiled_inner(else_branch, ctx, depth + 1)
+                eval_compiled_inner(else_branch, ctx, depth)
             }
         }
         CompiledExpr::Case { arms, other } => {
             for (cond, expr) in arms {
-                if eval_compiled_inner(cond, ctx, depth + 1)?.as_bool()? {
-                    return eval_compiled_inner(expr, ctx, depth + 1);
+                if eval_compiled_inner(cond, ctx, depth)?.as_bool()? {
+                    return eval_compiled_inner(expr, ctx, depth);
                 }
             }
             if let Some(other_expr) = other {
-                eval_compiled_inner(other_expr, ctx, depth + 1)
+                eval_compiled_inner(other_expr, ctx, depth)
             } else {
                 Err(anyhow!("CASE: no arm matched and no OTHER clause"))
             }
@@ -827,26 +831,26 @@ fn eval_compiled_inner(
         CompiledExpr::Let { bindings, body } => {
             let mut new_ctx = ctx.clone();
             for (name, expr) in bindings {
-                let val = eval_compiled_inner(expr, &new_ctx, depth + 1)?;
+                let val = eval_compiled_inner(expr, &new_ctx, depth)?;
                 new_ctx = new_ctx.with_local_value(name, val);
             }
-            eval_compiled_inner(body, &new_ctx, depth + 1)
+            eval_compiled_inner(body, &new_ctx, depth)
         }
 
         // Quantifiers
         CompiledExpr::Exists { var, domain, body } => {
-            let domain_val = eval_compiled_inner(domain, ctx, depth + 1)?;
+            let domain_val = eval_compiled_inner(domain, ctx, depth)?;
             let domain_set = domain_val.as_set()?;
             for elem in domain_set.iter() {
                 let new_ctx = ctx.with_local_value(var, elem.clone());
-                if eval_compiled_inner(body, &new_ctx, depth + 1)?.as_bool()? {
+                if eval_compiled_inner(body, &new_ctx, depth)?.as_bool()? {
                     return Ok(TlaValue::Bool(true));
                 }
             }
             Ok(TlaValue::Bool(false))
         }
         CompiledExpr::Forall { var, domain, body } => {
-            let domain_val = eval_compiled_inner(domain, ctx, depth + 1)?;
+            let domain_val = eval_compiled_inner(domain, ctx, depth)?;
             let domain_set = domain_val.as_set()?;
             if std::env::var("TLAPP_TRACE_FORALL").is_ok() {
                 eprintln!(
@@ -862,18 +866,18 @@ fn eval_compiled_inner(
                         var, elem, new_ctx.locals, depth
                     );
                 }
-                if !eval_compiled_inner(body, &new_ctx, depth + 1)?.as_bool()? {
+                if !eval_compiled_inner(body, &new_ctx, depth)?.as_bool()? {
                     return Ok(TlaValue::Bool(false));
                 }
             }
             Ok(TlaValue::Bool(true))
         }
         CompiledExpr::Choose { var, domain, body } => {
-            let domain_val = eval_compiled_inner(domain, ctx, depth + 1)?;
+            let domain_val = eval_compiled_inner(domain, ctx, depth)?;
             let domain_set = domain_val.as_set()?;
             for elem in domain_set.iter() {
                 let new_ctx = ctx.with_local_value(var, elem.clone());
-                if eval_compiled_inner(body, &new_ctx, depth + 1)?.as_bool()? {
+                if eval_compiled_inner(body, &new_ctx, depth)?.as_bool()? {
                     return Ok(elem.clone());
                 }
             }
@@ -887,7 +891,7 @@ fn eval_compiled_inner(
             body,
             filter,
         } => {
-            let domain_val = eval_compiled_inner(domain, ctx, depth + 1)?;
+            let domain_val = eval_compiled_inner(domain, ctx, depth)?;
             let domain_set = domain_val.as_set()?;
             let mut result = BTreeSet::new();
             for elem in domain_set.iter() {
@@ -895,11 +899,11 @@ fn eval_compiled_inner(
                 ctx.check_budget(1)?;
                 let new_ctx = ctx.with_local_value(var, elem.clone());
                 if let Some(filter_expr) = filter {
-                    if !eval_compiled_inner(filter_expr, &new_ctx, depth + 1)?.as_bool()? {
+                    if !eval_compiled_inner(filter_expr, &new_ctx, depth)?.as_bool()? {
                         continue;
                     }
                 }
-                let val = eval_compiled_inner(body, &new_ctx, depth + 1)?;
+                let val = eval_compiled_inner(body, &new_ctx, depth)?;
                 result.insert(val);
             }
             Ok(TlaValue::Set(Arc::new(result)))
@@ -907,7 +911,7 @@ fn eval_compiled_inner(
 
         // Function construction
         CompiledExpr::FuncConstruct { var, domain, body } => {
-            let domain_val = eval_compiled_inner(domain, ctx, depth + 1)?;
+            let domain_val = eval_compiled_inner(domain, ctx, depth)?;
             let domain_set = domain_val.as_set()?;
             let mut func = BTreeMap::new();
             for elem in domain_set.iter() {
@@ -916,7 +920,7 @@ fn eval_compiled_inner(
                 // allocate without bound under a configured budget.
                 ctx.check_budget(1)?;
                 let new_ctx = ctx.with_local_value(var, elem.clone());
-                let val = eval_compiled_inner(body, &new_ctx, depth + 1)?;
+                let val = eval_compiled_inner(body, &new_ctx, depth)?;
                 func.insert(elem.clone(), val);
             }
             Ok(TlaValue::Function(Arc::new(func)))
@@ -924,8 +928,8 @@ fn eval_compiled_inner(
 
         // Function set: [Domain -> Range] - set of all functions from Domain to Range
         CompiledExpr::FunctionSet { domain, range } => {
-            let domain_val = eval_compiled_inner(domain, ctx, depth + 1)?;
-            let range_val = eval_compiled_inner(range, ctx, depth + 1)?;
+            let domain_val = eval_compiled_inner(domain, ctx, depth)?;
+            let range_val = eval_compiled_inner(range, ctx, depth)?;
             let domain_set = domain_val.as_set()?;
             let range_set = range_val.as_set()?;
 
@@ -1044,6 +1048,8 @@ fn compiled_membership_contains(
     ctx: &EvalContext<'_>,
     depth: usize,
 ) -> Result<bool> {
+    // Single increment site (depth-tracking consolidation).
+    let depth = depth + 1;
     match set_expr {
         CompiledExpr::NatSet => Ok(matches!(value.as_int(), Ok(n) if n >= 0)),
         CompiledExpr::IntSet => Ok(value.as_int().is_ok()),
@@ -1051,26 +1057,26 @@ fn compiled_membership_contains(
         // Fast path: x \in a..b → a <= x && x <= b (avoids set construction)
         CompiledExpr::SetRange(lo, hi) => {
             let x = value.as_int()?;
-            let a = eval_compiled_inner(lo, ctx, depth + 1)?.as_int()?;
-            let b = eval_compiled_inner(hi, ctx, depth + 1)?.as_int()?;
+            let a = eval_compiled_inner(lo, ctx, depth)?.as_int()?;
+            let b = eval_compiled_inner(hi, ctx, depth)?.as_int()?;
             Ok(a <= x && x <= b)
         }
         CompiledExpr::Var(name) => {
             if let Some(def) = ctx.definition(name)
                 && def.params.is_empty()
             {
-                return membership_matches_text(value, &def.body, ctx, depth + 1);
+                return membership_matches_text(value, &def.body, ctx, depth);
             }
-            let set_val = eval_compiled_inner(set_expr, ctx, depth + 1)?;
+            let set_val = eval_compiled_inner(set_expr, ctx, depth)?;
             set_val.contains(value)
         }
-        CompiledExpr::Unparsed(text) => membership_matches_text(value, text, ctx, depth + 1),
+        CompiledExpr::Unparsed(text) => membership_matches_text(value, text, ctx, depth),
         // Handle Seq(S) - check if value is a sequence with all elements in S
         CompiledExpr::OpCall { name, args } if name == "Seq" && args.len() == 1 => {
             match value {
                 TlaValue::Seq(seq) => {
                     for elem in seq.iter() {
-                        if !compiled_membership_contains(elem, &args[0], ctx, depth + 1)? {
+                        if !compiled_membership_contains(elem, &args[0], ctx, depth)? {
                             return Ok(false);
                         }
                     }
@@ -1081,7 +1087,7 @@ fn compiled_membership_contains(
                 TlaValue::Function(func) => {
                     if func_is_sequence_shaped(func) {
                         for val in func.values() {
-                            if !compiled_membership_contains(val, &args[0], ctx, depth + 1)? {
+                            if !compiled_membership_contains(val, &args[0], ctx, depth)? {
                                 return Ok(false);
                             }
                         }
@@ -1097,7 +1103,7 @@ fn compiled_membership_contains(
         CompiledExpr::FunctionSet { domain, range } => {
             match value {
                 TlaValue::Function(func) => {
-                    let domain_val = eval_compiled_inner(domain, ctx, depth + 1)?;
+                    let domain_val = eval_compiled_inner(domain, ctx, depth)?;
                     let domain_set = domain_val.as_set()?;
                     // Check that the function's domain matches exactly
                     let func_domain: std::collections::BTreeSet<TlaValue> =
@@ -1107,7 +1113,7 @@ fn compiled_membership_contains(
                     }
                     // Check that every value in the function's range is in the range set
                     for val in func.values() {
-                        if !compiled_membership_contains(val, range, ctx, depth + 1)? {
+                        if !compiled_membership_contains(val, range, ctx, depth)? {
                             return Ok(false);
                         }
                     }
@@ -1117,7 +1123,7 @@ fn compiled_membership_contains(
             }
         }
         _ => {
-            let set_val = eval_compiled_inner(set_expr, ctx, depth + 1)?;
+            let set_val = eval_compiled_inner(set_expr, ctx, depth)?;
             set_val.contains(value)
         }
     }
@@ -1145,6 +1151,8 @@ fn membership_matches_text(
     ctx: &EvalContext<'_>,
     depth: usize,
 ) -> Result<bool> {
+    // Single increment site (depth-tracking consolidation).
+    let depth = depth + 1;
     let rhs_trimmed = expr.trim();
     match rhs_trimmed {
         "Nat" => Ok(matches!(value.as_int(), Ok(n) if n >= 0)),
@@ -1158,7 +1166,7 @@ fn membership_matches_text(
             if let Some(def) = ctx.definition(rhs_trimmed)
                 && def.params.is_empty()
             {
-                return membership_matches_text(value, &def.body, ctx, depth + 1);
+                return membership_matches_text(value, &def.body, ctx, depth);
             }
 
             if let Some(inner) = rhs_trimmed.strip_prefix("Seq(") {
@@ -1166,7 +1174,7 @@ fn membership_matches_text(
                     return match value {
                         TlaValue::Seq(seq) => {
                             for elem in seq.iter() {
-                                if !membership_matches_text(elem, set_expr, ctx, depth + 1)? {
+                                if !membership_matches_text(elem, set_expr, ctx, depth)? {
                                     return Ok(false);
                                 }
                             }
@@ -1174,7 +1182,7 @@ fn membership_matches_text(
                         }
                         TlaValue::Function(func) if func_is_sequence_shaped(func) => {
                             for val in func.values() {
-                                if !membership_matches_text(val, set_expr, ctx, depth + 1)? {
+                                if !membership_matches_text(val, set_expr, ctx, depth)? {
                                     return Ok(false);
                                 }
                             }
@@ -1204,7 +1212,7 @@ fn membership_matches_text(
                                 return Ok(false);
                             }
                             for item in func.values() {
-                                if !membership_matches_text(item, codomain_expr, ctx, depth + 1)? {
+                                if !membership_matches_text(item, codomain_expr, ctx, depth)? {
                                     return Ok(false);
                                 }
                             }
@@ -1274,7 +1282,7 @@ fn eval_except(
         // Evaluate the path keys
         let keys: Vec<TlaValue> = path
             .iter()
-            .map(|k| eval_compiled_inner(k, ctx, depth + 1))
+            .map(|k| eval_compiled_inner(k, ctx, depth))
             .collect::<Result<_>>()?;
 
         // Get the old value at this path (for @ operator)
@@ -1305,7 +1313,7 @@ fn eval_with_self_ref(
     // For other expressions, we need to evaluate them but handle SelfRef specially
     // The simplest approach is to add self_val as a special local binding
     let self_ctx = ctx.with_local_value("@", self_val.clone());
-    eval_with_self_ref_inner(expr, self_val, &self_ctx, depth + 1)
+    eval_with_self_ref_inner(expr, self_val, &self_ctx, depth)
 }
 
 /// Inner evaluation that handles SelfRef in subexpressions
@@ -1315,28 +1323,30 @@ fn eval_with_self_ref_inner(
     ctx: &EvalContext<'_>,
     depth: usize,
 ) -> Result<TlaValue> {
+    // Single increment site (depth-tracking consolidation).
+    let depth = depth + 1;
     match expr {
         CompiledExpr::SelfRef => Ok(self_val.clone()),
 
         // For binary operations, recursively handle SelfRef
         // T101.1: use checked_* to mirror eval_compiled_inner's overflow safety.
         CompiledExpr::Add(a, b) => {
-            let left = eval_with_self_ref_inner(a, self_val, ctx, depth + 1)?.as_int()?;
-            let right = eval_with_self_ref_inner(b, self_val, ctx, depth + 1)?.as_int()?;
+            let left = eval_with_self_ref_inner(a, self_val, ctx, depth)?.as_int()?;
+            let right = eval_with_self_ref_inner(b, self_val, ctx, depth)?.as_int()?;
             left.checked_add(right)
                 .map(TlaValue::Int)
                 .ok_or_else(|| anyhow!("integer overflow: {} + {}", left, right))
         }
         CompiledExpr::Sub(a, b) => {
-            let left = eval_with_self_ref_inner(a, self_val, ctx, depth + 1)?.as_int()?;
-            let right = eval_with_self_ref_inner(b, self_val, ctx, depth + 1)?.as_int()?;
+            let left = eval_with_self_ref_inner(a, self_val, ctx, depth)?.as_int()?;
+            let right = eval_with_self_ref_inner(b, self_val, ctx, depth)?.as_int()?;
             left.checked_sub(right)
                 .map(TlaValue::Int)
                 .ok_or_else(|| anyhow!("integer overflow: {} - {}", left, right))
         }
         CompiledExpr::Mul(a, b) => {
-            let left = eval_with_self_ref_inner(a, self_val, ctx, depth + 1)?.as_int()?;
-            let right = eval_with_self_ref_inner(b, self_val, ctx, depth + 1)?.as_int()?;
+            let left = eval_with_self_ref_inner(a, self_val, ctx, depth)?.as_int()?;
+            let right = eval_with_self_ref_inner(b, self_val, ctx, depth)?.as_int()?;
             left.checked_mul(right)
                 .map(TlaValue::Int)
                 .ok_or_else(|| anyhow!("integer overflow: {} * {}", left, right))
@@ -1344,7 +1354,7 @@ fn eval_with_self_ref_inner(
 
         // For all other expressions, fall back to regular evaluation
         // (they shouldn't contain unhandled SelfRef)
-        _ => eval_compiled_inner(expr, ctx, depth + 1),
+        _ => eval_compiled_inner(expr, ctx, depth),
     }
 }
 
@@ -1456,6 +1466,8 @@ fn eval_compiled_opcall(
     ctx: &EvalContext<'_>,
     depth: usize,
 ) -> Result<TlaValue> {
+    // Single increment site (see eval_compiled_inner above for rationale).
+    let depth = depth + 1;
     if depth > MAX_DEPTH {
         return Err(anyhow!("operator recursion depth exceeded at {}", name));
     }
@@ -1463,7 +1475,7 @@ fn eval_compiled_opcall(
     // First evaluate all arguments
     let arg_values: Vec<TlaValue> = args
         .iter()
-        .map(|a| eval_compiled_inner(a, ctx, depth + 1))
+        .map(|a| eval_compiled_inner(a, ctx, depth))
         .collect::<Result<_>>()?;
     let user_defined_shadow = matches!(name, "BoundedSeq" | "Max" | "Min")
         && ctx
@@ -1906,7 +1918,7 @@ fn eval_compiled_opcall(
     }
 
     // Evaluate the compiled body
-    eval_compiled_inner(&compiled_body, &new_ctx, depth + 1)
+    eval_compiled_inner(&compiled_body, &new_ctx, depth)
 }
 
 fn eval_builtin_extremum(name: &str, value: &TlaValue, want_max: bool) -> Result<TlaValue> {
