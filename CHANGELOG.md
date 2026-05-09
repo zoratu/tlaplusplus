@@ -1,5 +1,94 @@
 # Changelog
 
+## v1.2.0 (2026-05-07)
+
+Patch release driven by extensive fuzz + mutation testing. Six T20X
+soundness fixes in the compiled-eval / compiled-expr paths, two large
+refactors that improve testability without behavioural change, and
++281 targeted compiler-helper tests across 8 iterations that lift the
+compiler mutation kill rate from 42% → 65%.
+
+### Compiler-vs-interpreter soundness (T201–T207)
+
+- **T201** — Fuzz harness OOM. Six allocator sites (range, set
+  comprehension, function constructor) now charge `ctx.check_budget`
+  before allocating. Fuzz harness raised to `-rss_limit_mb=8192`.
+- **T202** — Compiler `LAMBDA` parser was looser than interpreter.
+  Tightened to mirror `eval.rs::parse_lambda` word-boundary rules.
+- **T203** — `LET`-binding eval OOM. Compiler now charges
+  `local_definitions.len() + defs.len()` before
+  `with_local_definitions`.
+- **T204** — Per-call entry-point eval budget tick.
+- **T205** — Bare `IOEnv` / `EmptyBag` in compiled eval. Compiler now
+  dispatches bare zero-arg builtins instead of falling through to
+  `ModelValue`.
+- **T206** — Chained binary `+`/`-` arithmetic. Compiler detects 3+
+  chains via `has_chained_top_level_arithmetic` and emits
+  `CompiledExpr::Unparsed` to delegate to the interpreter (the
+  reference). Generalises the per-shape T101.1 fixes.
+- **T207** — Compiler typed `SubSeq` accepted `m=0`. Surfaced by
+  mutation testing. `CompiledExpr::SubSeq` now mirrors the
+  interpreter's `m >= 1` validation.
+
+### Testing infrastructure — mutation kill rate 42% → 65%
+
+Eight iterations of compiler-helper coverage:
+
+- **T207 (iter 1, +66 tests).** Arity guards, scope protection,
+  membership shapes, short-circuit. **42.4% → 55.7%**. Surfaced T207
+  SubSeq m<1 soundness fix.
+- **T207b (iter 2, +46 tests).** Chain-detection boundaries,
+  community-module ops, arithmetic edges. **55.7% → 59.4%**.
+- **T207c (iter 3, +77 tests).** Deep-recursion stress (280+ levels),
+  direct unit tests on private scanner helpers. **59.4% → 61.3%**.
+- **Iter 4 (assertion fix).** Tightened deep-recursion assertions
+  from Ok-or-Err to Err-only. **61.3% → 62.8%**.
+- **T207d (iter 5, +40 tests).** Direct boundary tests for scanner
+  helpers — quantifier/EXCEPT/definition-equals/relop-disambiguation.
+  **62.8% → 63.7%**.
+- **T207e (iter 6, +28 tests).** More built-in deep recursion,
+  exhaustive membership shapes. **63.7% → 65.3%**.
+- **T207f (iter 7, +6 RECURSIVE tests).** `RECURSIVE Op(_)` chains
+  for user-defined op dispatch. **65.3% → 66.0%**.
+- **T207g (iter 8, +18 tests).** Deep recursion through every relop
+  and arithmetic dispatch arm. **66.0% → 65.4%** (mutation-to-mutation
+  variance dominates at this point).
+- **Dead code.** Removed `split_top_level_old` (235 lines,
+  `#[allow(dead_code)]`, never called) — surfaced as 158 noise
+  mutants in iter 1.
+
+Convergence at ~65–66% reflects equivalent mutants in compiler
+internal helpers (multiple `depth + 1` sites where the outer dispatch's
+depth check fires first, masking inner mutations). The compiler's real
+soundness guarantee is the layered safety net — T2 proptest equivalence
++ `fuzz_tla_swarm` + diff-vs-TLC + state-graph snapshots. Every real
+soundness bug found this cycle (T201–T207) came from those layers.
+
+### Refactors (no behavioural change)
+
+- **`src/main.rs`: 11,711 → 10 lines.** CLI dispatch tree split into
+  12 modules under `src/cli/`.
+- **`src/runtime.rs`: 4,323 → 2,451 lines.** Seven extraction chunks
+  landed (PauseController, checkpoint manifest, memory budget, shard
+  count, AtomicRunStats, T5.4 init producer, T10 liveness post-
+  processing, distributed handler wiring, progress tick); +64 unit
+  tests.
+- **T204.1.** `DistributedWorkStealer::print_stats()` wired into the
+  cluster run summary so steal counters surface by default.
+
+### Validation
+
+| Gate | Result |
+|---|---|
+| `cargo test --release` | 1,155 pass / 0 fail / 8 ignored |
+| `cargo test --release --features failpoints` | 1,177 pass / 0 fail / 8 ignored |
+| `cargo test --release --features symbolic-init` | 1,182 pass / 0 fail / 8 ignored |
+| `scripts/diff_tlc.sh` (vs TLC v1.7.4) | 13 / 13 |
+| Mutation testing — `eval.rs` (interpreter) | 100% kill rate |
+| Mutation testing — compiled_eval.rs + compiled_expr.rs | 65.4% kill rate (8 iters) |
+
+Drop-in for v1.0.x and v1.1.x. No public-API or CLI changes.
+
 ## v1.1.0 (2026-04-25)
 
 Feature release rolling up the post-1.0 sweep — the first wave of items
