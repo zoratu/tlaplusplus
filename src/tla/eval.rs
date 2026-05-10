@@ -260,7 +260,7 @@ impl<'a> EvalContext<'a> {
 
         if let Some(def) = self.definition(name) {
             if def.params.is_empty() {
-                return eval_operator_call(name, Vec::new(), self, depth + 1);
+                return eval_operator_call(name, Vec::new(), self, depth);
             }
             return Ok(definition_as_lambda(&def, self.locals.as_ref()));
         }
@@ -269,7 +269,7 @@ impl<'a> EvalContext<'a> {
         // (e.g., IOEnv, EmptyBag — TLA+ uses them without parentheses)
         match name {
             "IOEnv" | "EmptyBag" => {
-                return eval_operator_call(name, Vec::new(), self, depth + 1);
+                return eval_operator_call(name, Vec::new(), self, depth);
             }
             _ => {}
         }
@@ -1483,7 +1483,7 @@ fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Resul
     if let Some((lhs, op, rhs)) = split_top_level_defined_infix(expr, ctx) {
         let left = eval_expr_inner(lhs, ctx, depth + 1)?;
         let right = eval_expr_inner(rhs, ctx, depth + 1)?;
-        return eval_operator_call(&op, vec![left, right], ctx, depth + 1);
+        return eval_operator_call(&op, vec![left, right], ctx, depth);
     }
 
     let union_parts = split_top_level_keyword(expr, "\\union");
@@ -2099,7 +2099,7 @@ fn eval_primed_postfix_expr(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> 
             };
             rest = next_rest;
             let primed_ctx = ctx.with_primed_state_shadow_bindings();
-            eval_operator_call(&name, args, &primed_ctx, depth + 1)?
+            eval_operator_call(&name, args, &primed_ctx, depth)?
         } else {
             ctx.resolve_identifier(&format!("{name}'"), depth + 1)?
         }
@@ -2246,7 +2246,7 @@ fn parse_base<'a>(
             let trimmed_rest = rest.trim_start();
             let (args_text, next_rest) = take_bracket_group(trimmed_rest, '(', ')')?;
             let args = parse_argument_list(args_text, ctx, depth + 1)?;
-            let value = eval_operator_call(&name, args, ctx, depth + 1)?;
+            let value = eval_operator_call(&name, args, ctx, depth)?;
             return Ok((value, next_rest));
         }
 
@@ -2257,7 +2257,7 @@ fn parse_base<'a>(
             let trimmed_rest = rest.trim_start();
             let (args_text, next_rest) = take_bracket_group(trimmed_rest, '[', ']')?;
             let args = parse_argument_list(args_text, ctx, depth + 1)?;
-            let value = eval_operator_call(&name, args, ctx, depth + 1)?;
+            let value = eval_operator_call(&name, args, ctx, depth)?;
             return Ok((value, next_rest));
         }
 
@@ -2267,7 +2267,7 @@ fn parse_base<'a>(
             // as `(DOMAIN ReplicatedLog)[node]`.
             let (arg_value, next_rest) =
                 parse_atom_with_postfix(rest_after_name.trim_start(), ctx, depth + 1)?;
-            let value = eval_operator_call(&name, vec![arg_value], ctx, depth + 1)?;
+            let value = eval_operator_call(&name, vec![arg_value], ctx, depth)?;
             return Ok((value, next_rest));
         }
 
@@ -3500,6 +3500,10 @@ pub(crate) fn eval_operator_call(
     ctx: &EvalContext<'_>,
     depth: usize,
 ) -> Result<TlaValue> {
+    // Depth-tracking consolidation: callers pass `depth` (not `depth + 1`);
+    // we increment here. Mirrors compiled_eval.rs's pattern. Eliminates
+    // 26 cross-call mutation sites for a single increment.
+    let depth = depth + 1;
     if depth > MAX_EVAL_DEPTH {
         return Err(anyhow!("operator recursion depth exceeded at {name}"));
     }
@@ -4558,7 +4562,7 @@ pub(crate) fn eval_operator_call(
             let n = &args[1];
             let g = &args[2];
             // Reuse ConnectedComponents
-            let comps = eval_operator_call("ConnectedComponents", vec![g.clone()], ctx, depth + 1)?;
+            let comps = eval_operator_call("ConnectedComponents", vec![g.clone()], ctx, depth)?;
             for comp in comps.as_set()?.iter() {
                 let comp_set = comp.as_set()?;
                 if comp_set.contains(m) && comp_set.contains(n) {
@@ -4569,7 +4573,7 @@ pub(crate) fn eval_operator_call(
         }
         "IsStronglyConnected" if args.len() == 1 && !user_defined_shadow => {
             let comps =
-                eval_operator_call("ConnectedComponents", vec![args[0].clone()], ctx, depth + 1)?;
+                eval_operator_call("ConnectedComponents", vec![args[0].clone()], ctx, depth)?;
             let num_comps = comps.as_set()?.len();
             return Ok(TlaValue::Bool(num_comps <= 1));
         }

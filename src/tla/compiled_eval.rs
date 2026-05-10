@@ -179,7 +179,7 @@ fn eval_compiled_inner(
             // compiler returns ModelValue("IOEnv") while the interpreter
             // returns the actual env Record — surfaced by fuzz_tla_swarm.
             if matches!(name.as_str(), "IOEnv" | "EmptyBag") {
-                return crate::tla::eval::eval_operator_call(name, Vec::new(), ctx, depth + 1);
+                return crate::tla::eval::eval_operator_call(name, Vec::new(), ctx, depth);
             }
 
             // Fall back to model value for undefined identifiers
@@ -718,7 +718,7 @@ fn eval_compiled_inner(
                             .iter()
                             .map(|a| eval_compiled_inner(a, ctx, depth))
                             .collect::<Result<Vec<_>>>()?;
-                        return eval_operator_call(name, arg_values, ctx, depth + 1);
+                        return eval_operator_call(name, arg_values, ctx, depth);
                     }
 
                     let func_str = tla_value_to_string(&func);
@@ -1727,21 +1727,21 @@ fn eval_compiled_opcall(
         // === Community module: SequencesExt ===
         "SeqOf" if arg_values.len() == 2 && !user_defined_shadow => {
             // Delegate to text-based eval (set construction is complex)
-            return eval_operator_call("SeqOf", arg_values.clone(), ctx, depth + 1);
+            return eval_operator_call("SeqOf", arg_values.clone(), ctx, depth);
         }
         // === Community module: Folds ===
         "MapThenFoldSet" if arg_values.len() == 5 && !user_defined_shadow => {
-            return eval_operator_call("MapThenFoldSet", arg_values.clone(), ctx, depth + 1);
+            return eval_operator_call("MapThenFoldSet", arg_values.clone(), ctx, depth);
         }
         "FoldSet" if arg_values.len() == 3 && !user_defined_shadow => {
-            return eval_operator_call("FoldSet", arg_values.clone(), ctx, depth + 1);
+            return eval_operator_call("FoldSet", arg_values.clone(), ctx, depth);
         }
         "FoldFunctionOnSet" if arg_values.len() == 4 && !user_defined_shadow => {
-            return eval_operator_call("FoldFunctionOnSet", arg_values.clone(), ctx, depth + 1);
+            return eval_operator_call("FoldFunctionOnSet", arg_values.clone(), ctx, depth);
         }
         // === Community module: UndirectedGraphs ===
         "IsUndirectedGraph" if arg_values.len() == 1 && !user_defined_shadow => {
-            return eval_operator_call("IsUndirectedGraph", arg_values.clone(), ctx, depth + 1);
+            return eval_operator_call("IsUndirectedGraph", arg_values.clone(), ctx, depth);
         }
         "IsLoopFreeUndirectedGraph" if arg_values.len() == 1 && !user_defined_shadow => {
             return eval_operator_call(
@@ -1752,17 +1752,17 @@ fn eval_compiled_opcall(
             );
         }
         "ConnectedComponents" if arg_values.len() == 1 && !user_defined_shadow => {
-            return eval_operator_call("ConnectedComponents", arg_values.clone(), ctx, depth + 1);
+            return eval_operator_call("ConnectedComponents", arg_values.clone(), ctx, depth);
         }
         "AreConnectedIn" if arg_values.len() == 3 && !user_defined_shadow => {
-            return eval_operator_call("AreConnectedIn", arg_values.clone(), ctx, depth + 1);
+            return eval_operator_call("AreConnectedIn", arg_values.clone(), ctx, depth);
         }
         "IsStronglyConnected" if arg_values.len() == 1 && !user_defined_shadow => {
-            return eval_operator_call("IsStronglyConnected", arg_values.clone(), ctx, depth + 1);
+            return eval_operator_call("IsStronglyConnected", arg_values.clone(), ctx, depth);
         }
         // === Community module: FiniteSetsExt (additional) ===
         "Quantify" if arg_values.len() == 2 && !user_defined_shadow => {
-            return eval_operator_call("Quantify", arg_values.clone(), ctx, depth + 1);
+            return eval_operator_call("Quantify", arg_values.clone(), ctx, depth);
         }
         "SymDiff" if arg_values.len() == 2 && !user_defined_shadow => {
             let a = arg_values[0].as_set()?;
@@ -1771,13 +1771,13 @@ fn eval_compiled_opcall(
             return Ok(TlaValue::Set(Arc::new(result)));
         }
         "FlattenSet" if arg_values.len() == 1 && !user_defined_shadow => {
-            return eval_operator_call("FlattenSet", arg_values.clone(), ctx, depth + 1);
+            return eval_operator_call("FlattenSet", arg_values.clone(), ctx, depth);
         }
         "kSubset" if arg_values.len() == 2 && !user_defined_shadow => {
-            return eval_operator_call("kSubset", arg_values.clone(), ctx, depth + 1);
+            return eval_operator_call("kSubset", arg_values.clone(), ctx, depth);
         }
         "ChooseUnique" if arg_values.len() == 2 && !user_defined_shadow => {
-            return eval_operator_call("ChooseUnique", arg_values.clone(), ctx, depth + 1);
+            return eval_operator_call("ChooseUnique", arg_values.clone(), ctx, depth);
         }
         "SumSet" if arg_values.len() == 1 && !user_defined_shadow => {
             let set = arg_values[0].as_set()?;
@@ -1790,18 +1790,18 @@ fn eval_compiled_opcall(
             return Ok(TlaValue::Int(product));
         }
         "IsInjective" if arg_values.len() == 1 && !user_defined_shadow => {
-            return eval_operator_call("IsInjective", arg_values.clone(), ctx, depth + 1);
+            return eval_operator_call("IsInjective", arg_values.clone(), ctx, depth);
         }
         // === Community module: Graphs (directed) ===
         "IsDirectedGraph" | "Successors" | "Predecessors" | "InDegree" | "OutDegree" | "Roots"
         | "Leaves" | "Transpose" | "IsDag"
             if !user_defined_shadow =>
         {
-            return eval_operator_call(name, arg_values.clone(), ctx, depth + 1);
+            return eval_operator_call(name, arg_values.clone(), ctx, depth);
         }
         // === Community module: Relation ===
         "TransitiveClosure" if arg_values.len() == 2 && !user_defined_shadow => {
-            return eval_operator_call("TransitiveClosure", arg_values.clone(), ctx, depth + 1);
+            return eval_operator_call("TransitiveClosure", arg_values.clone(), ctx, depth);
         }
         "RemoveAt" if arg_values.len() == 2 && !user_defined_shadow => {
             let seq = sequence_like_values(&arg_values[0])
