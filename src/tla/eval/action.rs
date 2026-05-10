@@ -820,3 +820,252 @@ pub(super) fn matches_membership_expr(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tla::tla_state;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn applies_action_ir() {
+        let state = tla_state([("x", TlaValue::Int(1)), ("y", TlaValue::Int(2))]);
+        let action = ActionIr {
+            name: "Tick".to_string(),
+            params: vec![],
+            clauses: vec![
+                ActionClause::Guard {
+                    expr: "x < 5".to_string(),
+                },
+                ActionClause::PrimedAssignment {
+                    var: "x".to_string(),
+                    expr: "x + 1".to_string(),
+                },
+                ActionClause::Unchanged {
+                    vars: vec!["y".to_string()],
+                },
+            ],
+        };
+
+        let next = apply_action_ir(&action, &state)
+            .expect("action should evaluate")
+            .expect("guard is true");
+        assert_eq!(next.get("x"), Some(&TlaValue::Int(2)));
+        assert_eq!(next.get("y"), Some(&TlaValue::Int(2)));
+    }
+
+    #[test]
+    fn applies_action_ir_with_nested_action_references() {
+        let state = tla_state([
+            ("cat_box", TlaValue::Int(2)),
+            ("observed_box", TlaValue::Int(2)),
+            ("direction", TlaValue::String("right".to_string())),
+        ]);
+
+        let mut definitions = BTreeMap::new();
+        definitions.insert(
+            "Move_Cat".to_string(),
+            TlaDefinition {
+                name: "Move_Cat".to_string(),
+                params: vec![],
+                body: "/\\ cat_box' = cat_box + 1\n/\\ cat_box' \\in 1..6".to_string(),
+                is_recursive: false,
+            },
+        );
+        definitions.insert(
+            "Observe_Box".to_string(),
+            TlaDefinition {
+                name: "Observe_Box".to_string(),
+                params: vec![],
+                body: "LET next_box == IF direction = \"right\"\n                  THEN observed_box + 1\n                  ELSE observed_box - 1\nIN \\/ /\\ next_box \\in 2..5\n      /\\ observed_box' = next_box\n      /\\ UNCHANGED direction\n   \\/ /\\ next_box \\notin 2..5\n      /\\ direction' = CHOOSE d \\in {\"left\", \"right\"}: d /= direction\n      /\\ UNCHANGED observed_box".to_string(),
+                is_recursive: false,
+            },
+        );
+
+        let action = ActionIr {
+            name: "Next".to_string(),
+            params: vec![],
+            clauses: vec![
+                ActionClause::Guard {
+                    expr: "Move_Cat".to_string(),
+                },
+                ActionClause::Guard {
+                    expr: "Observe_Box".to_string(),
+                },
+            ],
+        };
+
+        let ctx = EvalContext::with_definitions(&state, &definitions);
+        let next = apply_action_ir_with_context(&action, &state, &ctx)
+            .expect("nested actions should evaluate")
+            .expect("nested actions should produce a successor");
+        assert_eq!(next.get("cat_box"), Some(&TlaValue::Int(3)));
+        assert_eq!(next.get("observed_box"), Some(&TlaValue::Int(3)));
+        assert_eq!(
+            next.get("direction"),
+            Some(&TlaValue::String("right".to_string()))
+        );
+    }
+
+    #[test]
+    fn applies_action_ir_with_primed_membership_generates_all_choices() {
+        let state = tla_state([("flip", TlaValue::String("H".to_string()))]);
+        let action = ActionIr {
+            name: "TossCoin".to_string(),
+            params: vec![],
+            clauses: vec![ActionClause::PrimedMembership {
+                var: "flip".to_string(),
+                set_expr: "{\"H\", \"T\"}".to_string(),
+            }],
+        };
+
+        let next = apply_action_ir_with_context_multi(&action, &state, &EvalContext::new(&state))
+            .expect("primed membership should enumerate successors");
+        assert_eq!(next.len(), 2, "{next:?}");
+        assert!(
+            next.iter()
+                .any(|st| st.get("flip") == Some(&TlaValue::String("H".to_string())))
+        );
+        assert!(
+            next.iter()
+                .any(|st| st.get("flip") == Some(&TlaValue::String("T".to_string())))
+        );
+    }
+
+    #[test]
+    fn action_guard_can_block_transition() {
+        let state = tla_state([("x", TlaValue::Int(10))]);
+        let action = ActionIr {
+            name: "Blocked".to_string(),
+            params: vec![],
+            clauses: vec![ActionClause::Guard {
+                expr: "x < 5".to_string(),
+            }],
+        };
+        let out = apply_action_ir(&action, &state).expect("evaluation should succeed");
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn applies_action_ir_with_conditional_branches() {
+        let state = tla_state([
+            ("flag", TlaValue::Bool(false)),
+            ("x", TlaValue::Int(7)),
+            ("y", TlaValue::Int(9)),
+        ]);
+        let action = ActionIr {
+            name: "Conditional".to_string(),
+            params: vec![],
+            clauses: vec![ActionClause::Guard {
+                expr: "IF flag THEN /\\ x' = x + 1 /\\ UNCHANGED y ELSE /\\ UNCHANGED x /\\ y' = y + 1"
+                    .to_string(),
+            }],
+        };
+
+        let next = apply_action_ir(&action, &state)
+            .expect("conditional action should evaluate")
+            .expect("branch should succeed");
+        assert_eq!(next.get("x"), Some(&TlaValue::Int(7)));
+        assert_eq!(next.get("y"), Some(&TlaValue::Int(10)));
+    }
+
+    #[test]
+    fn applies_action_ir_with_unchanged_primes_referenced_later() {
+        let state = tla_state([
+            ("flag", TlaValue::Bool(false)),
+            ("count", TlaValue::Int(7)),
+            ("announced", TlaValue::Bool(false)),
+        ]);
+        let action = ActionIr {
+            name: "Counter".to_string(),
+            params: vec![],
+            clauses: vec![
+                ActionClause::Guard {
+                    expr: "IF flag THEN /\\ count' = count + 1 ELSE /\\ UNCHANGED count"
+                        .to_string(),
+                },
+                ActionClause::PrimedAssignment {
+                    var: "announced".to_string(),
+                    expr: "count' >= 7".to_string(),
+                },
+            ],
+        };
+
+        let next = apply_action_ir(&action, &state)
+            .expect("conditional action should evaluate")
+            .expect("branch should succeed");
+        assert_eq!(next.get("count"), Some(&TlaValue::Int(7)));
+        assert_eq!(next.get("announced"), Some(&TlaValue::Bool(true)));
+    }
+
+    #[test]
+    fn applies_let_action_with_body_starting_with_disjunction() {
+        let state = tla_state([
+            ("observed_box", TlaValue::Int(2)),
+            ("direction", TlaValue::String("right".to_string())),
+        ]);
+        let action = ActionIr {
+            name: "ObserveBox".to_string(),
+            params: vec![],
+            clauses: vec![ActionClause::LetWithPrimes {
+                expr: "LET next_box == IF direction = \"right\"\n                  THEN observed_box + 1\n                  ELSE observed_box - 1\n  IN \\/ /\\ next_box \\in {2, 3, 4}\n        /\\ observed_box' = next_box\n        /\\ UNCHANGED direction\n     \\/ /\\ next_box \\notin {2, 3, 4}\n        /\\ direction' = CHOOSE d \\in {\"left\", \"right\"}: d /= direction\n        /\\ UNCHANGED observed_box".to_string(),
+            }],
+        };
+
+        let next = apply_action_ir(&action, &state)
+            .expect("LET action should evaluate")
+            .expect("one branch should succeed");
+        assert_eq!(next.get("observed_box"), Some(&TlaValue::Int(3)));
+        assert_eq!(
+            next.get("direction"),
+            Some(&TlaValue::String("right".to_string()))
+        );
+    }
+
+    #[test]
+    fn quantified_let_action_generates_multiple_successors() {
+        let state = tla_state([("x", TlaValue::Int(0)), ("y", TlaValue::Int(9))]);
+        let ctx = EvalContext::new(&state);
+        let action = ActionIr {
+            name: "Pick".to_string(),
+            params: vec![],
+            clauses: vec![ActionClause::LetWithPrimes {
+                expr: "LET choices == {1, 2} IN /\\ \\E pick \\in choices : /\\ x' = pick /\\ UNCHANGED <<y>>".to_string(),
+            }],
+        };
+
+        let next_states = apply_action_ir_with_context_multi(&action, &state, &ctx)
+            .expect("action should branch");
+        assert_eq!(next_states.len(), 2);
+        let next_xs: BTreeSet<i64> = next_states
+            .iter()
+            .map(|next| next.get("x").unwrap().as_int().unwrap())
+            .collect();
+        assert_eq!(next_xs, BTreeSet::from([1, 2]));
+        for next in next_states {
+            assert_eq!(next.get("y"), Some(&TlaValue::Int(9)));
+        }
+    }
+
+    #[test]
+    fn eval_action_body_supports_box_stuttering_formulas() {
+        let state = tla_state([("x", TlaValue::Int(0))]);
+        let defs = BTreeMap::new();
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        let branches =
+            eval_action_body_multi("[x' = x + 1]_x", &ctx, &BTreeMap::new()).expect("box action");
+        assert_eq!(branches.len(), 2);
+        assert!(
+            branches
+                .iter()
+                .any(|(staged, _)| staged.get("x") == Some(&TlaValue::Int(1)))
+        );
+        assert!(
+            branches
+                .iter()
+                .any(|(staged, _)| staged.get("x") == Some(&TlaValue::Int(0)))
+        );
+    }
+
+}
