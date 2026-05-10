@@ -18,7 +18,7 @@ use super::{
     EvalContext, bind_param_value, collect_function_mapping,
     contains_top_level_keyword, eval_expr_inner, find_top_level_char,
     find_top_level_keyword_index, parse_binders, parse_identifier_prefix,
-    parse_record_key, record_key_from_value, split_once_top_level,
+    parse_string_literal_prefix, record_key_from_value, split_once_top_level,
     split_top_level_symbol, take_bracket_group, tla_to_string, try_eval_record_set,
 };
 
@@ -393,3 +393,31 @@ pub(super) fn eval_bracket_index_key(expr: &str, ctx: &EvalContext<'_>, depth: u
     }
 }
 
+
+/// Parse a record key — accepts string literals (`"foo"`) and bare
+/// identifiers (`foo`). Used by both record-literal evaluation and
+/// EXCEPT-path destructuring; lives here because both call sites are in
+/// `bracket.rs`.
+fn parse_record_key(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('"') {
+        let (s, rest) = parse_string_literal_prefix(trimmed)?
+            .ok_or_else(|| anyhow!("invalid string record key: {trimmed}"))?;
+        if !rest.trim().is_empty() {
+            return Err(anyhow!("invalid trailing tokens in record key: {trimmed}"));
+        }
+        return Ok(s);
+    }
+
+    if trimmed
+        .chars()
+        .next()
+        .map(|c| c.is_alphabetic() || c == '_')
+        .unwrap_or(false)
+        && trimmed.chars().all(|c| c.is_alphanumeric() || c == '_')
+    {
+        return Ok(trimmed.to_string());
+    }
+
+    Err(anyhow!("unsupported record key syntax: {trimmed}"))
+}
