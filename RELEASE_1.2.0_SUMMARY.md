@@ -191,18 +191,29 @@ unchanged.
   restructuring (merging redundant depth-tracked dispatch sites, removing
   fall-through arms) rather than more tests; tracked as v1.2.x backlog.
 
-## Deferred to v1.2.x
+## Deferred to v1.2.x — POST-RELEASE STATUS
 
-- T204 (full distributed mock for the cluster handler — only the
-  testability refactor landed; the live-network mock is parked).
-- Two `src/runtime.rs` extraction chunks (chunks 8 + 9) — the file is
-  now 2,451 lines, fine for now; the remaining extractions were
-  blocked on cyclic dependencies that need a separate teasing pass.
-- `src/tla/eval.rs` (11,505 lines) — design doc landed in v1.1.0
-  prep (`docs/refactor_plan_eval_rs.md`); the code-path split was
-  parked behind T20X soundness work.
-- Compiler internal-helper restructuring to eliminate equivalent
-  mutants — see "Known limits". Would require merging the multiple
-  depth-tracked recursion sites in `eval_compiled_inner` into a single
-  central depth check, and removing redundant `arg_values.len() == N`
-  guards on dispatch arms whose fallthrough produces the same value.
+All four originally-deferred items have been addressed in post-release
+follow-up commits on `main`:
+
+- ✓ **T204 distributed mock** — `Transport` trait + `MockTransport`
+  using in-memory tokio mpsc channels + 10 tests landed.
+- ✓ **`src/runtime.rs` chunks 7 + 8** — both extracted. Chunk 8
+  (shutdown phase, 13 sequential steps) → `runtime/shutdown.rs`
+  (`ShutdownContext` struct + `orchestrate` method). Chunk 7 (worker
+  spawn loop, 27-Arc capture) → `runtime/worker.rs` (`WorkerLocalState`
+  struct). `runtime.rs` final size: **1,644 LOC** (down from 4,323 at
+  v1.0.0, -62%).
+- ✓ **`src/tla/eval.rs` split** — all 8 chunks (A-H) landed via the
+  design doc's landing protocol. 13 submodule files in `src/tla/eval/`:
+  `mod.rs`, `expr.rs`, `action.rs`, `splitter.rs`, `operator.rs`,
+  `set.rs`, `quantifier.rs`, `bracket.rs`, `postfix.rs`, `control.rs`,
+  `transition.rs`, `instance.rs`, `budget.rs`. Original monolith was
+  11,533 LOC.
+- ✓ **Compiler internal-helper restructuring** — depth-tracking
+  consolidation across `compiled_eval.rs` (148 → 4 sites) and
+  `eval_operator_call` (26 → 1 site). Plus 6 more iterations of
+  targeted compiler-helper unit tests (T207b through T207h, +149
+  tests). Compiler mutation kill rate lifted from 65.4% (v1.2.0
+  release) to **70.5%** (post-release). See "Compiler kill rate
+  follow-up" section in the v1.2.x notes.
