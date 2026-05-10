@@ -16,6 +16,21 @@ mod budget;
 mod splitter;
 mod control;
 mod transition;
+mod bracket;
+mod instance;
+mod postfix;
+
+// Sibling submodule items reused inside this file.
+use bracket::{eval_bracket_expression, eval_bracket_index_key, parse_argument_list};
+use instance::{
+    effective_instance_scope, eval_enabled, eval_module_instance_call,
+    eval_module_instance_ref,
+};
+use postfix::eval_atom_with_postfix;
+
+// pub(crate) re-export of bracket::apply_value preserves the existing
+// `crate::tla::eval::apply_value` path used by compiled_eval.rs.
+pub(crate) use bracket::apply_value;
 
 // Re-export public transition-context entry point.
 pub use transition::eval_action_constraint;
@@ -671,7 +686,7 @@ pub(crate) fn parse_action_call_expr(expr: &str) -> Option<(String, Vec<String>)
     Some((name, args))
 }
 
-fn seed_implicit_instance_constant_bindings(
+pub(super) fn seed_implicit_instance_constant_bindings(
     instance: &crate::tla::module::TlaModuleInstance,
     module: &crate::tla::module::TlaModule,
     parent_ctx: &EvalContext<'_>,
@@ -695,7 +710,7 @@ fn seed_implicit_instance_constant_bindings(
     }
 }
 
-fn bind_instance_substitutions(
+pub(super) fn bind_instance_substitutions(
     instance: &crate::tla::module::TlaModuleInstance,
     parent_ctx: &EvalContext<'_>,
     locals_mut: &mut BTreeMap<String, TlaValue>,
@@ -1807,294 +1822,7 @@ fn eval_lambda_expression(expr: &str, ctx: &EvalContext<'_>, _depth: usize) -> R
     })
 }
 
-fn parse_atom_with_postfix<'a>(
-    expr: &'a str,
-    ctx: &EvalContext<'_>,
-    depth: usize,
-) -> Result<(TlaValue, &'a str)> {
-    let (mut value, mut rest) = parse_base(expr, ctx, depth + 1)?;
-
-    loop {
-        let trimmed = rest.trim_start();
-        if trimmed.is_empty() {
-            break;
-        }
-
-        if let Some(after_dot) = trimmed.strip_prefix('.') {
-            let (field, next_rest) = parse_identifier_prefix(after_dot)
-                .ok_or_else(|| anyhow!("expected field after '.' in expression: {expr}"))?;
-            value = value.select_key(&field)?.clone();
-            rest = next_rest;
-            continue;
-        }
-
-        if trimmed.starts_with('[') {
-            let (inside, next_rest) = take_bracket_group(trimmed, '[', ']')?;
-            let key = eval_bracket_index_key(inside, ctx, depth + 1)?;
-
-            // Handle Lambda application differently from regular function application
-            match &value {
-                TlaValue::Lambda { .. } => {
-                    value = apply_value(&value, vec![key], ctx, depth + 1)?;
-                }
-                _ => {
-                    value = value.apply(&key)?.clone();
-                }
-            }
-
-            rest = next_rest;
-            continue;
-        }
-
-        break;
-    }
-
-    Ok((value, rest))
-}
-
-fn eval_atom_with_postfix(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<TlaValue> {
-    let (value, rest) = parse_atom_with_postfix(expr, ctx, depth + 1)?;
-    let trimmed_rest = rest.trim_start();
-    if trimmed_rest == "'" {
-        let base_len = expr.len().saturating_sub(rest.len());
-        let base_expr = expr[..base_len].trim_end();
-        return eval_primed_postfix_expr(base_expr, ctx, depth + 1);
-    }
-    // Handle \cdot action composition as trailing operator:
-    // "A \cdot B" parses A as atom, leaving "\cdot B" as rest.
-    if let Some(cdot_rest) = trimmed_rest.strip_prefix("\\cdot") {
-        let rhs = cdot_rest.trim();
-        if !rhs.is_empty() {
-            // Evaluate the right-hand side and return its result.
-            // For probing purposes both sides need to evaluate successfully.
-            let rhs_value = eval_expr_inner(rhs, ctx, depth + 1)?;
-            // Return the rhs value (action composition applies B after A).
-            return Ok(rhs_value);
-        }
-    }
-    if !trimmed_rest.is_empty() {
-        return Err(anyhow!("unexpected trailing tokens in expr: {expr}"));
-    }
-    Ok(value)
-}
-
-fn eval_primed_postfix_expr(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<TlaValue> {
-    let s = expr.trim_start();
-    let (name, mut rest) = parse_identifier_prefix(s)
-        .ok_or_else(|| anyhow!("expected identifier in primed expression: {expr}'"))?;
-    let mut value = {
-        let trimmed = rest.trim_start();
-        if trimmed.starts_with('(') {
-            let (args_text, next_rest) = take_bracket_group(trimmed, '(', ')')?;
-            let args = if args_text.trim().is_empty() {
-                Vec::new()
-            } else {
-                split_top_level(args_text, ",", false)
-                    .into_iter()
-                    .map(|arg| eval_expr_inner(arg.trim(), ctx, depth + 1))
-                    .collect::<Result<Vec<_>>>()?
-            };
-            rest = next_rest;
-            let primed_ctx = ctx.with_primed_state_shadow_bindings();
-            eval_operator_call(&name, args, &primed_ctx, depth + 1)?
-        } else {
-            ctx.resolve_identifier(&format!("{name}'"), depth + 1)?
-        }
-    };
-
-    loop {
-        let trimmed = rest.trim_start();
-        if trimmed.is_empty() {
-            break;
-        }
-
-        if let Some(after_dot) = trimmed.strip_prefix('.') {
-            let (field, next_rest) = parse_identifier_prefix(after_dot)
-                .ok_or_else(|| anyhow!("expected field after '.' in expression: {expr}'"))?;
-            value = value.select_key(&field)?.clone();
-            rest = next_rest;
-            continue;
-        }
-
-        if trimmed.starts_with('[') {
-            let (inside, next_rest) = take_bracket_group(trimmed, '[', ']')?;
-            let key = eval_bracket_index_key(inside, ctx, depth + 1)?;
-            value = value.apply(&key)?.clone();
-            rest = next_rest;
-            continue;
-        }
-
-        return Err(anyhow!(
-            "unexpected trailing tokens in primed expr: {expr}'"
-        ));
-    }
-
-    Ok(value)
-}
-
-fn parse_base<'a>(
-    expr: &'a str,
-    ctx: &EvalContext<'_>,
-    depth: usize,
-) -> Result<(TlaValue, &'a str)> {
-    let s = expr.trim_start();
-    if s.is_empty() {
-        return Err(anyhow!("unexpected end of expression"));
-    }
-
-    if let Some(rest) = s.strip_prefix("TRUE")
-        && !rest.chars().next().map(is_word_char).unwrap_or(false)
-    {
-        return Ok((TlaValue::Bool(true), rest));
-    }
-    if let Some(rest) = s.strip_prefix("FALSE")
-        && !rest.chars().next().map(is_word_char).unwrap_or(false)
-    {
-        return Ok((TlaValue::Bool(false), rest));
-    }
-
-    if let Some((text, rest)) = parse_string_literal_prefix(s)? {
-        return Ok((TlaValue::String(text), rest));
-    }
-
-    if let Some((value, rest)) = parse_int_prefix(s) {
-        // Range operator a..b is now handled as a binary operator in comparison section
-        return Ok((TlaValue::Int(value), rest));
-    }
-
-    if s.starts_with("<<") {
-        let (inner, rest) = take_angle_group(s)?;
-        let parts = split_top_level_symbol(inner, ",");
-        let mut out = Vec::new();
-        for part in parts {
-            if part.trim().is_empty() {
-                continue;
-            }
-            out.push(eval_expr_inner(&part, ctx, depth + 1)?);
-        }
-        return Ok((TlaValue::Seq(Arc::new(out)), rest));
-    }
-
-    if s.starts_with('{') {
-        let (inner, rest) = take_bracket_group(s, '{', '}')?;
-        let value = eval_set_expression(inner, ctx, depth + 1)?;
-        return Ok((value, rest));
-    }
-
-    if s.starts_with('[') {
-        let (inner, rest) = take_bracket_group(s, '[', ']')?;
-        let value = eval_bracket_expression(inner, ctx, depth + 1)?;
-        return Ok((value, rest));
-    }
-
-    if s.starts_with('(') {
-        let (inner, rest) = take_bracket_group(s, '(', ')')?;
-        let value = eval_expr_inner(inner, ctx, depth + 1)?;
-        return Ok((value, rest));
-    }
-
-    if let Some((name, rest_after_name)) = parse_identifier_prefix(s) {
-        let mut rest = rest_after_name;
-
-        // Strip PlusCal label prefix: "label:: expr" or "label(params):: expr"
-        // Labels are documentation-only in TLC — they don't affect evaluation.
-        {
-            let mut after_params = rest;
-            // Skip optional parameter list
-            if after_params.trim_start().starts_with('(') {
-                if let Ok((_, tail)) = take_bracket_group(after_params.trim_start(), '(', ')') {
-                    after_params = tail;
-                }
-            }
-            if let Some(body) = after_params.trim_start().strip_prefix("::") {
-                let body = body.trim_start();
-                if !body.is_empty() {
-                    // Re-parse from the body after the label
-                    return parse_base(body, ctx, depth);
-                }
-            }
-        }
-
-        let has_runtime_value = ctx.runtime_value(&name).is_some();
-        let operator_param_count = ctx.definition(&name).map(|def| def.params.len());
-
-        // Check for module instance operator: Alias!Operator
-        if rest.trim_start().starts_with('!') {
-            let after_bang = rest.trim_start()[1..].trim_start();
-            if let Some((operator_name, rest_after_op)) = parse_identifier_prefix(after_bang) {
-                let trimmed_rest = rest_after_op.trim_start();
-
-                // Check if this is a function call: Alias!Operator(args)
-                if trimmed_rest.starts_with('(') {
-                    let (args_text, next_rest) = take_bracket_group(trimmed_rest, '(', ')')?;
-                    let args = parse_argument_list(args_text, ctx, depth + 1)?;
-                    let value =
-                        eval_module_instance_call(&name, &operator_name, args, ctx, depth + 1)?;
-                    return Ok((value, next_rest));
-                }
-
-                // Otherwise it's a module instance reference to a constant/definition
-                let value = eval_module_instance_ref(&name, &operator_name, ctx, depth + 1)?;
-                return Ok((value, rest_after_op));
-            }
-        }
-
-        if rest.trim_start().starts_with('(') {
-            let trimmed_rest = rest.trim_start();
-            let (args_text, next_rest) = take_bracket_group(trimmed_rest, '(', ')')?;
-            let args = parse_argument_list(args_text, ctx, depth + 1)?;
-            let value = eval_operator_call(&name, args, ctx, depth + 1)?;
-            return Ok((value, next_rest));
-        }
-
-        if !has_runtime_value
-            && operator_param_count.unwrap_or(0) > 0
-            && rest.trim_start().starts_with('[')
-        {
-            let trimmed_rest = rest.trim_start();
-            let (args_text, next_rest) = take_bracket_group(trimmed_rest, '[', ']')?;
-            let args = parse_argument_list(args_text, ctx, depth + 1)?;
-            let value = eval_operator_call(&name, args, ctx, depth + 1)?;
-            return Ok((value, next_rest));
-        }
-
-        // Handle prefix operators like DOMAIN, UNION, and ENABLED that don't use parentheses
-        if matches!(name.as_str(), "DOMAIN" | "UNION") && !has_runtime_value {
-            // `DOMAIN ReplicatedLog[node]` should apply after postfix indexing, not
-            // as `(DOMAIN ReplicatedLog)[node]`.
-            let (arg_value, next_rest) =
-                parse_atom_with_postfix(rest_after_name.trim_start(), ctx, depth + 1)?;
-            let value = eval_operator_call(&name, vec![arg_value], ctx, depth + 1)?;
-            return Ok((value, next_rest));
-        }
-
-        // Handle ENABLED operator: ENABLED ActionName
-        if matches!(name.as_str(), "ENABLED") && !has_runtime_value {
-            let action_name_part = rest_after_name.trim_start();
-            if let Some((action_name, next_rest)) = parse_identifier_prefix(action_name_part) {
-                let mut rest = next_rest.trim_start();
-                let mut args = Vec::new();
-                if rest.starts_with('(') {
-                    let (args_text, tail) = take_bracket_group(rest, '(', ')')?;
-                    args = parse_argument_list(args_text, ctx, depth + 1)?;
-                    rest = tail;
-                }
-                let value = eval_enabled(&action_name, args, ctx, depth + 1)?;
-                return Ok((value, rest));
-            } else {
-                return Err(anyhow!("ENABLED expects an action name"));
-            }
-        }
-
-        let value = ctx.resolve_identifier(&name, depth + 1)?;
-        rest = rest_after_name;
-        return Ok((value, rest));
-    }
-
-    Err(anyhow!("unsupported expression atom: {expr}"))
-}
-
-fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<TlaValue> {
+pub(super) fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<TlaValue> {
     let inner = expr.trim();
     if inner.is_empty() {
         return Ok(TlaValue::Set(Arc::new(BTreeSet::new())));
@@ -2793,131 +2521,8 @@ fn substitute_identifier_owned(source: &str, name: &str, replacement: &str) -> S
     out
 }
 
-fn eval_bracket_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<TlaValue> {
-    if let Some(idx) = find_top_level_keyword_index(expr, "EXCEPT") {
-        let base_text = expr[..idx].trim();
-        let updates_text = expr[idx + "EXCEPT".len()..].trim();
-        return eval_except_expression(base_text, updates_text, ctx, depth + 1);
-    }
-
-    if let Some((lhs, rhs)) = split_once_top_level(expr, "|->") {
-        let lhs = lhs.trim();
-        let rhs = rhs.trim();
-
-        if contains_top_level_keyword(lhs, "\\in") {
-            let binders = parse_binders(lhs, ctx, depth + 1)?;
-            let mut assignments = BTreeMap::new();
-            let mut map = BTreeMap::new();
-            collect_function_mapping(0, &binders, rhs, &mut assignments, &mut map, ctx, depth + 1)?;
-            return Ok(TlaValue::Function(Arc::new(map)));
-        }
-
-        let mut record = BTreeMap::new();
-        for entry in split_top_level_symbol(expr, ",") {
-            let (key_text, value_text) = split_once_top_level(&entry, "|->")
-                .ok_or_else(|| anyhow!("invalid record entry: {entry}"))?;
-            let key = parse_record_key(key_text.trim())?;
-            let value = eval_expr_inner(value_text.trim(), ctx, depth + 1)?;
-            record.insert(key, value);
-        }
-        return Ok(TlaValue::Record(Arc::new(record)));
-    }
-
-    // Check for function set: [Domain -> Range]
-    if let Some((domain_text, range_text)) = split_once_top_level(expr, "->") {
-        let domain_text = domain_text.trim();
-        let range_text = range_text.trim();
-
-        let domain_val = eval_expr_inner(domain_text, ctx, depth + 1)?;
-        let range_val = eval_expr_inner(range_text, ctx, depth + 1)?;
-
-        let domain_set = domain_val
-            .as_set()
-            .with_context(|| format!("function set domain is not a set: {domain_text}"))?;
-        let range_set = range_val
-            .as_set()
-            .with_context(|| format!("function set range is not a set: {range_text}"))?;
-
-        // Generate all possible functions from domain to range
-        let domain_elems: Vec<TlaValue> = domain_set.iter().cloned().collect();
-        let range_elems: Vec<TlaValue> = range_set.iter().cloned().collect();
-
-        if domain_elems.is_empty() {
-            // Only one function from empty domain: the empty function
-            let empty_func = BTreeMap::new();
-            let mut result = BTreeSet::new();
-            result.insert(TlaValue::Function(Arc::new(empty_func)));
-            return Ok(TlaValue::Set(Arc::new(result)));
-        }
-
-        if range_elems.is_empty() {
-            // No functions from non-empty domain to empty range
-            return Ok(TlaValue::Set(Arc::new(BTreeSet::new())));
-        }
-
-        let n = domain_elems.len();
-        let m = range_elems.len();
-
-        // Limit the size to avoid memory explosion
-        let max_functions = 1_000_000usize;
-        let total = (m as u64).saturating_pow(n as u32);
-        if total > max_functions as u64 {
-            return Err(anyhow!(
-                "function set [D -> R] too large: {} elements in domain, {} in range = {} functions (max {})",
-                n,
-                m,
-                total,
-                max_functions
-            ));
-        }
-        ctx.check_budget(total as usize)?;
-
-        // Generate all functions by iterating through all combinations
-        let mut result = BTreeSet::new();
-        let mut indices = vec![0usize; n];
-
-        loop {
-            // Build function for current indices
-            let mut func: BTreeMap<TlaValue, TlaValue> = BTreeMap::new();
-            for (i, d) in domain_elems.iter().enumerate() {
-                func.insert(d.clone(), range_elems[indices[i]].clone());
-            }
-            result.insert(TlaValue::Function(Arc::new(func)));
-
-            // Increment indices (like counting in base m)
-            let mut carry = true;
-            for idx in indices.iter_mut() {
-                if carry {
-                    *idx += 1;
-                    if *idx >= m {
-                        *idx = 0;
-                    } else {
-                        carry = false;
-                    }
-                }
-            }
-            if carry {
-                break;
-            }
-        }
-
-        return Ok(TlaValue::Set(Arc::new(result)));
-    }
-
-    // Check for record set construction: [field: Set, field2: Set, ...]
-    // This creates the set of all records where each field takes values from its corresponding set
-    // For example: [a: {1,2}, b: {3,4}] = {[a |-> 1, b |-> 3], [a |-> 1, b |-> 4], [a |-> 2, b |-> 3], [a |-> 2, b |-> 4]}
-    if let Some(record_set) = try_eval_record_set(expr, ctx, depth + 1)? {
-        return Ok(record_set);
-    }
-
-    Err(anyhow!("unsupported bracket expression: [{expr}]"))
-}
-
-/// Try to evaluate a record set construction: [field: Set, field2: Set, ...]
-/// This creates the Cartesian product of all field/set pairs as records.
 /// Returns None if the expression doesn't match the record set pattern.
-fn try_eval_record_set(
+pub(super) fn try_eval_record_set(
     expr: &str,
     ctx: &EvalContext<'_>,
     depth: usize,
@@ -3026,256 +2631,6 @@ fn try_eval_record_set(
     }
 
     Ok(Some(TlaValue::Set(Arc::new(result))))
-}
-
-fn eval_except_expression(
-    base_text: &str,
-    updates_text: &str,
-    ctx: &EvalContext<'_>,
-    depth: usize,
-) -> Result<TlaValue> {
-    let mut current = eval_expr_inner(base_text, ctx, depth + 1)?;
-
-    for raw_update in split_top_level_symbol(updates_text, ",") {
-        let update = raw_update.trim();
-        if update.is_empty() {
-            continue;
-        }
-        let update = update
-            .strip_prefix('!')
-            .ok_or_else(|| anyhow!("EXCEPT update must start with '!': {update}"))?;
-
-        let eq_idx = find_top_level_char(update, '=')
-            .ok_or_else(|| anyhow!("EXCEPT update missing '=': {update}"))?;
-        let path_text = update[..eq_idx].trim();
-        let rhs_text = update[eq_idx + 1..].trim();
-
-        let path = parse_except_path(path_text, ctx, depth + 1)?;
-        let old_value = get_path_value(&current, &path)?;
-        let rhs_ctx = ctx.with_local_value("@", old_value);
-        let new_value = eval_expr_inner(rhs_text, &rhs_ctx, depth + 1)?;
-        current = set_path_value(&current, &path, new_value)?;
-    }
-
-    Ok(current)
-}
-
-pub(crate) fn apply_value(
-    func: &TlaValue,
-    args: Vec<TlaValue>,
-    ctx: &EvalContext<'_>,
-    depth: usize,
-) -> Result<TlaValue> {
-    match func {
-        TlaValue::Lambda {
-            params,
-            body,
-            captured_locals,
-        } => {
-            if params.len() != args.len() {
-                return Err(anyhow!(
-                    "Lambda arity mismatch: expected {}, got {}",
-                    params.len(),
-                    args.len()
-                ));
-            }
-
-            // Create a new context with captured locals
-            let mut lambda_ctx = ctx.clone();
-            lambda_ctx.locals = Rc::new((**captured_locals).clone());
-
-            // Bind arguments to parameters
-            {
-                let locals_mut = Rc::make_mut(&mut lambda_ctx.locals);
-                for (param, arg) in params.iter().zip(args.into_iter()) {
-                    bind_param_value(locals_mut, param, arg)?;
-                }
-            }
-
-            // Evaluate the lambda body
-            eval_expr_inner(body, &lambda_ctx, depth + 1)
-        }
-        TlaValue::Function(map) => {
-            if args.len() != 1 {
-                return Err(anyhow!("Function application expects exactly 1 argument"));
-            }
-            map.get(&args[0]).cloned().ok_or_else(|| {
-                // Build helpful error message with key and domain
-                let key_str = tla_to_string(&args[0]);
-                let domain_keys: Vec<String> = map.keys().take(10).map(tla_to_string).collect();
-                let domain_str = if map.len() > 10 {
-                    format!("{{{},...}} ({} keys)", domain_keys.join(", "), map.len())
-                } else {
-                    format!("{{{}}}", domain_keys.join(", "))
-                };
-                anyhow!(
-                    "function application failed: key {} not in domain {}",
-                    key_str,
-                    domain_str
-                )
-            })
-        }
-        _ => Err(anyhow!("Cannot apply non-function value: {func:?}")),
-    }
-}
-
-/// Evaluate a module instance operator call: Alias!Operator(args)
-fn eval_module_instance_call(
-    alias: &str,
-    operator_name: &str,
-    args: Vec<TlaValue>,
-    ctx: &EvalContext<'_>,
-    depth: usize,
-) -> Result<TlaValue> {
-    if depth > MAX_EVAL_DEPTH {
-        return Err(anyhow!(
-            "module instance recursion depth exceeded at {alias}!{operator_name}"
-        ));
-    }
-
-    // Get the module instance
-    let instances = ctx
-        .instances
-        .ok_or_else(|| anyhow!("no module instances available in context"))?;
-
-    let instance = instances
-        .get(alias)
-        .ok_or_else(|| anyhow!("module instance '{}' not found", alias))?;
-
-    // Get the module
-    let module = instance.module.as_ref().ok_or_else(|| {
-        anyhow!(
-            "module '{}' not loaded for instance '{}'",
-            instance.module_name,
-            alias
-        )
-    })?;
-
-    // Look up the operator in the instance module
-    let operator_def = module.definitions.get(operator_name).ok_or_else(|| {
-        anyhow!(
-            "operator '{}' not found in module '{}'",
-            operator_name,
-            instance.module_name
-        )
-    })?;
-
-    // Check arity
-    if operator_def.params.len() != args.len() {
-        return Err(anyhow!(
-            "operator '{alias}!{operator_name}' arity mismatch: expected {}, got {}",
-            operator_def.params.len(),
-            args.len()
-        ));
-    }
-
-    // Create a new context with the instance module's definitions and instances
-    let mut instance_ctx = ctx.clone();
-    instance_ctx.definitions = Some(&module.definitions);
-    instance_ctx.instances = effective_instance_scope(&module.instances, ctx.instances);
-    seed_implicit_instance_constant_bindings(instance, module, ctx, &mut instance_ctx);
-
-    // Apply substitutions: replace constants in the context
-    {
-        let locals_mut = std::rc::Rc::make_mut(&mut instance_ctx.locals);
-        bind_instance_substitutions(instance, ctx, locals_mut)?;
-    }
-
-    let mut child_ctx = instance_ctx;
-    {
-        let locals_mut = std::rc::Rc::make_mut(&mut child_ctx.locals);
-        for (param, arg) in operator_def.params.iter().zip(args.into_iter()) {
-            bind_param_value(locals_mut, param, arg)?;
-        }
-    }
-
-    // Evaluate the operator body
-    eval_expr_inner(&operator_def.body, &child_ctx, depth + 1)
-}
-
-fn effective_instance_scope<'a>(
-    module_instances: &'a BTreeMap<String, crate::tla::module::TlaModuleInstance>,
-    parent_instances: Option<&'a BTreeMap<String, crate::tla::module::TlaModuleInstance>>,
-) -> Option<&'a BTreeMap<String, crate::tla::module::TlaModuleInstance>> {
-    if module_instances.is_empty() {
-        parent_instances
-    } else {
-        Some(module_instances)
-    }
-}
-
-/// Evaluate a module instance reference: Alias!Constant
-fn eval_module_instance_ref(
-    alias: &str,
-    name: &str,
-    ctx: &EvalContext<'_>,
-    depth: usize,
-) -> Result<TlaValue> {
-    if depth > MAX_EVAL_DEPTH {
-        return Err(anyhow!(
-            "module instance recursion depth exceeded at {alias}!{name}"
-        ));
-    }
-
-    // Try to evaluate as a nullary operator call
-    eval_module_instance_call(alias, name, vec![], ctx, depth)
-}
-
-/// Evaluate ENABLED operator: check if an action is enabled in the current state.
-fn eval_enabled(
-    action_name: &str,
-    args: Vec<TlaValue>,
-    ctx: &EvalContext<'_>,
-    depth: usize,
-) -> Result<TlaValue> {
-    if depth > MAX_EVAL_DEPTH {
-        return Err(anyhow!("ENABLED recursion depth exceeded at {action_name}"));
-    }
-
-    // Look up the action definition
-    let action_def = ctx
-        .definition(action_name)
-        .ok_or_else(|| anyhow!("action '{}' not found for ENABLED", action_name))?;
-
-    // When arguments are provided but arity mismatches, that's an error.
-    // When no arguments are provided for a parameterized action (bare `ENABLED Send`),
-    // return TRUE as a safe over-approximation — the action *may* be enabled for some
-    // parameter values.  TLC would existentially quantify over the parameter domains,
-    // but discovering those domains is not always possible in the evaluator.
-    if action_def.params.len() != args.len() {
-        if args.is_empty() && !action_def.params.is_empty() {
-            // Bare ENABLED on a parameterized action — safe approximation
-            return Ok(TlaValue::Bool(true));
-        }
-        return Err(anyhow!(
-            "ENABLED action '{}' arity mismatch: expected {}, got {}",
-            action_name,
-            action_def.params.len(),
-            args.len()
-        ));
-    }
-
-    let mut enabled_ctx = ctx.clone();
-    if !args.is_empty() {
-        let locals_mut = Rc::make_mut(&mut enabled_ctx.locals);
-        for (param, arg) in action_def.params.iter().zip(args.into_iter()) {
-            bind_param_value(locals_mut, param, arg)?;
-        }
-    }
-
-    // Compile the action to IR
-    let action_ir = crate::tla::compile_action_ir(&action_def);
-
-    // Try to apply the action to see if it's enabled
-    // An action is enabled if it can produce a successor state
-    match apply_action_ir_with_context_multi(&action_ir, ctx.state, &enabled_ctx) {
-        Ok(next_states) => Ok(TlaValue::Bool(!next_states.is_empty())),
-        Err(_) => {
-            // Evaluation error - action is not enabled
-            // (This can happen with complex expressions that aren't fully supported)
-            Ok(TlaValue::Bool(false))
-        }
-    }
 }
 
 pub(crate) fn eval_operator_call(
@@ -4627,7 +3982,7 @@ fn eval_builtin_tlc_get(key: &TlaValue) -> Result<TlaValue> {
 }
 
 #[derive(Debug, Clone)]
-struct BinderSpec {
+pub(super) struct BinderSpec {
     vars: Vec<String>,
     domain: Vec<TlaValue>,
 }
@@ -4654,7 +4009,7 @@ fn parse_binder_pattern_vars(pattern: &str) -> Result<Vec<String>> {
     Ok(vec![trimmed.to_string()])
 }
 
-fn parse_binders(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<Vec<BinderSpec>> {
+pub(super) fn parse_binders(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<Vec<BinderSpec>> {
     let mut bindings = Vec::new();
     let mut rest = expr.trim();
 
@@ -4740,7 +4095,7 @@ fn remove_binder_assignments(assignments: &mut BTreeMap<String, TlaValue>, binde
     }
 }
 
-fn bind_param_value(
+pub(super) fn bind_param_value(
     assignments: &mut BTreeMap<String, TlaValue>,
     param: &str,
     value: TlaValue,
@@ -4822,7 +4177,7 @@ fn evaluate_forall(
     Ok(true)
 }
 
-fn collect_function_mapping(
+pub(super) fn collect_function_mapping(
     idx: usize,
     binders: &[BinderSpec],
     body: &str,
@@ -4985,161 +4340,6 @@ fn binder_key(
     }
 }
 
-#[derive(Debug, Clone)]
-enum PathSegment {
-    Field(String),
-    Index(TlaValue),
-}
-
-fn parse_except_path(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<Vec<PathSegment>> {
-    let mut out = Vec::new();
-    let mut rest = expr.trim();
-
-    while !rest.is_empty() {
-        if let Some(after_dot) = rest.strip_prefix('.') {
-            let (field, next_rest) = parse_identifier_prefix(after_dot)
-                .ok_or_else(|| anyhow!("invalid EXCEPT field path segment: {expr}"))?;
-            out.push(PathSegment::Field(field));
-            rest = next_rest.trim_start();
-            continue;
-        }
-
-        if rest.starts_with('[') {
-            let (inside, next_rest) = take_bracket_group(rest, '[', ']')?;
-            let key = eval_bracket_index_key(inside, ctx, depth + 1)?;
-            out.push(PathSegment::Index(key));
-            rest = next_rest.trim_start();
-            continue;
-        }
-
-        return Err(anyhow!("invalid EXCEPT path segment in '{expr}'"));
-    }
-
-    if out.is_empty() {
-        return Err(anyhow!("EXCEPT path is empty"));
-    }
-
-    Ok(out)
-}
-
-fn get_path_value(base: &TlaValue, path: &[PathSegment]) -> Result<TlaValue> {
-    if path.is_empty() {
-        return Ok(base.clone());
-    }
-
-    match &path[0] {
-        PathSegment::Field(name) => match base {
-            TlaValue::Record(map) => {
-                let next = map.get(name).cloned().unwrap_or(TlaValue::Undefined);
-                get_path_value(&next, &path[1..])
-            }
-            _ => Err(anyhow!("field access on non-record value {base:?}")),
-        },
-        PathSegment::Index(key) => match base {
-            TlaValue::Function(map) => {
-                let next = map.get(key).cloned().unwrap_or(TlaValue::Undefined);
-                get_path_value(&next, &path[1..])
-            }
-            TlaValue::Record(map) => {
-                let k = record_key_from_value(key)?;
-                let next = map.get(&k).cloned().unwrap_or(TlaValue::Undefined);
-                get_path_value(&next, &path[1..])
-            }
-            TlaValue::Seq(values) => {
-                let idx = key.as_int()?;
-                if idx <= 0 {
-                    return Err(anyhow!("sequence index must be >= 1, got {idx}"));
-                }
-                let zero = (idx - 1) as usize;
-                let next = values
-                    .get(zero)
-                    .cloned()
-                    .ok_or_else(|| anyhow!("sequence index out of range: {idx}"))?;
-                get_path_value(&next, &path[1..])
-            }
-            _ => Err(anyhow!("index access on unsupported value {base:?}")),
-        },
-    }
-}
-
-fn set_path_value(base: &TlaValue, path: &[PathSegment], new_value: TlaValue) -> Result<TlaValue> {
-    if path.is_empty() {
-        return Ok(new_value);
-    }
-
-    match &path[0] {
-        PathSegment::Field(name) => match base {
-            TlaValue::Record(map) => {
-                let current = map.get(name).cloned().unwrap_or(TlaValue::Undefined);
-                let updated = set_path_value(&current, &path[1..], new_value)?;
-                let mut next = (**map).clone();
-                next.insert(name.clone(), updated);
-                Ok(TlaValue::Record(Arc::new(next)))
-            }
-            _ => Err(anyhow!("field update on non-record value {base:?}")),
-        },
-        PathSegment::Index(key) => match base {
-            TlaValue::Function(map) => {
-                let current = map.get(key).cloned().unwrap_or(TlaValue::Undefined);
-                let updated = set_path_value(&current, &path[1..], new_value)?;
-                let mut next = (**map).clone();
-                next.insert(key.clone(), updated);
-                Ok(TlaValue::Function(Arc::new(next)))
-            }
-            TlaValue::Record(map) => {
-                let record_key = record_key_from_value(key)?;
-                let current = map.get(&record_key).cloned().unwrap_or(TlaValue::Undefined);
-                let updated = set_path_value(&current, &path[1..], new_value)?;
-                let mut next = (**map).clone();
-                next.insert(record_key, updated);
-                Ok(TlaValue::Record(Arc::new(next)))
-            }
-            TlaValue::Seq(values) => {
-                let idx = key.as_int()?;
-                if idx <= 0 {
-                    return Err(anyhow!("sequence index must be >= 1, got {idx}"));
-                }
-                let zero = (idx - 1) as usize;
-                if zero >= values.len() {
-                    return Err(anyhow!("sequence index out of range: {idx}"));
-                }
-
-                let updated = set_path_value(&values[zero], &path[1..], new_value)?;
-                let mut next = (**values).clone();
-                next[zero] = updated;
-                Ok(TlaValue::Seq(Arc::new(next)))
-            }
-            _ => Err(anyhow!("index update on unsupported value {base:?}")),
-        },
-    }
-}
-
-fn parse_argument_list(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<Vec<TlaValue>> {
-    let trimmed = expr.trim();
-    if trimmed.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut args = Vec::new();
-    for part in split_top_level_symbol(trimmed, ",") {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        args.push(eval_expr_inner(part, ctx, depth + 1)?);
-    }
-    Ok(args)
-}
-
-fn eval_bracket_index_key(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<TlaValue> {
-    let args = parse_argument_list(expr, ctx, depth + 1)?;
-    match args.len() {
-        0 => Err(anyhow!("empty bracket index")),
-        1 => Ok(args.into_iter().next().expect("single arg exists")),
-        _ => Ok(TlaValue::Seq(Arc::new(args))),
-    }
-}
-
 /// Greatest common divisor (Euclidean algorithm)
 fn gcd(a: u64, b: u64) -> u64 {
     if b == 0 { a } else { gcd(b, a % b) }
@@ -5186,7 +4386,7 @@ fn seq_or_string_concat(lhs: TlaValue, rhs: TlaValue) -> Result<TlaValue> {
     }
 }
 
-fn parse_record_key(raw: &str) -> Result<String> {
+pub(super) fn parse_record_key(raw: &str) -> Result<String> {
     let trimmed = raw.trim();
     if trimmed.starts_with('"') {
         let (s, rest) = parse_string_literal_prefix(trimmed)?
@@ -5210,7 +4410,7 @@ fn parse_record_key(raw: &str) -> Result<String> {
     Err(anyhow!("unsupported record key syntax: {trimmed}"))
 }
 
-fn record_key_from_value(value: &TlaValue) -> Result<String> {
+pub(super) fn record_key_from_value(value: &TlaValue) -> Result<String> {
     match value {
         TlaValue::String(v) | TlaValue::ModelValue(v) => Ok(v.clone()),
         _ => Err(anyhow!(
@@ -5282,7 +4482,7 @@ fn permute(values: &mut [TlaValue], idx: usize, out: &mut Vec<Vec<TlaValue>>) {
     }
 }
 
-fn tla_to_string(value: &TlaValue) -> String {
+pub(super) fn tla_to_string(value: &TlaValue) -> String {
     match value {
         TlaValue::String(v) => v.clone(),
         TlaValue::Int(v) => v.to_string(),
