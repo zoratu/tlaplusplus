@@ -22,9 +22,11 @@ use crate::tla::TlaValue;
 use super::{
     EvalContext, collect_binder_filter_set, collect_binder_map_set,
     contains_top_level_keyword, eval_expr_inner, find_top_level_char,
-    find_top_level_keyword_index, is_valid_identifier, parse_binders, split_once_top_level,
+    find_top_level_keyword_index, is_valid_identifier, parse_binders,
     split_top_level_symbol,
 };
+#[cfg(feature = "symbolic-init")]
+use super::split_once_top_level;
 
 pub(super) fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<TlaValue> {
     let inner = expr.trim();
