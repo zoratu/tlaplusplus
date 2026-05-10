@@ -1811,3 +1811,143 @@ pub(super) fn skip_leading_ws(input: &str, mut idx: usize) -> usize {
     }
     idx
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_top_level_keeps_simple_quantified_conjunctions_intact() {
+        let parts =
+            split_top_level_symbol(r#"~ \E m \in msgs : m.type = "2a" /\ m.bal = b"#, "/\\");
+        assert_eq!(
+            parts,
+            vec![r#"~ \E m \in msgs : m.type = "2a" /\ m.bal = b"#]
+        );
+    }
+
+    #[test]
+    fn split_top_level_keeps_simple_quantified_disjunctions_intact() {
+        let parts = split_top_level_symbol(r"\E a \in Acceptor : Phase1b(a) \/ Phase2b(a)", "\\/");
+        assert_eq!(parts, vec![r"\E a \in Acceptor : Phase1b(a) \/ Phase2b(a)"]);
+    }
+
+    #[test]
+    fn find_outer_else_handles_newlines() {
+        // Test that find_outer_else correctly finds ELSE across newlines
+        assert_eq!(find_outer_else("something\nELSE other"), Some(10));
+        assert_eq!(find_outer_else("something ELSE other"), Some(10));
+
+        // Nested IF should not confuse it
+        let nested = "IF inner THEN a ELSE b\nELSE outer";
+        assert_eq!(find_outer_else(nested), Some(23));
+    }
+
+    #[test]
+    fn t4_split_top_level_set_minus_distinguishes_set_difference_from_backslash_operators() {
+        // Kills eval.rs:5681:.. (`!starts_with_tla_backslash_operator` mutants
+        // and `is_whitespace`/`!=` mutants in split_top_level_set_minus).
+        // The set-minus splitter walks the string char-by-char and must
+        // distinguish a bare `\` (set difference) from a `\` that introduces a
+        // TLA+ operator like `\union` / `\subseteq` / `\E`. No prior test
+        // exercised whitespace-boundary detection.
+
+        let parts = split_top_level_set_minus("S \\ T");
+        assert_eq!(
+            parts.len(),
+            2,
+            "S \\ T must split into [S, T], got {parts:?}"
+        );
+        assert_eq!(parts[0].trim(), "S");
+        assert_eq!(parts[1].trim(), "T");
+
+        // \union must NOT trigger a set-minus split.
+        let parts = split_top_level_set_minus("S \\union T");
+        assert_eq!(
+            parts,
+            vec!["S \\union T".to_string()],
+            "\\union must not be split as set-minus"
+        );
+        // \subseteq must NOT trigger.
+        let parts = split_top_level_set_minus("S \\subseteq T");
+        assert_eq!(parts, vec!["S \\subseteq T".to_string()]);
+        // \E quantifier must NOT trigger.
+        let parts = split_top_level_set_minus("\\E i \\in S : P(i)");
+        assert_eq!(parts, vec!["\\E i \\in S : P(i)".to_string()]);
+        // No backslash at all => single element.
+        let parts = split_top_level_set_minus("S \\union T \\union U");
+        assert_eq!(parts.len(), 1);
+        // Set difference inside a set literal is *not* top-level (kills the
+        // `match ch '{' / '}' brace-tracker mutants).
+        let parts = split_top_level_set_minus("{1 \\ 2}");
+        assert_eq!(parts, vec!["{1 \\ 2}".to_string()]);
+    }
+
+    #[test]
+    fn t4_split_top_level_range_distinguishes_dotdot_from_dotdotdot() {
+        // Kills mutants in eval.rs:5935 split_top_level_range — particularly
+        // the `i > 0` check guarding a non-empty LHS, and the `after == Some('.')`
+        // check that prevents `...` from being parsed as `..`.
+        let r = split_top_level_range("1..5").expect("simple range must split");
+        assert_eq!(r, ("1", "5"));
+
+        // Range with whitespace.
+        let r = split_top_level_range("a + 1 .. b - 1").expect("range with spaces must split");
+        assert_eq!(r.0.trim(), "a + 1");
+        assert_eq!(r.1.trim(), "b - 1");
+
+        // No `..` => None.
+        assert!(split_top_level_range("a + b").is_none());
+        // `..` inside parens does not split at top level.
+        assert!(
+            split_top_level_range("(1..3)").is_none(),
+            "`..` inside parens must not be top-level"
+        );
+        // `..` inside braces does not split at top level.
+        assert!(
+            split_top_level_range("{x \\in 1..5 : x > 2}").is_none(),
+            "`..` inside braces must not be top-level"
+        );
+        // `..` inside square brackets does not split.
+        assert!(
+            split_top_level_range("[i \\in 1..3 |-> i*i]").is_none(),
+            "`..` inside `[]` must not be top-level"
+        );
+    }
+
+    #[test]
+    fn t4_split_top_level_comparison_recognises_subseteq_and_distinguishes_set_ops() {
+        // Kills mutants in eval.rs:5736 split_top_level_comparison — most
+        // importantly the `pattern == "="` / `pattern.starts_with('\\')` /
+        // `has_word_boundaries` mutants. T2.3 fixed `..` precedence relative
+        // to set ops; this test pins that fix so it can't regress via mutation.
+        let (lhs, op, rhs) = split_top_level_comparison("1..3 \\subseteq S")
+            .expect("range \\subseteq set must split");
+        assert_eq!(lhs.trim(), "1..3");
+        assert_eq!(op, "\\subseteq");
+        assert_eq!(rhs.trim(), "S");
+
+        // `=` must not trigger inside `==` (although TLA+ doesn't use `==`,
+        // the disambiguation guard at 5871 protects against `<>` / `>=`).
+        let (_lhs, op, _rhs) = split_top_level_comparison("a >= b").expect("a >= b must split");
+        assert_eq!(op, ">=");
+
+        // `<=` and `=<` are both accepted (TLA+ leq).
+        let (_lhs, op, _rhs) = split_top_level_comparison("a <= b").expect("a <= b must split");
+        assert_eq!(op, "<=");
+        let (_lhs, op, _rhs) = split_top_level_comparison("a =< b").expect("a =< b must split");
+        assert_eq!(op, "=<");
+
+        // `\notin` distinct from `\in`.
+        let (_lhs, op, _rhs) =
+            split_top_level_comparison("x \\notin S").expect("\\notin must split");
+        assert_eq!(op, "\\notin");
+
+        // Membership inside a function-application bracket is NOT top-level.
+        // f[1] = 2  parses as f[1] = 2 (the `=` is at top-level despite the
+        // `[]` wrapper around `1`).
+        let (_lhs, op, _rhs) =
+            split_top_level_comparison("f[1] = 2").expect("f[1] = 2 must split on top-level `=`");
+        assert_eq!(op, "=");
+    }
+}
