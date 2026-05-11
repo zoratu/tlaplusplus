@@ -151,7 +151,13 @@ pub fn spawn_inbound_handler(
                     initiator,
                     round: _,
                     all_idle,
+                    inflight_partition_edges: _,
+                    inflight_red_probes: _,
                 } => {
+                    // T10.2 phase 2 streaming counters are accepted on the
+                    // wire but currently ignored — they only become a
+                    // termination predicate once the streaming-DFS path is
+                    // wired into the runtime (stage 4+).
                     stealer.set_peer_idle(initiator, all_idle);
                     if stealer.all_nodes_idle() {
                         stealer.set_globally_terminated();
@@ -169,6 +175,58 @@ pub fn spawn_inbound_handler(
 
                 Message::Join { .. } | Message::Leave { .. } => {
                     // Dynamic membership not yet supported
+                }
+
+                // T10.2 phase 2 streaming nested-DFS variants. Stage 2 ships
+                // log-and-drop handler arms so the wire format is
+                // forward-compatible without affecting non-streaming runs.
+                // Stage 3+ will replace these with the real DFS routing.
+                Message::PartitionEdge {
+                    from_node,
+                    state_fp,
+                    ..
+                } => {
+                    if std::env::var("TLAPP_VERBOSE").is_ok() {
+                        eprintln!(
+                            "[cluster] dropping PartitionEdge from node {} fp {:#x} \
+                             (streaming-DFS not wired yet)",
+                            from_node, state_fp
+                        );
+                    }
+                }
+                Message::PartitionEdgeAck { .. } => {
+                    // No-op until the streaming-DFS sender tracks acks.
+                }
+                Message::RedDfsProbe {
+                    from_node,
+                    seed_fp,
+                    ..
+                } => {
+                    if std::env::var("TLAPP_VERBOSE").is_ok() {
+                        eprintln!(
+                            "[cluster] dropping RedDfsProbe from node {} seed {:#x} \
+                             (streaming-DFS not wired yet)",
+                            from_node, seed_fp
+                        );
+                    }
+                }
+                Message::RedDfsResponse { .. } => {
+                    // No-op until the streaming-DFS caller tracks responses.
+                }
+                Message::RequestStateBlob {
+                    from_node, fps, ..
+                } => {
+                    if std::env::var("TLAPP_VERBOSE").is_ok() {
+                        eprintln!(
+                            "[cluster] dropping RequestStateBlob from node {} ({} fps) \
+                             (streaming-DFS not wired yet)",
+                            from_node,
+                            fps.len()
+                        );
+                    }
+                }
+                Message::StateBlobResponse { .. } => {
+                    // No-op until trace-reconstruction is wired.
                 }
             }
         }
@@ -213,6 +271,11 @@ pub fn spawn_bloom_and_termination_task(
                 initiator: stealer.node_id(),
                 round,
                 all_idle: stealer.is_locally_idle(),
+                // Streaming-DFS counters are stage-4+ work; emit `None`
+                // so the wire format stays backward-compatible until the
+                // streaming path actually tracks these counters.
+                inflight_partition_edges: None,
+                inflight_red_probes: None,
             };
 
             for peer_id in 0..stealer.num_nodes() {

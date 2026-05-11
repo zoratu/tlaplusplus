@@ -6,6 +6,7 @@ pub mod compressed_segments;
 pub mod fingerprint_store;
 pub mod hybrid_fingerprint_store;
 pub mod numa;
+pub mod page_aligned_color_map;
 pub mod page_aligned_fingerprint_store;
 pub mod queue;
 pub mod s3_persistence;
