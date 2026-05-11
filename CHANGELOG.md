@@ -1,5 +1,53 @@
 # Changelog
 
+## v1.2.4 (2026-05-10)
+
+Patch release landing **T10.2 phase 2 stage 4** — the streaming-SCC
+memory win is finally realized.
+
+### T10.2 phase 2 stage 4 — drop labeled_transitions, in-band fairness verdict
+
+v1.2.3 noted the predicted memory win wasn't realized because the DFS
+path still populated `labeled_transitions`. This release lifts that.
+
+- `DfsWorkerCtx` no longer carries `labeled_transitions`. Builds a
+  thin local `LocalAdjacency = Vec<(u64, u64, String)>`
+  (fingerprints + action name only — no state clones).
+- New `run_inband_fairness_check` runs Tarjan + the existing
+  `check_fairness_on_scc_fp_sharded` predicate on the local triple
+  list when DFS exploration completes. Verdict equivalence with the
+  post-processing path holds by construction.
+- New `dfs_inband_verdict_done` flag tells `runtime/shutdown.rs` to
+  skip `liveness::run_post_processing` when DFS dispatch fired.
+- `runtime.rs` dispatch drops the `labeled_transitions` DashMap
+  immediately when DFS path fires.
+
+### Memory benchmark
+
+New `tests/dfs_memory_benchmark.rs` on synthetic `HighFanoutGrid`
+(360K states, 1.8M transitions):
+
+| Run | Peak RSS | Wall |
+|---|---|---|
+| BFS | 877 MiB | 3 s |
+| **DFS** | **513 MiB** | **24 s** |
+
+**41.5% RSS reduction.** DFS slower (single-worker by design;
+deliverable is memory, not throughput).
+
+### Validation
+
+| Gate | Result |
+|---|---|
+| `cargo test --release` | 1,212 pass / 0 fail / 8 ignored |
+| `cargo test --release --features failpoints` | 1,234 pass / 0 fail / 8 ignored |
+| `cargo test --release --features symbolic-init` | 1,239 pass / 0 fail / 8 ignored |
+| `dfs_worker_parity` (verdict equivalence) | 4 / 4 |
+| `dfs_memory_benchmark` (NEW) | DFS / BFS = 0.59 ✓ |
+| Verus proofs | 133 verified items, 0 errors, 0 axioms |
+
+Drop-in for v1.2.0 / v1.2.1 / v1.2.2 / v1.2.3. No public-API changes.
+
 ## v1.2.3 (2026-05-10)
 
 Patch release landing **T10.2 phase 2 stage 3** — the hot-loop DFS
