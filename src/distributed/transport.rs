@@ -209,6 +209,16 @@ impl ClusterTransport {
                         Message::Heartbeat { node_id, .. } => *node_id,
                         Message::Stop { node_id, .. } => *node_id,
                         Message::TerminationToken { initiator, .. } => *initiator,
+                        // T10.2 phase-2 streaming-DFS variants. Source-node
+                        // tagging matches the rest of the table: `from_node`
+                        // for sender-initiated messages, `owner_node` for
+                        // ack/response messages.
+                        Message::PartitionEdge { from_node, .. } => *from_node,
+                        Message::PartitionEdgeAck { from_node, .. } => *from_node,
+                        Message::RedDfsProbe { from_node, .. } => *from_node,
+                        Message::RedDfsResponse { from_node, .. } => *from_node,
+                        Message::RequestStateBlob { from_node, .. } => *from_node,
+                        Message::StateBlobResponse { from_node, .. } => *from_node,
                     };
                     if tx.send((from, msg)).await.is_err() {
                         // Receiver dropped — transport is shutting down.
