@@ -2,40 +2,11 @@
 
 ## v1.2.4 (2026-05-10)
 
-Patch release landing **T10.2 phase 2 stage 4** — the streaming-SCC
-memory win is finally realized.
+T10.2 phase 2 stage 4. The streaming-SCC memory win is realized: the DFS exploration path no longer materializes the labeled-transitions adjacency map.
 
-### T10.2 phase 2 stage 4 — drop labeled_transitions, in-band fairness verdict
+`DfsWorkerCtx` no longer carries the `labeled_transitions` field. The DFS worker builds a thin local `LocalAdjacency = Vec<(u64, u64, String)>` (source fingerprint, destination fingerprint, action name) — no state clones. A new `run_inband_fairness_check` runs Tarjan + the existing `check_fairness_on_scc_fp_sharded` predicate on the local triple list when DFS exploration completes. A new `dfs_inband_verdict_done: Arc<AtomicBool>` is shared with `runtime/shutdown.rs`; when set, `liveness::run_post_processing` is skipped entirely.
 
-v1.2.3 noted the predicted memory win wasn't realized because the DFS
-path still populated `labeled_transitions`. This release lifts that.
-
-- `DfsWorkerCtx` no longer carries `labeled_transitions`. Builds a
-  thin local `LocalAdjacency = Vec<(u64, u64, String)>`
-  (fingerprints + action name only — no state clones).
-- New `run_inband_fairness_check` runs Tarjan + the existing
-  `check_fairness_on_scc_fp_sharded` predicate on the local triple
-  list when DFS exploration completes. Verdict equivalence with the
-  post-processing path holds by construction.
-- New `dfs_inband_verdict_done` flag tells `runtime/shutdown.rs` to
-  skip `liveness::run_post_processing` when DFS dispatch fired.
-- `runtime.rs` dispatch drops the `labeled_transitions` DashMap
-  immediately when DFS path fires.
-
-### Memory benchmark
-
-New `tests/dfs_memory_benchmark.rs` on synthetic `HighFanoutGrid`
-(360K states, 1.8M transitions):
-
-| Run | Peak RSS | Wall |
-|---|---|---|
-| BFS | 877 MiB | 3 s |
-| **DFS** | **513 MiB** | **24 s** |
-
-**41.5% RSS reduction.** DFS slower (single-worker by design;
-deliverable is memory, not throughput).
-
-### Validation
+A new `tests/dfs_memory_benchmark.rs` (`#[ignore]` by default) runs a synthetic `HighFanoutGrid` spec at 600×600 (360,000 reachable states, 1,797,600 transitions): BFS peaks at 877 MiB / 3 s, DFS at 513 MiB / 24 s — DFS / BFS = 0.59, a 41.5% reduction. DFS is single-worker by Stage 4 design; the deliverable is the memory ratio. Stage 5 lifts single-worker DFS to multi-worker.
 
 | Gate | Result |
 |---|---|
@@ -46,40 +17,21 @@ deliverable is memory, not throughput).
 | `dfs_memory_benchmark` (NEW) | DFS / BFS = 0.59 ✓ |
 | Verus proofs | 133 verified items, 0 errors, 0 axioms |
 
-Drop-in for v1.2.0 / v1.2.1 / v1.2.2 / v1.2.3. No public-API changes.
+Drop-in for v1.2.0–v1.2.3. No public-API changes.
 
 ## v1.2.3 (2026-05-10)
 
-Patch release landing **T10.2 phase 2 stage 3** — the hot-loop DFS
-lift parked across v1.2.1 / v1.2.2. Two prior agents stopped at the
-same surface; the third used a SCOPED approach that sidesteps the
-universal lift entirely.
+T10.2 phase 2 stage 3. The hot-loop DFS exploration that was the headline parked item across v1.2.1 and v1.2.2 lands via a scoped third approach.
 
-### T10.2 phase 2 stage 3 — DFS exploration via separate worker
+A new file `src/runtime/dfs_worker.rs` (941 LOC) implements a separate single-worker single-node DFS exploration function with its own ctx struct. It drops features irrelevant to streaming-SCC mode: no checkpoint pause, no cluster steal, no init producer, no auto-tune throttle, no backpressure. `src/runtime/worker.rs` is byte-unchanged; default behaviour is identical to v1.2.2.
 
-- New file `src/runtime/dfs_worker.rs` (941 LOC) — single-worker
-  single-node DFS exploration with its own ctx struct. Drops features
-  irrelevant to streaming-SCC mode (no checkpoint pause, no cluster
-  steal, no init producer, no auto-tune throttle, no backpressure).
-- `src/runtime/worker.rs` is byte-unchanged — default behaviour
-  identical to v1.2.2.
-- Dispatch branch in `src/runtime.rs`: when
-  `--liveness-streaming-exploration` is on AND
-  `model.has_fairness_constraints()` AND no distributed stealer, spawn
-  ONE DFS worker instead of the normal worker fleet.
-- In-band Tarjan-style coloring via `PageAlignedColorMap` (Stage 1
-  deliverable from v1.2.1). Nested-DFS red probe on accepting-state
-  pop.
-- `tests/dfs_worker_parity.rs`: 4 BFS-vs-DFS parity tests
-  (WrapperNextFairness, NamedSubaction, ThreeCycle, SafetyOnly) —
-  identical state counts and liveness verdicts.
+A dispatch branch in `src/runtime.rs` checks `--liveness-streaming-exploration`, `model.has_fairness_constraints()`, and the absence of a distributed stealer. When all three hold, the run path spawns one DFS worker instead of the normal worker fleet.
 
-Honest finding: predicted >50% RSS reduction at 100M+ scale is NOT
-yet realized. DFS path still populates `labeled_transitions` — that
-lift is Stage 4. What this stage delivers is the architecture on
-which Stage 4 can drop labeled_transitions without touching BFS.
+The DFS worker uses in-band Tarjan-style coloring via the `PageAlignedColorMap` shipped in v1.2.1. Per-DFS-frame stack with `BlueFrame { state, successor_iter, color_owned }`. The nested-DFS red probe fires when an accepting state's frame pops (Gray → Black).
 
-### Validation
+`tests/dfs_worker_parity.rs` adds 4 BFS-vs-DFS parity tests (WrapperNextFairness, NamedSubaction, ThreeCycle, SafetyOnly) — identical state counts and liveness verdicts.
+
+The predicted >50% RSS reduction at 100M+ scale is not realized in this stage — DFS still populates `labeled_transitions`. That lift is Stage 4 (v1.2.4). What this stage delivers is the architecture on which Stage 4 can drop labeled_transitions without touching BFS.
 
 | Gate | Result |
 |---|---|
@@ -92,32 +44,15 @@ Drop-in for v1.2.0 / v1.2.1 / v1.2.2. No public-API changes.
 
 ## v1.2.2 (2026-05-10)
 
-Patch release continuing to push on the long-parked multi-week items.
+Patch release continuing the long-parked items work.
 
-### T13.5 `state_machines!` port — SHIPPED axiom-free
+T13.5 `state_machines!` port shipped axiom-free. LTL-native restatement of `theorem_no_starvation` via Verus's `state_machine!` macro plus refinement bridge to `reader_liveness_v2.rs`. New file `verification/verus/reader_liveness_state_machine.rs` (612 LOC, 15 verified items). Zero axioms.
 
-LTL-native restatement of `theorem_no_starvation` via Verus's
-`state_machine!` macro + refinement bridge to `reader_liveness_v2.rs`.
-New file `verification/verus/reader_liveness_state_machine.rs` (612
-LOC, 15 verified items). Zero axioms.
+T13.4 wrapper extension: a new `bounded_seqlock_retry_contains` in `shard_wrapper.rs` (+3 verified items, was 31 now 34). T13.4 Phases 2+3 (production-code annotation) remain parked behind 3 documented `vstd` capability gaps.
 
-### T13.4 wrapper extension
+Verus totals: 115 → 133 verified items (+18) across 6 proof files.
 
-Added `bounded_seqlock_retry_contains` to `shard_wrapper.rs` (+3
-verified items, was 31 now 34). T13.4 Phases 2+3 (production-code
-annotation) remain parked behind 3 documented `vstd` capability gaps.
-
-Verus totals: 115 → **133 verified items** (+18) across 6 proof files.
-
-### T10.2 phase 2 stage 3 partial
-
-Wires `PageAlignedColorMap` into the post-BFS oracle path behind the
-new `--liveness-streaming-exploration` flag (defaults OFF). Validates
-the data structure end-to-end; 3 new parity tests (Tarjan vs color-map).
-The actual hot-loop DFS lift (the headline Stage 3 deliverable) remains
-parked — same risk surface as the chunk-7 worker.rs refactor.
-
-### Validation
+T10.2 phase 2 stage 3 partial: wires `PageAlignedColorMap` into the post-BFS oracle path behind the new `--liveness-streaming-exploration` flag (defaults OFF). Validates the data structure end-to-end; 3 new parity tests (Tarjan vs color-map). The actual hot-loop DFS lift (the headline Stage 3 deliverable) remains parked — same risk surface as the chunk-7 worker.rs refactor.
 
 | Gate | Result |
 |---|---|
@@ -130,44 +65,23 @@ Drop-in for v1.2.0 / v1.2.1. No public-API or CLI changes.
 
 ## v1.2.1 (2026-05-10)
 
-Patch release closing out the v1.2.0 deferred-items list. 25 commits
-on top of v1.2.0 — no new user-facing features, no behavioural change.
-Drop-in for v1.2.0.
+Patch release closing out the v1.2.0 deferred-items list. 25 commits on top of v1.2.0; no new user-facing features and no behavioural change. Drop-in for v1.2.0.
 
 ### v1.2.0 deferred items — all closed
 
-- **T204 distributed mock for the cluster handler** — `Transport`
-  trait + `MockTransport` (in-memory tokio mpsc channels);
-  `DistributedWorkStealer` switched to `Arc<dyn Transport>`. 10 new
-  tests exercise the inbound handler / bloom-and-termination /
-  steal-trigger paths without real TCP.
-- **`src/runtime.rs` extraction chunks 7 + 8** — both extracted.
-  Chunk 8 (13-step shutdown phase) → `src/runtime/shutdown.rs`
-  (`ShutdownContext` + `orchestrate`). Chunk 7 (worker spawn loop,
-  27-Arc capture) → `src/runtime/worker.rs` (`WorkerLocalState`).
-  `runtime.rs`: 2,451 → 1,644 LOC.
-- **`src/tla/eval.rs` split** — all 8 chunks (A–H) of the design doc
-  landed. 11,533-line monolith → 13 submodule files under
-  `src/tla/eval/`. External API surface unchanged.
-- **Compiler internal-helper restructuring** — depth-tracking
-  consolidation (148 + 26 → 4 + 1 sites). Plus 6 more iterations of
-  targeted tests (T207b–T207h, +149 tests). Compiler mutation kill
-  rate: 65.4% → **70.5%** across 11 iterations.
+T204 distributed mock for the cluster handler — `Transport` trait + `MockTransport` (in-memory tokio mpsc channels); `DistributedWorkStealer` switched to `Arc<dyn Transport>`. 10 new tests exercise the inbound handler / bloom-and-termination / steal-trigger paths without real TCP.
+
+`src/runtime.rs` extraction chunks 7 + 8 — both extracted. Chunk 8 (13-step shutdown phase) → `src/runtime/shutdown.rs` (`ShutdownContext` + `orchestrate`). Chunk 7 (worker spawn loop, 27-Arc capture) → `src/runtime/worker.rs` (`WorkerLocalState`). `runtime.rs`: 2,451 → 1,644 LOC.
+
+`src/tla/eval.rs` split — all 8 chunks (A–H) of the design doc landed. 11,533-line monolith → 13 submodule files under `src/tla/eval/`. External API surface unchanged.
+
+Compiler internal-helper restructuring — depth-tracking consolidation (148 + 26 → 4 + 1 sites). Plus 6 more iterations of targeted tests (T207b–T207h, +149 tests). Compiler mutation kill rate: 65.4% → 70.5% across 11 iterations.
 
 ### Older parked items partially landed
 
-- **T10.2 phase 2 stages 1+2 of 5** — strictly-additive foundation:
-  - Stage 1: `PageAlignedColorMap` (524 LOC, 7 tests) — 2-bit Color
-    enum, hugepage mmap, NUMA-shard placement, lock-free CAS.
-  - Stage 2: protocol variants (`PartitionEdge`, `RedDfsProbe`,
-    `RequestStateBlob`, etc.) + `Option<u64>` extensions on
-    `TerminationToken`.
-  - Stages 3–5 still parked (5-week effort estimate).
-- **T13.4 Phase 1** — production-shape verified wrapper at
-  `verification/verus/shard_wrapper.rs` (1,083 LOC, 31 verified
-  items). Bounded outer probe loop now verified — closes the gap
-  `shard_methods.rs` deferred. **115 total Verus items verified**
-  (was 84). Phases 2+3 parked behind documented `vstd` capability gaps.
+T10.2 phase 2 stages 1+2 of 5 — strictly-additive foundation. Stage 1: `PageAlignedColorMap` (524 LOC, 7 tests) — 2-bit Color enum, hugepage mmap, NUMA-shard placement, lock-free CAS. Stage 2: protocol variants (`PartitionEdge`, `RedDfsProbe`, `RequestStateBlob`, etc.) + `Option<u64>` extensions on `TerminationToken`. Stages 3–5 still parked.
+
+T13.4 Phase 1 — production-shape verified wrapper at `verification/verus/shard_wrapper.rs` (1,083 LOC, 31 verified items). Bounded outer probe loop now verified — closes the gap `shard_methods.rs` deferred. 115 total Verus items verified (was 84). Phases 2+3 parked behind documented `vstd` capability gaps.
 
 ### Validation
 
@@ -179,7 +93,7 @@ Drop-in for v1.2.0.
 | `scripts/diff_tlc.sh` (vs TLC v1.7.4) | 13 / 13 |
 | Verus proofs (5 files) | 115 verified items, 0 errors |
 | Mutation testing — `eval.rs` (interpreter) | 100% kill rate |
-| Mutation testing — compiled_eval.rs + compiled_expr.rs | 70.5% kill rate |
+| Mutation testing — compiled_eval.rs + compiled_expr.rs | 70.5% kill rate (8 iters) |
 
 ## v1.2.0 (2026-05-07)
 
