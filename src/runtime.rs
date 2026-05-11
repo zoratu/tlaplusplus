@@ -169,6 +169,19 @@ pub struct EngineConfig {
     /// only specs ignore the flag. Distributed runs ignore the flag
     /// (DFS path is single-node by design).
     pub liveness_streaming_exploration: bool,
+
+    /// T10.2 stage 5 — number of worker threads in the DFS pool when the
+    /// streaming-exploration path fires. `0` means "match the BFS worker
+    /// plan count" (i.e. `worker_plan.worker_count`). `1` is the stage-4
+    /// single-worker path. Anything > 1 enables the
+    /// [`crate::runtime::dfs_pool`] cross-partition routing layer.
+    ///
+    /// Default `0` so the runtime auto-sizes the pool to the same fleet
+    /// size the BFS path would have used. The value is silently clamped
+    /// to `worker_plan.worker_count` if larger; clamped to `1` if 0 was
+    /// requested but `worker_plan.worker_count` resolves to 0 (which
+    /// shouldn't happen in practice but is a safe floor).
+    pub dfs_workers: usize,
 }
 
 impl Default for EngineConfig {
@@ -221,6 +234,7 @@ impl Default for EngineConfig {
             stolen_states_tx: None,
             liveness_streaming: false,
             liveness_streaming_exploration: false,
+            dfs_workers: 0,
         }
     }
 }
@@ -272,6 +286,7 @@ pub struct RunStats {
     pub fingerprints: FingerprintStats,
 }
 
+mod dfs_pool;
 mod dfs_worker;
 mod distributed;
 mod init_producer;
@@ -1180,41 +1195,89 @@ where
             }
         };
 
-        let dfs_ctx = dfs_worker::DfsWorkerCtx::<M> {
-            model: Arc::clone(&model),
-            fp_store: Arc::clone(&fp_store),
-            stats: Arc::clone(&run_stats),
-            stop: Arc::clone(&stop),
-            violation_tx: violation_tx.clone(),
-            violation_count: Arc::clone(&violation_count),
-            max_violations,
-            error_tx: error_tx.clone(),
-            stop_on_violation: config.stop_on_violation,
-            parent_map: parent_map.clone(),
-            state_map: state_map.clone(),
-            trace_count: Arc::clone(&trace_state_count),
-            max_trace_states,
-            color_map,
-            dfs_inband_verdict_done: Arc::clone(&dfs_inband_verdict_done),
+        // T10.2 stage 5 — choose between single-worker (Stage 4 path,
+        // `runtime/dfs_worker.rs`) and multi-worker pool (this stage,
+        // `runtime/dfs_pool.rs`). The pool size defaults to the BFS
+        // fleet's `worker_plan.worker_count`; explicit override via
+        // `EngineConfig::dfs_workers` is clamped to that ceiling so a
+        // user can't accidentally over-subscribe the cgroup CPU quota.
+        let requested_dfs_workers = if config.dfs_workers == 0 {
+            worker_plan.worker_count.max(1)
+        } else {
+            config.dfs_workers.min(worker_plan.worker_count.max(1))
         };
+        let num_dfs_workers = requested_dfs_workers.max(1);
 
         // The init producer was skipped above (`dfs_dispatch_will_fire`),
         // so the `init_producing` flag is already false and there is no
         // producer thread to coordinate with. The DFS worker seeds its
         // own initial-state set eagerly.
 
-        eprintln!(
-            "[runtime] T10.2 stage 4 DFS dispatch: single worker, color-map slots={}, \
-             labeled-transitions=DROPPED (in-band verdict), fairness constraints={}",
-            cm_capacity,
-            model.fairness_constraints().len()
-        );
+        if num_dfs_workers == 1 {
+            let dfs_ctx = dfs_worker::DfsWorkerCtx::<M> {
+                model: Arc::clone(&model),
+                fp_store: Arc::clone(&fp_store),
+                stats: Arc::clone(&run_stats),
+                stop: Arc::clone(&stop),
+                violation_tx: violation_tx.clone(),
+                violation_count: Arc::clone(&violation_count),
+                max_violations,
+                error_tx: error_tx.clone(),
+                stop_on_violation: config.stop_on_violation,
+                parent_map: parent_map.clone(),
+                state_map: state_map.clone(),
+                trace_count: Arc::clone(&trace_state_count),
+                max_trace_states,
+                color_map,
+                dfs_inband_verdict_done: Arc::clone(&dfs_inband_verdict_done),
+            };
 
-        let mut handles = Vec::with_capacity(1);
-        handles.push(std::thread::spawn(move || {
-            dfs_worker::run_dfs_worker::<M>(dfs_ctx);
-        }));
-        handles
+            eprintln!(
+                "[runtime] T10.2 stage 4 DFS dispatch: single worker, color-map slots={}, \
+                 labeled-transitions=DROPPED (in-band verdict), fairness constraints={}",
+                cm_capacity,
+                model.fairness_constraints().len()
+            );
+
+            let mut handles = Vec::with_capacity(1);
+            handles.push(std::thread::spawn(move || {
+                dfs_worker::run_dfs_worker::<M>(dfs_ctx);
+            }));
+            handles
+        } else {
+            let pool_ctx = dfs_pool::DfsPoolCtx::<M> {
+                num_workers: num_dfs_workers,
+                model: Arc::clone(&model),
+                fp_store: Arc::clone(&fp_store),
+                color_map,
+                stats: Arc::clone(&run_stats),
+                stop: Arc::clone(&stop),
+                violation_tx: violation_tx.clone(),
+                violation_count: Arc::clone(&violation_count),
+                max_violations,
+                error_tx: error_tx.clone(),
+                stop_on_violation: config.stop_on_violation,
+                parent_map: parent_map.clone(),
+                state_map: state_map.clone(),
+                trace_count: Arc::clone(&trace_state_count),
+                max_trace_states,
+                dfs_inband_verdict_done: Arc::clone(&dfs_inband_verdict_done),
+            };
+
+            eprintln!(
+                "[runtime] T10.2 stage 5 DFS pool dispatch: {} workers, color-map slots={}, \
+                 labeled-transitions=DROPPED (in-band verdict), fairness constraints={}",
+                num_dfs_workers,
+                cm_capacity,
+                model.fairness_constraints().len()
+            );
+
+            let mut handles = Vec::with_capacity(1);
+            handles.push(std::thread::spawn(move || {
+                dfs_pool::run_dfs_pool::<M>(pool_ctx);
+            }));
+            handles
+        }
     } else {
         let mut workers = Vec::with_capacity(worker_plan.worker_count);
         for (worker_id, worker_state) in worker_states.into_iter().enumerate() {

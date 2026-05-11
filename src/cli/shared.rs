@@ -101,6 +101,10 @@ pub(crate) fn build_engine_config(
         // inside the runtime so non-fairness specs are unaffected even with
         // the flag on.
         liveness_streaming_exploration: runtime.liveness_streaming_exploration,
+        // T10.2 stage 5 — DFS pool worker count. 0 = match BFS fleet
+        // size (default), 1 = single-worker DFS (Stage 4 path), N > 1 =
+        // multi-worker pool (Stage 5).
+        dfs_workers: runtime.dfs_workers,
     })
 }
 
