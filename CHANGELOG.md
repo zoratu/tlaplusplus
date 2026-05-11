@@ -1,5 +1,47 @@
 # Changelog
 
+## v1.2.3 (2026-05-10)
+
+Patch release landing **T10.2 phase 2 stage 3** — the hot-loop DFS
+lift parked across v1.2.1 / v1.2.2. Two prior agents stopped at the
+same surface; the third used a SCOPED approach that sidesteps the
+universal lift entirely.
+
+### T10.2 phase 2 stage 3 — DFS exploration via separate worker
+
+- New file `src/runtime/dfs_worker.rs` (941 LOC) — single-worker
+  single-node DFS exploration with its own ctx struct. Drops features
+  irrelevant to streaming-SCC mode (no checkpoint pause, no cluster
+  steal, no init producer, no auto-tune throttle, no backpressure).
+- `src/runtime/worker.rs` is byte-unchanged — default behaviour
+  identical to v1.2.2.
+- Dispatch branch in `src/runtime.rs`: when
+  `--liveness-streaming-exploration` is on AND
+  `model.has_fairness_constraints()` AND no distributed stealer, spawn
+  ONE DFS worker instead of the normal worker fleet.
+- In-band Tarjan-style coloring via `PageAlignedColorMap` (Stage 1
+  deliverable from v1.2.1). Nested-DFS red probe on accepting-state
+  pop.
+- `tests/dfs_worker_parity.rs`: 4 BFS-vs-DFS parity tests
+  (WrapperNextFairness, NamedSubaction, ThreeCycle, SafetyOnly) —
+  identical state counts and liveness verdicts.
+
+Honest finding: predicted >50% RSS reduction at 100M+ scale is NOT
+yet realized. DFS path still populates `labeled_transitions` — that
+lift is Stage 4. What this stage delivers is the architecture on
+which Stage 4 can drop labeled_transitions without touching BFS.
+
+### Validation
+
+| Gate | Result |
+|---|---|
+| `cargo test --release` | 1,212 pass / 0 fail / 8 ignored |
+| `cargo test --release --features failpoints` | 1,234 pass / 0 fail / 8 ignored |
+| `cargo test --release --features symbolic-init` | 1,239 pass / 0 fail / 8 ignored |
+| Verus proofs (6 files) | 133 verified items, 0 errors, 0 axioms |
+
+Drop-in for v1.2.0 / v1.2.1 / v1.2.2. No public-API changes.
+
 ## v1.2.2 (2026-05-10)
 
 Patch release continuing to push on the long-parked multi-week items.
