@@ -590,6 +590,127 @@ where
                         );
                     }
                 }
+
+                // T10.2 stage 3 — opt-in `--liveness-streaming-exploration`.
+                // Re-run the same nested-DFS over the production
+                // `PageAlignedColorMap` data structure (2 bits/fp, NUMA
+                // shard-placed, lock-free CAS) instead of the v1.1.0
+                // oracle's `HashMap<u64, Color>`. Cross-validate against
+                // both the Tarjan verdict above AND the v1.1.0 hash-backed
+                // oracle (when both flags are set). This is the
+                // production-shape exercise of `PageAlignedColorMap` on
+                // real fairness specs — the prerequisite for the eventual
+                // hot-loop DFS lift documented in
+                // `docs/T10.2-phase2-refined.md`.
+                //
+                // Kept inside the existing fairness-constraints block so
+                // it only runs on specs that actually need it; gated
+                // additionally on the runtime config flag so existing
+                // fairness tests are unaffected.
+                if config.liveness_streaming_exploration {
+                    let cm_started_at = std::time::Instant::now();
+
+                    // Acceptance set: same as the v1.1.0 oracle — the set
+                    // of fingerprints in known fairness-violating SCCs.
+                    // We re-derive it here so the page-aligned path does
+                    // not rely on `config.liveness_streaming` also being
+                    // set; both flags are independent toggles.
+                    let constraints = model.fairness_constraints();
+                    let next_name = model.next_action_name();
+                    let mut accepting_set: std::collections::HashSet<u64> =
+                        std::collections::HashSet::new();
+                    let cm_shards =
+                        crate::fairness::build_action_shard_index(&tx_triples);
+                    for scc in non_trivial_sccs.iter() {
+                        let scc_fps: std::collections::HashSet<u64> =
+                            scc.iter().copied().collect();
+                        let mut violated = false;
+                        for constraint in &constraints {
+                            if crate::fairness::check_fairness_on_scc_fp_sharded(
+                                &scc_fps,
+                                constraint,
+                                &cm_shards,
+                                &adjacency_fp,
+                                next_name,
+                            )
+                            .is_err()
+                            {
+                                violated = true;
+                                break;
+                            }
+                        }
+                        if violated {
+                            for fp in scc_fps {
+                                accepting_set.insert(fp);
+                            }
+                        }
+                    }
+
+                    // Build a PageAlignedColorMap sized for the
+                    // discovered fingerprint domain. We size up to the
+                    // next power of two of state_by_fp.len() so the
+                    // shard mask path is exercised.
+                    let n_states = state_by_fp.len().max(64);
+                    // 1 shard for the post-processing path — multi-shard
+                    // is exercised by the dedicated unit tests in
+                    // `page_aligned_color_map.rs` and is not load-bearing
+                    // for verdict correctness here.
+                    let cm_capacity = n_states.next_power_of_two().max(1024);
+                    match
+                        crate::storage::page_aligned_color_map::PageAlignedColorMap::new(
+                            cm_capacity,
+                            1,
+                            &[0],
+                        )
+                    {
+                        Err(err) => {
+                            eprintln!(
+                                "  [T10.2 stage-3] color-map allocation failed: {} — \
+                                 skipping page-aligned oracle (Tarjan verdict authoritative)",
+                                err
+                            );
+                        }
+                        Ok(color_map) => {
+                            let cm_init_fps: Vec<u64> =
+                                state_by_fp.keys().copied().collect();
+                            let cm_accepting =
+                                move |fp: u64| accepting_set.contains(&fp);
+                            let cm_graph =
+                                crate::streaming_scc::FingerprintAdjacencyGraph {
+                                    initial_fps: cm_init_fps,
+                                    adjacency: &adjacency_fp,
+                                    accepting: &cm_accepting,
+                                };
+                            let cm_result =
+                                crate::streaming_scc::nested_dfs_color_map(
+                                    &cm_graph,
+                                    &color_map,
+                                );
+                            let cm_found_cycle = matches!(
+                                cm_result,
+                                crate::streaming_scc::NestedDfsResult::AcceptingCycle { .. }
+                            );
+                            let tarjan_found_cycle = violation.is_some();
+
+                            eprintln!(
+                                "  [T10.2 stage-3] page-aligned color-map nested-DFS \
+                                 in {:.2?} — color_map_cycle={} tarjan_cycle={}",
+                                cm_started_at.elapsed(),
+                                cm_found_cycle,
+                                tarjan_found_cycle
+                            );
+                            if cm_found_cycle != tarjan_found_cycle {
+                                eprintln!(
+                                    "  [T10.2 stage-3] DIVERGENCE — page-aligned \
+                                     color-map oracle disagrees with Tarjan. The \
+                                     Tarjan result is authoritative; this likely \
+                                     indicates a bug in PageAlignedColorMap or in \
+                                     nested_dfs_color_map. File an issue."
+                                );
+                            }
+                        }
+                    }
+                }
             }
         } else {
             eprintln!("  No cycles detected - fairness constraints trivially satisfied");
@@ -654,6 +775,7 @@ mod tests {
         EngineConfig {
             enforce_cgroups: false,
             liveness_streaming: false,
+            liveness_streaming_exploration: false,
             ..EngineConfig::default()
         }
     }

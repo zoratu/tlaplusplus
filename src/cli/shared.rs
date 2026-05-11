@@ -96,6 +96,11 @@ pub(crate) fn build_engine_config(
         // adjacency and cross-validates against Tarjan-based fairness.
         // Defaults to off (set via --liveness-streaming).
         liveness_streaming: runtime.liveness_streaming,
+        // T10.2 stage 3 — opt-in PageAlignedColorMap nested-DFS path.
+        // Default off; gated additionally on model.has_fairness_constraints()
+        // inside the runtime so non-fairness specs are unaffected even with
+        // the flag on.
+        liveness_streaming_exploration: runtime.liveness_streaming_exploration,
     })
 }
 

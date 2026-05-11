@@ -321,6 +321,233 @@ fn red_dfs<G: LivenessGraph>(
     None
 }
 
+// -------- T10.2 stage 3: nested DFS over the production
+// `PageAlignedColorMap` (2-bit per fingerprint, NUMA-shard-placed,
+// lock-free CAS) instead of the `HashMap<u64, Color>` used by the
+// v1.1.0 oracle.
+//
+// The algorithm is identical to `nested_dfs` above; only the coloring
+// substrate changes. This variant requires the graph's `State` to be a
+// `u64` fingerprint (matching the color map's key shape) and so is
+// specialised to `LivenessGraph<State = u64>`. Used by the
+// `--liveness-streaming-exploration` runtime path.
+//
+// Why this is "Stage 3 partial" rather than "Stage 3 done": the design
+// doc describes lifting the BFS exploration loop itself into per-worker
+// DFS, which would let us drop the `labeled_transitions` adjacency map
+// during exploration (the actual memory win). That hot-loop rewrite is
+// gated by the T5.4/T6/T11.5 invariants documented at the top of
+// `runtime/worker.rs` and was deferred for v1.2.x. What this function
+// validates today is that the production color-map data structure
+// gives the same verdict as the HashMap-backed oracle on real fairness
+// specs — a prerequisite for the worker-loop lift.
+
+/// Run nested DFS using a [`PageAlignedColorMap`] as the coloring
+/// substrate. Returns the same shape of result as [`nested_dfs`].
+///
+/// The color map must be at least the size of the reachable
+/// fingerprint domain (in practice, `--fp-expected-items` rounded to a
+/// power of two).
+pub fn nested_dfs_color_map<G>(
+    graph: &G,
+    color_map: &crate::storage::page_aligned_color_map::PageAlignedColorMap,
+) -> NestedDfsResult<u64>
+where
+    G: LivenessGraph<State = u64>,
+{
+    use crate::storage::page_aligned_color_map::Color as MapColor;
+
+    // The blue DFS path from an initial state; used to reconstruct the
+    // lasso prefix and the cycle when red DFS finds a back-edge.
+    let mut blue_path: Vec<u64> = Vec::new();
+
+    for init in graph.initial_states() {
+        if color_map.load(init) != MapColor::White {
+            continue;
+        }
+        if let Some((prefix, cycle)) =
+            blue_dfs_iter_color_map(graph, init, color_map, &mut blue_path)
+        {
+            return NestedDfsResult::AcceptingCycle {
+                lasso_prefix: prefix,
+                cycle,
+            };
+        }
+        debug_assert!(blue_path.is_empty(), "blue path must drain after each root");
+    }
+    NestedDfsResult::NoAcceptingCycle
+}
+
+/// Iterative blue DFS using the page-aligned color map. Mirrors
+/// [`blue_dfs_iter`] but with CAS-based color transitions.
+fn blue_dfs_iter_color_map<G>(
+    graph: &G,
+    root: u64,
+    color_map: &crate::storage::page_aligned_color_map::PageAlignedColorMap,
+    blue_path: &mut Vec<u64>,
+) -> Option<(Vec<u64>, Vec<u64>)>
+where
+    G: LivenessGraph<State = u64>,
+{
+    use crate::storage::page_aligned_color_map::Color as MapColor;
+
+    // Enter root: White -> Cyan via CAS. If the CAS lost (another caller
+    // already entered), the outer loop's `load == White` guard already
+    // ruled that out, so a lost CAS here would be a soundness bug — we
+    // intentionally panic in debug to catch it.
+    let cas_root = color_map.cas(root, MapColor::White, MapColor::Cyan);
+    debug_assert!(
+        cas_root.is_ok(),
+        "root CAS White->Cyan must succeed in single-threaded oracle path"
+    );
+    blue_path.push(root);
+
+    let mut stack: Vec<(u64, Vec<u64>, usize)> =
+        vec![(root, graph.successors(&root), 0)];
+
+    while let Some((v, succs, mut i)) = stack.pop() {
+        let mut recursed = false;
+        while i < succs.len() {
+            let w = succs[i];
+            i += 1;
+            let cur = color_map.load(w);
+            if cur == MapColor::White {
+                // Try to claim. CAS may lose if another visit raced; in
+                // the single-threaded oracle this is unreachable, but we
+                // retry by checking the resulting color.
+                match color_map.cas(w, MapColor::White, MapColor::Cyan) {
+                    Ok(()) => {
+                        blue_path.push(w);
+                        let w_succs = graph.successors(&w);
+                        stack.push((v, succs, i));
+                        stack.push((w, w_succs, 0));
+                        recursed = true;
+                        break;
+                    }
+                    Err(_) => {
+                        // Lost the race — treat as already-visited; fall
+                        // through to next successor.
+                        continue;
+                    }
+                }
+            } else {
+                // Cyan / Blue / Red: already in some DFS state, skip.
+                continue;
+            }
+        }
+        if recursed {
+            continue;
+        }
+
+        // Post-order: maybe launch red DFS, then mark Blue and pop.
+        if graph.is_accepting(&v) {
+            if let Some((witness, red_cycle_tail)) =
+                red_dfs_color_map(graph, v, color_map)
+            {
+                let prefix_idx = blue_path
+                    .iter()
+                    .position(|&fp| fp == witness)
+                    .expect("witness must be on blue path (Cyan)");
+                let lasso_prefix: Vec<u64> = blue_path[..prefix_idx].to_vec();
+                let mut cycle: Vec<u64> = blue_path[prefix_idx..].to_vec();
+                cycle.extend(red_cycle_tail.into_iter());
+                cycle.push(witness);
+                return Some((lasso_prefix, cycle));
+            }
+        }
+
+        // Cyan -> Blue. CAS losing here would mean someone else mutated
+        // our path entry, which can't happen in single-threaded DFS;
+        // assert in debug.
+        let cas_done = color_map.cas(v, MapColor::Cyan, MapColor::Blue);
+        debug_assert!(
+            cas_done.is_ok(),
+            "post-order Cyan->Blue CAS must succeed; got {:?}",
+            cas_done
+        );
+        let popped = blue_path.pop();
+        debug_assert_eq!(popped, Some(v));
+    }
+    None
+}
+
+/// Red DFS using the page-aligned color map. Returns the witness
+/// fingerprint plus the trail from the seed when an accepting cycle is
+/// detected; `None` otherwise.
+fn red_dfs_color_map<G>(
+    graph: &G,
+    seed: u64,
+    color_map: &crate::storage::page_aligned_color_map::PageAlignedColorMap,
+) -> Option<(u64, Vec<u64>)>
+where
+    G: LivenessGraph<State = u64>,
+{
+    use crate::storage::page_aligned_color_map::Color as MapColor;
+
+    let seed_succs = graph.successors(&seed);
+    let mut stack: Vec<(u64, Vec<u64>, usize)> = vec![(seed, seed_succs, 0)];
+    let mut trail: Vec<u64> = vec![seed];
+
+    while let Some((v, succs, mut i)) = stack.pop() {
+        while trail.last() != Some(&v) {
+            trail.pop();
+        }
+        let mut recursed = false;
+        while i < succs.len() {
+            let w = succs[i];
+            i += 1;
+            let cw = color_map.load(w);
+            if cw == MapColor::Cyan {
+                // Back-edge to the blue stack — accepting cycle.
+                let mut tail = trail.clone();
+                tail.push(w);
+                return Some((w, tail[1..].to_vec()));
+            }
+            if cw == MapColor::Red {
+                continue;
+            }
+            // White or Blue: paint Red. The CAS may lose if another
+            // caller painted concurrently; either Cyan (handled above) or
+            // already Red (handled above) — in the single-threaded oracle
+            // path the only "lose" cases are benign.
+            //
+            // We try both CAS paths so we don't miss a live state on a
+            // freshly-entered Blue marker (race-free in this path but
+            // future-proof for Stage 4 multi-worker red DFS).
+            let cas_attempt = match cw {
+                MapColor::White => {
+                    color_map.cas(w, MapColor::White, MapColor::Red)
+                }
+                MapColor::Blue => color_map.cas(w, MapColor::Blue, MapColor::Red),
+                _ => unreachable!("handled above"),
+            };
+            if cas_attempt.is_err() {
+                // Color moved under us; re-load and dispatch.
+                let now = color_map.load(w);
+                if now == MapColor::Cyan {
+                    let mut tail = trail.clone();
+                    tail.push(w);
+                    return Some((w, tail[1..].to_vec()));
+                }
+                continue;
+            }
+            let w_succs = graph.successors(&w);
+            stack.push((v, succs, i));
+            trail.push(w);
+            stack.push((w, w_succs, 0));
+            recursed = true;
+            break;
+        }
+        if recursed {
+            continue;
+        }
+        if trail.last() == Some(&v) {
+            trail.pop();
+        }
+    }
+    None
+}
+
 // -------- Adapter: run streaming nested-DFS over an existing fingerprint
 // adjacency map. Used by the `--liveness-streaming` runtime path as the
 // validation harness. --------
@@ -559,6 +786,177 @@ mod tests {
                 assert!(cycle.contains(&2));
             }
             _ => panic!("expected accepting cycle via adapter"),
+        }
+    }
+
+    // -------- T10.2 stage 3: cover `nested_dfs_color_map` directly,
+    // independent of the runtime / fairness pipeline. The contract is
+    // "produces the same verdict as nested_dfs on any LivenessGraph<u64>".
+    // We replay the same fingerprint-adjacency fixtures used above.
+
+    use crate::storage::page_aligned_color_map::PageAlignedColorMap;
+
+    fn cm() -> PageAlignedColorMap {
+        // Sized for ~1024 fingerprints, single shard; matches the runtime
+        // post-processing path on the small fairness fixtures.
+        PageAlignedColorMap::new(1024, 1, &[0]).expect("color map alloc")
+    }
+
+    #[test]
+    fn color_map_dfs_finds_accepting_cycle() {
+        let mut adj: HashMap<u64, Vec<u64>> = HashMap::new();
+        adj.insert(0, vec![1]);
+        adj.insert(1, vec![2]);
+        adj.insert(2, vec![0]);
+        let accept = |s: u64| s == 2;
+        let g = FingerprintAdjacencyGraph {
+            initial_fps: vec![0],
+            adjacency: &adj,
+            accepting: &accept,
+        };
+        let r = nested_dfs_color_map(&g, &cm());
+        match r {
+            NestedDfsResult::AcceptingCycle { cycle, .. } => {
+                assert!(
+                    cycle.contains(&2),
+                    "color-map cycle must include accepting state 2; got {:?}",
+                    cycle
+                );
+            }
+            _ => panic!("expected accepting cycle via color-map DFS"),
+        }
+    }
+
+    #[test]
+    fn color_map_dfs_no_cycle_clean() {
+        // 0 -> 1 -> 2 (DAG, every node accepting; must NOT report cycle).
+        let mut adj: HashMap<u64, Vec<u64>> = HashMap::new();
+        adj.insert(0, vec![1]);
+        adj.insert(1, vec![2]);
+        adj.insert(2, vec![]);
+        let accept = |_s: u64| true;
+        let g = FingerprintAdjacencyGraph {
+            initial_fps: vec![0],
+            adjacency: &adj,
+            accepting: &accept,
+        };
+        let r = nested_dfs_color_map(&g, &cm());
+        assert!(matches!(r, NestedDfsResult::NoAcceptingCycle));
+    }
+
+    #[test]
+    fn color_map_dfs_self_loop_on_accept_reports() {
+        let mut adj: HashMap<u64, Vec<u64>> = HashMap::new();
+        adj.insert(7, vec![7]);
+        let accept = |s: u64| s == 7;
+        let g = FingerprintAdjacencyGraph {
+            initial_fps: vec![7],
+            adjacency: &adj,
+            accepting: &accept,
+        };
+        let r = nested_dfs_color_map(&g, &cm());
+        match r {
+            NestedDfsResult::AcceptingCycle { cycle, .. } => {
+                assert!(cycle.contains(&7), "self-loop cycle on 7");
+            }
+            _ => panic!("expected self-loop accepting cycle"),
+        }
+    }
+
+    #[test]
+    fn color_map_dfs_only_real_cycle_not_dead_end_accept() {
+        // 0 -> 1 (accepting, dead end); 0 -> 2 -> 3 -> 2 (cycle, 3 acc).
+        let mut adj: HashMap<u64, Vec<u64>> = HashMap::new();
+        adj.insert(0, vec![1, 2]);
+        adj.insert(1, vec![]);
+        adj.insert(2, vec![3]);
+        adj.insert(3, vec![2]);
+        let accept = |s: u64| s == 1 || s == 3;
+        let g = FingerprintAdjacencyGraph {
+            initial_fps: vec![0],
+            adjacency: &adj,
+            accepting: &accept,
+        };
+        let r = nested_dfs_color_map(&g, &cm());
+        match r {
+            NestedDfsResult::AcceptingCycle { cycle, .. } => {
+                assert!(
+                    cycle.contains(&3) && cycle.contains(&2),
+                    "expected 2-3 cycle, got {:?}",
+                    cycle
+                );
+                assert!(
+                    !cycle.contains(&1),
+                    "dead-end accepting branch must not appear in cycle"
+                );
+            }
+            _ => panic!("expected 2-3 cycle"),
+        }
+    }
+
+    #[test]
+    fn color_map_dfs_agrees_with_hash_map_on_random_small_graphs() {
+        // Cross-validation: for several deterministic small graphs, the
+        // color-map DFS and the hash-map DFS must produce verdicts that
+        // agree on whether an accepting cycle exists. (Cycle composition
+        // can differ across DFS visit orders, but the verdict cannot.)
+        let cases: Vec<(Vec<(u64, Vec<u64>)>, Vec<u64>, bool)> = vec![
+            // Cycle case: 0 -> 1 -> 2 -> 0, accept on 2.
+            (vec![(0, vec![1]), (1, vec![2]), (2, vec![0])], vec![2], true),
+            // No cycle: 0 -> 1 -> 2, accept on 2.
+            (vec![(0, vec![1]), (1, vec![2]), (2, vec![])], vec![2], false),
+            // Cycle but no accepting state on cycle.
+            (
+                vec![(0, vec![1]), (1, vec![2]), (2, vec![0])],
+                vec![],
+                false,
+            ),
+            // Two components, second has accepting cycle.
+            (
+                vec![
+                    (0, vec![1]),
+                    (1, vec![]),
+                    (2, vec![3]),
+                    (3, vec![4]),
+                    (4, vec![2]),
+                ],
+                vec![3],
+                true,
+            ),
+        ];
+        for (i, (edges, accept_set, want_cycle)) in cases.into_iter().enumerate() {
+            let mut adj: HashMap<u64, Vec<u64>> = HashMap::new();
+            for (k, vs) in &edges {
+                adj.insert(*k, vs.clone());
+            }
+            let init_fps: Vec<u64> = adj.keys().copied().collect();
+            let acc_set: std::collections::HashSet<u64> = accept_set.into_iter().collect();
+            let acc_clone = acc_set.clone();
+            let acc_clone2 = acc_set.clone();
+            let g_hash = FingerprintAdjacencyGraph {
+                initial_fps: init_fps.clone(),
+                adjacency: &adj,
+                accepting: &|fp: u64| acc_clone.contains(&fp),
+            };
+            let g_cm = FingerprintAdjacencyGraph {
+                initial_fps: init_fps,
+                adjacency: &adj,
+                accepting: &|fp: u64| acc_clone2.contains(&fp),
+            };
+            let r_hash = nested_dfs(&g_hash);
+            let r_cm = nested_dfs_color_map(&g_cm, &cm());
+            let h = matches!(r_hash, NestedDfsResult::AcceptingCycle { .. });
+            let c = matches!(r_cm, NestedDfsResult::AcceptingCycle { .. });
+            assert_eq!(
+                h, c,
+                "case {}: hash={} color_map={}",
+                i, h, c
+            );
+            assert_eq!(
+                h, want_cycle,
+                "case {}: ground-truth says cycle={}, but algorithms agree on {}",
+                i, want_cycle, h
+            );
         }
     }
 

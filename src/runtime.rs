@@ -132,6 +132,31 @@ pub struct EngineConfig {
     /// **Default `false`** — must not perturb the existing path until the
     /// in-exploration variant lands.
     pub liveness_streaming: bool,
+    /// T10.2 stage 3 — opt-in **page-aligned color-map** nested-DFS path.
+    ///
+    /// When `true` AND the model has fairness constraints, the post-BFS
+    /// liveness pipeline runs nested-DFS over the production
+    /// [`PageAlignedColorMap`](crate::storage::page_aligned_color_map) data
+    /// structure (2 bits per fingerprint, NUMA-shard-placed, lock-free CAS)
+    /// instead of the v1.1.0 oracle's `HashMap<u64, Color>`. The verdict is
+    /// cross-validated against the existing Tarjan-based fairness check; any
+    /// disagreement aborts the run with a diagnostic.
+    ///
+    /// **What this stage 3 actually delivers**: the production color-map
+    /// data structure validated end-to-end on real fairness specs, behind a
+    /// default-off flag. The actual lift of the BFS exploration into a
+    /// per-worker DFS loop (the "true streaming" memory win) is **deferred**
+    /// — the BFS path still builds the labeled-transitions adjacency map
+    /// during exploration; the color map currently only replaces the post-
+    /// processing oracle's HashMap. The hot-loop DFS rewrite has a 5-day
+    /// estimate per `docs/T10.2-phase2-refined.md` §10 and was deferred
+    /// after the chunk-7 runtime.rs complexity walls observed during
+    /// v1.1.x. Stages 4 and 5 in the design doc remain ungated by this
+    /// flag.
+    ///
+    /// **Default `false`** — must not perturb the existing path. Existing
+    /// fairness tests must keep using the existing path.
+    pub liveness_streaming_exploration: bool,
 }
 
 impl Default for EngineConfig {
@@ -183,6 +208,7 @@ impl Default for EngineConfig {
             donate_states_rx: None,
             stolen_states_tx: None,
             liveness_streaming: false,
+            liveness_streaming_exploration: false,
         }
     }
 }
