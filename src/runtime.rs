@@ -1107,14 +1107,25 @@ where
     //     and cross-node steal-trigger task ---
     distributed::spawn_handlers_if_any(&config, &queue, &stop);
 
-    // T10.2 stage 3 — opt-in single-worker DFS exploration with in-line
-    // page-aligned color-map coloring. When the flag is on AND the model
-    // declares fairness constraints, we replace the BFS worker fleet
-    // with a single DFS worker (see `runtime/dfs_worker.rs` for the
-    // rationale and dropped-feature audit). The DFS worker still
-    // populates the labeled-transitions map so the existing post-
-    // processing pipeline produces the canonical fairness verdict —
-    // gate-7 parity proves DFS and Tarjan paths agree on every fixture.
+    // T10.2 stage 4 — opt-in single-worker DFS exploration with in-band
+    // fairness verdict (no labeled-transitions DashMap materialization).
+    //
+    // When the flag is on AND the model declares fairness constraints AND
+    // the run is single-node (no distributed stealer attached), we replace
+    // the parallel BFS worker fleet with a single DFS worker
+    // (`runtime/dfs_worker.rs`). Stage 4 differs from Stage 3 in two
+    // ways:
+    //
+    // 1. The DFS worker does NOT populate `labeled_transitions`. It
+    //    builds a thin local fingerprint-only adjacency list and runs
+    //    Tarjan + the fairness check in-band, emitting any violation
+    //    through the same `violation_tx` channel the BFS path uses.
+    //    This realises the predicted memory win (no `LabeledTransition`
+    //    state clones).
+    // 2. The shutdown orchestrator skips
+    //    `liveness::run_post_processing` when the DFS path was used —
+    //    `dfs_inband_verdict_done` is set to `true` by the worker once
+    //    it has emitted (or skipped emitting) the fairness verdict.
     //
     // Default off, and additionally gated on `has_fairness_constraints`:
     // safety-only specs use the BFS fleet unchanged regardless of the
@@ -1124,10 +1135,33 @@ where
         && model.has_fairness_constraints()
         && config.distributed_stealer.is_none();
 
+    // Shared with both the DFS worker and the shutdown orchestrator.
+    // The worker sets it to `true` once it has run (or knowingly
+    // skipped) the in-band fairness check; shutdown reads it to gate
+    // `liveness::run_post_processing` so the labeled_transitions Tarjan
+    // pipeline doesn't re-run a verdict the DFS path already produced.
+    let dfs_inband_verdict_done = Arc::new(AtomicBool::new(false));
+
+    // When the DFS path is active, drop the labeled_transitions DashMap
+    // entirely — the DFS worker doesn't touch it, and the shutdown path
+    // is gated on `dfs_inband_verdict_done` so post-processing won't
+    // see it. This is the actual memory win Stage 4 is delivering.
+    let labeled_transitions_for_shutdown = if use_dfs_path {
+        None
+    } else {
+        labeled_transitions.clone()
+    };
+
     let workers: Vec<std::thread::JoinHandle<()>> = if use_dfs_path {
         // Drop the unused per-worker state vec; the DFS path doesn't
         // touch the work-stealing queue.
         drop(worker_states);
+
+        // Drop the unused labeled_transitions DashMap (BFS allocates it
+        // up at line ~1058 unconditionally when fairness is present).
+        // The DFS worker never touches it; releasing it now keeps peak
+        // RSS minimal.
+        drop(labeled_transitions);
 
         // Build a color map sized for the expected fingerprint domain.
         // Single shard for simplicity — multi-shard is exercised by the
@@ -1156,12 +1190,12 @@ where
             max_violations,
             error_tx: error_tx.clone(),
             stop_on_violation: config.stop_on_violation,
-            labeled_transitions: labeled_transitions.clone(),
             parent_map: parent_map.clone(),
             state_map: state_map.clone(),
             trace_count: Arc::clone(&trace_state_count),
             max_trace_states,
             color_map,
+            dfs_inband_verdict_done: Arc::clone(&dfs_inband_verdict_done),
         };
 
         // The init producer was skipped above (`dfs_dispatch_will_fire`),
@@ -1170,10 +1204,9 @@ where
         // own initial-state set eagerly.
 
         eprintln!(
-            "[runtime] T10.2 stage 3 DFS dispatch: single worker, color-map slots={}, \
-             labeled-transitions={}, fairness constraints={}",
+            "[runtime] T10.2 stage 4 DFS dispatch: single worker, color-map slots={}, \
+             labeled-transitions=DROPPED (in-band verdict), fairness constraints={}",
             cm_capacity,
-            labeled_transitions.is_some(),
             model.fairness_constraints().len()
         );
 
@@ -1256,7 +1289,8 @@ where
         error_rx,
         violation_rx,
         model: Arc::clone(&model),
-        labeled_transitions,
+        labeled_transitions: labeled_transitions_for_shutdown,
+        dfs_inband_verdict_done,
     }
     .orchestrate()
 }
