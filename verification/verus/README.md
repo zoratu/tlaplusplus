@@ -242,17 +242,105 @@ bounded-form fallback; it documents the temporal-logic shape and
 its axiom-discharge plan, both of which remain useful reference
 material for the eventual `state_machines!` port.
 
+### Tier-A.7 (T13.4 Phase 1): production-shape verified wrapper
+
+`shard_wrapper.rs` ships **31 verified items**, ~1s wall (`./run_proof.sh
+shard-wrapper`). It is the production-shape **wrapper struct**
+`VerifiedFingerprintShard` that mirrors the production `FingerprintShard`
+field layout (slot array + capacity) and ships:
+
+  - A **fully-bounded probe loop** (`bounded_contains_loop`) with
+    inductive invariant on the probe index — the headline new
+    capability beyond `shard_methods.rs`. The shadow file explicitly
+    deferred this ("a fully-bounded `for probes in 0..cap` form would
+    require a Verus loop with an inductive invariant ... out of scope
+    for the 6-hour T13.4 timebox"). This file lifts it.
+  - A **fully-bounded contains-or-insert loop**
+    (`bounded_contains_or_insert_loop`) lifting production lines
+    789-828 with the same loop invariant pattern, plus per-iteration
+    permission-map mutation via `tracked_remove`/`tracked_insert`.
+  - A **resize-mode dispatch wrapper**
+    (`bounded_contains_during_resize`) lifting production lines
+    578-622 — the old-table + new-table probe-or-skip control flow.
+  - A **verified constructor** (`make_empty_shard`) that mints an
+    `(VerifiedFingerprintShard, Tracked<Map<int, PermissionU64>>)`
+    pair with the post-condition that every slot is `empty_slot()`.
+    Models production lines 187-256 (`FingerprintShard::new`)
+    without the `mmap` allocation primitive (Phase-2 gap).
+  - **Bridge lemmas** (`lemma_inserted_matches_cas_step`,
+    `lemma_found_implies_in_view`, `lemma_inserted_visible_to_contains`,
+    `lemma_hit_observation_implies_contains`,
+    `lemma_empty_observation_locks_in`, `lemma_probe_index_step`,
+    `lemma_wrapper_probe_index_in_range`) connecting wrapper outputs
+    to tier-A's `tab_lookup` / `tab_insert` / `cas_step` predicates.
+
+| Production source | Wrapper function (verified) |
+|---|---|
+| line 626-643: `contains` body | `bounded_contains_loop` |
+| line 789-828: `contains_or_insert` body | `bounded_contains_or_insert_loop` |
+| line 578-622: `contains` resize-mode dispatch | `bounded_contains_during_resize` |
+| line 187-256: `FingerprintShard::new` | `make_empty_shard` |
+| line 805-823: CAS at one slot | `cas_insert_or_observe` (re-stated from `shard_methods.rs`) |
+| line 634: probe at one slot | `probe_slot_for_contains` (re-stated from `shard_methods.rs`) |
+
+What this tier gives beyond tier-A.5 (`shard_methods.rs`):
+
+  1. **Bounded outer probe loop, fully verified end-to-end.** The shadow
+     file is restricted to 2-step and 3-step unrolls because the
+     loop-invariant lift was deferred. This file lifts it via the
+     `index as int == probe_index(fp, probes as nat, cap as nat)` loop
+     invariant + `decreases cap as u64 - probes` termination clause.
+     This is the explicit "Step 3" deliverable from
+     `T13.2-T13.4-design.md` (smallest standalone Verus win, no new
+     `vstd` capability needed).
+
+  2. **Production-shape struct.** The shadow has only `ShardCells {
+     slots: Vec<PAtomicU64> }`. This file adds `capacity: usize` and
+     a `Tracked<Map<int, PermissionU64>>` permission map, mirroring
+     the production `FingerprintShard` skeleton at lines 124-176. The
+     `VerifiedFingerprintShard` is the Phase-1 wrapper struct called
+     out in the agent-aa936 brief.
+
+  3. **Wrapper-level method bodies, not just per-iteration helpers.**
+     The shadow proves single-iteration helpers
+     (`probe_slot_for_contains`, `cas_insert_or_observe`). This file
+     composes them into the full `bounded_contains_loop` and
+     `bounded_contains_or_insert_loop` with the production-side
+     bounded-iteration shape.
+
+What this file does NOT do (Phase 2 / Phase 3):
+
+  - **Does not replace the production `FingerprintShard`.** Production
+    `cargo build` and `cargo test` are unchanged — the wrapper is
+    additive and lives only under `verification/verus/`. Replacing
+    the production type would require resolving the three concrete
+    `vstd` capability gaps documented in `T13.2-T13.4-design.md`:
+    atomic-pointer-swap with overlapping permission lifetimes,
+    mmap-allocated `PointsToArray` with no provenance axiom, and
+    `&self` + linear ghost token incompatibility under
+    `AtomicInvariant`. The realistic path is a `state_machines!`
+    reformulation (5-7 agent-weeks).
+  - **Does not switch call sites in `runtime.rs`.** Phase 3 of the
+    brief; out of scope until Phase 2 lands.
+  - **Does not lift the seqlock retry loop** into a verified exec
+    function. Tier A's `lemma_reader_terminates` covers it at the
+    spec level.
+  - **Does not model the `count: AtomicU64` / `state: AtomicU8`
+    bookkeeping fields** (production lines 134, 107). Tier A and the
+    shadow explicitly omit them; this wrapper inherits that.
+
 ### Genuinely deferred to v1.2.0+
 
 - **Full Verus tracked-pointer integration of the production
-  `FingerprintShard` itself.** Annotating the production code with
-  `Tracked<PointsToArray<HashTableEntry>>` and threading the
-  permissions through every call site (vs the shadow approach which
-  ships annotated mirror methods). Requires rewriting
+  `FingerprintShard` itself (Phase 2 / Phase 3 of T13.4).** Annotating
+  the production code with `Tracked<PointsToArray<HashTableEntry>>` and
+  threading the permissions through every call site. Requires rewriting
   `allocate_huge_pages`, `allocate_file_backed`, the resize swap, and
   every `unsafe { std::slice::from_raw_parts(...) }` to use
-  `vstd::raw_ptr::PPtr` — multi-week work. The shadow methods in
-  `shard_methods.rs` are the working blueprint for this rewrite.
+  `vstd::raw_ptr::PPtr` — multi-week work, blocked on the `vstd`
+  capability gaps in `T13.2-T13.4-design.md`. The shadow methods in
+  `shard_methods.rs` and the production-shape wrapper in
+  `shard_wrapper.rs` are the working blueprints for this rewrite.
 - **Discharge of the three reader-liveness axioms.** See the
   discharge plans inside `reader_liveness.rs`. Estimated 4-6 agent-
   days, OR ~5-7 days to port the file to `state_machines!`.
@@ -327,14 +415,27 @@ the standard library's.
 
 ```
 cd verification/verus
-VERUS_DIR=/home/ubuntu/verus ./run_proof.sh                 # tier B (default)
-VERUS_DIR=/home/ubuntu/verus ./run_proof.sh tier-a          # tier A
-VERUS_DIR=/home/ubuntu/verus ./run_proof.sh shard-methods   # tier-A.5 (production-shape shadow)
-VERUS_DIR=/home/ubuntu/verus ./run_proof.sh liveness        # T13.5 reader liveness
+VERUS_DIR=/home/ubuntu/verus ./run_proof.sh                  # tier B (default)
+VERUS_DIR=/home/ubuntu/verus ./run_proof.sh tier-a           # tier A
+VERUS_DIR=/home/ubuntu/verus ./run_proof.sh shard-methods    # tier-A.5 (production-shape shadow)
+VERUS_DIR=/home/ubuntu/verus ./run_proof.sh shard-wrapper    # tier-A.7 (T13.4 Phase 1 wrapper)
+VERUS_DIR=/home/ubuntu/verus ./run_proof.sh reader-liveness-v2  # T13.5 axiom-free reader liveness
 ```
 
-Or run all four under CI; see `.github/workflows/verus.yml` for the
-complete gate (T13.6).
+Or run all under CI; see `.github/workflows/verus.yml` for the
+complete gate (T13.6). The CI gate currently runs tier-b, tier-a,
+shard-methods, and reader-liveness-v2; `shard-wrapper` is added
+in this commit and should be wired into the CI workflow alongside
+the others.
+
+Successful output (shard-wrapper, T13.4 Phase 1):
+
+```
+Using verus: /home/ubuntu/verus/source/target-verus/release/verus
+Verifying: shard_wrapper.rs
+
+verification results:: 31 verified, 0 errors
+```
 
 Successful output (tier B):
 
