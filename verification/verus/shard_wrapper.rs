@@ -1034,6 +1034,140 @@ pub proof fn lemma_inserted_visible_to_contains(
 }
 
 // ============================================================================
+// BOUNDED SEQLOCK RETRY LOOP (production lines 559-651 outer loop).
+// ============================================================================
+//
+// Production `FingerprintShard::contains` wraps the inner probe loop in an
+// outer seqlock retry loop:
+//
+//   loop {
+//       let seq_before = self.seq.load(Acquire);
+//       if seq_before % 2 == 1 { /* resize-mode dispatch */ continue; }
+//       /* normal-path probe loop */
+//       let seq_after = self.seq.load(Acquire);
+//       if seq_before == seq_after { return false; }
+//       // resize happened — retry
+//   }
+//
+// The unbounded form is research-grade (see tier A's `lemma_reader_terminates`
+// for the spec-level discharge using a writer-resize-count decrement).
+// The BOUNDED form takes a `max_retries: u64` parameter and proves
+// termination via `decreases max_retries - retries`. This matches the
+// production `MAX_RETRIES_BEFORE_PANIC = 1_000_000` ceiling at lines
+// 60-62 (every iteration counts toward this limit; production panics
+// past it).
+
+/// Outcome of a bounded seqlock retry loop.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SeqlockRetryOutcome {
+    /// The probe completed in a stable epoch (seq_before == seq_after, even).
+    /// The inner result is the probe's outcome.
+    Stable(BoundedLookup),
+    /// Hit `max_retries` without a stable epoch — production would panic.
+    /// We model this as a separate outcome so the function is total.
+    Exhausted,
+}
+
+/// **Verified bounded seqlock retry loop.** Production lines 559-651
+/// outer loop, lifted into Verus with a bounded retry count.
+///
+/// In production, `self.seq` is an `AtomicU64` toggled by writers
+/// (begin_resize bumps to odd, finalize_resize bumps to even). The
+/// reader retries the probe loop while seq disagrees pre/post.
+///
+/// PROOF STRATEGY: a bounded `while retries < max_retries` loop with
+/// `decreases max_retries - retries` for termination. The seq comparison
+/// is performed at the wrapper level via a `seq_atomic: PAtomicU64`
+/// field that mirrors production's `seq: AtomicU64`.
+///
+/// CONTRACT: if the function returns `Stable(_)`, the abstract probe
+/// outcome is sound — the caller can use it directly. If it returns
+/// `Exhausted`, the bounded retry budget was exceeded; the caller should
+/// either retry with a fresh budget or raise the limit (matching
+/// production's `MAX_RETRIES_BEFORE_PANIC` behavior).
+///
+/// This wrapper does NOT model concurrent writers — the seq is read but
+/// never modified by this function, so the `seq_before == seq_after`
+/// check trivially holds in any single-thread execution. The full
+/// concurrent-writer correctness is at tier A's spec level via
+/// `lemma_reader_terminates` (which assumes a finite resize budget).
+pub fn bounded_seqlock_retry_contains(
+    shard: &VerifiedFingerprintShard,
+    seq_atomic: &PAtomicU64,
+    Tracked(seq_perm): Tracked<&PermissionU64>,
+    Tracked(perms): Tracked<&Map<int, PermissionU64>>,
+    fp: u64,
+    max_retries: u64,
+) -> (result: SeqlockRetryOutcome)
+    requires
+        perms_wf(*shard, *perms),
+        fp != empty_slot(),
+        shard.capacity <= u64::MAX as usize,
+        seq_perm.view().patomic == seq_atomic.id(),
+        max_retries >= 1,
+    ensures
+        // If we returned Stable, the inner probe's invariant ensures clauses
+        // are propagated.
+        match result {
+            SeqlockRetryOutcome::Stable(BoundedLookup::Found) =>
+                exists|j: int| 0 <= j < shard.capacity
+                    && #[trigger] shard_view(*shard, *perms)[j] == fp,
+            SeqlockRetryOutcome::Stable(BoundedLookup::Absent) =>
+                exists|i: nat| #![auto]
+                    i < shard.capacity as nat
+                    && shard_view(*shard, *perms)
+                            [probe_index(fp, i, shard.capacity as nat)]
+                        == empty_slot(),
+            _ => true,
+        },
+{
+    let mut retries: u64 = 0;
+    while retries < max_retries
+        invariant
+            perms_wf(*shard, *perms),
+            fp != empty_slot(),
+            shard.capacity <= u64::MAX as usize,
+            seq_perm.view().patomic == seq_atomic.id(),
+            retries <= max_retries,
+        decreases max_retries - retries,
+    {
+        let seq_before = seq_atomic.load(Tracked(seq_perm));
+
+        // Resize-mode skip: production has a complex resize-mode dispatch
+        // here (lines 561-622). For wrapper-level safety we model only
+        // the normal path; resize-mode is covered separately by
+        // `bounded_contains_during_resize`. If seq is odd (resize in
+        // progress) we count this as a retry.
+        if seq_before % 2 == 1 {
+            retries = retries + 1;
+            continue;
+        }
+
+        // Normal-path probe (production lines 625-643).
+        let probe_result = bounded_contains_loop(shard, fp, Tracked(perms));
+
+        // Re-read seq to check for a concurrent resize (production lines
+        // 645-650). In the wrapper's single-thread model, seq cannot
+        // change between the two loads, so seq_before == seq_after
+        // always holds. In production, a concurrent writer could bump
+        // seq; the production `if seq_before == seq_after` test catches
+        // this and triggers a retry.
+        let seq_after = seq_atomic.load(Tracked(seq_perm));
+
+        if seq_before == seq_after {
+            return SeqlockRetryOutcome::Stable(probe_result);
+        }
+        // seq changed under us — retry. Wrapper-level: this branch
+        // is unreachable (single-thread, seq immutable here), so we
+        // bump retries and continue. In production, this is the case
+        // where a concurrent writer raced and we need to redo the
+        // probe under the new epoch.
+        retries = retries + 1;
+    }
+    SeqlockRetryOutcome::Exhausted
+}
+
+// ============================================================================
 // COVERAGE TABLE — what's now machine-checked beyond `shard_methods.rs`.
 // ============================================================================
 //
@@ -1043,6 +1177,7 @@ pub proof fn lemma_inserted_visible_to_contains(
 // |------------------------------|-----------------------------------|-----------------------------|
 // | line 626-643: contains body  | bounded_contains_loop             | Full bounded probe loop     |
 // | line 789-828: contains_or_insert body | bounded_contains_or_insert_loop | Full bounded CAS-or-skip loop |
+// | line 559-651: contains outer seqlock retry | bounded_seqlock_retry_contains | Bounded outer retry loop with seq parity dispatch |
 //
 // New bridge lemmas (wrapper → tier-A spec):
 //
@@ -1060,9 +1195,12 @@ pub proof fn lemma_inserted_visible_to_contains(
 //   - Production `FingerprintShard` itself is unchanged. The wrapper is
 //     additive; production `cargo build` and `cargo test` are unaffected.
 //
-//   - The seqlock retry loop (production lines 559-649 outer loop) is
-//     not lifted into the wrapper. Tier A's `lemma_reader_terminates`
-//     covers it at the spec level.
+//   - The seqlock retry loop's UNBOUNDED-fairness termination
+//     (production lines 559-649 outer loop without a max_retries
+//     ceiling) requires a writer-resize-count ghost decrement — see
+//     tier A's `lemma_reader_terminates` for the spec-level discharge.
+//     This wrapper ships the bounded form (`bounded_seqlock_retry_
+//     contains`); the unbounded form remains research-grade.
 //
 //   - Resize-mode interleavings (production lines 561-622, 681-778) are
 //     covered by tier-A's spec-level `step_insert_during_resize_a` /

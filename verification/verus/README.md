@@ -242,9 +242,9 @@ bounded-form fallback; it documents the temporal-logic shape and
 its axiom-discharge plan, both of which remain useful reference
 material for the eventual `state_machines!` port.
 
-### Tier-A.7 (T13.4 Phase 1): production-shape verified wrapper
+### Tier-A.7 (T13.4 Phase 1 + 1.5): production-shape verified wrapper
 
-`shard_wrapper.rs` ships **31 verified items**, ~1s wall (`./run_proof.sh
+`shard_wrapper.rs` ships **34 verified items**, ~1s wall (`./run_proof.sh
 shard-wrapper`). It is the production-shape **wrapper struct**
 `VerifiedFingerprintShard` that mirrors the production `FingerprintShard`
 field layout (slot array + capacity) and ships:
@@ -282,6 +282,7 @@ field layout (slot array + capacity) and ships:
 | line 187-256: `FingerprintShard::new` | `make_empty_shard` |
 | line 805-823: CAS at one slot | `cas_insert_or_observe` (re-stated from `shard_methods.rs`) |
 | line 634: probe at one slot | `probe_slot_for_contains` (re-stated from `shard_methods.rs`) |
+| line 559-651: `contains` outer seqlock retry loop | `bounded_seqlock_retry_contains` (Phase 1.5 add) |
 
 What this tier gives beyond tier-A.5 (`shard_methods.rs`):
 
@@ -322,12 +323,69 @@ What this file does NOT do (Phase 2 / Phase 3):
     reformulation (5-7 agent-weeks).
   - **Does not switch call sites in `runtime.rs`.** Phase 3 of the
     brief; out of scope until Phase 2 lands.
-  - **Does not lift the seqlock retry loop** into a verified exec
-    function. Tier A's `lemma_reader_terminates` covers it at the
-    spec level.
+  - **Does not lift the seqlock retry loop's UNBOUNDED-fairness
+    termination** into a verified exec function — tier A's
+    `lemma_reader_terminates` covers it at the spec level. The Phase
+    1.5 add `bounded_seqlock_retry_contains` ships the BOUNDED form
+    (`max_retries: u64` parameter, `decreases max_retries - retries`),
+    matching production's `MAX_RETRIES_BEFORE_PANIC = 1_000_000`
+    ceiling.
   - **Does not model the `count: AtomicU64` / `state: AtomicU8`
     bookkeeping fields** (production lines 134, 107). Tier A and the
     shadow explicitly omit them; this wrapper inherits that.
+
+#### Phase 1.5 add (2026-05): bounded seqlock retry loop
+
+`bounded_seqlock_retry_contains` lifts the production OUTER seqlock
+retry loop (lines 559-651) into a verified exec function. Bounded
+form via `max_retries: u64` parameter and `decreases max_retries -
+retries` termination clause. Models production's `MAX_RETRIES_BEFORE_
+PANIC` ceiling literally; the unbounded-fairness form remains
+research-grade (would require a writer-resize-count ghost decrement
+threaded through `finalize_resize`). Outcome enum
+`SeqlockRetryOutcome::{Stable(BoundedLookup), Exhausted}` makes the
+retry-budget exhaustion case total. +3 verified items (was 31, now
+34).
+
+### Tier-A.8 (T13.5 polish): `state_machines!` port of reader liveness
+
+`reader_liveness_state_machine.rs` ships **15 verified items**, ~1s
+wall (`./run_proof.sh sm` or `./run_proof.sh reader-liveness-sm`).
+LTL-native restatement of v2's headline `theorem_no_starvation`
+using Verus's `state_machine!` macro.
+
+**Status: optional polish.** The headline `theorem_no_starvation`
+already ships axiom-free in `reader_liveness_v2.rs` over a
+hand-rolled `Seq<ShardSeqState>` model. This file is the LTL-native
+equivalent: defines a `state_machine!(ShardSeq)` with three
+transitions (`begin_resize`, `finalize_resize`, `stutter`),
+two `#[invariant]` predicates, four `#[inductive]` proofs, plus a
+**refinement bridge** to `reader_liveness_v2.rs` showing every SM
+transition refines a v2 `step_relation_v2` step. The headline
+`theorem_no_starvation_sm` is restated and proved (constructively
+via the same 2-step stutter / 3-step finalize-stutter witnesses as
+v2). Zero axioms. Run via `./run_proof.sh sm`.
+
+| Property | Lemma | Status |
+|---|---|---|
+| **State-machine init refinement** | `theorem_init_refines` | Proved. |
+| **Per-transition refinement** | `lemma_begin_resize_refines`, `lemma_finalize_resize_refines`, `lemma_stutter_refines` | Proved. |
+| **Step refinement** | `theorem_step_refines` | Proved (every SM step refines a v2 step). |
+| **Prefix refinement** | `theorem_prefix_refines` | Proved (well-formed SM prefix lifts to v2 prefix). |
+| **Reader-success refinement** | `lemma_reader_success_refines` | Proved. |
+| **Constructive witnesses** | `lemma_reader_can_observe_stutter_sm`, `lemma_extension_composes_sm` | Proved (constructive 2-step / 3-step). |
+| **MAIN THEOREM (SM-level)** | `theorem_reader_eventually_succeeds_sm` | Proved (no axioms). |
+| **No-starvation corollary (SM-level)** | `theorem_no_starvation_sm` | Proved (no axioms). |
+
+What this file does NOT do:
+- Does NOT replace `reader_liveness_v2.rs`. v2 is the canonical
+  0-axiom proof; this is an LTL-native reformulation that future
+  state-machines!-native consumers can build on.
+- Does NOT introduce new soundness — same headline, different
+  framework.
+- Does NOT integrate with the production fingerprint shard. Like all
+  other Verus proof files in this directory, this is verified by
+  `verus`, not compiled by `rustc`.
 
 ### Genuinely deferred to v1.2.0+
 
@@ -341,9 +399,13 @@ What this file does NOT do (Phase 2 / Phase 3):
   capability gaps in `T13.2-T13.4-design.md`. The shadow methods in
   `shard_methods.rs` and the production-shape wrapper in
   `shard_wrapper.rs` are the working blueprints for this rewrite.
-- **Discharge of the three reader-liveness axioms.** See the
-  discharge plans inside `reader_liveness.rs`. Estimated 4-6 agent-
-  days, OR ~5-7 days to port the file to `state_machines!`.
+- **Discharge of the three reader-liveness axioms.** Discharged
+  constructively in `reader_liveness_v2.rs` (17 verified, 0 axioms,
+  `./run_proof.sh reader-liveness-v2`). The `state_machines!` port
+  ships in `reader_liveness_state_machine.rs` (15 verified, 0
+  axioms, `./run_proof.sh sm`). Both ship the headline
+  `theorem_no_starvation`. The original `reader_liveness.rs` is
+  preserved as the bounded-form fallback.
 
 ## Honest verdict on Verus for tlaplusplus
 
@@ -418,8 +480,9 @@ cd verification/verus
 VERUS_DIR=/home/ubuntu/verus ./run_proof.sh                  # tier B (default)
 VERUS_DIR=/home/ubuntu/verus ./run_proof.sh tier-a           # tier A
 VERUS_DIR=/home/ubuntu/verus ./run_proof.sh shard-methods    # tier-A.5 (production-shape shadow)
-VERUS_DIR=/home/ubuntu/verus ./run_proof.sh shard-wrapper    # tier-A.7 (T13.4 Phase 1 wrapper)
+VERUS_DIR=/home/ubuntu/verus ./run_proof.sh shard-wrapper    # tier-A.7 (T13.4 Phase 1 + 1.5 wrapper)
 VERUS_DIR=/home/ubuntu/verus ./run_proof.sh reader-liveness-v2  # T13.5 axiom-free reader liveness
+VERUS_DIR=/home/ubuntu/verus ./run_proof.sh sm               # T13.5 state_machines! port
 ```
 
 Or run all under CI; see `.github/workflows/verus.yml` for the
