@@ -286,8 +286,127 @@ pub struct RunStats {
     pub fingerprints: FingerprintStats,
 }
 
+mod dfs_cluster_bridge;
 mod dfs_pool;
 mod dfs_worker;
+
+/// Public test entrypoint: run a multi-node cluster DFS pool and
+/// return the merged `RunOutcome`. Wraps the same `dfs_pool::run_dfs_pool`
+/// the runtime uses, but lets integration tests inject a `Transport`
+/// per node without going through `run_model` (which would require
+/// real cluster orchestration). Stage 5 Layer B.
+pub mod dfs_cluster_test_api {
+    use super::dfs_pool::{DfsPoolClusterCtx, DfsPoolCtx, run_dfs_pool};
+    use super::stats::AtomicRunStats;
+    use super::Violation;
+    use crate::distributed::transport::Transport;
+    use crate::model::Model;
+    use crate::storage::page_aligned_color_map::PageAlignedColorMap;
+    use crate::storage::unified_fingerprint_store::{
+        UnifiedFingerprintConfig, UnifiedFingerprintStore,
+    };
+    use crossbeam_channel::{Receiver, Sender, bounded};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+    /// One node's outcome: distinct count + any violation.
+    pub struct ClusterNodeOutcome<S> {
+        pub states_distinct: u64,
+        pub violation: Option<Violation<S>>,
+    }
+
+    /// Run a single node of a multi-node cluster DFS pool. The caller
+    /// is responsible for arranging that the same `(num_nodes,
+    /// workers_per_node)` partition shape is used by every node, and
+    /// that all nodes' `Transport` peers can reach each other.
+    ///
+    /// Returns when the cluster bridge declares global termination (or
+    /// `stop` flips). The shared fingerprint store and color map are
+    /// PER-NODE — Layer B does NOT run a shared fingerprint store
+    /// across nodes; the cluster partitioning guarantees no two nodes
+    /// own the same fingerprint, so per-node stores are sufficient and
+    /// avoid a network round-trip on every dedup.
+    pub fn run_one_cluster_node<M: Model>(
+        model: Arc<M>,
+        node_id: u32,
+        num_nodes: u32,
+        workers_per_node: usize,
+        transport: Arc<dyn Transport>,
+        tokio_handle: tokio::runtime::Handle,
+        stop: Arc<AtomicBool>,
+    ) -> ClusterNodeOutcome<M::State> {
+        let cfg = UnifiedFingerprintConfig {
+            use_bloom: false,
+            use_auto_switch: false,
+            shard_count: 4,
+            expected_items: 16_384,
+            false_positive_rate: 0.01,
+            shard_size_mb: 4,
+            num_numa_nodes: 1,
+            auto_switch_config: None,
+            backing_dir: None,
+        };
+        let fp_store =
+            Arc::new(UnifiedFingerprintStore::new(cfg, &[None, None, None, None]).unwrap());
+        let color_map = Arc::new(PageAlignedColorMap::new(16_384, 1, &[0]).unwrap());
+        let stats = Arc::new(AtomicRunStats::default());
+        let (vtx, vrx): (Sender<Violation<M::State>>, Receiver<Violation<M::State>>) =
+            bounded(64);
+        let (etx, _erx) = crossbeam_channel::unbounded();
+        let verdict_done = Arc::new(AtomicBool::new(false));
+
+        let cluster_ctx = DfsPoolClusterCtx {
+            transport,
+            node_id,
+            num_nodes,
+            tokio_handle,
+            _phantom: std::marker::PhantomData,
+        };
+
+        let ctx = DfsPoolCtx::<M> {
+            num_workers: workers_per_node,
+            model,
+            fp_store,
+            color_map,
+            stats: Arc::clone(&stats),
+            stop,
+            violation_tx: vtx,
+            violation_count: Arc::new(AtomicUsize::new(0)),
+            max_violations: 1,
+            error_tx: etx,
+            stop_on_violation: false,
+            parent_map: None,
+            state_map: None,
+            trace_count: Arc::new(AtomicU64::new(0)),
+            max_trace_states: 0,
+            dfs_inband_verdict_done: verdict_done,
+            cluster: Some(cluster_ctx),
+        };
+
+        run_dfs_pool(ctx);
+
+        let (_g, _p, distinct, _d, _e, _c) = stats.snapshot();
+        let mut violations: Vec<Violation<M::State>> = Vec::new();
+        while let Ok(v) = vrx.try_recv() {
+            violations.push(v);
+        }
+        ClusterNodeOutcome {
+            states_distinct: distinct,
+            violation: violations.into_iter().next(),
+        }
+    }
+
+    /// Convenience: also expose the in-process partition function so
+    /// the test harness can verify partition assignments directly.
+    pub fn partition_for_fp_cluster(
+        fp: u64,
+        num_nodes: u32,
+        workers_per_node: usize,
+    ) -> (u32, usize) {
+        super::dfs_cluster_bridge::partition_for_fp_cluster(fp, num_nodes, workers_per_node)
+    }
+
+}
 mod distributed;
 mod init_producer;
 mod liveness;
@@ -1262,6 +1381,13 @@ where
                 trace_count: Arc::clone(&trace_state_count),
                 max_trace_states,
                 dfs_inband_verdict_done: Arc::clone(&dfs_inband_verdict_done),
+                // Layer B is not wired into `run_model` itself for v1.2.6
+                // — the multi-node DFS pool is exercised end-to-end via
+                // the `tests/dfs_cluster_layer_b.rs` rig that constructs
+                // the pool directly with a `DfsPoolClusterCtx` in hand.
+                // Keeping the runtime entrypoint single-node preserves
+                // gates 1-9 and avoids a flag-day for the cluster CLI.
+                cluster: None,
             };
 
             eprintln!(

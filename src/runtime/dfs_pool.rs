@@ -76,6 +76,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
+use super::dfs_cluster_bridge::ClusterBridge;
 use super::dfs_worker::{
     FpStoreExt, LocalAdjacency, compute_labeled_successors, emit_safety_violation,
     run_inband_fairness_check,
@@ -98,21 +99,27 @@ pub(super) fn partition_for_fp(fp: u64, num_workers: usize) -> usize {
 
 /// Cross-partition explore message. Sent from the partition that
 /// generated the successor to the partition that owns the successor.
-struct ExploreMsg<S> {
-    state: S,
-    fp: u64,
+///
+/// Layer B note: this is the in-process counterpart of the
+/// `Message::PartitionEdge` wire variant. The cluster bridge
+/// (`dfs_cluster_bridge`) decodes incoming `PartitionEdge` payloads
+/// back into this exact struct before pushing onto a local worker's
+/// inbox — keeping the local-vs-remote message handling unified.
+pub(super) struct ExploreMsg<S> {
+    pub(super) state: S,
+    pub(super) fp: u64,
     /// Predecessor fp + action label, recorded by the *receiving* worker
     /// in its LocalAdjacency so the post-exploration merge sees a
     /// complete edge list. We could record it on the sender side too,
     /// but recording on the receiver gives a cleaner "every triple is
     /// recorded by the worker that owns the destination" invariant —
     /// useful for debugging and for any future per-partition reductions.
-    from_fp: u64,
-    action: String,
+    pub(super) from_fp: u64,
+    pub(super) action: String,
     /// Set true if the source predecessor caller has already filtered out
     /// constraint-failing edges (it never has — but we keep the field so
     /// the wire format matches the in-process logic).
-    passes_constraints: bool,
+    pub(super) passes_constraints: bool,
 }
 
 /// Per-worker pool context. Built once by [`run_dfs_pool`] and handed
@@ -147,6 +154,15 @@ struct PoolWorker<M: Model> {
     /// Per-worker idle flags, indexed by worker id.
     idle_flags: Arc<Vec<AtomicBool>>,
     labeled_supported: bool,
+    /// Optional cluster bridge — `Some` in multi-node mode, `None` in
+    /// single-node Layer A mode. When present, successors whose home
+    /// node != self.node_id are dispatched via the bridge instead of
+    /// the in-process `outbox_tx`.
+    cluster: Option<Arc<ClusterBridge<M::State>>>,
+    /// This node's id in the cluster (or 0 in single-node mode).
+    self_node: u32,
+    /// Total number of cluster nodes (or 1 in single-node mode).
+    num_nodes: u32,
 }
 
 /// Per-worker output collected on join. The pool merges these to feed
@@ -172,7 +188,8 @@ struct PoolFrame<S> {
 }
 
 /// Public bundle that runs the multi-worker pool. Mirrors the shape of
-/// `dfs_worker::DfsWorkerCtx` plus the worker count.
+/// `dfs_worker::DfsWorkerCtx` plus the worker count and (Layer B) the
+/// optional cluster bridge.
 pub(super) struct DfsPoolCtx<M: Model> {
     pub(super) num_workers: usize,
     pub(super) model: Arc<M>,
@@ -190,6 +207,26 @@ pub(super) struct DfsPoolCtx<M: Model> {
     pub(super) trace_count: Arc<AtomicU64>,
     pub(super) max_trace_states: u64,
     pub(super) dfs_inband_verdict_done: Arc<AtomicBool>,
+    /// Layer B cluster setup. When `Some`, the pool's workers route
+    /// remote-partition successors via the bridge's transport instead
+    /// of the in-process channel. When `None` (the v1.2.5 default),
+    /// behavior is identical to single-node Layer A.
+    pub(super) cluster: Option<DfsPoolClusterCtx<M::State>>,
+}
+
+/// Layer B cluster wiring passed in by the runtime when the DFS pool
+/// is part of a multi-node cluster run. The pool itself constructs the
+/// `ClusterBridge` once `inbox_tx` handles are available.
+pub(super) struct DfsPoolClusterCtx<S>
+where
+    S: Clone + Send + Sync + 'static + serde::Serialize + serde::de::DeserializeOwned,
+{
+    pub(super) transport: Arc<dyn crate::distributed::transport::Transport>,
+    pub(super) node_id: u32,
+    pub(super) num_nodes: u32,
+    pub(super) tokio_handle: tokio::runtime::Handle,
+    /// Phantom for the type parameter.
+    pub(super) _phantom: std::marker::PhantomData<fn() -> S>,
 }
 
 /// Run the multi-worker DFS pool to completion. This is the Stage 5
@@ -215,7 +252,13 @@ pub(super) fn run_dfs_pool<M: Model>(ctx: DfsPoolCtx<M>) {
         trace_count,
         max_trace_states,
         dfs_inband_verdict_done,
+        cluster,
     } = ctx;
+
+    let (self_node, num_nodes) = match cluster.as_ref() {
+        Some(cc) => (cc.node_id, cc.num_nodes),
+        None => (0u32, 1u32),
+    };
 
     let started_at = Instant::now();
 
@@ -261,15 +304,60 @@ pub(super) fn run_dfs_pool<M: Model>(ctx: DfsPoolCtx<M>) {
     // color CAS happens inside the worker, mirroring the single-worker
     // path's seed loop. We bypass the inflight counter for seeds — they
     // are the conceptual "external input" that the pool starts from.
+    //
+    // Layer B note: in cluster mode every node enumerates the same
+    // initial states (model.initial_states() is deterministic), but
+    // each node only seeds the ones whose `(node_id, worker_id)` home
+    // matches the local node — peer nodes will seed the remainder.
+    // This guarantees no duplicate seeding without requiring a network
+    // round-trip.
     let mut seeds_per_worker: Vec<Vec<M::State>> = (0..num_workers)
         .map(|_| Vec::new())
         .collect();
     for s in initial_states {
         let canon = model.canonicalize(s);
         let fp = model.fingerprint(&canon);
-        let owner = partition_for_fp(fp, num_workers);
-        seeds_per_worker[owner].push(canon);
+        let owner_local = if num_nodes > 1 {
+            let (owner_node, owner_worker) = super::dfs_cluster_bridge::partition_for_fp_cluster(
+                fp,
+                num_nodes,
+                num_workers,
+            );
+            if owner_node != self_node {
+                continue; // peer node will seed this initial state
+            }
+            owner_worker
+        } else {
+            partition_for_fp(fp, num_workers)
+        };
+        seeds_per_worker[owner_local].push(canon);
     }
+
+    // ---- Build cluster bridge (Layer B only) ---------------------------
+    let cluster_bridge: Option<Arc<ClusterBridge<M::State>>> = match cluster {
+        Some(cc) => {
+            // The bridge needs sender handles to push received messages
+            // onto each local worker's inbox. We use clones of the
+            // existing per-worker `outbox_txs` (which are already the
+            // canonical per-worker inboxes — `outbox_tx[i]` is the
+            // sender side of `inbox_rx[i]`).
+            let bridge_inboxes: Vec<Sender<ExploreMsg<M::State>>> = outbox_txs.clone();
+            let bridge = ClusterBridge::<M::State>::new(
+                cc.transport,
+                cc.node_id,
+                cc.num_nodes,
+                num_workers,
+                bridge_inboxes,
+                Arc::clone(&stop),
+                cc.tokio_handle,
+                Arc::clone(&inflight),
+            );
+            // Spawn the recv + broadcast tasks on the tokio runtime.
+            Arc::clone(&bridge).start();
+            Some(bridge)
+        }
+        None => None,
+    };
 
     // ---- Spawn workers -------------------------------------------------
     let mut handles: Vec<std::thread::JoinHandle<WorkerOutput<M::State>>> =
@@ -300,13 +388,18 @@ pub(super) fn run_dfs_pool<M: Model>(ctx: DfsPoolCtx<M>) {
             inflight: Arc::clone(&inflight),
             idle_flags: Arc::clone(&idle_flags),
             labeled_supported,
+            cluster: cluster_bridge.clone(),
+            self_node,
+            num_nodes,
         };
         handles.push(std::thread::spawn(move || run_one_pool_worker(worker, seeds)));
     }
 
     // Drop the runtime-side outbox handles so the only remaining senders
-    // are the per-worker clones inside `PoolWorker::outbox_tx`. When all
-    // workers exit and drop their clones the channels close cleanly.
+    // are the per-worker clones inside `PoolWorker::outbox_tx` AND the
+    // cluster bridge's clones. When all workers exit and drop their
+    // clones — and the bridge releases its set on shutdown — the
+    // channels close cleanly.
     drop(outbox_txs);
 
     // ---- Join + merge --------------------------------------------------
@@ -426,6 +519,9 @@ fn run_one_pool_worker<M: Model>(
         inflight,
         idle_flags,
         labeled_supported,
+        cluster,
+        self_node,
+        num_nodes,
     } = w;
 
     let mut local_fp_cache: HashSet<u64> = HashSet::with_capacity(8192);
@@ -566,6 +662,9 @@ fn run_one_pool_worker<M: Model>(
             if self_was_idle {
                 idle_flags[id].store(false, Ordering::Release);
                 self_was_idle = false;
+                if let Some(b) = cluster.as_ref() {
+                    b.set_self_idle(false);
+                }
             }
             advance_one_step::<M>(
                 &model,
@@ -573,6 +672,9 @@ fn run_one_pool_worker<M: Model>(
                 &color_map,
                 id,
                 num_workers,
+                self_node,
+                num_nodes,
+                cluster.as_ref(),
                 &outbox_tx,
                 &inflight,
                 &idle_flags,
@@ -602,24 +704,54 @@ fn run_one_pool_worker<M: Model>(
         if !self_was_idle {
             idle_flags[id].store(true, Ordering::Release);
             self_was_idle = true;
+            // In cluster mode the bridge needs to know when the local
+            // pool's idle predicate flips so its termination consensus
+            // tokens are accurate. We propagate idle when ALL local
+            // workers are idle to avoid thrashing the bridge counter.
+            if let Some(b) = cluster.as_ref() {
+                if all_idle(&idle_flags) && inbox_rx.is_empty() {
+                    b.set_self_idle(true);
+                }
+            }
         }
 
         // Termination check: all idle + inflight == 0 + my inbox empty.
         // We re-check inflight and inbox after marking idle to close the
         // race where a peer increments inflight then sends to us between
         // our two checks.
-        if inflight.load(Ordering::Acquire) == 0
+        let local_quiescent = inflight.load(Ordering::Acquire) == 0
             && inbox_rx.is_empty()
-            && all_idle(&idle_flags)
-        {
+            && all_idle(&idle_flags);
+
+        if local_quiescent {
             // Double-confirm: re-read inflight after seeing all_idle.
             // Mattern-style 2-round: if we still see 0 and no peer is
             // working we are done.
-            if inflight.load(Ordering::Acquire) == 0
+            let still_quiescent = inflight.load(Ordering::Acquire) == 0
                 && inbox_rx.is_empty()
-                && all_idle(&idle_flags)
-            {
-                break;
+                && all_idle(&idle_flags);
+            if still_quiescent {
+                match cluster.as_ref() {
+                    None => break,
+                    Some(b) => {
+                        b.set_self_idle(true);
+                        if b.is_globally_terminated() {
+                            if std::env::var("TLAPP_VERBOSE").is_ok() {
+                                eprintln!(
+                                    "[dfs-pool n={} w={}] cluster terminated; exiting",
+                                    self_node, id
+                                );
+                            }
+                            break;
+                        }
+                        // Don't break yet — the bridge needs at least
+                        // one round of cluster-quiescent broadcasts to
+                        // promote local-quiescent to globally-terminated.
+                        // Fall through to the recv_timeout below to
+                        // park briefly, giving the bridge time to flip
+                        // the global flag.
+                    }
+                }
             }
         }
 
@@ -629,6 +761,9 @@ fn run_one_pool_worker<M: Model>(
             Ok(msg) => {
                 idle_flags[id].store(false, Ordering::Release);
                 self_was_idle = false;
+                if let Some(b) = cluster.as_ref() {
+                    b.set_self_idle(false);
+                }
                 handle_explore_msg::<M>(
                     msg,
                     &model,
@@ -868,7 +1003,8 @@ fn handle_explore_msg<M: Model>(
 
 /// Advance the top frame by visiting its next successor (or post-order
 /// pop if exhausted). Mirrors `dfs_worker::run_blue_dfs`'s body but
-/// routes successors via `partition_for_fp`.
+/// routes successors via `partition_for_fp` (single-node Layer A) or
+/// the cluster bridge (multi-node Layer B).
 #[allow(clippy::too_many_arguments)]
 fn advance_one_step<M: Model>(
     model: &Arc<M>,
@@ -876,6 +1012,9 @@ fn advance_one_step<M: Model>(
     color_map: &Arc<PageAlignedColorMap>,
     self_id: usize,
     num_workers: usize,
+    self_node: u32,
+    num_nodes: u32,
+    cluster: Option<&Arc<ClusterBridge<M::State>>>,
     outbox_tx: &[Sender<ExploreMsg<M::State>>],
     inflight: &Arc<AtomicI64>,
     _idle_flags: &Arc<Vec<AtomicBool>>,
@@ -903,6 +1042,10 @@ fn advance_one_step<M: Model>(
         ShouldStop,
     }
 
+    // Capture this here, before the `last_mut()` borrow, so the
+    // bridge send below doesn't need a fresh `&blue_stack` while a
+    // mutable borrow is already live.
+    let stack_depth = blue_stack.len() as u32;
     let outcome = {
         let top = match blue_stack.last_mut() {
             Some(t) => t,
@@ -922,8 +1065,46 @@ fn advance_one_step<M: Model>(
             // Cross-partition routing: if the successor's home is not us,
             // ship it to the owner. The owner records the edge in its
             // own LocalAdjacency, so we deliberately do NOT record here.
-            let owner = partition_for_fp(next_fp, num_workers);
-            if owner != self_id {
+            //
+            // In single-node mode (`num_nodes == 1`) the owner lookup
+            // returns `(0, worker_id)` and routing is purely in-process.
+            // In Layer B cluster mode, an owner on another node is
+            // dispatched through the bridge instead of `outbox_tx`.
+            let (owner_node, owner_worker) = if num_nodes > 1 {
+                super::dfs_cluster_bridge::partition_for_fp_cluster(
+                    next_fp, num_nodes, num_workers,
+                )
+            } else {
+                (self_node, partition_for_fp(next_fp, num_workers))
+            };
+
+            if owner_node != self_node {
+                // Cross-NODE successor — bridge dispatch.
+                let bridge = cluster.expect("num_nodes>1 implies cluster bridge is set");
+                if let Err(e) = bridge.send_remote(
+                    owner_node,
+                    owner_worker,
+                    next_state.clone(),
+                    next_fp,
+                    top_fp,
+                    action_name.clone(),
+                    passes_constraints,
+                    stack_depth,
+                ) {
+                    eprintln!(
+                        "[dfs-pool n={} w={}] cross-node send failed: {}; \
+                         falling back to local routing",
+                        self_node, self_id, e
+                    );
+                    // Best-effort fallback: record the edge locally so
+                    // the verdict isn't silently dropped. The peer is
+                    // unreachable; the cluster will eventually time out.
+                    adj.record(top_fp, next_fp, action_name);
+                }
+                continue;
+            }
+
+            if owner_worker != self_id {
                 inflight.fetch_add(1, Ordering::AcqRel);
                 let msg = ExploreMsg {
                     state: next_state,
@@ -932,7 +1113,7 @@ fn advance_one_step<M: Model>(
                     action: action_name,
                     passes_constraints,
                 };
-                if let Err(send_err) = outbox_tx[owner].send(msg) {
+                if let Err(send_err) = outbox_tx[owner_worker].send(msg) {
                     // Channel closed unexpectedly — the receiver
                     // worker already exited. This shouldn't happen
                     // unless we're shutting down. Roll back inflight
@@ -1240,6 +1421,7 @@ mod tests {
             trace_count: Arc::new(AtomicU64::new(0)),
             max_trace_states: 0,
             dfs_inband_verdict_done: verdict_done,
+            cluster: None,
         };
         run_dfs_pool(ctx);
         let (_g, _p, distinct, _d, _e, _c) = stats.snapshot();
