@@ -67,6 +67,9 @@ echo
 # Pass `shard-wrapper` (or `wrapper`) to verify the production-shape
 # wrapper struct with bounded probe loops (`shard_wrapper.rs`, T13.4
 # Phase 1 — bounded outer probe loop with inductive invariant).
+# Pass `reader-liveness-sm` (or `sm`) to verify the state_machines!
+# port of the reader-liveness protocol (`reader_liveness_state_machine.rs`,
+# T13.5 polish — LTL-native restatement of v2's headline theorem).
 TIER="${1:-b}"
 case "$TIER" in
   a|tier-a|tiera|A) PROOF_FILE="seqlock_resize_tier_a.rs" ;;
@@ -75,7 +78,8 @@ case "$TIER" in
   liveness|tier-liveness|live|l) PROOF_FILE="reader_liveness.rs" ;;
   liveness-v2|tier-liveness-v2|live-v2|l2|reader-liveness-v2) PROOF_FILE="reader_liveness_v2.rs" ;;
   shard-wrapper|wrapper|shard_wrapper|w) PROOF_FILE="shard_wrapper.rs" ;;
-  *) echo "error: unknown tier '$TIER'; pass 'a', 'b', 'shadow', 'liveness', 'liveness-v2', or 'shard-wrapper'" >&2; exit 2 ;;
+  reader-liveness-sm|liveness-sm|live-sm|sm|reader_liveness_state_machine) PROOF_FILE="reader_liveness_state_machine.rs" ;;
+  *) echo "error: unknown tier '$TIER'; pass 'a', 'b', 'shadow', 'liveness', 'liveness-v2', 'shard-wrapper', or 'reader-liveness-sm'" >&2; exit 2 ;;
 esac
 
 echo "Verifying: $PROOF_FILE"
