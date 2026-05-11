@@ -1,5 +1,43 @@
 # Changelog
 
+## v1.2.2 (2026-05-10)
+
+Patch release continuing to push on the long-parked multi-week items.
+
+### T13.5 `state_machines!` port — SHIPPED axiom-free
+
+LTL-native restatement of `theorem_no_starvation` via Verus's
+`state_machine!` macro + refinement bridge to `reader_liveness_v2.rs`.
+New file `verification/verus/reader_liveness_state_machine.rs` (612
+LOC, 15 verified items). Zero axioms.
+
+### T13.4 wrapper extension
+
+Added `bounded_seqlock_retry_contains` to `shard_wrapper.rs` (+3
+verified items, was 31 now 34). T13.4 Phases 2+3 (production-code
+annotation) remain parked behind 3 documented `vstd` capability gaps.
+
+Verus totals: 115 → **133 verified items** (+18) across 6 proof files.
+
+### T10.2 phase 2 stage 3 partial
+
+Wires `PageAlignedColorMap` into the post-BFS oracle path behind the
+new `--liveness-streaming-exploration` flag (defaults OFF). Validates
+the data structure end-to-end; 3 new parity tests (Tarjan vs color-map).
+The actual hot-loop DFS lift (the headline Stage 3 deliverable) remains
+parked — same risk surface as the chunk-7 worker.rs refactor.
+
+### Validation
+
+| Gate | Result |
+|---|---|
+| `cargo test --release` | 1,205 pass / 0 fail / 8 ignored |
+| `cargo test --release --features failpoints` | 1,222 pass / 0 fail / 8 ignored |
+| `cargo test --release --features symbolic-init` | 1,227 pass / 0 fail / 8 ignored |
+| Verus proofs (6 files) | 133 verified items, 0 errors, 0 axioms |
+
+Drop-in for v1.2.0 / v1.2.1. No public-API or CLI changes.
+
 ## v1.2.1 (2026-05-10)
 
 Patch release closing out the v1.2.0 deferred-items list. 25 commits
