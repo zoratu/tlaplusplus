@@ -166,17 +166,20 @@ struct BlueFrame<S> {
 /// always heap-allocated unless empty), expect ~32-48 B per edge. For
 /// edge counts up to a few million this fits comfortably inside the
 /// memory budget the DFS path frees up by dropping the DashMap.
+///
+/// Stage 5: this type is shared between the single-worker DFS path
+/// (`run_dfs_worker`) and the multi-worker DFS pool (`dfs_pool`).
 #[derive(Default)]
-struct LocalAdjacency {
-    triples: Vec<(u64, u64, String)>,
+pub(super) struct LocalAdjacency {
+    pub(super) triples: Vec<(u64, u64, String)>,
 }
 
 impl LocalAdjacency {
-    fn record(&mut self, from_fp: u64, to_fp: u64, action: String) {
+    pub(super) fn record(&mut self, from_fp: u64, to_fp: u64, action: String) {
         self.triples.push((from_fp, to_fp, action));
     }
 
-    fn into_triples(self) -> Vec<(u64, u64, String)> {
+    pub(super) fn into_triples(self) -> Vec<(u64, u64, String)> {
         self.triples
     }
 }
@@ -610,7 +613,7 @@ fn run_blue_dfs<M: Model>(
 /// `labeled_transitions` DashMap shape (which `worker.rs` populates
 /// **before** the constraint filter, see lines ~495-506). Only the
 /// blue-DFS descent skips constraint-failing successors.
-fn compute_labeled_successors<M: Model>(
+pub(super) fn compute_labeled_successors<M: Model>(
     model: &Arc<M>,
     state: &M::State,
     labeled_supported: bool,
@@ -700,8 +703,11 @@ fn run_red_probe_inband(
 /// predicates as the post-processing path. Given the same triple input
 /// it produces identical verdicts. The in-band path therefore satisfies
 /// the gate-6 / gate-7 parity tests by construction.
+///
+/// Stage 5: also called by the multi-worker DFS pool after merging
+/// per-worker triple lists into one global triple list.
 #[allow(clippy::too_many_arguments)]
-fn run_inband_fairness_check<M: Model>(
+pub(super) fn run_inband_fairness_check<M: Model>(
     model: &Arc<M>,
     triples: Vec<(u64, u64, String)>,
     constraints: &[FairnessConstraint],
@@ -838,7 +844,7 @@ fn run_inband_fairness_check<M: Model>(
 /// Emit a safety violation through the violation channel and update the
 /// violation_count + stop atoms per the BFS worker's T11.5 ordering.
 #[allow(clippy::too_many_arguments)]
-fn emit_safety_violation<M: Model>(
+pub(super) fn emit_safety_violation<M: Model>(
     model: &Arc<M>,
     state: M::State,
     message: String,
@@ -884,7 +890,7 @@ fn emit_safety_violation<M: Model>(
     }
 }
 
-trait FpStoreExt {
+pub(super) trait FpStoreExt {
     fn contains_or_insert_unchecked(&self, fp: u64) -> Result<bool>;
 }
 

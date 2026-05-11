@@ -162,6 +162,19 @@ pub(crate) struct RuntimeArgs {
     /// comes purely from in-band cycle detection (the actual memory win).
     #[arg(long, default_value_t = false)]
     pub(crate) liveness_streaming_exploration: bool,
+
+    /// T10.2 stage 5 — DFS pool worker count (active only with
+    /// `--liveness-streaming-exploration`). `0` (default) auto-sizes the
+    /// pool to the BFS fleet's worker count. `1` keeps the stage-4
+    /// single-worker DFS. Anything > 1 enables the multi-worker DFS pool
+    /// with cross-partition routing.
+    ///
+    /// Clamped to the BFS fleet ceiling so it can't oversubscribe the
+    /// cgroup CPU quota. Ignored unless
+    /// `--liveness-streaming-exploration` is also set and the model has
+    /// fairness constraints.
+    #[arg(long, default_value_t = 0)]
+    pub(crate) dfs_workers: usize,
 }
 
 #[derive(Args, Clone, Debug)]
