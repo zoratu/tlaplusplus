@@ -102,6 +102,13 @@ pub(super) struct ShutdownContext<'a, M: Model> {
     // Step 13: liveness post-processing
     pub model: Arc<M>,
     pub labeled_transitions: Option<Arc<DashMap<u64, Vec<LabeledTransition<M::State>>>>>,
+    /// T10.2 stage 4 — when set to `true` by the DFS worker
+    /// (`runtime/dfs_worker.rs`), shutdown skips the
+    /// `liveness::run_post_processing` Tarjan pass because the DFS worker
+    /// has already produced the in-band fairness verdict and emitted any
+    /// resulting violation through `violation_tx`. When `false` (BFS
+    /// path), post-processing runs as before.
+    pub dfs_inband_verdict_done: Arc<AtomicBool>,
 }
 
 impl<'a, M: Model> ShutdownContext<'a, M> {
@@ -313,7 +320,22 @@ impl<'a, M: Model> ShutdownContext<'a, M> {
         };
 
         // ---- Step 13: liveness post-processing (T10) ----------------
-        if let Some(liveness_violation) = liveness::run_post_processing(
+        //
+        // T10.2 stage 4 gate: when the DFS exploration path was used
+        // (`--liveness-streaming-exploration` + fairness constraints +
+        // single-node), the DFS worker has already produced the in-band
+        // fairness verdict and emitted any violation through
+        // `violation_tx` (collected at step 12 above). Skip the Tarjan
+        // post-processing pass entirely — re-running it on the (None)
+        // labeled-transitions map would emit "no transitions recorded"
+        // and on a populated map would double-count.
+        let dfs_inband_done = self.dfs_inband_verdict_done.load(Ordering::Acquire);
+        if dfs_inband_done {
+            eprintln!(
+                "Liveness post-processing: skipped — DFS worker already produced \
+                 in-band fairness verdict (T10.2 stage 4)"
+            );
+        } else if let Some(liveness_violation) = liveness::run_post_processing(
             violation.is_some(),
             &self.model,
             self.labeled_transitions.as_ref(),
