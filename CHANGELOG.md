@@ -1,5 +1,58 @@
 # Changelog
 
+## v1.2.1 (2026-05-10)
+
+Patch release closing out the v1.2.0 deferred-items list. 25 commits
+on top of v1.2.0 — no new user-facing features, no behavioural change.
+Drop-in for v1.2.0.
+
+### v1.2.0 deferred items — all closed
+
+- **T204 distributed mock for the cluster handler** — `Transport`
+  trait + `MockTransport` (in-memory tokio mpsc channels);
+  `DistributedWorkStealer` switched to `Arc<dyn Transport>`. 10 new
+  tests exercise the inbound handler / bloom-and-termination /
+  steal-trigger paths without real TCP.
+- **`src/runtime.rs` extraction chunks 7 + 8** — both extracted.
+  Chunk 8 (13-step shutdown phase) → `src/runtime/shutdown.rs`
+  (`ShutdownContext` + `orchestrate`). Chunk 7 (worker spawn loop,
+  27-Arc capture) → `src/runtime/worker.rs` (`WorkerLocalState`).
+  `runtime.rs`: 2,451 → 1,644 LOC.
+- **`src/tla/eval.rs` split** — all 8 chunks (A–H) of the design doc
+  landed. 11,533-line monolith → 13 submodule files under
+  `src/tla/eval/`. External API surface unchanged.
+- **Compiler internal-helper restructuring** — depth-tracking
+  consolidation (148 + 26 → 4 + 1 sites). Plus 6 more iterations of
+  targeted tests (T207b–T207h, +149 tests). Compiler mutation kill
+  rate: 65.4% → **70.5%** across 11 iterations.
+
+### Older parked items partially landed
+
+- **T10.2 phase 2 stages 1+2 of 5** — strictly-additive foundation:
+  - Stage 1: `PageAlignedColorMap` (524 LOC, 7 tests) — 2-bit Color
+    enum, hugepage mmap, NUMA-shard placement, lock-free CAS.
+  - Stage 2: protocol variants (`PartitionEdge`, `RedDfsProbe`,
+    `RequestStateBlob`, etc.) + `Option<u64>` extensions on
+    `TerminationToken`.
+  - Stages 3–5 still parked (5-week effort estimate).
+- **T13.4 Phase 1** — production-shape verified wrapper at
+  `verification/verus/shard_wrapper.rs` (1,083 LOC, 31 verified
+  items). Bounded outer probe loop now verified — closes the gap
+  `shard_methods.rs` deferred. **115 total Verus items verified**
+  (was 84). Phases 2+3 parked behind documented `vstd` capability gaps.
+
+### Validation
+
+| Gate | Result |
+|---|---|
+| `cargo test --release` | 1,197 pass / 0 fail / 8 ignored |
+| `cargo test --release --features failpoints` | 1,219 pass / 0 fail / 8 ignored |
+| `cargo test --release --features symbolic-init` | 1,224 pass / 0 fail / 8 ignored |
+| `scripts/diff_tlc.sh` (vs TLC v1.7.4) | 13 / 13 |
+| Verus proofs (5 files) | 115 verified items, 0 errors |
+| Mutation testing — `eval.rs` (interpreter) | 100% kill rate |
+| Mutation testing — compiled_eval.rs + compiled_expr.rs | 70.5% kill rate |
+
 ## v1.2.0 (2026-05-07)
 
 Patch release driven by extensive fuzz + mutation testing. Six T20X
