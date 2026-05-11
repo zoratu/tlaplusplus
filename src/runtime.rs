@@ -132,30 +132,42 @@ pub struct EngineConfig {
     /// **Default `false`** — must not perturb the existing path until the
     /// in-exploration variant lands.
     pub liveness_streaming: bool,
-    /// T10.2 stage 3 — opt-in **page-aligned color-map** nested-DFS path.
+    /// T10.2 stage 3 — opt-in single-worker DFS exploration with in-line
+    /// page-aligned color-map coloring.
     ///
-    /// When `true` AND the model has fairness constraints, the post-BFS
-    /// liveness pipeline runs nested-DFS over the production
-    /// [`PageAlignedColorMap`](crate::storage::page_aligned_color_map) data
-    /// structure (2 bits per fingerprint, NUMA-shard-placed, lock-free CAS)
-    /// instead of the v1.1.0 oracle's `HashMap<u64, Color>`. The verdict is
-    /// cross-validated against the existing Tarjan-based fairness check; any
-    /// disagreement aborts the run with a diagnostic.
+    /// When `true` AND the model has fairness constraints AND the run is
+    /// single-node (no distributed stealer attached), the runtime
+    /// replaces the parallel BFS worker fleet with a single DFS worker
+    /// ([`crate::runtime::dfs_worker`]) that walks the state graph in
+    /// depth-first order, coloring each fingerprint via the production
+    /// [`PageAlignedColorMap`](crate::storage::page_aligned_color_map)
+    /// data structure (2 bits per fingerprint, NUMA-shard-placed, lock-
+    /// free CAS). On every accepting-state pop a nested-DFS red probe
+    /// runs in-band against the same color map.
     ///
-    /// **What this stage 3 actually delivers**: the production color-map
-    /// data structure validated end-to-end on real fairness specs, behind a
-    /// default-off flag. The actual lift of the BFS exploration into a
-    /// per-worker DFS loop (the "true streaming" memory win) is **deferred**
-    /// — the BFS path still builds the labeled-transitions adjacency map
-    /// during exploration; the color map currently only replaces the post-
-    /// processing oracle's HashMap. The hot-loop DFS rewrite has a 5-day
-    /// estimate per `docs/T10.2-phase2-refined.md` §10 and was deferred
-    /// after the chunk-7 runtime.rs complexity walls observed during
-    /// v1.1.x. Stages 4 and 5 in the design doc remain ungated by this
-    /// flag.
+    /// **What this stage 3 actually delivers (scoped lift)**:
+    /// - Production color-map data structure validated end-to-end on
+    ///   real fairness specs (Stage 1 deliverable, was already shipping
+    ///   under this flag pre-stage-3).
+    /// - **NEW: a separate DFS exploration function** that runs instead
+    ///   of the BFS fleet under the flag, drops the features irrelevant
+    ///   to single-node DFS (checkpoint pause coordination, cluster
+    ///   stealing, init producer streaming, distributed donate, auto-
+    ///   tune throttle, backpressure), and produces the same fairness
+    ///   verdict as the Tarjan path.
     ///
-    /// **Default `false`** — must not perturb the existing path. Existing
-    /// fairness tests must keep using the existing path.
+    /// The DFS worker still populates the labeled-transitions adjacency
+    /// map, so the existing `runtime/liveness.rs::run_post_processing`
+    /// pipeline produces the canonical Liveness verdict and the
+    /// `--liveness-streaming-exploration` color-map oracle still cross-
+    /// validates against Tarjan. Stage 4 (per
+    /// `docs/T10.2-phase2-refined.md` §10) lifts the labeled-transitions
+    /// population so the fairness verdict comes purely from in-band
+    /// cycle detection (the actual memory win at 100M+ scale).
+    ///
+    /// **Default `false`** — must not perturb the existing path. Safety-
+    /// only specs ignore the flag. Distributed runs ignore the flag
+    /// (DFS path is single-node by design).
     pub liveness_streaming_exploration: bool,
 }
 
@@ -260,6 +272,7 @@ pub struct RunStats {
     pub fingerprints: FingerprintStats,
 }
 
+mod dfs_worker;
 mod distributed;
 mod init_producer;
 mod liveness;
@@ -768,18 +781,36 @@ where
     // For specs where Init enumeration dominates wall time (Einstein-class
     // puzzles where the symbolic SMT loop runs for tens of minutes), workers
     // begin invariant evaluation on partial results within seconds.
-    let init_producer = init_producer::spawn_init_producer(
-        resumed_from_checkpoint,
-        Arc::clone(&model),
-        Arc::clone(&queue),
-        Arc::clone(&fp_store),
-        Arc::clone(&run_stats),
-        state_map.clone(),
-        Arc::clone(&trace_state_count),
-        Arc::clone(&stop),
-        error_tx.clone(),
-        Arc::clone(&init_producing),
-    );
+    // T10.2 stage 3 — skip the BFS Init producer when the DFS dispatch
+    // will replace the worker fleet. The DFS worker enumerates initial
+    // states eagerly via `Model::initial_states()` and feeds them into
+    // its own fp-store dedup pipeline. Spawning the producer here would
+    // double-count `states_distinct` and would also pre-insert init
+    // fingerprints into the fp-store, making the DFS root CAS path see
+    // every initial state as "already visited."
+    let dfs_dispatch_will_fire = config.liveness_streaming_exploration
+        && model.has_fairness_constraints()
+        && config.distributed_stealer.is_none();
+    let init_producer = if dfs_dispatch_will_fire {
+        // Clear the producer-busy flag immediately so the (skipped)
+        // worker termination path doesn't wait on a producer that was
+        // never launched.
+        init_producing.store(false, Ordering::Release);
+        None
+    } else {
+        init_producer::spawn_init_producer(
+            resumed_from_checkpoint,
+            Arc::clone(&model),
+            Arc::clone(&queue),
+            Arc::clone(&fp_store),
+            Arc::clone(&run_stats),
+            state_map.clone(),
+            Arc::clone(&trace_state_count),
+            Arc::clone(&stop),
+            error_tx.clone(),
+            Arc::clone(&init_producing),
+        )
+    };
     // We can't early-exit on 0-initial-states here without first joining the
     // producer thread, but that would defeat the point of streaming. Instead,
     // termination detection in the main loop handles the 0-initial-states case
@@ -1076,9 +1107,85 @@ where
     //     and cross-node steal-trigger task ---
     distributed::spawn_handlers_if_any(&config, &queue, &stop);
 
-    let mut workers = Vec::with_capacity(worker_plan.worker_count);
-    for (worker_id, worker_state) in worker_states.into_iter().enumerate() {
-        let ctx = worker::WorkerLocalState::<M> {
+    // T10.2 stage 3 — opt-in single-worker DFS exploration with in-line
+    // page-aligned color-map coloring. When the flag is on AND the model
+    // declares fairness constraints, we replace the BFS worker fleet
+    // with a single DFS worker (see `runtime/dfs_worker.rs` for the
+    // rationale and dropped-feature audit). The DFS worker still
+    // populates the labeled-transitions map so the existing post-
+    // processing pipeline produces the canonical fairness verdict —
+    // gate-7 parity proves DFS and Tarjan paths agree on every fixture.
+    //
+    // Default off, and additionally gated on `has_fairness_constraints`:
+    // safety-only specs use the BFS fleet unchanged regardless of the
+    // flag. Distributed mode is incompatible with the DFS path (single-
+    // node only by design); we fall back to BFS in that case.
+    let use_dfs_path = config.liveness_streaming_exploration
+        && model.has_fairness_constraints()
+        && config.distributed_stealer.is_none();
+
+    let workers: Vec<std::thread::JoinHandle<()>> = if use_dfs_path {
+        // Drop the unused per-worker state vec; the DFS path doesn't
+        // touch the work-stealing queue.
+        drop(worker_states);
+
+        // Build a color map sized for the expected fingerprint domain.
+        // Single shard for simplicity — multi-shard is exercised by the
+        // unit tests in `page_aligned_color_map.rs`. NUMA node 0 is the
+        // single-node fallback used throughout the runtime when no
+        // explicit topology is requested.
+        let cm_capacity = config.fp_expected_items.max(1024).next_power_of_two();
+        let color_map = match crate::storage::page_aligned_color_map::PageAlignedColorMap::new(
+            cm_capacity,
+            1,
+            &[0],
+        ) {
+            Ok(m) => Arc::new(m),
+            Err(e) => {
+                return Err(anyhow!("failed to allocate page-aligned color map: {e}"));
+            }
+        };
+
+        let dfs_ctx = dfs_worker::DfsWorkerCtx::<M> {
+            model: Arc::clone(&model),
+            fp_store: Arc::clone(&fp_store),
+            stats: Arc::clone(&run_stats),
+            stop: Arc::clone(&stop),
+            violation_tx: violation_tx.clone(),
+            violation_count: Arc::clone(&violation_count),
+            max_violations,
+            error_tx: error_tx.clone(),
+            stop_on_violation: config.stop_on_violation,
+            labeled_transitions: labeled_transitions.clone(),
+            parent_map: parent_map.clone(),
+            state_map: state_map.clone(),
+            trace_count: Arc::clone(&trace_state_count),
+            max_trace_states,
+            color_map,
+        };
+
+        // The init producer was skipped above (`dfs_dispatch_will_fire`),
+        // so the `init_producing` flag is already false and there is no
+        // producer thread to coordinate with. The DFS worker seeds its
+        // own initial-state set eagerly.
+
+        eprintln!(
+            "[runtime] T10.2 stage 3 DFS dispatch: single worker, color-map slots={}, \
+             labeled-transitions={}, fairness constraints={}",
+            cm_capacity,
+            labeled_transitions.is_some(),
+            model.fairness_constraints().len()
+        );
+
+        let mut handles = Vec::with_capacity(1);
+        handles.push(std::thread::spawn(move || {
+            dfs_worker::run_dfs_worker::<M>(dfs_ctx);
+        }));
+        handles
+    } else {
+        let mut workers = Vec::with_capacity(worker_plan.worker_count);
+        for (worker_id, worker_state) in worker_states.into_iter().enumerate() {
+            let ctx = worker::WorkerLocalState::<M> {
             model: Arc::clone(&model),
             fp_store: Arc::clone(&fp_store),
             queue: Arc::clone(&queue),
@@ -1110,15 +1217,17 @@ where
             donate_tx: config.donate_states_tx.clone(),
             init_producing: Arc::clone(&init_producing),
         };
-        // Move worker_state by value into the spawned thread (matches the
-        // pre-refactor semantics — each worker owns its SpillableWorkerState).
-        // The body lives in `runtime/worker.rs::run_worker`; this is pure
-        // code motion. See that module's docstring for the T5.4/T6/T11.5
-        // ordering invariants the body preserves.
-        workers.push(std::thread::spawn(move || {
-            worker::run_worker::<M>(worker_id, worker_state, ctx);
-        }));
-    }
+            // Move worker_state by value into the spawned thread (matches the
+            // pre-refactor semantics — each worker owns its SpillableWorkerState).
+            // The body lives in `runtime/worker.rs::run_worker`; this is pure
+            // code motion. See that module's docstring for the T5.4/T6/T11.5
+            // ordering invariants the body preserves.
+            workers.push(std::thread::spawn(move || {
+                worker::run_worker::<M>(worker_id, worker_state, ctx);
+            }));
+        }
+        workers
+    };
 
     // Shutdown phase — extracted to runtime/shutdown.rs. The 13-step
     // sequence is documented in `docs/runtime-refactor-plan.md`

@@ -135,20 +135,31 @@ pub(crate) struct RuntimeArgs {
     /// `docs/T10.2-streaming-scc-design.md` for the full design.
     #[arg(long, default_value_t = false)]
     pub(crate) liveness_streaming: bool,
-    /// T10.2 stage 3 — opt-in **page-aligned color-map** nested-DFS path.
+    /// T10.2 stage 3 — opt-in single-worker DFS exploration with in-line
+    /// page-aligned color-map coloring.
     ///
-    /// When set AND the model has fairness constraints, the post-BFS
-    /// liveness pipeline runs nested-DFS over the production
-    /// `PageAlignedColorMap` data structure (2 bits per fingerprint, NUMA-
-    /// shard-placed, lock-free CAS) instead of the v1.1.0 oracle's
-    /// `HashMap<u64, Color>`. The verdict is cross-validated against the
-    /// existing Tarjan-based fairness check; any disagreement aborts the
-    /// run with a diagnostic.
+    /// When set AND the model has fairness constraints AND the run is
+    /// single-node (no `--cluster-listen`), the runtime replaces the
+    /// parallel BFS worker fleet with a single DFS worker
+    /// (`runtime/dfs_worker.rs`) that walks the state graph in depth-
+    /// first order, coloring each fingerprint via the production
+    /// `PageAlignedColorMap` (2 bits per fingerprint, NUMA-shard-placed,
+    /// lock-free CAS). On every accepting-state pop a nested-DFS red
+    /// probe runs in-band against the same color map.
     ///
-    /// Stage 3 of T10.2 phase 2 (`docs/T10.2-phase2-refined.md`). The full
-    /// "in-exploration" hot-loop DFS lift remains future work — this flag
-    /// today only swaps the post-processing oracle's color storage for the
-    /// production NUMA-aware data structure.
+    /// The DFS worker still populates the labeled-transitions adjacency
+    /// map, so the existing post-processing fairness pipeline produces
+    /// the canonical Liveness verdict — gate-7 parity tests assert DFS
+    /// and Tarjan paths agree on every fairness fixture.
+    ///
+    /// Default off and additionally gated on `has_fairness_constraints`:
+    /// safety-only specs always use the BFS path regardless of this
+    /// flag. Distributed runs (`--cluster-listen`) also fall back to BFS
+    /// (the DFS path is single-node by design).
+    ///
+    /// See `docs/T10.2-phase2-refined.md` §10 for the staged plan; stage
+    /// 4 lifts the labeled-transitions population so the fairness verdict
+    /// comes purely from in-band cycle detection (the actual memory win).
     #[arg(long, default_value_t = false)]
     pub(crate) liveness_streaming_exploration: bool,
 }
