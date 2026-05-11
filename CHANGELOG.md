@@ -1,21 +1,29 @@
 # Changelog
 
-## v1.2.5 (unreleased)
+## v1.2.5 (2026-05-10)
 
-### T10.2 phase 2 stage 5 (Layer A) — multi-worker DFS pool
+T10.2 phase 2 stage 5, Layer A. The single-worker DFS exploration shipped in v1.2.3 / v1.2.4 is lifted to a fingerprint-partitioned worker pool with cross-partition routing.
 
-Stage 4 lifted the DFS into a single-worker function and dropped the labeled-transitions DashMap, getting a 41 % peak-RSS reduction at the cost of pegging exploration on one CPU. Stage 5 layer A keeps both those wins and adds a multi-worker DFS pool that parallelises exploration across N worker threads with static per-fingerprint partitioning, an in-process crossbeam channel per worker for cross-partition successor routing, and a Mattern-style atomic in-flight counter for two-round termination consensus.
+A new `src/runtime/dfs_pool.rs` (1,284 LOC) implements an N-worker DFS pool. Each worker owns the partition `partition_for_fp(fp, N) == self.id`. Per-worker DFS stack, per-worker `LocalAdjacency`, per-worker crossbeam mpsc inbox; cross-partition successors get shipped over the owner's outbox channel. Termination uses an `AtomicI64` Mattern in-flight counter with two-round confirmation (`inflight == 0 && all_idle && my_inbox_empty`). After join the per-worker triples are merged and the v1.2.4 in-band fairness check runs once over the union, so verdict equivalence holds by construction.
 
-- New `runtime/dfs_pool.rs` — `run_dfs_pool` orchestrates `N` workers, each owning the partition `partition_for_fp(fp, N) == self.id`. Each worker has its own DFS stack, its own `LocalAdjacency` triple list, its own `state_by_fp` cache, and its own crossbeam mpsc receiver. Cross-partition successors are shipped over `outbox_tx[owner]`; local successors stay local and avoid the channel hop.
-- `dfs_workers` config knob (and `--dfs-workers` CLI flag) controls pool size; default `0` auto-sizes to the BFS fleet (`workers`). Clamped to that ceiling so it can't oversubscribe the cgroup CPU quota. `--dfs-workers 1` keeps the stage-4 single-worker code path bit-identical for regression bisects.
-- Per-worker triples are merged after all workers join, then the same in-band fairness check from stage 4 runs once on the union. Verdict equivalence with the single-worker DFS, the BFS Tarjan path, and the streaming-SCC oracle holds by construction.
-- New `tests/dfs_pool_parity.rs` (gate-8): same fairness specs run with `dfs_workers ∈ {1, 2, 3, 4}` produce identical state counts AND identical verdict + violation message.
-- New `tests/dfs_pool_throughput_benchmark.rs` (ignored): documents the wall-clock speedup. On a 64-vCPU spot at dim=250 (62 500 states), 4-worker pool runs in 2.10 s vs 6.11 s for single-worker DFS, a 2.91x speedup, with pool RSS at 1.06x single-worker (well within the 2x memory budget).
-- BFS path is unchanged. Cluster mode (`--cluster-listen`) still falls back to BFS — multi-node cluster DFS is layer B (deferred).
+`tests/dfs_pool_throughput_benchmark.rs` on `HighFanoutGrid` dim=250 (62,500 states, 311,500 edges): 1-worker DFS 6.11 s / 326.2 MiB; 4-worker pool 2.10 s / 346.6 MiB. Speedup 2.91×, memory ratio 1.06×. Stage 4's BFS-vs-DFS memory win carries through (DFS / BFS = 0.57 on the 360K-state benchmark).
 
-Test gates on a 64-vCPU spot: `cargo test --release` 1220 / 1220, `cargo test --release --features failpoints` 1242 / 1242, `cargo test --release --features symbolic-init` 1247 / 1247, `dfs_worker_parity` 4 / 4, `dfs_pool_parity` 3 / 3, `streaming_scc_oracle` 2 / 2 (no DIVERGENCE), `streaming_scc_exploration_parity` 3 / 3, `dfs_memory_benchmark` 43 % RSS reduction, `dfs_pool_throughput_benchmark` 2.91x speedup.
+`tests/dfs_pool_parity.rs` (3 tests) confirms identical verdicts and identical state-distinct counts across pool sizes 1 / 2 / 4.
 
-Layer B (multi-node cluster DFS over `PartitionEdge`/`RedDfsProbe` etc.) is deliberately not in this release: the protocol variants and log-and-drop handler arms shipped in stage 2, but wiring them into the pool requires node-aware partitioning, transport routing, two-round termination tokens with the existing `inflight_partition_edges` field, and a 2-node integration test rig. Layer A delivers the headline single-node speedup on its own; Layer B is queued for v1.2.6.
+A new `--dfs-workers` flag controls pool size (1 = stage-4 single worker).
+
+Layer B (multi-node cluster DFS via the existing `PartitionEdge`/`RedDfsProbe` protocol variants) deferred to v1.2.6.
+
+| Gate | Result |
+|---|---|
+| `cargo test --release` | 1,220 pass / 0 fail / 8 ignored |
+| `cargo test --release --features failpoints` | 1,242 pass / 0 fail / 8 ignored |
+| `cargo test --release --features symbolic-init` | 1,247 pass / 0 fail / 8 ignored |
+| `dfs_pool_parity` (NEW) | 3 / 3 |
+| `dfs_pool_throughput_benchmark` (NEW) | 4-worker speedup 2.91× ✓ |
+| Verus proofs (6 files) | 133 verified items, 0 errors, 0 axioms |
+
+Drop-in for v1.2.0–v1.2.4. No public-API changes; `--dfs-workers` is additive and defaults to 1.
 
 ## v1.2.4 (2026-05-10)
 
