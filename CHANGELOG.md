@@ -4,7 +4,7 @@
 
 T10.2 phase 2 stage 5, Layer B. The single-node multi-worker DFS pool shipped in v1.2.5 is extended to span multiple cluster nodes via cross-node routing.
 
-A new `src/runtime/dfs_cluster_bridge.rs` (692 LOC) provides the async-to-sync bridge between `Transport::recv()` and the per-worker crossbeam mpsc inboxes. `src/runtime/dfs_pool.rs` gains a `DfsPoolClusterCtx` and cluster-aware partition routing: each worker's partition is `(node_id, worker_id)`; local partitions stay on the local crossbeam mpsc, remote partitions ship over the `Transport` as `PartitionEdge` messages. Termination uses a two-round consensus over the existing `TerminationToken.inflight_partition_edges` field.
+A new `src/runtime/dfs_cluster_bridge.rs` provides the async-to-sync bridge between `Transport::recv()` and the per-worker crossbeam mpsc inboxes. `src/runtime/dfs_pool.rs` gains a `DfsPoolClusterCtx` and cluster-aware partition routing: each worker's partition is `(node_id, worker_id)`; local partitions stay on the local crossbeam mpsc, remote partitions ship over the `Transport` as `PartitionEdge` messages. Termination uses a two-round consensus over the existing `TerminationToken.inflight_partition_edges` field.
 
 `tests/dfs_cluster_layer_b.rs` (4 default + 1 ignored memory benchmark) uses the existing `MockTransport` (T204, v1.2.1) to wire two transport instances through a shared `MockNetwork`. No real TCP. Identical liveness verdicts and identical state-distinct counts confirmed across single-node pool vs 2-node cluster runs of the same fairness spec.
 
@@ -27,7 +27,7 @@ Drop-in for v1.2.0–v1.2.5. No public-API or CLI changes.
 
 T10.2 phase 2 stage 5, Layer A. The single-worker DFS exploration shipped in v1.2.3 / v1.2.4 is lifted to a fingerprint-partitioned worker pool with cross-partition routing.
 
-A new `src/runtime/dfs_pool.rs` (1,284 LOC) implements an N-worker DFS pool. Each worker owns the partition `partition_for_fp(fp, N) == self.id`. Per-worker DFS stack, per-worker `LocalAdjacency`, per-worker crossbeam mpsc inbox; cross-partition successors get shipped over the owner's outbox channel. Termination uses an `AtomicI64` Mattern in-flight counter with two-round confirmation (`inflight == 0 && all_idle && my_inbox_empty`). After join the per-worker triples are merged and the v1.2.4 in-band fairness check runs once over the union, so verdict equivalence holds by construction.
+A new `src/runtime/dfs_pool.rs` implements an N-worker DFS pool. Each worker owns the partition `partition_for_fp(fp, N) == self.id`. Per-worker DFS stack, per-worker `LocalAdjacency`, per-worker crossbeam mpsc inbox; cross-partition successors get shipped over the owner's outbox channel. Termination uses an `AtomicI64` Mattern in-flight counter with two-round confirmation (`inflight == 0 && all_idle && my_inbox_empty`). After join the per-worker triples are merged and the v1.2.4 in-band fairness check runs once over the union, so verdict equivalence holds by construction.
 
 `tests/dfs_pool_throughput_benchmark.rs` on `HighFanoutGrid` dim=250 (62,500 states, 311,500 edges): 1-worker DFS 6.11 s / 326.2 MiB; 4-worker pool 2.10 s / 346.6 MiB. Speedup 2.91×, memory ratio 1.06×. Stage 4's BFS-vs-DFS memory win carries through (DFS / BFS = 0.57 on the 360K-state benchmark).
 
@@ -71,7 +71,7 @@ Drop-in for v1.2.0–v1.2.3. No public-API changes.
 
 T10.2 phase 2 stage 3. The hot-loop DFS exploration that was the headline parked item across v1.2.1 and v1.2.2 lands via a scoped third approach.
 
-A new file `src/runtime/dfs_worker.rs` (941 LOC) implements a separate single-worker single-node DFS exploration function with its own ctx struct. It drops features irrelevant to streaming-SCC mode: no checkpoint pause, no cluster steal, no init producer, no auto-tune throttle, no backpressure. `src/runtime/worker.rs` is byte-unchanged; default behaviour is identical to v1.2.2.
+A new file `src/runtime/dfs_worker.rs` implements a separate single-worker single-node DFS exploration function with its own ctx struct. It drops features irrelevant to streaming-SCC mode: no checkpoint pause, no cluster steal, no init producer, no auto-tune throttle, no backpressure. `src/runtime/worker.rs` is byte-unchanged; default behaviour is identical to v1.2.2.
 
 A dispatch branch in `src/runtime.rs` checks `--liveness-streaming-exploration`, `model.has_fairness_constraints()`, and the absence of a distributed stealer. When all three hold, the run path spawns one DFS worker instead of the normal worker fleet.
 
@@ -94,7 +94,7 @@ Drop-in for v1.2.0 / v1.2.1 / v1.2.2. No public-API changes.
 
 Patch release continuing the long-parked items work.
 
-T13.5 `state_machines!` port shipped axiom-free. LTL-native restatement of `theorem_no_starvation` via Verus's `state_machine!` macro plus refinement bridge to `reader_liveness_v2.rs`. New file `verification/verus/reader_liveness_state_machine.rs` (612 LOC, 15 verified items). Zero axioms.
+T13.5 `state_machines!` port shipped axiom-free. LTL-native restatement of `theorem_no_starvation` via Verus's `state_machine!` macro plus refinement bridge to `reader_liveness_v2.rs`. New file `verification/verus/reader_liveness_state_machine.rs` (15 verified items). Zero axioms.
 
 T13.4 wrapper extension: a new `bounded_seqlock_retry_contains` in `shard_wrapper.rs` (+3 verified items, was 31 now 34). T13.4 Phases 2+3 (production-code annotation) remain parked behind 3 documented `vstd` capability gaps.
 
@@ -119,17 +119,17 @@ Patch release closing out the v1.2.0 deferred-items list. 25 commits on top of v
 
 T204 distributed mock for the cluster handler — `Transport` trait + `MockTransport` (in-memory tokio mpsc channels); `DistributedWorkStealer` switched to `Arc<dyn Transport>`. 10 new tests exercise the inbound handler / bloom-and-termination / steal-trigger paths without real TCP.
 
-`src/runtime.rs` extraction chunks 7 + 8 — both extracted. Chunk 8 (13-step shutdown phase) → `src/runtime/shutdown.rs` (`ShutdownContext` + `orchestrate`). Chunk 7 (worker spawn loop, 27-Arc capture) → `src/runtime/worker.rs` (`WorkerLocalState`). `runtime.rs`: 2,451 → 1,644 LOC.
+`src/runtime.rs` extraction chunks 7 + 8 — both extracted. Chunk 8 (13-step shutdown phase) → `src/runtime/shutdown.rs` (`ShutdownContext` + `orchestrate`). Chunk 7 (worker spawn loop, 27-Arc capture) → `src/runtime/worker.rs` (`WorkerLocalState`). 
 
-`src/tla/eval.rs` split — all 8 chunks (A–H) of the design doc landed. 11,533-line monolith → 13 submodule files under `src/tla/eval/`. External API surface unchanged.
+`src/tla/eval.rs` split — all 8 chunks (A–H) of the design doc landed. The monolith becomes 13 submodule files under `src/tla/eval/`. External API surface unchanged.
 
 Compiler internal-helper restructuring — depth-tracking consolidation (148 + 26 → 4 + 1 sites). Plus 6 more iterations of targeted tests (T207b–T207h, +149 tests). Compiler mutation kill rate: 65.4% → 70.5% across 11 iterations.
 
 ### Older parked items partially landed
 
-T10.2 phase 2 stages 1+2 of 5 — strictly-additive foundation. Stage 1: `PageAlignedColorMap` (524 LOC, 7 tests) — 2-bit Color enum, hugepage mmap, NUMA-shard placement, lock-free CAS. Stage 2: protocol variants (`PartitionEdge`, `RedDfsProbe`, `RequestStateBlob`, etc.) + `Option<u64>` extensions on `TerminationToken`. Stages 3–5 still parked.
+T10.2 phase 2 stages 1+2 of 5 — strictly-additive foundation. Stage 1: `PageAlignedColorMap` (7 unit tests) — 2-bit Color enum, hugepage mmap, NUMA-shard placement, lock-free CAS. Stage 2: protocol variants (`PartitionEdge`, `RedDfsProbe`, `RequestStateBlob`, etc.) + `Option<u64>` extensions on `TerminationToken`. Stages 3–5 still parked.
 
-T13.4 Phase 1 — production-shape verified wrapper at `verification/verus/shard_wrapper.rs` (1,083 LOC, 31 verified items). Bounded outer probe loop now verified — closes the gap `shard_methods.rs` deferred. 115 total Verus items verified (was 84). Phases 2+3 parked behind documented `vstd` capability gaps.
+T13.4 Phase 1 — production-shape verified wrapper at `verification/verus/shard_wrapper.rs` (31 verified items). Bounded outer probe loop now verified — closes the gap `shard_methods.rs` deferred. 115 total Verus items verified (was 84). Phases 2+3 parked behind documented `vstd` capability gaps.
 
 ### Validation
 
@@ -196,7 +196,7 @@ Eight iterations of compiler-helper coverage:
 - **T207g (iter 8, +18 tests).** Deep recursion through every relop
   and arithmetic dispatch arm. **66.0% → 65.4%** (mutation-to-mutation
   variance dominates at this point).
-- **Dead code.** Removed `split_top_level_old` (235 lines,
+- **Dead code.** Removed `split_top_level_old` (annotated
   `#[allow(dead_code)]`, never called) — surfaced as 158 noise
   mutants in iter 1.
 
@@ -209,9 +209,9 @@ soundness bug found this cycle (T201–T207) came from those layers.
 
 ### Refactors (no behavioural change)
 
-- **`src/main.rs`: 11,711 → 10 lines.** CLI dispatch tree split into
+- **`src/main.rs` split.** CLI dispatch tree split into
   12 modules under `src/cli/`.
-- **`src/runtime.rs`: 4,323 → 2,451 lines.** Seven extraction chunks
+- **`src/runtime.rs` partial split.** Seven extraction chunks
   landed (PauseController, checkpoint manifest, memory budget, shard
   count, AtomicRunStats, T5.4 init producer, T10 liveness post-
   processing, distributed handler wiring, progress tick); +64 unit

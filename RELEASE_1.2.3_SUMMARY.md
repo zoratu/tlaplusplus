@@ -4,11 +4,11 @@ T10.2 phase 2 stage 3. The hot-loop DFS exploration that was the headline parked
 
 ## T10.2 phase 2 stage 3 — DFS exploration via separate worker
 
-Two prior agents stopped at the same surface for the same reason: lifting the BFS exploration in `src/runtime/worker.rs::run_worker` (733 LOC, 27-Arc capture, T5.4/T6/T11.5 ordering invariants) is a multi-day risky rewrite. This release uses a different approach that sidesteps the universal lift.
+Two prior agents stopped at the same surface for the same reason: lifting the BFS exploration in `src/runtime/worker.rs::run_worker` is a multi-day risky rewrite. The function captures 27 distinct `Arc<...>` clones and threads T5.4/T6/T11.5 ordering invariants throughout. This release uses a different approach that sidesteps the universal lift.
 
-A new file `src/runtime/dfs_worker.rs` (941 LOC) implements a separate single-worker single-node DFS exploration function with its own ctx struct. It drops features irrelevant to streaming-SCC mode: no checkpoint pause, no cluster steal, no init producer streaming, no distributed donate, no auto-tune throttle, no backpressure.
+A new file `src/runtime/dfs_worker.rs` implements a separate single-worker single-node DFS exploration function with its own ctx struct. It drops features irrelevant to streaming-SCC mode: no checkpoint pause, no cluster steal, no init producer streaming, no distributed donate, no auto-tune throttle, no backpressure.
 
-A dispatch branch in `src/runtime.rs` (+199 LOC) checks `--liveness-streaming-exploration`, `model.has_fairness_constraints()`, and the absence of a distributed stealer. When all three hold, the run path spawns one `dfs_worker::run_dfs_worker` instead of the normal worker fleet. The init producer is conditionally skipped to avoid double-counting `states_distinct`.
+A dispatch branch in `src/runtime.rs` checks `--liveness-streaming-exploration`, `model.has_fairness_constraints()`, and the absence of a distributed stealer. When all three hold, the run path spawns one `dfs_worker::run_dfs_worker` instead of the normal worker fleet. The init producer is conditionally skipped to avoid double-counting `states_distinct`.
 
 `src/runtime/worker.rs` is byte-unchanged. The default code path is identical to v1.2.2; the new code path activates only when the flag is on.
 
@@ -61,7 +61,7 @@ Drop-in for v1.2.0/v1.2.1/v1.2.2. No public-API changes; the `--liveness-streami
 
 ## Code-organization deltas vs v1.2.2
 
-New `src/runtime/dfs_worker.rs` (941 LOC, 3 unit tests). New `tests/dfs_worker_parity.rs` (4 integration tests). `src/runtime.rs` +199 LOC dispatch branch + producer-skip. `src/cli/args.rs` +25 LOC docstring update for the flag. Tests at 1,212 (was 1,205, +7). Verus proofs unchanged at 133 verified items.
+New `src/runtime/dfs_worker.rs` with 3 unit tests. New `tests/dfs_worker_parity.rs` with 4 integration tests. `src/runtime.rs` adds the dispatch branch and producer-skip. `src/cli/args.rs` adds a docstring update for the flag. Tests at 1,212 (was 1,205). Verus proofs unchanged at 133 verified items.
 
 ## Still parked
 

@@ -4,7 +4,7 @@ T10.2 phase 2 stage 5, Layer B. The single-node multi-worker DFS pool shipped in
 
 ## T10.2 phase 2 stage 5 Layer B — multi-node cluster DFS
 
-A new `src/runtime/dfs_cluster_bridge.rs` (692 LOC) provides the async-to-sync bridge between `Transport::recv()` (async, boxed-future return) and the per-worker crossbeam mpsc inboxes (sync). The bridge thread drains incoming `PartitionEdge` messages and forwards them into the appropriate worker's `inbox_tx`. Outbound cross-node sends use fire-and-forget `Handle::spawn`; the inflight counter guarantees correctness regardless of when the network catches up.
+A new `src/runtime/dfs_cluster_bridge.rs` provides the async-to-sync bridge between `Transport::recv()` (async, boxed-future return) and the per-worker crossbeam mpsc inboxes (sync). The bridge thread drains incoming `PartitionEdge` messages and forwards them into the appropriate worker's `inbox_tx`. Outbound cross-node sends use fire-and-forget `Handle::spawn`; the inflight counter guarantees correctness regardless of when the network catches up.
 
 `src/runtime/dfs_pool.rs` gains a `DfsPoolClusterCtx` and cluster-aware partition routing. Each worker's partition is `(node_id, worker_id)` under the existing `partition_for_fp` bit-mixing — local partitions stay on the local crossbeam mpsc, remote partitions ship over the `Transport` as `PartitionEdge` messages.
 
@@ -12,7 +12,7 @@ Termination uses a two-round consensus over the existing `TerminationToken.infli
 
 ## Validation
 
-`tests/dfs_cluster_layer_b.rs` (358 LOC, 4 default tests + 1 ignored memory benchmark) uses the existing `MockTransport` (T204, v1.2.1) to wire two transport instances through a shared `MockNetwork`. No real TCP. The tests assert identical liveness verdicts and identical `states_distinct` counts when the same fairness spec is run under the single-node pool vs the 2-node cluster.
+`tests/dfs_cluster_layer_b.rs` (4 default tests + 1 ignored memory benchmark) uses the existing `MockTransport` (T204, v1.2.1) to wire two transport instances through a shared `MockNetwork`. No real TCP. The tests assert identical liveness verdicts and identical `states_distinct` counts when the same fairness spec is run under the single-node pool vs the 2-node cluster.
 
 Per-node cluster memory at dim=8 (64 states): single-node DFS RSS delta 0.6 MiB, 2-node cluster RSS delta 0.8 MiB total → 0.4 MiB per node = 0.64× single-node baseline.
 
@@ -50,7 +50,7 @@ Drop-in for v1.2.0–v1.2.5. No public-API or CLI changes. Production multi-node
 
 ## Code-organization deltas vs v1.2.5
 
-New `src/runtime/dfs_cluster_bridge.rs` (692 LOC, 3 unit tests). New `tests/dfs_cluster_layer_b.rs` (358 LOC, 5 tests). `src/runtime.rs` +126 LOC (`pub mod dfs_cluster_test_api`, bridge module declaration). `src/runtime/dfs_pool.rs` +204 / -22 LOC (cluster ctx, cluster-aware partition routing, bridge-aware termination predicate). Tests at 1,227 (was 1,220, +7). Verus proofs unchanged at 133 verified items.
+New `src/runtime/dfs_cluster_bridge.rs` with 3 unit tests. New `tests/dfs_cluster_layer_b.rs` with 5 tests. `src/runtime.rs` adds a `pub mod dfs_cluster_test_api` and the bridge module declaration. `src/runtime/dfs_pool.rs` gains the cluster ctx, cluster-aware partition routing, and bridge-aware termination predicate. Tests at 1,227 (was 1,220). Verus proofs unchanged at 133 verified items.
 
 ## Still parked
 

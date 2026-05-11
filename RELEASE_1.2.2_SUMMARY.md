@@ -6,15 +6,15 @@ Patch release continuing the long-parked items work.
 
 LTL-native restatement of the headline `theorem_no_starvation` via Verus's `state_machine!` macro. Proves the theorem from a refinement bridge to the v1.1.0 constructive proof in `reader_liveness_v2.rs`.
 
-A new file `verification/verus/reader_liveness_state_machine.rs` (612 LOC, 15 verified items, ~1s wall, run via `./run_proof.sh sm`) defines `state_machine!(ShardSeq)` with three transitions (`begin_resize`, `finalize_resize`, `stutter`), two `#[invariant]` predicates, and four `#[inductive]` proofs. A refinement bridge (`theorem_step_refines`, `theorem_prefix_refines`) shows every state-machine transition refines a v2 `step_relation_v2` step. The headline `theorem_no_starvation_sm` is proved constructively with the same 2-step stutter and 3-step finalize-stutter witnesses as v2. Zero axioms.
+A new file `verification/verus/reader_liveness_state_machine.rs` (15 verified items, ~1s wall, run via `./run_proof.sh sm`) defines `state_machine!(ShardSeq)` with three transitions (`begin_resize`, `finalize_resize`, `stutter`), two `#[invariant]` predicates, and four `#[inductive]` proofs. A refinement bridge (`theorem_step_refines`, `theorem_prefix_refines`) shows every state-machine transition refines a v2 `step_relation_v2` step. The headline `theorem_no_starvation_sm` is proved constructively with the same 2-step stutter and 3-step finalize-stutter witnesses as v2. Zero axioms.
 
 ## T13.4 — wrapper-level seqlock retry verified
 
-A new `bounded_seqlock_retry_contains` in `verification/verus/shard_wrapper.rs` (+3 verified items, was 31 now 34). Wrapper-level seqlock retry loop with `decreases max_retries - retries` termination — closes another piece of the gap between the shadow methods and the production retry loop.
+A new `bounded_seqlock_retry_contains` in `verification/verus/shard_wrapper.rs` (+3 verified items, total now 34). Wrapper-level seqlock retry loop with `decreases max_retries - retries` termination — closes another piece of the gap between the shadow methods and the production retry loop.
 
 T13.4 Phases 2+3 (production-code annotation of `FingerprintShard`) remain parked. The Phase 2 probe reconfirmed all three documented `vstd` capability gaps:
 
-1. `unsafe { std::slice::from_raw_parts(table_ptr, capacity) }` at `src/storage/page_aligned_fingerprint_store.rs:627-628` — `table_ptr` comes from a swappable `AtomicPtr`; modeling without `external_body` isn't possible today.
+1. `unsafe { std::slice::from_raw_parts(table_ptr, capacity) }` in the contains probe loop — `table_ptr` comes from a swappable `AtomicPtr`; modeling without `external_body` isn't possible today.
 2. `mmap(MAP_HUGETLB | MAP_POPULATE)` in `FingerprintShard::new` — `Tracked<PointsToArray<...>>` requires a memory-provenance axiom or an `external_body` permission mint.
 3. `unsafe impl Send` with `&self` everywhere — `vstd::AtomicInvariant` workaround would add open/close per probe step, regressing the 220K-states/sec hot path.
 
@@ -36,7 +36,7 @@ Wires the production `PageAlignedColorMap` data structure (Stage 1 deliverable) 
 
 `src/streaming_scc.rs` gains `nested_dfs_color_map` plus helpers and 5 unit tests. `src/runtime/liveness.rs` gains the page-aligned oracle integration. `src/runtime.rs` gains the `liveness_streaming_exploration` config field. `src/cli/args.rs` and `src/cli/shared.rs` add the new `--liveness-streaming-exploration` flag. `tests/streaming_scc_exploration_parity.rs` adds 3 parity tests (Tarjan vs color-map; observed `color_map_cycle=true tarjan_cycle=true` and `color_map_cycle=false tarjan_cycle=false` on the existing fairness fixtures).
 
-Stages 3 (hot-loop DFS lift), 4 (cross-partition routing + memory benchmark), and 5 (cluster + corpus revalidation) remain parked. Two agents in succession have stopped at the same surface for the same reason: lifting the BFS exploration into per-worker DFS requires touching `src/runtime/worker.rs::run_worker` (733 LOC) preserving T5.4 init-producer ordering, T6 cluster idle-flag handshake, T11.5 violation-finish ordering, plus auto-tune throttle, checkpoint pause points, stolen-state drain, donate-tx, distributed bloom skip, backpressure, and parent-map tracking. The realistic path forward is dedicated focused-session work that can sit on the spot host with a hot build cache.
+Stages 3 (hot-loop DFS lift), 4 (cross-partition routing + memory benchmark), and 5 (cluster + corpus revalidation) remain parked. Two agents in succession have stopped at the same surface for the same reason: lifting the BFS exploration into per-worker DFS requires touching `src/runtime/worker.rs::run_worker` preserving T5.4 init-producer ordering, T6 cluster idle-flag handshake, T11.5 violation-finish ordering, plus auto-tune throttle, checkpoint pause points, stolen-state drain, donate-tx, distributed bloom skip, backpressure, and parent-map tracking. The realistic path forward is dedicated focused-session work that can sit on the spot host with a hot build cache.
 
 ## Validation gates
 
@@ -59,7 +59,7 @@ Drop-in for v1.2.0 / v1.2.1. No public-API or CLI changes (the new `--liveness-s
 
 ## Code-organization deltas vs v1.2.1
 
-1 new Verus proof file (`reader_liveness_state_machine.rs`, 15 verified items). `shard_wrapper.rs` extended with `bounded_seqlock_retry_contains` (+3 verified). 1 new src test file (`tests/streaming_scc_exploration_parity.rs`). Tests at 1,205 (was 1,197, +8). Verus proofs at 133 (was 115, +18).
+1 new Verus proof file (`reader_liveness_state_machine.rs`, 15 verified items). `shard_wrapper.rs` extended with `bounded_seqlock_retry_contains` (+3 verified). 1 new src test file (`tests/streaming_scc_exploration_parity.rs`). Tests at 1,205 (was 1,197). Verus proofs at 133 (was 115).
 
 ## Still parked
 

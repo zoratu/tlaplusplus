@@ -56,7 +56,7 @@ Drop-in for v1.2.0–v1.2.3. No public-API changes. The `--liveness-streaming-ex
 
 ## Code-organization deltas vs v1.2.3
 
-`src/runtime/dfs_worker.rs` rewritten internally: 941 → 1,450 LOC (+509/-381 net). `src/runtime.rs` +60 LOC for the dfs_inband_verdict_done wiring. `src/runtime/shutdown.rs` +24 LOC for the post-processing skip. New `tests/dfs_memory_benchmark.rs` (394 LOC). Tests at 1,212 (memory benchmark is `#[ignore]` by default; run via `cargo test --release --test dfs_memory_benchmark -- --ignored`). Verus proofs unchanged at 133 verified items.
+`src/runtime/dfs_worker.rs` rewritten internally. `src/runtime.rs` gets the dfs_inband_verdict_done wiring. `src/runtime/shutdown.rs` gets the post-processing skip. New `tests/dfs_memory_benchmark.rs`. Tests at 1,212 (memory benchmark is `#[ignore]` by default; run via `cargo test --release --test dfs_memory_benchmark -- --ignored`). Verus proofs unchanged at 133 verified items.
 
 ## Still parked
 

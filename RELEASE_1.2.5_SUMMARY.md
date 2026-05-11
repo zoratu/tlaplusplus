@@ -4,7 +4,7 @@ T10.2 phase 2 stage 5, Layer A. The single-worker DFS exploration shipped in v1.
 
 ## T10.2 phase 2 stage 5 Layer A — single-node multi-worker DFS pool
 
-A new `src/runtime/dfs_pool.rs` (1,284 LOC) implements an N-worker DFS pool that shares the v1.2.4 in-band fairness verdict path. Each worker owns the partition `partition_for_fp(fp, N) == self.id` (same bit-mixing as `home_numa`). Per-worker DFS stack, per-worker `LocalAdjacency` triples, per-worker `state_by_fp` cache, per-worker crossbeam mpsc `Receiver`. Cross-partition successors are shipped over `outbox_tx[owner]`; local successors stay local.
+A new `src/runtime/dfs_pool.rs` implements an N-worker DFS pool that shares the v1.2.4 in-band fairness verdict path. Each worker owns the partition `partition_for_fp(fp, N) == self.id` (same bit-mixing as `home_numa`). Per-worker DFS stack, per-worker `LocalAdjacency` triples, per-worker `state_by_fp` cache, per-worker crossbeam mpsc `Receiver`. Cross-partition successors are shipped over `outbox_tx[owner]`; local successors stay local.
 
 Termination uses an `AtomicI64` Mattern in-flight counter incremented on each cross-partition send and decremented as the first action in `handle_explore_msg` on receive. Termination requires `inflight == 0 && all_idle && my_inbox_empty` confirmed twice (Mattern two-round). After the worker join, per-worker triples are merged and the same in-band fairness check from stage 4 (`dfs_worker::run_inband_fairness_check`) runs once over the union, so verdict equivalence with the stage-4 single-worker path holds by construction.
 
@@ -50,7 +50,7 @@ Drop-in for v1.2.0–v1.2.4. No public-API changes. The new `--dfs-workers` flag
 
 ## Code-organization deltas vs v1.2.4
 
-New `src/runtime/dfs_pool.rs` (1,284 LOC). New `tests/dfs_pool_parity.rs` (215 LOC, 3 tests). New `tests/dfs_pool_throughput_benchmark.rs` (274 LOC, ignored by default). `src/runtime/dfs_worker.rs` exposes 22 LOC of helpers as `pub(super)` for the pool. `src/runtime.rs`, `src/cli/args.rs`, `src/cli/shared.rs` add the `--dfs-workers` flag plumbing. Tests at 1,220 (was 1,212, +8). Verus proofs unchanged at 133 verified items.
+New `src/runtime/dfs_pool.rs`. New `tests/dfs_pool_parity.rs` with 3 tests. New `tests/dfs_pool_throughput_benchmark.rs` (ignored by default). `src/runtime/dfs_worker.rs` exposes a few helpers as `pub(super)` for the pool. `src/runtime.rs`, `src/cli/args.rs`, `src/cli/shared.rs` add the `--dfs-workers` flag plumbing. Tests at 1,220 (was 1,212). Verus proofs unchanged at 133 verified items.
 
 ## Still parked
 
