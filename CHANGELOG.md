@@ -1,5 +1,28 @@
 # Changelog
 
+## v1.2.6 (2026-05-10)
+
+T10.2 phase 2 stage 5, Layer B. The single-node multi-worker DFS pool shipped in v1.2.5 is extended to span multiple cluster nodes via cross-node routing.
+
+A new `src/runtime/dfs_cluster_bridge.rs` (692 LOC) provides the async-to-sync bridge between `Transport::recv()` and the per-worker crossbeam mpsc inboxes. `src/runtime/dfs_pool.rs` gains a `DfsPoolClusterCtx` and cluster-aware partition routing: each worker's partition is `(node_id, worker_id)`; local partitions stay on the local crossbeam mpsc, remote partitions ship over the `Transport` as `PartitionEdge` messages. Termination uses a two-round consensus over the existing `TerminationToken.inflight_partition_edges` field.
+
+`tests/dfs_cluster_layer_b.rs` (4 default + 1 ignored memory benchmark) uses the existing `MockTransport` (T204, v1.2.1) to wire two transport instances through a shared `MockNetwork`. No real TCP. Identical liveness verdicts and identical state-distinct counts confirmed across single-node pool vs 2-node cluster runs of the same fairness spec.
+
+Per-node cluster memory at dim=8 (64 states): single-node DFS 0.6 MiB delta, 2-node cluster 0.8 MiB total → 0.4 MiB per node = 0.64× single-node baseline.
+
+Deliberate carve-outs: cross-partition red-DFS send path stays log-only (verdict comes from per-node in-band Tarjan); `RequestStateBlob` send-side stays a no-op (trace reconstruction across nodes deferred); `--dfs-cluster-listen` CLI flag wiring deferred (production multi-node DFS pool runs go through `dfs_cluster_test_api`).
+
+| Gate | Result |
+|---|---|
+| `cargo test --release` | 1,227 pass / 0 fail / 11 ignored |
+| `cargo test --release --features failpoints` | 1,249 pass / 0 fail / 11 ignored |
+| `cargo test --release --features symbolic-init` | 1,254 pass / 0 fail / 11 ignored |
+| `dfs_cluster_layer_b` (NEW) | 4 / 4 (+ 1 ignored, 0.64× per-node memory ratio ✓) |
+| `cross_node_steal_handshake` (T6 cluster mode unaffected) | 3 / 3 |
+| Verus proofs (6 files) | 133 verified items, 0 errors, 0 axioms |
+
+Drop-in for v1.2.0–v1.2.5. No public-API or CLI changes.
+
 ## v1.2.5 (2026-05-10)
 
 T10.2 phase 2 stage 5, Layer A. The single-worker DFS exploration shipped in v1.2.3 / v1.2.4 is lifted to a fingerprint-partitioned worker pool with cross-partition routing.
