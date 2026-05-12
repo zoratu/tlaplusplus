@@ -373,8 +373,8 @@ pub open spec fn finalize_extension_exists(prefix: Seq<ShardSeqState>, ext: Seq<
 // production code's resize loop bounds rehash work by capacity, and
 // finalize is unconditional after rehash completes; together these
 // bound the extension length. Verus can verify this on a concrete
-// loop annotation; the work is multi-day annotation effort on the
-// production code, not a deep proof issue.
+// loop annotation; the work is annotation effort on the production
+// code, not a deep proof issue.
 #[verifier::external_body]
 pub proof fn axiom_writer_eventually_finalizes(prefix: Seq<ShardSeqState>)
     requires
@@ -539,10 +539,10 @@ pub proof fn theorem_no_starvation(prefix: Seq<ShardSeqState>)
 //       has a finite trip count bounded by capacity; after the loop,
 //       `finalize_resize` is unconditional. Each iteration is
 //       `step_stutter_seq` (rehash does not change seq) followed by a
-//       single `step_finalize_resize_seq`. Estimated additional
-//       work: 1-2 agent-days, mostly to thread the Verus
-//       loop-invariant annotation through the production code or a
-//       shadow copy of it (similar in shape to `shard_methods.rs`).
+//       single `step_finalize_resize_seq`. The work is mostly
+//       threading the Verus loop-invariant annotation through the
+//       production code or a shadow copy of it (similar in shape to
+//       `shard_methods.rs`).
 //
 //   (2) axiom_reader_can_observe_stutter
 //       Statement: from a stable prefix, a 2-step stutter extension
@@ -555,9 +555,9 @@ pub proof fn theorem_no_starvation(prefix: Seq<ShardSeqState>)
 //       writer execute concurrently on different cores. In Verus
 //       this requires a scheduler model that distinguishes the
 //       writer's `begin_resize` from a reader's `seq.load()`.
-//       Estimated additional work: 2-3 agent-days for a full
-//       scheduler-fairness annotation, OR migrate to
-//       `state_machines!` which has built-in scheduler-step labels.
+//       The full scheduler-fairness annotation is one path; the
+//       other is migrating to `state_machines!` which has built-in
+//       scheduler-step labels.
 //
 //   (3) axiom_extension_composes
 //       Statement: a resizing prefix has SOME 2-step stutter-bearing
@@ -572,15 +572,14 @@ pub proof fn theorem_no_starvation(prefix: Seq<ShardSeqState>)
 //       sequence-arithmetic fact about Verus `Seq`, not a temporal-
 //       logic fact. Discharging it requires walking through the
 //       indices of the concatenated sequence and showing each
-//       adjacent pair preserves `step_relation`. Estimated work:
-//       2-4 hours of careful index-arithmetic in Verus.
+//       adjacent pair preserves `step_relation`. Careful
+//       index-arithmetic in Verus.
 //
 // All three axioms are CLASSICALLY TRUE under the production code's
 // concurrent semantics. They would be discharged by a pencil-and-
-// paper temporal-logic proof in well under a page each. The work
-// to formalize them in current Verus is roughly 4-6 agent-days
-// total, OR a full port to `state_machines!` (~5-7 agent-days for
-// the model + LTL operator setup).
+// paper temporal-logic proof in well under a page each. Formalizing
+// them in current Verus is one path; another is a full port to
+// `state_machines!` for the model + LTL operator setup.
 //
 // ----------------------------------------------------------------------------
 // MIGRATION PATH TO `state_machines!`

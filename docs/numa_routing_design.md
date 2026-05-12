@@ -2,15 +2,13 @@
 
 ## Problem
 
-On 6-NUMA systems, 83% of fingerprint checks hit remote memory (140ns vs 60ns).
-This causes 20-38% kernel time and limits throughput to 5-9M states/min.
+On 6-NUMA systems, 83% of fingerprint checks hit remote memory (140ns vs 60ns). This causes 20-38% kernel time and limits throughput to 5-9M states/min.
 
 ## Solution: Route States to Their Fingerprint's Home NUMA
 
 ### Key Insight
 
-Each fingerprint deterministically maps to one NUMA node. If we route states to their
-fingerprint's home NUMA, all fingerprint checks become local.
+Each fingerprint deterministically maps to one NUMA node. If we route states to their fingerprint's home NUMA, all fingerprint checks become local.
 
 ### Architecture
 

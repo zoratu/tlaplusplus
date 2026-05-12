@@ -36,10 +36,10 @@
 // What this file is NOT
 // =====================
 //
-// This is **Phase 1** per the agent-aa936a brief. Phase 2 (annotate
-// production code in-place) and Phase 3 (switch call sites in
-// runtime.rs) are NOT shipped because of the three concrete `vstd`
-// capability gaps documented in `T13.2-T13.4-design.md`:
+// This is **Phase 1**. Phase 2 (annotate production code in-place)
+// and Phase 3 (switch call sites in runtime.rs) are NOT shipped
+// because of the three concrete `vstd` capability gaps documented in
+// `T13.2-T13.4-design.md`:
 //
 //   - Gap 1: `AtomicPtr<HashTableEntry>` table swap with overlapping
 //     permission lifetimes for old/current/new allocations. No `vstd`
@@ -59,8 +59,8 @@
 //
 // Per the design doc, the realistic path forward for full T13.4 is a
 // `state_machines!` reformulation, jointly with T13.5's liveness
-// discharge — 5-7 agent-weeks, research-grade. Phase 1 here ships
-// the maximum-tractable production-shape coverage.
+// discharge; research-grade. Phase 1 here ships the
+// maximum-tractable production-shape coverage.
 //
 // What this file gives us beyond `shard_methods.rs`
 // =================================================
@@ -277,8 +277,8 @@ pub fn probe_slot_for_contains(
 //
 //     // The OUTER probe loop (`while probes < capacity`) is not yet a
 //     // Verus exec function — it would require a `decreases capacity -
-//     // probes` clause and an inductive invariant ... ~1 day of work;
-//     // out of scope for the 6-hour T13.4 timebox.
+//     // probes` clause and an inductive invariant ...
+//     // out of scope for the initial T13.4 cycle.
 //
 // We lift it here. The function bodies match production lines 626-643
 // byte-for-byte at the load + 3-way fork structure.

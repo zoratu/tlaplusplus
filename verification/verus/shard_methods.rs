@@ -9,7 +9,7 @@
 //
 // Closing the gap fully (T13.4) requires rewriting `FingerprintShard`
 // to thread `Tracked<PointsTo<HashTableEntry>>` through every method
-// signature — multi-week work.
+// signature — research-grade rewrite work.
 //
 // This file (T13.4 partial) is a **shadow Verus module** that mirrors
 // the hot-path method bodies (`contains` / `contains_or_insert` /
@@ -31,10 +31,10 @@
 //    semantics that tier A's `lemma_insert_then_lookup` is named for.
 //    The shadow `contains_or_insert_normal_path_step` discharges
 //    `cas_step` semantics directly (production lines 805-823).
-// 3. **A drop-in template for the real production rewrite.** When
-//    multi-week T13.4 work happens, the rewrite team has a working
-//    blueprint for what permission threading looks like and what the
-//    contracts must say.
+// 3. **A drop-in template for the real production rewrite.** When the
+//    full T13.4 work happens, the rewrite team has a working blueprint
+//    for what permission threading looks like and what the contracts
+//    must say.
 //
 // What this file does NOT do
 // ==========================
@@ -102,7 +102,7 @@ pub open spec fn probe_index(fp: u64, i: nat, cap: nat) -> int
 // `vstd::raw_ptr::PPtr<HashTableEntry>` and the permission map would
 // become a `Tracked<PointsToArray<HashTableEntry>>`. That requires
 // rewriting `allocate_huge_pages`, `allocate_file_backed`, and the
-// resize swap to thread permissions through — multi-week work.
+// resize swap to thread permissions through — research-grade rewrite work.
 pub struct ShardCells {
     /// Per-slot atomic fingerprint storage. Production lines 103-105
     /// (`fp: AtomicU64` in `HashTableEntry`); production accesses these
@@ -769,8 +769,8 @@ pub fn contains_or_insert_step(
 // - The OUTER probe loop (`while probes < capacity`) is not yet a
 //   Verus exec function — it would require a `decreases capacity -
 //   probes` clause and an inductive invariant tying loop iterations to
-//   tier-A's `probe_terminus_at`. Tractable but ~1 day of work; out of
-//   scope for the 6-hour T13.4 timebox.
+//   tier-A's `probe_terminus_at`. Tractable but out of scope for the
+//   initial T13.4 cycle. (Now lifted in shard_wrapper.rs.)
 // - The seqlock retry loop (lines 559-649) is still proved at the
 //   spec level by tier-A's `lemma_reader_terminates`. Lifting it here
 //   would require modeling `Tracked<&PermissionU64>` flowing across

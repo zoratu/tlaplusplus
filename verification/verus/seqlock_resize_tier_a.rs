@@ -37,9 +37,10 @@
 //    Full Verus tracked-permission integration on the production
 //    `AtomicPtr<HashTableEntry>` would require rewriting the production
 //    code to thread `Tracked<PointsTo<...>>` through every call site.
-//    That is the multi-week tier-A effort flagged in the README; what
-//    this file ships is the *spec-level* CAS soundness proof, which is
-//    the prerequisite for a future production-code annotation pass.
+//    That is the research-grade tier-A effort flagged in the README;
+//    what this file ships is the *spec-level* CAS soundness proof,
+//    which is the prerequisite for a future production-code annotation
+//    pass.
 //
 // 4. **Bounded-resize termination (`T13.3`).** Proves the reader retry
 //    loop in `contains` (page_aligned_fingerprint_store.rs:557-649)
@@ -55,7 +56,7 @@
 // - Raw pointer arithmetic in `unsafe { std::slice::from_raw_parts(...) }`.
 //   Verus has `vstd::raw_ptr` for this but applying it requires
 //   rewriting `FingerprintShard` to thread `Tracked<PointsTo>` through
-//   every call. Estimated effort: still 1-2 agent-weeks.
+//   every call — research-grade rewrite work.
 //
 // - Memory-ordering of `AtomicPtr` (`Acquire`/`Release`/`AcqRel`). The
 //   tier-A model treats each atomic op as sequentially consistent,

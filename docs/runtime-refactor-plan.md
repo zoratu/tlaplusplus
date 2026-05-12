@@ -1,30 +1,14 @@
 # `src/runtime.rs` Refactor Plan
 
-Status: **PARTIALLY LANDED (Path A, chunks 1-7 of 8)** — see "Landed
-chunks" appendix at the bottom of this file. Chunk 7 (worker spawn loop)
-and chunk 8 (shutdown orchestration) remain inline in `runtime.rs`
-pending a follow-up that introduces the `WorkerCtx<M>` struct from the
-"Concurrency-coupling analysis" section. The worker loop in particular
-requires bundling 27 captured Arcs into a single context type so the
-extraction does not regress the T5.4 producer / T6 cluster steal /
-T11.5 violation-finish ordering invariants documented below.
+Status: **PARTIALLY LANDED (Path A, chunks 1-7 of 8)** — see "Landed chunks" appendix at the bottom of this file. Chunk 7 (worker spawn loop) and chunk 8 (shutdown orchestration) remain inline in `runtime.rs` pending a follow-up that introduces the `WorkerCtx<M>` struct from the "Concurrency-coupling analysis" section. The worker loop in particular requires bundling 27 captured Arcs into a single context type so the extraction does not regress the T5.4 producer / T6 cluster steal / T11.5 violation-finish ordering invariants documented below.
 
-`src/runtime.rs` is 4,323 lines. It accreted T5.4 (init producer thread),
-T6 (cluster steal trigger wiring), T10/T10.1-T10.4 (parallel liveness
-post-processing), T10.2 (streaming-SCC oracle), and T11.5 (violation
-handler / `queue.finish()` ordering) on top of the original BFS worker
-loop, termination detection, and checkpoint coordinator.
+`src/runtime.rs` is 4,323 lines. It accreted T5.4 (init producer thread), T6 (cluster steal trigger wiring), T10/T10.1-T10.4 (parallel liveness post-processing), T10.2 (streaming-SCC oracle), and T11.5 (violation handler / `queue.finish()` ordering) on top of the original BFS worker loop, termination detection, and checkpoint coordinator.
 
-This document captures the proposed module split, the dependency graph
-between submodules, and — most importantly — the concurrency-coupling
-analysis that forced the conclusion that the refactor cannot be landed
-in the time budget under the working constraint that all `cargo` runs
-must happen on a remote spot host.
+This document captures the proposed module split, the dependency graph between submodules, and the concurrency-coupling analysis that forced the conclusion that the refactor cannot land in a single session under the working constraint that all `cargo` runs must happen on a remote spot host.
 
 ## Why this is design-only
 
-The split itself is mechanical, but every chunk has to be validated by
-the full gate set on the remote host:
+The split itself is mechanical, but every chunk has to be validated by the full gate set on the remote host:
 
 - `cargo test --release` (~790 tests)
 - `cargo test --release --features failpoints` (~812 tests, single-threaded)
@@ -34,18 +18,11 @@ the full gate set on the remote host:
 - `cargo test --release --test cross_node_steal_handshake`
 - `cargo test --release --test streaming_init_t5_4`
 
-Running each chunk's gates over the remote spot loop, with build cache
-warmups, conservatively costs 25-40 min/chunk. With 8 chunks (see
-**Move plan** below) that is 4-6 hours of pure validation, plus
-diagnosis + re-roll on any chunk that breaks. The 8-hour budget does
-not absorb a single broken chunk; landing partial moves violates the
-binary quality bar. Path B keeps the design captured and defers the
-move to a session that can sit on the spot host with a hot build cache.
+Running each chunk's gates over the remote spot loop, with build cache warmups, has substantial validation cost per chunk plus diagnosis + re-roll on any chunk that breaks. Landing partial moves violates the binary quality bar. Path B keeps the design captured and defers the move to a session that can sit on the spot host with a hot build cache.
 
 ## Top-level definitions today (line numbers)
 
-Index of every top-level definition in `src/runtime.rs` as of
-`f161249`:
+Index of every top-level definition in `src/runtime.rs` as of `f161249`:
 
 | Lines | Name | Visibility | Notes |
 |---|---|---|---|
@@ -89,8 +66,7 @@ External `pub` consumers:
 
 - `src/lib.rs` re-exports the six items above.
 - `src/simulation.rs` imports `PropertyType, Violation`.
-- `reconstruct_trace` and `reconstruct_trace_limited` are `pub` but
-  not re-exported. Both are reachable as `crate::runtime::*` paths.
+- `reconstruct_trace` and `reconstruct_trace_limited` are `pub` but not re-exported. Both are reachable as `crate::runtime::*` paths.
 
 ## Proposed module tree
 
@@ -214,139 +190,65 @@ pub fn run_model<M: Model>(model: M, config: EngineConfig) -> Result<RunOutcome<
 }
 ```
 
-`SharedRuntimeState` is the **only new abstraction** the refactor
-introduces. Everything else is pure code motion.
+`SharedRuntimeState` is the **only new abstraction** the refactor introduces. Everything else is pure code motion.
 
 ## Concurrency-coupling analysis
 
-The reason this is hard is that `run_model` is a single function whose
-correctness depends on the **textual order** of statements that touch
-several Arc-wrapped atomics. Each move chunk has to preserve:
+The reason this is hard is that `run_model` is a single function whose correctness depends on the **textual order** of statements that touch several Arc-wrapped atomics. Each move chunk has to preserve:
 
 ### 1. T5.4 init-producer ordering (lines 1538-1669, 2244, 2416-2423, 2868-2882)
 
 Invariants:
 
-- `init_producing: Arc<AtomicBool>` is set to `true` **before** the
-  producer thread is spawned (line 1538), then cleared by a Drop guard
-  inside the producer thread closure (lines 1571-1577) so that a
-  panic inside the producer doesn't strand workers.
-- Workers (line 2420) check `init_producing.load(Acquire)` after
-  `has_pending_work()` returns `false` and before terminating. Order
-  matters: queue check first, producer check second. Reversing this
-  introduces a race where a state pushed by the producer between the
-  two checks would be missed by the terminating worker.
-- The producer joins **after** all workers join (line 2872 vs line
-  2840). This is load-bearing: the workers' termination check above
-  reads `init_producing` and a producer that exits before workers
-  must have cleared the flag (via Drop) so workers can terminate.
+- `init_producing: Arc<AtomicBool>` is set to `true` **before** the producer thread is spawned (line 1538), then cleared by a Drop guard inside the producer thread closure (lines 1571-1577) so that a panic inside the producer doesn't strand workers.
+- Workers (line 2420) check `init_producing.load(Acquire)` after `has_pending_work()` returns `false` and before terminating. Order matters: queue check first, producer check second. Reversing this introduces a race where a state pushed by the producer between the two checks would be missed by the terminating worker.
+- The producer joins **after** all workers join (line 2872 vs line 2840). This is load-bearing: the workers' termination check above reads `init_producing` and a producer that exits before workers must have cleared the flag (via Drop) so workers can terminate.
 
-Refactor risk: extracting `spawn_init_producer` is mechanical, but the
-worker-loop check at line 2420 must stay in the **same textual position
-relative to the queue check and the cluster-idle handshake**. This
-means `worker/loop.rs` must keep the empty-pop branch (lines 2353-2461)
-in one continuous block — splitting it across helpers would obscure
-the ordering and risk a future contributor reordering them.
+Refactor risk: extracting `spawn_init_producer` is mechanical, but the worker-loop check at line 2420 must stay in the **same textual position relative to the queue check and the cluster-idle handshake**. This means `worker/loop.rs` must keep the empty-pop branch (lines 2353-2461) in one continuous block — splitting it across helpers would obscure the ordering and risk a future contributor reordering them.
 
 ### 2. T6 cluster steal-trigger and idle-flag handshake (lines 2148-2211, 2452-2458, 2826-2832)
 
 Invariants:
 
-- `stealer.set_locally_idle(true)` is called on the empty-pop path
-  (line 2454) before the worker waits 10ms. T6 fix history (line 2448
-  comment): previously this was only set on worker exit, which deadlocked
-  cluster termination consensus.
-- `stealer.set_locally_idle(false)` is called as soon as a worker pops
-  a state (line 2474), and `note_local_work()` fires every
-  STATS_FLUSH_INTERVAL (line 2495).
-- `stealer.set_locally_idle(true)` also fires on the **last** worker
-  exit (line 2828: `if remaining == 1`).
-- `spawn_steal_trigger_task` is spawned unconditionally inside the
-  `Some(stealer)` branch (line 2203), even though it short-circuits
-  on singleton clusters internally.
+- `stealer.set_locally_idle(true)` is called on the empty-pop path (line 2454) before the worker waits 10ms. T6 fix history (line 2448 comment): previously this was only set on worker exit, which deadlocked cluster termination consensus.
+- `stealer.set_locally_idle(false)` is called as soon as a worker pops a state (line 2474), and `note_local_work()` fires every STATS_FLUSH_INTERVAL (line 2495).
+- `stealer.set_locally_idle(true)` also fires on the **last** worker exit (line 2828: `if remaining == 1`).
+- `spawn_steal_trigger_task` is spawned unconditionally inside the `Some(stealer)` branch (line 2203), even though it short-circuits on singleton clusters internally.
 
-Refactor risk: the three idle-flag transitions in the worker loop must
-all stay in `worker/loop.rs`. The steal-trigger spawn moves cleanly
-into `distributed.rs::spawn_handlers_if_any`. The `local_pending_fn`
-closure (lines 2167-2173) — which bridges `pending_count()` over-reporting
-via `has_pending_work()` — must remain as a unit; it cannot be split
-across files.
+Refactor risk: the three idle-flag transitions in the worker loop must all stay in `worker/loop.rs`. The steal-trigger spawn moves cleanly into `distributed.rs::spawn_handlers_if_any`. The `local_pending_fn` closure (lines 2167-2173) — which bridges `pending_count()` over-reporting via `has_pending_work()` — must remain as a unit; it cannot be split across files.
 
 ### 3. T11.5 violation finish ordering (lines 2530-2557)
 
 Invariants:
 
-- On a safety violation that triggers `should_stop`, the order is
-  fixed: (a) `worker_violation_tx.try_send`, (b) `violation_count.fetch_add`,
-  (c) `worker_stop.store(true, Release)`, (d) `worker_queue.finish()`,
-  (e) `worker_queue.worker_idle(id)`, (f) `break`.
-- `queue.finish()` (step d) is **the** fix for T11.5: without it,
-  orphan items in the violator's local deque keep `should_terminate`
-  returning false for siblings, causing a hang. The final `queue.finish()`
-  in the `run_model` shutdown path (line 2897) is a separate call that
-  fires after all workers join.
+- On a safety violation that triggers `should_stop`, the order is fixed: (a) `worker_violation_tx.try_send`, (b) `violation_count.fetch_add`, (c) `worker_stop.store(true, Release)`, (d) `worker_queue.finish()`, (e) `worker_queue.worker_idle(id)`, (f) `break`.
+- `queue.finish()` (step d) is **the** fix for T11.5: without it, orphan items in the violator's local deque keep `should_terminate` returning false for siblings, causing a hang. The final `queue.finish()` in the `run_model` shutdown path (line 2897) is a separate call that fires after all workers join.
 
-Refactor risk: the violation-handler block (lines 2499-2559) cannot be
-extracted to a free function unless the function takes `&worker_queue`,
-`&worker_stop`, `&worker_violation_tx`, `&worker_violation_count`, and
-the trace-reconstruction closure references (`worker_parent_map`,
-`worker_state_map`). That signature is so wide that the helper would
-not actually shrink the worker loop in any meaningful way — the helper
-body is also shorter than its signature. Recommendation: keep it inline
-in `worker/loop.rs`. Same for the T5.4/T6 idle handshake.
+Refactor risk: the violation-handler block (lines 2499-2559) cannot be extracted to a free function unless the function takes `&worker_queue`, `&worker_stop`, `&worker_violation_tx`, `&worker_violation_count`, and the trace-reconstruction closure references (`worker_parent_map`, `worker_state_map`). That signature is so wide that the helper would not actually shrink the worker loop in any meaningful way — the helper body is also shorter than its signature. Recommendation: keep it inline in `worker/loop.rs`. Same for the T5.4/T6 idle handshake.
 
 ### 4. T10 liveness post-processing dependency on transitions DashMap
 
-The fairness path (lines 3022-3590) reads `labeled_transitions: Arc<DashMap<...>>`
-that workers populate during exploration (lines 2586-2606). Workers
-must have all joined before the post-processing reads, because the
-parallel-flatten path uses raw shard locks (`unsafe { let raw_iter = guard.iter() }`)
-and would race with concurrent inserts.
+The fairness path (lines 3022-3590) reads `labeled_transitions: Arc<DashMap<...>>` that workers populate during exploration (lines 2586-2606). Workers must have all joined before the post-processing reads, because the parallel-flatten path uses raw shard locks (`unsafe { let raw_iter = guard.iter() }`) and would race with concurrent inserts.
 
-The barrier is the worker-join loop (line 2840). The init-producer
-join (line 2872) happens after worker join, so producer-side fingerprint-only
-states are not in `labeled_transitions` (only workers populate it via
-`worker_model.next_states_labeled`).
+The barrier is the worker-join loop (line 2840). The init-producer join (line 2872) happens after worker join, so producer-side fingerprint-only states are not in `labeled_transitions` (only workers populate it via `worker_model.next_states_labeled`).
 
-Refactor risk: `liveness.rs` must be invoked **after**
-`shutdown::orchestrate`'s worker-join phase, before the `RunOutcome`
-is built. The cleanest split is: `shutdown::orchestrate` returns the
-joined workers and the run_stats snapshot, then the orchestrator in
-`mod.rs::run_model` calls `liveness::run_post_processing` with the
-DashMap. The current code structure already follows this order; the
-refactor preserves it.
+Refactor risk: `liveness.rs` must be invoked **after** `shutdown::orchestrate`'s worker-join phase, before the `RunOutcome` is built. The cleanest split is: `shutdown::orchestrate` returns the joined workers and the run_stats snapshot, then the orchestrator in `mod.rs::run_model` calls `liveness::run_post_processing` with the DashMap. The current code structure already follows this order; the refactor preserves it.
 
 ### 5. Per-worker state ownership
 
-`worker_states: Vec<WorkerState>` (line 1445) is moved into the
-worker spawn closures via `into_iter().enumerate()`. Each worker owns
-its own `WorkerState`. Refactor risk: `worker::spawn` must take
-`worker_state: WorkerState` by value, not by `&mut` — moving across
-the thread boundary is the existing semantics.
+`worker_states: Vec<WorkerState>` (line 1445) is moved into the worker spawn closures via `into_iter().enumerate()`. Each worker owns its own `WorkerState`. Refactor risk: `worker::spawn` must take `worker_state: WorkerState` by value, not by `&mut` — moving across the thread boundary is the existing semantics.
 
 ### 6. Closures over local `flush_local_stats` and `process_batch`
 
-`flush_local_stats` (lines 2297-2329) and `process_batch` (lines
-2651-2769) are closures defined inside the worker loop. Both close over
-`&mut` locals (`local_states_processed`, `pending_batch`, `local_fp_dedup`,
-`unique_states`, `unique_fps`, `batch_seen`, `local_fp_cache`,
-`local_fp_cache_hits`, `states_with_home_numa`, `fps_to_check`,
-`states_to_check`).
+`flush_local_stats` (lines 2297-2329) and `process_batch` (lines 2651-2769) are closures defined inside the worker loop. Both close over `&mut` locals (`local_states_processed`, `pending_batch`, `local_fp_dedup`, `unique_states`, `unique_fps`, `batch_seen`, `local_fp_cache`, `local_fp_cache_hits`, `states_with_home_numa`, `fps_to_check`, `states_to_check`).
 
 Extracting them as free functions requires either:
 
-(a) Passing **all** these `&mut` locals as parameters (function
-    signature ~12 params, `&mut` for half of them, plus
-    `&Arc<UnifiedFingerprintStore>`, `&Arc<DashMap<...>>`,
-    `&Arc<AtomicU64>`, `&AtomicRunStats`).
+(a) Passing **all** these `&mut` locals as parameters (function signature ~12 params, `&mut` for half of them, plus `&Arc<UnifiedFingerprintStore>`, `&Arc<DashMap<...>>`, `&Arc<AtomicU64>`, `&AtomicRunStats`).
 
-(b) Bundling them into a `WorkerLocalState` struct that the worker
-    loop owns, with `WorkerLocalState::process_batch(&mut self, ...)`
-    methods. This is the recommended path but introduces a new
-    struct and ~120 LOC of plumbing per method.
+(b) Bundling them into a `WorkerLocalState` struct that the worker loop owns, with `WorkerLocalState::process_batch(&mut self, ...)` methods. This is the recommended path but introduces a new struct and ~120 LOC of plumbing per method.
 
-Either option is correctness-preserving but **non-trivial** to validate
-without running the full test gate set on each iteration.
+Either option is correctness-preserving but **non-trivial** to validate without running the full test gate set on each iteration.
 
 ### 7. Shutdown ordering (lines 2837-2999)
 
@@ -366,20 +268,13 @@ The shutdown phase has 13 distinct steps in a specific order:
 12. Violation collection — 3010-3019
 13. Liveness post-processing — 3048-3590
 
-Steps 1-12 are fixed; reordering breaks crash-recovery semantics or
-risks deadlock. Step 13 must come after step 11 (errors) but before
-the final `RunOutcome` build because `violation` may be reassigned by
-liveness.
+Steps 1-12 are fixed; reordering breaks crash-recovery semantics or risks deadlock. Step 13 must come after step 11 (errors) but before the final `RunOutcome` build because `violation` may be reassigned by liveness.
 
-Refactor risk: `shutdown.rs::orchestrate` must encode these 13 steps
-in this order. The function signature is wide (it needs Arc clones of
-every shared atomic, every JoinHandle, every queue/fp_store handle,
-plus `&config` and `started_at`).
+Refactor risk: `shutdown.rs::orchestrate` must encode these 13 steps in this order. The function signature is wide (it needs Arc clones of every shared atomic, every JoinHandle, every queue/fp_store handle, plus `&config` and `started_at`).
 
 ## Move plan (sequence)
 
-If a future session attempts the move, the chunks should be applied
-**in this order**, with the full gate set run between each:
+If a future session attempts the move, the chunks should be applied **in this order**, with the full gate set run between each:
 
 | # | Chunk | Touches | Why first/last |
 |---|---|---|---|
@@ -392,20 +287,15 @@ If a future session attempts the move, the chunks should be applied
 | 7 | `worker/loop.rs` + `worker/batch.rs` | Lines 2213-2834 | **Largest risk**; T6, T11.5, T5.4 worker checks |
 | 8 | `liveness.rs` + `shutdown.rs` + final `mod.rs` cleanup | Lines 2837-3631 | Orchestrator becomes the new run_model |
 
-Validation cost (estimated, on c8g.metal-24xl with hot cache):
+Validation gates (run on c8g.metal-24xl with hot cache):
 
-| Gate | Time |
-|---|---|
-| `cargo test --release` | ~6 min |
-| `cargo test --release --features failpoints --test-threads 2` | ~12 min |
-| `cargo test --release --features symbolic-init` | ~7 min |
-| `scripts/diff_tlc.sh` | ~5 min (13 specs sequential) |
-| Targeted regressions (T1.3 fairness, T6 steal, T5.4 producer) | ~3 min |
+- `cargo test --release`
+- `cargo test --release --features failpoints --test-threads 2`
+- `cargo test --release --features symbolic-init`
+- `scripts/diff_tlc.sh` (13 specs sequential)
+- Targeted regressions (T1.3 fairness, T6 steal, T5.4 producer)
 
-Total per chunk: ~33 min. 8 chunks = ~4.4 hours of clean validation,
-with zero re-rolls. Realistic with a single re-roll allowance per
-chunk: ~6.5 hours. Not safely landable in 8 hours when the operator
-can't watch the spot host.
+Each chunk has substantial validation cost; the full eight-chunk landing requires sustained operator attention on the spot host with a hot build cache.
 
 ## Tests that move with each chunk
 
@@ -419,59 +309,31 @@ can't watch the spot host.
 
 ## Visibility audit
 
-Every helper currently private stays private after refactor. The
-private-to-`runtime/`-but-cross-submodule items become `pub(super)`
-(or `pub(crate::runtime)` via `pub(crate)` if Rust ever stabilizes
-nested `pub(in path)` ergonomics). Specifically:
+Every helper currently private stays private after refactor. The private-to-`runtime/`-but-cross-submodule items become `pub(super)` (or `pub(crate::runtime)` via `pub(crate)` if Rust ever stabilizes nested `pub(in path)` ergonomics). Specifically:
 
-- `PauseController`, `next_quiescence_timeout_secs`,
-  `request_checkpoint_pause`, `pause_worker_after_empty_pop_during_checkpoint`,
-  `CheckpointPauseQueue` — `pub(super)` from `pause.rs`.
-- `CheckpointManifest`, `MAX_CHECKPOINT_FILES`, `write_checkpoint_manifest`,
-  `load_checkpoint_manifest`, `write_validated_rolling_checkpoint`,
-  `prune_old_checkpoints` — `pub(super)` from `checkpoint::manifest`.
+- `PauseController`, `next_quiescence_timeout_secs`, `request_checkpoint_pause`, `pause_worker_after_empty_pop_during_checkpoint`, `CheckpointPauseQueue` — `pub(super)` from `pause.rs`.
+- `CheckpointManifest`, `MAX_CHECKPOINT_FILES`, `write_checkpoint_manifest`, `load_checkpoint_manifest`, `write_validated_rolling_checkpoint`, `prune_old_checkpoints` — `pub(super)` from `checkpoint::manifest`.
 - `AtomicRunStats` — `pub(super)` from `stats.rs`.
-- `compute_effective_memory_max`, `should_enable_file_backed_fingerprint_store`,
-  `should_start_fingerprint_memory_monitor`, `apply_memory_budget`,
-  `calculate_optimal_shard_count` — `pub(super)` from their respective files.
+- `compute_effective_memory_max`, `should_enable_file_backed_fingerprint_store`, `should_start_fingerprint_memory_monitor`, `apply_memory_budget`, `calculate_optimal_shard_count` — `pub(super)` from their respective files.
 
-External `pub` items (the six in `lib.rs::pub use`) keep `pub`
-visibility from `runtime/mod.rs`.
+External `pub` items (the six in `lib.rs::pub use`) keep `pub` visibility from `runtime/mod.rs`.
 
 ## What gets fixed in follow-ups (not now)
 
 Bugs and code-smell I noticed while reading; **none are fixed inline**:
 
-1. `CheckpointContext` and `checkpoint_once` (lines 906-994) are
-   `#[allow(dead_code)]`. They've been superseded by the inline
-   checkpoint-thread body. File a follow-up to delete after refactor.
-2. `RunStats::queue` is built in the final `RunOutcome` (lines 3613-3625)
-   with **zeros** for `spilled_items`, `spill_batches`, `loaded_segments`,
-   `loaded_items`, `max_inmem_len`, `spill_lost_permanently`. The actual
-   `WorkStealingStats` doesn't carry these — they live on the spillable
-   queue's own stats. The on-exit-checkpoint manifest (line 2952) calls
-   `queue.stats()` which **does** return spill numbers — different shape.
-   File follow-up: unify the stats schema.
-3. `process_batch` line 2769 returns `Ok(())` but its `.is_ok()` check
-   on lines 2776-2785 / 2793-2802 — only the error path matters. This
-   is fine but the closure is awkward; converting to a method on
-   `WorkerLocalState` would make the control flow clearer.
-4. The compressed-ring summary print (lines 2985-2999) is in
-   `run_model` shutdown but conditionally fires only if the spillable
-   queue has compression stats. Belongs in `shutdown.rs`.
+1. `CheckpointContext` and `checkpoint_once` (lines 906-994) are `#[allow(dead_code)]`. They've been superseded by the inline checkpoint-thread body. File a follow-up to delete after refactor.
+2. `RunStats::queue` is built in the final `RunOutcome` (lines 3613-3625) with **zeros** for `spilled_items`, `spill_batches`, `loaded_segments`, `loaded_items`, `max_inmem_len`, `spill_lost_permanently`. The actual `WorkStealingStats` doesn't carry these — they live on the spillable queue's own stats. The on-exit-checkpoint manifest (line 2952) calls `queue.stats()` which **does** return spill numbers — different shape. File follow-up: unify the stats schema.
+3. `process_batch` line 2769 returns `Ok(())` but its `.is_ok()` check on lines 2776-2785 / 2793-2802 — only the error path matters. This is fine but the closure is awkward; converting to a method on `WorkerLocalState` would make the control flow clearer.
+4. The compressed-ring summary print (lines 2985-2999) is in `run_model` shutdown but conditionally fires only if the spillable queue has compression stats. Belongs in `shutdown.rs`.
 
 ## Commit hash this plan was written against
 
-`f161249` (`chore: remove extracted Java class files, update .gitignore`)
-on branch `worktree-agent-a6e9544466376a95d`.
+`f161249` (`chore: remove extracted Java class files, update .gitignore`).
 
 ## Landed chunks (Path A, partial)
 
-Six commits on top of `f161249` extract the easy + medium chunks. The
-file shrinks from 4,323 LOC to 2,451 LOC (-43%); the bulk of what
-remains is the worker spawn loop (587 LOC, chunk 7) and the 13-step
-shutdown phase (chunk 8). All gates (790 default tests, 812 failpoint,
-817 symbolic-init, 13/13 diff_tlc, chaos smoke 12/12) remain green.
+Six commits on top of `f161249` extract the easy + medium chunks. The file shrinks from 4,323 LOC to 2,451 LOC (-43%); the bulk of what remains is the worker spawn loop (587 LOC, chunk 7) and the 13-step shutdown phase (chunk 8). All gates (790 default tests, 812 failpoint, 817 symbolic-init, 13/13 diff_tlc, chaos smoke 12/12) remain green.
 
 | Chunk | File(s) | LOC moved | Notes |
 |---|---|---:|---|
@@ -483,51 +345,23 @@ shutdown phase (chunk 8). All gates (790 default tests, 812 failpoint,
 | 6 | `runtime/progress.rs` + `runtime/distributed.rs` | 226 + 100 | Progress thread + T6 handler wiring |
 | 7 | `runtime/liveness.rs` | 598 | T10/T10.1-T10.4 + T10.2 oracle |
 
-Total: ~2,202 LOC moved across 9 new files (one of which is `liveness.rs`
-at 598 LOC, almost entirely a verbatim move of the post-BFS fairness
-pipeline). `runtime.rs` retains the orchestration scaffold + worker
-spawn loop + shutdown.
+Total: ~2,202 LOC moved across 9 new files (one of which is `liveness.rs` at 598 LOC, almost entirely a verbatim move of the post-BFS fairness pipeline). `runtime.rs` retains the orchestration scaffold + worker spawn loop + shutdown.
 
 ### Not landed (deferred to a follow-up session)
 
-**Chunk 7 (worker spawn loop, 587 LOC).** The worker thread closure
-captures 27 distinct `Arc<...>` clones plus the per-worker `WorkerState`
-by value. Internal `flush_local_stats` and `process_batch` closures
-themselves close over 12+ `&mut` locals. The "Closures over local
-flush_local_stats and process_batch" section above describes the two
-options: a 12-param free function or a `WorkerLocalState` struct with
-~120 LOC of plumbing. Either is doable but each option needs a focused
-session that can iterate quickly on the spot host (compile errors will
-cascade through the worker body), and the T6 idle-flag handshake plus
-T11.5 violation-finish ordering must be re-validated against
-`wrapper_next_fairness_t1_3`, `streaming_init_t5_4`, and
-`cross_node_steal_handshake` after each iteration.
+**Chunk 7 (worker spawn loop, 587 LOC).** The worker thread closure captures 27 distinct `Arc<...>` clones plus the per-worker `WorkerState` by value. Internal `flush_local_stats` and `process_batch` closures themselves close over 12+ `&mut` locals. The "Closures over local flush_local_stats and process_batch" section above describes the two options: a 12-param free function or a `WorkerLocalState` struct with ~120 LOC of plumbing. Either is doable but each option needs a focused session that can iterate quickly on the spot host (compile errors will cascade through the worker body), and the T6 idle-flag handshake plus T11.5 violation-finish ordering must be re-validated against `wrapper_next_fairness_t1_3`, `streaming_init_t5_4`, and `cross_node_steal_handshake` after each iteration.
 
-**Chunk 8 (shutdown.rs, ~250 LOC).** The 13-step shutdown phase
-(worker join → init join → progress stop → auto-tuner join → queue
-finish → mem monitor stop+unpark+join → checkpoint stop+resume+join
-→ exit checkpoint write → fp_store flush → compression stats →
-worker error drain → violation collection) is currently 13 sequential
-fragments interleaved with state collection. Extracting it requires
-either a wide-signature `shutdown::orchestrate(...)` function or a
-ShutdownContext struct. The signature is wide because the function
-needs Arc clones of every shared atomic, every JoinHandle, every
-queue/fp_store handle, plus `&config` and `started_at`.
+**Chunk 8 (shutdown.rs, ~250 LOC).** The 13-step shutdown phase (worker join → init join → progress stop → auto-tuner join → queue finish → mem monitor stop+unpark+join → checkpoint stop+resume+join → exit checkpoint write → fp_store flush → compression stats → worker error drain → violation collection) is currently 13 sequential fragments interleaved with state collection. Extracting it requires either a wide-signature `shutdown::orchestrate(...)` function or a ShutdownContext struct. The signature is wide because the function needs Arc clones of every shared atomic, every JoinHandle, every queue/fp_store handle, plus `&config` and `started_at`.
 
 ### Validation snapshot at the chunk-7 head
 
 - `cargo build --release` — clean.
 - `cargo build --release --features failpoints` — clean.
 - `cargo test --release` — 790 pass, 0 fail, 8 ignored.
-- `cargo test --release --features failpoints --test-threads=2` — 812
-  pass, 0 fail, 8 ignored.
-- `cargo test --release --features symbolic-init` — 817 pass, 0 fail,
-  8 ignored.
+- `cargo test --release --features failpoints --test-threads=2` — 812 pass, 0 fail, 8 ignored.
+- `cargo test --release --features symbolic-init` — 817 pass, 0 fail, 8 ignored.
 - `scripts/diff_tlc.sh` — 13/13 specs match TLC v2.19 state counts.
 - `scripts/chaos_smoke.sh` — 12/12 failpoints exercised, 0 divergences.
-- `cargo test --release --test wrapper_next_fairness_t1_3` — 2/2 pass
-  (T1.3 fairness regression).
-- `cargo test --release --test streaming_init_t5_4` — 1/1 pass (T5.4
-  producer regression).
-- `cargo test --release --test cross_node_steal_handshake` — 3/3 pass
-  (T6 handshake).
+- `cargo test --release --test wrapper_next_fairness_t1_3` — 2/2 pass (T1.3 fairness regression).
+- `cargo test --release --test streaming_init_t5_4` — 1/1 pass (T5.4 producer regression).
+- `cargo test --release --test cross_node_steal_handshake` — 3/3 pass (T6 handshake).

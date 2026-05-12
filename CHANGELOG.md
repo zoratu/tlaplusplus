@@ -119,7 +119,7 @@ Patch release closing out the v1.2.0 deferred-items list. 25 commits on top of v
 
 T204 distributed mock for the cluster handler — `Transport` trait + `MockTransport` (in-memory tokio mpsc channels); `DistributedWorkStealer` switched to `Arc<dyn Transport>`. 10 new tests exercise the inbound handler / bloom-and-termination / steal-trigger paths without real TCP.
 
-`src/runtime.rs` extraction chunks 7 + 8 — both extracted. Chunk 8 (13-step shutdown phase) → `src/runtime/shutdown.rs` (`ShutdownContext` + `orchestrate`). Chunk 7 (worker spawn loop, 27-Arc capture) → `src/runtime/worker.rs` (`WorkerLocalState`). 
+`src/runtime.rs` extraction chunks 7 + 8 — both extracted. Chunk 8 (13-step shutdown phase) → `src/runtime/shutdown.rs` (`ShutdownContext` + `orchestrate`). Chunk 7 (worker spawn loop, 27-Arc capture) → `src/runtime/worker.rs` (`WorkerLocalState`).
 
 `src/tla/eval.rs` split — all 8 chunks (A–H) of the design doc landed. The monolith becomes 13 submodule files under `src/tla/eval/`. External API surface unchanged.
 
@@ -145,79 +145,41 @@ T13.4 Phase 1 — production-shape verified wrapper at `verification/verus/shard
 
 ## v1.2.0 (2026-05-07)
 
-Patch release driven by extensive fuzz + mutation testing. Six T20X
-soundness fixes in the compiled-eval / compiled-expr paths, two large
-refactors that improve testability without behavioural change, and
-+281 targeted compiler-helper tests across 8 iterations that lift the
-compiler mutation kill rate from 42% → 65%.
+Patch release driven by extensive fuzz + mutation testing. Six T20X soundness fixes in the compiled-eval / compiled-expr paths, two large refactors that improve testability without behavioural change, and +281 targeted compiler-helper tests across 8 iterations that lift the compiler mutation kill rate from 42% → 65%.
 
 ### Compiler-vs-interpreter soundness (T201–T207)
 
-- **T201** — Fuzz harness OOM. Six allocator sites (range, set
-  comprehension, function constructor) now charge `ctx.check_budget`
-  before allocating. Fuzz harness raised to `-rss_limit_mb=8192`.
-- **T202** — Compiler `LAMBDA` parser was looser than interpreter.
-  Tightened to mirror `eval.rs::parse_lambda` word-boundary rules.
-- **T203** — `LET`-binding eval OOM. Compiler now charges
-  `local_definitions.len() + defs.len()` before
-  `with_local_definitions`.
+- **T201** — Fuzz harness OOM. Six allocator sites (range, set comprehension, function constructor) now charge `ctx.check_budget` before allocating. Fuzz harness raised to `-rss_limit_mb=8192`.
+- **T202** — Compiler `LAMBDA` parser was looser than interpreter. Tightened to mirror `eval.rs::parse_lambda` word-boundary rules.
+- **T203** — `LET`-binding eval OOM. Compiler now charges `local_definitions.len() + defs.len()` before `with_local_definitions`.
 - **T204** — Per-call entry-point eval budget tick.
-- **T205** — Bare `IOEnv` / `EmptyBag` in compiled eval. Compiler now
-  dispatches bare zero-arg builtins instead of falling through to
-  `ModelValue`.
-- **T206** — Chained binary `+`/`-` arithmetic. Compiler detects 3+
-  chains via `has_chained_top_level_arithmetic` and emits
-  `CompiledExpr::Unparsed` to delegate to the interpreter (the
-  reference). Generalises the per-shape T101.1 fixes.
-- **T207** — Compiler typed `SubSeq` accepted `m=0`. Surfaced by
-  mutation testing. `CompiledExpr::SubSeq` now mirrors the
-  interpreter's `m >= 1` validation.
+- **T205** — Bare `IOEnv` / `EmptyBag` in compiled eval. Compiler now dispatches bare zero-arg builtins instead of falling through to `ModelValue`.
+- **T206** — Chained binary `+`/`-` arithmetic. Compiler detects 3+ chains via `has_chained_top_level_arithmetic` and emits `CompiledExpr::Unparsed` to delegate to the interpreter (the reference). Generalises the per-shape T101.1 fixes.
+- **T207** — Compiler typed `SubSeq` accepted `m=0`. Surfaced by mutation testing. `CompiledExpr::SubSeq` now mirrors the interpreter's `m >= 1` validation.
 
 ### Testing infrastructure — mutation kill rate 42% → 65%
 
 Eight iterations of compiler-helper coverage:
 
-- **T207 (iter 1, +66 tests).** Arity guards, scope protection,
-  membership shapes, short-circuit. **42.4% → 55.7%**. Surfaced T207
-  SubSeq m<1 soundness fix.
-- **T207b (iter 2, +46 tests).** Chain-detection boundaries,
-  community-module ops, arithmetic edges. **55.7% → 59.4%**.
-- **T207c (iter 3, +77 tests).** Deep-recursion stress (280+ levels),
-  direct unit tests on private scanner helpers. **59.4% → 61.3%**.
-- **Iter 4 (assertion fix).** Tightened deep-recursion assertions
-  from Ok-or-Err to Err-only. **61.3% → 62.8%**.
-- **T207d (iter 5, +40 tests).** Direct boundary tests for scanner
-  helpers — quantifier/EXCEPT/definition-equals/relop-disambiguation.
-  **62.8% → 63.7%**.
-- **T207e (iter 6, +28 tests).** More built-in deep recursion,
-  exhaustive membership shapes. **63.7% → 65.3%**.
-- **T207f (iter 7, +6 RECURSIVE tests).** `RECURSIVE Op(_)` chains
-  for user-defined op dispatch. **65.3% → 66.0%**.
-- **T207g (iter 8, +18 tests).** Deep recursion through every relop
-  and arithmetic dispatch arm. **66.0% → 65.4%** (mutation-to-mutation
-  variance dominates at this point).
-- **Dead code.** Removed `split_top_level_old` (annotated
-  `#[allow(dead_code)]`, never called) — surfaced as 158 noise
-  mutants in iter 1.
+- **T207 (iter 1, +66 tests).** Arity guards, scope protection, membership shapes, short-circuit. **42.4% → 55.7%**. Surfaced T207 SubSeq m<1 soundness fix.
+- **T207b (iter 2, +46 tests).** Chain-detection boundaries, community-module ops, arithmetic edges. **55.7% → 59.4%**.
+- **T207c (iter 3, +77 tests).** Deep-recursion stress (280+ levels), direct unit tests on private scanner helpers. **59.4% → 61.3%**.
+- **Iter 4 (assertion fix).** Tightened deep-recursion assertions from Ok-or-Err to Err-only. **61.3% → 62.8%**.
+- **T207d (iter 5, +40 tests).** Direct boundary tests for scanner helpers — quantifier/EXCEPT/definition-equals/relop-disambiguation. **62.8% → 63.7%**.
+- **T207e (iter 6, +28 tests).** More built-in deep recursion, exhaustive membership shapes. **63.7% → 65.3%**.
+- **T207f (iter 7, +6 RECURSIVE tests).** `RECURSIVE Op(_)` chains for user-defined op dispatch. **65.3% → 66.0%**.
+- **T207g (iter 8, +18 tests).** Deep recursion through every relop and arithmetic dispatch arm. **66.0% → 65.4%** (mutation-to-mutation variance dominates at this point).
+- **Dead code.** Removed `split_top_level_old` (annotated `#[allow(dead_code)]`, never called) — surfaced as 158 noise mutants in iter 1.
 
-Convergence at ~65–66% reflects equivalent mutants in compiler
-internal helpers (multiple `depth + 1` sites where the outer dispatch's
-depth check fires first, masking inner mutations). The compiler's real
-soundness guarantee is the layered safety net — T2 proptest equivalence
+Convergence at ~65–66% reflects equivalent mutants in compiler internal helpers (multiple `depth + 1` sites where the outer dispatch's depth check fires first, masking inner mutations). The compiler's real soundness guarantee is the layered safety net — T2 proptest equivalence
 + `fuzz_tla_swarm` + diff-vs-TLC + state-graph snapshots. Every real
 soundness bug found this cycle (T201–T207) came from those layers.
 
 ### Refactors (no behavioural change)
 
-- **`src/main.rs` split.** CLI dispatch tree split into
-  12 modules under `src/cli/`.
-- **`src/runtime.rs` partial split.** Seven extraction chunks
-  landed (PauseController, checkpoint manifest, memory budget, shard
-  count, AtomicRunStats, T5.4 init producer, T10 liveness post-
-  processing, distributed handler wiring, progress tick); +64 unit
-  tests.
-- **T204.1.** `DistributedWorkStealer::print_stats()` wired into the
-  cluster run summary so steal counters surface by default.
+- **`src/main.rs` split.** CLI dispatch tree split into 12 modules under `src/cli/`.
+- **`src/runtime.rs` partial split.** Seven extraction chunks landed (PauseController, checkpoint manifest, memory budget, shard count, AtomicRunStats, T5.4 init producer, T10 liveness post- processing, distributed handler wiring, progress tick); +64 unit tests.
+- **T204.1.** `DistributedWorkStealer::print_stats()` wired into the cluster run summary so steal counters surface by default.
 
 ### Validation
 
@@ -234,137 +196,47 @@ Drop-in for v1.0.x and v1.1.x. No public-API or CLI changes.
 
 ## v1.1.0 (2026-04-25)
 
-Feature release rolling up the post-1.0 sweep — the first wave of items
-the v1.0.0 plan had marked **DEFER TO 1.1.0**, plus a mid-cycle
-soundness fix surfaced by the differential gates and a Verus
-production-shape proof tier.
+Feature release rolling up the post-1.0 sweep — the first wave of items the v1.0.0 plan had marked **DEFER TO 1.1.0**, plus a mid-cycle soundness fix surfaced by the differential gates and a Verus production-shape proof tier.
 
 ### Symbolic Init — joint encoding (T5.4 + T5.5)
 
-- **T5.4 — Streaming Init enumeration via a producer thread.** The
-  `Model::initial_states()` contract gained a streaming variant; large
-  cross-product Inits no longer materialize before the first worker can
-  start, and the Init producer overlaps with state exploration. This is
-  the architectural prerequisite that made T5.5 representable.
-- **T5.5 — Joint Init + invariant Z3 encoding.** When `--features
-  symbolic-init` is enabled and the spec's invariants are reducible to
-  the Init shape, Init constraints and invariants are encoded as a
-  single Z3 formula and enumerated together rather than enumerate-then-
-  filter. End-to-end on the Einstein-class spec the v1.0.0 plan called
-  out as the canonical hard case: **44 min → 14 ms** wall-time,
-  including Z3 startup. Reverts cleanly to the v1.0.0 enumerate-then-
-  filter path when the invariant body is not Z3-reducible.
+- **T5.4 — Streaming Init enumeration via a producer thread.** The `Model::initial_states()` contract gained a streaming variant; large cross-product Inits no longer materialize before the first worker can start, and the Init producer overlaps with state exploration. This is the architectural prerequisite that made T5.5 representable.
+- **T5.5 — Joint Init + invariant Z3 encoding.** When `--features symbolic-init` is enabled and the spec's invariants are reducible to the Init shape, Init constraints and invariants are encoded as a single Z3 formula and enumerated together rather than enumerate-then- filter. End-to-end on the Einstein-class spec the v1.0.0 plan called out as the canonical hard case: **44 min → 14 ms** wall-time, including Z3 startup. Reverts cleanly to the v1.0.0 enumerate-then- filter path when the invariant body is not Z3-reducible.
 
 ### Liveness scaling (T10.1 / T10.2 / T10.3 / T10.4)
 
-- **T10.1, T10.3, T10.4 — Liveness post-processing follow-ups.**
-  Parallel-flatten of the SCC transition table via dashmap raw shards
-  (~20% on the LivenessBench shape at N=10), trivial-SCC pre-filter for
-  sparse graphs, per-action transition shard so per-constraint checks
-  hit only the relevant shard (~6x per-constraint check on multi-WF
-  shapes).
-- **T10.2 — Streaming-SCC oracle (nested DFS), opt-in via
-  `--liveness-streaming`.** Phase-1 oracle: a structural self-test that
-  validates the nested-DFS ordering against the existing iterative
-  Tarjan output on every supported shape. Includes the O(N) red-DFS
-  fix (Cyan color check rather than rebuilding the `blue_path`
-  HashSet). Phase-2 — driving the oracle from the live exploration
-  frontier — has its design pinned and is tracked for v1.2.0.
+- **T10.1, T10.3, T10.4 — Liveness post-processing follow-ups.** Parallel-flatten of the SCC transition table via dashmap raw shards (~20% on the LivenessBench shape at N=10), trivial-SCC pre-filter for sparse graphs, per-action transition shard so per-constraint checks hit only the relevant shard (~6x per-constraint check on multi-WF shapes).
+- **T10.2 — Streaming-SCC oracle (nested DFS), opt-in via `--liveness-streaming`.** Phase-1 oracle: a structural self-test that validates the nested-DFS ordering against the existing iterative Tarjan output on every supported shape. Includes the O(N) red-DFS fix (Cyan color check rather than rebuilding the `blue_path` HashSet). Phase-2 — driving the oracle from the live exploration frontier — has its design pinned and is tracked for v1.2.0.
 
 ### Trace minimization (T9.1 / T9.2 / T9.3)
 
-- **T9.1 — Transitive variable relevance.** The relevance scan now
-  follows operator-inlining edges, so variables that only reach the
-  invariant through a chain of helper definitions are correctly marked
-  as relevant rather than collapsed to "(noise)".
-- **T9.2 — Median BFS seed.** The BFS shortcut search now seeds from
-  the median of the violation-trace prefix rather than the head, which
-  cuts shortcut-search work on long traces.
-- **T9.3 — Suffix shortening.** A second pass attempts to shorten the
-  post-violation suffix by replaying alternate transitions; useful when
-  the original trace took a long detour to reach the witness state.
+- **T9.1 — Transitive variable relevance.** The relevance scan now follows operator-inlining edges, so variables that only reach the invariant through a chain of helper definitions are correctly marked as relevant rather than collapsed to "(noise)".
+- **T9.2 — Median BFS seed.** The BFS shortcut search now seeds from the median of the violation-trace prefix rather than the head, which cuts shortcut-search work on long traces.
+- **T9.3 — Suffix shortening.** A second pass attempts to shorten the post-violation suffix by replaying alternate transitions; useful when the original trace took a long detour to reach the witness state.
 
 ### Partial-order reduction follow-ups (T7.1 / T7.2 / T7.3)
 
-- **T7.1 — Batched per-disjunct evaluation.** The stubborn-set
-  computation now batches per-disjunct enabledness checks rather than
-  re-evaluating each disjunct's guard from scratch. PorBenchProcessGrid:
-  19.7x → **39.2x** state reduction.
-- **T7.2 — Smarter stubborn-set seed.** Seed selection now prefers
-  actions with the smallest dependency closure rather than picking the
-  first enabled action in source order, which produces consistently
-  smaller stubborn sets on irregular dependency graphs.
-- **T7.3 — POR for liveness via the Peled (1994) visible-action
-  proviso.** Lifts the v1.0.0 safety-only restriction. POR now composes
-  with WF/SF fairness when the visible-action proviso is satisfiable;
-  the runtime still rejects POR cleanly on shapes where it is not.
+- **T7.1 — Batched per-disjunct evaluation.** The stubborn-set computation now batches per-disjunct enabledness checks rather than re-evaluating each disjunct's guard from scratch. PorBenchProcessGrid: 19.7x → **39.2x** state reduction.
+- **T7.2 — Smarter stubborn-set seed.** Seed selection now prefers actions with the smallest dependency closure rather than picking the first enabled action in source order, which produces consistently smaller stubborn sets on irregular dependency graphs.
+- **T7.3 — POR for liveness via the Peled (1994) visible-action proviso.** Lifts the v1.0.0 safety-only restriction. POR now composes with WF/SF fairness when the visible-action proviso is satisfiable; the runtime still rejects POR cleanly on shapes where it is not.
 
 ### Robustness (T11.3 / T11.4 / T11.5 / T12.1)
 
-- **T11.3 — Per-PR chaos-smoke gate.** A 5-minute CI variant of the
-  1-hour soak that runs every PR; covers the same swarm-mode failpoint
-  matrix at lower iteration depth so regressions in chaos-tolerance
-  surface before merge.
-- **T11.4 — `route_spill_batch` Err-branch inflight leak fix.** The
-  spill router's error path was leaking the `inflight_spilled` counter,
-  which caused `has_pending_work()` to return false even when items
-  were stuck in the spill pipeline; observed under fault injection.
-  Now decremented in the Err arm so termination detection stays
-  consistent with the queue's actual contents.
-- **T11.5 — Violation-exit hang fix.** Workers spinning in
-  `pop_slow_path` did not observe `queue.finish()` when a violation set
-  `worker_stop=true` at NUMA-auto worker counts, so they never exited.
-  `pop_slow_path` now checks `self.finished` alongside `pause_requested`
-  and the violation handler calls `worker_queue.finish()`.
-- **T12.1 — Recursive-depth test stack.** The deliberate-unbounded-
-  recursion test was crashing on x86_64 because the default thread
-  stack was below the test's 8 MB depth; fixed by allocating an 8 MB
-  thread stack for that test only.
+- **T11.3 — Per-PR chaos-smoke gate.** A 5-minute CI variant of the 1-hour soak that runs every PR; covers the same swarm-mode failpoint matrix at lower iteration depth so regressions in chaos-tolerance surface before merge.
+- **T11.4 — `route_spill_batch` Err-branch inflight leak fix.** The spill router's error path was leaking the `inflight_spilled` counter, which caused `has_pending_work()` to return false even when items were stuck in the spill pipeline; observed under fault injection. Now decremented in the Err arm so termination detection stays consistent with the queue's actual contents.
+- **T11.5 — Violation-exit hang fix.** Workers spinning in `pop_slow_path` did not observe `queue.finish()` when a violation set `worker_stop=true` at NUMA-auto worker counts, so they never exited. `pop_slow_path` now checks `self.finished` alongside `pause_requested` and the violation handler calls `worker_queue.finish()`.
+- **T12.1 — Recursive-depth test stack.** The deliberate-unbounded- recursion test was crashing on x86_64 because the default thread stack was below the test's 8 MB depth; fixed by allocating an 8 MB thread stack for that test only.
 
 ### Verification (T13.1 – T13.6 partial)
 
-- **T13.1 + T13.2 + T13.3 — Verus tier A.** A 31-lemma proof at
-  `verification/verus/seqlock_resize_tier_a.rs` covering a
-  `Seq<u64>` linear-probe model, spec-level CAS soundness, and
-  bounded reader-retry termination. Sits one rung below the production
-  code: the model is the production protocol, not the production
-  pointers.
-- **T13.4 partial — Tier-A.5 production-shape shadow methods.** A new
-  shadow-method tier in the Verus crate adds 17 lemmas that mirror the
-  hot-path `FingerprintShard` methods one-to-one, which closes the
-  shape gap between the tier-A model and the production code without
-  yet threading `Tracked<PointsTo<HashTableEntry>>` through the real
-  type. Phase-2 (production-code annotations) tracked for v1.2.0.
-- **T13.3 + T13.5 — Constructive reader-liveness proof, axiom-free.** A
-  new proof at `verification/verus/reader_liveness_v2.rs` discharges the
-  unbounded-fairness reader-liveness theorem `theorem_no_starvation` with
-  **0 axioms** (17 verified, 0 errors via `./run_proof.sh
-  reader-liveness-v2`, ~0.8s wall). The three previous protocol-shape
-  axioms (`axiom_writer_eventually_finalizes`,
-  `axiom_reader_can_observe_stutter`, `axiom_extension_composes`) are
-  replaced by constructive lemmas with explicit short-`seq!` witnesses
-  (2- and 3-element extensions); `wf_prefix` over each short literal
-  reduces to a small case-split on `step_relation`'s three disjuncts that
-  the SMT solver discharges automatically. The original
-  `verification/verus/reader_liveness.rs` (14 verified plus 3 documented
-  `external_body` axioms) is preserved as the bounded-form temporal-trace
-  fallback and reference for the eventual `state_machines!` port.
-- **T13.6 — CI gate for the Verus tier-A run.** A workflow gate that
-  runs the full Verus tier-A proof on every push so a regression in
-  the model-level guarantees fails the build rather than silently
-  accumulating.
+- **T13.1 + T13.2 + T13.3 — Verus tier A.** A 31-lemma proof at `verification/verus/seqlock_resize_tier_a.rs` covering a `Seq<u64>` linear-probe model, spec-level CAS soundness, and bounded reader-retry termination. Sits one rung below the production code: the model is the production protocol, not the production pointers.
+- **T13.4 partial — Tier-A.5 production-shape shadow methods.** A new shadow-method tier in the Verus crate adds 17 lemmas that mirror the hot-path `FingerprintShard` methods one-to-one, which closes the shape gap between the tier-A model and the production code without yet threading `Tracked<PointsTo<HashTableEntry>>` through the real type. Phase-2 (production-code annotations) tracked for v1.2.0.
+- **T13.3 + T13.5 — Constructive reader-liveness proof, axiom-free.** A new proof at `verification/verus/reader_liveness_v2.rs` discharges the unbounded-fairness reader-liveness theorem `theorem_no_starvation` with **0 axioms** (17 verified, 0 errors via `./run_proof.sh reader-liveness-v2`, ~0.8s wall). The three previous protocol-shape axioms (`axiom_writer_eventually_finalizes`, `axiom_reader_can_observe_stutter`, `axiom_extension_composes`) are replaced by constructive lemmas with explicit short-`seq!` witnesses (2- and 3-element extensions); `wf_prefix` over each short literal reduces to a small case-split on `step_relation`'s three disjuncts that the SMT solver discharges automatically. The original `verification/verus/reader_liveness.rs` (14 verified plus 3 documented `external_body` axioms) is preserved as the bounded-form temporal-trace fallback and reference for the eventual `state_machines!` port.
+- **T13.6 — CI gate for the Verus tier-A run.** A workflow gate that runs the full Verus tier-A proof on every push so a regression in the model-level guarantees fails the build rather than silently accumulating.
 
 ### Compiled-vs-interpreted soundness fix (T101.1)
 
-- **T101.1 — Compiler arithmetic associativity.** The compiled-IR
-  parser was associating chained `+`/`-` differently than the
-  interpreter on five distinct shapes, which produced silent
-  Ok-vs-Err and value divergences that the T2 proptest harness
-  caught. Tightened the compiler parser to match interpreter
-  validation exactly. New regression cases pinned in
-  `tests/compiled_vs_interpreted.rs`. **Soundness fix** — these are
-  not panic-resistance fixes, they were genuine wrong answers from
-  the compiled path.
+- **T101.1 — Compiler arithmetic associativity.** The compiled-IR parser was associating chained `+`/`-` differently than the interpreter on five distinct shapes, which produced silent Ok-vs-Err and value divergences that the T2 proptest harness caught. Tightened the compiler parser to match interpreter validation exactly. New regression cases pinned in `tests/compiled_vs_interpreted.rs`. **Soundness fix** — these are not panic-resistance fixes, they were genuine wrong answers from the compiled path.
 
 ### Validation gates
 
@@ -379,276 +251,119 @@ production-shape proof tier.
 
 ### Compatibility
 
-Drop-in for v1.0.x. No public-API or CLI changes; new behaviour is
-opt-in (`--features symbolic-init` for T5.4/T5.5,
-`--liveness-streaming` for T10.2 oracle). Fingerprint format,
-checkpoint format, and state-graph dump format are all unchanged.
+Drop-in for v1.0.x. No public-API or CLI changes; new behaviour is opt-in (`--features symbolic-init` for T5.4/T5.5, `--liveness-streaming` for T10.2 oracle). Fingerprint format, checkpoint format, and state-graph dump format are all unchanged.
 
 ## v1.0.1 (2026-04-25)
 
-Patch release covering the **"Bugs Rust Won't Catch"** audit — three
-sub-audits (T101 / T102 / T103) targeting the classes of defects that the
-Rust type system cannot catch on its own: parser/compiler panics on
-adversarial input, silently-discarded `Result` values, and lossy UTF-8
-conversions.
+Patch release covering the **"Bugs Rust Won't Catch"** audit — three sub-audits (T101 / T102 / T103) targeting the classes of defects that the Rust type system cannot catch on its own: parser/compiler panics on adversarial input, silently-discarded `Result` values, and lossy UTF-8 conversions.
 
 ### T101 — Parser/evaluator panic-resistance (fuzz audit)
 
-- Stood up `cargo-fuzz` targets across the TLA+ parser and the compiled-IR
-  evaluator and ran them long enough to drive crash counts to zero.
-- Fixed **four panic classes** in the parser/compiler, all stemming from
-  `&str[..]` slicing on non-character boundaries when the input contains
-  non-ASCII bytes — affected sites included the indexed-op-call parser,
-  recursive-decl parser, INSTANCE substitution, CFG comment stripping, and
-  two LET-binding range computations in `compiled_expr` and `eval`.
-- Added **7 regression tests** in `tests/fuzz_panic_regressions_t101.rs`
-  pinning each crash so a future regression is caught immediately.
-- Wired the swarm-equivalence fuzz target so symmetry-reduced and
-  un-reduced runs are diff-checked on every fuzz iteration.
+- Stood up `cargo-fuzz` targets across the TLA+ parser and the compiled-IR evaluator and ran them long enough to drive crash counts to zero.
+- Fixed **four panic classes** in the parser/compiler, all stemming from `&str[..]` slicing on non-character boundaries when the input contains non-ASCII bytes — affected sites included the indexed-op-call parser, recursive-decl parser, INSTANCE substitution, CFG comment stripping, and two LET-binding range computations in `compiled_expr` and `eval`.
+- Added **7 regression tests** in `tests/fuzz_panic_regressions_t101.rs` pinning each crash so a future regression is caught immediately.
+- Wired the swarm-equivalence fuzz target so symmetry-reduced and un-reduced runs are diff-checked on every fuzz iteration.
 
 ### T102 — `Result`-discard audit (silent-error audit)
 
-- Audited every `let _ = ...`, `.ok()`, and `#[must_use]`-bypass in the
-  codebase and classified each as intentional (logged channel-closed,
-  best-effort cleanup) or a real bug.
-- **Headline fix:** the runtime's per-worker `error_tx` could deadlock
-  under concurrent send when the receiver had already drained — converted
-  to a non-blocking try-send with an explicit drop-on-full path so
-  workers never block on error reporting.
-- Fixed **9 additional propagation sites** where I/O errors,
-  checkpoint-write failures, and parser warnings were being swallowed
-  silently; each now either propagates upstream or logs a structured
-  warning.
+- Audited every `let _ = ...`, `.ok()`, and `#[must_use]`-bypass in the codebase and classified each as intentional (logged channel-closed, best-effort cleanup) or a real bug.
+- **Headline fix:** the runtime's per-worker `error_tx` could deadlock under concurrent send when the receiver had already drained — converted to a non-blocking try-send with an explicit drop-on-full path so workers never block on error reporting.
+- Fixed **9 additional propagation sites** where I/O errors, checkpoint-write failures, and parser warnings were being swallowed silently; each now either propagates upstream or logs a structured warning.
 
 ### T103 — Lossy UTF-8 conversion audit
 
-- Audited every `String::from_utf8_lossy` and `OsStr::to_string_lossy`
-  call site to confirm none were on a soundness-critical path
-  (state hashing, fingerprint identity, action equality).
+- Audited every `String::from_utf8_lossy` and `OsStr::to_string_lossy` call site to confirm none were on a soundness-critical path (state hashing, fingerprint identity, action equality).
 - **Two fixes,** both on defensive observability paths:
-  - S3 checkpoint key construction was using `_lossy` on a borrowed
-    `OsStr` derived from a checkpoint path, which could corrupt the key
-    on filesystems with non-UTF-8 path components. Switched to a strict
-    UTF-8 conversion that returns an error rather than silently uploading
-    to a mangled key.
-  - The disk-stats code path that reports spilled-segment sizes used
-    `_lossy` on a path it then logged; switched to strict UTF-8 so a
-    non-UTF-8 path triggers a warning rather than producing a corrupt log
-    line.
-- **No state-path soundness issue was found** — the audit confirmed the
-  hot path (state serialization, fingerprinting) never goes through a
-  lossy conversion.
+  - S3 checkpoint key construction was using `_lossy` on a borrowed `OsStr` derived from a checkpoint path, which could corrupt the key on filesystems with non-UTF-8 path components. Switched to a strict UTF-8 conversion that returns an error rather than silently uploading to a mangled key.
+  - The disk-stats code path that reports spilled-segment sizes used `_lossy` on a path it then logged; switched to strict UTF-8 so a non-UTF-8 path triggers a warning rather than producing a corrupt log line.
+- **No state-path soundness issue was found** — the audit confirmed the hot path (state serialization, fingerprinting) never goes through a lossy conversion.
 
 ## v1.0.0 (2026-04-27)
 
-First stable release. The 1.0 cycle focused on correctness foundations,
-high-leverage performance wins, polish, and a Verus-checked proof of the
-fingerprint store's resize protocol.
+First stable release. The 1.0 cycle focused on correctness foundations, high-leverage performance wins, polish, and a Verus-checked proof of the fingerprint store's resize protocol.
 
 ### Correctness foundations
 
-- **Differential testing vs TLC as a CI gate.** `scripts/diff_tlc.sh` plus
-  `.github/workflows/diff-tlc.yml` runs 13 curated specs under both TLC and
-  tlaplusplus on every push. State counts agree exactly; the harness uncovered
-  seven real divergences (T1.1, T1.3, T1.4, T1.5, T1.6, T2.4, T11.5) that
-  were all fixed before the release.
-- **Compiled-vs-interpreted proptest equivalence.**
-  `tests/compiled_vs_interpreted.rs` generates well-typed
-  Int/Bool/Set/Seq/Record/Str expressions and asserts the text evaluator and
-  the compiled-IR evaluator agree on every case. Wired into CI at
-  `PROPTEST_CASES=128`; runs at 2048 across 9 seeds locally.
-- **State-graph snapshot tests.** `tests/state_graph_snapshots.rs` pins the
-  reachable set for 7 small TLA+ specs as 128-bit XxHash3 digests, validated
-  against TLC v2.19.
-- **Mutation-testing audit.** `cargo-mutants` was run against `src/tla/eval.rs`
-  and `src/tla/action_exec.rs`; 17 inline kill-tests added to cover the
-  consequential survivor categories.
+- **Differential testing vs TLC as a CI gate.** `scripts/diff_tlc.sh` plus `.github/workflows/diff-tlc.yml` runs 13 curated specs under both TLC and tlaplusplus on every push. State counts agree exactly; the harness uncovered seven real divergences (T1.1, T1.3, T1.4, T1.5, T1.6, T2.4, T11.5) that were all fixed before the release.
+- **Compiled-vs-interpreted proptest equivalence.** `tests/compiled_vs_interpreted.rs` generates well-typed Int/Bool/Set/Seq/Record/Str expressions and asserts the text evaluator and the compiled-IR evaluator agree on every case. Wired into CI at `PROPTEST_CASES=128`; runs at 2048 across 9 seeds locally.
+- **State-graph snapshot tests.** `tests/state_graph_snapshots.rs` pins the reachable set for 7 small TLA+ specs as 128-bit XxHash3 digests, validated against TLC v2.19.
+- **Mutation-testing audit.** `cargo-mutants` was run against `src/tla/eval.rs` and `src/tla/action_exec.rs`; 17 inline kill-tests added to cover the consequential survivor categories.
 
 ### Soundness fixes (caught by the new gates)
 
-- **T1.1.** Compiled `\E x \in S : Action(x)` inside a wrapper definition now
-  routes through the interpreted action evaluator, so existential branches no
-  longer silently produce zero successors. Surfaced under `QueueSegmentSync`
-  (TLC: 1531 distinct, pre-fix: 5).
-- **T1.3.** Wrapper-Next fairness constraint accepts any in-SCC transition
-  when the constraint's action name matches the spec's Next definition,
-  eliminating the false-positive SCC fairness violation seen on `WorkQueue`.
-- **T1.4.** Compiled expression evaluator no longer mis-splits LET bodies on
-  indented `\/`, fixing the `\A x : \E m \in {} : ...` always-TRUE shape that
-  affected Paxos-style specs.
-- **T1.5.** Next-splitter no longer slices `/\ guard /\ \/ A \/ B /\ shared`
-  on the inner `\/`, so shared post-conditions are no longer dropped and
-  spurious successors are no longer fabricated. Closes the VIEW projection
-  mismatch on `ViewTest`.
-- **T1.6.** `<=>` (logical equivalence) was silently mis-parsed as `<= >`
-  because the `=>` splitter consumed the `=>` *inside* `<=>`. Fixed in both
-  interpreter (`eval_expr_inner` now splits `<=>` before `=>`) and compiled
-  evaluator (new `CompiledExpr::Iff` variant placed before `Implies`).
-  `FingerprintStoreResize.tla` now matches TLC exactly.
-- **T2.1, T2.2.** Compiled-expr parser now scans for top-level `EXCEPT` only
-  at bracket depth 0, so nested record-EXCEPT and EXCEPT-inside-record-literal
-  shapes compile correctly.
-- **T2.3.** `..` precedence vs set ops is fixed in both interpreter and
-  compiler — `n..m \subseteq S` and `S \union n..m` now type-check and
-  evaluate correctly in both code paths.
-- **T2.4.** Unary minus inside binary subtraction (`<<(-1 - r.a), 0>>` and
-  similar) no longer compiles to `Unparsed`; a new `find_binary_minus_split`
-  helper walks past unary-minus positions before splitting.
+- **T1.1.** Compiled `\E x \in S : Action(x)` inside a wrapper definition now routes through the interpreted action evaluator, so existential branches no longer silently produce zero successors. Surfaced under `QueueSegmentSync` (TLC: 1531 distinct, pre-fix: 5).
+- **T1.3.** Wrapper-Next fairness constraint accepts any in-SCC transition when the constraint's action name matches the spec's Next definition, eliminating the false-positive SCC fairness violation seen on `WorkQueue`.
+- **T1.4.** Compiled expression evaluator no longer mis-splits LET bodies on indented `\/`, fixing the `\A x : \E m \in {} : ...` always-TRUE shape that affected Paxos-style specs.
+- **T1.5.** Next-splitter no longer slices `/\ guard /\ \/ A \/ B /\ shared` on the inner `\/`, so shared post-conditions are no longer dropped and spurious successors are no longer fabricated. Closes the VIEW projection mismatch on `ViewTest`.
+- **T1.6.** `<=>` (logical equivalence) was silently mis-parsed as `<= >` because the `=>` splitter consumed the `=>` *inside* `<=>`. Fixed in both interpreter (`eval_expr_inner` now splits `<=>` before `=>`) and compiled evaluator (new `CompiledExpr::Iff` variant placed before `Implies`). `FingerprintStoreResize.tla` now matches TLC exactly.
+- **T2.1, T2.2.** Compiled-expr parser now scans for top-level `EXCEPT` only at bracket depth 0, so nested record-EXCEPT and EXCEPT-inside-record-literal shapes compile correctly.
+- **T2.3.** `..` precedence vs set ops is fixed in both interpreter and compiler — `n..m \subseteq S` and `S \union n..m` now type-check and evaluate correctly in both code paths.
+- **T2.4.** Unary minus inside binary subtraction (`<<(-1 - r.a), 0>>` and similar) no longer compiles to `Unparsed`; a new `find_binary_minus_split` helper walks past unary-minus positions before splitting.
 
 ### Performance — high-leverage wins
 
-- **T5. Symbolic Init enumeration via Z3** (opt-in, `--features symbolic-init`).
-  Filtered record-set Init shapes (e.g. `{c \in [f1: 0..N, f2: 0..N] :
-  pred(c)}`) are translated to SMT and enumerated symbolically. Benchmark on
-  `TightCan`: N=15 brute-force 14.71 s → symbolic 1.40 s (10.5x); N=20
-  58.42 s → 1.41 s (41x); N=40 brute-force exhausts the eval budget,
-  symbolic finishes in 1.6 s.
-- **T6. Cross-node distributed work stealing.** TCP-based steal protocol with
-  steal-victim threshold, peer-down cooldown, and termination consensus
-  extension. Three pre-existing v0.3.0 distributed-mode termination bugs
-  surfaced and were fixed (so any multi-node cluster can now converge at all).
-  Cluster mode remains opt-in (`--cluster-listen`); see T6.1 entry in
-  `RELEASE_1.0.0_LOG.md` for the honest cluster-vs-independent benchmark.
-- **T7. Partial-order reduction (POR) via stubborn sets** (opt-in, `--por`).
-  Static read/write dependency analysis at module load; per-state stubborn-set
-  computation under enabled-disjunct restriction. Safety-only — automatically
-  rejected when fairness/liveness constraints are present. Benchmark on
-  `PorBenchProcessGrid` (4 independent processes, MAX=4): full=625 states,
-  POR=17 — **36.8x state reduction, 17.9x wall-time speedup**.
-- **T8. State compression in the spillover queue** (default on, opt-out
-  `--queue-compression false`). zstd-compressed in-memory ring sits between
-  the hot work-stealing deques and the disk-backed overflow. Triggers only
-  when the spill path is already engaged. Benchmark: 13.2x compression ratio,
-  -68% peak RSS at 1M items, +2% wall time.
-- **T10. Liveness checking scaling.** Iterative Tarjan + fingerprint-keyed
-  graph + fast `check_fairness_on_scc_fp` cut SCC-based fairness
-  post-processing from O(scc_size × tx × constraints) to O(tx × constraints).
-  Benchmark on `LivenessBench` (32k states, 143k transitions, one giant SCC,
-  6 WF constraints): liveness phase wall-time **63.39 s → 115.28 ms (~550x)**,
-  total wall-time 64.92 s → 1.60 s, peak RSS 2.59 GB → 1.99 GB (-23%).
+- **T5. Symbolic Init enumeration via Z3** (opt-in, `--features symbolic-init`). Filtered record-set Init shapes (e.g. `{c \in [f1: 0..N, f2: 0..N] : pred(c)}`) are translated to SMT and enumerated symbolically. Benchmark on `TightCan`: N=15 brute-force 14.71 s → symbolic 1.40 s (10.5x); N=20 58.42 s → 1.41 s (41x); N=40 brute-force exhausts the eval budget, symbolic finishes in 1.6 s.
+- **T6. Cross-node distributed work stealing.** TCP-based steal protocol with steal-victim threshold, peer-down cooldown, and termination consensus extension. Three pre-existing v0.3.0 distributed-mode termination bugs surfaced and were fixed (so any multi-node cluster can now converge at all). Cluster mode remains opt-in (`--cluster-listen`); see T6.1 entry in `RELEASE_1.0.0_LOG.md` for the honest cluster-vs-independent benchmark.
+- **T7. Partial-order reduction (POR) via stubborn sets** (opt-in, `--por`). Static read/write dependency analysis at module load; per-state stubborn-set computation under enabled-disjunct restriction. Safety-only — automatically rejected when fairness/liveness constraints are present. Benchmark on `PorBenchProcessGrid` (4 independent processes, MAX=4): full=625 states, POR=17 — **36.8x state reduction, 17.9x wall-time speedup**.
+- **T8. State compression in the spillover queue** (default on, opt-out `--queue-compression false`). zstd-compressed in-memory ring sits between the hot work-stealing deques and the disk-backed overflow. Triggers only when the spill path is already engaged. Benchmark: 13.2x compression ratio, -68% peak RSS at 1M items, +2% wall time.
+- **T10. Liveness checking scaling.** Iterative Tarjan + fingerprint-keyed graph + fast `check_fairness_on_scc_fp` cut SCC-based fairness post-processing from O(scc_size × tx × constraints) to O(tx × constraints). Benchmark on `LivenessBench` (32k states, 143k transitions, one giant SCC, 6 WF constraints): liveness phase wall-time **63.39 s → 115.28 ms (~550x)**, total wall-time 64.92 s → 1.60 s, peak RSS 2.59 GB → 1.99 GB (-23%).
 
 ### Polish
 
-- **T9. Trace minimization on violation** (default on, `--minimize-trace`).
-  Two-phase: (A) earliest-violation truncation + BFS shortcut search to fixed
-  point; (B) syntactic variable-relevance scan on the invariant body, used to
-  mark unrelated state variables as "(noise)" in the printed trace. 30 s
-  default budget. Diamond fixture: 9 → 6 states in 375 µs.
-- **T11. 1-hour chaos soak harness.** `scripts/chaos_soak.sh` plus a
-  `FailScenario::setup()` wiring under `cfg(feature = "failpoints")`. 1-hour
-  c8g.xlarge soak against `CheckpointDrain`: **387 iterations, 0 divergences,
-  0 hangs**. Every failpoint in `src/chaos.rs` (12 names) fired ≥23 times;
-  the runtime tolerates persistent permanent failures in every checkpoint
-  sub-step, FP-store-pressure path, and queue spill/load path.
+- **T9. Trace minimization on violation** (default on, `--minimize-trace`). Two-phase: (A) earliest-violation truncation + BFS shortcut search to fixed point; (B) syntactic variable-relevance scan on the invariant body, used to mark unrelated state variables as "(noise)" in the printed trace. 30 s default budget. Diamond fixture: 9 → 6 states in 375 µs.
+- **T11. 1-hour chaos soak harness.** `scripts/chaos_soak.sh` plus a `FailScenario::setup()` wiring under `cfg(feature = "failpoints")`. 1-hour c8g.xlarge soak against `CheckpointDrain`: **387 iterations, 0 divergences, 0 hangs**. Every failpoint in `src/chaos.rs` (12 names) fired ≥23 times; the runtime tolerates persistent permanent failures in every checkpoint sub-step, FP-store-pressure path, and queue spill/load path.
 - **T16. Regehr-style swarm testing** at two layers:
-  - **T16a.** The T2 proptest harness picks a random subset of 17 shape
-    categories per case (mean ~8.5 enabled), so each case explores a
-    *minimal-feature-interaction* slice. The original uniform proptest is
-    kept as a regression gate.
-  - **T16b.** The chaos soak supports `--swarm-mode N|auto` (default 1; auto
-    picks 1-4 concurrent failpoints per iter). 30-minute soak: 204 iters,
-    0 divergences, 66/66 distinct concurrent failpoint pairs observed
-    (exhaustive pair coverage).
-- **T12. Cross-arch CI matrix.** diff-TLC workflow now runs as a
-  `[ubuntu-latest, ubuntu-24.04-arm]` matrix (both archs run lib + bin tests,
-  the diff harness, and the T2 proptest at `PROPTEST_CASES=128`).
+  - **T16a.** The T2 proptest harness picks a random subset of 17 shape categories per case (mean ~8.5 enabled), so each case explores a *minimal-feature-interaction* slice. The original uniform proptest is kept as a regression gate.
+  - **T16b.** The chaos soak supports `--swarm-mode N|auto` (default 1; auto picks 1-4 concurrent failpoints per iter). 30-minute soak: 204 iters, 0 divergences, 66/66 distinct concurrent failpoint pairs observed (exhaustive pair coverage).
+- **T12. Cross-arch CI matrix.** diff-TLC workflow now runs as a `[ubuntu-latest, ubuntu-24.04-arm]` matrix (both archs run lib + bin tests, the diff harness, and the T2 proptest at `PROPTEST_CASES=128`).
 
 ### Verification
 
-- **T13. Verus on the fingerprint store** — tier B, protocol-level proof.
-  `verification/verus/seqlock_resize.rs` (600 lines, 19 verified lemmas)
-  proves the headline soundness theorem `theorem_no_fingerprint_lost`: in
-  any well-formed execution of the protocol, every inserted fingerprint
-  remains observable from then on. Proof is at the protocol abstraction
-  layer — table = `Set<u64>`, atomic step semantics; it does NOT verify the
-  production code's pointer arithmetic, memory orderings, or linear-probe
-  collision behavior. See `verification/verus/README.md` for the assumptions
-  and the tier-A roadmap (T13.1–T13.3, deferred to v1.1.0).
+- **T13. Verus on the fingerprint store** — tier B, protocol-level proof. `verification/verus/seqlock_resize.rs` (600 lines, 19 verified lemmas) proves the headline soundness theorem `theorem_no_fingerprint_lost`: in any well-formed execution of the protocol, every inserted fingerprint remains observable from then on. Proof is at the protocol abstraction layer — table = `Set<u64>`, atomic step semantics; it does NOT verify the production code's pointer arithmetic, memory orderings, or linear-probe collision behavior. See `verification/verus/README.md` for the assumptions and the tier-A roadmap (T13.1–T13.3, deferred to v1.1.0).
 
 ### Distributed
 
-- **T6.1. Cross-node re-benchmark on a real corpus spec.** Confirmed the
-  v0.3.0 design's tradeoff: cluster mode (each node maintains its own FP
-  store, redundant exploration but no global FP synchronization) is slower
-  than independent-explorer mode on canonical workloads. Cluster mode stays
-  opt-in (`--cluster-listen`). Global FP partitioning is multi-quarter work
-  out of scope for v1.0.0; tracked in the v1.1.0 backlog.
+- **T6.1. Cross-node re-benchmark on a real corpus spec.** Confirmed the v0.3.0 design's tradeoff: cluster mode (each node maintains its own FP store, redundant exploration but no global FP synchronization) is slower than independent-explorer mode on canonical workloads. Cluster mode stays opt-in (`--cluster-listen`). Global FP partitioning is multi-quarter work out of scope for v1.0.0; tracked in the v1.1.0 backlog.
 
 ### Soundness fixes shipped in the final integration validation
 
-- **T1.6.** `<=>` (logical equivalence) was silently mis-parsed because the
-  `=>` splitter consumed the `=>` *inside* `<=>`. Fixed in both interpreter
-  and compiled-IR paths; `FingerprintStoreResize.tla` now matches TLC exactly
-  (52,376 generated, 15,970 distinct, 0 violations).
-- **T11.1.** `--queue-max-inmem-items` below natural state count caused the
-  spill path to drop states. Root cause: items in the spill pipeline were
-  invisible to `has_pending_work()`/`should_terminate()`. Fixed via
-  `inflight_spilled` AtomicU64 counter; 5 deterministic runs at cap=2000 now
-  return exactly 26,344 distinct each.
-- **T11.5.** Violation-exit hang under timeout-wrapper at NUMA-auto worker
-  counts. Workers spinning in `pop_slow_path` did not observe `queue.finish()`
-  so they never exited after a violation set `worker_stop=true`. Two-line fix:
-  pop_slow_path now checks `self.finished` alongside `pause_requested`, and
-  the violation handler calls `worker_queue.finish()`.
+- **T1.6.** `<=>` (logical equivalence) was silently mis-parsed because the `=>` splitter consumed the `=>` *inside* `<=>`. Fixed in both interpreter and compiled-IR paths; `FingerprintStoreResize.tla` now matches TLC exactly (52,376 generated, 15,970 distinct, 0 violations).
+- **T11.1.** `--queue-max-inmem-items` below natural state count caused the spill path to drop states. Root cause: items in the spill pipeline were invisible to `has_pending_work()`/`should_terminate()`. Fixed via `inflight_spilled` AtomicU64 counter; 5 deterministic runs at cap=2000 now return exactly 26,344 distinct each.
+- **T11.5.** Violation-exit hang under timeout-wrapper at NUMA-auto worker counts. Workers spinning in `pop_slow_path` did not observe `queue.finish()` so they never exited after a violation set `worker_stop=true`. Two-line fix: pop_slow_path now checks `self.finished` alongside `pause_requested`, and the violation handler calls `worker_queue.finish()`.
 
 ### Quality follow-ups shipped
 
-- **T5.1+T5.2+T5.3** — Symbolic Init handles sequence-set comprehensions and
-  Distinct-shortcut permutation symmetry; near-tautology detection covered by
-  the existing v0.3.0 sum-range constraint propagation.
-- **T5.6** — Tightened the symbolic-init `Distinct` shortcut to require
-  per-position chain evidence (proptest divergence fix).
-- **T7.1+T7.2+T7.3** — POR enhancements: batched per-disjunct evaluation
-  (PorBenchProcessGrid 19.7x → 39.2x), smarter stubborn-set seed, POR for
-  liveness via Peled (1994) visible-action proviso.
-- **T9.1+T9.2+T9.3** — Trace minimization: transitive variable relevance
-  through operator inlining, multi-source BFS seed, suffix shortening.
-- **T10.1+T10.3+T10.4** — Liveness scaling: parallel-flatten via dashmap raw
-  shards (~20% on N=10), trivial-SCC pre-filter for sparse graphs,
-  per-action transition shard (~6x per-constraint check).
-- **T11.2** — Re-soak validated T11.1 fix at cap=2000 driving the spill path
-  under fault injection (166 iters, 0 divergences).
-- **T12.1** — Cross-arch CI stack-overflow on the deliberate unbounded
-  recursion test fixed by allocating an 8 MB thread stack for that test only.
-- **T13.1+T13.2+T13.3** — Verus tier A: 31 lemmas verified including
-  `theorem_no_fingerprint_lost_a` over a `Seq<u64>` linear-probe model,
-  spec-level CAS soundness, and bounded reader-retry termination. Lives at
-  `verification/verus/seqlock_resize_tier_a.rs`.
+- **T5.1+T5.2+T5.3** — Symbolic Init handles sequence-set comprehensions and Distinct-shortcut permutation symmetry; near-tautology detection covered by the existing v0.3.0 sum-range constraint propagation.
+- **T5.6** — Tightened the symbolic-init `Distinct` shortcut to require per-position chain evidence (proptest divergence fix).
+- **T7.1+T7.2+T7.3** — POR enhancements: batched per-disjunct evaluation (PorBenchProcessGrid 19.7x → 39.2x), smarter stubborn-set seed, POR for liveness via Peled (1994) visible-action proviso.
+- **T9.1+T9.2+T9.3** — Trace minimization: transitive variable relevance through operator inlining, multi-source BFS seed, suffix shortening.
+- **T10.1+T10.3+T10.4** — Liveness scaling: parallel-flatten via dashmap raw shards (~20% on N=10), trivial-SCC pre-filter for sparse graphs, per-action transition shard (~6x per-constraint check).
+- **T11.2** — Re-soak validated T11.1 fix at cap=2000 driving the spill path under fault injection (166 iters, 0 divergences).
+- **T12.1** — Cross-arch CI stack-overflow on the deliberate unbounded recursion test fixed by allocating an 8 MB thread stack for that test only.
+- **T13.1+T13.2+T13.3** — Verus tier A: 31 lemmas verified including `theorem_no_fingerprint_lost_a` over a `Seq<u64>` linear-probe model, spec-level CAS soundness, and bounded reader-retry termination. Lives at `verification/verus/seqlock_resize_tier_a.rs`.
 
 ### Test suite
 
-- **756 default tests** (release, no extra features), 0 failures,
-  8 ignored (disk-checkpoint round-trip pending serializable queue + per-test
-  ignores for chaos/S3 doctests + a few env-dependent integration ignores).
+- **756 default tests** (release, no extra features), 0 failures, 8 ignored (disk-checkpoint round-trip pending serializable queue + per-test ignores for chaos/S3 doctests + a few env-dependent integration ignores).
 - **776 tests with `--features failpoints`**, 0 failures.
 - **774 tests with `--features symbolic-init`**, 0 failures.
-- 13/13 specs pass `scripts/diff_tlc.sh` (state counts agree exactly with
-  TLC v2.19 on every spec).
+- 13/13 specs pass `scripts/diff_tlc.sh` (state counts agree exactly with TLC v2.19 on every spec).
 - 12 active state-graph snapshot tests, all match.
-- T2 proptest equivalence harness clean across 9 seeds at
-  `PROPTEST_CASES=2048` (validated on 3 fresh seeds: 1, 7, 42).
-- 10-minute swarm-mode chaos soak: 63 iterations, 0 divergences, 0 hangs;
-  61 distinct concurrent failpoint pairs observed.
+- T2 proptest equivalence harness clean across 9 seeds at `PROPTEST_CASES=2048` (validated on 3 fresh seeds: 1, 7, 42).
+- 10-minute swarm-mode chaos soak: 63 iterations, 0 divergences, 0 hangs; 61 distinct concurrent failpoint pairs observed.
 - Verus tier-A: 31 lemmas verified, 0 errors.
 
 ### Deferred to v1.1.0
 
-The following items remain on the post-1.0.0 roadmap. Detail in
-`RELEASE_1.0.0_PLAN.md` (each entry begins with `**DEFER TO 1.1.0.**`).
+The following items remain on the post-1.0.0 roadmap. Detail in `RELEASE_1.0.0_PLAN.md` (each entry begins with `**DEFER TO 1.1.0.**`).
 
-- **T5.4** — Streaming Init enumeration / eager invariant filtering during
-  cross-product (Einstein-class workloads).
-- **T5.5** — Joint Init+Solution symbolic encoding (single-shot Z3 query for
-  full Einstein-style specs).
-- **T10.2** — Streaming SCC discovery during exploration (on-the-fly liveness
-  for 100M+ state spaces).
+- **T5.4** — Streaming Init enumeration / eager invariant filtering during cross-product (Einstein-class workloads).
+- **T5.5** — Joint Init+Solution symbolic encoding (single-shot Z3 query for full Einstein-style specs).
+- **T10.2** — Streaming SCC discovery during exploration (on-the-fly liveness for 100M+ state spaces).
 - **T11.3** — CI-gate variant of the chaos soak (~5 min nightly form).
-- **T11.4** — `route_spill_batch` inflight-counter accounting on disk-overflow
-  push errors.
-- **T13.4** — Production-code Verus annotations
-  (`Tracked<PointsTo<HashTableEntry>>` threaded through `FingerprintShard`).
-- **T13.5** — Unbounded-fairness reader liveness via Verus
-  `state_machines!` macro.
+- **T11.4** — `route_spill_batch` inflight-counter accounting on disk-overflow push errors.
+- **T13.4** — Production-code Verus annotations (`Tracked<PointsTo<HashTableEntry>>` threaded through `FingerprintShard`).
+- **T13.5** — Unbounded-fairness reader liveness via Verus `state_machines!` macro.
 - **T13.6** — CI gate for Verus tier-A run.
 
 ## v0.3.0 (2026-03-25)

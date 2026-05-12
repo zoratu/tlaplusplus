@@ -1,17 +1,12 @@
 # Verus proofs for tlaplusplus
 
-This directory contains formal verification artifacts for tlaplusplus's
-own correctness, separate from the model checker's TLA+ frontend.
+This directory contains formal verification artifacts for tlaplusplus's own correctness, separate from the model checker's TLA+ frontend.
 
-The first artifact (T13, release 1.0.0) is `seqlock_resize.rs` — a
-machine-checked proof of the seqlock-based dynamic-resize protocol used
-by the lock-free fingerprint store
-(`src/storage/page_aligned_fingerprint_store.rs`).
+The first artifact (T13, release 1.0.0) is `seqlock_resize.rs` — a machine-checked proof of the seqlock-based dynamic-resize protocol used by the lock-free fingerprint store (`src/storage/page_aligned_fingerprint_store.rs`).
 
 ## What is proved
 
-The proof file declares 19 lemmas that Verus discharges via the Z3 SMT
-solver. Together they establish, on an abstract model of the protocol:
+The proof file declares 19 lemmas that Verus discharges via the Z3 SMT solver. Together they establish, on an abstract model of the protocol:
 
 | Property | Lemma | Plain English |
 |---|---|---|
@@ -24,58 +19,25 @@ solver. Together they establish, on an abstract model of the protocol:
 | **Step monotonicity** | `lemma_step_preserves_contents` | Every transition in the protocol's state machine preserves `effective_contents` (the set of fingerprints observable to readers) as a superset, with the *single* exception of `finalize_resize`, which is guarded by the rehash-completion precondition `s.old_table.subset_of(s.new_table)`. |
 | **MAIN THEOREM** | `theorem_no_fingerprint_lost` | In any well-formed execution of the protocol, every fingerprint present at any point remains observable from then on. |
 
-The main theorem is the precise machine-checked statement of the soundness
-property the user cares about: **"Once a state's fingerprint is admitted to
-the fingerprint store, no resize event can cause the model checker to
-silently re-explore it or to silently miss a future violation by losing
-track of it."**
+The main theorem is the precise machine-checked statement of the soundness property the user cares about: **"Once a state's fingerprint is admitted to the fingerprint store, no resize event can cause the model checker to silently re-explore it or to silently miss a future violation by losing track of it."**
 
 ## What is *assumed* (axioms / unproven preconditions)
 
-The proof is at the **protocol abstraction layer**. It deliberately
-abstracts:
+The proof is at the **protocol abstraction layer**. It deliberately abstracts:
 
-1. **Pointer arithmetic and open-addressed probing.** The production
-   code stores fingerprints in a flat array indexed by `fp % capacity`
-   with linear probing on collisions. The proof models the table as a
-   `Set<u64>`. Implication: the proof shows the *protocol* is correct,
-   but does not (yet) prove that the probe sequence implementation
-   actually realises that abstract set faithfully. A bug like "linear
-   probe wraps incorrectly at the table boundary" would not be caught
-   by this proof.
+1. **Pointer arithmetic and open-addressed probing.** The production code stores fingerprints in a flat array indexed by `fp % capacity` with linear probing on collisions. The proof models the table as a `Set<u64>`. Implication: the proof shows the *protocol* is correct, but does not (yet) prove that the probe sequence implementation actually realises that abstract set faithfully. A bug like "linear probe wraps incorrectly at the table boundary" would not be caught by this proof.
 
-2. **Memory orderings of atomic operations.** The proof treats each
-   protocol step as atomic. The production code uses `AcqRel`/`Acquire`
-   pairings. The proof assumes these orderings are sufficient — i.e.
-   that the abstract sequential semantics is the right model for the
-   relaxed-atomic concurrent execution. (For the seqlock pattern this
-   is the standard assumption, justified in the literature; see
-   "C++ Concurrency in Action" Ch. 5.)
+2. **Memory orderings of atomic operations.** The proof treats each protocol step as atomic. The production code uses `AcqRel`/`Acquire` pairings. The proof assumes these orderings are sufficient — i.e. that the abstract sequential semantics is the right model for the relaxed-atomic concurrent execution. (For the seqlock pattern this is the standard assumption, justified in the literature; see "C++ Concurrency in Action" Ch. 5.)
 
-3. **Single ongoing resize.** The protocol model assumes at most one
-   resize is in progress at a time. The production code enforces this
-   via `resize_lock: Mutex<()>` (line 142). We do not model the mutex
-   explicitly; we instead model "resize is in progress" as the
-   `seq % 2 == 1` parity bit being set.
+3. **Single ongoing resize.** The protocol model assumes at most one resize is in progress at a time. The production code enforces this via `resize_lock: Mutex<()>` (line 142). We do not model the mutex explicitly; we instead model "resize is in progress" as the `seq % 2 == 1` parity bit being set.
 
-4. **Mmap allocation produces a zero-filled region.** Production uses
-   `MAP_ANONYMOUS` (line 466 comment) which the kernel guarantees to
-   zero-fill. The proof models `step_begin_resize` as setting
-   `new_table` to the empty set, equivalent to all-zero entries.
+4. **Mmap allocation produces a zero-filled region.** Production uses `MAP_ANONYMOUS` (line 466 comment) which the kernel guarantees to zero-fill. The proof models `step_begin_resize` as setting `new_table` to the empty set, equivalent to all-zero entries.
 
-5. **Rehash completion as an atomic ghost step.** The production code
-   migrates entries one bucket at a time (`rehash_batch_counted` lines
-   280–344), and concurrent inserts can land in `new_table` during the
-   migration. Our `step_rehash_complete` step asserts the union as a
-   single primitive; the inductive `lemma_step_preserves_contents` over
-   `step_rehash_one` covers the per-entry case faithfully.
+5. **Rehash completion as an atomic ghost step.** The production code migrates entries one bucket at a time (`rehash_batch_counted` lines 280–344), and concurrent inserts can land in `new_table` during the migration. Our `step_rehash_complete` step asserts the union as a single primitive; the inductive `lemma_step_preserves_contents` over `step_rehash_one` covers the per-entry case faithfully.
 
 ## Tier A (post-1.0.0): partial coverage shipped
 
-`seqlock_resize_tier_a.rs` extends tier B along the three axes flagged
-in the v1.1.0 backlog. The file is independently verified
-(`./run_proof.sh tier-a` => `verification results:: 31 verified, 0
-errors`, ~0.7s wall), in addition to tier B.
+`seqlock_resize_tier_a.rs` extends tier B along the three axes flagged in the v1.1.0 backlog. The file is independently verified (`./run_proof.sh tier-a` => `verification results:: 31 verified, 0 errors`, ~0.7s wall), in addition to tier B.
 
 | Property | Lemma | Status |
 |---|---|---|
@@ -100,31 +62,14 @@ errors`, ~0.7s wall), in addition to tier B.
 
 ### What is STILL abstracted in tier A
 
-- Raw `slice::from_raw_parts` over `*mut HashTableEntry`. Tier A models
-  the slice as a `Seq<u64>`; the pointer-to-slice conversion is
-  axiomatic. Eliminating this would require `vstd::raw_ptr` annotations
-  on `FingerprintShard::contains_or_insert` — still an estimated 1-2
-  agent-weeks of code-rewrite work.
-- Memory orderings (`Ordering::Acquire/Release/AcqRel`). Tier A treats
-  atomics as sequentially consistent. The seqlock pattern is correct
-  under SC, and the production code uses the standard release/acquire
-  pairings — but a fully-relaxed-memory-model proof would require Verus
-  support for the C++20 memory model (research-grade, not yet
-  available).
-- `resize_lock: Mutex<()>` (line 142). Tier A models "single resize at
-  a time" via the seq parity bit. The mutex is what physically
-  enforces this in production; tier A relies on the protocol-level
-  parity invariant rather than the mutex directly.
-- `mmap(MAP_ANONYMOUS)` zero-fill. Modeled as `Seq::new(cap, |_| 0)`.
-  The kernel guarantee is axiomatic.
+- Raw `slice::from_raw_parts` over `*mut HashTableEntry`. Tier A models the slice as a `Seq<u64>`; the pointer-to-slice conversion is axiomatic. Eliminating this would require `vstd::raw_ptr` annotations on `FingerprintShard::contains_or_insert` — research-grade rewrite work.
+- Memory orderings (`Ordering::Acquire/Release/AcqRel`). Tier A treats atomics as sequentially consistent. The seqlock pattern is correct under SC, and the production code uses the standard release/acquire pairings — but a fully-relaxed-memory-model proof would require Verus support for the C++20 memory model (research-grade, not yet available).
+- `resize_lock: Mutex<()>` (line 142). Tier A models "single resize at a time" via the seq parity bit. The mutex is what physically enforces this in production; tier A relies on the protocol-level parity invariant rather than the mutex directly.
+- `mmap(MAP_ANONYMOUS)` zero-fill. Modeled as `Seq::new(cap, |_| 0)`. The kernel guarantee is axiomatic.
 
 ### Tier-A.5 (T13.4 partial): production-shape shadow methods
 
-`shard_methods.rs` ships **17 verified items**, ~0.7s wall
-(`./run_proof.sh shadow`). It is the production-shape annotated shadow
-of `FingerprintShard`'s hot-path methods, using real Verus tracked-
-permission machinery (`PAtomicU64` + `Tracked<&PermissionU64>` +
-`Tracked<&mut PermissionU64>`) on real per-slot atomic cells.
+`shard_methods.rs` ships **17 verified items**, ~0.7s wall (`./run_proof.sh shadow`). It is the production-shape annotated shadow of `FingerprintShard`'s hot-path methods, using real Verus tracked- permission machinery (`PAtomicU64` + `Tracked<&PermissionU64>` + `Tracked<&mut PermissionU64>`) on real per-slot atomic cells.
 
 | Production method | Shadow function (verified) | Production lines covered |
 |---|---|---|
@@ -147,43 +92,20 @@ Bridge lemmas (production-shape -> tier-A spec):
 | `(fp + i) % cap` is in [0, cap) | `lemma_probe_index_in_bounds` |
 
 What this tier gives beyond tier A:
-1. **Real Verus permissions on real atomic cells.** Tier A modeled the
-   table as `Seq<u64>`; this file uses `Vec<PAtomicU64>` plus a
-   `Tracked<Map<int, PermissionU64>>` permission map — the same
-   machinery a full T13.4 production rewrite would use.
-2. **`requires`/`ensures` clauses tied to tier-A predicates.** Each
-   shadow method's post-condition references tier-A's `tab_lookup`,
-   `cas_step`, and `tab_insert` semantics via the bridge lemmas.
-3. **Drop-in template for the production rewrite.** When the full
-   multi-week T13.4 work happens, the rewrite team has a working
-   blueprint for permission threading and contract shapes.
+1. **Real Verus permissions on real atomic cells.** Tier A modeled the table as `Seq<u64>`; this file uses `Vec<PAtomicU64>` plus a `Tracked<Map<int, PermissionU64>>` permission map — the same machinery a full T13.4 production rewrite would use.
+2. **`requires`/`ensures` clauses tied to tier-A predicates.** Each shadow method's post-condition references tier-A's `tab_lookup`, `cas_step`, and `tab_insert` semantics via the bridge lemmas.
+3. **Drop-in template for the production rewrite.** When the full T13.4 work happens, the rewrite team has a working blueprint for permission threading and contract shapes.
 
 What the shadow file does NOT do:
-- Does not replace the production `FingerprintShard`. Production
-  `cargo build` is unchanged; the shadow file lives only under
-  `verification/verus/` and is verified by `verus`, not compiled by
-  `rustc` into the binary.
-- Does not lift the outer probe loop into a single bounded-iteration
-  Verus exec function. The 2- and 3-step unrolls demonstrate the
-  shape; a fully-bounded `for probes in 0..cap` form requires a Verus
-  loop with an inductive invariant and a per-slot permission swap.
-  Tier A's `lemma_probe_terminus_bounded` already discharges
-  termination at the spec level.
-- Does not model the seqlock retry loop in production-shape. Tier A's
-  `lemma_reader_terminates` covers that at the spec level.
+- Does not replace the production `FingerprintShard`. Production `cargo build` is unchanged; the shadow file lives only under `verification/verus/` and is verified by `verus`, not compiled by `rustc` into the binary.
+- Does not lift the outer probe loop into a single bounded-iteration Verus exec function. The 2- and 3-step unrolls demonstrate the shape; a fully-bounded `for probes in 0..cap` form requires a Verus loop with an inductive invariant and a per-slot permission swap. Tier A's `lemma_probe_terminus_bounded` already discharges termination at the spec level.
+- Does not model the seqlock retry loop in production-shape. Tier A's `lemma_reader_terminates` covers that at the spec level.
 
 ### Tier-A.6 (T13.5): unbounded-fairness reader liveness
 
-`reader_liveness.rs` extends tier A's bounded `lemma_reader_terminates`
-with the unbounded-liveness statement: "a writer cannot starve a
-reader indefinitely" under a temporal weak-fairness assumption that
-writers do not perpetually block in a resize. Run via
-`./run_proof.sh liveness`.
+`reader_liveness.rs` extends tier A's bounded `lemma_reader_terminates` with the unbounded-liveness statement: "a writer cannot starve a reader indefinitely" under a temporal weak-fairness assumption that writers do not perpetually block in a resize. Run via `./run_proof.sh liveness`.
 
-This file is preserved as the bounded-form fallback. The headline
-T13.3 + T13.5 result lives in `reader_liveness_v2.rs` (see below),
-which discharges all three axioms with explicit finite-prefix
-witnesses.
+This file is preserved as the bounded-form fallback. The headline T13.3 + T13.5 result lives in `reader_liveness_v2.rs` (see below), which discharges all three axioms with explicit finite-prefix witnesses.
 
 | Property | Lemma | Status |
 |---|---|---|
@@ -202,14 +124,9 @@ witnesses.
 
 ### Tier-A.6 (T13.3 + T13.5, constructive): axiom-free reader liveness
 
-`reader_liveness_v2.rs` is the constructive sibling of
-`reader_liveness.rs`. It proves the same headline statements
-(`theorem_reader_eventually_succeeds`, `theorem_no_starvation`) with
-**zero axioms**. Run via `./run_proof.sh reader-liveness-v2`
-(also accepts `liveness-v2`, `live-v2`, `l2`).
+`reader_liveness_v2.rs` is the constructive sibling of `reader_liveness.rs`. It proves the same headline statements (`theorem_reader_eventually_succeeds`, `theorem_no_starvation`) with **zero axioms**. Run via `./run_proof.sh reader-liveness-v2` (also accepts `liveness-v2`, `live-v2`, `l2`).
 
-Each of the original three axioms is replaced by a constructive
-lemma whose witness is an explicit short `seq!` literal:
+Each of the original three axioms is replaced by a constructive lemma whose witness is an explicit short `seq!` literal:
 
 | Original axiom | Replacement lemma | Witness |
 |---|---|---|
@@ -217,13 +134,7 @@ lemma whose witness is an explicit short `seq!` literal:
 | `axiom_reader_can_observe_stutter` | `lemma_reader_can_observe_stutter` | `seq![s, s]` — the stable tail stuttered once |
 | `axiom_extension_composes` | `lemma_extension_composes` | `seq![s, finalize(s), finalize(s)]` — finalize then stutter |
 
-`wf_prefix` over a 2- or 3-element literal reduces to a small number
-of `step_relation` checks that the SMT solver discharges by case
-analysis on `step_relation`'s three disjuncts. The composition
-witness inlines the case-2-then-case-1 reasoning that was previously
-admitted as `axiom_extension_composes`, so all three discharge in a
-single file with no temporal-logic machinery beyond the
-finite-prefix `Seq<ShardSeqState>` model.
+`wf_prefix` over a 2- or 3-element literal reduces to a small number of `step_relation` checks that the SMT solver discharges by case analysis on `step_relation`'s three disjuncts. The composition witness inlines the case-2-then-case-1 reasoning that was previously admitted as `axiom_extension_composes`, so all three discharge in a single file with no temporal-logic machinery beyond the finite-prefix `Seq<ShardSeqState>` model.
 
 | Property | Lemma | Status |
 |---|---|---|
@@ -234,45 +145,19 @@ finite-prefix `Seq<ShardSeqState>` model.
 | **MAIN THEOREM** | `theorem_reader_eventually_succeeds` | Proved (no axioms). |
 | **No-starvation corollary** | `theorem_no_starvation` | Proved (no axioms). |
 
-`./run_proof.sh reader-liveness-v2` reports
-`verification results:: 17 verified, 0 errors` in well under one second.
+`./run_proof.sh reader-liveness-v2` reports `verification results:: 17 verified, 0 errors` in well under one second.
 
-The original `reader_liveness.rs` is intentionally kept as the
-bounded-form fallback; it documents the temporal-logic shape and
-its axiom-discharge plan, both of which remain useful reference
-material for the eventual `state_machines!` port.
+The original `reader_liveness.rs` is intentionally kept as the bounded-form fallback; it documents the temporal-logic shape and its axiom-discharge plan, both of which remain useful reference material for the eventual `state_machines!` port.
 
 ### Tier-A.7 (T13.4 Phase 1 + 1.5): production-shape verified wrapper
 
-`shard_wrapper.rs` ships **34 verified items**, ~1s wall (`./run_proof.sh
-shard-wrapper`). It is the production-shape **wrapper struct**
-`VerifiedFingerprintShard` that mirrors the production `FingerprintShard`
-field layout (slot array + capacity) and ships:
+`shard_wrapper.rs` ships **34 verified items**, ~1s wall (`./run_proof.sh shard-wrapper`). It is the production-shape **wrapper struct** `VerifiedFingerprintShard` that mirrors the production `FingerprintShard` field layout (slot array + capacity) and ships:
 
-  - A **fully-bounded probe loop** (`bounded_contains_loop`) with
-    inductive invariant on the probe index — the headline new
-    capability beyond `shard_methods.rs`. The shadow file explicitly
-    deferred this ("a fully-bounded `for probes in 0..cap` form would
-    require a Verus loop with an inductive invariant ... out of scope
-    for the 6-hour T13.4 timebox"). This file lifts it.
-  - A **fully-bounded contains-or-insert loop**
-    (`bounded_contains_or_insert_loop`) lifting production lines
-    789-828 with the same loop invariant pattern, plus per-iteration
-    permission-map mutation via `tracked_remove`/`tracked_insert`.
-  - A **resize-mode dispatch wrapper**
-    (`bounded_contains_during_resize`) lifting production lines
-    578-622 — the old-table + new-table probe-or-skip control flow.
-  - A **verified constructor** (`make_empty_shard`) that mints an
-    `(VerifiedFingerprintShard, Tracked<Map<int, PermissionU64>>)`
-    pair with the post-condition that every slot is `empty_slot()`.
-    Models production lines 187-256 (`FingerprintShard::new`)
-    without the `mmap` allocation primitive (Phase-2 gap).
-  - **Bridge lemmas** (`lemma_inserted_matches_cas_step`,
-    `lemma_found_implies_in_view`, `lemma_inserted_visible_to_contains`,
-    `lemma_hit_observation_implies_contains`,
-    `lemma_empty_observation_locks_in`, `lemma_probe_index_step`,
-    `lemma_wrapper_probe_index_in_range`) connecting wrapper outputs
-    to tier-A's `tab_lookup` / `tab_insert` / `cas_step` predicates.
+  - A **fully-bounded probe loop** (`bounded_contains_loop`) with inductive invariant on the probe index — the headline new capability beyond `shard_methods.rs`. The shadow file explicitly deferred this ("a fully-bounded `for probes in 0..cap` form would require a Verus loop with an inductive invariant ... out of scope for the 6-hour T13.4 timebox"). This file lifts it.
+  - A **fully-bounded contains-or-insert loop** (`bounded_contains_or_insert_loop`) lifting production lines 789-828 with the same loop invariant pattern, plus per-iteration permission-map mutation via `tracked_remove`/`tracked_insert`.
+  - A **resize-mode dispatch wrapper** (`bounded_contains_during_resize`) lifting production lines 578-622 — the old-table + new-table probe-or-skip control flow.
+  - A **verified constructor** (`make_empty_shard`) that mints an `(VerifiedFingerprintShard, Tracked<Map<int, PermissionU64>>)` pair with the post-condition that every slot is `empty_slot()`. Models production lines 187-256 (`FingerprintShard::new`) without the `mmap` allocation primitive (Phase-2 gap).
+  - **Bridge lemmas** (`lemma_inserted_matches_cas_step`, `lemma_found_implies_in_view`, `lemma_inserted_visible_to_contains`, `lemma_hit_observation_implies_contains`, `lemma_empty_observation_locks_in`, `lemma_probe_index_step`, `lemma_wrapper_probe_index_in_range`) connecting wrapper outputs to tier-A's `tab_lookup` / `tab_insert` / `cas_step` predicates.
 
 | Production source | Wrapper function (verified) |
 |---|---|
@@ -286,85 +171,28 @@ field layout (slot array + capacity) and ships:
 
 What this tier gives beyond tier-A.5 (`shard_methods.rs`):
 
-  1. **Bounded outer probe loop, fully verified end-to-end.** The shadow
-     file is restricted to 2-step and 3-step unrolls because the
-     loop-invariant lift was deferred. This file lifts it via the
-     `index as int == probe_index(fp, probes as nat, cap as nat)` loop
-     invariant + `decreases cap as u64 - probes` termination clause.
-     This is the explicit "Step 3" deliverable from
-     `T13.2-T13.4-design.md` (smallest standalone Verus win, no new
-     `vstd` capability needed).
+  1. **Bounded outer probe loop, fully verified end-to-end.** The shadow file is restricted to 2-step and 3-step unrolls because the loop-invariant lift was deferred. This file lifts it via the `index as int == probe_index(fp, probes as nat, cap as nat)` loop invariant + `decreases cap as u64 - probes` termination clause. This is the explicit "Step 3" deliverable from `T13.2-T13.4-design.md` (smallest standalone Verus win, no new `vstd` capability needed).
 
-  2. **Production-shape struct.** The shadow has only `ShardCells {
-     slots: Vec<PAtomicU64> }`. This file adds `capacity: usize` and
-     a `Tracked<Map<int, PermissionU64>>` permission map, mirroring
-     the production `FingerprintShard` skeleton at lines 124-176. The
-     `VerifiedFingerprintShard` is the Phase-1 wrapper struct called
-     out in the agent-aa936 brief.
+  2. **Production-shape struct.** The shadow has only `ShardCells { slots: Vec<PAtomicU64> }`. This file adds `capacity: usize` and a `Tracked<Map<int, PermissionU64>>` permission map, mirroring the production `FingerprintShard` skeleton at lines 124-176. The `VerifiedFingerprintShard` is the Phase-1 wrapper struct.
 
-  3. **Wrapper-level method bodies, not just per-iteration helpers.**
-     The shadow proves single-iteration helpers
-     (`probe_slot_for_contains`, `cas_insert_or_observe`). This file
-     composes them into the full `bounded_contains_loop` and
-     `bounded_contains_or_insert_loop` with the production-side
-     bounded-iteration shape.
+  3. **Wrapper-level method bodies, not just per-iteration helpers.** The shadow proves single-iteration helpers (`probe_slot_for_contains`, `cas_insert_or_observe`). This file composes them into the full `bounded_contains_loop` and `bounded_contains_or_insert_loop` with the production-side bounded-iteration shape.
 
 What this file does NOT do (Phase 2 / Phase 3):
 
-  - **Does not replace the production `FingerprintShard`.** Production
-    `cargo build` and `cargo test` are unchanged — the wrapper is
-    additive and lives only under `verification/verus/`. Replacing
-    the production type would require resolving the three concrete
-    `vstd` capability gaps documented in `T13.2-T13.4-design.md`:
-    atomic-pointer-swap with overlapping permission lifetimes,
-    mmap-allocated `PointsToArray` with no provenance axiom, and
-    `&self` + linear ghost token incompatibility under
-    `AtomicInvariant`. The realistic path is a `state_machines!`
-    reformulation (5-7 agent-weeks).
-  - **Does not switch call sites in `runtime.rs`.** Phase 3 of the
-    brief; out of scope until Phase 2 lands.
-  - **Does not lift the seqlock retry loop's UNBOUNDED-fairness
-    termination** into a verified exec function — tier A's
-    `lemma_reader_terminates` covers it at the spec level. The Phase
-    1.5 add `bounded_seqlock_retry_contains` ships the BOUNDED form
-    (`max_retries: u64` parameter, `decreases max_retries - retries`),
-    matching production's `MAX_RETRIES_BEFORE_PANIC = 1_000_000`
-    ceiling.
-  - **Does not model the `count: AtomicU64` / `state: AtomicU8`
-    bookkeeping fields** (production lines 134, 107). Tier A and the
-    shadow explicitly omit them; this wrapper inherits that.
+  - **Does not replace the production `FingerprintShard`.** Production `cargo build` and `cargo test` are unchanged — the wrapper is additive and lives only under `verification/verus/`. Replacing the production type would require resolving the three concrete `vstd` capability gaps documented in `T13.2-T13.4-design.md`: atomic-pointer-swap with overlapping permission lifetimes, mmap-allocated `PointsToArray` with no provenance axiom, and `&self` + linear ghost token incompatibility under `AtomicInvariant`. The realistic path is a `state_machines!` reformulation; research-grade.
+  - **Does not switch call sites in `runtime.rs`.** Phase 3 of the brief; out of scope until Phase 2 lands.
+  - **Does not lift the seqlock retry loop's UNBOUNDED-fairness termination** into a verified exec function — tier A's `lemma_reader_terminates` covers it at the spec level. The Phase 1.5 add `bounded_seqlock_retry_contains` ships the BOUNDED form (`max_retries: u64` parameter, `decreases max_retries - retries`), matching production's `MAX_RETRIES_BEFORE_PANIC = 1_000_000` ceiling.
+  - **Does not model the `count: AtomicU64` / `state: AtomicU8` bookkeeping fields** (production lines 134, 107). Tier A and the shadow explicitly omit them; this wrapper inherits that.
 
 #### Phase 1.5 add (2026-05): bounded seqlock retry loop
 
-`bounded_seqlock_retry_contains` lifts the production OUTER seqlock
-retry loop (lines 559-651) into a verified exec function. Bounded
-form via `max_retries: u64` parameter and `decreases max_retries -
-retries` termination clause. Models production's `MAX_RETRIES_BEFORE_
-PANIC` ceiling literally; the unbounded-fairness form remains
-research-grade (would require a writer-resize-count ghost decrement
-threaded through `finalize_resize`). Outcome enum
-`SeqlockRetryOutcome::{Stable(BoundedLookup), Exhausted}` makes the
-retry-budget exhaustion case total. +3 verified items (was 31, now
-34).
+`bounded_seqlock_retry_contains` lifts the production OUTER seqlock retry loop (lines 559-651) into a verified exec function. Bounded form via `max_retries: u64` parameter and `decreases max_retries - retries` termination clause. Models production's `MAX_RETRIES_BEFORE_ PANIC` ceiling literally; the unbounded-fairness form remains research-grade (would require a writer-resize-count ghost decrement threaded through `finalize_resize`). Outcome enum `SeqlockRetryOutcome::{Stable(BoundedLookup), Exhausted}` makes the retry-budget exhaustion case total. +3 verified items (was 31, now 34).
 
 ### Tier-A.8 (T13.5 polish): `state_machines!` port of reader liveness
 
-`reader_liveness_state_machine.rs` ships **15 verified items**, ~1s
-wall (`./run_proof.sh sm` or `./run_proof.sh reader-liveness-sm`).
-LTL-native restatement of v2's headline `theorem_no_starvation`
-using Verus's `state_machine!` macro.
+`reader_liveness_state_machine.rs` ships **15 verified items**, ~1s wall (`./run_proof.sh sm` or `./run_proof.sh reader-liveness-sm`). LTL-native restatement of v2's headline `theorem_no_starvation` using Verus's `state_machine!` macro.
 
-**Status: optional polish.** The headline `theorem_no_starvation`
-already ships axiom-free in `reader_liveness_v2.rs` over a
-hand-rolled `Seq<ShardSeqState>` model. This file is the LTL-native
-equivalent: defines a `state_machine!(ShardSeq)` with three
-transitions (`begin_resize`, `finalize_resize`, `stutter`),
-two `#[invariant]` predicates, four `#[inductive]` proofs, plus a
-**refinement bridge** to `reader_liveness_v2.rs` showing every SM
-transition refines a v2 `step_relation_v2` step. The headline
-`theorem_no_starvation_sm` is restated and proved (constructively
-via the same 2-step stutter / 3-step finalize-stutter witnesses as
-v2). Zero axioms. Run via `./run_proof.sh sm`.
+**Status: optional polish.** The headline `theorem_no_starvation` already ships axiom-free in `reader_liveness_v2.rs` over a hand-rolled `Seq<ShardSeqState>` model. This file is the LTL-native equivalent: defines a `state_machine!(ShardSeq)` with three transitions (`begin_resize`, `finalize_resize`, `stutter`), two `#[invariant]` predicates, four `#[inductive]` proofs, plus a **refinement bridge** to `reader_liveness_v2.rs` showing every SM transition refines a v2 `step_relation_v2` step. The headline `theorem_no_starvation_sm` is restated and proved (constructively via the same 2-step stutter / 3-step finalize-stutter witnesses as v2). Zero axioms. Run via `./run_proof.sh sm`.
 
 | Property | Lemma | Status |
 |---|---|---|
@@ -378,58 +206,25 @@ v2). Zero axioms. Run via `./run_proof.sh sm`.
 | **No-starvation corollary (SM-level)** | `theorem_no_starvation_sm` | Proved (no axioms). |
 
 What this file does NOT do:
-- Does NOT replace `reader_liveness_v2.rs`. v2 is the canonical
-  0-axiom proof; this is an LTL-native reformulation that future
-  state-machines!-native consumers can build on.
-- Does NOT introduce new soundness — same headline, different
-  framework.
-- Does NOT integrate with the production fingerprint shard. Like all
-  other Verus proof files in this directory, this is verified by
-  `verus`, not compiled by `rustc`.
+- Does NOT replace `reader_liveness_v2.rs`. v2 is the canonical 0-axiom proof; this is an LTL-native reformulation that future state-machines!-native consumers can build on.
+- Does NOT introduce new soundness — same headline, different framework.
+- Does NOT integrate with the production fingerprint shard. Like all other Verus proof files in this directory, this is verified by `verus`, not compiled by `rustc`.
 
 ### Genuinely deferred to v1.2.0+
 
-- **Full Verus tracked-pointer integration of the production
-  `FingerprintShard` itself (Phase 2 / Phase 3 of T13.4).** Annotating
-  the production code with `Tracked<PointsToArray<HashTableEntry>>` and
-  threading the permissions through every call site. Requires rewriting
-  `allocate_huge_pages`, `allocate_file_backed`, the resize swap, and
-  every `unsafe { std::slice::from_raw_parts(...) }` to use
-  `vstd::raw_ptr::PPtr` — multi-week work, blocked on the `vstd`
-  capability gaps in `T13.2-T13.4-design.md`. The shadow methods in
-  `shard_methods.rs` and the production-shape wrapper in
-  `shard_wrapper.rs` are the working blueprints for this rewrite.
-- **Discharge of the three reader-liveness axioms.** Discharged
-  constructively in `reader_liveness_v2.rs` (17 verified, 0 axioms,
-  `./run_proof.sh reader-liveness-v2`). The `state_machines!` port
-  ships in `reader_liveness_state_machine.rs` (15 verified, 0
-  axioms, `./run_proof.sh sm`). Both ship the headline
-  `theorem_no_starvation`. The original `reader_liveness.rs` is
-  preserved as the bounded-form fallback.
+- **Full Verus tracked-pointer integration of the production `FingerprintShard` itself (Phase 2 / Phase 3 of T13.4).** Annotating the production code with `Tracked<PointsToArray<HashTableEntry>>` and threading the permissions through every call site. Requires rewriting `allocate_huge_pages`, `allocate_file_backed`, the resize swap, and every `unsafe { std::slice::from_raw_parts(...) }` to use `vstd::raw_ptr::PPtr` — research-grade rewrite work, blocked on the `vstd` capability gaps in `T13.2-T13.4-design.md`. The shadow methods in `shard_methods.rs` and the production-shape wrapper in `shard_wrapper.rs` are the working blueprints for this rewrite.
+- **Discharge of the three reader-liveness axioms.** Discharged constructively in `reader_liveness_v2.rs` (17 verified, 0 axioms, `./run_proof.sh reader-liveness-v2`). The `state_machines!` port ships in `reader_liveness_state_machine.rs` (15 verified, 0 axioms, `./run_proof.sh sm`). Both ship the headline `theorem_no_starvation`. The original `reader_liveness.rs` is preserved as the bounded-form fallback.
 
 ## Honest verdict on Verus for tlaplusplus
 
-**Tier B is real value with bounded cost.** A 600-line proof file with
-19 verified lemmas, completed in one focused agent run, gives us a
-machine-checked artifact that the *protocol* is sound. If a future
-refactor of `page_aligned_fingerprint_store.rs` changes the protocol
-shape (e.g. adds a "cancel resize mid-flight" path), the proof will
-catch it during code review when the abstraction is updated to match.
+**Tier B is real value with bounded cost.** A 600-line proof file with 19 verified lemmas gives us a machine-checked artifact that the *protocol* is sound. If a future refactor of `page_aligned_fingerprint_store.rs` changes the protocol shape (e.g. adds a "cancel resize mid-flight" path), the proof will catch it during code review when the abstraction is updated to match.
 
-**Tier A is research-grade effort.** Direct verification of the unsafe
-production code would require a multi-week rewrite. For 1.0.0 the
-risk/value tradeoff favors keeping the production code idiomatic and
-the Verus proof at the protocol level.
+**Tier A is research-grade effort.** Direct verification of the unsafe production code would require a substantial rewrite. For 1.0.0 the risk/value tradeoff favors keeping the production code idiomatic and the Verus proof at the protocol level.
 
-**Recommendation for v1.1+**: extend this proof along two axes that
-*don't* require rewriting production code:
+**Recommendation for v1.1+**: extend this proof along two axes that *don't* require rewriting production code:
 
-1. Model linear-probe collision behavior as a concrete `Seq<Option<u64>>`
-   instead of `Set<u64>`, and prove the abstract `contains`/`insert`
-   spec. This catches probe-sequence bugs without touching production.
-2. Model worker-thread interleavings explicitly via Verus's
-   `state_machines!` macro, so reader retries can be proved live (not
-   just safe).
+1. Model linear-probe collision behavior as a concrete `Seq<Option<u64>>` instead of `Set<u64>`, and prove the abstract `contains`/`insert` spec. This catches probe-sequence bugs without touching production.
+2. Model worker-thread interleavings explicitly via Verus's `state_machines!` macro, so reader retries can be proved live (not just safe).
 
 ## How to reproduce
 
@@ -441,10 +236,7 @@ the Verus proof at the protocol level.
 
 ### Install Verus from source
 
-Verus does not yet ship a prebuilt aarch64 Linux binary
-(https://github.com/verus-lang/verus/releases/latest as of
-2026-04-25 ships only x86_64 Linux + arm64 macOS + x86_64 macOS +
-x86_64 Windows). On x86_64 Linux:
+Verus does not yet ship a prebuilt aarch64 Linux binary (https://github.com/verus-lang/verus/releases/latest as of 2026-04-25 ships only x86_64 Linux + arm64 macOS + x86_64 macOS + x86_64 Windows). On x86_64 Linux:
 
 ```
 wget https://github.com/verus-lang/verus/releases/latest/download/<asset>.zip
@@ -467,11 +259,7 @@ cp /usr/bin/z3 ./z3
 vargo --no-solver-version-check build --release --vstd-no-verify
 ```
 
-`--vstd-no-verify` is required when using a non-pinned Z3, because
-`vstd` itself contains proof obligations that go through cleanly only
-on Z3 4.12.5. This does not affect the soundness of *our* proof —
-Verus still runs Z3 against `seqlock_resize.rs`'s VC, just not against
-the standard library's.
+`--vstd-no-verify` is required when using a non-pinned Z3, because `vstd` itself contains proof obligations that go through cleanly only on Z3 4.12.5. This does not affect the soundness of *our* proof — Verus still runs Z3 against `seqlock_resize.rs`'s VC, just not against the standard library's.
 
 ### Run the proof
 
@@ -485,11 +273,7 @@ VERUS_DIR=/home/ubuntu/verus ./run_proof.sh reader-liveness-v2  # T13.5 axiom-fr
 VERUS_DIR=/home/ubuntu/verus ./run_proof.sh sm               # T13.5 state_machines! port
 ```
 
-Or run all under CI; see `.github/workflows/verus.yml` for the
-complete gate (T13.6). The CI gate currently runs tier-b, tier-a,
-shard-methods, and reader-liveness-v2; `shard-wrapper` is added
-in this commit and should be wired into the CI workflow alongside
-the others.
+Or run all under CI; see `.github/workflows/verus.yml` for the complete gate (T13.6). The CI gate currently runs tier-b, tier-a, shard-methods, and reader-liveness-v2; `shard-wrapper` is added in this commit and should be wired into the CI workflow alongside the others.
 
 Successful output (shard-wrapper, T13.4 Phase 1):
 
@@ -518,15 +302,10 @@ Verifying: seqlock_resize_tier_a.rs
 verification results:: 31 verified, 0 errors
 ```
 
-Both files verify in well under one second (after the 10-15 minute
-one-time Verus build).
+Both files verify in well under one second (after the 10-15 minute one-time Verus build).
 
 ### Toolchain versions used (2026-04-25)
 
-- Verus: HEAD of `main` branch at clone time, commit
-  `release/0.2026.04.19.6f7d4de` or newer.
+- Verus: HEAD of `main` branch at clone time, commit `release/0.2026.04.19.6f7d4de` or newer.
 - Rust: pinned to 1.95.0 by `verus/rust-toolchain.toml`.
-- Z3: 4.13.3 (Ubuntu 25.10 apt) with `-V no-solver-version-check`.
-  Verus's "preferred" Z3 is 4.12.5; behavior on 4.13.3 has not been
-  formally validated by the Verus team but produces identical results
-  for our small first-order proof obligations.
+- Z3: 4.13.3 (Ubuntu 25.10 apt) with `-V no-solver-version-check`. Verus's "preferred" Z3 is 4.12.5; behavior on 4.13.3 has not been formally validated by the Verus team but produces identical results for our small first-order proof obligations.
