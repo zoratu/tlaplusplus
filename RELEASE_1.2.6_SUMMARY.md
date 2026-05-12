@@ -24,7 +24,7 @@ The following are documented as non-blocking for Layer B's verdict-equivalence d
 
 - **Cross-partition red-DFS send path** stays log-only. The receive arms for `RedDfsProbe` reply `NotFound` to keep the wire shape stable. The DFS pool's verdict comes from the post-exploration in-band Tarjan over the merged per-node `LocalAdjacency` triples, not the in-loop red probe. Cross-partition red-DFS would only matter if Layer B switched to streaming SCC discovery, which is a separate roadmap item.
 - **`RequestStateBlob` send-side** stays a no-op (receive arms reply with empty blobs). Trace reconstruction across partition boundaries is deferred. The single-coordinator pattern keeps trace reconstruction local to whichever node owns the violating SCC.
-- **`--dfs-cluster-listen` CLI flag wiring** is deferred. Production multi-node DFS pool runs go through `dfs_cluster_test_api`; threading the bridge through `EngineConfig` + `cli/args.rs` + `cli/shared.rs` is a separate flag-day.
+- **`--dfs-cluster-listen` CLI flag wiring** is deferred. Shipping multi-node DFS pool runs go through `dfs_cluster_test_api`; threading the bridge through `EngineConfig` + `cli/args.rs` + `cli/shared.rs` is a separate flag-day.
 - **Per-node fingerprint stores share no state with peers.** Layer B cluster-DFS mode and the existing T6 independent-exploration cluster mode are mutually exclusive runtimes that share the protocol but not the bridge.
 
 ## Validation gates
@@ -46,7 +46,7 @@ The following are documented as non-blocking for Layer B's verdict-equivalence d
 
 ## Compatibility
 
-Drop-in for v1.2.0–v1.2.5. No public-API or CLI changes. Production multi-node DFS pool runs go through `dfs_cluster_test_api`; the `--dfs-cluster-listen` user-facing flag is queued for a later release.
+Drop-in for v1.2.0–v1.2.5. No public-API or CLI changes. Shipping multi-node DFS pool runs go through `dfs_cluster_test_api`; the `--dfs-cluster-listen` user-facing flag is queued for a later release.
 
 ## Code-organization deltas vs v1.2.5
 
@@ -54,4 +54,4 @@ New `src/runtime/dfs_cluster_bridge.rs` with 3 unit tests. New `tests/dfs_cluste
 
 ## Still parked
 
-- T13.4 Phases 2+3 — production-code Verus rewrite of `FingerprintShard`, blocked by three documented `vstd` capability gaps.
+- T13.4 Phases 2+3 — shipping-code Verus rewrite of `FingerprintShard`, blocked by three documented `vstd` capability gaps.

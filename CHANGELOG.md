@@ -10,7 +10,7 @@ A new `src/runtime/dfs_cluster_bridge.rs` provides the async-to-sync bridge betw
 
 Per-node cluster memory at dim=8 (64 states): single-node DFS 0.6 MiB delta, 2-node cluster 0.8 MiB total → 0.4 MiB per node = 0.64× single-node baseline.
 
-Deliberate carve-outs: cross-partition red-DFS send path stays log-only (verdict comes from per-node in-band Tarjan); `RequestStateBlob` send-side stays a no-op (trace reconstruction across nodes deferred); `--dfs-cluster-listen` CLI flag wiring deferred (production multi-node DFS pool runs go through `dfs_cluster_test_api`).
+Deliberate carve-outs: cross-partition red-DFS send path stays log-only (verdict comes from per-node in-band Tarjan); `RequestStateBlob` send-side stays a no-op (trace reconstruction across nodes deferred); `--dfs-cluster-listen` CLI flag wiring deferred (shipping multi-node DFS pool runs go through `dfs_cluster_test_api`).
 
 | Gate | Result |
 |---|---|
@@ -96,7 +96,7 @@ Patch release continuing the long-parked items work.
 
 T13.5 `state_machines!` port shipped axiom-free. LTL-native restatement of `theorem_no_starvation` via Verus's `state_machine!` macro plus refinement bridge to `reader_liveness_v2.rs`. New file `verification/verus/reader_liveness_state_machine.rs` (15 verified items). Zero axioms.
 
-T13.4 wrapper extension: a new `bounded_seqlock_retry_contains` in `shard_wrapper.rs` (+3 verified items, was 31 now 34). T13.4 Phases 2+3 (production-code annotation) remain parked behind 3 documented `vstd` capability gaps.
+T13.4 wrapper extension: a new `bounded_seqlock_retry_contains` in `shard_wrapper.rs` (+3 verified items, was 31 now 34). T13.4 Phases 2+3 (shipping-code annotation) remain parked behind 3 documented `vstd` capability gaps.
 
 Verus totals: 115 → 133 verified items (+18) across 6 proof files.
 
@@ -129,7 +129,7 @@ Compiler internal-helper restructuring — depth-tracking consolidation (148 + 2
 
 T10.2 phase 2 stages 1+2 of 5 — strictly-additive foundation. Stage 1: `PageAlignedColorMap` (7 unit tests) — 2-bit Color enum, hugepage mmap, NUMA-shard placement, lock-free CAS. Stage 2: protocol variants (`PartitionEdge`, `RedDfsProbe`, `RequestStateBlob`, etc.) + `Option<u64>` extensions on `TerminationToken`. Stages 3–5 still parked.
 
-T13.4 Phase 1 — production-shape verified wrapper at `verification/verus/shard_wrapper.rs` (31 verified items). Bounded outer probe loop now verified — closes the gap `shard_methods.rs` deferred. 115 total Verus items verified (was 84). Phases 2+3 parked behind documented `vstd` capability gaps.
+T13.4 Phase 1 — shipping-shape verified wrapper at `verification/verus/shard_wrapper.rs` (31 verified items). Bounded outer probe loop now verified — closes the gap `shard_methods.rs` deferred. 115 total Verus items verified (was 84). Phases 2+3 parked behind documented `vstd` capability gaps.
 
 ### Validation
 
@@ -196,7 +196,7 @@ Drop-in for v1.0.x and v1.1.x. No public-API or CLI changes.
 
 ## v1.1.0 (2026-04-25)
 
-Feature release rolling up the post-1.0 sweep — the first wave of items the v1.0.0 plan had marked **DEFER TO 1.1.0**, plus a mid-cycle soundness fix surfaced by the differential gates and a Verus production-shape proof tier.
+Feature release rolling up the post-1.0 sweep — the first wave of items the v1.0.0 plan had marked **DEFER TO 1.1.0**, plus a mid-cycle soundness fix surfaced by the differential gates and a Verus shipping-shape proof tier.
 
 ### Symbolic Init — joint encoding (T5.4 + T5.5)
 
@@ -229,8 +229,8 @@ Feature release rolling up the post-1.0 sweep — the first wave of items the v1
 
 ### Verification (T13.1 – T13.6 partial)
 
-- **T13.1 + T13.2 + T13.3 — Verus tier A.** A 31-lemma proof at `verification/verus/seqlock_resize_tier_a.rs` covering a `Seq<u64>` linear-probe model, spec-level CAS soundness, and bounded reader-retry termination. Sits one rung below the production code: the model is the production protocol, not the production pointers.
-- **T13.4 partial — Tier-A.5 production-shape shadow methods.** A new shadow-method tier in the Verus crate adds 17 lemmas that mirror the hot-path `FingerprintShard` methods one-to-one, which closes the shape gap between the tier-A model and the production code without yet threading `Tracked<PointsTo<HashTableEntry>>` through the real type. Phase-2 (production-code annotations) tracked for v1.2.0.
+- **T13.1 + T13.2 + T13.3 — Verus tier A.** A 31-lemma proof at `verification/verus/seqlock_resize_tier_a.rs` covering a `Seq<u64>` linear-probe model, spec-level CAS soundness, and bounded reader-retry termination. Sits one rung below the shipping code: the model is the shipping protocol, not the shipping pointers.
+- **T13.4 partial — Tier-A.5 shipping-shape shadow methods.** A new shadow-method tier in the Verus crate adds 17 lemmas that mirror the hot-path `FingerprintShard` methods one-to-one, which closes the shape gap between the tier-A model and the shipping code without yet threading `Tracked<PointsTo<HashTableEntry>>` through the real type. Phase-2 (shipping-code annotations) tracked for v1.2.0.
 - **T13.3 + T13.5 — Constructive reader-liveness proof, axiom-free.** A new proof at `verification/verus/reader_liveness_v2.rs` discharges the unbounded-fairness reader-liveness theorem `theorem_no_starvation` with **0 axioms** (17 verified, 0 errors via `./run_proof.sh reader-liveness-v2`, ~0.8s wall). The three previous protocol-shape axioms (`axiom_writer_eventually_finalizes`, `axiom_reader_can_observe_stutter`, `axiom_extension_composes`) are replaced by constructive lemmas with explicit short-`seq!` witnesses (2- and 3-element extensions); `wf_prefix` over each short literal reduces to a small case-split on `step_relation`'s three disjuncts that the SMT solver discharges automatically. The original `verification/verus/reader_liveness.rs` (14 verified plus 3 documented `external_body` axioms) is preserved as the bounded-form temporal-trace fallback and reference for the eventual `state_machines!` port.
 - **T13.6 — CI gate for the Verus tier-A run.** A workflow gate that runs the full Verus tier-A proof on every push so a regression in the model-level guarantees fails the build rather than silently accumulating.
 
@@ -319,7 +319,7 @@ First stable release. The 1.0 cycle focused on correctness foundations, high-lev
 
 ### Verification
 
-- **T13. Verus on the fingerprint store** — tier B, protocol-level proof. `verification/verus/seqlock_resize.rs` (600 lines, 19 verified lemmas) proves the headline soundness theorem `theorem_no_fingerprint_lost`: in any well-formed execution of the protocol, every inserted fingerprint remains observable from then on. Proof is at the protocol abstraction layer — table = `Set<u64>`, atomic step semantics; it does NOT verify the production code's pointer arithmetic, memory orderings, or linear-probe collision behavior. See `verification/verus/README.md` for the assumptions and the tier-A roadmap (T13.1–T13.3, deferred to v1.1.0).
+- **T13. Verus on the fingerprint store** — tier B, protocol-level proof. `verification/verus/seqlock_resize.rs` (600 lines, 19 verified lemmas) proves the headline soundness theorem `theorem_no_fingerprint_lost`: in any well-formed execution of the protocol, every inserted fingerprint remains observable from then on. Proof is at the protocol abstraction layer — table = `Set<u64>`, atomic step semantics; it does NOT verify the shipping code's pointer arithmetic, memory orderings, or linear-probe collision behavior. See `verification/verus/README.md` for the assumptions and the tier-A roadmap (T13.1–T13.3, deferred to v1.1.0).
 
 ### Distributed
 
@@ -362,7 +362,7 @@ The following items remain on the post-1.0.0 roadmap. Detail in `RELEASE_1.0.0_P
 - **T10.2** — Streaming SCC discovery during exploration (on-the-fly liveness for 100M+ state spaces).
 - **T11.3** — CI-gate variant of the chaos soak (~5 min nightly form).
 - **T11.4** — `route_spill_batch` inflight-counter accounting on disk-overflow push errors.
-- **T13.4** — Production-code Verus annotations (`Tracked<PointsTo<HashTableEntry>>` threaded through `FingerprintShard`).
+- **T13.4** — Shipping-code Verus annotations (`Tracked<PointsTo<HashTableEntry>>` threaded through `FingerprintShard`).
 - **T13.5** — Unbounded-fairness reader liveness via Verus `state_machines!` macro.
 - **T13.6** — CI gate for Verus tier-A run.
 

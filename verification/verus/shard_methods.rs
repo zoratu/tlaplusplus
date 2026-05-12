@@ -1,15 +1,15 @@
-// Tier-A.5 — production-shape annotated shadow of FingerprintShard's
+// Tier-A.5 — shipping-shape annotated shadow of FingerprintShard's
 // hot-path methods.
 //
 // Tier A (`seqlock_resize_tier_a.rs`) verifies the linear-probe protocol
 // at the spec level: `cas_step`, `tab_lookup`, `tab_insert` are pure
-// functions on `Seq<u64>`. Production (`src/storage/page_aligned_
+// functions on `Seq<u64>`. Shipping (`src/storage/page_aligned_
 // fingerprint_store.rs`) uses real `AtomicU64` slots accessed via
 // `unsafe { std::slice::from_raw_parts(...) }` over an mmap'd region.
 //
 // Closing the gap fully (T13.4) requires rewriting `FingerprintShard`
 // to thread `Tracked<PointsTo<HashTableEntry>>` through every method
-// signature — research-grade rewrite work.
+// signature — open-ended rewrite work.
 //
 // This file (T13.4 partial) is a **shadow Verus module** that mirrors
 // the hot-path method bodies (`contains` / `contains_or_insert` /
@@ -23,23 +23,23 @@
 // 1. **Real Verus permissions on real atomic cells.** Tier A models the
 //    table as `Seq<u64>`. This file uses `Vec<PAtomicU64>` plus a
 //    `Tracked<Map<int, PermissionU64>>` permission map — the same
-//    machinery that would be used in a full T13.4 production rewrite.
-//    The shadow methods are byte-shape-identical to the production
+//    machinery that would be used in a full T13.4 in-place rewrite.
+//    The shadow methods are byte-shape-identical to the shipping
 //    code at the load / CAS / store level.
 // 2. **`requires`/`ensures` clauses tied to tier A.** The shadow
 //    `contains_normal_path_step` discharges the same `tab_lookup`
 //    semantics that tier A's `lemma_insert_then_lookup` is named for.
 //    The shadow `contains_or_insert_normal_path_step` discharges
-//    `cas_step` semantics directly (production lines 805-823).
-// 3. **A drop-in template for the real production rewrite.** When the
+//    `cas_step` semantics directly (lines 805-823).
+// 3. **A drop-in template for the real in-place rewrite.** When the
 //    full T13.4 work happens, the rewrite team has a working blueprint
 //    for what permission threading looks like and what the contracts
 //    must say.
 //
 // What this file does NOT do
 // ==========================
-// - It does **not** replace the production `FingerprintShard`. The
-//   real `cargo build` still uses the production code unchanged. This
+// - It does **not** replace the `FingerprintShard` itself. The
+//   real `cargo build` still uses the shipping code unchanged. This
 //   file lives only under `verification/verus/` and is verified by
 //   `verus`, not compiled by `rustc` into the binary.
 // - It does **not** model the resize-mode interleavings end-to-end.
@@ -65,7 +65,7 @@ verus! {
 // ----------------------------------------------------------------------------
 // Re-state minimal tier-A predicates so this file is self-contained.
 // (Keeping them inline avoids cross-file Verus module-resolution issues
-// — the real production rewrite would `use seqlock_resize_tier_a::*` once
+// — the real in-place rewrite would `use seqlock_resize_tier_a::*` once
 // these are crate-mates.)
 // ----------------------------------------------------------------------------
 
@@ -83,14 +83,14 @@ pub open spec fn probe_index(fp: u64, i: nat, cap: nat) -> int
 // SHADOW SHARD CELLS — real PAtomicU64 array with tracked permission map
 // ----------------------------------------------------------------------------
 //
-// Production `FingerprintShard` (src/storage/page_aligned_fingerprint_store.rs:
+// The `FingerprintShard` itself (src/storage/page_aligned_fingerprint_store.rs:
 // 124-176) holds:
 //   - `table: AtomicPtr<HashTableEntry>` — pointer into mmap'd memory
 //   - capacity: AtomicUsize
 //   - count: AtomicU64
 //   - seq: AtomicU64 (seqlock parity)
 //
-// In the production code the slots themselves are *inside* the mmap'd
+// In the shipping code the slots themselves are *inside* the mmap'd
 // region, accessed via `unsafe { std::slice::from_raw_parts(table_ptr,
 // capacity) }` (line 628). To model this in Verus without rewriting the
 // mmap path, we use a `Vec<PAtomicU64>` for the slot array — same per-
@@ -102,10 +102,10 @@ pub open spec fn probe_index(fp: u64, i: nat, cap: nat) -> int
 // `vstd::raw_ptr::PPtr<HashTableEntry>` and the permission map would
 // become a `Tracked<PointsToArray<HashTableEntry>>`. That requires
 // rewriting `allocate_huge_pages`, `allocate_file_backed`, and the
-// resize swap to thread permissions through — research-grade rewrite work.
+// resize swap to thread permissions through — open-ended rewrite work.
 pub struct ShardCells {
-    /// Per-slot atomic fingerprint storage. Production lines 103-105
-    /// (`fp: AtomicU64` in `HashTableEntry`); production accesses these
+    /// Per-slot atomic fingerprint storage. Lines 103-105
+    /// (`fp: AtomicU64` in `HashTableEntry`); shipping accesses these
     /// via `table[index].fp.load(...)` on the slice.
     pub slots: Vec<PAtomicU64>,
 }
@@ -126,7 +126,7 @@ pub open spec fn slots_view(
 
 // Well-formedness predicate: every slot in `cells.slots` is paired with
 // a permission in `perms` that is `for` exactly that slot. This is the
-// invariant the production code maintains via construction (the slot
+// invariant the shipping code maintains via construction (the slot
 // array and the implicit permission to access it are co-allocated).
 pub open spec fn cells_wf(
     cells: ShardCells,
@@ -140,10 +140,10 @@ pub open spec fn cells_wf(
 
 // ----------------------------------------------------------------------------
 // SHADOW METHOD 1: probe a single slot, read-only (the inner step of
-// `FingerprintShard::contains` at production lines 626-643).
+// `FingerprintShard::contains` at lines 626-643).
 // ----------------------------------------------------------------------------
 //
-// Production code (line 634):
+// Shipping code (line 634):
 //
 //     let stored_fp = table[index].fp.load(Ordering::Acquire);
 //     if stored_fp == fp { return true; }       // hit
@@ -165,7 +165,7 @@ pub enum ProbeStep {
 // PermissionU64>` argument is the read permission to that slot's atomic
 // — the Verus analog of having the table pointer in scope.
 //
-// `requires`: idx in range, fp != 0 (matches production's empty-slot
+// `requires`: idx in range, fp != 0 (matches shipping code's empty-slot
 // sentinel discipline at line 557: `let fp = if fp == 0 { 1 } else { fp };`).
 //
 // `ensures`: the returned `ProbeStep` reflects what the slot held at
@@ -202,10 +202,10 @@ pub fn probe_slot_for_contains(
 
 // ----------------------------------------------------------------------------
 // SHADOW METHOD 2: the CAS step of `contains_or_insert` normal path
-// (production lines 800-823).
+// (lines 800-823).
 // ----------------------------------------------------------------------------
 //
-// Production code (line 805):
+// Shipping code (line 805):
 //
 //     match entry.fp.compare_exchange(0, fp, Ordering::AcqRel, Ordering::Acquire) {
 //         Ok(_)  => { /* inserted */ ... result = Some(false); break; }
@@ -229,7 +229,7 @@ pub enum CasOutcome {
 // success.
 //
 // `ensures` are stated against `old(perm)` (pre-CAS view) and `perm`
-// (post-CAS view). This is the production-shape analog of tier A's
+// (post-CAS view). This is the shipping-shape analog of tier A's
 // `lemma_cas_soundness`:
 //   - `Inserted`: pre value was 0, post value is fp.
 //   - `AlreadyPresent`: pre value was fp, post value unchanged.
@@ -262,7 +262,7 @@ pub fn cas_insert_or_observe(
     let r = cells.slots[idx].compare_exchange(Tracked(perm), 0u64, fp);
     match r {
         Ok(_actual) => {
-            // CAS succeeded — slot was 0, now is fp. Production line
+            // CAS succeeded — slot was 0, now is fp. Shipping line
             // 805-810 then does `entry.state.store(1)` and bumps
             // count; those are auxiliary to the abstract contract
             // (count is just a heuristic; state is unused by lookups).
@@ -272,12 +272,12 @@ pub fn cas_insert_or_observe(
             if actual == fp {
                 // Lost the CAS, but the contender wrote the SAME fp —
                 // so from the abstract perspective the fp is now
-                // present. Production line 818 returns true (already
+                // present. Line 818 returns true (already
                 // present).
                 CasOutcome::AlreadyPresent
             } else {
                 // Lost the CAS to a different fp; keep probing.
-                // Production line 822 falls through to `index = (index +
+                // Line 822 falls through to `index = (index +
                 // 1) % capacity`.
                 CasOutcome::LostRace
             }
@@ -287,14 +287,14 @@ pub fn cas_insert_or_observe(
 
 // ----------------------------------------------------------------------------
 // SHADOW METHOD 3: bounded probe loop body for the rehash migration step
-// (production lines 312-340 in `rehash_batch_counted`). For each non-
+// (lines 312-340 in `rehash_batch_counted`). For each non-
 // empty old-table slot, find a destination in the new table and CAS
 // `fp` in. We model the inner CAS-or-skip step.
 // ----------------------------------------------------------------------------
 
 // A single migration attempt at new-table slot `idx` for fingerprint
 // `fp`. Returns `true` if the slot now contains `fp` (either we wrote
-// it, or someone else already did) — the production code's `break`
+// it, or someone else already did) — the shipping code's `break`
 // conditions at lines 320-321, 332, 334.
 pub fn rehash_one_step(
     new_cells: &ShardCells,
@@ -420,7 +420,7 @@ pub proof fn lemma_probe_empty_matches_tier_a(
 
 // CAS-then-lookup composition: after a successful CAS at the
 // linear-probe terminus, a subsequent probe at the same slot would
-// observe `Hit`. This is the production-shape analog of tier-A's
+// observe `Hit`. This is the shipping-shape analog of tier-A's
 // `lemma_insert_then_lookup` — the correctness justification for the
 // `contains_or_insert` returning `false` (newly inserted) and being
 // observable to a subsequent `contains` on the same fp.
@@ -459,7 +459,7 @@ pub proof fn lemma_cas_then_probe_observes_fp(
 // slot j != idx had a non-empty value `v` before the CAS, that slot
 // still holds `v` after the CAS. This is the "linear probe under
 // concurrent CAS does not lose existing fingerprints" property —
-// production-shape analog of tier-A's `lemma_insert_preserves_contents`.
+// shipping-shape analog of tier-A's `lemma_insert_preserves_contents`.
 pub proof fn lemma_cas_preserves_other_slots(
     cells: ShardCells,
     perms_pre: Map<int, PermissionU64>,
@@ -487,7 +487,7 @@ pub proof fn lemma_cas_preserves_other_slots(
 {
 }
 
-// Probe-index range: the production code's `index = (fp as usize) %
+// Probe-index range: the shipping code's `index = (fp as usize) %
 // capacity` and `index = (index + 1) % capacity` always produce indices
 // in [0, capacity). Mirrors tier-A's `lemma_probe_index_in_range`.
 pub proof fn lemma_probe_index_in_bounds(fp: u64, i: nat, cap: nat)
@@ -501,7 +501,7 @@ pub proof fn lemma_probe_index_in_bounds(fp: u64, i: nat, cap: nat)
 // SHADOW METHOD 4: bounded outer probe loop (read-only contains path).
 // ----------------------------------------------------------------------------
 //
-// Production lines 626-643:
+// Lines 626-643:
 //
 //     let mut index = (fp as usize) % capacity;
 //     let mut probes = 0u64;
@@ -586,10 +586,10 @@ pub fn two_probe_contains(
 
 // ----------------------------------------------------------------------------
 // SHADOW METHOD 4b: a small-arity (3-step) bounded probe loop —
-// production hot loop unrolled and verified end-to-end.
+// shipping hot loop unrolled and verified end-to-end.
 // ----------------------------------------------------------------------------
 //
-// Production lines 626-643's `while probes < capacity` loop, unrolled to
+// Lines 626-643's `while probes < capacity` loop, unrolled to
 // the 3 most common iterations (the open-addressed hash table is sized
 // so that ~80% of lookups terminate within 1-3 probes per the load-
 // factor analysis). Each iteration calls `probe_slot_for_contains` and
@@ -599,7 +599,7 @@ pub fn two_probe_contains(
 // loop with an inductive invariant tracking the cumulative probe state;
 // tier A's `lemma_probe_terminus_bounded` already proves the
 // termination behavior at the spec level, so we restrict the exec form
-// to the unrolled 3-step shape that matches the production hot path
+// to the unrolled 3-step shape that matches the shipping hot path
 // without fighting Verus loop invariants.
 pub fn three_probe_contains(
     cells: &ShardCells,
@@ -672,12 +672,12 @@ pub fn three_probe_contains(
 // SHADOW METHOD 5: contains_or_insert single iteration (probe + CAS at one slot).
 // ----------------------------------------------------------------------------
 //
-// One iteration of the production normal-path loop at lines 789-828.
+// One iteration of the shipping normal-path loop at lines 789-828.
 // Discharges the per-iteration contract: read the slot, and either
 // (a) report Hit (slot already had fp), (b) attempt CAS and report
 // outcome, or (c) report Continue (need to advance index).
 //
-// This is the core unit of the production hot loop — every iteration of
+// This is the core unit of the shipping hot loop — every iteration of
 // `while probes < capacity` executes exactly this body. Composing N of
 // these (with appropriate index advancement and permission map
 // indexing) gives the full method body.
@@ -725,13 +725,13 @@ pub fn contains_or_insert_step(
         }),
 {
     // Step 1: load the slot to decide whether to CAS or skip.
-    // Production line 791: `let stored_fp = entry.fp.load(...)`.
+    // Line 791: `let stored_fp = entry.fp.load(...)`.
     let stored = cells.slots[idx].load(Tracked(&*perm));
     if stored == fp {
-        // Production line 793: already present, no CAS needed.
+        // Line 793: already present, no CAS needed.
         InsertStepOutcome::AlreadyPresent
     } else if stored == 0 {
-        // Production line 798-823: slot looks empty, attempt CAS.
+        // Line 798-823: slot looks empty, attempt CAS.
         let cas = cas_insert_or_observe(cells, idx, fp, Tracked(perm));
         match cas {
             CasOutcome::Inserted => InsertStepOutcome::NewlyInserted,
@@ -739,7 +739,7 @@ pub fn contains_or_insert_step(
             CasOutcome::LostRace => InsertStepOutcome::LostRaceDifferentFp,
         }
     } else {
-        // Production line 826: slot held an unrelated fp; advance index.
+        // Line 826: slot held an unrelated fp; advance index.
         InsertStepOutcome::Continue
     }
 }
@@ -748,9 +748,9 @@ pub fn contains_or_insert_step(
 // PRODUCTION-CODE COVERAGE BEYOND TIER A
 // ----------------------------------------------------------------------------
 //
-// Production methods now covered by Verus-verified shadow methods:
+// Shipping methods now covered by Verus-verified shadow methods:
 //
-// | Production              | Shadow function                  | Method-shape verification |
+// | Shipping              | Shadow function                  | Method-shape verification |
 // |-------------------------|----------------------------------|---------------------------|
 // | line 634, contains      | probe_slot_for_contains          | full (load -> 3-way)      |
 // | line 805-823, contains_or_insert normal-path CAS | cas_insert_or_observe | full (CAS -> 3-way) |
@@ -779,7 +779,7 @@ pub fn contains_or_insert_step(
 // - `mmap` allocation, `set_mempolicy`, `madvise` — these are still
 //   axiomatic. The `Vec<PAtomicU64>` slot array is the standard Verus
 //   pattern that elides these.
-// - `state.store(1)` (production line 810) and `count.fetch_add(1)`
+// - `state.store(1)` (line 810) and `count.fetch_add(1)`
 //   (line 811) — these are bookkeeping unused by lookup soundness.
 //   Tier A explicitly does not model them; this file inherits that.
 

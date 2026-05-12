@@ -61,4 +61,4 @@ Drop-in for v1.2.0–v1.2.3. No public-API changes. The `--liveness-streaming-ex
 ## Still parked
 
 - T10.2 phase 2 stage 5 — multi-worker DFS via cross-partition routing.
-- T13.4 Phases 2+3 — production-code Verus rewrite of `FingerprintShard`. Blocked by three documented `vstd` capability gaps.
+- T13.4 Phases 2+3 — shipping-code Verus rewrite of `FingerprintShard`. Blocked by three documented `vstd` capability gaps.

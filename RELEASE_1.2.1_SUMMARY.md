@@ -30,7 +30,7 @@ Stages 3–5 (worker DFS body, partition routing, cluster mode) remain parked pe
 
 ### T13.4 Verus tracked-pointer integration — Phase 1
 
-Production-shape verified wrapper at `verification/verus/shard_wrapper.rs` (31 verified items). Lifts the bounded outer probe loop that `shard_methods.rs` deferred. Five proof files now verify with 115 total verified items (was 84). Phases 2 (production-code annotation) and 3 (call site swap) remain parked behind the three documented `vstd` capability gaps.
+Shipping-shape verified wrapper at `verification/verus/shard_wrapper.rs` (31 verified items). Lifts the bounded outer probe loop that `shard_methods.rs` deferred. Five proof files now verify with 115 total verified items (was 84). Phases 2 (shipping-code annotation) and 3 (call site swap) remain parked behind the three documented `vstd` capability gaps.
 
 ## Stale checkbox closed
 
@@ -63,5 +63,5 @@ Drop-in for v1.2.0. No public-API or CLI changes. Fingerprint format, checkpoint
 ## Still parked
 
 - T10.2 phase 2 stages 3+4+5 — runtime hot-loop rewrite + partition routing + cluster mode.
-- T13.4 Phases 2+3 — production-code Verus rewrite of `FingerprintShard`, blocked by three documented `vstd` capability gaps.
+- T13.4 Phases 2+3 — shipping-code Verus rewrite of `FingerprintShard`, blocked by three documented `vstd` capability gaps.
 - T13.5 `state_machines!` port — optional polish; the headline `theorem_no_starvation` already shipped axiom-free in v1.1.0 via `reader_liveness_v2.rs`.

@@ -10,9 +10,9 @@ A new file `verification/verus/reader_liveness_state_machine.rs` (15 verified it
 
 ## T13.4 — wrapper-level seqlock retry verified
 
-A new `bounded_seqlock_retry_contains` in `verification/verus/shard_wrapper.rs` (+3 verified items, total now 34). Wrapper-level seqlock retry loop with `decreases max_retries - retries` termination — closes another piece of the gap between the shadow methods and the production retry loop.
+A new `bounded_seqlock_retry_contains` in `verification/verus/shard_wrapper.rs` (+3 verified items, total now 34). Wrapper-level seqlock retry loop with `decreases max_retries - retries` termination — closes another piece of the gap between the shadow methods and the shipping retry loop.
 
-T13.4 Phases 2+3 (production-code annotation of `FingerprintShard`) remain parked. The Phase 2 probe reconfirmed all three documented `vstd` capability gaps:
+T13.4 Phases 2+3 (shipping-code annotation of `FingerprintShard`) remain parked. The Phase 2 probe reconfirmed all three documented `vstd` capability gaps:
 
 1. `unsafe { std::slice::from_raw_parts(table_ptr, capacity) }` in the contains probe loop — `table_ptr` comes from a swappable `AtomicPtr`; modeling without `external_body` isn't possible today.
 2. `mmap(MAP_HUGETLB | MAP_POPULATE)` in `FingerprintShard::new` — `Tracked<PointsToArray<...>>` requires a memory-provenance axiom or an `external_body` permission mint.
@@ -32,7 +32,7 @@ T13.4 Phases 2+3 (production-code annotation of `FingerprintShard`) remain parke
 
 ## T10.2 phase 2 — stage 3 partial (data-structure integration)
 
-Wires the production `PageAlignedColorMap` data structure (Stage 1 deliverable) into the post-BFS oracle path behind a new `--liveness-streaming-exploration` flag. Validates the data structure end-to-end on real fairness specs.
+Wires the `PageAlignedColorMap` data structure (Stage 1 deliverable) into the post-BFS oracle path behind a new `--liveness-streaming-exploration` flag. Validates the data structure end-to-end on real fairness specs.
 
 `src/streaming_scc.rs` gains `nested_dfs_color_map` plus helpers and 5 unit tests. `src/runtime/liveness.rs` gains the page-aligned oracle integration. `src/runtime.rs` gains the `liveness_streaming_exploration` config field. `src/cli/args.rs` and `src/cli/shared.rs` add the new `--liveness-streaming-exploration` flag. `tests/streaming_scc_exploration_parity.rs` adds 3 parity tests (Tarjan vs color-map; observed `color_map_cycle=true tarjan_cycle=true` and `color_map_cycle=false tarjan_cycle=false` on the existing fairness fixtures).
 

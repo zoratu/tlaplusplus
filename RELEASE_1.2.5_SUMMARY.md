@@ -55,4 +55,4 @@ New `src/runtime/dfs_pool.rs`. New `tests/dfs_pool_parity.rs` with 3 tests. New 
 ## Still parked
 
 - T10.2 phase 2 stage 5 Layer B — multi-node cluster DFS via the existing `PartitionEdge`/`RedDfsProbe` protocol variants.
-- T13.4 Phases 2+3 — production-code Verus rewrite of `FingerprintShard`, blocked by three documented `vstd` capability gaps.
+- T13.4 Phases 2+3 — shipping-code Verus rewrite of `FingerprintShard`, blocked by three documented `vstd` capability gaps.

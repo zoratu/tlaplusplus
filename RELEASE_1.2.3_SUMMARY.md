@@ -66,4 +66,4 @@ New `src/runtime/dfs_worker.rs` with 3 unit tests. New `tests/dfs_worker_parity.
 ## Still parked
 
 - T10.2 phase 2 stages 4 + 5 — Stage 4 drops `labeled_transitions` and proves the memory win; Stage 5 wires multi-worker DFS via cross-partition routing.
-- T13.4 Phases 2+3 — production-code Verus rewrite of `FingerprintShard`. Blocked by three documented `vstd` capability gaps.
+- T13.4 Phases 2+3 — shipping-code Verus rewrite of `FingerprintShard`. Blocked by three documented `vstd` capability gaps.

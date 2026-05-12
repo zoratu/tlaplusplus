@@ -10,7 +10,7 @@
 // starve a reader indefinitely" — under a temporal fairness
 // assumption that writers do not perpetually keep the seqlock odd.
 // This is the formal version of the informal claim that the
-// production seqlock retry loop
+// shipping seqlock retry loop
 // (`page_aligned_fingerprint_store.rs:557-649`) is live, not just safe.
 //
 // HONEST OUTCOME (per the task brief)
@@ -36,7 +36,7 @@
 //
 // What is NOT shipped here is direct integration with Verus's
 // `state_machines!` macro. The macro is functional and is the
-// recommended vehicle for liveness proofs in production-grade Verus,
+// recommended vehicle for liveness proofs in shipping-grade Verus,
 // but its surface for temporal-logic LTL operators (`always`,
 // `eventually`, `leads_to`) is still evolving across releases. A
 // hand-rolled trace model is shipped here, plus a documented
@@ -158,7 +158,7 @@ pub proof fn lemma_step_relation_monotonic(s: ShardSeqState, s_next: ShardSeqSta
 // READER SEMANTICS
 // ----------------------------------------------------------------------------
 //
-// Production reader (page_aligned_fingerprint_store.rs:557-649):
+// Shipping reader (page_aligned_fingerprint_store.rs:557-649):
 //
 //     loop {
 //         seq_before = self.seq.load();
@@ -334,7 +334,7 @@ pub proof fn theorem_prefix_seq_growth_bounded(prefix: Seq<ShardSeqState>, i: in
 //
 // The bound `K` in `writer_finalizes_within(K)` is the maximum
 // number of additional steps the writer needs to finalize, from
-// any reachable resizing state. In production, K is bounded by the
+// any reachable resizing state. In shipping, K is bounded by the
 // table-size constant + a small constant for the finalize step
 // itself; in our abstraction we just take K as a parameter.
 
@@ -367,13 +367,13 @@ pub open spec fn finalize_extension_exists(prefix: Seq<ShardSeqState>, ext: Seq<
 // AXIOM 1 (writer-fairness): from any well-formed prefix ending in
 // a resizing state, an extension exists that ends in a stable state.
 //
-// What it would take to discharge: a model of the production
+// What it would take to discharge: a model of the shipping
 // `rehash_batch_counted` loop showing it always reaches the
 // `finalize_resize` call after at most O(table_capacity) steps. The
-// production code's resize loop bounds rehash work by capacity, and
+// shipping code's resize loop bounds rehash work by capacity, and
 // finalize is unconditional after rehash completes; together these
 // bound the extension length. Verus can verify this on a concrete
-// loop annotation; the work is annotation effort on the production
+// loop annotation; the work is annotation effort on the shipping
 // code, not a deep proof issue.
 #[verifier::external_body]
 pub proof fn axiom_writer_eventually_finalizes(prefix: Seq<ShardSeqState>)
@@ -519,7 +519,7 @@ pub proof fn theorem_no_starvation(prefix: Seq<ShardSeqState>)
 //   * BOUNDED (tier A) — useful for static worst-case analysis where
 //     the application supplies a bound on writer activity.
 //   * UNBOUNDED (this file) — the formal liveness property,
-//     conditioned on writer fairness, that justifies the production
+//     conditioned on writer fairness, that justifies the shipping
 //     code's unbounded retry loop.
 //
 // ----------------------------------------------------------------------------
@@ -534,14 +534,14 @@ pub proof fn theorem_no_starvation(prefix: Seq<ShardSeqState>)
 //                  ends in a stable state.
 //
 //       Discharge plan: Build a Verus model of
-//       `rehash_batch_counted` (production line 280-344) annotated
+//       `rehash_batch_counted` (line 280-344) annotated
 //       with the loop invariant `slots_done <= capacity`. The loop
 //       has a finite trip count bounded by capacity; after the loop,
 //       `finalize_resize` is unconditional. Each iteration is
 //       `step_stutter_seq` (rehash does not change seq) followed by a
 //       single `step_finalize_resize_seq`. The work is mostly
 //       threading the Verus loop-invariant annotation through the
-//       production code or a shadow copy of it (similar in shape to
+//       shipping code or a shadow copy of it (similar in shape to
 //       `shard_methods.rs`).
 //
 //   (2) axiom_reader_can_observe_stutter
@@ -575,7 +575,7 @@ pub proof fn theorem_no_starvation(prefix: Seq<ShardSeqState>)
 //       adjacent pair preserves `step_relation`. Careful
 //       index-arithmetic in Verus.
 //
-// All three axioms are CLASSICALLY TRUE under the production code's
+// All three axioms are CLASSICALLY TRUE under the shipping code's
 // concurrent semantics. They would be discharged by a pencil-and-
 // paper temporal-logic proof in well under a page each. Formalizing
 // them in current Verus is one path; another is a full port to

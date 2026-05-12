@@ -39,7 +39,7 @@ Tested on u-6tb1.metal (384-core, 6 NUMA nodes) with Combined.tla:
 
 ### Combined.tla (Complex Multi-Module TLA+ Spec)
 
-Realistic production TLA+ specification with:
+Realistic shipping TLA+ specification with:
 - Multiple interacting modules
 - Complex state transitions
 - Large state space (~billions of states)

@@ -54,7 +54,7 @@ Eight iterations of targeted compiler-helper coverage on top of the existing T2 
 
 ### Fuzz harness signal-vs-noise framing
 
-`scripts/fuzz.sh` documents the policy: fuzz targets surface panics, sanitizer trips, and compiler-vs-interpreter divergences. RSS-cap exits from adversarial memory-consumption inputs are noise; the harness raises libFuzzer's RSS limit to 8 GB so the soundness signal isn't drowned out. Production runs use `budget=None` — this is fuzz harness configuration only, not user-facing behavior.
+`scripts/fuzz.sh` documents the policy: fuzz targets surface panics, sanitizer trips, and compiler-vs-interpreter divergences. RSS-cap exits from adversarial memory-consumption inputs are noise; the harness raises libFuzzer's RSS limit to 8 GB so the soundness signal isn't drowned out. Shipping runs use `budget=None` — this is fuzz harness configuration only, not user-facing behavior.
 
 ## Validation gates
 

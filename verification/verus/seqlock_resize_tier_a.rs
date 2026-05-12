@@ -14,32 +14,32 @@
 //
 // 1. **Linear-probe table model (`T13.1`).** Defines `Table = Seq<u64>`
 //    with 0 reserved as the empty sentinel — exact match to the
-//    production code's "store 0=empty, fp values use 1..u64::MAX"
+//    shipping code's "store 0=empty, fp values use 1..u64::MAX"
 //    convention at page_aligned_fingerprint_store.rs:556 (`if fp == 0
 //    { 1 } else { fp }`). All operations — `tab_lookup`, `tab_insert`,
-//    `tab_contents` — are spec functions implementing the production
+//    `tab_contents` — are spec functions implementing the shipping
 //    probe loop semantics from lines 631-641 (`contains`) and 783-839
 //    (`contains_or_insert` normal path).
 //
 // 2. **Probe-correctness lemmas.** Proves that linear probing realizes
 //    the abstract `Set<u64>` faithfully. Key lemma:
 //    `lemma_insert_then_lookup`: after `tab_insert(t, fp)` succeeds,
-//    `tab_lookup(t', fp) == true`. This is the property the production
+//    `tab_lookup(t', fp) == true`. This is the property the shipping
 //    `contains_or_insert` CAS loop relies on.
 //
 // 3. **CAS soundness sketch (`T13.2`).** Defines an abstract
 //    `cas_step` (success/failure cases) and proves that a successful
 //    CAS on a slot transitions the table contents from `S` to
 //    `S.insert(fp)`. This bridges the protocol-level
-//    `step_insert_during_resize` to the actual production CAS at
+//    `step_insert_during_resize` to the actual shipping CAS at
 //    page_aligned_fingerprint_store.rs:723-741.
 //
-//    Full Verus tracked-permission integration on the production
-//    `AtomicPtr<HashTableEntry>` would require rewriting the production
+//    Full Verus tracked-permission integration on the shipping
+//    `AtomicPtr<HashTableEntry>` would require rewriting the shipping
 //    code to thread `Tracked<PointsTo<...>>` through every call site.
-//    That is the research-grade tier-A effort flagged in the README;
+//    That is the open-ended tier-A effort flagged in the README;
 //    what this file ships is the *spec-level* CAS soundness proof,
-//    which is the prerequisite for a future production-code annotation
+//    which is the prerequisite for a future shipping-code annotation
 //    pass.
 //
 // 4. **Bounded-resize termination (`T13.3`).** Proves the reader retry
@@ -56,7 +56,7 @@
 // - Raw pointer arithmetic in `unsafe { std::slice::from_raw_parts(...) }`.
 //   Verus has `vstd::raw_ptr` for this but applying it requires
 //   rewriting `FingerprintShard` to thread `Tracked<PointsTo>` through
-//   every call — research-grade rewrite work.
+//   every call — open-ended rewrite work.
 //
 // - Memory-ordering of `AtomicPtr` (`Acquire`/`Release`/`AcqRel`). The
 //   tier-A model treats each atomic op as sequentially consistent,
@@ -88,7 +88,7 @@ verus! {
 // Capacity is `t.len()`.
 pub type Table = Seq<u64>;
 
-// The empty-slot sentinel. Production guarantees (line 556) fp != 0 by
+// The empty-slot sentinel. Shipping guarantees (line 556) fp != 0 by
 // remapping 0 -> 1 before insert.
 pub open spec fn EMPTY() -> u64 { 0u64 }
 
@@ -103,7 +103,7 @@ pub open spec fn probe_index(fp: u64, i: nat, cap: nat) -> int
 }
 
 // The probe terminates within `cap` steps if a slot containing either
-// `fp` or `EMPTY` is encountered (the production code's break conditions
+// `fp` or `EMPTY` is encountered (the shipping code's break conditions
 // at lines 633-637). We define the termination index as the *minimum* i
 // in [0, cap) at which the slot is fp-or-empty. We use a recursive
 // search bounded by `cap`.
@@ -136,7 +136,7 @@ pub open spec fn probe_terminus(t: Table, fp: u64) -> nat
 }
 
 // The lookup result: did we find `fp` along its probe sequence?
-// `tab_lookup(t, fp)` mirrors `contains` at line 554 of the production
+// `tab_lookup(t, fp)` mirrors `contains` at line 554 of the shipping
 // code, taking only the normal (non-resize) path.
 pub open spec fn tab_lookup(t: Table, fp: u64) -> bool
     recommends
@@ -154,7 +154,7 @@ pub open spec fn tab_lookup(t: Table, fp: u64) -> bool
 // Insert: produce the new table with fp written at the first empty slot
 // in fp's probe sequence. If the slot is already fp, the table is
 // unchanged. If the table is full and fp not present, the result is the
-// unchanged table (production would CAS-spin or yield; we model
+// unchanged table (shipping would CAS-spin or yield; we model
 // "insert failed" as no-op at this abstraction level — see CAS soundness
 // section below for the dynamic case).
 pub open spec fn tab_insert(t: Table, fp: u64) -> Table
@@ -487,7 +487,7 @@ pub open spec fn observable_a(s: ShardStateA, fp: u64) -> bool
 // CAS SOUNDNESS (T13.2)
 // ----------------------------------------------------------------------------
 //
-// The production code's resize-mode CAS (page_aligned_fingerprint_store.rs:
+// The shipping code's resize-mode CAS (page_aligned_fingerprint_store.rs:
 // 723-741) targets `entry.fp.compare_exchange(0, fp, AcqRel, Acquire)`. The
 // key safety property: a successful CAS at slot S transitions the
 // abstract table contents from C to C ∪ {fp}, and never overwrites a
@@ -510,7 +510,7 @@ pub open spec fn cas_step(t: Table, slot: int, fp: u64) -> Option<Table>
 }
 
 // CAS soundness: a successful CAS preserves all prior contents and adds
-// exactly fp. This is the abstract reading of the production CAS at
+// exactly fp. This is the abstract reading of the shipping CAS at
 // lines 723-741.
 pub proof fn lemma_cas_soundness(t: Table, slot: int, fp: u64)
     requires
@@ -538,7 +538,7 @@ pub proof fn lemma_cas_soundness(t: Table, slot: int, fp: u64)
 
 // CAS failure: when the slot is already occupied by some `actual`, the
 // CAS returns None and no state mutation occurs. Caller's contract
-// (production code lines 737-740) is to either succeed (if `actual ==
+// (shipping code lines 737-740) is to either succeed (if `actual ==
 // fp`, treat as already present) or retry probing.
 pub proof fn lemma_cas_failure_no_clobber(t: Table, slot: int, fp: u64, actual: u64)
     requires
@@ -599,7 +599,7 @@ pub open spec fn step_insert_during_resize_a(s: ShardStateA, fp: u64) -> ShardSt
     }
 }
 
-// Migrate one entry from old_table[i] into new_table (production:
+// Migrate one entry from old_table[i] into new_table (shipping:
 // rehash_batch_counted lines 312-340). i is the source slot.
 pub open spec fn step_rehash_one_a(s: ShardStateA, i: int) -> ShardStateA
     recommends
@@ -722,7 +722,7 @@ pub proof fn lemma_cas_during_resize_observable_a(s: ShardStateA, slot: int, fp:
 // BOUNDED-RESIZE TERMINATION (T13.3)
 // ----------------------------------------------------------------------------
 //
-// The production reader retry loop at page_aligned_fingerprint_store.rs:
+// The shipping reader retry loop at page_aligned_fingerprint_store.rs:
 // 557-649 is structured as:
 //
 //     loop {
@@ -774,7 +774,7 @@ pub proof fn lemma_reader_progress(n: nat, i: nat)
 
 // Soundness of a single reader observation under the seqlock retry: if
 // `seq_before == seq_after`, the read happened against one consistent
-// snapshot — no resize boundary was crossed (production line 645).
+// snapshot — no resize boundary was crossed (line 645).
 pub proof fn lemma_reader_consistent_snapshot(s_before: ShardStateA, s_after: ShardStateA)
     requires
         s_before.seq == s_after.seq,
@@ -828,7 +828,7 @@ pub proof fn lemma_lookup_implies_in_contents(t: Table, fp: u64)
 // This lemma requires: every empty slot in fp's probe sequence is
 // reached only AFTER fp's slot. Equivalently, fp was inserted via
 // linear-probe semantics (not stuffed into an arbitrary slot). This is
-// the production code's invariant: `contains_or_insert` always inserts
+// the shipping code's invariant: `contains_or_insert` always inserts
 // at the first EMPTY slot in fp's probe sequence (page_aligned_
 // fingerprint_store.rs:783-820), so any fp in the table satisfies it.
 //
@@ -837,7 +837,7 @@ pub open spec fn linear_probe_invariant(t: Table, fp: u64) -> bool
     recommends t.len() > 0, fp != EMPTY(),
 {
     // For every k in [0, cap), if t[probe_index(fp, k, cap)] == EMPTY()
-    // then no probe slot j > k along fp's sequence holds fp. (Production
+    // then no probe slot j > k along fp's sequence holds fp. (Shipping
     // never bypasses an empty slot when looking for fp.)
     forall|k: nat, j: nat| #![trigger t[probe_index(fp, k, t.len())], t[probe_index(fp, j, t.len())]]
         k < t.len() && j < t.len() && k < j
@@ -951,7 +951,7 @@ pub proof fn theorem_no_fingerprint_lost_a(
 }
 
 // Concurrent-insert variant: a fingerprint inserted into new_table
-// while resize is mid-flight (production: lines 723-741) survives the
+// while resize is mid-flight (shipping: lines 723-741) survives the
 // finalize swap.
 pub proof fn theorem_concurrent_insert_survives_a(
     s_mid_resize: ShardStateA,
@@ -966,7 +966,7 @@ pub proof fn theorem_concurrent_insert_survives_a(
         fp_concurrent != EMPTY(),
     ensures
         ({
-            // Apply the abstract CAS (production lines 723-741).
+            // Apply the abstract CAS (lines 723-741).
             let new_t = s_mid_resize.new_table.update(slot, fp_concurrent);
             let s_after_cas = ShardStateA {
                 seq: s_mid_resize.seq,

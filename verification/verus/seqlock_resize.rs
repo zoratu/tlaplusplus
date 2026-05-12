@@ -18,16 +18,16 @@
 //   - memory-ordering of atomics (the abstract steps execute atomically),
 //   - concurrent inserts during the rehash window (modeled as a single
 //     interleaving where every "insert during resize" deposits into the
-//     new table, exactly mirroring the production code's `contains_or_insert`
+//     new table, exactly mirroring the shipping code's `contains_or_insert`
 //     resize-in-progress branch at lines 656–776 of
 //     page_aligned_fingerprint_store.rs).
 //
-// The production code's three claimed invariants on the seqlock resize
+// The shipping code's three claimed invariants on the seqlock resize
 // (see CLAUDE.md "Lock-Free Fingerprint Store" section) are:
 //   1. Seqlock coordination (odd = resizing, even = stable)  -> proved (P2)
 //   2. Atomic pointer swapping for lock-free table replacement -> modeled
 //      as a single `finalize_resize` step that updates `table` and bumps
-//      `seq` to the next even value (single-stepped here; the production
+//      `seq` to the next even value (single-stepped here; the shipping
 //      code does these as two atomic stores plus one fetch_add).
 //   3. Readers spin-wait during resize, then retry -> modeled by the
 //      `contains_under_resize` reader spec, which checks BOTH old and
@@ -64,7 +64,7 @@ verus! {
 //   - the "live" table contents as a Set<u64>,
 //   - during resize, an additional "old" snapshot frozen at resize start.
 //
-// Production correspondence:
+// Shipping correspondence:
 //   `seq`        <-> AtomicU64, page_aligned_fingerprint_store.rs:138
 //   `table`      <-> AtomicPtr<HashTableEntry> at line 130 (current table)
 //   `old_table`  <-> AtomicPtr at line 145 (snapshot during resize)
@@ -82,7 +82,7 @@ pub struct ShardState {
 // Well-formedness invariant.
 // ----------------------------------------------------------------------------
 //
-// Captures the protocol-level invariant the production code maintains:
+// Captures the protocol-level invariant the shipping code maintains:
 //   - parity tracks whether resize is in progress;
 //   - during resize, `new_table` is a superset of the entries already
 //     migrated from `old_table` (rehash never deletes);
@@ -96,7 +96,7 @@ pub open spec fn wf(s: ShardState) -> bool {
         // RESIZING: the snapshot is non-empty only insofar as it captures
         // a previous stable `table`. The reader-observable union is
         // (old_table ∪ new_table). The current `table` field is unchanged
-        // until finalize runs (production: `finalize_resize` swaps `table`
+        // until finalize runs (shipping: `finalize_resize` swaps `table`
         // to point at the new region at line 368 BEFORE the seq bump at
         // line 374, but at the abstract level the swap and bump are one
         // step). We do not constrain `table` further here since readers
@@ -121,11 +121,11 @@ pub open spec fn observable(s: ShardState, fp: u64) -> bool {
 // ----------------------------------------------------------------------------
 // PROTOCOL TRANSITIONS
 // Each `step_*` function is the abstract effect of a primitive in the
-// production seqlock resize.
+// shipping seqlock resize.
 // ----------------------------------------------------------------------------
 
 // Insert during the stable state (no resize in progress).
-// Production correspondence: `contains_or_insert` "NORMAL PATH" branch
+// Shipping correspondence: `contains_or_insert` "NORMAL PATH" branch
 // at lines 778–838. Inserts go into `table`, seq is unchanged.
 pub open spec fn step_insert_stable(s: ShardState, fp: u64) -> ShardState {
     ShardState {
@@ -138,7 +138,7 @@ pub open spec fn step_insert_stable(s: ShardState, fp: u64) -> ShardState {
 
 // Begin a resize: snapshot `table` into `old_table`, clear `new_table`,
 // bump seq to the next odd number.
-// Production correspondence: `resize` lines 469–497.
+// Shipping correspondence: `resize` lines 469–497.
 pub open spec fn step_begin_resize(s: ShardState) -> ShardState {
     ShardState {
         seq: s.seq + 1,
@@ -148,7 +148,7 @@ pub open spec fn step_begin_resize(s: ShardState) -> ShardState {
     }
 }
 
-// Insert during resize: production code (lines 704–746) places it in the
+// Insert during resize: shipping code (lines 704–746) places it in the
 // new table directly. Old table is frozen.
 pub open spec fn step_insert_during_resize(s: ShardState, fp: u64) -> ShardState {
     ShardState {
@@ -160,9 +160,9 @@ pub open spec fn step_insert_during_resize(s: ShardState, fp: u64) -> ShardState
 }
 
 // Migrate one entry from old to new during incremental rehash (one bucket
-// at a time). Production: `rehash_batch_counted` lines 280–344.
+// at a time). Shipping: `rehash_batch_counted` lines 280–344.
 // We model migration of a single fingerprint that is in `old_table` but
-// not yet in `new_table`. The production code uses CAS on the new table;
+// not yet in `new_table`. The shipping code uses CAS on the new table;
 // the abstract step is a set insert.
 pub open spec fn step_rehash_one(s: ShardState, fp: u64) -> ShardState {
     ShardState {
@@ -174,8 +174,8 @@ pub open spec fn step_rehash_one(s: ShardState, fp: u64) -> ShardState {
 }
 
 // Finalize: swap `new_table` into `table`, clear scratch, bump seq to even.
-// Production: `finalize_resize` lines 357–390. Precondition (matched in
-// production by `is_rehash_complete` at line 503) is that every old entry
+// Shipping: `finalize_resize` lines 357–390. Precondition (matched in
+// shipping by `is_rehash_complete` at line 503) is that every old entry
 // has been migrated.
 pub open spec fn step_finalize_resize(s: ShardState) -> ShardState {
     ShardState {
@@ -323,7 +323,7 @@ pub proof fn lemma_resize_preserves_membership(s0: ShardState, fp: u64)
 // We weave a sequence of inserts during resize between begin and finalize.
 // The proof composes lemma_resize_preserves_membership with the helpers
 // above to cover the "insert lands in new table while resize is mid-flight"
-// case the production code handles at contains_or_insert lines 704–746.
+// case the shipping code handles at contains_or_insert lines 704–746.
 // ----------------------------------------------------------------------------
 pub proof fn lemma_concurrent_insert_during_resize_preserved(
     s0: ShardState,
@@ -381,7 +381,7 @@ pub proof fn lemma_concurrent_insert_during_resize_preserved(
 // ----------------------------------------------------------------------------
 // READER LIVENESS / CONSISTENCY
 //
-// The production reader uses the standard seqlock retry pattern: read
+// The shipping reader uses the standard seqlock retry pattern: read
 // `seq_before`, do the lookup, read `seq_after`, retry if they differ
 // (page_aligned_fingerprint_store.rs:644–648 and 828–831).
 //

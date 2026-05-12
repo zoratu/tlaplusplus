@@ -11,7 +11,7 @@
 // `reader_liveness_v2.rs` (17 verified, 0 axioms). This file adds an
 // independently-verified RESTATEMENT of the same protocol using the
 // `state_machine!` macro, so future state_machines!-native consumers
-// (refinement to a tracked-state-machines version of the production
+// (refinement to a tracked-state-machines version of the shipping
 // fingerprint shard, etc.) have a structural starting point.
 //
 // What this file ships
@@ -606,7 +606,7 @@ pub proof fn theorem_no_starvation_sm(prefix: Seq<ShardSeq::State>)
 //   - Does NOT introduce any axioms. All proofs are constructive.
 //   - Does NOT replace `reader_liveness_v2.rs`. v2 remains the
 //     canonical 0-axiom proof.
-//   - Does NOT integrate with the production fingerprint shard. The
-//     production code is unchanged; this is a Verus-only proof file.
+//   - Does NOT integrate with the shipping fingerprint shard. The
+//     shipping code is unchanged; this is a Verus-only proof file.
 
 fn main() {}

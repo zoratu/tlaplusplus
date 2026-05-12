@@ -1,13 +1,13 @@
-// Tier-A.6 — production-shape VERIFIED WRAPPER for FingerprintShard.
+// Tier-A.6 — shipping-shape VERIFIED WRAPPER for FingerprintShard.
 //
-// Status: T13.4 Phase 1 — production-shape wrapper, verified.
+// Status: T13.4 Phase 1 — shipping-shape wrapper, verified.
 //
 // What this file is
 // =================
 //
 // This file extends the `shard_methods.rs` shadow (T13.4 partial,
-// 17 verified items) with a production-shape *wrapper struct*
-// `VerifiedFingerprintShard` that mirrors the production
+// 17 verified items) with a shipping-shape *wrapper struct*
+// `VerifiedFingerprintShard` that mirrors the shipping
 // `FingerprintShard` field layout (slot array + capacity + count + seq)
 // and ships verified hot-path methods including:
 //
@@ -18,25 +18,25 @@
 //      because the loop-invariant lift was deferred; this file does it.
 //
 //   2. A verified `contains` method body that uses the bounded probe
-//      loop and matches production lines 626-643 byte-for-byte at the
+//      loop and matches lines 626-643 byte-for-byte at the
 //      load + 3-way fork structure.
 //
 //   3. A verified `contains_or_insert` method body that uses a bounded
-//      CAS-or-skip loop, matching production lines 789-828.
+//      CAS-or-skip loop, matching lines 789-828.
 //
 //   4. Bridge lemmas connecting wrapper outputs to tier-A's
 //      `tab_lookup` and `tab_insert` predicates.
 //
-//   5. **Production-shape struct** carrying the Verus tracked-permission
+//   5. **Shipping-shape struct** carrying the Verus tracked-permission
 //      map `Tracked<Map<int, PermissionU64>>` alongside the slot
 //      `Vec<PAtomicU64>` — a Phase-1 wrapper that demonstrates the
-//      permission-threading discipline at production scale without
-//      replacing the production `FingerprintShard`.
+//      permission-threading discipline at shipping scale without
+//      replacing the `FingerprintShard` itself.
 //
 // What this file is NOT
 // =====================
 //
-// This is **Phase 1**. Phase 2 (annotate production code in-place)
+// This is **Phase 1**. Phase 2 (annotate shipping code in-place)
 // and Phase 3 (switch call sites in runtime.rs) are NOT shipped
 // because of the three concrete `vstd` capability gaps documented in
 // `T13.2-T13.4-design.md`:
@@ -53,14 +53,14 @@
 //
 //   - Gap 3: `&self`-callable methods + linear ghost permissions force
 //     either `AtomicInvariant<TableState>` (measurable perf hit due to
-//     nested invariant opens at every probe step) or production-wide
+//     nested invariant opens at every probe step) or shipping-wide
 //     `Tracked<...>` parameter threading (blast radius reaches
 //     `runtime.rs` and most of `storage/`).
 //
 // Per the design doc, the realistic path forward for full T13.4 is a
 // `state_machines!` reformulation, jointly with T13.5's liveness
-// discharge; research-grade. Phase 1 here ships the
-// maximum-tractable production-shape coverage.
+// discharge; open-ended. Phase 1 here ships the
+// maximum-tractable shipping-shape coverage.
 //
 // What this file gives us beyond `shard_methods.rs`
 // =================================================
@@ -70,20 +70,20 @@
 //      form would require a Verus loop with an inductive invariant
 //      tracking the cumulative probe state ... out of scope for the
 //      6-hour T13.4 timebox." This file lifts that loop with an
-//      explicit invariant on the probe index, matching the production
+//      explicit invariant on the probe index, matching the shipping
 //      `while probes < capacity` shape at lines 633-643.
 //
-//   2. **Production-shape struct.** `shard_methods.rs` only defines
+//   2. **Shipping-shape struct.** `shard_methods.rs` only defines
 //      `ShardCells { slots: Vec<PAtomicU64> }`. This file adds
 //      capacity, count, and seq fields plus the tracked permission
-//      map, mirroring the production `FingerprintShard` skeleton at
+//      map, mirroring the `FingerprintShard` itself skeleton at
 //      lines 124-176.
 //
 //   3. **Wrapper-level method bodies, not just per-iteration helpers.**
 //      `shard_methods.rs` proves single-iteration helpers
 //      (`probe_slot_for_contains`, `cas_insert_or_observe`). This
 //      file composes them into the full `bounded_contains_loop` and
-//      `bounded_contains_or_insert_loop` with the production-side
+//      `bounded_contains_or_insert_loop` with the shipping-side
 //      retry and `seq_before == seq_after` consistency check.
 //
 // HOW TO RUN
@@ -152,10 +152,10 @@ pub open spec fn empty_at_or_before(t: Table, fp: u64, i: nat, cap: nat) -> bool
 }
 
 // ============================================================================
-// VERIFIED WRAPPER STRUCT — production-shape mirror of `FingerprintShard`.
+// VERIFIED WRAPPER STRUCT — shipping-shape mirror of `FingerprintShard`.
 // ============================================================================
 //
-// Production `FingerprintShard` (src/storage/page_aligned_fingerprint_store.rs:
+// The `FingerprintShard` itself (src/storage/page_aligned_fingerprint_store.rs:
 // 124-176) holds (relevant subset):
 //
 //     struct FingerprintShard {
@@ -170,12 +170,12 @@ pub open spec fn empty_at_or_before(t: Table, fp: u64, i: nat, cap: nat) -> bool
 //
 //   - The slot array is a `Vec<PAtomicU64>` (each slot is a real Verus
 //     atomic with tracked permission), modeling the per-slot
-//     `HashTableEntry::fp: AtomicU64` (production line 105).
+//     `HashTableEntry::fp: AtomicU64` (line 105).
 //
 //   - The `Tracked<Map<int, PermissionU64>>` is the Verus ghost permission
 //     to access each slot — the analog of having an
 //     `unsafe { std::slice::from_raw_parts(table_ptr, capacity) }`
-//     expansion in scope (production line 628).
+//     expansion in scope (line 628).
 //
 //   - `capacity` is a plain `usize` (we model only one stable capacity per
 //     wrapper instance; resize-mode is left to tier-A's spec-level proof).
@@ -184,20 +184,20 @@ pub open spec fn empty_at_or_before(t: Table, fp: u64, i: nat, cap: nat) -> bool
 //     permissions; we don't model the full seqlock retry loop here (that
 //     stays at tier A's spec level via `lemma_reader_terminates`).
 //
-// This wrapper does NOT replace the production `FingerprintShard`. It is
+// This wrapper does NOT replace the `FingerprintShard` itself. It is
 // an additive, additionally-verified shadow of the *normal-path*
-// (non-resize) hot-path methods, structured as a stand-alone production-
+// (non-resize) hot-path methods, structured as a stand-alone shipping-
 // shape struct rather than the loose `ShardCells` of `shard_methods.rs`.
 pub struct VerifiedFingerprintShard {
-    /// Per-slot atomic fingerprint storage (production lines 103-105).
+    /// Per-slot atomic fingerprint storage (lines 103-105).
     pub slots: Vec<PAtomicU64>,
-    /// Stable capacity for this wrapper instance. In production this is
+    /// Stable capacity for this wrapper instance. In shipping this is
     /// `AtomicUsize` because of resize; the wrapper models a single
     /// resize-stable epoch.
     pub capacity: usize,
 }
 
-// Permission-map well-formedness (production analog: the implicit fact
+// Permission-map well-formedness (shipping analog: the implicit fact
 // that the slice obtained from `from_raw_parts(table_ptr, capacity)` is
 // fully owned for the duration of the `contains` call).
 pub open spec fn perms_wf(
@@ -280,7 +280,7 @@ pub fn probe_slot_for_contains(
 //     // probes` clause and an inductive invariant ...
 //     // out of scope for the initial T13.4 cycle.
 //
-// We lift it here. The function bodies match production lines 626-643
+// We lift it here. The function bodies match lines 626-643
 // byte-for-byte at the load + 3-way fork structure.
 //
 // PROOF STRATEGY: the loop carries an inductive invariant
@@ -335,12 +335,12 @@ pub enum BoundedLookup {
     TableFull,         // probed all `cap` slots, none was empty or fp
 }
 
-/// **Verified bounded probe loop.** This is the production
+/// **Verified bounded probe loop.** This is the shipping
 /// `contains` normal-path body at lines 626-643, lifted into Verus
 /// with a real `while probes < cap` loop and an inductive invariant
 /// on the probe index.
 ///
-/// Production code (lines 626-643):
+/// Shipping code (lines 626-643):
 /// ```ignore
 /// let mut index = (fp as usize) % capacity;
 /// let mut probes = 0u64;
@@ -367,8 +367,8 @@ pub fn bounded_contains_loop(
         perms_wf(*shard, *perms),
         fp != empty_slot(),
         // Bound `cap` so `(fp % cap as u64) as usize` is provably in range
-        // (avoids fighting Verus on the production-side `(fp as usize) % cap`
-        // cast); production sets cap from `usize`-sized allocations so this
+        // (avoids fighting Verus on the shipping-side `(fp as usize) % cap`
+        // cast); shipping sets cap from `usize`-sized allocations so this
         // always holds in practice.
         shard.capacity <= u64::MAX as usize,
     ensures
@@ -386,7 +386,7 @@ pub fn bounded_contains_loop(
                 == empty_slot(),
 {
     let cap = shard.capacity;
-    // index = (fp % cap_as_u64) as usize — mirrors production line 630
+    // index = (fp % cap_as_u64) as usize — mirrors line 630
     // semantically. We use the u64-modulo form to avoid the
     // `(fp as usize) % cap` cast that triggers a recommendation
     // warning for fp possibly out of usize range.
@@ -481,7 +481,7 @@ pub fn bounded_contains_loop(
         }
     }
 
-    // Probed all `cap` slots, found no empty and no fp. Production line 643
+    // Probed all `cap` slots, found no empty and no fp. Line 643
     // falls through to "return false" — the `seq_after == seq_before` check
     // (line 647) decides whether to retry. We model this as `TableFull`
     // because at the linear-probe level it means the chain is fully occupied
@@ -543,7 +543,7 @@ pub fn cas_insert_or_observe(
 // VERIFIED BOUNDED CONTAINS_OR_INSERT LOOP.
 // ============================================================================
 //
-// This is the production `contains_or_insert` normal-path body at lines
+// This is the `contains_or_insert` normal-path body at lines
 // 789-828, lifted into Verus with a bounded loop. The CAS step requires
 // **mutable** permission to the slot being CAS'd, which means we need to
 // extract a `Tracked<&mut PermissionU64>` from the `Tracked<&mut Map<...>>`
@@ -552,12 +552,12 @@ pub fn cas_insert_or_observe(
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum BoundedInsertOutcome {
-    AlreadyPresent,    // returned: true (production line 794)
-    NewlyInserted,     // returned: false (production line 815)
+    AlreadyPresent,    // returned: true (line 794)
+    NewlyInserted,     // returned: false (line 815)
     TableFull,         // probed `cap` slots, none was empty or fp
 }
 
-/// **Verified bounded contains_or_insert loop.** Production lines
+/// **Verified bounded contains_or_insert loop.** Lines
 /// 789-828 lifted into Verus.
 ///
 /// The loop carries the same invariant as `bounded_contains_loop`,
@@ -567,7 +567,7 @@ pub enum BoundedInsertOutcome {
 /// for the read-then-CAS dispatch), then puts the (possibly mutated)
 /// permission back.
 ///
-/// Production code (lines 789-828, simplified):
+/// Shipping code (lines 789-828, simplified):
 /// ```ignore
 /// let mut index = (fp as usize) % capacity;
 /// let mut probes = 0u64;
@@ -646,7 +646,7 @@ pub fn bounded_contains_or_insert_loop(
         // Step 1: load the slot to dispatch.
         let stored = shard.slots[index].load(Tracked(&perm));
         if stored == fp {
-            // AlreadyPresent (production line 793-795).
+            // AlreadyPresent (line 793-795).
             assert(perm.view().value == fp);
             // Put the permission back.
             proof {
@@ -657,7 +657,7 @@ pub fn bounded_contains_or_insert_loop(
             return BoundedInsertOutcome::AlreadyPresent;
         }
         if stored == 0 {
-            // CAS attempt (production line 805-823).
+            // CAS attempt (line 805-823).
             let cas = cas_insert_or_observe(shard, index, fp, Tracked(&mut perm));
             match cas {
                 CasOutcome::Inserted => {
@@ -833,10 +833,10 @@ pub proof fn lemma_hit_observation_implies_contains(
 }
 
 // ============================================================================
-// RESIZE-MODE STRUCTURAL WRAPPER (production lines 559-622).
+// RESIZE-MODE STRUCTURAL WRAPPER (lines 559-622).
 // ============================================================================
 //
-// Production `contains` (lines 559-622) handles the resize-mode case by:
+// The `contains` (lines 559-622) handles the resize-mode case by:
 //
 //   1. Reading the seqlock; if odd (resize in progress), enter the
 //      resize-mode branch.
@@ -865,10 +865,10 @@ pub enum ResizeModeLookup {
     TableFullEither,
 }
 
-/// **Verified resize-mode probe dispatch.** Production lines 578-622
+/// **Verified resize-mode probe dispatch.** Lines 578-622
 /// lifted into Verus.
 ///
-/// In production, `old_shard` and `new_shard` are owned by the same
+/// In shipping, `old_shard` and `new_shard` are owned by the same
 /// `FingerprintShard` (fields `old_table` + `old_capacity` and
 /// `new_table` + `new_capacity`). For Phase-1 verification we model
 /// them as two separate `VerifiedFingerprintShard`s with their own
@@ -922,15 +922,15 @@ pub fn bounded_contains_during_resize(
 }
 
 // ============================================================================
-// VERIFIED CONSTRUCTOR — production line 187-256 analog.
+// VERIFIED CONSTRUCTOR — line 187-256 analog.
 // ============================================================================
 //
 // `VerifiedFingerprintShard::new` constructs a fresh wrapper with all
 // slots initialised to `empty_slot()`. The companion `Tracked<Map<...>>`
 // is also constructed.
 //
-// In production, allocation goes through `mmap(MAP_HUGETLB | MAP_POPULATE)`
-// (production lines 187-256, branching to `allocate_huge_pages` or
+// In shipping, allocation goes through `mmap(MAP_HUGETLB | MAP_POPULATE)`
+// (lines 187-256, branching to `allocate_huge_pages` or
 // `allocate_file_backed`). The kernel zero-fill of `MAP_ANONYMOUS` is
 // what guarantees the all-zero (= empty_slot()) initial state. Our
 // `Vec<PAtomicU64>::push` per-slot initialisation models the same
@@ -1034,10 +1034,10 @@ pub proof fn lemma_inserted_visible_to_contains(
 }
 
 // ============================================================================
-// BOUNDED SEQLOCK RETRY LOOP (production lines 559-651 outer loop).
+// BOUNDED SEQLOCK RETRY LOOP (lines 559-651 outer loop).
 // ============================================================================
 //
-// Production `FingerprintShard::contains` wraps the inner probe loop in an
+// The `FingerprintShard::contains` wraps the inner probe loop in an
 // outer seqlock retry loop:
 //
 //   loop {
@@ -1049,12 +1049,12 @@ pub proof fn lemma_inserted_visible_to_contains(
 //       // resize happened — retry
 //   }
 //
-// The unbounded form is research-grade (see tier A's `lemma_reader_terminates`
+// The unbounded form is open-ended (see tier A's `lemma_reader_terminates`
 // for the spec-level discharge using a writer-resize-count decrement).
 // The BOUNDED form takes a `max_retries: u64` parameter and proves
 // termination via `decreases max_retries - retries`. This matches the
-// production `MAX_RETRIES_BEFORE_PANIC = 1_000_000` ceiling at lines
-// 60-62 (every iteration counts toward this limit; production panics
+// the `MAX_RETRIES_BEFORE_PANIC = 1_000_000` ceiling at lines
+// 60-62 (every iteration counts toward this limit; shipping panics
 // past it).
 
 /// Outcome of a bounded seqlock retry loop.
@@ -1063,28 +1063,28 @@ pub enum SeqlockRetryOutcome {
     /// The probe completed in a stable epoch (seq_before == seq_after, even).
     /// The inner result is the probe's outcome.
     Stable(BoundedLookup),
-    /// Hit `max_retries` without a stable epoch — production would panic.
+    /// Hit `max_retries` without a stable epoch — shipping would panic.
     /// We model this as a separate outcome so the function is total.
     Exhausted,
 }
 
-/// **Verified bounded seqlock retry loop.** Production lines 559-651
+/// **Verified bounded seqlock retry loop.** Lines 559-651
 /// outer loop, lifted into Verus with a bounded retry count.
 ///
-/// In production, `self.seq` is an `AtomicU64` toggled by writers
+/// In shipping, `self.seq` is an `AtomicU64` toggled by writers
 /// (begin_resize bumps to odd, finalize_resize bumps to even). The
 /// reader retries the probe loop while seq disagrees pre/post.
 ///
 /// PROOF STRATEGY: a bounded `while retries < max_retries` loop with
 /// `decreases max_retries - retries` for termination. The seq comparison
 /// is performed at the wrapper level via a `seq_atomic: PAtomicU64`
-/// field that mirrors production's `seq: AtomicU64`.
+/// field that mirrors shipping code's `seq: AtomicU64`.
 ///
 /// CONTRACT: if the function returns `Stable(_)`, the abstract probe
 /// outcome is sound — the caller can use it directly. If it returns
 /// `Exhausted`, the bounded retry budget was exceeded; the caller should
 /// either retry with a fresh budget or raise the limit (matching
-/// production's `MAX_RETRIES_BEFORE_PANIC` behavior).
+/// shipping code's `MAX_RETRIES_BEFORE_PANIC` behavior).
 ///
 /// This wrapper does NOT model concurrent writers — the seq is read but
 /// never modified by this function, so the `seq_before == seq_after`
@@ -1133,7 +1133,7 @@ pub fn bounded_seqlock_retry_contains(
     {
         let seq_before = seq_atomic.load(Tracked(seq_perm));
 
-        // Resize-mode skip: production has a complex resize-mode dispatch
+        // Resize-mode skip: shipping has a complex resize-mode dispatch
         // here (lines 561-622). For wrapper-level safety we model only
         // the normal path; resize-mode is covered separately by
         // `bounded_contains_during_resize`. If seq is odd (resize in
@@ -1143,14 +1143,14 @@ pub fn bounded_seqlock_retry_contains(
             continue;
         }
 
-        // Normal-path probe (production lines 625-643).
+        // Normal-path probe (lines 625-643).
         let probe_result = bounded_contains_loop(shard, fp, Tracked(perms));
 
-        // Re-read seq to check for a concurrent resize (production lines
+        // Re-read seq to check for a concurrent resize (lines
         // 645-650). In the wrapper's single-thread model, seq cannot
         // change between the two loads, so seq_before == seq_after
-        // always holds. In production, a concurrent writer could bump
-        // seq; the production `if seq_before == seq_after` test catches
+        // always holds. In shipping, a concurrent writer could bump
+        // seq; the `if seq_before == seq_after` test catches
         // this and triggers a retry.
         let seq_after = seq_atomic.load(Tracked(seq_perm));
 
@@ -1159,7 +1159,7 @@ pub fn bounded_seqlock_retry_contains(
         }
         // seq changed under us — retry. Wrapper-level: this branch
         // is unreachable (single-thread, seq immutable here), so we
-        // bump retries and continue. In production, this is the case
+        // bump retries and continue. In shipping, this is the case
         // where a concurrent writer raced and we need to redo the
         // probe under the new epoch.
         retries = retries + 1;
@@ -1171,9 +1171,9 @@ pub fn bounded_seqlock_retry_contains(
 // COVERAGE TABLE — what's now machine-checked beyond `shard_methods.rs`.
 // ============================================================================
 //
-// Production methods now covered by Verus-verified bounded loops:
+// Shipping methods now covered by Verus-verified bounded loops:
 //
-// | Production source            | Wrapper function                  | Verifies what?              |
+// | Shipping source            | Wrapper function                  | Verifies what?              |
 // |------------------------------|-----------------------------------|-----------------------------|
 // | line 626-643: contains body  | bounded_contains_loop             | Full bounded probe loop     |
 // | line 789-828: contains_or_insert body | bounded_contains_or_insert_loop | Full bounded CAS-or-skip loop |
@@ -1192,17 +1192,17 @@ pub fn bounded_seqlock_retry_contains(
 //
 // What's STILL not covered (Phase 2/3 — see top-of-file design-doc gap list):
 //
-//   - Production `FingerprintShard` itself is unchanged. The wrapper is
-//     additive; production `cargo build` and `cargo test` are unaffected.
+//   - The `FingerprintShard` itself itself is unchanged. The wrapper is
+//     additive; the `cargo build` and `cargo test` are unaffected.
 //
 //   - The seqlock retry loop's UNBOUNDED-fairness termination
-//     (production lines 559-649 outer loop without a max_retries
+//     (lines 559-649 outer loop without a max_retries
 //     ceiling) requires a writer-resize-count ghost decrement — see
 //     tier A's `lemma_reader_terminates` for the spec-level discharge.
 //     This wrapper ships the bounded form (`bounded_seqlock_retry_
-//     contains`); the unbounded form remains research-grade.
+//     contains`); the unbounded form remains open-ended.
 //
-//   - Resize-mode interleavings (production lines 561-622, 681-778) are
+//   - Resize-mode interleavings (lines 561-622, 681-778) are
 //     covered by tier-A's spec-level `step_insert_during_resize_a` /
 //     `lemma_cas_during_resize_observable_a`. The wrapper models a
 //     single resize-stable epoch.
@@ -1211,7 +1211,7 @@ pub fn bounded_seqlock_retry_contains(
 //     still axiomatic. The `Vec<PAtomicU64>` slot array is the standard
 //     Verus pattern that elides these.
 //
-//   - `count: AtomicU64` and `state: AtomicU8` (production lines 134,
+//   - `count: AtomicU64` and `state: AtomicU8` (lines 134,
 //     107) are bookkeeping unused by lookup soundness. Tier A and
 //     `shard_methods.rs` explicitly omit them; this wrapper inherits
 //     that.
