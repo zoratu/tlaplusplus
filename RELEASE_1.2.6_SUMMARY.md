@@ -54,4 +54,4 @@ New `src/runtime/dfs_cluster_bridge.rs` with 3 unit tests. New `tests/dfs_cluste
 
 ## Still parked
 
-- T13.4 Phases 2+3 — shipping-code Verus rewrite of `FingerprintShard`, blocked by three documented `vstd` capability gaps.
+- T13.4 Phases 2+3 — shipping-code Verus rewrite of `FingerprintShard`. Substantial open-ended verification work; gap 1 of the three documented `vstd` capability gaps has since been resolved by `verification/verus/atomic_ptr_with_epoch.rs` (16 verified, 0 errors — see `T13.2-T13.4-design.md` "Gap 1 update (2026-05-13)"), but the multi-epoch generalisation, exec-atomic wiring, and gap 2 (mmap-allocated `PointsToArray`) remain.

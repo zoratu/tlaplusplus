@@ -70,6 +70,10 @@ echo
 # Pass `reader-liveness-sm` (or `sm`) to verify the state_machines!
 # port of the reader-liveness protocol (`reader_liveness_state_machine.rs`,
 # T13.5 polish — LTL-native restatement of v2's headline theorem).
+# Pass `epoch` (or `atomic-ptr-epoch`) to verify the gap-1
+# proof-of-concept (`atomic_ptr_with_epoch.rs`, T13.4 design follow-up
+# to verus-lang/verus#2437 — tokenized_state_machine!-based RCU
+# protocol skeleton).
 TIER="${1:-b}"
 case "$TIER" in
   a|tier-a|tiera|A) PROOF_FILE="seqlock_resize_tier_a.rs" ;;
@@ -79,7 +83,8 @@ case "$TIER" in
   liveness-v2|tier-liveness-v2|live-v2|l2|reader-liveness-v2) PROOF_FILE="reader_liveness_v2.rs" ;;
   shard-wrapper|wrapper|shard_wrapper|w) PROOF_FILE="shard_wrapper.rs" ;;
   reader-liveness-sm|liveness-sm|live-sm|sm|reader_liveness_state_machine) PROOF_FILE="reader_liveness_state_machine.rs" ;;
-  *) echo "error: unknown tier '$TIER'; pass 'a', 'b', 'shadow', 'liveness', 'liveness-v2', 'shard-wrapper', or 'reader-liveness-sm'" >&2; exit 2 ;;
+  epoch|atomic-ptr-epoch|atomic_ptr_with_epoch|e) PROOF_FILE="atomic_ptr_with_epoch.rs" ;;
+  *) echo "error: unknown tier '$TIER'; pass 'a', 'b', 'shadow', 'liveness', 'liveness-v2', 'shard-wrapper', 'reader-liveness-sm', or 'epoch'" >&2; exit 2 ;;
 esac
 
 echo "Verifying: $PROOF_FILE"

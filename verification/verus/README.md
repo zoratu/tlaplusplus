@@ -210,9 +210,17 @@ What this file does NOT do:
 - Does NOT introduce new soundness — same headline, different framework.
 - Does NOT integrate with the shipping fingerprint shard. Like all other Verus proof files in this directory, this is verified by `verus`, not compiled by `rustc`.
 
+### Tier-A.9 (T13.4 gap-1 PoC): `atomic_ptr_with_epoch.rs`
+
+`atomic_ptr_with_epoch.rs` ships **16 verified items**, 0 errors (`./run_proof.sh epoch`). A `tokenized_state_machine!`-based skeleton proving that the RCU/seqlock atomic-pointer-swap pattern — Gap 1 in `T13.2-T13.4-design.md` — is verifiable in Verus today, with no new `vstd` primitive. Direct follow-up to [verus-lang/verus#2437](https://github.com/verus-lang/verus/issues/2437), where core Verus collaborator @tjhance pointed at `verus/examples/state_machines/counting.rs` as the pattern to use.
+
+The protocol exposes `publish` / `reclaim` / `acquire_read` / `release_read` / `read_guards` transitions over an `Option<T>` storage slot, a `(nat, T)` counter, and a `Multiset<T>` of `ReadRef` tokens. The `read_guards` property realises the `guard` instruction tjhance referenced — gives `&T` access through a live `ReadRef` without consuming the linear permission. Verus's stability of the protocol's `main_inv` invariant proves: outstanding `ReadRef` count equals the counter, and every token names the same `T` as is stored.
+
+What this PoC proves and what remains open is documented in `T13.2-T13.4-design.md` "Gap 1 update (2026-05-13)". Headline: single-epoch swap-blocks-until-readers-zero verifies; the multi-epoch generalisation (non-blocking swap, OLD readers carry on across the swap — what `FingerprintShard` actually does) and the exec-atomic wiring are tractable extensions, not blockers.
+
 ### Genuinely deferred to v1.2.0+
 
-- **Full Verus tracked-pointer integration of the `FingerprintShard` itself itself (Phase 2 / Phase 3 of T13.4).** Annotating the shipping code with `Tracked<PointsToArray<HashTableEntry>>` and threading the permissions through every call site. Requires rewriting `allocate_huge_pages`, `allocate_file_backed`, the resize swap, and every `unsafe { std::slice::from_raw_parts(...) }` to use `vstd::raw_ptr::PPtr` — open-ended rewrite work, blocked on the `vstd` capability gaps in `T13.2-T13.4-design.md`. The shadow methods in `shard_methods.rs` and the shipping-shape wrapper in `shard_wrapper.rs` are the working blueprints for this rewrite.
+- **Full Verus tracked-pointer integration of the `FingerprintShard` itself (Phase 2 / Phase 3 of T13.4).** Annotating the shipping code with `Tracked<PointsToArray<HashTableEntry>>` and threading the permissions through every call site. Requires rewriting `allocate_huge_pages`, `allocate_file_backed`, the resize swap, and every `unsafe { std::slice::from_raw_parts(...) }` to use `vstd::raw_ptr::PPtr`. Gap 1 (atomic-pointer-swap) is no longer a `vstd` capability blocker — the PoC in `atomic_ptr_with_epoch.rs` validates the pattern. The remaining open work is gap 2 (mmap-allocated `PointsToArray`), the multi-epoch generalisation of the PoC, and the exec-atomic wiring of the protocol tokens onto a real `AtomicPtr`. The shadow methods in `shard_methods.rs` and the shipping-shape wrapper in `shard_wrapper.rs` are the working blueprints for the shipping-code side of the rewrite.
 - **Discharge of the three reader-liveness axioms.** Discharged constructively in `reader_liveness_v2.rs` (17 verified, 0 axioms, `./run_proof.sh reader-liveness-v2`). The `state_machines!` port ships in `reader_liveness_state_machine.rs` (15 verified, 0 axioms, `./run_proof.sh sm`). Both ship the headline `theorem_no_starvation`. The original `reader_liveness.rs` is preserved as the bounded-form fallback.
 
 ## Honest verdict on Verus for tlaplusplus
@@ -271,6 +279,7 @@ VERUS_DIR=/home/ubuntu/verus ./run_proof.sh shard-methods    # tier-A.5 (shippin
 VERUS_DIR=/home/ubuntu/verus ./run_proof.sh shard-wrapper    # tier-A.7 (T13.4 Phase 1 + 1.5 wrapper)
 VERUS_DIR=/home/ubuntu/verus ./run_proof.sh reader-liveness-v2  # T13.5 axiom-free reader liveness
 VERUS_DIR=/home/ubuntu/verus ./run_proof.sh sm               # T13.5 state_machines! port
+VERUS_DIR=/home/ubuntu/verus ./run_proof.sh epoch            # T13.4 gap-1 PoC (verus-lang/verus#2437 follow-up)
 ```
 
 Or run all under CI; see `.github/workflows/verus.yml` for the complete gate (T13.6). The CI gate currently runs tier-b, tier-a, shard-methods, and reader-liveness-v2; `shard-wrapper` is added in this commit and should be wired into the CI workflow alongside the others.
