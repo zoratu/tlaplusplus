@@ -218,6 +218,14 @@ The protocol exposes `publish` / `reclaim` / `acquire_read` / `release_read` / `
 
 What this PoC proves and what remains open is documented in `T13.2-T13.4-design.md` "Gap 1 update (2026-05-13)". Headline: single-epoch swap-blocks-until-readers-zero verifies; the multi-epoch generalisation, the exec-atomic wiring, and the gap-2 / gap-3 questions all resolve in existing Verus features — see the "Cross-survey of Verus examples" section in `T13.2-T13.4-design.md` for the full inventory.
 
+### Tier-A.10 (T13.4 Phase 2 slice 1): `shard_exec_wired.rs`
+
+`shard_exec_wired.rs` ships **11 verified items**, 0 errors (`./run_proof.sh exec-wired`). The first exec-wired artifact: a `VerifiedShard` struct that ties the `EpochProtocol` (the protocol skeleton from `atomic_ptr_with_epoch.rs`) to a real `PAtomicU64` slot inside a `PPtr<InnerShard>` allocation. The `read(&self) -> u64` method walks the protocol's `read_ref_guards` to obtain a `&PointsTo<InnerShard>`, dereferences the pointer, then opens a `Shared<AtomicInvariant>` around the atomic load to access the slot's `PermissionU64`.
+
+This validates the gap-1 + gap-3 patterns end-to-end against real exec atomics. Template: `examples/state_machines/arc.rs` (`MyArc<S>` + `InnerArc<S>` + `RefCounter<Perm>`), with the protocol renamed to `EpochProtocol<T>` and the cell carrying our slot atomic.
+
+Single-epoch only. The next slice adds the swap pattern (Arc-of-Arc style: per-epoch protocol instances + an outer `AtomicPtr<VerifiedShard>` that publishes the current epoch).
+
 ### Genuinely deferred to v1.2.0+
 
 - **Full Verus tracked-pointer integration of the `FingerprintShard` itself (Phase 2 / Phase 3 of T13.4).** Annotating the shipping code with `Tracked<PointsToArray<HashTableEntry>>` and threading the permissions through every call site. Requires rewriting `allocate_huge_pages`, `allocate_file_backed`, the resize swap, and every `unsafe { std::slice::from_raw_parts(...) }` to use `vstd::raw_ptr::PPtr` (plus an `external_body` mmap wrapper modeled on `vstd::raw_ptr::allocate`). Substantial design-and-engineering work, but no longer blocked on any vstd capability gap — all three originally-documented gaps (atomic-pointer swap, mmap-allocated `PointsToArray`, `&self` + linear ghost) resolve in current Verus features. Working templates: `examples/state_machines/arc.rs` for the RCU exec wiring, `vstd::raw_ptr::allocate` for the mmap-shape external_body, `vstd::logatom` for the logically-atomic specification pattern that avoids per-step invariant opens. The shadow methods in `shard_methods.rs` and the shipping-shape wrapper in `shard_wrapper.rs` are the working blueprints for the shipping-code side; `atomic_ptr_with_epoch.rs` is the validated protocol skeleton.
