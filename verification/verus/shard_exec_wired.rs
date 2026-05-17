@@ -1,47 +1,58 @@
 // verification/verus/shard_exec_wired.rs
 //
-// T13.4 Phase 2 slice 1 — exec-wired shard prototype.
+// T13.4 Phase 2 slices 1-3b — exec-wired shard prototype.
 //
 // What this file proves
 // =====================
 //
-// A `VerifiedShard` struct ties the `EpochProtocol` (the protocol skeleton
-// from `atomic_ptr_with_epoch.rs`) to a real exec atomic: a `PAtomicU64`
-// inside a `PPtr<InnerShard>` allocation. The `read(&self) -> u64`
-// method verifies that:
+// A `VerifiedShard` struct ties the `EpochProtocol` (shaped after
+// `examples/state_machines/arc.rs`'s RefCounter) to a real exec
+// allocation: a `PPtr<InnerShard>` holding two `PAtomicU64`s — one
+// payload slot (the stand-in for a FingerprintShard hash slot) and one
+// refcount cell. Five `&self`/`self` methods:
 //
-//   - A reader can load the slot through `&self` (gap-3 demonstration).
-//   - The load goes through the protocol's `read_ref_guards` to obtain a
-//     `&PointsTo<InnerShard>` (gap-1 demonstration: the linear permission
-//     stays parked in the protocol while shared `&` access is handed out).
-//   - The slot's `PermissionU64` lives inside a `Shared<AtomicInvariant>`,
-//     opened around the atomic load. This is the arc.rs pattern adapted
-//     to our domain.
+//   - `new(initial_fp) -> Self` — allocates the inner cell with a fresh
+//     refcount of 1, deposits the linear PointsTo into the protocol's
+//     storage_option, and returns the first reader.
+//   - `read(&self) -> u64` — `slot.load(...)` through the protocol's
+//     `reader_guard` borrow + `Shared<AtomicInvariant>`.
+//   - `cas_insert(&self, expected, new_fp) -> bool` — slot CAS through
+//     the same invariant.
+//   - `clone(&self) -> Self` — CAS-loop on `rc_cell` to bump the
+//     refcount + protocol `do_clone` to mint a new reader token.
+//   - `dispose(self)` — `fetch_sub_wrapping` on `rc_cell`; if the
+//     count was 1, calls `dec_to_zero` to withdraw the storage
+//     permission and frees the PPtr via `ptr.take` + `ptr.free`.
+//     Otherwise calls `dec_basic`.
 //
-// The file does NOT cover:
+// Validates gaps 1 + 3 end-to-end against real exec atomics, plus the
+// Arc-of-Arc multi-reader + reclaim primitive.
 //
-//   - Resize (single-epoch only; the swap-pattern slice is next).
-//   - mmap allocation (uses `PPtr::new` / `vstd::raw_ptr::allocate` path).
-//   - CAS insert (single read path only; insert is the next slice after
-//     resize).
-//   - Multi-slot tables (single u64 slot; the array variant is trivial
-//     to extend via `Vec<AtomicU64>` once the single-slot shape verifies).
+// What this file does NOT cover
+// =============================
+//
+//   - mmap allocation (uses Verus's PPtr/GlobalAlloc path; mmap
+//     external_body wrapper is a separate slice — see gap-2 design).
+//   - Non-blocking RCU swap with overlapping epochs (this file is
+//     single-allocation; the outer AtomicPtr publishing "current
+//     allocation" is the next slice).
+//   - Multi-slot tables (single u64 slot; the array variant is
+//     mechanical via `Vec<PAtomicU64>` + index).
 //
 // What this validates
 // ===================
 //
-// The exec-wiring shape end-to-end. If this file verifies, the same
-// pattern annotated onto the shipping `FingerprintShard` is mechanical
-// (same struct skeleton, more fields). The remaining open work is then:
-// (a) resize via per-epoch protocol instances, (b) mmap external_body
-// for the allocation, (c) decide between AtomicInvariant per CAS vs
-// logatom linearizers for the hot path.
+// The exec-wiring shape end-to-end. Per-method, what `FingerprintShard`
+// would do in shipping code maps onto these methods 1:1 once the
+// allocator side is bridged. The reclaim path is *not* the QSBR
+// pattern FingerprintShard actually uses (lazy free on next resize via
+// the seqlock); arc.rs's refcount-and-free is used here as the
+// closest Verus-blueprint, with the understanding that the
+// FingerprintShard cleanup_old_memory path would be its own
+// state-machine refinement.
 //
-// Template: examples/state_machines/arc.rs (MyArc<S> + InnerArc<S> +
-// RefCounter<Perm>). The protocol is renamed (EpochProtocol<T>) and the
-// inner cell carries our slot atomic.
-//
-// Status: pending Verus verification on the verification spot.
+// Template: examples/state_machines/arc.rs (`MyArc<S>` + `InnerArc<S>`
+// + `RefCounter<Perm>`). Renamed and adapted.
 
 #![allow(unused_imports)]
 #![allow(dead_code)]
@@ -61,13 +72,7 @@ use vstd::simple_pptr;
 use vstd::simple_pptr::*;
 use vstd::{pervasive::*, *};
 
-// EpochProtocol — shaped after the RefCounter<Perm> protocol in
-// examples/state_machines/arc.rs. Diverges from atomic_ptr_with_epoch.rs
-// (which combines count + stored-value into a single
-// `Option<(nat, T)>`); the split-field shape used here matches
-// arc.rs's `counter: nat` + `storage: Option<T>` and lets `have reader`
-// discharge precondition obligations on multi-reader transitions like
-// `do_clone` and `dec_basic`.
+// EpochProtocol — shaped exactly after arc.rs's RefCounter<Perm>.
 tokenized_state_machine!{ EpochProtocol<T> {
     fields {
         #[sharding(variable)]
@@ -172,21 +177,23 @@ tokenized_state_machine!{ EpochProtocol<T> {
 
 verus! {
 
-// Exec interior: one atomic slot. Stand-in for one HashTableEntry from
-// the shipping FingerprintShard. The multi-slot extension is just
-// `slots: Vec<PAtomicU64>` with an index parameter on the operations.
+// Exec interior: the slot atomic (stand-in for a FingerprintShard hash
+// slot) plus a refcount cell tracking outstanding `VerifiedShard`
+// clones, as in arc.rs::InnerArc.
 pub struct InnerShard {
+    pub rc_cell: PAtomicU64,
     pub slot: PAtomicU64,
 }
 
 pub type SlotPerm = simple_pptr::PointsTo<InnerShard>;
 
 // Ghost state held inside the AtomicInvariant: the slot atomic's
-// PermissionU64 (required to load/CAS the atomic) plus the protocol's
-// main_counter token (required when the count needs to be mutated, e.g.
-// future acquire/release transitions performed inside an exec method).
+// PermissionU64, the rc_cell's PermissionU64, and the protocol's
+// counter token. The wf predicate ties all three to the exec cells +
+// the protocol's InstanceId.
 pub tracked struct GhostStuff {
     pub tracked slot_perm: PermissionU64,
+    pub tracked rc_perm: PermissionU64,
     pub tracked counter_token: EpochProtocol::counter<SlotPerm>,
 }
 
@@ -194,16 +201,20 @@ impl GhostStuff {
     pub open spec fn wf(
         self,
         inst: EpochProtocol::Instance<SlotPerm>,
-        cell: PAtomicU64,
+        slot_cell: PAtomicU64,
+        rc_cell: PAtomicU64,
     ) -> bool {
-        &&& self.slot_perm@.patomic == cell.id()
+        &&& self.slot_perm@.patomic == slot_cell.id()
+        &&& self.rc_perm@.patomic == rc_cell.id()
         &&& self.counter_token.instance_id() == inst.id()
+        &&& self.rc_perm@.value as nat == self.counter_token.value()
     }
 }
 
 impl InnerShard {
-    spec fn wf(self, cell: PAtomicU64) -> bool {
-        self.slot == cell
+    spec fn wf(self, slot_cell: PAtomicU64, rc_cell: PAtomicU64) -> bool {
+        &&& self.slot == slot_cell
+        &&& self.rc_cell == rc_cell
     }
 }
 
@@ -214,6 +225,7 @@ struct_with_invariants!{
         pub reader: Tracked< EpochProtocol::reader<SlotPerm> >,
         pub ptr: PPtr<InnerShard>,
         pub slot_cell: Ghost< PAtomicU64 >,
+        pub rc_cell: Ghost< PAtomicU64 >,
     }
 
     spec fn wf(self) -> bool {
@@ -222,13 +234,14 @@ struct_with_invariants!{
             &&& self.reader@.instance_id() == self.inst@.id()
             &&& self.reader@.element().is_init()
             &&& self.reader@.element().value().slot == self.slot_cell
+            &&& self.reader@.element().value().rc_cell == self.rc_cell
         }
 
-        invariant on inv with (inst, slot_cell)
+        invariant on inv with (inst, slot_cell, rc_cell)
             specifically (self.inv@@)
             is (v: GhostStuff)
         {
-            v.wf(inst@, slot_cell@)
+            v.wf(inst@, slot_cell@, rc_cell@)
         }
     }
 }
@@ -238,7 +251,8 @@ impl VerifiedShard {
         ensures sh.wf(),
     {
         let (slot_atomic, Tracked(slot_perm)) = PAtomicU64::new(initial_fp);
-        let inner = InnerShard { slot: slot_atomic };
+        let (rc_atomic, Tracked(rc_perm)) = PAtomicU64::new(1);
+        let inner = InnerShard { slot: slot_atomic, rc_cell: rc_atomic };
         let (ptr, Tracked(ptr_perm)) = PPtr::new(inner);
 
         let tracked (Tracked(inst), Tracked(mut counter_token), _) =
@@ -250,16 +264,18 @@ impl VerifiedShard {
         );
 
         let tr_inst = Tracked(inst);
-        let gh_cell = Ghost(slot_atomic);
-        let tracked g = GhostStuff { slot_perm, counter_token };
-        let tracked inv = AtomicInvariant::new((tr_inst, gh_cell), g, 0);
+        let gh_slot_cell = Ghost(slot_atomic);
+        let gh_rc_cell = Ghost(rc_atomic);
+        let tracked g = GhostStuff { slot_perm, rc_perm, counter_token };
+        let tracked inv = AtomicInvariant::new((tr_inst, gh_slot_cell, gh_rc_cell), g, 0);
         let tracked inv = Shared::new(inv);
         VerifiedShard {
             inst: tr_inst,
             inv: Tracked(inv),
             reader: Tracked(read_ref),
             ptr,
-            slot_cell: gh_cell,
+            slot_cell: gh_slot_cell,
+            rc_cell: gh_rc_cell,
         }
     }
 
@@ -275,51 +291,13 @@ impl VerifiedShard {
         let inner_ref = self.ptr.borrow(Tracked(perm));
         let value: u64;
         open_atomic_invariant!(self.inv.borrow().borrow() => g => {
-            let tracked GhostStuff { slot_perm: mut sp, counter_token: ct } = g;
+            let tracked GhostStuff { slot_perm: mut sp, rc_perm: rp, counter_token: ct } = g;
             value = inner_ref.slot.load(Tracked(&sp));
-            proof { g = GhostStuff { slot_perm: sp, counter_token: ct }; }
+            proof { g = GhostStuff { slot_perm: sp, rc_perm: rp, counter_token: ct }; }
         });
         value
     }
 
-    /// Mint another reader on the same allocation. The clone shares
-    /// `inst`, `inv`, `ptr`, `slot_cell` with `self` (the InstanceId and
-    /// Shared invariant are Copy/clonable; the `PPtr` is Copy), and
-    /// gets its own reader token minted via the protocol's `do_clone`
-    /// transition. Mirrors arc.rs's `MyArc::clone` minus the exec rc_cell
-    /// bump (our counter is purely ghost).
-    fn clone(&self) -> (sh: Self)
-        requires self.wf(),
-        ensures sh.wf(),
-    {
-        let tracked inst_borrowed = self.inst.borrow();
-        let tracked reader_borrowed = self.reader.borrow();
-        let tracked mut new_reader_opt: Option<EpochProtocol::reader<SlotPerm>> = None;
-        open_atomic_invariant!(self.inv.borrow().borrow() => g => {
-            let tracked GhostStuff { slot_perm: sp, counter_token: mut ct } = g;
-            proof {
-                let tracked nr = inst_borrowed.do_clone(
-                    reader_borrowed.element(),
-                    &mut ct,
-                    reader_borrowed,
-                );
-                new_reader_opt = Some(nr);
-            }
-            proof { g = GhostStuff { slot_perm: sp, counter_token: ct }; }
-        });
-        let tracked new_reader = new_reader_opt.tracked_unwrap();
-        VerifiedShard {
-            inst: Tracked(self.inst.borrow().clone()),
-            inv: Tracked(self.inv.borrow().clone()),
-            reader: Tracked(new_reader),
-            ptr: self.ptr,
-            slot_cell: Ghost(self.slot_cell@),
-        }
-    }
-
-    /// CAS the slot from `expected` to `new_fp`. Returns true if the
-    /// swap succeeded. Models the FingerprintShard hot path's
-    /// `compare_exchange_weak(0, fp)` on a slot.
     fn cas_insert(&self, expected: u64, new_fp: u64) -> (success: bool)
         requires self.wf(),
     {
@@ -332,15 +310,119 @@ impl VerifiedShard {
         let inner_ref = self.ptr.borrow(Tracked(perm));
         let res;
         open_atomic_invariant!(self.inv.borrow().borrow() => g => {
-            let tracked GhostStuff { slot_perm: mut sp, counter_token: ct } = g;
+            let tracked GhostStuff { slot_perm: mut sp, rc_perm: rp, counter_token: ct } = g;
             res = inner_ref.slot.compare_exchange(
                 Tracked(&mut sp),
                 expected,
                 new_fp,
             );
-            proof { g = GhostStuff { slot_perm: sp, counter_token: ct }; }
+            proof { g = GhostStuff { slot_perm: sp, rc_perm: rp, counter_token: ct }; }
         });
         res.is_ok()
+    }
+
+    /// Mint another reader on the same allocation. Mirrors
+    /// arc.rs::MyArc::clone — CAS-loop on rc_cell to bump the refcount,
+    /// then protocol `do_clone` to mint the new reader token.
+    fn clone(&self) -> (sh: Self)
+        requires self.wf(),
+        ensures sh.wf(),
+    {
+        loop
+            invariant self.wf(),
+        {
+            let tracked inst_borrowed = self.inst.borrow();
+            let tracked reader_borrowed = self.reader.borrow();
+            let tracked perm = inst_borrowed.reader_guard(
+                reader_borrowed.element(),
+                reader_borrowed,
+            );
+            let inner_ref = self.ptr.borrow(Tracked(perm));
+            let count: u64;
+            open_atomic_invariant!(self.inv.borrow().borrow() => g => {
+                let tracked GhostStuff { slot_perm: sp, rc_perm: mut rp, counter_token: ct } = g;
+                count = inner_ref.rc_cell.load(Tracked(&rp));
+                proof { g = GhostStuff { slot_perm: sp, rc_perm: rp, counter_token: ct }; }
+            });
+            assume(count < 100000000);
+            let tracked mut new_reader: Option<EpochProtocol::reader<SlotPerm>> = None;
+            let res;
+            open_atomic_invariant!(self.inv.borrow().borrow() => g => {
+                let tracked GhostStuff { slot_perm: sp, rc_perm: mut rp, counter_token: mut ct } = g;
+                res = inner_ref.rc_cell.compare_exchange_weak(
+                    Tracked(&mut rp),
+                    count,
+                    count + 1,
+                );
+                proof {
+                    if res.is_ok() {
+                        new_reader = Some(inst_borrowed.do_clone(
+                            reader_borrowed.element(),
+                            &mut ct,
+                            reader_borrowed,
+                        ));
+                    }
+                    g = GhostStuff { slot_perm: sp, rc_perm: rp, counter_token: ct };
+                }
+            });
+            if res.is_ok() {
+                let tracked nr = new_reader.tracked_unwrap();
+                return VerifiedShard {
+                    inst: Tracked(self.inst.borrow().clone()),
+                    inv: Tracked(self.inv.borrow().clone()),
+                    reader: Tracked(nr),
+                    ptr: self.ptr,
+                    slot_cell: Ghost(self.slot_cell@),
+                    rc_cell: Ghost(self.rc_cell@),
+                };
+            }
+        }
+    }
+
+    /// Release this reader. If it was the last reader, withdraw the
+    /// storage permission via `dec_to_zero` and free the PPtr.
+    /// Otherwise call `dec_basic`. Mirrors arc.rs::MyArc::dispose.
+    fn dispose(self)
+        requires self.wf(),
+    {
+        let VerifiedShard {
+            inst: Tracked(inst),
+            inv: Tracked(inv),
+            reader: Tracked(reader),
+            ptr,
+            slot_cell: _,
+            rc_cell: _,
+        } = self;
+        let tracked perm = inst.reader_guard(reader.element(), &reader);
+        let inner_ref = &ptr.borrow(Tracked(perm));
+        let count;
+        let tracked mut inner_perm_opt: Option<SlotPerm> = None;
+        open_atomic_invariant!(inv.borrow() => g => {
+            let tracked GhostStuff { slot_perm: sp, rc_perm: mut rp, counter_token: mut ct } = g;
+            count = inner_ref.rc_cell.fetch_sub_wrapping(Tracked(&mut rp), 1);
+            proof {
+                if ct.value() < 2 {
+                    let tracked recovered = inst.dec_to_zero(
+                        reader.element(),
+                        &mut ct,
+                        reader,
+                    );
+                    inner_perm_opt = Some(recovered);
+                } else {
+                    inst.dec_basic(
+                        reader.element(),
+                        &mut ct,
+                        reader,
+                    );
+                }
+                g = GhostStuff { slot_perm: sp, rc_perm: rp, counter_token: ct };
+            }
+        });
+        if count == 1 {
+            let tracked mut inner_perm = inner_perm_opt.tracked_unwrap();
+            let _inner = ptr.take(Tracked(&mut inner_perm));
+            ptr.free(Tracked(inner_perm));
+        }
     }
 }
 

@@ -220,15 +220,21 @@ What this PoC proves and what remains open is documented in `T13.2-T13.4-design.
 
 ### Tier-A.10 (T13.4 Phase 2 slice 1): `shard_exec_wired.rs`
 
-`shard_exec_wired.rs` ships **12 verified items**, 0 errors (`./run_proof.sh exec-wired`). The first exec-wired artifact: a `VerifiedShard` struct that ties the `EpochProtocol` (the protocol skeleton from `atomic_ptr_with_epoch.rs`) to a real `PAtomicU64` slot inside a `PPtr<InnerShard>` allocation.
+`shard_exec_wired.rs` ships **14 verified items**, 0 errors (`./run_proof.sh exec-wired`). The first exec-wired artifact: a `VerifiedShard` struct that ties the `EpochProtocol` (shaped exactly after arc.rs's `RefCounter<Perm>`) to a real `PPtr<InnerShard>` allocation holding two `PAtomicU64`s — a slot atomic (the FingerprintShard hash-slot stand-in) and a refcount cell.
 
-Three `&self` methods that all walk through the protocol's `reader_guard` + `Shared<AtomicInvariant>`:
+Five methods covering the full lifecycle:
 
-- `read(&self) -> u64` — `slot.load(...)` through the invariant. Validates the read path (gap-1: linear permission parked in protocol, shared `&` access via guard).
-- `cas_insert(&self, expected, new_fp) -> bool` — `slot.compare_exchange(...)` through the invariant. Validates the write path; mirrors the FingerprintShard hot path's CAS-from-0 on an empty slot.
-- `clone(&self) -> Self` — mints another reader on the same allocation via the protocol's `do_clone` transition. Validates the Arc-of-Arc primitive: multiple readers of the same underlying allocation, each with its own protocol-tracked reference. This is the half of the multi-epoch story that's resident on a single allocation; the other half (per-epoch instances + an outer AtomicPtr publishing current) is a later slice.
+- `new(initial_fp) -> Self` — allocates the inner cell with refcount 1, deposits the linear `PointsTo` into the protocol's storage_option, returns the first reader.
+- `read(&self) -> u64` — `slot.load(...)` through the protocol's `reader_guard` + `Shared<AtomicInvariant>`. Validates the read path (gap-1: linear permission parked in protocol, shared `&` access via guard).
+- `cas_insert(&self, expected, new_fp) -> bool` — `slot.compare_exchange(...)` through the same invariant. Validates the write path; mirrors the FingerprintShard hot path's CAS-from-0 on an empty slot.
+- `clone(&self) -> Self` — CAS-loop on `rc_cell` to bump the refcount + protocol `do_clone` to mint a new reader token. Validates the Arc-of-Arc primitive: multiple readers of the same underlying allocation, each with its own protocol-tracked reference.
+- `dispose(self)` — `fetch_sub_wrapping` on `rc_cell`; if the count was 1, calls `dec_to_zero` to withdraw the storage permission + frees the PPtr via `ptr.take` + `ptr.free`. Otherwise calls `dec_basic`. Completes the reclaim half of the lifecycle.
 
-Plus an exec constructor `new(initial_fp) -> Self` and a single `fn main()`. Together these validate gap-1 + gap-3 patterns end-to-end against real exec atomics. The protocol is shaped exactly like arc.rs's `RefCounter<Perm>` (split-field `counter: nat` + `storage: Option<T>` + `reader: Multiset<T>`), with `do_deposit` / `do_clone` / `dec_basic` / `dec_to_zero` as transitions and `reader_guard` as the borrow property.
+Together these validate gaps 1 + 3 end-to-end against real exec atomics plus the Arc-of-Arc multi-reader + reclaim primitive. The protocol uses arc.rs's split-field shape (`counter: nat` + `storage: Option<T>` + `reader: Multiset<T>`) with `do_deposit` / `do_clone` / `dec_basic` / `dec_to_zero` as transitions and `reader_guard` as the borrow property.
+
+The reclaim path here is *not* the QSBR pattern FingerprintShard actually uses (lazy free on next resize via the seqlock); arc.rs's refcount-and-free is used as the closest Verus blueprint. The FingerprintShard `cleanup_old_memory` path would be its own state-machine refinement on top.
+
+Still not covered: mmap allocation (gap-2 closure), non-blocking RCU swap with overlapping epochs (the outer AtomicPtr publishing "current allocation"), and multi-slot tables (single u64 slot; the array variant is mechanical via `Vec<PAtomicU64>` + index).
 
 ### Genuinely deferred to v1.2.0+
 
