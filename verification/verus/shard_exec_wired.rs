@@ -269,6 +269,38 @@ impl VerifiedShard {
         });
         value
     }
+
+    /// CAS the slot from `expected` to `new_fp`. Returns true if the
+    /// swap succeeded. Models the FingerprintShard hot path's
+    /// `compare_exchange_weak(0, fp)` on a slot.
+    ///
+    /// This is the write-path analog of `read`: same `&self` access,
+    /// same `read_ref_guards` to obtain the `&PointsTo<InnerShard>`,
+    /// same `open_atomic_invariant!` to access the slot's
+    /// `PermissionU64`. The only difference is `compare_exchange` in
+    /// place of `load`.
+    fn cas_insert(&self, expected: u64, new_fp: u64) -> (success: bool)
+        requires self.wf(),
+    {
+        let tracked inst_borrowed = self.inst.borrow();
+        let tracked reader_borrowed = self.reader.borrow();
+        let tracked perm = inst_borrowed.read_ref_guards(
+            reader_borrowed.element(),
+            reader_borrowed,
+        );
+        let inner_ref = self.ptr.borrow(Tracked(perm));
+        let res;
+        open_atomic_invariant!(self.inv.borrow().borrow() => g => {
+            let tracked GhostStuff { slot_perm: mut sp, counter_token: ct } = g;
+            res = inner_ref.slot.compare_exchange(
+                Tracked(&mut sp),
+                expected,
+                new_fp,
+            );
+            proof { g = GhostStuff { slot_perm: sp, counter_token: ct }; }
+        });
+        res.is_ok()
+    }
 }
 
 } // verus!

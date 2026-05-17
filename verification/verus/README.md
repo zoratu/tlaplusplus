@@ -220,9 +220,14 @@ What this PoC proves and what remains open is documented in `T13.2-T13.4-design.
 
 ### Tier-A.10 (T13.4 Phase 2 slice 1): `shard_exec_wired.rs`
 
-`shard_exec_wired.rs` ships **11 verified items**, 0 errors (`./run_proof.sh exec-wired`). The first exec-wired artifact: a `VerifiedShard` struct that ties the `EpochProtocol` (the protocol skeleton from `atomic_ptr_with_epoch.rs`) to a real `PAtomicU64` slot inside a `PPtr<InnerShard>` allocation. The `read(&self) -> u64` method walks the protocol's `read_ref_guards` to obtain a `&PointsTo<InnerShard>`, dereferences the pointer, then opens a `Shared<AtomicInvariant>` around the atomic load to access the slot's `PermissionU64`.
+`shard_exec_wired.rs` ships **12 verified items**, 0 errors (`./run_proof.sh exec-wired`). The first exec-wired artifact: a `VerifiedShard` struct that ties the `EpochProtocol` (the protocol skeleton from `atomic_ptr_with_epoch.rs`) to a real `PAtomicU64` slot inside a `PPtr<InnerShard>` allocation.
 
-This validates the gap-1 + gap-3 patterns end-to-end against real exec atomics. Template: `examples/state_machines/arc.rs` (`MyArc<S>` + `InnerArc<S>` + `RefCounter<Perm>`), with the protocol renamed to `EpochProtocol<T>` and the cell carrying our slot atomic.
+Two `&self` methods that both walk through the protocol's `read_ref_guards` + `Shared<AtomicInvariant>`:
+
+- `read(&self) -> u64` — `slot.load(...)` through the invariant. Validates the read path (gap-1: linear permission parked in protocol, shared `&` access via guard).
+- `cas_insert(&self, expected, new_fp) -> bool` — `slot.compare_exchange(...)` through the invariant. Validates the write path; mirrors the FingerprintShard hot path's CAS-from-0 on an empty slot.
+
+Together these validate the gap-1 + gap-3 patterns end-to-end against real exec atomics. Template: `examples/state_machines/arc.rs` (`MyArc<S>` + `InnerArc<S>` + `RefCounter<Perm>`), with the protocol renamed to `EpochProtocol<T>` and the cell carrying our slot atomic.
 
 Single-epoch only. The next slice adds the swap pattern (Arc-of-Arc style: per-epoch protocol instances + an outer `AtomicPtr<VerifiedShard>` that publishes the current epoch).
 
