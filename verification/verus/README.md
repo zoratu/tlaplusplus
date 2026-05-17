@@ -220,7 +220,7 @@ What this PoC proves and what remains open is documented in `T13.2-T13.4-design.
 
 ### Tier-A.10 (T13.4 Phase 2 slice 1): `shard_exec_wired.rs`
 
-`shard_exec_wired.rs` ships **15 verified items**, 0 errors (`./run_proof.sh exec-wired`). The first exec-wired artifact: a `VerifiedShard` struct that ties the `EpochProtocol` (shaped exactly after arc.rs's `RefCounter<Perm>`) to a real `PPtr<InnerShard>` allocation holding two `PAtomicU64`s — a slot atomic (the FingerprintShard hash-slot stand-in) and a refcount cell.
+`shard_exec_wired.rs` ships **19 verified items**, 0 errors (`./run_proof.sh exec-wired`). The first exec-wired artifact: a `VerifiedShard` struct that ties the `EpochProtocol` (shaped exactly after arc.rs's `RefCounter<Perm>`) to a real `PPtr<InnerShard>` allocation holding two `PAtomicU64`s — a slot atomic (the FingerprintShard hash-slot stand-in) and a refcount cell.
 
 Five methods covering the full lifecycle:
 
@@ -235,6 +235,13 @@ Together these validate gaps 1 + 3 end-to-end against real exec atomics plus the
 The reclaim path here is *not* the QSBR pattern FingerprintShard actually uses (lazy free on next resize via the seqlock); arc.rs's refcount-and-free is used as the closest Verus blueprint. The FingerprintShard `cleanup_old_memory` path would be its own state-machine refinement on top.
 
 Plus a `demonstrate_swap_pattern()` exec function (slice 3c) that exercises two coexisting `VerifiedShard` instances through a swap-like sequence: epoch A's writer publishes + a reader clones; epoch B's writer publishes a separate allocation; A's reader continues across the publication; B's reader attaches; A is drained independently via successive `dispose`s; B is then drained too. Validates the multi-epoch composition by construction — both epochs maintain independent protocols, independent reader counts, and independent allocations.
+
+Slice 5 adds **`ShardRegistry`** + **`demonstrate_registry_swap()`**: a lock-based RCU registry that wraps a `VerifiedShard` inside a `vstd::rwlock::RwLock<VerifiedShard, WellFormedShardPred>`. Two `&self` methods:
+
+- `clone_current(&self) -> VerifiedShard` — acquires the read lock, clones the inner shard (minting a fresh reader on its allocation), releases.
+- `swap(&self, new: VerifiedShard) -> VerifiedShard` — acquires the write lock, replaces the protected shard, returns the old one for the caller to dispose at their leisure. Existing outstanding clones from before the swap continue to access the OLD allocation via their own ReadRef tokens.
+
+The correctness story (no use-after-free, no data races on the linear permissions) is the same as for a lock-free RCU swap because `WellFormedShardPred` carries `v.wf()` and `release_write` requires `inv(new_val)`. The runtime perf cost is the lock contention vs. truly atomic publication; the lock-free version using `vstd::atomic_ghost::AtomicU64<...>` carrying the protocol's tokens is a follow-up slice.
 
 ### Tier-A.11 (T13.4 Phase 2 slice 4): `mmap_external_body.rs`
 

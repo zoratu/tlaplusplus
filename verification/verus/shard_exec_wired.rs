@@ -67,6 +67,7 @@ use vstd::invariant::*;
 use vstd::modes::*;
 use vstd::multiset::*;
 use vstd::prelude::*;
+use vstd::rwlock::*;
 use vstd::shared::*;
 use vstd::simple_pptr;
 use vstd::simple_pptr::*;
@@ -426,6 +427,86 @@ impl VerifiedShard {
     }
 }
 
+/// Predicate for the registry's RwLock: the protected value is always
+/// a well-formed VerifiedShard.
+pub struct WellFormedShardPred;
+
+impl RwLockPredicate<VerifiedShard> for WellFormedShardPred {
+    closed spec fn inv(self, v: VerifiedShard) -> bool {
+        v.wf()
+    }
+}
+
+/// Lock-based RCU registry. Holds a `VerifiedShard` inside an `RwLock`
+/// with a `WellFormedShardPred` predicate. Two operations:
+///
+///   - `clone_current(&self) -> VerifiedShard` — acquire the read lock,
+///     clone the current shard (minting a fresh reader on its
+///     allocation), release. The clone outlives the lock acquisition;
+///     concurrent calls all observe the same underlying allocation
+///     while the registry hasn't swapped.
+///
+///   - `swap(&self, new: VerifiedShard) -> VerifiedShard` — acquire
+///     the write lock, replace the protected shard with `new`, release.
+///     Returns the old shard so the caller can dispose at their
+///     leisure (its existing clones, if any, continue to use the OLD
+///     allocation since they hold their own protocol-tracked readers).
+///
+/// This is the lock-based version of the swap orchestration. The
+/// correctness story is the same as for a lock-free RCU swap — no
+/// use-after-free, no data races on the linear permissions — because
+/// `WellFormedShardPred` carries `v.wf()` and `release_write` requires
+/// `inv(new_val)`. The runtime perf cost is the lock contention vs.
+/// truly atomic publication; the lock-free version using
+/// `vstd::atomic_ghost::AtomicU64<...>` carrying the protocol's tokens
+/// is a follow-up slice.
+pub struct ShardRegistry {
+    pub lock: RwLock<VerifiedShard, WellFormedShardPred>,
+}
+
+impl ShardRegistry {
+    pub closed spec fn wf(self) -> bool {
+        true
+    }
+
+    fn new(initial_fp: u64) -> (r: Self)
+        ensures r.wf(),
+    {
+        let v = VerifiedShard::new(initial_fp);
+        let lock = RwLock::new(v, Ghost(WellFormedShardPred));
+        ShardRegistry { lock }
+    }
+
+    /// Clone the current shard while holding the read lock briefly.
+    /// The returned `VerifiedShard` carries its own ReadRef on the
+    /// allocation; after release, the registry's lock is free again.
+    fn clone_current(&self) -> (sh: VerifiedShard)
+        requires self.wf(),
+        ensures sh.wf(),
+    {
+        let handle = self.lock.acquire_read();
+        let cloned = handle.borrow().clone();
+        handle.release_read();
+        cloned
+    }
+
+    /// Replace the current shard with `new`, returning the old one.
+    /// Caller is responsible for disposing the returned shard (it can
+    /// be live for arbitrary time after the swap — other readers
+    /// holding their own clones continue to access it via their
+    /// individual ReadRefs).
+    fn swap(&self, new: VerifiedShard) -> (old: VerifiedShard)
+        requires
+            self.wf(),
+            new.wf(),
+        ensures old.wf(),
+    {
+        let (old, write_handle) = self.lock.acquire_write();
+        write_handle.release_write(new);
+        old
+    }
+}
+
 /// Demonstrates the multi-epoch story via composition of the existing
 /// primitives. Two `VerifiedShard` instances coexist; each has its own
 /// allocation, its own protocol instance, its own refcount, and its own
@@ -473,6 +554,54 @@ fn demonstrate_swap_pattern() {
     // Drain epoch B.
     b_writer.dispose();
     b_reader.dispose();
+}
+
+/// Demonstrates the registry-based swap (slice 5). A `ShardRegistry`
+/// publishes one VerifiedShard at a time; readers clone via the
+/// registry, the writer swaps to a new shard, the old shard plus any
+/// outstanding clones continue to function independently.
+pub fn demonstrate_registry_swap() {
+    let reg = ShardRegistry::new(0);
+
+    // Reader 1 attaches to epoch A.
+    let a_reader_1 = reg.clone_current();
+    let _va1 = a_reader_1.read();
+
+    // Reader 2 also attaches to epoch A.
+    let a_reader_2 = reg.clone_current();
+    let _va2 = a_reader_2.read();
+
+    // Writer publishes epoch B. The returned `a_writer` is the
+    // formerly-current VerifiedShard. Existing a_reader_{1,2} are
+    // unaffected — they hold their own ReadRefs on epoch A's
+    // allocation, which is kept alive by their refcount.
+    let new_b = VerifiedShard::new(100);
+    let a_writer = reg.swap(new_b);
+
+    // Now reads through the registry go to epoch B.
+    let b_reader = reg.clone_current();
+    let _vb = b_reader.read();
+
+    // Old A readers continue to use epoch A.
+    let _va1_after = a_reader_1.read();
+
+    // Drain epoch A independently from the registry. Each VerifiedShard
+    // holds its own ReadRef; when the last one disposes, dec_to_zero
+    // runs and the allocation is freed.
+    a_writer.dispose();
+    a_reader_1.dispose();
+    a_reader_2.dispose();
+
+    // Drain epoch B. The registry still holds one reference; the local
+    // b_reader holds another. Dispose b_reader, then swap the registry
+    // with a placeholder so we can dispose its inner shard too.
+    b_reader.dispose();
+    let placeholder = VerifiedShard::new(200);
+    let final_b = reg.swap(placeholder);
+    final_b.dispose();
+    // (The placeholder is now in the registry; it leaks at end of
+    // scope, which Verus permits for tracked-token-bearing values per
+    // arc.rs's main() example.)
 }
 
 } // verus!
