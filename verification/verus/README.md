@@ -236,6 +236,12 @@ The reclaim path here is *not* the QSBR pattern FingerprintShard actually uses (
 
 Plus a `demonstrate_swap_pattern()` exec function (slice 3c) that exercises two coexisting `VerifiedShard` instances through a swap-like sequence: epoch A's writer publishes + a reader clones; epoch B's writer publishes a separate allocation; A's reader continues across the publication; B's reader attaches; A is drained independently via successive `dispose`s; B is then drained too. Validates the multi-epoch composition by construction — both epochs maintain independent protocols, independent reader counts, and independent allocations.
 
+### Tier-A.11 (T13.4 Phase 2 slice 4): `mmap_external_body.rs`
+
+`mmap_external_body.rs` ships **1 verified item**, 0 errors (`./run_proof.sh mmap`). The verified item is a `demonstrate_mmap_lifecycle` exec function that allocates a 2 MiB huge-page region via `mmap_allocate_huge_pages`, then immediately frees it via `munmap_huge_pages`. The two wrapper functions are `#[verifier::external_body]` — trusted at the FFI boundary the same way `vstd::raw_ptr::allocate` itself is.
+
+This closes gap 2 from the original T13.4 design doc. The original framing claimed "Verus refuses to admit a fresh ghost token from an external-body function" — factually wrong, since `vstd::raw_ptr::allocate` (line 907 of `source/vstd/raw_ptr.rs`) is itself `external_body` and mints fresh `Tracked<PointsToRaw>` / `Tracked<Dealloc>` via `Tracked::assume_new()`. This file ports the exact same shape to `libc::mmap` with `MAP_HUGETLB | MAP_POPULATE` (the flags `FingerprintShard::allocate_huge_pages` uses), introducing a parallel `MmapDealloc` tracked struct + `MmapDeallocData` ghost struct mirroring `Dealloc` / `DeallocData`. The trust assumption is identical to vstd's: the implementation actually does what the `ensures` clause says.
+
 Still not covered: mmap allocation (gap-2 closure), the exec wiring of the outer `AtomicPtr<InnerShard>` that publishes "which allocation is current" (the `AtomicPtrWithEpoch` shape from tjhance's reply, with its own ghost state tracking address→permission), and multi-slot tables (single u64 slot; the array variant is mechanical via `Vec<PAtomicU64>` + index). The protocol composition validated by `demonstrate_swap_pattern` is the prerequisite for the outer AtomicPtr wiring.
 
 ### Genuinely deferred to v1.2.0+
@@ -300,6 +306,8 @@ VERUS_DIR=/home/ubuntu/verus ./run_proof.sh shard-wrapper    # tier-A.7 (T13.4 P
 VERUS_DIR=/home/ubuntu/verus ./run_proof.sh reader-liveness-v2  # T13.5 axiom-free reader liveness
 VERUS_DIR=/home/ubuntu/verus ./run_proof.sh sm               # T13.5 state_machines! port
 VERUS_DIR=/home/ubuntu/verus ./run_proof.sh epoch            # T13.4 gap-1 PoC (verus-lang/verus#2437 follow-up)
+VERUS_DIR=/home/ubuntu/verus ./run_proof.sh exec-wired       # T13.4 Phase 2 slices 1-3c (exec wiring)
+VERUS_DIR=/home/ubuntu/verus ./run_proof.sh mmap             # T13.4 Phase 2 slice 4 (gap-2 mmap external_body)
 ```
 
 Or run all under CI; see `.github/workflows/verus.yml` for the complete gate (T13.6). The CI gate currently runs tier-b, tier-a, shard-methods, and reader-liveness-v2; `shard-wrapper` is added in this commit and should be wired into the CI workflow alongside the others.
