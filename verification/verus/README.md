@@ -220,7 +220,7 @@ What this PoC proves and what remains open is documented in `T13.2-T13.4-design.
 
 ### Tier-A.10 (T13.4 Phase 2 slice 1): `shard_exec_wired.rs`
 
-`shard_exec_wired.rs` ships **14 verified items**, 0 errors (`./run_proof.sh exec-wired`). The first exec-wired artifact: a `VerifiedShard` struct that ties the `EpochProtocol` (shaped exactly after arc.rs's `RefCounter<Perm>`) to a real `PPtr<InnerShard>` allocation holding two `PAtomicU64`s — a slot atomic (the FingerprintShard hash-slot stand-in) and a refcount cell.
+`shard_exec_wired.rs` ships **15 verified items**, 0 errors (`./run_proof.sh exec-wired`). The first exec-wired artifact: a `VerifiedShard` struct that ties the `EpochProtocol` (shaped exactly after arc.rs's `RefCounter<Perm>`) to a real `PPtr<InnerShard>` allocation holding two `PAtomicU64`s — a slot atomic (the FingerprintShard hash-slot stand-in) and a refcount cell.
 
 Five methods covering the full lifecycle:
 
@@ -234,7 +234,9 @@ Together these validate gaps 1 + 3 end-to-end against real exec atomics plus the
 
 The reclaim path here is *not* the QSBR pattern FingerprintShard actually uses (lazy free on next resize via the seqlock); arc.rs's refcount-and-free is used as the closest Verus blueprint. The FingerprintShard `cleanup_old_memory` path would be its own state-machine refinement on top.
 
-Still not covered: mmap allocation (gap-2 closure), non-blocking RCU swap with overlapping epochs (the outer AtomicPtr publishing "current allocation"), and multi-slot tables (single u64 slot; the array variant is mechanical via `Vec<PAtomicU64>` + index).
+Plus a `demonstrate_swap_pattern()` exec function (slice 3c) that exercises two coexisting `VerifiedShard` instances through a swap-like sequence: epoch A's writer publishes + a reader clones; epoch B's writer publishes a separate allocation; A's reader continues across the publication; B's reader attaches; A is drained independently via successive `dispose`s; B is then drained too. Validates the multi-epoch composition by construction — both epochs maintain independent protocols, independent reader counts, and independent allocations.
+
+Still not covered: mmap allocation (gap-2 closure), the exec wiring of the outer `AtomicPtr<InnerShard>` that publishes "which allocation is current" (the `AtomicPtrWithEpoch` shape from tjhance's reply, with its own ghost state tracking address→permission), and multi-slot tables (single u64 slot; the array variant is mechanical via `Vec<PAtomicU64>` + index). The protocol composition validated by `demonstrate_swap_pattern` is the prerequisite for the outer AtomicPtr wiring.
 
 ### Genuinely deferred to v1.2.0+
 

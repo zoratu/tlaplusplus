@@ -426,6 +426,55 @@ impl VerifiedShard {
     }
 }
 
+/// Demonstrates the multi-epoch story via composition of the existing
+/// primitives. Two `VerifiedShard` instances coexist; each has its own
+/// allocation, its own protocol instance, its own refcount, and its own
+/// readers. Drain on one does not affect the other.
+///
+/// This is what the FingerprintShard rehash pattern looks like at the
+/// protocol level:
+///   - `a_writer` + `a_reader` = readers attached to the OLD table
+///   - `b_writer` + `b_reader` = readers attached to the NEW table
+///   - The publish step (in real RCU, an `AtomicPtr` swap) is omitted
+///     here; this demo just shows that the two epochs CAN coexist with
+///     independent lifecycles, which is the half that gap 1 was about.
+///
+/// The exec wiring of the outer `AtomicPtr<InnerShard>` that publishes
+/// "which allocation is current" is a separate slice — that's where the
+/// `AtomicPtrWithEpoch` shape from tjhance's reply lives in exec form,
+/// with its own ghost state tracking address→permission. The protocol
+/// composition this demo verifies is the *prerequisite* for that wiring.
+fn demonstrate_swap_pattern() {
+    // Epoch A: writer publishes initial allocation, an existing reader
+    // clones from it.
+    let a_writer = VerifiedShard::new(0);
+    let a_reader = a_writer.clone();
+
+    // Epoch B begins: writer publishes a fresh allocation. In real RCU,
+    // an outer AtomicPtr swap would now make `b` the "current" pointer.
+    let b_writer = VerifiedShard::new(100);
+
+    // OLD reader from A continues to use A across the publication.
+    let _val_a = a_reader.read();
+    let _ok_a = a_reader.cas_insert(0, 7);
+
+    // NEW reader attaches to B.
+    let b_reader = b_writer.clone();
+    let _val_b = b_reader.read();
+
+    // Drain epoch A independently. After both A holders dispose, A's
+    // allocation is reclaimed via dec_to_zero + ptr.free.
+    a_writer.dispose();
+    a_reader.dispose();
+
+    // B is unaffected.
+    let _val_b_after = b_writer.read();
+
+    // Drain epoch B.
+    b_writer.dispose();
+    b_reader.dispose();
+}
+
 } // verus!
 
 fn main() { }
