@@ -222,14 +222,13 @@ What this PoC proves and what remains open is documented in `T13.2-T13.4-design.
 
 `shard_exec_wired.rs` ships **12 verified items**, 0 errors (`./run_proof.sh exec-wired`). The first exec-wired artifact: a `VerifiedShard` struct that ties the `EpochProtocol` (the protocol skeleton from `atomic_ptr_with_epoch.rs`) to a real `PAtomicU64` slot inside a `PPtr<InnerShard>` allocation.
 
-Two `&self` methods that both walk through the protocol's `read_ref_guards` + `Shared<AtomicInvariant>`:
+Three `&self` methods that all walk through the protocol's `reader_guard` + `Shared<AtomicInvariant>`:
 
 - `read(&self) -> u64` — `slot.load(...)` through the invariant. Validates the read path (gap-1: linear permission parked in protocol, shared `&` access via guard).
 - `cas_insert(&self, expected, new_fp) -> bool` — `slot.compare_exchange(...)` through the invariant. Validates the write path; mirrors the FingerprintShard hot path's CAS-from-0 on an empty slot.
+- `clone(&self) -> Self` — mints another reader on the same allocation via the protocol's `do_clone` transition. Validates the Arc-of-Arc primitive: multiple readers of the same underlying allocation, each with its own protocol-tracked reference. This is the half of the multi-epoch story that's resident on a single allocation; the other half (per-epoch instances + an outer AtomicPtr publishing current) is a later slice.
 
-Together these validate the gap-1 + gap-3 patterns end-to-end against real exec atomics. Template: `examples/state_machines/arc.rs` (`MyArc<S>` + `InnerArc<S>` + `RefCounter<Perm>`), with the protocol renamed to `EpochProtocol<T>` and the cell carrying our slot atomic.
-
-Single-epoch only. The next slice adds the swap pattern (Arc-of-Arc style: per-epoch protocol instances + an outer `AtomicPtr<VerifiedShard>` that publishes the current epoch).
+Plus an exec constructor `new(initial_fp) -> Self` and a single `fn main()`. Together these validate gap-1 + gap-3 patterns end-to-end against real exec atomics. The protocol is shaped exactly like arc.rs's `RefCounter<Perm>` (split-field `counter: nat` + `storage: Option<T>` + `reader: Multiset<T>`), with `do_deposit` / `do_clone` / `dec_basic` / `dec_to_zero` as transitions and `reader_guard` as the borrow property.
 
 ### Genuinely deferred to v1.2.0+
 

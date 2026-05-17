@@ -61,102 +61,113 @@ use vstd::simple_pptr;
 use vstd::simple_pptr::*;
 use vstd::{pervasive::*, *};
 
-// EpochProtocol — same protocol as `atomic_ptr_with_epoch.rs`, inlined
-// because Verus proof files in this directory are verified standalone
-// and don't share a crate. Keep in sync with the upstream PoC if either
-// file evolves.
+// EpochProtocol — shaped after the RefCounter<Perm> protocol in
+// examples/state_machines/arc.rs. Diverges from atomic_ptr_with_epoch.rs
+// (which combines count + stored-value into a single
+// `Option<(nat, T)>`); the split-field shape used here matches
+// arc.rs's `counter: nat` + `storage: Option<T>` and lets `have reader`
+// discharge precondition obligations on multi-reader transitions like
+// `do_clone` and `dec_basic`.
 tokenized_state_machine!{ EpochProtocol<T> {
     fields {
-        #[sharding(storage_option)]
-        pub stored: Option<T>,
-
         #[sharding(variable)]
-        pub main_counter: Option<(nat, T)>,
+        pub counter: nat,
+
+        #[sharding(storage_option)]
+        pub storage: Option<T>,
 
         #[sharding(multiset)]
-        pub read_ref: Multiset<T>,
-    }
-
-    init!{
-        new() {
-            init stored = None;
-            init main_counter = None;
-            init read_ref = Multiset::empty();
-        }
-    }
-
-    transition!{
-        publish(t: T) {
-            require pre.main_counter.is_none();
-            update main_counter = Some((0, t));
-            deposit stored += Some(t);
-        }
-    }
-
-    transition!{
-        reclaim() {
-            require let Some((count, t)) = pre.main_counter;
-            require count == 0;
-            update main_counter = None;
-            withdraw stored -= Some(t);
-        }
-    }
-
-    transition!{
-        acquire_read() {
-            require let Some((count, t)) = pre.main_counter;
-            update main_counter = Some((count + 1, t));
-            add read_ref += { t };
-        }
-    }
-
-    transition!{
-        release_read(t1: T) {
-            remove read_ref -= { t1 };
-            require let Some((count, t2)) = pre.main_counter;
-            assert count >= 1;
-            assert t1 == t2;
-            update main_counter = Some(((count - 1) as nat, t1));
-        }
-    }
-
-    property!{
-        read_ref_guards(t: T) {
-            have read_ref >= { t };
-            guard stored >= Some(t);
-        }
+        pub reader: Multiset<T>,
     }
 
     #[invariant]
-    pub spec fn main_inv(&self) -> bool {
-        match self.stored {
-            None => {
-                &&& self.main_counter.is_none()
-                &&& self.read_ref =~= Multiset::empty()
-            }
-            Some(t) => {
-                match self.main_counter {
-                    Some((count, t1)) => {
-                        &&& t == t1
-                        &&& self.read_ref.count(t) == count
-                        &&& (forall |t0: T| t0 != t ==> self.read_ref.count(t0) == 0)
-                    }
-                    None => false,
-                }
-            }
+    pub fn reader_agrees_storage(&self) -> bool {
+        forall |t: T| self.reader.count(t) > 0 ==> self.storage == Option::Some(t)
+    }
+
+    #[invariant]
+    pub fn counter_agrees_storage(&self) -> bool {
+        self.counter == 0 ==> self.storage is None
+    }
+
+    #[invariant]
+    pub fn counter_agrees_storage_rev(&self) -> bool {
+        self.storage is None ==> self.counter == 0
+    }
+
+    #[invariant]
+    pub fn counter_agrees_reader_count(&self) -> bool {
+        self.storage is Some ==> self.reader.count(self.storage->0) == self.counter
+    }
+
+    init!{
+        initialize_empty() {
+            init counter = 0;
+            init storage = Option::None;
+            init reader = Multiset::empty();
         }
     }
 
-    #[inductive(new)]
-    fn new_inductive(post: Self) { }
-    #[inductive(publish)]
-    fn publish_inductive(pre: Self, post: Self, t: T) { }
-    #[inductive(reclaim)]
-    fn reclaim_inductive(pre: Self, post: Self) { }
-    #[inductive(acquire_read)]
-    fn acquire_read_inductive(pre: Self, post: Self) { }
-    #[inductive(release_read)]
-    fn release_read_inductive(pre: Self, post: Self, t1: T) { }
+    #[inductive(initialize_empty)]
+    fn initialize_empty_inductive(post: Self) { }
+
+    transition!{
+        do_deposit(x: T) {
+            require(pre.counter == 0);
+            update counter = 1;
+            deposit storage += Some(x);
+            add reader += {x};
+        }
+    }
+
+    #[inductive(do_deposit)]
+    fn do_deposit_inductive(pre: Self, post: Self, x: T) { }
+
+    property!{
+        reader_guard(x: T) {
+            have reader >= {x};
+            guard storage >= Some(x);
+        }
+    }
+
+    transition!{
+        do_clone(x: T) {
+            have reader >= {x};
+            add reader += {x};
+            update counter = pre.counter + 1;
+        }
+    }
+
+    #[inductive(do_clone)]
+    fn do_clone_inductive(pre: Self, post: Self, x: T) {
+        assert(pre.reader.count(x) > 0);
+    }
+
+    transition!{
+        dec_basic(x: T) {
+            require(pre.counter >= 2);
+            remove reader -= {x};
+            update counter = (pre.counter - 1) as nat;
+        }
+    }
+
+    transition!{
+        dec_to_zero(x: T) {
+            remove reader -= {x};
+            require(pre.counter < 2);
+            assert(pre.counter == 1);
+            update counter = 0;
+            withdraw storage -= Some(x);
+        }
+    }
+
+    #[inductive(dec_basic)]
+    fn dec_basic_inductive(pre: Self, post: Self, x: T) {
+        assert(pre.reader.count(x) > 0);
+    }
+
+    #[inductive(dec_to_zero)]
+    fn dec_to_zero_inductive(pre: Self, post: Self, x: T) { }
 }}
 
 verus! {
@@ -176,7 +187,7 @@ pub type SlotPerm = simple_pptr::PointsTo<InnerShard>;
 // future acquire/release transitions performed inside an exec method).
 pub tracked struct GhostStuff {
     pub tracked slot_perm: PermissionU64,
-    pub tracked counter_token: EpochProtocol::main_counter<SlotPerm>,
+    pub tracked counter_token: EpochProtocol::counter<SlotPerm>,
 }
 
 impl GhostStuff {
@@ -200,7 +211,7 @@ struct_with_invariants!{
     pub struct VerifiedShard {
         pub inst: Tracked< EpochProtocol::Instance<SlotPerm> >,
         pub inv: Tracked< Shared<AtomicInvariant<_, GhostStuff, _>> >,
-        pub reader: Tracked< EpochProtocol::read_ref<SlotPerm> >,
+        pub reader: Tracked< EpochProtocol::reader<SlotPerm> >,
         pub ptr: PPtr<InnerShard>,
         pub slot_cell: Ghost< PAtomicU64 >,
     }
@@ -231,11 +242,12 @@ impl VerifiedShard {
         let (ptr, Tracked(ptr_perm)) = PPtr::new(inner);
 
         let tracked (Tracked(inst), Tracked(mut counter_token), _) =
-            EpochProtocol::Instance::new(None);
-        proof {
-            inst.publish(ptr_perm, ptr_perm, &mut counter_token);
-        }
-        let tracked read_ref = inst.acquire_read(&mut counter_token);
+            EpochProtocol::Instance::initialize_empty(Option::None);
+        let tracked read_ref = inst.do_deposit(
+            ptr_perm,
+            &mut counter_token,
+            ptr_perm,
+        );
 
         let tr_inst = Tracked(inst);
         let gh_cell = Ghost(slot_atomic);
@@ -256,7 +268,7 @@ impl VerifiedShard {
     {
         let tracked inst_borrowed = self.inst.borrow();
         let tracked reader_borrowed = self.reader.borrow();
-        let tracked perm = inst_borrowed.read_ref_guards(
+        let tracked perm = inst_borrowed.reader_guard(
             reader_borrowed.element(),
             reader_borrowed,
         );
@@ -270,21 +282,50 @@ impl VerifiedShard {
         value
     }
 
+    /// Mint another reader on the same allocation. The clone shares
+    /// `inst`, `inv`, `ptr`, `slot_cell` with `self` (the InstanceId and
+    /// Shared invariant are Copy/clonable; the `PPtr` is Copy), and
+    /// gets its own reader token minted via the protocol's `do_clone`
+    /// transition. Mirrors arc.rs's `MyArc::clone` minus the exec rc_cell
+    /// bump (our counter is purely ghost).
+    fn clone(&self) -> (sh: Self)
+        requires self.wf(),
+        ensures sh.wf(),
+    {
+        let tracked inst_borrowed = self.inst.borrow();
+        let tracked reader_borrowed = self.reader.borrow();
+        let tracked mut new_reader_opt: Option<EpochProtocol::reader<SlotPerm>> = None;
+        open_atomic_invariant!(self.inv.borrow().borrow() => g => {
+            let tracked GhostStuff { slot_perm: sp, counter_token: mut ct } = g;
+            proof {
+                let tracked nr = inst_borrowed.do_clone(
+                    reader_borrowed.element(),
+                    &mut ct,
+                    reader_borrowed,
+                );
+                new_reader_opt = Some(nr);
+            }
+            proof { g = GhostStuff { slot_perm: sp, counter_token: ct }; }
+        });
+        let tracked new_reader = new_reader_opt.tracked_unwrap();
+        VerifiedShard {
+            inst: Tracked(self.inst.borrow().clone()),
+            inv: Tracked(self.inv.borrow().clone()),
+            reader: Tracked(new_reader),
+            ptr: self.ptr,
+            slot_cell: Ghost(self.slot_cell@),
+        }
+    }
+
     /// CAS the slot from `expected` to `new_fp`. Returns true if the
     /// swap succeeded. Models the FingerprintShard hot path's
     /// `compare_exchange_weak(0, fp)` on a slot.
-    ///
-    /// This is the write-path analog of `read`: same `&self` access,
-    /// same `read_ref_guards` to obtain the `&PointsTo<InnerShard>`,
-    /// same `open_atomic_invariant!` to access the slot's
-    /// `PermissionU64`. The only difference is `compare_exchange` in
-    /// place of `load`.
     fn cas_insert(&self, expected: u64, new_fp: u64) -> (success: bool)
         requires self.wf(),
     {
         let tracked inst_borrowed = self.inst.borrow();
         let tracked reader_borrowed = self.reader.borrow();
-        let tracked perm = inst_borrowed.read_ref_guards(
+        let tracked perm = inst_borrowed.reader_guard(
             reader_borrowed.element(),
             reader_borrowed,
         );
