@@ -3,6 +3,12 @@ name = "tlaplusplus"
 version = "1.2.6"
 edition = "2024"
 
+# T13.4 Phase 2 — cargo-verus reads this to know it should verify this
+# crate. Only meaningful when the `verus` feature is on; ignored by
+# regular `cargo build` / `cargo test`.
+[package.metadata.verus]
+verify = true
+
 [features]
 default = []
 # Enable fail points for chaos/fault injection testing
@@ -10,6 +16,16 @@ failpoints = ["fail/failpoints"]
 # Enable Z3-backed symbolic Init enumeration (T5).
 # Requires libz3-dev / clang to build the z3-sys bindgen step.
 symbolic-init = ["dep:z3"]
+# Enable Verus annotations on shipping FingerprintShard (T13.4 Phase 2).
+# Activates the Verus path-deps below; only needed for `cargo verus check`,
+# not for regular `cargo build` / `cargo test`. The Verus deps are optional
+# git-deps pinned to a known-good Verus rev; default builds don't fetch them.
+verus = [
+    "dep:vstd",
+    "dep:verus_builtin",
+    "dep:verus_builtin_macros",
+    "dep:verus_state_machines_macros",
+]
 
 [dependencies]
 # Chaos testing - only active with failpoints feature
@@ -44,6 +60,18 @@ z3 = { version = "0.12", default-features = false, optional = true }
 # AWS SDK for S3 persistence (built-in for spot instance checkpoint/resume)
 aws-sdk-s3 = "1.65"
 aws-config = "1.5"
+
+# Verus annotations on shipping code (T13.4 Phase 2, opt-in via `verus` feature).
+# Git deps so Mac/CI cargo builds don't require a local Verus checkout; only
+# fetched when the `verus` feature is enabled. Pinned to a known-good
+# Verus rev that matches the verification spot's `git clone --depth 1`
+# (currently e479cce). Bump in lockstep with spot rebuilds — verus
+# binary and vstd source must come from the same commit, else verus
+# panics in erase.rs when looking up vstd built-ins.
+vstd = { git = "https://github.com/verus-lang/verus.git", rev = "e479cce", optional = true }
+verus_builtin = { git = "https://github.com/verus-lang/verus.git", rev = "e479cce", optional = true }
+verus_builtin_macros = { git = "https://github.com/verus-lang/verus.git", rev = "e479cce", optional = true }
+verus_state_machines_macros = { git = "https://github.com/verus-lang/verus.git", rev = "e479cce", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 procfs = "0.17"

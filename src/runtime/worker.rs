@@ -236,7 +236,7 @@ pub(super) fn run_worker<M: Model>(
 
         // Chaos: failpoint for worker panic
         #[cfg(feature = "failpoints")]
-        if crate::fail_point_is_set!("worker_panic") {
+        if fail_point_is_set!("worker_panic") {
             panic!("chaos: failpoint worker_panic triggered");
         }
 

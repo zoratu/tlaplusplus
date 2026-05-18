@@ -49,7 +49,7 @@ pub(super) fn write_checkpoint_manifest(
     manifest: &CheckpointManifest,
 ) -> Result<()> {
     // Chaos: fail point for testing checkpoint write failures
-    crate::fail_point!("checkpoint_write_fail");
+    fail_point!("checkpoint_write_fail");
 
     // Chaos: apply I/O latency if configured
     crate::chaos::apply_io_latency();
@@ -62,13 +62,13 @@ pub(super) fn write_checkpoint_manifest(
     let bytes = serde_json::to_vec_pretty(manifest).context("failed serializing checkpoint")?;
 
     // Chaos: fail point for disk write
-    crate::fail_point!("checkpoint_disk_write_fail");
+    fail_point!("checkpoint_disk_write_fail");
 
     std::fs::write(&tmp, bytes)
         .with_context(|| format!("failed writing checkpoint temp file {}", tmp.display()))?;
 
     // Chaos: fail point for atomic rename
-    crate::fail_point!("checkpoint_rename_fail");
+    fail_point!("checkpoint_rename_fail");
 
     std::fs::rename(&tmp, path)
         .with_context(|| format!("failed atomically moving checkpoint to {}", path.display()))?;
@@ -259,11 +259,11 @@ where
 
     let checkpoint_result = (|| -> Result<()> {
         // Chaos: fail point for queue flush
-        crate::fail_point!("checkpoint_queue_flush_fail");
+        fail_point!("checkpoint_queue_flush_fail");
         ctx.queue.checkpoint_flush()?;
 
         // Chaos: fail point for fingerprint flush
-        crate::fail_point!("checkpoint_fp_flush_fail");
+        fail_point!("checkpoint_fp_flush_fail");
         let _ = ctx.fp_store.flush()?;
 
         let (states_generated, states_processed, states_distinct, duplicates, enqueued, _) =

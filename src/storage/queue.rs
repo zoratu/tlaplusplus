@@ -325,7 +325,7 @@ where
 
     fn spill_batch_now(&self, batch: Vec<T>) -> Result<()> {
         // Chaos: fail point for queue spill
-        crate::fail_point!("queue_spill_fail");
+        fail_point!("queue_spill_fail");
 
         // Chaos: apply I/O latency if configured
         crate::chaos::apply_io_latency();
@@ -504,7 +504,7 @@ where
 
     fn load_one_segment(&self) -> Result<()> {
         // Chaos: fail point for segment load
-        crate::fail_point!("queue_load_fail");
+        fail_point!("queue_load_fail");
 
         // Chaos: apply I/O latency if configured
         crate::chaos::apply_io_latency();

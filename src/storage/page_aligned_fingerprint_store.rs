@@ -1465,7 +1465,7 @@ impl PageAlignedFingerprintStore {
         // Chaos: simulate shard full - degrade gracefully by treating as "not seen"
         // This may cause duplicate exploration but won't crash the system
         #[cfg(feature = "failpoints")]
-        if crate::fail_point_is_set!("fp_store_shard_full") {
+        if fail_point_is_set!("fp_store_shard_full") {
             // Log once per ~1000 calls to avoid spam
             static WARN_COUNTER: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0);
@@ -2182,3 +2182,4 @@ mod tests {
         }
     }
 }
+

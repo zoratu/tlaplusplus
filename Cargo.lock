@@ -1272,7 +1272,7 @@ dependencies = [
  "futures-sink",
  "futures-util",
  "http 0.2.12",
- "indexmap",
+ "indexmap 2.13.0",
  "slab",
  "tokio",
  "tokio-util",
@@ -1291,12 +1291,18 @@ dependencies = [
  "futures-core",
  "futures-sink",
  "http 1.4.0",
- "indexmap",
+ "indexmap 2.13.0",
  "slab",
  "tokio",
  "tokio-util",
  "tracing",
 ]
+
+[[package]]
+name = "hashbrown"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a9ee70c43aaf417c914396645a0fa852624801b24ebb7ae78fe8272889ac888"
 
 [[package]]
 name = "hashbrown"
@@ -1634,6 +1640,16 @@ checksum = "3acae9609540aa318d1bc588455225fb2085b9ed0c4f6bd0d9d5bcd86f1a0344"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
+]
+
+[[package]]
+name = "indexmap"
+version = "1.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd070e393353796e801d209ad339e89596eb4c8d430d18ede6a1cced8fafbd99"
+dependencies = [
+ "autocfg",
+ "hashbrown 0.12.3",
 ]
 
 [[package]]
@@ -2772,6 +2788,10 @@ dependencies = [
  "tempfile",
  "tokio",
  "twox-hash",
+ "verus_builtin",
+ "verus_builtin_macros",
+ "verus_state_machines_macros",
+ "vstd",
  "z3",
  "zstd",
 ]
@@ -2975,10 +2995,68 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "verus_builtin"
+version = "0.0.0-2026-05-06-1803"
+source = "git+https://github.com/verus-lang/verus.git?rev=fae8859#fae885933d60b690adaa9dc7e0db40b322f194f0"
+
+[[package]]
+name = "verus_builtin_macros"
+version = "0.0.0-2026-05-10-0145"
+source = "git+https://github.com/verus-lang/verus.git?rev=fae8859#fae885933d60b690adaa9dc7e0db40b322f194f0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+ "synstructure",
+ "verus_prettyplease",
+ "verus_syn",
+]
+
+[[package]]
+name = "verus_prettyplease"
+version = "0.0.0-2026-05-10-0145"
+source = "git+https://github.com/verus-lang/verus.git?rev=fae8859#fae885933d60b690adaa9dc7e0db40b322f194f0"
+dependencies = [
+ "proc-macro2",
+ "verus_syn",
+]
+
+[[package]]
+name = "verus_state_machines_macros"
+version = "0.0.0-2026-05-10-0145"
+source = "git+https://github.com/verus-lang/verus.git?rev=fae8859#fae885933d60b690adaa9dc7e0db40b322f194f0"
+dependencies = [
+ "indexmap 1.9.3",
+ "proc-macro2",
+ "quote",
+ "verus_syn",
+]
+
+[[package]]
+name = "verus_syn"
+version = "0.0.0-2026-05-10-0145"
+source = "git+https://github.com/verus-lang/verus.git?rev=fae8859#fae885933d60b690adaa9dc7e0db40b322f194f0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
 name = "vsimd"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
+
+[[package]]
+name = "vstd"
+version = "0.0.0-2026-05-10-0145"
+source = "git+https://github.com/verus-lang/verus.git?rev=fae8859#fae885933d60b690adaa9dc7e0db40b322f194f0"
+dependencies = [
+ "verus_builtin",
+ "verus_builtin_macros",
+ "verus_state_machines_macros",
+]
 
 [[package]]
 name = "wait-timeout"
