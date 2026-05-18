@@ -14,22 +14,24 @@
 // What is annotated
 // =================
 //
-// `compute_numa_index_from_hash` is the body of
-// `PageAlignedFingerprintStore::home_numa` extracted as a free function
-// over plain values (no struct refs). The annotation discharges:
+// Two free functions over plain values (no struct refs) that mirror
+// the bodies of shipping `PageAlignedFingerprintStore` methods. The
+// shipping `#[cfg(feature = "verus")]` paths delegate to these so
+// `cargo verus check` lifts the verified bounds into the shipping
+// call paths.
 //
-//   - `requires num_numa_nodes > 0` — prevents the `% 0` UB
-//   - `ensures c < num_numa_nodes` — the routing invariant the
-//     shipping `home_numa` method depends on for its callers (which
-//     index into `self.shards` by the returned value)
+//   1. `compute_numa_index_from_hash` — body of `home_numa`. Verified:
+//      `requires num_numa_nodes > 0, ensures c < num_numa_nodes`. The
+//      bound callers rely on when indexing into per-NUMA shard arrays.
 //
-// The shipping `home_numa` body in
-// `src/storage/page_aligned_fingerprint_store.rs` is the same three
-// lines verbatim; both compute the same value byte-for-byte. A future
-// pass can replace the inline body with `compute_numa_index_from_hash(
-// fp, self.num_numa_nodes)` to lift the verified bound into the
-// shipping call path; for now this file ships the verified shadow as
-// proof that real shipping logic is verifiable here.
+//   2. `clamp_to_shard_count` — the final `.min(num_shards - 1)` step
+//      of `shard_id_for`. Verified:
+//      `requires num_shards > 0, ensures sid < num_shards`. The bound
+//      callers rely on when indexing `self.shards[sid]`. The
+//      multiply-and-add that precedes the clamp stays in shipping code
+//      (overflow can't happen for shipping inputs but Verus doesn't
+//      yet have specs for `saturating_mul`/`saturating_add`); the
+//      bounded clamp is the part with the actual safety property.
 //
 // What's needed for full method annotation
 // ========================================
@@ -59,5 +61,34 @@ verus! {
         // selection.
         let mixed = (fp >> 32) ^ (fp >> 16) ^ fp;
         (mixed as usize) % num_numa_nodes
+    }
+
+    /// Clamp a pre-computed raw shard index to `[0, num_shards)`.
+    /// Mirrors the final `.min(...)` step of
+    /// `PageAlignedFingerprintStore::shard_id_for`. The caller computes
+    /// `raw = numa * shards_per_numa + shard_within_numa` (which can in
+    /// principle overflow for adversarial inputs, but in practice stays
+    /// well under `usize::MAX` since shipping `num_numa_nodes *
+    /// shards_per_numa` is typically < 1024), then passes the result
+    /// here for the bounded-clamp step.
+    ///
+    /// Verified: `ensures sid < num_shards`, the bound callers rely on
+    /// when indexing `self.shards[sid]`.
+    ///
+    /// Why split this off from the multiply: Verus doesn't yet have
+    /// specifications for `usize::saturating_mul` / `saturating_add`,
+    /// and proving the regular `*` / `+` don't overflow requires
+    /// preconditions on `numa` and `shards_per_numa` that callers
+    /// can't easily express. Verifying just the clamp is sound and
+    /// captures the actual safety property that matters at the index
+    /// site (the bound on `sid`).
+    pub fn clamp_to_shard_count(raw: usize, num_shards: usize) -> (sid: usize)
+        requires num_shards > 0,
+        ensures sid < num_shards,
+    {
+        // Manual min (rather than `.min(...)`): Verus doesn't yet
+        // provide specifications for `usize::min`.
+        let upper = (num_shards - 1) as usize;
+        if raw < upper { raw } else { upper }
     }
 }

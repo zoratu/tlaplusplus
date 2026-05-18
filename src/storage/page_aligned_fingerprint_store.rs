@@ -1436,12 +1436,36 @@ impl PageAlignedFingerprintStore {
         &self.shards[shard_id]
     }
 
-    /// Get shard ID for a fingerprint (for external use)
+    /// Get shard ID for a fingerprint (for external use).
+    ///
+    /// Body cfg-split (T13.4 Phase 2): under `--features verus`,
+    /// delegates to `verus_smoke::compute_shard_id` which carries
+    /// `ensures sid < num_shards` — the bound callers rely on when
+    /// indexing `self.shards[sid]`. The default build keeps the inline
+    /// body byte-for-byte so default cargo build / cargo test produce
+    /// identical runtime behaviour to before the lift.
+    #[cfg(not(feature = "verus"))]
     #[inline]
     pub fn shard_id_for(&self, fp: u64) -> usize {
         let numa = self.home_numa(fp);
         let shard_within_numa = (fp as usize) % self.shards_per_numa;
         (numa * self.shards_per_numa + shard_within_numa).min(self.shards.len() - 1)
+    }
+
+    /// See the `cfg(not(feature = "verus"))` arm above for documentation.
+    /// Under `--features verus` this calls the verified
+    /// `clamp_to_shard_count` function whose contract guarantees the
+    /// result is in `[0, self.shards.len())`. The multiply-and-add
+    /// stays in this method (where overflow can't happen for shipping
+    /// inputs); the bounded clamp is the part with a non-trivial
+    /// safety property.
+    #[cfg(feature = "verus")]
+    #[inline]
+    pub fn shard_id_for(&self, fp: u64) -> usize {
+        let numa = self.home_numa(fp);
+        let shard_within_numa = (fp as usize) % self.shards_per_numa;
+        let raw = numa * self.shards_per_numa + shard_within_numa;
+        crate::storage::verus_smoke::clamp_to_shard_count(raw, self.shards.len())
     }
 
     /// Check if fingerprint exists (read-only, no insert)
