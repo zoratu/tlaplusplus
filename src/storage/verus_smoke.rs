@@ -11,37 +11,53 @@
 // `src/lib.rs` and `src/storage/mod.rs`; this file is the only verus-
 // processed module.
 //
-// What this validates
-// ===================
+// What is annotated
+// =================
 //
-// The cargo-verus build flow runs end-to-end against the actual
-// tlaplusplus crate (not a parallel demo). The `verus_integration_smoke`
-// function below is a verified item INSIDE the shipping crate's source
-// tree.
+// `compute_numa_index_from_hash` is the body of
+// `PageAlignedFingerprintStore::home_numa` extracted as a free function
+// over plain values (no struct refs). The annotation discharges:
 //
-// The path to annotating actual `FingerprintShard` / `PageAlignedFingerprintStore`
-// methods is open from here: each shipping method that should be
-// verified needs an `external_type_specification` bridge (so Verus
-// knows about the struct's shape) plus the per-method annotation. The
-// verified prototypes in `verification/verus/shard_exec_wired.rs`,
-// `shard_methods.rs`, `shard_multi_slot.rs`, `mmap_external_body.rs`,
-// and `atomic_ptr_with_epoch.rs` cover every pattern those annotations
-// need. See `verification/verus/T13.4-PHASE2-CLOSURE.md` for the full
-// hand-off.
+//   - `requires num_numa_nodes > 0` — prevents the `% 0` UB
+//   - `ensures c < num_numa_nodes` — the routing invariant the
+//     shipping `home_numa` method depends on for its callers (which
+//     index into `self.shards` by the returned value)
+//
+// The shipping `home_numa` body in
+// `src/storage/page_aligned_fingerprint_store.rs` is the same three
+// lines verbatim; both compute the same value byte-for-byte. A future
+// pass can replace the inline body with `compute_numa_index_from_hash(
+// fp, self.num_numa_nodes)` to lift the verified bound into the
+// shipping call path; for now this file ships the verified shadow as
+// proof that real shipping logic is verifiable here.
+//
+// What's needed for full method annotation
+// ========================================
+//
+// To verify `PageAlignedFingerprintStore::home_numa` directly (as a
+// method on the struct, not via this free function), Verus needs an
+// `external_type_specification` bridge for `PageAlignedFingerprintStore`
+// plus a spec function exposing the `num_numa_nodes` field. That is
+// open-ended scaffolding work; the patterns are in
+// `verification/verus/T13.4-PHASE2-CLOSURE.md`.
 
 use verus_builtin::*;
 use verus_builtin_macros::verus;
 use vstd::prelude::*;
 
 verus! {
-    /// Smoke-test that the cargo-verus integration runs end-to-end on
-    /// shipping code. Trivial postcondition (`n == 42`) discharged
-    /// from the literal in the body. Replace with real method
-    /// annotations once the `external_type_specification` bridges for
-    /// `FingerprintShard` / `PageAlignedFingerprintStore` are written.
-    pub fn verus_integration_smoke() -> (n: usize)
-        ensures n == 42,
+    /// Compute which NUMA node a fingerprint hashes to. Mirrors the
+    /// body of `PageAlignedFingerprintStore::home_numa` in the
+    /// shipping file. Verified to satisfy `c < num_numa_nodes`, the
+    /// invariant the shipping callers rely on when indexing into the
+    /// per-NUMA shard array.
+    pub fn compute_numa_index_from_hash(fp: u64, num_numa_nodes: usize) -> (c: usize)
+        requires num_numa_nodes > 0,
+        ensures c < num_numa_nodes,
     {
-        42
+        // Mix bits to reduce correlation between NUMA routing and shard
+        // selection.
+        let mixed = (fp >> 32) ^ (fp >> 16) ^ fp;
+        (mixed as usize) % num_numa_nodes
     }
 }

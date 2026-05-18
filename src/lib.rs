@@ -1,8 +1,11 @@
-// T13.4 Phase 2 — register the Verus tool-attribute namespace under the
-// `verus` cargo feature so `#[verifier::external]` etc. resolve cleanly
-// under regular rustc. Cargo-verus uses these markers to know which
-// modules to skip when verifying.
-#![cfg_attr(feature = "verus", register_tool(verifier))]
+// T13.4 Phase 2 — `#[cfg_attr(feature = "verus", verifier::external)]`
+// markers tell cargo-verus to skip modules that aren't being verified.
+// Under regular rustc with `--features verus`, these attributes are
+// not recognized (the `verifier` tool namespace isn't a known crate),
+// so `cargo build --features verus` only works under cargo-verus's
+// wrapper. Mac/CI default builds (no feature) are unaffected; the
+// supported verification flow is `cargo verus check --features verus`
+// on a Verus-built spot.
 
 #[cfg_attr(feature = "verus", verifier::external)]
 pub mod autotune;
