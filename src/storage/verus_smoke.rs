@@ -33,6 +33,15 @@
 //      yet have specs for `saturating_mul`/`saturating_add`); the
 //      bounded clamp is the part with the actual safety property.
 //
+//   3. `next_probe_slot` — the `(index + 1) % capacity` step at the
+//      heart of FingerprintShard's linear-probing hot path (13 call
+//      sites in the shipping shard's `contains` / `contains_or_insert`
+//      / `rehash_batch` / `finalize_resize` methods). Verified:
+//      `requires capacity > 0, current < capacity, ensures slot < capacity`.
+//      The ensures captures the loop invariant that the probe index
+//      always stays in `[0, capacity)` regardless of how many times
+//      it wraps.
+//
 // What's needed for full method annotation
 // ========================================
 //
@@ -90,5 +99,24 @@ verus! {
         // provide specifications for `usize::min`.
         let upper = (num_shards - 1) as usize;
         if raw < upper { raw } else { upper }
+    }
+
+    /// Next slot in a linear probe sequence. Mirrors the
+    /// `(index + 1) % capacity` step at the heart of
+    /// `FingerprintShard`'s `contains` / `contains_or_insert` /
+    /// `rehash_batch` / `finalize_resize` hot paths (13 call sites in
+    /// the shipping shard). Verified to satisfy the loop invariant
+    /// that the probe index stays in `[0, capacity)`.
+    ///
+    /// Written without `%` because Verus doesn't yet have a usize
+    /// `%` spec in scope here. The conditional form has the same
+    /// runtime behaviour for the input range we admit
+    /// (`current < capacity`).
+    pub fn next_probe_slot(current: usize, capacity: usize) -> (slot: usize)
+        requires capacity > 0, current < capacity,
+        ensures slot < capacity,
+    {
+        let next = current + 1;
+        if next == capacity { 0 } else { next }
     }
 }
