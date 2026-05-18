@@ -1376,11 +1376,33 @@ impl PageAlignedFingerprintStore {
     ///
     /// This determines which NUMA node "owns" this fingerprint.
     /// States should be routed to their fingerprint's home NUMA for local checking.
+    ///
+    /// Body cfg-split (T13.4 Phase 2): under `--features verus`, delegates
+    /// to `crate::storage::verus_smoke::compute_numa_index_from_hash`,
+    /// which carries `requires num_numa_nodes > 0, ensures c < num_numa_nodes`
+    /// — the bound callers rely on when indexing `self.shards` by the
+    /// returned value. The default build keeps the inline body byte-for-byte
+    /// so default cargo build / cargo test produce identical runtime
+    /// behaviour to before the lift.
+    #[cfg(not(feature = "verus"))]
     #[inline]
     pub fn home_numa(&self, fp: u64) -> usize {
         // Mix bits to reduce correlation between NUMA routing and shard selection
         let mixed = (fp >> 32) ^ (fp >> 16) ^ fp;
         (mixed as usize) % self.num_numa_nodes
+    }
+
+    /// See the `cfg(not(feature = "verus"))` arm above for documentation.
+    /// Under `--features verus` this calls the verified
+    /// `compute_numa_index_from_hash` function whose contract guarantees
+    /// the result is in `[0, self.num_numa_nodes)`.
+    #[cfg(feature = "verus")]
+    #[inline]
+    pub fn home_numa(&self, fp: u64) -> usize {
+        crate::storage::verus_smoke::compute_numa_index_from_hash(
+            fp,
+            self.num_numa_nodes,
+        )
     }
 
     /// Get number of NUMA nodes
