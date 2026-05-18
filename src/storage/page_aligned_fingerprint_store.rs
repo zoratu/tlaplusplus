@@ -178,6 +178,30 @@ struct FingerprintShard {
 unsafe impl Send for FingerprintShard {}
 unsafe impl Sync for FingerprintShard {}
 
+/// Next slot in a linear probe sequence (T13.4 Phase 2).
+///
+/// Cfg-split: under `--features verus` this delegates to the verified
+/// `crate::storage::verus_smoke::next_probe_slot`, whose contract
+/// guarantees `result < capacity` given `current < capacity` and
+/// `capacity > 0`. Default builds keep the `(current + 1) % capacity`
+/// inline so runtime behaviour is unchanged.
+///
+/// Used by `FingerprintShard`'s linear-probe hot paths (`contains`,
+/// `contains_or_insert`, `rehash_batch`, `finalize_resize` — 10 call
+/// sites). The bound `result < capacity` is what callers depend on
+/// when indexing `table[index]` inside the probe loop.
+#[cfg(not(feature = "verus"))]
+#[inline]
+fn next_probe_slot(current: usize, capacity: usize) -> usize {
+    (current + 1) % capacity
+}
+
+#[cfg(feature = "verus")]
+#[inline]
+fn next_probe_slot(current: usize, capacity: usize) -> usize {
+    crate::storage::verus_smoke::next_probe_slot(current, capacity)
+}
+
 impl FingerprintShard {
     /// Create a new shard with huge page allocation or file-backed mmap
     ///
@@ -335,7 +359,7 @@ impl FingerprintShard {
                             Err(_) => {}
                         }
                     }
-                    index = (index + 1) % new_cap;
+                    index = next_probe_slot(index, new_cap);
                 }
             }
         }
@@ -592,7 +616,7 @@ impl FingerprintShard {
                         if stored_fp == 0 {
                             break;
                         }
-                        index = (index + 1) % old_cap;
+                        index = next_probe_slot(index, old_cap);
                         probes += 1;
                     }
                 }
@@ -614,7 +638,7 @@ impl FingerprintShard {
                         if stored_fp == 0 {
                             break;
                         }
-                        index = (index + 1) % new_cap;
+                        index = next_probe_slot(index, new_cap);
                         probes += 1;
                     }
                 }
@@ -638,7 +662,7 @@ impl FingerprintShard {
                 if stored_fp == 0 {
                     break;
                 }
-                index = (index + 1) % capacity;
+                index = next_probe_slot(index, capacity);
                 probes += 1;
             }
 
@@ -698,7 +722,7 @@ impl FingerprintShard {
                         if stored_fp == 0 {
                             break;
                         }
-                        index = (index + 1) % old_cap;
+                        index = next_probe_slot(index, old_cap);
                         probes += 1;
                     }
                 }
@@ -743,7 +767,7 @@ impl FingerprintShard {
                             }
                         }
 
-                        index = (index + 1) % new_cap;
+                        index = next_probe_slot(index, new_cap);
                         probes += 1;
                     }
 
@@ -823,7 +847,7 @@ impl FingerprintShard {
                     }
                 }
 
-                index = (index + 1) % capacity;
+                index = next_probe_slot(index, capacity);
                 probes += 1;
             }
 
@@ -963,7 +987,7 @@ impl FingerprintShard {
                         if stored_fp == 0 {
                             break;
                         }
-                        index = (index + 1) % old_cap;
+                        index = next_probe_slot(index, old_cap);
                         probes += 1;
                     }
                 }
@@ -1009,7 +1033,7 @@ impl FingerprintShard {
                             }
                         }
 
-                        index = (index + 1) % new_cap;
+                        index = next_probe_slot(index, new_cap);
                         probes += 1;
                     }
 
@@ -1092,7 +1116,7 @@ impl FingerprintShard {
                     }
                 }
 
-                index = (index + 1) % capacity;
+                index = next_probe_slot(index, capacity);
                 probes += 1;
             }
 
