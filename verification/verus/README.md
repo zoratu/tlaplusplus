@@ -243,6 +243,19 @@ Slice 5 adds **`ShardRegistry`** + **`demonstrate_registry_swap()`**: a lock-bas
 
 The correctness story (no use-after-free, no data races on the linear permissions) is the same as for a lock-free RCU swap because `WellFormedShardPred` carries `v.wf()` and `release_write` requires `inv(new_val)`. The runtime perf cost is the lock contention vs. truly atomic publication; the lock-free version using `vstd::atomic_ghost::AtomicU64<...>` carrying the protocol's tokens is a follow-up slice.
 
+### Tier-A.13 (T13.4 Phase 2 slice 7): `verification/cargo-verus-demo/`
+
+Standalone cargo project (NOT a workspace member of tlaplusplus) demonstrating the `cargo-verus` build integration on shipping-shape code. Ships **1 verified item**, 0 errors via `cargo verus check` (run from `verification/cargo-verus-demo/`).
+
+Contains a `FingerprintShard` struct mirroring the shipping shape at `src/storage/page_aligned_fingerprint_store.rs` line 124+ plus an annotated `capacity()` method. The struct fields match the shipping layout 1:1; the same annotation would attach directly to the shipping struct under a cargo-verus build of the main crate.
+
+What this validates: the cargo-verus build flow runs end-to-end against shipping-shape Rust. The missing piece between the verified prototypes in `verification/verus/` (slices 1-6) and an actual in-place annotation of `src/storage/page_aligned_fingerprint_store.rs` is now just a build-integration decision — add the Verus path-deps to the main Cargo.toml, gate them behind a `verus` feature so Mac/CI builds don't pull them in, mark all currently-unannotated modules as `#[verifier::external]`, and incrementally annotate FingerprintShard methods. Each method's annotation pattern is already worked out in the verified prototypes.
+
+Setup notes:
+- Cargo.toml has hardcoded path-deps to `/home/ubuntu/verus/source/{vstd,builtin,builtin_macros,state_machines_macros}` — only resolves on the verification spot where Verus is built from source.
+- Excluded from the main workspace by virtue of being a separate Cargo project at a sibling directory rather than a workspace member.
+- The aarch64 Z3 workaround requires patching `~/verus/source/vstd/Cargo.toml` to `verify = false` (instead of `true`) so cargo-verus doesn't re-verify vstd's bundled proofs with the wrong Z3 version, plus passing `-V no-solver-version-check` after `--`: `cargo verus check -- -V no-solver-version-check`.
+
 ### Tier-A.12 (T13.4 Phase 2 slice 6): `shard_multi_slot.rs`
 
 `shard_multi_slot.rs` ships **19 verified items**, 0 errors (`./run_proof.sh multi-slot`). Extends the single-slot `VerifiedShard` in `shard_exec_wired.rs` to two slots, validating that the per-slot `AtomicInvariant` bookkeeping composes for `N` slots: each `PAtomicU64` slot gets its own `PermissionU64` carried in `GhostStuff`, and `read_at(idx)` / `cas_insert_at(idx, ...)` branch on an index parameter without losing soundness.

@@ -1,0 +1,35 @@
+# T13.4 Phase 2 slice 7 — cargo-verus integration demo.
+#
+# Standalone cargo project (NOT a workspace member of tlaplusplus) that
+# uses the cargo-verus build flow to verify a shipping-shape
+# FingerprintShard method in-place.
+#
+# Run via:
+#   cd verification/cargo-verus-demo
+#   cargo verus check
+#
+# Requires:
+#   - Verus built from source at /home/ubuntu/verus (the spot's path)
+#   - cargo-verus in PATH (typically /home/ubuntu/verus/source/target-verus/release/cargo-verus)
+#
+# Mac-side `cargo build --release` from the tlaplusplus root does NOT
+# touch this directory — it's intentionally outside the workspace so
+# the path-deps below (which only exist on the verification spot) don't
+# break local development.
+
+[package]
+name = "cargo-verus-demo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vstd = { path = "/home/ubuntu/verus/source/vstd" }
+verus_builtin = { path = "/home/ubuntu/verus/source/builtin" }
+verus_builtin_macros = { path = "/home/ubuntu/verus/source/builtin_macros" }
+verus_state_machines_macros = { path = "/home/ubuntu/verus/source/state_machines_macros" }
+
+[package.metadata.verus]
+verify = true
+
+[lib]
+path = "src/lib.rs"
