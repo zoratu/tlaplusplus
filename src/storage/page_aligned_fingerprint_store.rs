@@ -202,6 +202,24 @@ fn next_probe_slot(current: usize, capacity: usize) -> usize {
     crate::storage::verus_smoke::next_probe_slot(current, capacity)
 }
 
+/// Initial slot for a linear probe sequence (T13.4 Phase 2).
+///
+/// Cfg-split mirror of `next_probe_slot` for the loop-entry case.
+/// Under default features inlines to `(fp as usize) % capacity`; under
+/// `--features verus` delegates to the verified `initial_probe_slot`
+/// whose contract guarantees `result < capacity` given `capacity > 0`.
+#[cfg(not(feature = "verus"))]
+#[inline]
+fn initial_probe_slot(fp: u64, capacity: usize) -> usize {
+    (fp as usize) % capacity
+}
+
+#[cfg(feature = "verus")]
+#[inline]
+fn initial_probe_slot(fp: u64, capacity: usize) -> usize {
+    crate::storage::verus_smoke::initial_probe_slot(fp, capacity)
+}
+
 impl FingerprintShard {
     /// Create a new shard with huge page allocation or file-backed mmap
     ///
@@ -651,7 +669,7 @@ impl FingerprintShard {
             let table_ptr = self.get_table();
             let table = unsafe { std::slice::from_raw_parts(table_ptr, capacity) };
 
-            let mut index = (fp as usize) % capacity;
+            let mut index = initial_probe_slot(fp, capacity);
             let mut probes = 0u64;
 
             while probes < capacity as u64 {
@@ -806,7 +824,7 @@ impl FingerprintShard {
             let table_ptr = self.get_table();
             let table = unsafe { std::slice::from_raw_parts_mut(table_ptr, capacity) };
 
-            let mut index = (fp as usize) % capacity;
+            let mut index = initial_probe_slot(fp, capacity);
             let mut probes = 0u64;
             let mut result = None;
 
@@ -1078,7 +1096,7 @@ impl FingerprintShard {
             let table_ptr = self.get_table();
             let table = unsafe { std::slice::from_raw_parts_mut(table_ptr, capacity) };
 
-            let mut index = (fp as usize) % capacity;
+            let mut index = initial_probe_slot(fp, capacity);
             let mut probes = 0u64;
             let mut result = None;
 

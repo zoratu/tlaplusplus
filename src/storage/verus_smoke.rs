@@ -34,13 +34,20 @@
 //      bounded clamp is the part with the actual safety property.
 //
 //   3. `next_probe_slot` — the `(index + 1) % capacity` step at the
-//      heart of FingerprintShard's linear-probing hot path (13 call
+//      heart of FingerprintShard's linear-probing hot path (10 call
 //      sites in the shipping shard's `contains` / `contains_or_insert`
-//      / `rehash_batch` / `finalize_resize` methods). Verified:
+//      / `rehash_batch` / `finalize_resize` methods, wired). Verified:
 //      `requires capacity > 0, current < capacity, ensures slot < capacity`.
 //      The ensures captures the loop invariant that the probe index
 //      always stays in `[0, capacity)` regardless of how many times
 //      it wraps.
+//
+//   4. `initial_probe_slot` — the `(fp as usize) % capacity` step that
+//      enters the probe loop. Verified:
+//      `requires capacity > 0, ensures slot < capacity`. Wired into 3
+//      shipping initialization sites in `contains` /
+//      `contains_or_insert` / `rehash_batch` (the
+//      `let mut index = (fp as usize) % capacity;` lines).
 //
 // What's needed for full method annotation
 // ========================================
@@ -118,5 +125,20 @@ verus! {
     {
         let next = current + 1;
         if next == capacity { 0 } else { next }
+    }
+
+    /// Initial slot for entering a linear probe sequence. Mirrors the
+    /// `(fp as usize) % capacity` step that initialises the probe
+    /// loop's `index` variable in `FingerprintShard::contains` /
+    /// `contains_or_insert` / `rehash_batch` (3 shipping call sites).
+    /// Verified to satisfy the loop invariant that probe indices stay
+    /// in `[0, capacity)`.
+    ///
+    /// Body byte-identical to the shipping inline expression.
+    pub fn initial_probe_slot(fp: u64, capacity: usize) -> (slot: usize)
+        requires capacity > 0,
+        ensures slot < capacity,
+    {
+        (fp as usize) % capacity
     }
 }
