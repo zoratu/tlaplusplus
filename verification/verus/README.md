@@ -243,6 +243,12 @@ Slice 5 adds **`ShardRegistry`** + **`demonstrate_registry_swap()`**: a lock-bas
 
 The correctness story (no use-after-free, no data races on the linear permissions) is the same as for a lock-free RCU swap because `WellFormedShardPred` carries `v.wf()` and `release_write` requires `inv(new_val)`. The runtime perf cost is the lock contention vs. truly atomic publication; the lock-free version using `vstd::atomic_ghost::AtomicU64<...>` carrying the protocol's tokens is a follow-up slice.
 
+### Tier-A.12 (T13.4 Phase 2 slice 6): `shard_multi_slot.rs`
+
+`shard_multi_slot.rs` ships **19 verified items**, 0 errors (`./run_proof.sh multi-slot`). Extends the single-slot `VerifiedShard` in `shard_exec_wired.rs` to two slots, validating that the per-slot `AtomicInvariant` bookkeeping composes for `N` slots: each `PAtomicU64` slot gets its own `PermissionU64` carried in `GhostStuff`, and `read_at(idx)` / `cas_insert_at(idx, ...)` branch on an index parameter without losing soundness.
+
+The 2-slot hardcoded version validates the per-slot composition pattern. The N-slot extension (e.g. `Vec<PAtomicU64>` for `slots` + `Map<int, PermissionU64>` ghost) is mechanically the same shape — see the comment at the bottom of the file for the worked-out generalisation. Lifecycle methods (`clone` / `dispose`) and the `ShardRegistry` from `shard_exec_wired.rs` are not re-implemented here since they're slot-count-independent.
+
 ### Tier-A.11 (T13.4 Phase 2 slice 4): `mmap_external_body.rs`
 
 `mmap_external_body.rs` ships **1 verified item**, 0 errors (`./run_proof.sh mmap`). The verified item is a `demonstrate_mmap_lifecycle` exec function that allocates a 2 MiB huge-page region via `mmap_allocate_huge_pages`, then immediately frees it via `munmap_huge_pages`. The two wrapper functions are `#[verifier::external_body]` — trusted at the FFI boundary the same way `vstd::raw_ptr::allocate` itself is.
@@ -315,6 +321,7 @@ VERUS_DIR=/home/ubuntu/verus ./run_proof.sh sm               # T13.5 state_machi
 VERUS_DIR=/home/ubuntu/verus ./run_proof.sh epoch            # T13.4 gap-1 PoC (verus-lang/verus#2437 follow-up)
 VERUS_DIR=/home/ubuntu/verus ./run_proof.sh exec-wired       # T13.4 Phase 2 slices 1-3c (exec wiring)
 VERUS_DIR=/home/ubuntu/verus ./run_proof.sh mmap             # T13.4 Phase 2 slice 4 (gap-2 mmap external_body)
+VERUS_DIR=/home/ubuntu/verus ./run_proof.sh multi-slot       # T13.4 Phase 2 slice 6 (per-slot AtomicInvariant)
 ```
 
 Or run all under CI; see `.github/workflows/verus.yml` for the complete gate (T13.6). The CI gate currently runs tier-b, tier-a, shard-methods, and reader-liveness-v2; `shard-wrapper` is added in this commit and should be wired into the CI workflow alongside the others.

@@ -86,7 +86,8 @@ case "$TIER" in
   epoch|atomic-ptr-epoch|atomic_ptr_with_epoch|e) PROOF_FILE="atomic_ptr_with_epoch.rs" ;;
   exec-wired|shard-exec-wired|shard_exec_wired|ew) PROOF_FILE="shard_exec_wired.rs" ;;
   mmap|mmap-external-body|mmap_external_body|m) PROOF_FILE="mmap_external_body.rs" ;;
-  *) echo "error: unknown tier '$TIER'; pass 'a', 'b', 'shadow', 'liveness', 'liveness-v2', 'shard-wrapper', 'reader-liveness-sm', 'epoch', 'exec-wired', or 'mmap'" >&2; exit 2 ;;
+  multi-slot|shard-multi-slot|shard_multi_slot|ms) PROOF_FILE="shard_multi_slot.rs" ;;
+  *) echo "error: unknown tier '$TIER'; pass 'a', 'b', 'shadow', 'liveness', 'liveness-v2', 'shard-wrapper', 'reader-liveness-sm', 'epoch', 'exec-wired', 'mmap', or 'multi-slot'" >&2; exit 2 ;;
 esac
 
 echo "Verifying: $PROOF_FILE"
