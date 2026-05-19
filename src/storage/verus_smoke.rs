@@ -91,6 +91,15 @@
 //      Completes the resize calculation chain (capacity-doubling →
 //      memory-sizing).
 //
+//  10. `compute_rehash_batch_end` — the `(start + batch_size).min(old_cap)`
+//      step in `FingerprintShard::rehash_batch_counted`. Each rehash
+//      worker claims a batch via `fetch_add`, then clamps the end to
+//      `old_cap`. Verified: `requires start + batch_size <= usize::MAX,
+//      ensures end <= old_cap && end >= start`. The first conjunct is
+//      the bound that prevents probing past the old table; the second
+//      guarantees the batch makes progress (or is empty when start ==
+//      old_cap).
+//
 // What's needed for full method annotation
 // ========================================
 //
@@ -332,5 +341,36 @@ verus! {
         assert(new_capacity * entry_size > 0) by(nonlinear_arith)
             requires new_capacity > 0, entry_size > 0;
         new_capacity * entry_size
+    }
+
+    /// Compute the end index of a rehash batch. Mirrors
+    /// `(start + batch_size).min(old_cap)` at
+    /// `FingerprintShard::rehash_batch_counted` (line 436). Each
+    /// rehash worker claims a batch via `fetch_add(batch_size)` on
+    /// `rehash_cursor`, then clamps the end to `old_cap` so it never
+    /// probes past the table.
+    ///
+    /// Verified: `requires start + batch_size <= usize::MAX` rules out
+    /// overflow in the sum (shipping has `start < old_cap` from the
+    /// guard at line 433 + `batch_size` bounded by
+    /// `compute_rehash_batch_size_from_pct` to `<= 16384`, so the sum
+    /// always fits). Ensures `end <= old_cap` (the bound rehash
+    /// callers rely on when iterating `table[i]` for `i in start..end`)
+    /// and `end >= start` (the batch is non-decreasing).
+    ///
+    /// Manual conditional rather than `.min(...)` because Verus
+    /// doesn't yet have a `usize::min` spec.
+    pub fn compute_rehash_batch_end(start: usize, batch_size: usize, old_cap: usize) -> (end: usize)
+        requires
+            start + batch_size <= usize::MAX,
+            start <= old_cap,  // shipping guarantees this via the
+                                // `if start >= old_cap { return false; }`
+                                // guard at line 433 of rehash_batch_counted.
+        ensures
+            end <= old_cap,
+            end >= start,
+    {
+        let target = start + batch_size;
+        if target < old_cap { target } else { old_cap }
     }
 }

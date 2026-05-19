@@ -295,6 +295,24 @@ fn compute_memory_size_for_resize(new_capacity: usize, entry_size: usize) -> usi
     crate::storage::verus_smoke::compute_memory_size_for_resize(new_capacity, entry_size)
 }
 
+/// Rehash batch end index (T13.4 Phase 2).
+///
+/// Cfg-split: default uses `(start + batch_size).min(old_cap)` (the
+/// shipping expression); under `--features verus` delegates to the
+/// verified `compute_rehash_batch_end` whose contract guarantees
+/// `end <= old_cap && end >= start`.
+#[cfg(not(feature = "verus"))]
+#[inline]
+fn compute_rehash_batch_end(start: usize, batch_size: usize, old_cap: usize) -> usize {
+    (start + batch_size).min(old_cap)
+}
+
+#[cfg(feature = "verus")]
+#[inline]
+fn compute_rehash_batch_end(start: usize, batch_size: usize, old_cap: usize) -> usize {
+    crate::storage::verus_smoke::compute_rehash_batch_end(start, batch_size, old_cap)
+}
+
 impl FingerprintShard {
     /// Create a new shard with huge page allocation or file-backed mmap
     ///
@@ -433,7 +451,7 @@ impl FingerprintShard {
         if start >= old_cap {
             return false; // All batches claimed
         }
-        let end = (start + batch_size).min(old_cap);
+        let end = compute_rehash_batch_end(start, batch_size, old_cap);
 
         // Track which thread type processed this batch
         if is_resize_thread {
