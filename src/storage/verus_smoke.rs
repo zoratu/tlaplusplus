@@ -49,6 +49,12 @@
 //      `contains_or_insert` / `rehash_batch` (the
 //      `let mut index = (fp as usize) % capacity;` lines).
 //
+//   5. `compute_new_capacity_on_resize` — the `old_capacity * 2`
+//      doubling at `FingerprintShard::resize`. Verified:
+//      `requires old_capacity > 0, old_capacity <= usize::MAX / 2,
+//      ensures new == old * 2 && new > old`. Captures the
+//      no-overflow + strictly-growing invariants for resize.
+//
 // What's needed for full method annotation
 // ========================================
 //
@@ -140,5 +146,26 @@ verus! {
         ensures slot < capacity,
     {
         (fp as usize) % capacity
+    }
+
+    /// Compute the new capacity when resizing a `FingerprintShard`'s
+    /// hash table. Mirrors `old_capacity * 2` at
+    /// `FingerprintShard::resize`. Verified to satisfy:
+    ///   - no overflow (precondition `old_capacity <= usize::MAX / 2`)
+    ///   - strict growth (`new > old`, given `old > 0`)
+    ///   - exact doubling (`new == old * 2`)
+    ///
+    /// The shipping resize callers always have `old_capacity` in the
+    /// millions at most (bounded by available memory / 8-byte entry
+    /// size), so the `<= usize::MAX / 2` precondition holds trivially.
+    pub fn compute_new_capacity_on_resize(old_capacity: usize) -> (new_capacity: usize)
+        requires
+            old_capacity > 0,
+            old_capacity <= usize::MAX / 2,
+        ensures
+            new_capacity == old_capacity * 2,
+            new_capacity > old_capacity,
+    {
+        old_capacity * 2
     }
 }

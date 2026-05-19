@@ -220,6 +220,25 @@ fn initial_probe_slot(fp: u64, capacity: usize) -> usize {
     crate::storage::verus_smoke::initial_probe_slot(fp, capacity)
 }
 
+/// New capacity when doubling on resize (T13.4 Phase 2).
+///
+/// Cfg-split: default keeps `old_capacity * 2` inline; under
+/// `--features verus` delegates to the verified
+/// `compute_new_capacity_on_resize` which carries
+/// `requires old_capacity > 0, old_capacity <= usize::MAX / 2,
+/// ensures new == old * 2 && new > old`.
+#[cfg(not(feature = "verus"))]
+#[inline]
+fn compute_new_capacity_on_resize(old_capacity: usize) -> usize {
+    old_capacity * 2
+}
+
+#[cfg(feature = "verus")]
+#[inline]
+fn compute_new_capacity_on_resize(old_capacity: usize) -> usize {
+    crate::storage::verus_smoke::compute_new_capacity_on_resize(old_capacity)
+}
+
 impl FingerprintShard {
     /// Create a new shard with huge page allocation or file-backed mmap
     ///
@@ -469,7 +488,7 @@ impl FingerprintShard {
     /// Resize the shard to double capacity
     fn resize(&self) {
         let old_capacity = self.get_capacity();
-        let new_capacity = old_capacity * 2;
+        let new_capacity = compute_new_capacity_on_resize(old_capacity);
         let entry_size = std::mem::size_of::<HashTableEntry>();
         let new_memory_size = new_capacity * entry_size;
 
