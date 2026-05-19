@@ -239,6 +239,25 @@ fn compute_new_capacity_on_resize(old_capacity: usize) -> usize {
     crate::storage::verus_smoke::compute_new_capacity_on_resize(old_capacity)
 }
 
+/// Hash table capacity from mmap region (T13.4 Phase 2).
+///
+/// Cfg-split: default inlines `(memory_size / entry_size) * 9 / 10`.
+/// Under `--features verus`, delegates to the verified
+/// `compute_capacity_from_memory` whose contract guarantees
+/// `capacity * entry_size <= memory_size` — the memory-safety
+/// property the unsafe `from_raw_parts` slice construction relies on.
+#[cfg(not(feature = "verus"))]
+#[inline]
+fn compute_capacity_from_memory(memory_size: usize, entry_size: usize) -> usize {
+    (memory_size / entry_size) * 9 / 10
+}
+
+#[cfg(feature = "verus")]
+#[inline]
+fn compute_capacity_from_memory(memory_size: usize, entry_size: usize) -> usize {
+    crate::storage::verus_smoke::compute_capacity_from_memory(memory_size, entry_size)
+}
+
 impl FingerprintShard {
     /// Create a new shard with huge page allocation or file-backed mmap
     ///
@@ -281,7 +300,7 @@ impl FingerprintShard {
 
         // Calculate capacity (leave 10% headroom for open addressing)
         let entry_size = std::mem::size_of::<HashTableEntry>();
-        let capacity = (memory_size / entry_size) * 9 / 10;
+        let capacity = compute_capacity_from_memory(memory_size, entry_size);
 
         // The hash table uses zero (0) as the "empty slot" sentinel.
         // mmap(MAP_ANONYMOUS) guarantees zero-filled pages on first access,

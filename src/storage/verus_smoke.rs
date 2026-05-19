@@ -55,6 +55,18 @@
 //      ensures new == old * 2 && new > old`. Captures the
 //      no-overflow + strictly-growing invariants for resize.
 //
+//   6. `compute_capacity_from_memory` — the
+//      `(memory_size / entry_size) * 9 / 10` capacity calculation at
+//      `FingerprintShard::new` (the 10% headroom rule for open
+//      addressing). Verified: `requires entry_size > 0, memory_size
+//      <= usize::MAX / 9, ensures capacity <= memory_size / entry_size`.
+//      The stronger property `capacity * entry_size <= memory_size`
+//      (the one that directly justifies the unsafe `from_raw_parts`
+//      slice construction) needs `vstd::arithmetic::div_mod` lemmas
+//      to discharge the integer-division identity; the weaker bound
+//      here doesn't require that machinery and follows from the
+//      `(x * 9) / 10 <= x` monotonicity that Verus auto-derives.
+//
 // What's needed for full method annotation
 // ========================================
 //
@@ -167,5 +179,37 @@ verus! {
             new_capacity > old_capacity,
     {
         old_capacity * 2
+    }
+
+    /// Compute the open-addressed hash table capacity from an mmap'd
+    /// memory region. Mirrors `(memory_size / entry_size) * 9 / 10` at
+    /// `FingerprintShard::new` (the 10% headroom rule for open
+    /// addressing).
+    ///
+    /// Verified: `capacity <= memory_size / entry_size`. Each entry
+    /// fits in the allocation; combined with the shipping
+    /// `entry_size` constant being `size_of::<HashTableEntry>()`, this
+    /// bounds how many entries are reachable through the table
+    /// pointer.
+    ///
+    /// The stronger safety property `capacity * entry_size <= memory_size`
+    /// (which would directly justify the unsafe `from_raw_parts` slice
+    /// construction) needs Verus's `vstd::arithmetic::div_mod` lemmas
+    /// to discharge the integer-division identity `(a / b) * b <= a`;
+    /// the weaker bound here doesn't require that machinery. Wiring
+    /// the strong form is a follow-up using `lemma_fundamental_div_mod`.
+    ///
+    /// Precondition `memory_size <= usize::MAX / 9` prevents overflow
+    /// in the intermediate `(memory_size / entry_size) * 9` step.
+    /// Shipping callers always have memory_size in the GB range
+    /// (~10^9), well under `usize::MAX / 9` (~10^18).
+    pub fn compute_capacity_from_memory(memory_size: usize, entry_size: usize) -> (capacity: usize)
+        requires
+            entry_size > 0,
+            memory_size <= usize::MAX / 9,
+        ensures
+            capacity <= memory_size / entry_size,
+    {
+        (memory_size / entry_size) * 9 / 10
     }
 }
