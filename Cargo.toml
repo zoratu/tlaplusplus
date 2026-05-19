@@ -65,13 +65,15 @@ aws-config = "1.5"
 # Git deps so Mac/CI cargo builds don't require a local Verus checkout; only
 # fetched when the `verus` feature is enabled. Pinned to a known-good
 # Verus rev that matches the verification spot's `git clone --depth 1`
-# (currently e479cce). Bump in lockstep with spot rebuilds — verus
+# (currently 46362a2). Bump in lockstep with spot rebuilds — verus
 # binary and vstd source must come from the same commit, else verus
-# panics in erase.rs when looking up vstd built-ins.
-vstd = { git = "https://github.com/verus-lang/verus.git", rev = "e479cce", optional = true }
-verus_builtin = { git = "https://github.com/verus-lang/verus.git", rev = "e479cce", optional = true }
-verus_builtin_macros = { git = "https://github.com/verus-lang/verus.git", rev = "e479cce", optional = true }
-verus_state_machines_macros = { git = "https://github.com/verus-lang/verus.git", rev = "e479cce", optional = true }
+# panics in erase.rs when looking up vstd built-ins, or fails with
+# external_trait_specification mismatches on rustc-version-sensitive
+# items like slice::SliceIndex.
+vstd = { git = "https://github.com/verus-lang/verus.git", rev = "46362a2", optional = true }
+verus_builtin = { git = "https://github.com/verus-lang/verus.git", rev = "46362a2", optional = true }
+verus_builtin_macros = { git = "https://github.com/verus-lang/verus.git", rev = "46362a2", optional = true }
+verus_state_machines_macros = { git = "https://github.com/verus-lang/verus.git", rev = "46362a2", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 procfs = "0.17"

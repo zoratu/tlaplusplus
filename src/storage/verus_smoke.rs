@@ -74,6 +74,14 @@
 //      alongside `compute_numa_index_from_hash` and `clamp_to_shard_count`
 //      to compute the final shard index.
 //
+//   8. `compute_rehash_batch_size_from_pct` — the load-factor →
+//      batch-size decision at `FingerprintShard::compute_rehash_batch_size`.
+//      Verified: `requires load_pct <= 100, ensures size == 1024 ||
+//      size == 4096 || size == 16384`. First annotation with a
+//      disjunction ensures (rather than a bounded-index inequality);
+//      Verus discharges via case analysis on the if-else branches.
+//      Wired into the shipping method via f64 → u8 percent conversion.
+//
 // What's needed for full method annotation
 // ========================================
 //
@@ -234,5 +242,28 @@ verus! {
         ensures sid < shards_per_numa,
     {
         (fp as usize) % shards_per_numa
+    }
+
+    /// Adaptive rehash batch size based on table occupancy.
+    /// Mirrors `FingerprintShard::compute_rehash_batch_size`'s branch
+    /// logic, reformulated over a u8 percent (the shipping method uses
+    /// f64 load factor, converted at the call site).
+    ///
+    /// Verified: result is one of `{1024, 4096, 16384}` — i.e., always
+    /// a positive batch size matching the shipping decision table:
+    ///   - load < 50% → 16384 (sparse table, large batches)
+    ///   - load > 75% → 1024  (dense table, small batches)
+    ///   - else       → 4096  (medium)
+    pub fn compute_rehash_batch_size_from_pct(load_pct: u8) -> (size: usize)
+        requires load_pct <= 100,
+        ensures size == 1024 || size == 4096 || size == 16384,
+    {
+        if load_pct < 50 {
+            16384
+        } else if load_pct > 75 {
+            1024
+        } else {
+            4096
+        }
     }
 }

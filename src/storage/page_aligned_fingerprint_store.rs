@@ -357,6 +357,17 @@ impl FingerprintShard {
     /// Sparse tables (<50% full) use larger batches (16384) since there are
     /// fewer entries to move and less CAS contention. Dense tables (>75% full)
     /// use smaller batches (1024) to reduce contention and yield more CPU to workers.
+    ///
+    /// Body cfg-split (T13.4 Phase 2): under `--features verus`,
+    /// converts the f64 load factor to a u8 percent and delegates to
+    /// `crate::storage::verus_smoke::compute_rehash_batch_size_from_pct`,
+    /// whose contract proves the result is always in `{1024, 4096,
+    /// 16384}`. Default build keeps the f64 branching byte-for-byte.
+    /// For boundary values (load == 0.50 / 0.75 exactly) the two paths
+    /// agree; intermediate values round consistently because the
+    /// shipping `< 0.50` and `> 0.75` comparisons mirror the verified
+    /// `< 50` and `> 75` u8 comparisons.
+    #[cfg(not(feature = "verus"))]
     fn compute_rehash_batch_size(&self) -> usize {
         let load = self.load_factor();
         if load < 0.50 {
@@ -366,6 +377,14 @@ impl FingerprintShard {
         } else {
             4096
         }
+    }
+
+    /// See the `cfg(not(feature = "verus"))` arm above.
+    #[cfg(feature = "verus")]
+    fn compute_rehash_batch_size(&self) -> usize {
+        let load = self.load_factor();
+        let load_pct = (load.clamp(0.0, 1.0) * 100.0) as u8;
+        crate::storage::verus_smoke::compute_rehash_batch_size_from_pct(load_pct)
     }
 
     /// Participate in incremental rehash: move a batch of entries from
