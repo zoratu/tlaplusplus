@@ -258,6 +258,24 @@ fn compute_capacity_from_memory(memory_size: usize, entry_size: usize) -> usize 
     crate::storage::verus_smoke::compute_capacity_from_memory(memory_size, entry_size)
 }
 
+/// Within-NUMA shard index for a fingerprint (T13.4 Phase 2).
+///
+/// Cfg-split: default keeps `(fp as usize) % shards_per_numa` inline;
+/// under `--features verus` delegates to the verified
+/// `compute_shard_within_numa` whose contract guarantees
+/// `result < shards_per_numa`.
+#[cfg(not(feature = "verus"))]
+#[inline]
+fn compute_shard_within_numa(fp: u64, shards_per_numa: usize) -> usize {
+    (fp as usize) % shards_per_numa
+}
+
+#[cfg(feature = "verus")]
+#[inline]
+fn compute_shard_within_numa(fp: u64, shards_per_numa: usize) -> usize {
+    crate::storage::verus_smoke::compute_shard_within_numa(fp, shards_per_numa)
+}
+
 impl FingerprintShard {
     /// Create a new shard with huge page allocation or file-backed mmap
     ///
@@ -1511,7 +1529,7 @@ impl PageAlignedFingerprintStore {
     fn shard_for(&self, fp: u64) -> &FingerprintShard {
         let numa = self.home_numa(fp);
         // Select shard within this NUMA's range
-        let shard_within_numa = (fp as usize) % self.shards_per_numa;
+        let shard_within_numa = compute_shard_within_numa(fp, self.shards_per_numa);
         let shard_id = (numa * self.shards_per_numa + shard_within_numa).min(self.shards.len() - 1);
         &self.shards[shard_id]
     }
@@ -1528,7 +1546,7 @@ impl PageAlignedFingerprintStore {
     #[inline]
     pub fn shard_id_for(&self, fp: u64) -> usize {
         let numa = self.home_numa(fp);
-        let shard_within_numa = (fp as usize) % self.shards_per_numa;
+        let shard_within_numa = compute_shard_within_numa(fp, self.shards_per_numa);
         (numa * self.shards_per_numa + shard_within_numa).min(self.shards.len() - 1)
     }
 
@@ -1543,7 +1561,7 @@ impl PageAlignedFingerprintStore {
     #[inline]
     pub fn shard_id_for(&self, fp: u64) -> usize {
         let numa = self.home_numa(fp);
-        let shard_within_numa = (fp as usize) % self.shards_per_numa;
+        let shard_within_numa = compute_shard_within_numa(fp, self.shards_per_numa);
         let raw = numa * self.shards_per_numa + shard_within_numa;
         crate::storage::verus_smoke::clamp_to_shard_count(raw, self.shards.len())
     }

@@ -67,6 +67,13 @@
 //      here doesn't require that machinery and follows from the
 //      `(x * 9) / 10 <= x` monotonicity that Verus auto-derives.
 //
+//   7. `compute_shard_within_numa` — the `(fp as usize) % shards_per_numa`
+//      step at `PageAlignedFingerprintStore::shard_for` and
+//      `shard_id_for`. Verified: `requires shards_per_numa > 0,
+//      ensures sid < shards_per_numa`. Used in the shard-routing path
+//      alongside `compute_numa_index_from_hash` and `clamp_to_shard_count`
+//      to compute the final shard index.
+//
 // What's needed for full method annotation
 // ========================================
 //
@@ -211,5 +218,21 @@ verus! {
             capacity <= memory_size / entry_size,
     {
         (memory_size / entry_size) * 9 / 10
+    }
+
+    /// Compute the within-NUMA shard index for a fingerprint.
+    /// Mirrors `(fp as usize) % shards_per_numa` at
+    /// `PageAlignedFingerprintStore::shard_for` and `shard_id_for`.
+    /// Verified: `ensures sid < shards_per_numa`.
+    ///
+    /// Body byte-identical to the shipping inline expression.
+    /// Combines with `compute_numa_index_from_hash` and
+    /// `clamp_to_shard_count` to drive the shard-routing path:
+    /// `clamp_to_shard_count(numa * shards_per_numa + within, num_shards)`.
+    pub fn compute_shard_within_numa(fp: u64, shards_per_numa: usize) -> (sid: usize)
+        requires shards_per_numa > 0,
+        ensures sid < shards_per_numa,
+    {
+        (fp as usize) % shards_per_numa
     }
 }
