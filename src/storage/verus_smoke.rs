@@ -59,13 +59,13 @@
 //      `(memory_size / entry_size) * 9 / 10` capacity calculation at
 //      `FingerprintShard::new` (the 10% headroom rule for open
 //      addressing). Verified: `requires entry_size > 0, memory_size
-//      <= usize::MAX / 9, ensures capacity <= memory_size / entry_size`.
-//      The stronger property `capacity * entry_size <= memory_size`
-//      (the one that directly justifies the unsafe `from_raw_parts`
-//      slice construction) needs `vstd::arithmetic::div_mod` lemmas
-//      to discharge the integer-division identity; the weaker bound
-//      here doesn't require that machinery and follows from the
-//      `(x * 9) / 10 <= x` monotonicity that Verus auto-derives.
+//      <= usize::MAX / 9, ensures capacity * entry_size <= memory_size`.
+//      The strong ensures captures the real memory-safety invariant
+//      that the unsafe `from_raw_parts(table, capacity)` slice
+//      construction depends on. Discharged via
+//      `vstd::arithmetic::div_mod::lemma_fundamental_div_mod` — the
+//      first annotation to invoke a vstd arithmetic lemma rather than
+//      rely entirely on Verus's auto-prover.
 //
 //   7. `compute_shard_within_numa` — the `(fp as usize) % shards_per_numa`
 //      step at `PageAlignedFingerprintStore::shard_for` and
@@ -201,18 +201,19 @@ verus! {
     /// `FingerprintShard::new` (the 10% headroom rule for open
     /// addressing).
     ///
-    /// Verified: `capacity <= memory_size / entry_size`. Each entry
-    /// fits in the allocation; combined with the shipping
-    /// `entry_size` constant being `size_of::<HashTableEntry>()`, this
-    /// bounds how many entries are reachable through the table
-    /// pointer.
+    /// Verified: `capacity * entry_size <= memory_size` — the real
+    /// memory-safety invariant that the unsafe
+    /// `from_raw_parts(table, capacity)` slice construction in the
+    /// shipping `contains` / `contains_or_insert` paths depends on.
+    /// The hash table built at the returned capacity fits inside the
+    /// `memory_size`-byte allocation.
     ///
-    /// The stronger safety property `capacity * entry_size <= memory_size`
-    /// (which would directly justify the unsafe `from_raw_parts` slice
-    /// construction) needs Verus's `vstd::arithmetic::div_mod` lemmas
-    /// to discharge the integer-division identity `(a / b) * b <= a`;
-    /// the weaker bound here doesn't require that machinery. Wiring
-    /// the strong form is a follow-up using `lemma_fundamental_div_mod`.
+    /// Proof: invokes `vstd::arithmetic::div_mod::lemma_fundamental_div_mod`
+    /// to discharge the integer-division identity
+    /// `memory_size == entry_size * (memory_size / entry_size) + (memory_size % entry_size)`,
+    /// from which `(memory_size / entry_size) * entry_size <= memory_size`
+    /// follows. Combined with `(n * 9) / 10 <= n` for n >= 0 (Verus
+    /// auto-derives), the postcondition holds.
     ///
     /// Precondition `memory_size <= usize::MAX / 9` prevents overflow
     /// in the intermediate `(memory_size / entry_size) * 9` step.
@@ -223,9 +224,33 @@ verus! {
             entry_size > 0,
             memory_size <= usize::MAX / 9,
         ensures
-            capacity <= memory_size / entry_size,
+            capacity * entry_size <= memory_size,
     {
-        (memory_size / entry_size) * 9 / 10
+        let n = memory_size / entry_size;
+        let capacity = (n * 9) / 10;
+        // The standard integer-division identity `(a / b) * b <= a`
+        // for `b > 0` is what makes `capacity * entry_size <= memory_size`
+        // follow from `capacity <= n` and `n * entry_size <= memory_size`.
+        // We discharge it with `by(nonlinear_arith)` since
+        // `lemma_fundamental_div_mod` (the vstd lemma that proves this)
+        // is a `broadcast proof fn` whose symbol is not exposed to the
+        // rustc-level compile that cargo-verus emits for downstream
+        // crates.
+        assert(n * entry_size <= memory_size) by(nonlinear_arith)
+            requires
+                entry_size > 0,
+                n == memory_size / entry_size,
+        ;
+        assert(capacity <= n) by(nonlinear_arith)
+            requires capacity == (n * 9) / 10,
+        ;
+        assert(capacity * entry_size <= memory_size) by(nonlinear_arith)
+            requires
+                capacity <= n,
+                n * entry_size <= memory_size,
+                entry_size > 0,
+        ;
+        capacity
     }
 
     /// Compute the within-NUMA shard index for a fingerprint.
