@@ -82,6 +82,15 @@
 //      Verus discharges via case analysis on the if-else branches.
 //      Wired into the shipping method via f64 → u8 percent conversion.
 //
+//   9. `compute_memory_size_for_resize` — the
+//      `new_capacity * entry_size` computation at
+//      `FingerprintShard::resize` that determines how many bytes to
+//      mmap for the new table. Verified: no-overflow precondition
+//      `new_capacity <= usize::MAX / entry_size`, plus
+//      `memory_size == new_capacity * entry_size && memory_size > 0`.
+//      Completes the resize calculation chain (capacity-doubling →
+//      memory-sizing).
+//
 // What's needed for full method annotation
 // ========================================
 //
@@ -290,5 +299,38 @@ verus! {
         } else {
             4096
         }
+    }
+
+    /// Memory size required for a hash table of `new_capacity` entries
+    /// at `entry_size` bytes each. Mirrors `new_capacity * entry_size`
+    /// at `FingerprintShard::resize`.
+    ///
+    /// Verified: precondition `new_capacity <= usize::MAX / entry_size`
+    /// rules out usize overflow in the multiplication. Ensures the
+    /// result is exactly `new_capacity * entry_size` and strictly
+    /// positive (since both inputs are > 0). Completes the resize
+    /// calculation chain alongside `compute_new_capacity_on_resize`:
+    /// `compute_memory_size_for_resize(compute_new_capacity_on_resize(
+    /// old_capacity), entry_size)`.
+    pub fn compute_memory_size_for_resize(new_capacity: usize, entry_size: usize) -> (memory_size: usize)
+        requires
+            new_capacity > 0,
+            entry_size > 0,
+            new_capacity <= usize::MAX / entry_size,
+        ensures
+            memory_size == new_capacity * entry_size,
+            memory_size > 0,
+    {
+        // Verus needs explicit no-overflow for the usize multiplication
+        // and explicit positivity for the `> 0` postcondition; both
+        // discharged via nonlinear_arith from the preconditions.
+        assert(new_capacity * entry_size <= usize::MAX) by(nonlinear_arith)
+            requires
+                new_capacity <= usize::MAX / entry_size,
+                entry_size > 0,
+        ;
+        assert(new_capacity * entry_size > 0) by(nonlinear_arith)
+            requires new_capacity > 0, entry_size > 0;
+        new_capacity * entry_size
     }
 }

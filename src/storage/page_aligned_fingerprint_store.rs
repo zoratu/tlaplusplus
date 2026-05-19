@@ -276,6 +276,25 @@ fn compute_shard_within_numa(fp: u64, shards_per_numa: usize) -> usize {
     crate::storage::verus_smoke::compute_shard_within_numa(fp, shards_per_numa)
 }
 
+/// Memory size for a hash table of `new_capacity` entries at
+/// `entry_size` bytes each (T13.4 Phase 2).
+///
+/// Cfg-split: default inlines `new_capacity * entry_size`; under
+/// `--features verus` delegates to the verified
+/// `compute_memory_size_for_resize` whose contract proves no-overflow
+/// + exact equality + strict positivity.
+#[cfg(not(feature = "verus"))]
+#[inline]
+fn compute_memory_size_for_resize(new_capacity: usize, entry_size: usize) -> usize {
+    new_capacity * entry_size
+}
+
+#[cfg(feature = "verus")]
+#[inline]
+fn compute_memory_size_for_resize(new_capacity: usize, entry_size: usize) -> usize {
+    crate::storage::verus_smoke::compute_memory_size_for_resize(new_capacity, entry_size)
+}
+
 impl FingerprintShard {
     /// Create a new shard with huge page allocation or file-backed mmap
     ///
@@ -546,7 +565,7 @@ impl FingerprintShard {
         let old_capacity = self.get_capacity();
         let new_capacity = compute_new_capacity_on_resize(old_capacity);
         let entry_size = std::mem::size_of::<HashTableEntry>();
-        let new_memory_size = new_capacity * entry_size;
+        let new_memory_size = compute_memory_size_for_resize(new_capacity, entry_size);
 
         eprintln!(
             "Resizing fingerprint shard {} from {} to {} entries ({} MB -> {} MB)",
