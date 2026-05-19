@@ -100,6 +100,15 @@
 //      guarantees the batch makes progress (or is empty when start ==
 //      old_cap).
 //
+//  11. `is_resize_in_progress` — the seqlock parity check at 6+
+//      shipping sites (`seq % 2 == 1` in contains / contains_or_insert
+//      / finalize_resize). The shipping seqlock toggles `seq` between
+//      odd (resize in progress) and even (stable). Verified:
+//      `ensures in_progress == (seq % 2 == 1) && in_progress == ((seq & 1) == 1)`.
+//      The bit-vector equivalence `(seq % 2 == 1) <==> ((seq & 1) == 1)`
+//      is discharged via `by(bit_vector)` — first annotation to use
+//      Verus's bitvector solver.
+//
 // What's needed for full method annotation
 // ========================================
 //
@@ -372,5 +381,28 @@ verus! {
     {
         let target = start + batch_size;
         if target < old_cap { target } else { old_cap }
+    }
+
+    /// Is a seqlock counter currently in the "resize in progress"
+    /// state? Mirrors the `seq % 2 == 1` check appearing in
+    /// `FingerprintShard::contains` / `contains_or_insert` /
+    /// `finalize_resize` (6+ shipping sites). The shipping seqlock
+    /// toggles `seq` between odd (resize in progress) and even
+    /// (stable) via `fetch_add(1)` calls in `resize` / `finalize_resize`.
+    ///
+    /// Verified ensures expose two equivalent formulations of the
+    /// parity check: the modular form (`seq % 2 == 1`) that matches
+    /// the shipping code's notation, plus the bit-AND form
+    /// (`(seq & 1) == 1`) which a compiler may favour for codegen.
+    /// The bitvector equivalence is discharged via `by(bit_vector)` —
+    /// the first annotation in this file to use Verus's bitvector
+    /// solver.
+    pub fn is_resize_in_progress(seq: u64) -> (in_progress: bool)
+        ensures
+            in_progress == (seq % 2 == 1),
+            in_progress == ((seq & 1) == 1),
+    {
+        assert((seq % 2 == 1) == ((seq & 1) == 1)) by(bit_vector);
+        seq % 2 == 1
     }
 }

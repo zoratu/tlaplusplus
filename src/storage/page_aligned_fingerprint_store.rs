@@ -313,6 +313,24 @@ fn compute_rehash_batch_end(start: usize, batch_size: usize, old_cap: usize) -> 
     crate::storage::verus_smoke::compute_rehash_batch_end(start, batch_size, old_cap)
 }
 
+/// Is the seqlock currently in "resize in progress" state? (T13.4 Phase 2)
+///
+/// Cfg-split: default uses `seq % 2 == 1`; under `--features verus`
+/// delegates to the verified `is_resize_in_progress` whose ensures
+/// proves the equivalence of `(seq % 2 == 1)` and `((seq & 1) == 1)`
+/// via Verus's bitvector solver.
+#[cfg(not(feature = "verus"))]
+#[inline]
+fn is_resize_in_progress(seq: u64) -> bool {
+    seq % 2 == 1
+}
+
+#[cfg(feature = "verus")]
+#[inline]
+fn is_resize_in_progress(seq: u64) -> bool {
+    crate::storage::verus_smoke::is_resize_in_progress(seq)
+}
+
 impl FingerprintShard {
     /// Create a new shard with huge page allocation or file-backed mmap
     ///
@@ -712,7 +730,7 @@ impl FingerprintShard {
 
         loop {
             let seq_before = self.seq.load(Ordering::Acquire);
-            if seq_before % 2 == 1 {
+            if is_resize_in_progress(seq_before) {
                 // RESIZE IN PROGRESS — participate in incremental rehash
                 // before doing our own lookup. This distributes rehash work
                 // across all workers instead of blocking on the resize thread.
@@ -722,7 +740,7 @@ impl FingerprintShard {
                 if self.is_rehash_complete() {
                     if let Some(_guard) = self.resize_lock.try_lock() {
                         // Double-check under lock
-                        if self.seq.load(Ordering::Acquire) % 2 == 1 && self.is_rehash_complete() {
+                        if is_resize_in_progress(self.seq.load(Ordering::Acquire)) && self.is_rehash_complete() {
                             self.finalize_resize();
                         }
                     }
@@ -832,7 +850,7 @@ impl FingerprintShard {
                 std::thread::yield_now();
             }
             let seq_before = self.seq.load(Ordering::Acquire);
-            if seq_before % 2 == 1 {
+            if is_resize_in_progress(seq_before) {
                 // RESIZE IN PROGRESS - use lock-free path through old+new tables
 
                 // Step 1: Check old table (RCU read)
@@ -919,7 +937,7 @@ impl FingerprintShard {
 
                 // Check if resize completed
                 let seq_recheck = self.seq.load(Ordering::Acquire);
-                if seq_recheck % 2 == 0 {
+                if !is_resize_in_progress(seq_recheck) {
                     continue;
                 }
                 // Resize still in progress — yield instead of spinning
@@ -1077,7 +1095,7 @@ impl FingerprintShard {
             }
             // Read seqlock - if odd, resize in progress
             let seq_before = self.seq.load(Ordering::Acquire);
-            if seq_before % 2 == 1 {
+            if is_resize_in_progress(seq_before) {
                 resize_path_count += 1;
 
                 // If we've been stuck in resize path for many retries, yield aggressively
@@ -1092,7 +1110,7 @@ impl FingerprintShard {
                 // Check if rehash is now complete — try to finalize
                 if self.is_rehash_complete() {
                     if let Some(_guard) = self.resize_lock.try_lock() {
-                        if self.seq.load(Ordering::Acquire) % 2 == 1 && self.is_rehash_complete() {
+                        if is_resize_in_progress(self.seq.load(Ordering::Acquire)) && self.is_rehash_complete() {
                             self.finalize_resize();
                         }
                     }
@@ -1190,7 +1208,7 @@ impl FingerprintShard {
 
                 // new_table not yet set up OR resize just completed and cleared it
                 let seq_recheck = self.seq.load(Ordering::Acquire);
-                if seq_recheck % 2 == 0 {
+                if !is_resize_in_progress(seq_recheck) {
                     continue;
                 }
                 // Still resizing but new_table not ready - yield
