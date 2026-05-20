@@ -1474,7 +1474,11 @@ impl PageAlignedFingerprintStore {
         _worker_cpus: &[Option<usize>],
         backing_dir: Option<&Path>,
     ) -> Result<Self> {
+        #[cfg(not(feature = "verus"))]
         let shard_count = config.shard_count.max(1).next_power_of_two();
+        #[cfg(feature = "verus")]
+        let shard_count =
+            crate::storage::verus_smoke::max_usize(config.shard_count, 1).next_power_of_two();
 
         // Detect NUMA topology
         let numa_topology = crate::storage::numa::NumaTopology::detect()?;
