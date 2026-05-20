@@ -16,7 +16,10 @@ pub(super) fn compute_effective_memory_max(config: &EngineConfig) -> Option<u64>
         None
     };
     match (config.memory_max_bytes, cgroup_limit) {
+        #[cfg(not(feature = "verus"))]
         (Some(user), Some(cgroup)) => Some(user.min(cgroup)),
+        #[cfg(feature = "verus")]
+        (Some(user), Some(cgroup)) => Some(crate::storage::verus_smoke::min_u64(user, cgroup)),
         (Some(user), None) => Some(user),
         (None, Some(cgroup)) => Some(cgroup),
         (None, None) => None,
@@ -52,12 +55,18 @@ pub(super) fn apply_memory_budget(
         //   50% state queue (in-memory portion)
         //   15% OS, worker stacks, other overhead
         let budget_fp_cache = (memory_max.saturating_mul(10) / 100).max(64 * 1024 * 1024);
-        fp_cache = fp_cache.min(budget_fp_cache);
+        #[cfg(not(feature = "verus"))]
+        { fp_cache = fp_cache.min(budget_fp_cache); }
+        #[cfg(feature = "verus")]
+        { fp_cache = crate::storage::verus_smoke::min_u64(fp_cache, budget_fp_cache); }
 
         let state_bytes = config.estimated_state_bytes.max(1) as u64;
         let budget_queue_items = (memory_max.saturating_mul(50) / 100) / state_bytes;
         let budget_queue_items = budget_queue_items.max(10_000) as usize;
-        queue_limit = queue_limit.min(budget_queue_items);
+        #[cfg(not(feature = "verus"))]
+        { queue_limit = queue_limit.min(budget_queue_items); }
+        #[cfg(feature = "verus")]
+        { queue_limit = crate::storage::verus_smoke::min_usize(queue_limit, budget_queue_items); }
 
         if std::env::var("TLAPP_VERBOSE").is_ok() {
             eprintln!(

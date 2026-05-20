@@ -691,6 +691,18 @@ verus! {
         if a >= b { a - b } else { 0 }
     }
 
+    /// u64 counterpart to `min_usize`. Replaces shipping
+    /// `u64::min` / `Ord::min` calls under `--features verus`.
+    /// The memory-budget code in `runtime::memory::apply_memory_budget`
+    /// has three such sites (lines 19, 55, 60) where the budget
+    /// limit `.min(<computed>)` selects the tighter of user-supplied
+    /// vs computed bounds.
+    pub fn min_u64(a: u64, b: u64) -> (r: u64)
+        ensures r <= a, r <= b, r == a || r == b,
+    {
+        if a < b { a } else { b }
+    }
+
     /// Replace `usize::min` since Verus doesn't yet have a spec for
     /// `Ord::min`. Returns the lesser of `a` and `b`.
     ///
