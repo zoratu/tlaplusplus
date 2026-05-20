@@ -670,6 +670,27 @@ verus! {
         if amount < 64 { amount } else { 63 }
     }
 
+    /// Saturating subtraction for u64. Replaces shipping
+    /// `a.saturating_sub(b)` under `--features verus` since Verus
+    /// doesn't yet have a spec for `u64::saturating_sub`. Returns
+    /// `a - b` when `a >= b`, else `0`.
+    ///
+    /// Verified: a stronger spec than the stdlib's truncating
+    /// behaviour: `a >= b ==> r == a - b`, `a < b ==> r == 0`,
+    /// plus `r <= a`. The first two exactly capture the saturation
+    /// at zero; the third is the bound callers rely on when using
+    /// the result as a count (e.g. `pushed.saturating_sub(popped)`
+    /// at `work_stealing_queues::pending_count` for the queue
+    /// backlog calculation).
+    pub fn saturating_sub_u64(a: u64, b: u64) -> (r: u64)
+        ensures
+            a >= b ==> r == a - b,
+            a < b ==> r == 0,
+            r <= a,
+    {
+        if a >= b { a - b } else { 0 }
+    }
+
     /// Replace `usize::max` since Verus doesn't yet have a spec for
     /// `Ord::max`. Returns the greater of `a` and `b`.
     ///

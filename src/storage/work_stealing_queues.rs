@@ -705,14 +705,21 @@ impl<T: 'static> WorkStealingQueues<T> {
     pub fn should_apply_backpressure(&self, max_pending: u64) -> bool {
         let pushed = self.global_pushed.load(Ordering::Relaxed);
         let popped = self.global_popped.load(Ordering::Relaxed);
-        pushed.saturating_sub(popped) > max_pending
+        #[cfg(not(feature = "verus"))]
+        let pending = pushed.saturating_sub(popped);
+        #[cfg(feature = "verus")]
+        let pending = crate::storage::verus_smoke::saturating_sub_u64(pushed, popped);
+        pending > max_pending
     }
 
     /// Get approximate pending count
     pub fn pending_count(&self) -> u64 {
         let pushed = self.global_pushed.load(Ordering::Relaxed);
         let popped = self.global_popped.load(Ordering::Relaxed);
-        pushed.saturating_sub(popped)
+        #[cfg(not(feature = "verus"))]
+        { pushed.saturating_sub(popped) }
+        #[cfg(feature = "verus")]
+        { crate::storage::verus_smoke::saturating_sub_u64(pushed, popped) }
     }
 
     /// Adjust counters after draining items (e.g., during checkpoint)
