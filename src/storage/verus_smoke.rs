@@ -737,6 +737,16 @@ verus! {
         if a < b { b } else { a }
     }
 
+    /// u16 counterpart to `max_usize`. Used at
+    /// `models::flurm_job_lifecycle::new` (line 17) where
+    /// `max_time_limit.max(1)` ensures the flurm job lifecycle
+    /// model has at least one valid timestep.
+    pub fn max_u16(a: u16, b: u16) -> (r: u16)
+        ensures r >= a, r >= b, r == a || r == b,
+    {
+        if a < b { b } else { a }
+    }
+
     /// Replace `usize::min` since Verus doesn't yet have a spec for
     /// `Ord::min`. Returns the lesser of `a` and `b`.
     ///

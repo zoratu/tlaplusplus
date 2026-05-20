@@ -14,7 +14,10 @@ impl FlurmJobLifecycleModel {
             max_jobs: max_jobs.max(1),
             #[cfg(feature = "verus")]
             max_jobs: crate::storage::verus_smoke::max_usize(max_jobs, 1),
+            #[cfg(not(feature = "verus"))]
             max_time_limit: max_time_limit.max(1),
+            #[cfg(feature = "verus")]
+            max_time_limit: crate::storage::verus_smoke::max_u16(max_time_limit, 1),
         }
     }
 
