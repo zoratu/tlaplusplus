@@ -181,7 +181,10 @@ impl ColorShard {
     /// Build a new shard sized for `slots` color entries on the given NUMA
     /// node. `slots` is rounded up to a multiple of 32 (one word).
     fn new(slots: usize, numa_node: usize) -> Result<Self, ColorMapAllocError> {
+        #[cfg(not(feature = "verus"))]
         let slots = slots.max(32);
+        #[cfg(feature = "verus")]
+        let slots = crate::storage::verus_smoke::max_usize(slots, 32);
         let word_count = slots.div_ceil(32);
         let bytes = word_count * std::mem::size_of::<u64>();
         // Round up to the huge-page boundary to match the FP store.
