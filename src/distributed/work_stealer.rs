@@ -467,8 +467,11 @@ impl DistributedWorkStealer {
     /// fails and we want to remove the peer from the live-peer set.
     pub fn mark_peer_down_without_steal_count(&self, peer_id: u32) {
         let cooldown_ms = self.peer_down_cooldown_ms.load(Ordering::Relaxed);
-        let until_ns =
-            self.started_at.elapsed().as_nanos() as u64 + (cooldown_ms * 1_000_000).max(1);
+        #[cfg(not(feature = "verus"))]
+        let cd_ns = (cooldown_ms * 1_000_000).max(1);
+        #[cfg(feature = "verus")]
+        let cd_ns = crate::storage::verus_smoke::max_u64(cooldown_ms * 1_000_000, 1);
+        let until_ns = self.started_at.elapsed().as_nanos() as u64 + cd_ns;
         if let Some(slot) = self.peer_down_until_ns.get(peer_id as usize) {
             slot.store(until_ns, Ordering::Release);
         }

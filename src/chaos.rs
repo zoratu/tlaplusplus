@@ -162,7 +162,11 @@ pub fn apply_io_latency() {
 
 /// Set allocation failure probability (0-100)
 pub fn set_alloc_fail_probability(pct: u64) {
-    CHAOS_ALLOC_FAIL_PCT.store(pct.min(100), Ordering::Release);
+    #[cfg(not(feature = "verus"))]
+    let capped = pct.min(100);
+    #[cfg(feature = "verus")]
+    let capped = crate::storage::verus_smoke::min_u64(pct, 100);
+    CHAOS_ALLOC_FAIL_PCT.store(capped, Ordering::Release);
 }
 
 /// Check if allocation should fail (based on probability)
