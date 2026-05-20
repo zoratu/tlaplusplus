@@ -652,4 +652,26 @@ verus! {
         assert((bp_u64 % 8) < 8) by(bit_vector);
         (bp_u64 % 8) as u32
     }
+
+    /// Bit index of a value within a 64-bit word. Mirrors
+    /// `node_id % (std::mem::size_of::<libc::c_ulong>() * 8)` at
+    /// `storage::numa::set_preferred_node` (line 309) and
+    /// `bind_to_nodes` (line 388). On the Linux x86_64 / aarch64
+    /// targets we support, `c_ulong` is 8 bytes (64 bits), so the
+    /// shipping expression evaluates to `node_id % 64`.
+    ///
+    /// The shipping callers use the result as `1 << bit_idx` where
+    /// the LHS is a `c_ulong` (u64), so per Rust semantics
+    /// `bit_idx >= 64` is undefined behaviour. The verified bound
+    /// rules this out.
+    ///
+    /// Verified: `ensures bit_idx < 64`. Bit-vector discharge:
+    /// `v % 64 < 64` for any v at u64 width.
+    pub fn compute_bit_idx_in_u64_word(value: usize) -> (bit_idx: usize)
+        ensures bit_idx < 64,
+    {
+        let v_u64: u64 = value as u64;
+        assert((v_u64 % 64) < 64) by(bit_vector);
+        (v_u64 % 64) as usize
+    }
 }

@@ -306,7 +306,10 @@ pub fn set_preferred_node(node_id: usize) -> Result<()> {
     // nodemask is an array of unsigned long, with bit N representing node N
     let mut nodemask: [libc::c_ulong; 16] = [0; 16]; // Support up to 1024 nodes
     let word_idx = node_id / (std::mem::size_of::<libc::c_ulong>() * 8);
+    #[cfg(not(feature = "verus"))]
     let bit_idx = node_id % (std::mem::size_of::<libc::c_ulong>() * 8);
+    #[cfg(feature = "verus")]
+    let bit_idx = crate::storage::verus_smoke::compute_bit_idx_in_u64_word(node_id);
 
     if word_idx < nodemask.len() {
         nodemask[word_idx] = 1 << bit_idx;
@@ -385,7 +388,10 @@ pub fn bind_to_nodes(node_ids: &[usize]) -> Result<()> {
     let mut nodemask: [libc::c_ulong; 16] = [0; 16]; // Support up to 1024 nodes
     for &node_id in node_ids {
         let word_idx = node_id / (std::mem::size_of::<libc::c_ulong>() * 8);
+        #[cfg(not(feature = "verus"))]
         let bit_idx = node_id % (std::mem::size_of::<libc::c_ulong>() * 8);
+        #[cfg(feature = "verus")]
+        let bit_idx = crate::storage::verus_smoke::compute_bit_idx_in_u64_word(node_id);
         if word_idx < nodemask.len() {
             nodemask[word_idx] |= 1 << bit_idx;
         }
