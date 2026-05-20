@@ -1,5 +1,40 @@
 # Changelog
 
+## v1.2.7 (2026-05-20)
+
+Verus T13.4 Phase 2 in-place annotation expansion. `src/storage/verus_smoke.rs` grows
+from 12 to 38 verified helper functions driving **177 shipping call sites across 31
+shipping files** (was ~58 sites / ~9 files at the v1.2.7 cycle start). New helpers:
+`min_usize` / `max_usize` / `min_u64` / `max_u64` / `min_u32` / `max_u32` / `max_u16`
+(stdlib `Ord::min` / `Ord::max` substitutes since Verus doesn't yet spec them),
+`clamp_usize` / `clamp_u64`, `saturating_add_u64` / `saturating_sub_u64` /
+`saturating_dec_i32_to_zero`, plus a recursive `gcd` with `decreases b` termination
+proof. The cfg-split pattern keeps default builds unchanged; `--features verus`
+activates verified paths.
+
+Status correction: T5.4 (streaming Init enumeration), T5.5 (joint Init+invariant Z3
+encoding / Einstein 44 min → 14 ms), T10.2 (streaming SCC, phase 1 + phase 2 stages
+1–5), and T13.5 (`state_machines!` port) were already shipped — `CLAUDE.md`'s
+"Deferred to v1.1.x" section is updated to reflect actual status. The remaining
+T13.4 full lift (`Vec<PAtomicU64>` + `Tracked<Map<int, PermissionU64>>` rewrite of
+`FingerprintShard`) is defensibly parked per `verification/verus/T13.4-PHASE2-CLOSURE.md`
+— all original verification-research blockers resolved in 186 verified items across 11
+standalone artifacts; what remains is mechanical engineering work.
+
+| Gate | Result |
+|---|---|
+| `cargo test --release` | 1,227 pass / 0 fail / 11 ignored |
+| `cargo test --release --features failpoints` | 1,249 pass / 0 fail / 11 ignored |
+| `PROPTEST_CASES=2048 cargo test --release --test compiled_vs_interpreted` | 17 / 0 (16× default) |
+| `scripts/chaos_smoke.sh` (swarm-mode auto) | 12/12 failpoints, 39 concurrent pairs, 0 div, 0 hangs |
+| `cargo verus check --features verus` (shipping) | 49 verified, 0 errors |
+| Verus standalone (9 of 11 tiers) | 144 verified, 0 errors |
+
+See `RELEASE_1.2.7_SUMMARY.md` for the full helper inventory, file-coverage list,
+and the T13.4 closure-status update.
+
+Drop-in for v1.2.0–v1.2.6. No public-API or CLI changes.
+
 ## v1.2.6 (2026-05-10)
 
 T10.2 phase 2 stage 5, Layer B. The single-node multi-worker DFS pool shipped in v1.2.5 is extended to span multiple cluster nodes via cross-node routing.
