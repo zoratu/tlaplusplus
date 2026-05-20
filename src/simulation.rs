@@ -88,7 +88,12 @@ impl Rng {
     }
 
     fn range(&mut self, n: usize) -> usize {
-        (self.next_u64() % n as u64) as usize
+        let r = self.next_u64();
+        #[cfg(not(feature = "verus"))]
+        let idx = (r % n as u64) as usize;
+        #[cfg(feature = "verus")]
+        let idx = crate::storage::verus_smoke::compute_u64_index_mod(r, n);
+        idx
     }
 
     /// Select a random subset containing between `min_frac` and `max_frac` of

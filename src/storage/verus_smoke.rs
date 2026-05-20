@@ -606,4 +606,18 @@ verus! {
     {
         (worker_id * 7) % num_workers
     }
+
+    /// `(value % count_as_u64) as usize` — bounded-index where the
+    /// numerator is u64 (e.g. RNG output, bloom-filter hash) and the
+    /// modulus is usize. Sites: `simulation::Rng::range`,
+    /// `distributed::bloom::hash_position`.
+    ///
+    /// Verified: `requires count > 0, ensures idx < count`. The
+    /// `count as u64` cast is lossless on 64-bit targets.
+    pub fn compute_u64_index_mod(value: u64, count: usize) -> (idx: usize)
+        requires count > 0,
+        ensures idx < count,
+    {
+        (value % count as u64) as usize
+    }
 }

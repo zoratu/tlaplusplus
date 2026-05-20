@@ -159,7 +159,12 @@ impl BloomFilter {
     fn hash_position(&self, fp: u64, i: usize) -> usize {
         let h1 = splitmix64(fp);
         let h2 = splitmix64(fp.wrapping_add(0x517cc1b727220a95));
-        (h1.wrapping_add((i as u64).wrapping_mul(h2)) % self.num_bits as u64) as usize
+        let raw = h1.wrapping_add((i as u64).wrapping_mul(h2));
+        #[cfg(not(feature = "verus"))]
+        let pos = (raw % self.num_bits as u64) as usize;
+        #[cfg(feature = "verus")]
+        let pos = crate::storage::verus_smoke::compute_u64_index_mod(raw, self.num_bits);
+        pos
     }
 }
 
