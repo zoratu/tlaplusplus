@@ -511,7 +511,12 @@ fn run_blue_dfs<M: Model>(
                 // Cache state for in-band trace reconstruction (bounded
                 // — once we hit max_trace_states the SCC reporter
                 // falls back to "first SCC fp" representative).
-                if state_by_fp.len() < (max_trace_states as usize).max(8192) {
+                if state_by_fp.len() < {
+                    #[cfg(not(feature = "verus"))]
+                    { (max_trace_states as usize).max(8192) }
+                    #[cfg(feature = "verus")]
+                    { crate::storage::verus_smoke::max_usize(max_trace_states as usize, 8192) }
+                } {
                     state_by_fp
                         .entry(next_fp)
                         .or_insert_with(|| next_state.clone());

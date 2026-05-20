@@ -103,8 +103,16 @@ impl Rng {
             return Vec::new();
         }
         // Pick a target count between min and max
-        let min_count = ((n as f64 * min_frac).ceil() as usize).max(1);
-        let max_count = ((n as f64 * max_frac).floor() as usize).min(n);
+        let raw_min_count = (n as f64 * min_frac).ceil() as usize;
+        let raw_max_count = (n as f64 * max_frac).floor() as usize;
+        #[cfg(not(feature = "verus"))]
+        let min_count = raw_min_count.max(1);
+        #[cfg(feature = "verus")]
+        let min_count = crate::storage::verus_smoke::max_usize(raw_min_count, 1);
+        #[cfg(not(feature = "verus"))]
+        let max_count = raw_max_count.min(n);
+        #[cfg(feature = "verus")]
+        let max_count = crate::storage::verus_smoke::min_usize(raw_max_count, n);
         let target = if min_count >= max_count {
             min_count
         } else {
