@@ -117,6 +117,15 @@
 //      `ensures bit_offset < 64`. First annotation in a shipping file
 //      other than `page_aligned_fingerprint_store.rs`.
 //
+//  13. `compute_slot_within_shard` — the
+//      `(fp as u32) as usize & self.slot_mask` step at
+//      `PageAlignedColorMap::locate` (line 281). Reduces a fingerprint
+//      to a within-shard slot index via bitwise AND with the slot
+//      mask. Verified: `ensures within <= slot_mask`. The shipping
+//      design has `slot_mask = slots_per_shard - 1` for power-of-2
+//      shard sizes, so this also bounds `within < slots_per_shard`.
+//      Discharged via `by(bit_vector)` for the AND-bound identity.
+//
 // What's needed for full method annotation
 // ========================================
 //
@@ -431,5 +440,31 @@ verus! {
         ensures bit_offset < 64,
     {
         ((within % 32) * 2) as u32
+    }
+
+    /// Reduce a fingerprint to a within-shard slot index via the
+    /// power-of-2 modulo trick (bitwise AND with the slot mask).
+    /// Mirrors `(fp as u32) as usize & self.slot_mask` at
+    /// `PageAlignedColorMap::locate` (line 281).
+    ///
+    /// Verified: `ensures within <= slot_mask`. For the shipping
+    /// design where `slot_mask = slots_per_shard - 1` (slot count is
+    /// a power of 2), this also implies `within < slots_per_shard`,
+    /// which is the bound `shard.word(within / 32)` indirectly relies
+    /// on.
+    ///
+    /// Proof relies on the bitvector identity `(x & m) <= m`. Z3's
+    /// bit_vector solver needs a fixed bit width, so we discharge the
+    /// bound at `u64` width first, then cast back to usize. The u64
+    /// cast widens losslessly on 64-bit targets; the `as usize`
+    /// narrowing back is bounded by `slot_mask as u64`, which is
+    /// `slot_mask` (assuming `usize >= u64`, true for our targets).
+    pub fn compute_slot_within_shard(fp: u64, slot_mask: usize) -> (within: usize)
+        ensures within <= slot_mask,
+    {
+        let fp_lo: u64 = (fp as u32) as u64;
+        let mask_u64: u64 = slot_mask as u64;
+        assert((fp_lo & mask_u64) <= mask_u64) by(bit_vector);
+        (fp_lo & mask_u64) as usize
     }
 }

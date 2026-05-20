@@ -72,6 +72,24 @@ fn compute_bit_offset(within: usize) -> u32 {
     crate::storage::verus_smoke::compute_bit_offset(within)
 }
 
+/// Within-shard slot index from a fingerprint (T13.4 Phase 2).
+///
+/// Cfg-split: default uses `(fp as u32) as usize & slot_mask`; under
+/// `--features verus` delegates to the verified
+/// `compute_slot_within_shard` whose ensures (`within <= slot_mask`)
+/// is discharged via the bitvector AND-with-mask identity.
+#[cfg(not(feature = "verus"))]
+#[inline]
+fn compute_slot_within_shard(fp: u64, slot_mask: usize) -> usize {
+    (fp as u32) as usize & slot_mask
+}
+
+#[cfg(feature = "verus")]
+#[inline]
+fn compute_slot_within_shard(fp: u64, slot_mask: usize) -> usize {
+    crate::storage::verus_smoke::compute_slot_within_shard(fp, slot_mask)
+}
+
 impl Color {
     #[inline]
     fn from_bits(bits: u64) -> Color {
@@ -296,7 +314,7 @@ impl PageAlignedColorMap {
         } else {
             (fp >> 32) as usize % self.shards.len()
         };
-        let within = (fp as u32) as usize & self.slot_mask;
+        let within = compute_slot_within_shard(fp, self.slot_mask);
         let word_idx = within / 32;
         let bit_offset = compute_bit_offset(within);
         (shard_idx, word_idx, bit_offset)
