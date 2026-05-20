@@ -90,6 +90,24 @@ fn compute_slot_within_shard(fp: u64, slot_mask: usize) -> usize {
     crate::storage::verus_smoke::compute_slot_within_shard(fp, slot_mask)
 }
 
+/// Shard index from fingerprint via bitwise AND with shard mask (T13.4 Phase 2).
+///
+/// Cfg-split: default uses `(fp >> 32) as usize & shard_mask`; under
+/// `--features verus` delegates to the verified
+/// `compute_shard_idx_from_mask` whose ensures (`shard_idx <= shard_mask`)
+/// is discharged via u64-width bitvector reasoning.
+#[cfg(not(feature = "verus"))]
+#[inline]
+fn compute_shard_idx_from_mask(fp: u64, shard_mask: usize) -> usize {
+    (fp >> 32) as usize & shard_mask
+}
+
+#[cfg(feature = "verus")]
+#[inline]
+fn compute_shard_idx_from_mask(fp: u64, shard_mask: usize) -> usize {
+    crate::storage::verus_smoke::compute_shard_idx_from_mask(fp, shard_mask)
+}
+
 impl Color {
     #[inline]
     fn from_bits(bits: u64) -> Color {
@@ -310,7 +328,7 @@ impl PageAlignedColorMap {
     #[inline]
     pub(crate) fn locate(&self, fp: u64) -> (usize, usize, u32) {
         let shard_idx = if self.shard_mask != 0 {
-            (fp >> 32) as usize & self.shard_mask
+            compute_shard_idx_from_mask(fp, self.shard_mask)
         } else {
             (fp >> 32) as usize % self.shards.len()
         };

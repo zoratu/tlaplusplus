@@ -126,6 +126,14 @@
 //      shard sizes, so this also bounds `within < slots_per_shard`.
 //      Discharged via `by(bit_vector)` for the AND-bound identity.
 //
+//  14. `compute_shard_idx_from_mask` — the
+//      `(fp >> 32) as usize & self.shard_mask` step (AND branch of
+//      shard_idx selection at `PageAlignedColorMap::locate` line 277).
+//      Uses the upper 32 bits of the fingerprint to select a shard
+//      via bitwise AND with the shard mask. Verified:
+//      `ensures shard_idx <= shard_mask`. Same u64-bitvector pattern
+//      as `compute_slot_within_shard`.
+//
 // What's needed for full method annotation
 // ========================================
 //
@@ -466,5 +474,23 @@ verus! {
         let mask_u64: u64 = slot_mask as u64;
         assert((fp_lo & mask_u64) <= mask_u64) by(bit_vector);
         (fp_lo & mask_u64) as usize
+    }
+
+    /// Select a shard index from a fingerprint via bitwise AND with
+    /// the shard mask. Mirrors `(fp >> 32) as usize & self.shard_mask`
+    /// at `PageAlignedColorMap::locate` (line 277, AND branch).
+    /// The shipping design has `shard_mask = shards.len() - 1` for
+    /// power-of-2 shard counts, so this also bounds
+    /// `shard_idx < shards.len()`.
+    ///
+    /// Verified: `ensures shard_idx <= shard_mask`. Same u64-width
+    /// bitvector pattern as `compute_slot_within_shard`.
+    pub fn compute_shard_idx_from_mask(fp: u64, shard_mask: usize) -> (shard_idx: usize)
+        ensures shard_idx <= shard_mask,
+    {
+        let upper: u64 = fp >> 32;
+        let mask_u64: u64 = shard_mask as u64;
+        assert((upper & mask_u64) <= mask_u64) by(bit_vector);
+        (upper & mask_u64) as usize
     }
 }
