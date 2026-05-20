@@ -174,7 +174,12 @@ fn parse_env_usize(name: &str, default: usize, min: usize, max: usize) -> usize 
     std::env::var(name)
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .map(|value| value.clamp(min, max))
+        .map(|value| {
+            #[cfg(not(feature = "verus"))]
+            { value.clamp(min, max) }
+            #[cfg(feature = "verus")]
+            { crate::storage::verus_smoke::clamp_usize(value, min, max) }
+        })
         .unwrap_or(default)
 }
 
@@ -182,7 +187,12 @@ fn parse_env_u64(name: &str, default: u64, min: u64, max: u64) -> u64 {
     std::env::var(name)
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
-        .map(|value| value.clamp(min, max))
+        .map(|value| {
+            #[cfg(not(feature = "verus"))]
+            { value.clamp(min, max) }
+            #[cfg(feature = "verus")]
+            { crate::storage::verus_smoke::clamp_u64(value, min, max) }
+        })
         .unwrap_or(default)
 }
 

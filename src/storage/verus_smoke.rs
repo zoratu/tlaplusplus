@@ -670,6 +670,39 @@ verus! {
         if amount < 64 { amount } else { 63 }
     }
 
+    /// Clamp a usize value into the inclusive interval `[min, max]`.
+    /// Replaces shipping `.clamp(min, max)` calls under
+    /// `--features verus` since Verus doesn't yet have a spec for
+    /// `Ord::clamp`.
+    ///
+    /// Verified: `requires min <= max, ensures min <= r <= max`. The
+    /// bounded result is what callers depend on — e.g. the final
+    /// `adjusted.clamp(min_shards, max_shards)` at
+    /// `runtime::shards::calculate_optimal_shard_count` (line 68)
+    /// guarantees the returned shard count lies in
+    /// `[min_shards, max_shards]`, the bound that downstream code
+    /// (in particular `shards.len() - 1` mask construction) relies on.
+    pub fn clamp_usize(value: usize, min: usize, max: usize) -> (r: usize)
+        requires min <= max,
+        ensures min <= r, r <= max,
+    {
+        if value < min { min }
+        else if value > max { max }
+        else { value }
+    }
+
+    /// Same shape as `clamp_usize` but for u64. Mirrors the
+    /// `.clamp(min, max)` calls in `parse_env_u64` at
+    /// `storage::s3_persistence` (line 185).
+    pub fn clamp_u64(value: u64, min: u64, max: u64) -> (r: u64)
+        requires min <= max,
+        ensures min <= r, r <= max,
+    {
+        if value < min { min }
+        else if value > max { max }
+        else { value }
+    }
+
     /// Euclidean GCD. Mirrors the `gcd(a: u64, b: u64) -> u64`
     /// helpers in `tla::compiled_eval::gcd` (line 95) and
     /// `tla::eval::operator::gcd` (line 1384). Both have identical

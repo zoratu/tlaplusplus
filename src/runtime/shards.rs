@@ -65,7 +65,10 @@ pub(super) fn calculate_optimal_shard_count(
     let min_shards = (numa_node_count * 2).max(worker_count.next_power_of_two());
     let max_shards = 4096;
 
+    #[cfg(not(feature = "verus"))]
     let final_count = adjusted.clamp(min_shards, max_shards);
+    #[cfg(feature = "verus")]
+    let final_count = crate::storage::verus_smoke::clamp_usize(adjusted, min_shards, max_shards);
 
     if std::env::var("TLAPP_VERBOSE").is_ok() {
         eprintln!(
