@@ -240,11 +240,21 @@ where
 
         let (notify_tx, notify_rx) = unbounded();
 
+        #[cfg(not(feature = "verus"))]
+        let (cfg_inmem_limit, cfg_spill_batch) = (
+            config.inmem_limit.max(100),
+            config.spill_batch.max(16),
+        );
+        #[cfg(feature = "verus")]
+        let (cfg_inmem_limit, cfg_spill_batch) = (
+            crate::storage::verus_smoke::max_usize(config.inmem_limit, 100),
+            crate::storage::verus_smoke::max_usize(config.spill_batch, 16),
+        );
         Ok(Self {
             inmem: SegQueue::new(),
             inmem_len: AtomicUsize::new(0),
-            inmem_limit: config.inmem_limit.max(100),
-            spill_batch: config.spill_batch.max(16),
+            inmem_limit: cfg_inmem_limit,
+            spill_batch: cfg_spill_batch,
             spill_dir_path,
             spill_tx: Mutex::new(Some(spill_tx)),
             segments,
