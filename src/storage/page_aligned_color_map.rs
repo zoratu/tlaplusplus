@@ -307,7 +307,11 @@ impl PageAlignedColorMap {
             let node = if numa_nodes.is_empty() {
                 0
             } else {
-                numa_nodes[shard_idx % numa_nodes.len()]
+                #[cfg(not(feature = "verus"))]
+                let idx = shard_idx % numa_nodes.len();
+                #[cfg(feature = "verus")]
+                let idx = crate::storage::verus_smoke::compute_index_mod(shard_idx, numa_nodes.len());
+                numa_nodes[idx]
             };
             shards.push(ColorShard::new(slots_per_shard, node)?);
         }

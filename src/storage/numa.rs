@@ -240,7 +240,10 @@ impl NumaTopology {
         for shard_id in 0..shard_count {
             // Find which worker will access this shard most
             // Simple heuristic: worker_id = shard_id % worker_count
+            #[cfg(not(feature = "verus"))]
             let worker_id = shard_id % worker_cpus.len();
+            #[cfg(feature = "verus")]
+            let worker_id = crate::storage::verus_smoke::compute_index_mod(shard_id, worker_cpus.len());
 
             // Get the CPU and NUMA node for that worker
             let numa_node = worker_cpus

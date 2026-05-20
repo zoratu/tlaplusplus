@@ -357,10 +357,16 @@ pub fn build_worker_plan(req: WorkerPlanRequest) -> WorkerPlan {
         let mut numa_assignments = Vec::with_capacity(worker_count);
 
         for idx in 0..worker_count {
+            #[cfg(not(feature = "verus"))]
             let node_idx = idx % numa_nodes.len();
+            #[cfg(feature = "verus")]
+            let node_idx = crate::storage::verus_smoke::compute_index_mod(idx, numa_nodes.len());
             let node_round = idx / numa_nodes.len();
             let node = &numa_nodes[node_idx];
+            #[cfg(not(feature = "verus"))]
             let cpu = node[node_round % node.len()];
+            #[cfg(feature = "verus")]
+            let cpu = node[crate::storage::verus_smoke::compute_index_mod(node_round, node.len())];
             cpus.push(Some(cpu));
             numa_assignments.push(node_idx);
         }
