@@ -1599,12 +1599,27 @@ impl PageAlignedFingerprintStore {
     /// 1. Compute home NUMA from fingerprint
     /// 2. Select shard within that NUMA's range
     #[inline]
+    /// Body cfg-split (T13.4 Phase 2): under `--features verus`, the
+    /// `.min(self.shards.len() - 1)` clamp delegates to the verified
+    /// `clamp_to_shard_count`. Default keeps the inline `.min(...)`
+    /// byte-for-byte.
     #[allow(dead_code)]
+    #[cfg(not(feature = "verus"))]
     fn shard_for(&self, fp: u64) -> &FingerprintShard {
         let numa = self.home_numa(fp);
         // Select shard within this NUMA's range
         let shard_within_numa = compute_shard_within_numa(fp, self.shards_per_numa);
         let shard_id = (numa * self.shards_per_numa + shard_within_numa).min(self.shards.len() - 1);
+        &self.shards[shard_id]
+    }
+
+    #[allow(dead_code)]
+    #[cfg(feature = "verus")]
+    fn shard_for(&self, fp: u64) -> &FingerprintShard {
+        let numa = self.home_numa(fp);
+        let shard_within_numa = compute_shard_within_numa(fp, self.shards_per_numa);
+        let raw = numa * self.shards_per_numa + shard_within_numa;
+        let shard_id = crate::storage::verus_smoke::clamp_to_shard_count(raw, self.shards.len());
         &self.shards[shard_id]
     }
 
