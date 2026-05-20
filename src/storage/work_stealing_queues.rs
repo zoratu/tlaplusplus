@@ -32,6 +32,24 @@ const MAX_REMOTE_STEAL_ATTEMPTS: usize = 1;
 /// - Per-NUMA injector queues for fingerprint-based routing
 /// - States are routed to their fingerprint's home NUMA
 /// - Workers prefer their local NUMA injector over remote
+/// Next steal-target index in a round-robin scan (T13.4 Phase 2).
+///
+/// Cfg-split: default uses `(start + i) % num_workers`; under
+/// `--features verus` delegates to the verified `compute_steal_idx`
+/// whose ensures (`idx < num_workers`) is what the shipping
+/// `local_workers[idx]` index depends on for in-range access.
+#[cfg(not(feature = "verus"))]
+#[inline]
+fn compute_steal_idx(start: usize, i: usize, num_workers: usize) -> usize {
+    (start + i) % num_workers
+}
+
+#[cfg(feature = "verus")]
+#[inline]
+fn compute_steal_idx(start: usize, i: usize, num_workers: usize) -> usize {
+    crate::storage::verus_smoke::compute_steal_idx(start, i, num_workers)
+}
+
 pub struct WorkStealingQueues<T> {
     /// Per-NUMA injector queues for fingerprint-based state routing
     /// States are pushed to their fingerprint's home NUMA's injector
@@ -407,7 +425,7 @@ impl<T: 'static> WorkStealingQueues<T> {
             let start = (worker_state.id * 7) % local_workers.len();
             let max_attempts = local_workers.len().min(MAX_LOCAL_STEAL_ATTEMPTS);
             for i in 0..max_attempts {
-                let idx = (start + i) % local_workers.len();
+                let idx = compute_steal_idx(start, i, local_workers.len());
                 let target = local_workers[idx];
                 if target == worker_state.id {
                     continue;
@@ -464,7 +482,7 @@ impl<T: 'static> WorkStealingQueues<T> {
             let start = (worker_state.id * 7) % remote_workers.len();
             let max_attempts = remote_workers.len().min(MAX_REMOTE_STEAL_ATTEMPTS);
             for i in 0..max_attempts {
-                let idx = (start + i) % remote_workers.len();
+                let idx = compute_steal_idx(start, i, remote_workers.len());
                 let target = remote_workers[idx];
 
                 // For remote NUMA, also use batch stealing

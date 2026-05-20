@@ -554,4 +554,24 @@ verus! {
         assert((fp & mask_u64) <= mask_u64) by(bit_vector);
         (fp & mask_u64) as usize
     }
+
+    /// Compute the next steal-target index in a round-robin work-stealing
+    /// scan. Mirrors `(start + i) % local_workers.len()` (and similarly
+    /// for remote_workers) at `work_stealing_queues.rs` lines 410, 467.
+    /// Each worker scans the worker list starting at its
+    /// `worker_id * 7 % len` position, then iterates `(start + 0, start +
+    /// 1, ...)` modulo `num_workers` to choose victims.
+    ///
+    /// Verified: `requires start + i <= usize::MAX, num_workers > 0,
+    /// ensures idx < num_workers`. The `start + i` non-overflow
+    /// precondition holds in shipping because `i < MAX_LOCAL_STEAL_ATTEMPTS`
+    /// (a small constant) and `start < num_workers` (also small).
+    pub fn compute_steal_idx(start: usize, i: usize, num_workers: usize) -> (idx: usize)
+        requires
+            start + i <= usize::MAX,
+            num_workers > 0,
+        ensures idx < num_workers,
+    {
+        (start + i) % num_workers
+    }
 }
