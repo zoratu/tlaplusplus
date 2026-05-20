@@ -620,4 +620,36 @@ verus! {
     {
         (value % count as u64) as usize
     }
+
+    /// Decompose a bit position into its byte index. Mirrors
+    /// `bit_pos / 8` at `distributed::bloom::BloomFilter::insert` /
+    /// `may_contain` (lines 98, 112).
+    ///
+    /// Verified: `ensures byte_idx == bit_pos / 8`. Exact-equality
+    /// ensures lets callers reason about the byte boundary structure;
+    /// pairs with `compute_bit_idx_in_byte` to give the full
+    /// decomposition.
+    pub fn compute_byte_idx_in_array(bit_pos: usize) -> (byte_idx: usize)
+        ensures byte_idx == bit_pos / 8,
+    {
+        bit_pos / 8
+    }
+
+    /// Decompose a bit position into its bit index *within* a u8 byte.
+    /// Mirrors `bit_pos % 8` at `distributed::bloom::BloomFilter::insert`
+    /// / `may_contain` (lines 99, 113). The shipping callers use the
+    /// result as `1 << bit_idx` where the LHS is a `u8`, so per Rust
+    /// semantics `bit_idx >= 8` is undefined behaviour (panics in
+    /// debug, wraps in release).
+    ///
+    /// Verified: `ensures bit_idx < 8`. The shift-by-bit_idx is then
+    /// well-defined under the verified bound. Bit-vector discharge:
+    /// `b % 8 < 8` for any b at u64 width.
+    pub fn compute_bit_idx_in_byte(bit_pos: usize) -> (bit_idx: u32)
+        ensures bit_idx < 8,
+    {
+        let bp_u64: u64 = bit_pos as u64;
+        assert((bp_u64 % 8) < 8) by(bit_vector);
+        (bp_u64 % 8) as u32
+    }
 }

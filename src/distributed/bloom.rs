@@ -95,9 +95,15 @@ impl BloomFilter {
     pub fn insert(&self, fp: u64) {
         for i in 0..self.num_hashes {
             let bit_pos = self.hash_position(fp, i);
+            #[cfg(not(feature = "verus"))]
             let byte_idx = bit_pos / 8;
-            let bit_idx = bit_pos % 8;
-            self.bits[byte_idx].fetch_or(1 << bit_idx, Ordering::Relaxed);
+            #[cfg(feature = "verus")]
+            let byte_idx = crate::storage::verus_smoke::compute_byte_idx_in_array(bit_pos);
+            #[cfg(not(feature = "verus"))]
+            let bit_idx = (bit_pos % 8) as u32;
+            #[cfg(feature = "verus")]
+            let bit_idx = crate::storage::verus_smoke::compute_bit_idx_in_byte(bit_pos);
+            self.bits[byte_idx].fetch_or(1u8 << bit_idx, Ordering::Relaxed);
         }
     }
 
@@ -109,9 +115,15 @@ impl BloomFilter {
     pub fn may_contain(&self, fp: u64) -> bool {
         for i in 0..self.num_hashes {
             let bit_pos = self.hash_position(fp, i);
+            #[cfg(not(feature = "verus"))]
             let byte_idx = bit_pos / 8;
-            let bit_idx = bit_pos % 8;
-            if self.bits[byte_idx].load(Ordering::Relaxed) & (1 << bit_idx) == 0 {
+            #[cfg(feature = "verus")]
+            let byte_idx = crate::storage::verus_smoke::compute_byte_idx_in_array(bit_pos);
+            #[cfg(not(feature = "verus"))]
+            let bit_idx = (bit_pos % 8) as u32;
+            #[cfg(feature = "verus")]
+            let bit_idx = crate::storage::verus_smoke::compute_bit_idx_in_byte(bit_pos);
+            if self.bits[byte_idx].load(Ordering::Relaxed) & (1u8 << bit_idx) == 0 {
                 return false;
             }
         }
