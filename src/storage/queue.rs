@@ -460,7 +460,11 @@ where
     pub fn pop_bulk(&self, max_items: usize) -> Result<Vec<T>> {
         self.check_error()?;
 
-        let mut result = Vec::with_capacity(max_items.min(256));
+        #[cfg(not(feature = "verus"))]
+        let cap = max_items.min(256);
+        #[cfg(feature = "verus")]
+        let cap = crate::storage::verus_smoke::min_usize(max_items, 256);
+        let mut result = Vec::with_capacity(cap);
 
         // Pop from in-memory queue
         while result.len() < max_items {

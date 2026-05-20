@@ -691,6 +691,20 @@ verus! {
         if a >= b { a - b } else { 0 }
     }
 
+    /// Replace `usize::min` since Verus doesn't yet have a spec for
+    /// `Ord::min`. Returns the lesser of `a` and `b`.
+    ///
+    /// Verified: `ensures r <= a, r <= b, r == a || r == b`. The
+    /// strongest piece is the trichotomy `r == a || r == b`; callers
+    /// that need a cap (e.g. `available_parallelism.min(32)` for
+    /// the checkpoint I/O thread count) get the upper-bound `r <= 32`
+    /// from the verified post-condition.
+    pub fn min_usize(a: usize, b: usize) -> (r: usize)
+        ensures r <= a, r <= b, r == a || r == b,
+    {
+        if a < b { a } else { b }
+    }
+
     /// Replace `usize::max` since Verus doesn't yet have a spec for
     /// `Ord::max`. Returns the greater of `a` and `b`.
     ///

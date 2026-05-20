@@ -1308,10 +1308,13 @@ where
 
         // Flush the overflow queue to ensure all segments are written to disk
         // Use parallel checkpoint with multiple threads for faster I/O
-        let num_checkpoint_threads = std::thread::available_parallelism()
+        let raw = std::thread::available_parallelism()
             .map(|p| p.get())
-            .unwrap_or(4)
-            .min(32); // Cap at 32 threads for I/O
+            .unwrap_or(4);
+        #[cfg(not(feature = "verus"))]
+        let num_checkpoint_threads = raw.min(32); // Cap at 32 threads for I/O
+        #[cfg(feature = "verus")]
+        let num_checkpoint_threads = crate::storage::verus_smoke::min_usize(raw, 32);
         eprintln!(
             "Checkpoint: calling overflow.parallel_checkpoint_flush with {} threads (defer_delete={})",
             num_checkpoint_threads, self.defer_segment_deletion
