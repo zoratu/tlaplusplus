@@ -129,7 +129,7 @@ pub(super) fn partition_for_fp_cluster(
     }
     let global = crate::storage::verus_smoke::compute_numa_index_from_hash(fp, total);
     let node_id = (global / workers_per_node) as u32;
-    let worker_id = global % workers_per_node;
+    let worker_id = crate::storage::verus_smoke::compute_index_mod(global, workers_per_node);
     (node_id, worker_id)
 }
 

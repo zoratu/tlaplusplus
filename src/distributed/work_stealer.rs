@@ -499,6 +499,10 @@ impl DistributedWorkStealer {
     /// List live (not down) peer ids, rotated by a clock-derived offset so
     /// that two simultaneous starvers don't both target the same peer first.
     /// Avoids pulling in a `rand` dep just for a steal-target shuffle.
+    ///
+    /// Cfg-split (T13.4 Phase 2): the rotation `% peers.len()`
+    /// delegates under `--features verus` to `compute_index_mod`
+    /// (verified `requires count > 0, ensures idx < count`).
     pub fn live_peers_shuffled(&self) -> Vec<u32> {
         let peers: Vec<u32> = (0..self.num_nodes)
             .filter(|&i| i != self.node_id && !self.is_peer_down(i))
@@ -509,8 +513,11 @@ impl DistributedWorkStealer {
         // Rotate by (clock_ns ^ node_id) % len. Cheap and good enough for
         // load-spreading; we don't need cryptographic randomness here.
         let now_ns = self.started_at.elapsed().as_nanos() as u64;
-        let rot = ((now_ns ^ (self.node_id as u64).wrapping_mul(0x9E3779B97F4A7C15)) as usize)
-            % peers.len();
+        let raw = (now_ns ^ (self.node_id as u64).wrapping_mul(0x9E3779B97F4A7C15)) as usize;
+        #[cfg(not(feature = "verus"))]
+        let rot = raw % peers.len();
+        #[cfg(feature = "verus")]
+        let rot = crate::storage::verus_smoke::compute_index_mod(raw, peers.len());
         let mut rotated = Vec::with_capacity(peers.len());
         rotated.extend_from_slice(&peers[rot..]);
         rotated.extend_from_slice(&peers[..rot]);

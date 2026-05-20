@@ -574,4 +574,18 @@ verus! {
     {
         (start + i) % num_workers
     }
+
+    /// Generic `value % count` bounded-index helper. Sites: dfs cluster
+    /// bridge's `global % workers_per_node`, work-stealer's
+    /// `(now_ns ^ node_id) % peers.len()` rotation, and any other
+    /// `usize % usize` where the input has no extra structure to
+    /// exploit.
+    ///
+    /// Verified: `requires count > 0, ensures idx < count`.
+    pub fn compute_index_mod(value: usize, count: usize) -> (idx: usize)
+        requires count > 0,
+        ensures idx < count,
+    {
+        value % count
+    }
 }
