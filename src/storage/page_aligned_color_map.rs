@@ -54,6 +54,24 @@ pub enum Color {
     Red = 0b11,   // visited by red DFS
 }
 
+/// Bit offset within a u64 color word (T13.4 Phase 2).
+///
+/// Cfg-split: default keeps `((within % 32) * 2) as u32` inline; under
+/// `--features verus` delegates to the verified `compute_bit_offset`
+/// whose contract guarantees `result < 64` — required for the shipping
+/// `word >> bit_offset` shift on a `u64` to be well-defined.
+#[cfg(not(feature = "verus"))]
+#[inline]
+fn compute_bit_offset(within: usize) -> u32 {
+    ((within % 32) * 2) as u32
+}
+
+#[cfg(feature = "verus")]
+#[inline]
+fn compute_bit_offset(within: usize) -> u32 {
+    crate::storage::verus_smoke::compute_bit_offset(within)
+}
+
 impl Color {
     #[inline]
     fn from_bits(bits: u64) -> Color {
@@ -280,7 +298,7 @@ impl PageAlignedColorMap {
         };
         let within = (fp as u32) as usize & self.slot_mask;
         let word_idx = within / 32;
-        let bit_offset = ((within % 32) * 2) as u32;
+        let bit_offset = compute_bit_offset(within);
         (shard_idx, word_idx, bit_offset)
     }
 

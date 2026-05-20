@@ -109,6 +109,14 @@
 //      is discharged via `by(bit_vector)` — first annotation to use
 //      Verus's bitvector solver.
 //
+//  12. `compute_bit_offset` — the `((within % 32) * 2) as u32` step
+//      at `PageAlignedColorMap::locate` in
+//      `src/storage/page_aligned_color_map.rs`. The bit_offset is
+//      used to shift a `u64` (`word >> bit_offset`), so it MUST be
+//      `< 64` for the shift to be well-defined. Verified:
+//      `ensures bit_offset < 64`. First annotation in a shipping file
+//      other than `page_aligned_fingerprint_store.rs`.
+//
 // What's needed for full method annotation
 // ========================================
 //
@@ -404,5 +412,24 @@ verus! {
     {
         assert((seq % 2 == 1) == ((seq & 1) == 1)) by(bit_vector);
         seq % 2 == 1
+    }
+
+    /// Compute the bit offset within a `u64` word for storing a 2-bit
+    /// color value. Mirrors `((within % 32) * 2) as u32` at
+    /// `PageAlignedColorMap::locate`.
+    ///
+    /// Verified: `ensures bit_offset < 64`. The shipping callers use
+    /// the result as a shift amount for `word >> bit_offset` where
+    /// `word: u64`. Per Rust semantics, shifting by `>= 64` is
+    /// implementation-defined behaviour (in practice it panics in
+    /// debug, wraps in release); the verified bound rules this out.
+    ///
+    /// Proof: `within % 32 < 32` (mod identity), so
+    /// `(within % 32) * 2 < 64`. Verus auto-derives without a
+    /// nonlinear_arith hint because 32 and 2 are concrete literals.
+    pub fn compute_bit_offset(within: usize) -> (bit_offset: u32)
+        ensures bit_offset < 64,
+    {
+        ((within % 32) * 2) as u32
     }
 }
