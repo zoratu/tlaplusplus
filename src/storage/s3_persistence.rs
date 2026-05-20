@@ -386,9 +386,15 @@ impl S3Persistence {
         let start_time = std::time::Instant::now();
         let mut last_progress_time = start_time;
 
-        let semaphore = Arc::new(Semaphore::new(
-            tuning.download_concurrency.max(1).min(total_files.max(1)),
-        ));
+        #[cfg(not(feature = "verus"))]
+        let sem_cap = tuning.download_concurrency.max(1).min(total_files.max(1));
+        #[cfg(feature = "verus")]
+        let sem_cap = {
+            let a = crate::storage::verus_smoke::max_usize(tuning.download_concurrency, 1);
+            let b = crate::storage::verus_smoke::max_usize(total_files, 1);
+            crate::storage::verus_smoke::min_usize(a, b)
+        };
+        let semaphore = Arc::new(Semaphore::new(sem_cap));
         let mut join_set = JoinSet::new();
         let download_jobs: Vec<(String, FileState)> = manifest
             .files
