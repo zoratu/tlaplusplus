@@ -297,9 +297,15 @@ impl PageAlignedColorMap {
         numa_nodes: &[usize],
     ) -> Result<Self, ColorMapAllocError> {
         assert!(shard_count >= 1, "color map shard count must be >= 1");
+        #[cfg(not(feature = "verus"))]
         let slots_per_shard = expected_fingerprints
             .div_ceil(shard_count)
             .max(32);
+        #[cfg(feature = "verus")]
+        let slots_per_shard = crate::storage::verus_smoke::max_usize(
+            expected_fingerprints.div_ceil(shard_count),
+            32,
+        );
         // Round slots_per_shard up to next power of two so we can mask
         // instead of modulo. (Cheap: at 100M / 128 shards = ~781K slots
         // per shard, so ~30% wasted address space at most.)
