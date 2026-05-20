@@ -87,6 +87,11 @@ use super::Violation;
 /// Static partition assignment. Same bit-mixing used by
 /// `PageAlignedFingerprintStore::home_numa` so DFS partitioning aligns
 /// with the fingerprint store's NUMA placement when both are present.
+/// Cfg-split (T13.4 Phase 2): under `--features verus` the bit-mix
+/// + modulo step delegates to `compute_numa_index_from_hash` in
+/// `verus_smoke`, whose contract carries `requires num > 0, ensures
+/// result < num` — exactly the bound partition callers depend on.
+#[cfg(not(feature = "verus"))]
 #[inline]
 pub(super) fn partition_for_fp(fp: u64, num_workers: usize) -> usize {
     debug_assert!(num_workers > 0, "num_workers must be positive");
@@ -95,6 +100,16 @@ pub(super) fn partition_for_fp(fp: u64, num_workers: usize) -> usize {
     }
     let mixed = (fp >> 32) ^ (fp >> 16) ^ fp;
     (mixed as usize) % num_workers
+}
+
+#[cfg(feature = "verus")]
+#[inline]
+pub(super) fn partition_for_fp(fp: u64, num_workers: usize) -> usize {
+    debug_assert!(num_workers > 0, "num_workers must be positive");
+    if num_workers == 1 {
+        return 0;
+    }
+    crate::storage::verus_smoke::compute_numa_index_from_hash(fp, num_workers)
 }
 
 /// Cross-partition explore message. Sent from the partition that
