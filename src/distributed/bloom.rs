@@ -42,7 +42,10 @@ impl BloomFilter {
     ///
     /// The filter size is clamped to a minimum of 1 KB and maximum of 64 MB.
     pub fn new(expected_items: usize, fpr: f64) -> Self {
+        #[cfg(not(feature = "verus"))]
         let expected_items = expected_items.max(1);
+        #[cfg(feature = "verus")]
+        let expected_items = crate::storage::verus_smoke::max_usize(expected_items, 1);
         let fpr = fpr.max(1e-10).min(0.5);
 
         let ln2 = std::f64::consts::LN_2;
@@ -51,13 +54,25 @@ impl BloomFilter {
         // Optimal number of bits
         let m = (-(expected_items as f64) * fpr.ln() / ln2_sq).ceil() as usize;
         // Clamp to [8192, 512M] bits = [1KB, 64MB]
+        #[cfg(not(feature = "verus"))]
         let m = m.max(8192).min(512 * 1024 * 1024);
+        #[cfg(feature = "verus")]
+        let m = crate::storage::verus_smoke::min_usize(
+            crate::storage::verus_smoke::max_usize(m, 8192),
+            512 * 1024 * 1024,
+        );
         // Round up to byte boundary
         let m = (m + 7) & !7;
 
         // Optimal number of hash functions
         let k = ((m as f64 / expected_items as f64) * ln2).ceil() as usize;
+        #[cfg(not(feature = "verus"))]
         let k = k.max(1).min(20);
+        #[cfg(feature = "verus")]
+        let k = crate::storage::verus_smoke::min_usize(
+            crate::storage::verus_smoke::max_usize(k, 1),
+            20,
+        );
 
         let num_bytes = m / 8;
         let mut bits = Vec::with_capacity(num_bytes);
