@@ -64,7 +64,15 @@ pub(super) fn next_quiescence_timeout_secs(attempt_index: u32, elapsed: Duration
     let shift_amt = crate::storage::verus_smoke::clamp_shift_to_lt_64(attempt_index);
     let planned_timeout =
         QUIESCENCE_INITIAL_TIMEOUT_SECS.saturating_mul(1u64 << shift_amt);
-    Some(planned_timeout.min(remaining_secs.max(1)))
+    #[cfg(not(feature = "verus"))]
+    {
+        Some(planned_timeout.min(remaining_secs.max(1)))
+    }
+    #[cfg(feature = "verus")]
+    {
+        let r_at_least_1 = crate::storage::verus_smoke::max_u64(remaining_secs, 1);
+        Some(crate::storage::verus_smoke::min_u64(planned_timeout, r_at_least_1))
+    }
 }
 
 impl PauseController {

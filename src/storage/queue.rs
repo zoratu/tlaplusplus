@@ -743,8 +743,12 @@ where
         let items_written = AtomicU64::new(0);
         let batch_queue: Mutex<Vec<Vec<T>>> = Mutex::new(batches);
 
+        #[cfg(not(feature = "verus"))]
+        let thread_cap = num_threads.min(total_batches);
+        #[cfg(feature = "verus")]
+        let thread_cap = crate::storage::verus_smoke::min_usize(num_threads, total_batches);
         std::thread::scope(|s| {
-            for thread_id in 0..num_threads.min(total_batches) {
+            for thread_id in 0..thread_cap {
                 let batch_queue = &batch_queue;
                 let errors = &errors;
                 let segments_written = &segments_written;

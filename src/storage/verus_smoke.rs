@@ -703,6 +703,17 @@ verus! {
         if a < b { a } else { b }
     }
 
+    /// u64 counterpart to `max_usize`. Replaces shipping
+    /// `u64::max` / `Ord::max` calls under `--features verus`.
+    /// Used at `runtime::pause::next_quiescence_timeout_secs`
+    /// (line 67) where `remaining_secs.max(1)` ensures the
+    /// quiescence-wait timeout is never zero.
+    pub fn max_u64(a: u64, b: u64) -> (r: u64)
+        ensures r >= a, r >= b, r == a || r == b,
+    {
+        if a < b { b } else { a }
+    }
+
     /// Replace `usize::min` since Verus doesn't yet have a spec for
     /// `Ord::min`. Returns the lesser of `a` and `b`.
     ///
