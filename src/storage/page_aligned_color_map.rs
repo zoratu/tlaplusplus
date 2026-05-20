@@ -108,6 +108,32 @@ fn compute_shard_idx_from_mask(fp: u64, shard_mask: usize) -> usize {
     crate::storage::verus_smoke::compute_shard_idx_from_mask(fp, shard_mask)
 }
 
+/// Shard index from fingerprint via modulo (fallback path) (T13.4 Phase 2).
+#[cfg(not(feature = "verus"))]
+#[inline]
+fn compute_shard_idx_modulo(fp: u64, num_shards: usize) -> usize {
+    (fp >> 32) as usize % num_shards
+}
+
+#[cfg(feature = "verus")]
+#[inline]
+fn compute_shard_idx_modulo(fp: u64, num_shards: usize) -> usize {
+    crate::storage::verus_smoke::compute_shard_idx_modulo(fp, num_shards)
+}
+
+/// u64-word index from a within-shard slot (T13.4 Phase 2).
+#[cfg(not(feature = "verus"))]
+#[inline]
+fn compute_word_idx(within: usize) -> usize {
+    within / 32
+}
+
+#[cfg(feature = "verus")]
+#[inline]
+fn compute_word_idx(within: usize) -> usize {
+    crate::storage::verus_smoke::compute_word_idx(within)
+}
+
 impl Color {
     #[inline]
     fn from_bits(bits: u64) -> Color {
@@ -330,10 +356,10 @@ impl PageAlignedColorMap {
         let shard_idx = if self.shard_mask != 0 {
             compute_shard_idx_from_mask(fp, self.shard_mask)
         } else {
-            (fp >> 32) as usize % self.shards.len()
+            compute_shard_idx_modulo(fp, self.shards.len())
         };
         let within = compute_slot_within_shard(fp, self.slot_mask);
-        let word_idx = within / 32;
+        let word_idx = compute_word_idx(within);
         let bit_offset = compute_bit_offset(within);
         (shard_idx, word_idx, bit_offset)
     }

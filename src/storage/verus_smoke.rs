@@ -134,6 +134,19 @@
 //      `ensures shard_idx <= shard_mask`. Same u64-bitvector pattern
 //      as `compute_slot_within_shard`.
 //
+//  15. `compute_shard_idx_modulo` — the
+//      `(fp >> 32) as usize % self.shards.len()` step (% branch of
+//      `PageAlignedColorMap::locate` line 279, fallback for
+//      non-power-of-2 shard counts when `shard_mask == 0`). Verified:
+//      `requires num_shards > 0, ensures shard_idx < num_shards`.
+//      Bounded-index pattern, same shape as `compute_numa_index_from_hash`.
+//
+//  16. `compute_word_idx` — the `within / 32` step at
+//      `PageAlignedColorMap::locate` (line 282) computing the
+//      u64-word index from a within-shard slot. Verified:
+//      `ensures word_idx <= within / 32`. The shipping callers use
+//      this with `shard.word(word_idx)` for bounds-checked access.
+//
 // What's needed for full method annotation
 // ========================================
 //
@@ -492,5 +505,34 @@ verus! {
         let mask_u64: u64 = shard_mask as u64;
         assert((upper & mask_u64) <= mask_u64) by(bit_vector);
         (upper & mask_u64) as usize
+    }
+
+    /// Fallback shard-index selection via modulo when the shard count
+    /// isn't a power of 2 (so the bitmask trick doesn't apply).
+    /// Mirrors `(fp >> 32) as usize % self.shards.len()` at
+    /// `PageAlignedColorMap::locate` line 279.
+    ///
+    /// Verified: `requires num_shards > 0, ensures shard_idx < num_shards`.
+    /// Bounded-index pattern.
+    pub fn compute_shard_idx_modulo(fp: u64, num_shards: usize) -> (shard_idx: usize)
+        requires num_shards > 0,
+        ensures shard_idx < num_shards,
+    {
+        (fp >> 32) as usize % num_shards
+    }
+
+    /// Compute the u64-word index from a within-shard slot. Mirrors
+    /// `within / 32` at `PageAlignedColorMap::locate` line 282. Each
+    /// u64 word stores 32 two-bit color values, so the word index is
+    /// `within / 32`.
+    ///
+    /// Verified: `ensures word_idx == within / 32`. The exact-equality
+    /// ensures lets callers reason about word boundaries (e.g. the
+    /// `(within % 32) * 2` bit offset within the word) without
+    /// recomputing.
+    pub fn compute_word_idx(within: usize) -> (word_idx: usize)
+        ensures word_idx == within / 32,
+    {
+        within / 32
     }
 }
