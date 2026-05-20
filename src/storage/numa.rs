@@ -537,9 +537,13 @@ impl NumaDiagnostics {
             }
         }
 
+        #[cfg(not(feature = "verus"))]
+        let nc_filter = topology.node_count.max(1);
+        #[cfg(feature = "verus")]
+        let nc_filter = crate::storage::verus_smoke::max_usize(topology.node_count, 1);
         let mut fingerprint_store_nodes: Vec<usize> = fingerprint_store_nodes
             .into_iter()
-            .filter(|&node| node < topology.node_count.max(1))
+            .filter(|&node| node < nc_filter)
             .collect();
         fingerprint_store_nodes.sort_unstable();
         fingerprint_store_nodes.dedup();
@@ -633,7 +637,11 @@ impl NumaDiagnostics {
         eprintln!("=== NUMA Diagnostics for Stuck Workers ===");
 
         // Group stuck workers by their NUMA node
-        let mut stuck_by_node: Vec<Vec<usize>> = vec![Vec::new(); self.node_count.max(1)];
+        #[cfg(not(feature = "verus"))]
+        let nc_stuck = self.node_count.max(1);
+        #[cfg(feature = "verus")]
+        let nc_stuck = crate::storage::verus_smoke::max_usize(self.node_count, 1);
+        let mut stuck_by_node: Vec<Vec<usize>> = vec![Vec::new(); nc_stuck];
         for &worker_id in stuck_worker_ids {
             if let Some(&node) = worker_numa_nodes.get(worker_id) {
                 if node < stuck_by_node.len() {
