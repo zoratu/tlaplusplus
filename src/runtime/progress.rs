@@ -217,7 +217,10 @@ where
                                 ratio * 100.0
                             );
                             // Throttle to 25% of workers
+                            #[cfg(not(feature = "verus"))]
                             let reduced = (progress_worker_count / 4).max(1);
+                            #[cfg(feature = "verus")]
+                            let reduced = crate::storage::verus_smoke::max_usize(progress_worker_count / 4, 1);
                             progress_throttle.set_active_target(reduced);
                             memory_throttled = true;
                             memory_warned = true;
@@ -238,7 +241,10 @@ where
                                 ratio * 100.0
                             );
                             // Throttle to 50% of workers
+                            #[cfg(not(feature = "verus"))]
                             let reduced = (progress_worker_count / 2).max(1);
+                            #[cfg(feature = "verus")]
+                            let reduced = crate::storage::verus_smoke::max_usize(progress_worker_count / 2, 1);
                             progress_throttle.set_active_target(reduced);
                             memory_warned = true;
                         }
