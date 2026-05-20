@@ -747,6 +747,17 @@ verus! {
         if a < b { b } else { a }
     }
 
+    /// u32 counterpart to `max_usize`. Used at
+    /// `models::adaptive_branching` for branching-factor step
+    /// floors (lines 38 + 51). The `.max(5)` / `.max(10)` floors
+    /// ensure forward progress at low branching counts where 10%
+    /// of the current value would round to 0.
+    pub fn max_u32(a: u32, b: u32) -> (r: u32)
+        ensures r >= a, r >= b, r == a || r == b,
+    {
+        if a < b { b } else { a }
+    }
+
     /// Replace `usize::min` since Verus doesn't yet have a spec for
     /// `Ord::min`. Returns the lesser of `a` and `b`.
     ///

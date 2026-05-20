@@ -35,7 +35,13 @@ impl AdaptiveBranchingModel {
         let current = self.current_branching_factor.load(Ordering::Relaxed);
         if current < self.max_branching {
             // Increase by 10% or at least 5
+            #[cfg(not(feature = "verus"))]
             let increase = ((current as f64 * 0.1) as u32).max(5);
+            #[cfg(feature = "verus")]
+            let increase = crate::storage::verus_smoke::max_u32(
+                (current as f64 * 0.1) as u32,
+                5,
+            );
             let new_val = (current + increase).min(self.max_branching);
             self.current_branching_factor
                 .store(new_val, Ordering::Relaxed);
@@ -48,7 +54,13 @@ impl AdaptiveBranchingModel {
         let current = self.current_branching_factor.load(Ordering::Relaxed);
         if current > self.min_branching {
             // Decrease by 20% or at least 10 (more aggressive backoff)
+            #[cfg(not(feature = "verus"))]
             let decrease = ((current as f64 * 0.2) as u32).max(10);
+            #[cfg(feature = "verus")]
+            let decrease = crate::storage::verus_smoke::max_u32(
+                (current as f64 * 0.2) as u32,
+                10,
+            );
             let new_val = current.saturating_sub(decrease).max(self.min_branching);
             self.current_branching_factor
                 .store(new_val, Ordering::Relaxed);
