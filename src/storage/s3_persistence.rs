@@ -956,12 +956,18 @@ async fn upload_changed_files(
     let mut queue_bytes_uploaded = 0u64;
 
     let pending_uploads = collect_pending_uploads(local_dir, prefix, uploaded_offsets).await?;
-    let semaphore = Arc::new(Semaphore::new(
-        tuning
-            .upload_concurrency
-            .max(1)
-            .min(pending_uploads.len().max(1)),
-    ));
+    #[cfg(not(feature = "verus"))]
+    let sem_cap = tuning
+        .upload_concurrency
+        .max(1)
+        .min(pending_uploads.len().max(1));
+    #[cfg(feature = "verus")]
+    let sem_cap = {
+        let a = crate::storage::verus_smoke::max_usize(tuning.upload_concurrency, 1);
+        let b = crate::storage::verus_smoke::max_usize(pending_uploads.len(), 1);
+        crate::storage::verus_smoke::min_usize(a, b)
+    };
+    let semaphore = Arc::new(Semaphore::new(sem_cap));
     let mut join_set = JoinSet::new();
 
     for upload in pending_uploads {
@@ -1125,9 +1131,15 @@ async fn multipart_upload_file(
         .to_string();
 
     let ranges = plan_multipart_ranges(file_size, part_size_bytes);
-    let semaphore = Arc::new(Semaphore::new(
-        multipart_upload_concurrency.max(1).min(ranges.len().max(1)),
-    ));
+    #[cfg(not(feature = "verus"))]
+    let mp_sem_cap = multipart_upload_concurrency.max(1).min(ranges.len().max(1));
+    #[cfg(feature = "verus")]
+    let mp_sem_cap = {
+        let a = crate::storage::verus_smoke::max_usize(multipart_upload_concurrency, 1);
+        let b = crate::storage::verus_smoke::max_usize(ranges.len(), 1);
+        crate::storage::verus_smoke::min_usize(a, b)
+    };
+    let semaphore = Arc::new(Semaphore::new(mp_sem_cap));
     let mut join_set = JoinSet::new();
     let mut file = File::open(entry_path).await?;
 
