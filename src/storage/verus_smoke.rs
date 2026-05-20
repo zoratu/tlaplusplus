@@ -588,4 +588,22 @@ verus! {
     {
         value % count
     }
+
+    /// Starting offset for a worker's round-robin steal scan. Mirrors
+    /// `(worker_state.id * 7) % local_workers.len()` (and remote
+    /// variant) at `work_stealing_queues.rs` lines 425 + 482. The `7`
+    /// is just a prime stride for spreading start positions across
+    /// workers so steal scans don't all hit the same victim first.
+    ///
+    /// Verified: `requires worker_id <= usize::MAX / 7, num_workers > 0,
+    /// ensures start < num_workers`. The non-overflow precondition
+    /// holds trivially in shipping (worker_id < 1000 in practice).
+    pub fn compute_steal_start(worker_id: usize, num_workers: usize) -> (start: usize)
+        requires
+            worker_id <= usize::MAX / 7,
+            num_workers > 0,
+        ensures start < num_workers,
+    {
+        (worker_id * 7) % num_workers
+    }
 }

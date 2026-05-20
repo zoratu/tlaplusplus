@@ -50,6 +50,19 @@ fn compute_steal_idx(start: usize, i: usize, num_workers: usize) -> usize {
     crate::storage::verus_smoke::compute_steal_idx(start, i, num_workers)
 }
 
+/// Starting offset for worker's round-robin steal scan (T13.4 Phase 2).
+#[cfg(not(feature = "verus"))]
+#[inline]
+fn compute_steal_start(worker_id: usize, num_workers: usize) -> usize {
+    (worker_id * 7) % num_workers
+}
+
+#[cfg(feature = "verus")]
+#[inline]
+fn compute_steal_start(worker_id: usize, num_workers: usize) -> usize {
+    crate::storage::verus_smoke::compute_steal_start(worker_id, num_workers)
+}
+
 pub struct WorkStealingQueues<T> {
     /// Per-NUMA injector queues for fingerprint-based state routing
     /// States are pushed to their fingerprint's home NUMA's injector
@@ -422,7 +435,7 @@ impl<T: 'static> WorkStealingQueues<T> {
             if local_workers.is_empty() {
                 return None;
             }
-            let start = (worker_state.id * 7) % local_workers.len();
+            let start = compute_steal_start(worker_state.id, local_workers.len());
             let max_attempts = local_workers.len().min(MAX_LOCAL_STEAL_ATTEMPTS);
             for i in 0..max_attempts {
                 let idx = compute_steal_idx(start, i, local_workers.len());
@@ -479,7 +492,7 @@ impl<T: 'static> WorkStealingQueues<T> {
             }
 
             // Try a few workers from this remote node
-            let start = (worker_state.id * 7) % remote_workers.len();
+            let start = compute_steal_start(worker_state.id, remote_workers.len());
             let max_attempts = remote_workers.len().min(MAX_REMOTE_STEAL_ATTEMPTS);
             for i in 0..max_attempts {
                 let idx = compute_steal_idx(start, i, remote_workers.len());
