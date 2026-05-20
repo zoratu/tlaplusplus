@@ -770,6 +770,29 @@ verus! {
         if a < b { a } else { b }
     }
 
+    /// Saturating decrement of an i32 with zero as the floor.
+    /// Mirrors `(x - 1).max(0)` used in TLA+ paren / bracket /
+    /// brace / angle depth-tracking loops at
+    /// `tla::action_exec` (lines 899, 901, 903, 910) and
+    /// `tla::compiled_expr` (lines 1948, 2025, 2036).
+    ///
+    /// The shipping callers maintain `depth >= 0` as a loop
+    /// invariant; the .max(0) is defense-in-depth against
+    /// unbalanced brackets in malformed input.
+    ///
+    /// Verified ensures:
+    ///   r >= 0
+    ///   x > 0  ==> r == x - 1
+    ///   x <= 0 ==> r == 0
+    pub fn saturating_dec_i32_to_zero(x: i32) -> (r: i32)
+        ensures
+            r >= 0,
+            x > 0  ==> r == x - 1,
+            x <= 0 ==> r == 0,
+    {
+        if x > 0 { x - 1 } else { 0 }
+    }
+
     /// Replace `usize::min` since Verus doesn't yet have a spec for
     /// `Ord::min`. Returns the lesser of `a` and `b`.
     ///

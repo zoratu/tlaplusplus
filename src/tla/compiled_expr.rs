@@ -1945,7 +1945,10 @@ fn find_top_level_arrow(s: &str) -> Option<usize> {
     while i < bytes.len() {
         match bytes[i] {
             b'(' | b'[' | b'{' => depth += 1,
+            #[cfg(not(feature = "verus"))]
             b')' | b']' | b'}' => depth = (depth - 1).max(0),
+            #[cfg(feature = "verus")]
+            b')' | b']' | b'}' => depth = crate::storage::verus_smoke::saturating_dec_i32_to_zero(depth),
             b'-' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b'>' => {
                 // Check it's not "|->"
                 if i > 0 && bytes[i - 1] == b'|' {
@@ -2022,7 +2025,10 @@ fn find_top_level_except(s: &str) -> Option<(usize, usize)> {
             continue;
         }
         if b == b'>' && i + 1 < bytes.len() && bytes[i + 1] == b'>' {
-            depth = (depth - 1).max(0);
+            #[cfg(not(feature = "verus"))]
+            { depth = (depth - 1).max(0); }
+            #[cfg(feature = "verus")]
+            { depth = crate::storage::verus_smoke::saturating_dec_i32_to_zero(depth); }
             i += 2;
             continue;
         }
@@ -2033,7 +2039,10 @@ fn find_top_level_except(s: &str) -> Option<(usize, usize)> {
                 continue;
             }
             b')' | b']' | b'}' => {
-                depth = (depth - 1).max(0);
+                #[cfg(not(feature = "verus"))]
+                { depth = (depth - 1).max(0); }
+                #[cfg(feature = "verus")]
+                { depth = crate::storage::verus_smoke::saturating_dec_i32_to_zero(depth); }
                 i += 1;
                 continue;
             }

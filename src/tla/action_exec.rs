@@ -896,18 +896,30 @@ fn has_top_level_conjunct(expr: &str) -> bool {
         }
         match ch {
             b'(' => paren += 1,
+            #[cfg(not(feature = "verus"))]
             b')' => paren = (paren - 1).max(0),
+            #[cfg(feature = "verus")]
+            b')' => paren = crate::storage::verus_smoke::saturating_dec_i32_to_zero(paren),
             b'[' => bracket += 1,
+            #[cfg(not(feature = "verus"))]
             b']' => bracket = (bracket - 1).max(0),
+            #[cfg(feature = "verus")]
+            b']' => bracket = crate::storage::verus_smoke::saturating_dec_i32_to_zero(bracket),
             b'{' => brace += 1,
+            #[cfg(not(feature = "verus"))]
             b'}' => brace = (brace - 1).max(0),
+            #[cfg(feature = "verus")]
+            b'}' => brace = crate::storage::verus_smoke::saturating_dec_i32_to_zero(brace),
             b'<' if bytes.get(i + 1) == Some(&b'<') => {
                 angle += 1;
                 i += 2;
                 continue;
             }
             b'>' if bytes.get(i + 1) == Some(&b'>') => {
-                angle = (angle - 1).max(0);
+                #[cfg(not(feature = "verus"))]
+                { angle = (angle - 1).max(0); }
+                #[cfg(feature = "verus")]
+                { angle = crate::storage::verus_smoke::saturating_dec_i32_to_zero(angle); }
                 i += 2;
                 continue;
             }
