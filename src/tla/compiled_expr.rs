@@ -1502,7 +1502,11 @@ fn split_binary_op_with<'a>(expr: &'a str, op: &str, prefer_last: bool) -> Optio
                     // `%`, `..` — are not parens; multi-char arithmetic
                     // ops like `\\div` are word-bounded and the inner chars
                     // are alphabetic, harmless to skip).
-                    i += op_chars.len().max(1);
+                    #[cfg(not(feature = "verus"))]
+                    let step = op_chars.len().max(1);
+                    #[cfg(feature = "verus")]
+                    let step = crate::storage::verus_smoke::max_usize(op_chars.len(), 1);
+                    i += step;
                     continue;
                 }
                 return Some((&expr[..left_byte_end], &expr[right_byte_start..]));
