@@ -485,7 +485,7 @@ impl FingerprintShard {
             let fp = old_slice[i].fp.load(Ordering::Acquire);
             if fp != 0 {
                 // Insert into new table using CAS
-                let mut index = (fp as usize) % new_cap;
+                let mut index = initial_probe_slot(fp, new_cap);
                 loop {
                     let new_entry = &new_slice[index];
                     let stored = new_entry.fp.load(Ordering::Acquire);
@@ -753,7 +753,7 @@ impl FingerprintShard {
 
                 if !old_table_ptr.is_null() && old_cap > 0 {
                     let old_table = unsafe { std::slice::from_raw_parts(old_table_ptr, old_cap) };
-                    let mut index = (fp as usize) % old_cap;
+                    let mut index = initial_probe_slot(fp, old_cap);
                     let mut probes = 0u64;
 
                     while probes < old_cap as u64 {
@@ -775,7 +775,7 @@ impl FingerprintShard {
 
                 if !new_table_ptr.is_null() && new_cap > 0 {
                     let new_table = unsafe { std::slice::from_raw_parts(new_table_ptr, new_cap) };
-                    let mut index = (fp as usize) % new_cap;
+                    let mut index = initial_probe_slot(fp, new_cap);
                     let mut probes = 0u64;
 
                     while probes < new_cap as u64 {
@@ -859,7 +859,7 @@ impl FingerprintShard {
 
                 if !old_table_ptr.is_null() && old_cap > 0 {
                     let old_table = unsafe { std::slice::from_raw_parts(old_table_ptr, old_cap) };
-                    let mut index = (fp as usize) % old_cap;
+                    let mut index = initial_probe_slot(fp, old_cap);
                     let mut probes = 0u64;
 
                     while probes < old_cap as u64 {
@@ -882,7 +882,7 @@ impl FingerprintShard {
                 if !new_table_ptr.is_null() && new_cap > 0 {
                     let new_table =
                         unsafe { std::slice::from_raw_parts_mut(new_table_ptr, new_cap) };
-                    let mut index = (fp as usize) % new_cap;
+                    let mut index = initial_probe_slot(fp, new_cap);
                     let mut probes = 0u64;
 
                     while probes < new_cap as u64 {
@@ -1123,7 +1123,7 @@ impl FingerprintShard {
 
                 if !old_table_ptr.is_null() && old_cap > 0 {
                     let old_table = unsafe { std::slice::from_raw_parts(old_table_ptr, old_cap) };
-                    let mut index = (fp as usize) % old_cap;
+                    let mut index = initial_probe_slot(fp, old_cap);
                     let mut probes = 0u64;
 
                     while probes < old_cap as u64 {
@@ -1147,7 +1147,7 @@ impl FingerprintShard {
                 if !new_table_ptr.is_null() && new_cap > 0 {
                     let new_table =
                         unsafe { std::slice::from_raw_parts_mut(new_table_ptr, new_cap) };
-                    let mut index = (fp as usize) % new_cap;
+                    let mut index = initial_probe_slot(fp, new_cap);
                     let mut probes = 0u64;
 
                     while probes < new_cap as u64 {
