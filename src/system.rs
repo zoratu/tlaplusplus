@@ -137,7 +137,10 @@ fn cgroup_quota_cores() -> Option<usize> {
             return None;
         }
         let floor = (quota / period) as usize;
+        #[cfg(not(feature = "verus"))]
         return Some(floor.max(1));
+        #[cfg(feature = "verus")]
+        return Some(crate::storage::verus_smoke::max_usize(floor, 1));
     }
 
     let quota = read_first(&[PathBuf::from("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")])?
@@ -150,7 +153,10 @@ fn cgroup_quota_cores() -> Option<usize> {
         return None;
     }
     let floor = (quota / period) as usize;
-    Some(floor.max(1))
+    #[cfg(not(feature = "verus"))]
+    { Some(floor.max(1)) }
+    #[cfg(feature = "verus")]
+    { Some(crate::storage::verus_smoke::max_usize(floor, 1)) }
 }
 
 pub fn cgroup_memory_max_bytes() -> Option<u64> {
@@ -255,7 +261,11 @@ pub fn build_worker_plan(req: WorkerPlanRequest) -> WorkerPlan {
         && let Some(quota) = quota_limit
         && quota < allowed_cpus.len()
     {
-        allowed_cpus.truncate(quota.max(1));
+        #[cfg(not(feature = "verus"))]
+        let trunc = quota.max(1);
+        #[cfg(feature = "verus")]
+        let trunc = crate::storage::verus_smoke::max_usize(quota, 1);
+        allowed_cpus.truncate(trunc);
     }
 
     // Filter CPUs to requested NUMA nodes if specified
@@ -308,7 +318,10 @@ pub fn build_worker_plan(req: WorkerPlanRequest) -> WorkerPlan {
         };
 
     let requested_workers = if req.requested_workers == 0 {
-        optimal_workers.max(1)
+        #[cfg(not(feature = "verus"))]
+        { optimal_workers.max(1) }
+        #[cfg(feature = "verus")]
+        { crate::storage::verus_smoke::max_usize(optimal_workers, 1) }
     } else {
         req.requested_workers
     };
