@@ -1777,10 +1777,16 @@ impl PageAlignedFingerprintStore {
 
         // Process shards in worker-specific order to reduce contention
         // Worker N starts at shard (N % num_shards) and wraps around
+        #[cfg(not(feature = "verus"))]
         let start_shard = worker_id % num_shards;
+        #[cfg(feature = "verus")]
+        let start_shard = crate::storage::verus_smoke::compute_index_mod(worker_id, num_shards);
 
         for offset in 0..num_shards {
+            #[cfg(not(feature = "verus"))]
             let shard_id = (start_shard + offset) % num_shards;
+            #[cfg(feature = "verus")]
+            let shard_id = crate::storage::verus_smoke::compute_steal_idx(start_shard, offset, num_shards);
             let group = &shard_groups[shard_id];
 
             if group.is_empty() {

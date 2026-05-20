@@ -133,11 +133,25 @@ impl BloomFingerprintStore {
         compute_shard_id_from_lower_bits(fp, self.shard_mask)
     }
 
-    /// Get home NUMA node for a fingerprint (for NUMA-aware queue routing)
+    /// Get home NUMA node for a fingerprint (for NUMA-aware queue routing).
+    ///
+    /// Cfg-split (T13.4 Phase 2): under `--features verus` the `%`
+    /// delegates to `compute_index_mod` (verified `ensures result <
+    /// count`). Different bit-mix from the page-aligned store
+    /// (`>> 48` vs `>> 32 ^ >> 16 ^ fp`) — the bloom store is bounded
+    /// in size so high bits are sufficient for spreading.
+    #[cfg(not(feature = "verus"))]
     #[inline]
     pub fn home_numa(&self, fp: u64) -> usize {
         // Distribute fingerprints across NUMA nodes based on high bits
         ((fp >> 48) as usize) % self.num_numa_nodes
+    }
+
+    #[cfg(feature = "verus")]
+    #[inline]
+    pub fn home_numa(&self, fp: u64) -> usize {
+        let value = (fp >> 48) as usize;
+        crate::storage::verus_smoke::compute_index_mod(value, self.num_numa_nodes)
     }
 
     /// Send fingerprint to persistence writer (non-blocking)
@@ -234,7 +248,10 @@ impl BloomFingerprintStore {
         // Process each shard's fingerprints with a SINGLE write lock per shard
         // Start from worker_id offset to spread contention
         for i in 0..num_shards {
+            #[cfg(not(feature = "verus"))]
             let shard_id = (i + worker_id) % num_shards;
+            #[cfg(feature = "verus")]
+            let shard_id = crate::storage::verus_smoke::compute_steal_idx(worker_id, i, num_shards);
             let group = &shard_groups[shard_id];
 
             if group.is_empty() {
