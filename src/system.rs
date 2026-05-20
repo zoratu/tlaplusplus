@@ -222,10 +222,13 @@ fn intersect_sorted(left: &[usize], right: &[usize]) -> Vec<usize> {
 }
 
 pub fn build_worker_plan(req: WorkerPlanRequest) -> WorkerPlan {
-    let host_cpus = std::thread::available_parallelism()
+    let host_cpus_raw = std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or_else(|_| num_cpus::get())
-        .max(1);
+        .unwrap_or_else(|_| num_cpus::get());
+    #[cfg(not(feature = "verus"))]
+    let host_cpus = host_cpus_raw.max(1);
+    #[cfg(feature = "verus")]
+    let host_cpus = crate::storage::verus_smoke::max_usize(host_cpus_raw, 1);
 
     let mut allowed_cpus = if let Some(mut user) = req.requested_core_ids {
         user.sort_unstable();
@@ -347,9 +350,16 @@ pub fn build_worker_plan(req: WorkerPlanRequest) -> WorkerPlan {
         allowed_cpus.clone()
     };
 
+    #[cfg(not(feature = "verus"))]
     let worker_count = requested_workers
         .min(effective_allowed_cpus.len().max(1))
         .max(1);
+    #[cfg(feature = "verus")]
+    let worker_count = {
+        let cap = crate::storage::verus_smoke::max_usize(effective_allowed_cpus.len(), 1);
+        let capped = crate::storage::verus_smoke::min_usize(requested_workers, cap);
+        crate::storage::verus_smoke::max_usize(capped, 1)
+    };
 
     // Build NUMA-aware worker assignments using effective CPUs (filtered by NUMA optimization)
     let raw_nodes = discover_numa_nodes();
@@ -390,7 +400,10 @@ pub fn build_worker_plan(req: WorkerPlanRequest) -> WorkerPlan {
     };
 
     // Count workers per NUMA node
+    #[cfg(not(feature = "verus"))]
     let num_numa_nodes = numa_nodes.len().max(1);
+    #[cfg(feature = "verus")]
+    let num_numa_nodes = crate::storage::verus_smoke::max_usize(numa_nodes.len(), 1);
     let mut workers_per_numa = vec![0usize; num_numa_nodes];
     for &node in &worker_numa_nodes {
         if node < workers_per_numa.len() {
