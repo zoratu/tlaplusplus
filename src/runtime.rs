@@ -1338,11 +1338,23 @@ where
         // `EngineConfig::dfs_workers` is clamped to that ceiling so a
         // user can't accidentally over-subscribe the cgroup CPU quota.
         let requested_dfs_workers = if config.dfs_workers == 0 {
-            worker_plan.worker_count.max(1)
+            #[cfg(not(feature = "verus"))]
+            { worker_plan.worker_count.max(1) }
+            #[cfg(feature = "verus")]
+            { crate::storage::verus_smoke::max_usize(worker_plan.worker_count, 1) }
         } else {
-            config.dfs_workers.min(worker_plan.worker_count.max(1))
+            #[cfg(not(feature = "verus"))]
+            { config.dfs_workers.min(worker_plan.worker_count.max(1)) }
+            #[cfg(feature = "verus")]
+            {
+                let cap = crate::storage::verus_smoke::max_usize(worker_plan.worker_count, 1);
+                crate::storage::verus_smoke::min_usize(config.dfs_workers, cap)
+            }
         };
+        #[cfg(not(feature = "verus"))]
         let num_dfs_workers = requested_dfs_workers.max(1);
+        #[cfg(feature = "verus")]
+        let num_dfs_workers = crate::storage::verus_smoke::max_usize(requested_dfs_workers, 1);
 
         // The init producer was skipped above (`dfs_dispatch_will_fire`),
         // so the `init_producing` flag is already false and there is no
