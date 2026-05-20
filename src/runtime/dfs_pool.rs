@@ -427,9 +427,18 @@ pub(super) fn run_dfs_pool<M: Model>(ctx: DfsPoolCtx<M>) {
     for h in handles {
         match h.join() {
             Ok(out) => {
-                total_seen = total_seen.saturating_add(out.states_seen);
-                total_distinct = total_distinct.saturating_add(out.states_distinct);
-                total_dup = total_dup.saturating_add(out.states_duplicates);
+                #[cfg(not(feature = "verus"))]
+                {
+                    total_seen = total_seen.saturating_add(out.states_seen);
+                    total_distinct = total_distinct.saturating_add(out.states_distinct);
+                    total_dup = total_dup.saturating_add(out.states_duplicates);
+                }
+                #[cfg(feature = "verus")]
+                {
+                    total_seen = crate::storage::verus_smoke::saturating_add_u64(total_seen, out.states_seen);
+                    total_distinct = crate::storage::verus_smoke::saturating_add_u64(total_distinct, out.states_distinct);
+                    total_dup = crate::storage::verus_smoke::saturating_add_u64(total_dup, out.states_duplicates);
+                }
                 if all_triples.is_empty() {
                     all_triples = out.triples;
                 } else {

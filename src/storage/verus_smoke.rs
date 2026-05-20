@@ -670,6 +670,29 @@ verus! {
         if amount < 64 { amount } else { 63 }
     }
 
+    /// Saturating addition for u64. Replaces shipping
+    /// `a.saturating_add(b)` under `--features verus` since Verus
+    /// doesn't yet have a spec for `u64::saturating_add`. Returns
+    /// `a + b` when the sum fits in u64, else `u64::MAX`.
+    ///
+    /// Verified: a stronger spec than the stdlib's truncating
+    /// behaviour: when the sum doesn't overflow the post says
+    /// `r == a + b`; when it does, the post says `r == u64::MAX`.
+    /// Plus the always-true `r >= a, r >= b` (monotone in both
+    /// arguments).
+    ///
+    /// Used at `runtime::dfs_pool::run`'s stats-aggregation loop
+    /// (lines 430-432) where DFS worker outputs are summed across
+    /// the pool.
+    pub fn saturating_add_u64(a: u64, b: u64) -> (r: u64)
+        ensures
+            a <= u64::MAX - b ==> r == a + b,
+            a > u64::MAX - b  ==> r == u64::MAX,
+            r >= a, r >= b,
+    {
+        if a <= u64::MAX - b { a + b } else { u64::MAX }
+    }
+
     /// Saturating subtraction for u64. Replaces shipping
     /// `a.saturating_sub(b)` under `--features verus` since Verus
     /// doesn't yet have a spec for `u64::saturating_sub`. Returns
