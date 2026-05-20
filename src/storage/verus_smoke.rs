@@ -670,6 +670,27 @@ verus! {
         if amount < 64 { amount } else { 63 }
     }
 
+    /// Euclidean GCD. Mirrors the `gcd(a: u64, b: u64) -> u64`
+    /// helpers in `tla::compiled_eval::gcd` (line 95) and
+    /// `tla::eval::operator::gcd` (line 1384). Both have identical
+    /// bodies: `if b == 0 { a } else { gcd(b, a % b) }`.
+    ///
+    /// First verified *recursive* function in this module. Verus
+    /// needs a `decreases` clause to prove termination of the
+    /// recursion. The right termination measure is `b`: on the
+    /// recursive call `gcd(b, a % b)`, the new `b` is `a % b`,
+    /// and for u64 with `b > 0` we have `a % b < b` (Verus
+    /// auto-derives this).
+    ///
+    /// The base case (`b == 0`) returns `a`; recursive call has
+    /// `b > 0` by branch condition, so the modulo is well-defined.
+    /// No bound on `a` is required.
+    pub fn gcd(a: u64, b: u64) -> (g: u64)
+        decreases b,
+    {
+        if b == 0 { a } else { gcd(b, a % b) }
+    }
+
     /// Bit index of a value within a 64-bit word. Mirrors
     /// `node_id % (std::mem::size_of::<libc::c_ulong>() * 8)` at
     /// `storage::numa::set_preferred_node` (line 309) and

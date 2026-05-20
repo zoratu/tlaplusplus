@@ -92,8 +92,14 @@ fn tla_value_to_string(value: &TlaValue) -> String {
     }
 }
 
+#[cfg(not(feature = "verus"))]
 fn gcd(a: u64, b: u64) -> u64 {
     if b == 0 { a } else { gcd(b, a % b) }
+}
+
+#[cfg(feature = "verus")]
+fn gcd(a: u64, b: u64) -> u64 {
+    crate::storage::verus_smoke::gcd(a, b)
 }
 
 fn sequence_like_values(value: &TlaValue) -> Option<Vec<TlaValue>> {
