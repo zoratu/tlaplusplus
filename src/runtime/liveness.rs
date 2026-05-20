@@ -654,12 +654,21 @@ where
                     // discovered fingerprint domain. We size up to the
                     // next power of two of state_by_fp.len() so the
                     // shard mask path is exercised.
+                    #[cfg(not(feature = "verus"))]
                     let n_states = state_by_fp.len().max(64);
+                    #[cfg(feature = "verus")]
+                    let n_states = crate::storage::verus_smoke::max_usize(state_by_fp.len(), 64);
                     // 1 shard for the post-processing path — multi-shard
                     // is exercised by the dedicated unit tests in
                     // `page_aligned_color_map.rs` and is not load-bearing
                     // for verdict correctness here.
+                    #[cfg(not(feature = "verus"))]
                     let cm_capacity = n_states.next_power_of_two().max(1024);
+                    #[cfg(feature = "verus")]
+                    let cm_capacity = crate::storage::verus_smoke::max_usize(
+                        n_states.next_power_of_two(),
+                        1024,
+                    );
                     match
                         crate::storage::page_aligned_color_map::PageAlignedColorMap::new(
                             cm_capacity,

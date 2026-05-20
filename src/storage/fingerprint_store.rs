@@ -59,7 +59,11 @@ impl FingerprintStore {
         #[cfg(feature = "verus")]
         let shard_count =
             crate::storage::verus_smoke::max_usize(config.shard_count, 1).next_power_of_two();
+        #[cfg(not(feature = "verus"))]
         let expected_per_shard = (config.expected_items / shard_count).max(10_000);
+        #[cfg(feature = "verus")]
+        let expected_per_shard =
+            crate::storage::verus_smoke::max_usize(config.expected_items / shard_count, 10_000);
 
         let shards = (0..shard_count)
             .map(|_| FingerprintShard {
