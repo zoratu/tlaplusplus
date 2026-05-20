@@ -1503,13 +1503,22 @@ impl PageAlignedFingerprintStore {
         let mut shards = Vec::with_capacity(shard_count);
         for shard_id in 0..shard_count {
             // Deterministic: shard N belongs to NUMA (N / shards_per_numa)
+            #[cfg(not(feature = "verus"))]
             let numa_node = (shard_id / shards_per_numa).min(num_numa_nodes - 1);
+            #[cfg(feature = "verus")]
+            let numa_node = crate::storage::verus_smoke::min_usize(
+                shard_id / shards_per_numa,
+                num_numa_nodes - 1,
+            );
 
             // Stagger sizes: vary by ±25% based on shard_id to spread out resizes
             // Using prime multipliers to ensure good distribution
             let stagger_factor = 1.0 + 0.25 * ((shard_id * 7 % 11) as f64 / 10.0 - 0.5);
-            let staggered_size_mb =
-                ((config.shard_size_mb as f64 * stagger_factor) as usize).max(64);
+            let raw_size_mb = (config.shard_size_mb as f64 * stagger_factor) as usize;
+            #[cfg(not(feature = "verus"))]
+            let staggered_size_mb = raw_size_mb.max(64);
+            #[cfg(feature = "verus")]
+            let staggered_size_mb = crate::storage::verus_smoke::max_usize(raw_size_mb, 64);
 
             let shard = FingerprintShard::new(staggered_size_mb, numa_node, backing_dir, shard_id)
                 .context(format!(
