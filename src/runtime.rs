@@ -544,8 +544,15 @@ where
         // 2MB per shard is enough for ~56K entries at 75% load — plenty
         // to get started, and resize doubles capacity seamlessly.
         let min_shard_bytes = 2 * 1024 * 1024; // 2MB minimum per shard
+        #[cfg(not(feature = "verus"))]
         let bytes_per_shard = (total_bytes_needed / shard_count).max(min_shard_bytes);
-        (bytes_per_shard / (1024 * 1024)).max(2) // At least 2MB
+        #[cfg(feature = "verus")]
+        let bytes_per_shard =
+            crate::storage::verus_smoke::max_usize(total_bytes_needed / shard_count, min_shard_bytes);
+        #[cfg(not(feature = "verus"))]
+        { (bytes_per_shard / (1024 * 1024)).max(2) } // At least 2MB
+        #[cfg(feature = "verus")]
+        { crate::storage::verus_smoke::max_usize(bytes_per_shard / (1024 * 1024), 2) }
     } else {
         0 // Not used in bloom mode
     };
@@ -1216,7 +1223,10 @@ where
             max_workers: worker_plan.worker_count,
             min_workers: worker_plan.worker_count / 8, // Floor at 1/8 of workers
             target_sys_pct: 20.0,
+            #[cfg(not(feature = "verus"))]
             adjustment_step: (worker_plan.worker_count / 16).max(4), // ~6% at a time
+            #[cfg(feature = "verus")]
+            adjustment_step: crate::storage::verus_smoke::max_usize(worker_plan.worker_count / 16, 4),
             verbose: true,
             ..Default::default()
         };
