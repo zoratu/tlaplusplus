@@ -87,6 +87,14 @@ use std::time::Duration;
 /// Static cluster partition assignment. Same bit-mixing the in-process
 /// `partition_for_fp` uses, but spread over `num_nodes * workers_per_node`
 /// total partitions and decomposed into `(node_id, worker_id)`.
+///
+/// Cfg-split (T13.4 Phase 2): under `--features verus` the bit-mix
+/// + modulo for `global` delegates to `compute_numa_index_from_hash`
+/// (verified `ensures result < total`). The decompose into
+/// `(node_id, worker_id)` stays inline — verifying
+/// `(global / workers_per_node) < num_nodes` needs nontrivial
+/// integer-division reasoning that's a separate slice.
+#[cfg(not(feature = "verus"))]
 #[inline]
 pub(super) fn partition_for_fp_cluster(
     fp: u64,
@@ -101,6 +109,25 @@ pub(super) fn partition_for_fp_cluster(
     }
     let mixed = (fp >> 32) ^ (fp >> 16) ^ fp;
     let global = (mixed as usize) % total;
+    let node_id = (global / workers_per_node) as u32;
+    let worker_id = global % workers_per_node;
+    (node_id, worker_id)
+}
+
+#[cfg(feature = "verus")]
+#[inline]
+pub(super) fn partition_for_fp_cluster(
+    fp: u64,
+    num_nodes: u32,
+    workers_per_node: usize,
+) -> (u32, usize) {
+    debug_assert!(num_nodes > 0, "num_nodes must be positive");
+    debug_assert!(workers_per_node > 0, "workers_per_node must be positive");
+    let total = (num_nodes as usize) * workers_per_node;
+    if total == 1 {
+        return (0, 0);
+    }
+    let global = crate::storage::verus_smoke::compute_numa_index_from_hash(fp, total);
     let node_id = (global / workers_per_node) as u32;
     let worker_id = global % workers_per_node;
     (node_id, worker_id)
