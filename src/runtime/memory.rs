@@ -60,9 +60,15 @@ pub(super) fn apply_memory_budget(
         #[cfg(feature = "verus")]
         { fp_cache = crate::storage::verus_smoke::min_u64(fp_cache, budget_fp_cache); }
 
+        #[cfg(not(feature = "verus"))]
         let state_bytes = config.estimated_state_bytes.max(1) as u64;
+        #[cfg(feature = "verus")]
+        let state_bytes = crate::storage::verus_smoke::max_usize(config.estimated_state_bytes, 1) as u64;
         let budget_queue_items = (memory_max.saturating_mul(50) / 100) / state_bytes;
+        #[cfg(not(feature = "verus"))]
         let budget_queue_items = budget_queue_items.max(10_000) as usize;
+        #[cfg(feature = "verus")]
+        let budget_queue_items = crate::storage::verus_smoke::max_u64(budget_queue_items, 10_000) as usize;
         #[cfg(not(feature = "verus"))]
         { queue_limit = queue_limit.min(budget_queue_items); }
         #[cfg(feature = "verus")]
