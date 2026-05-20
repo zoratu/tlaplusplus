@@ -38,7 +38,10 @@ impl HybridFingerprintStore {
         // CRITICAL: Sled's cache_capacity is just for page cache
         // Total memory usage can be 3-5x this due to write buffers, compaction, etc.
         // So we clamp to a conservative max
+        #[cfg(not(feature = "verus"))]
         let safe_cache_mb = cache_size_mb.min(5000); // Max 5GB cache
+        #[cfg(feature = "verus")]
+        let safe_cache_mb = crate::storage::verus_smoke::min_usize(cache_size_mb, 5000);
 
         // Configure sled with VERY conservative settings
         let db = sled::Config::new()

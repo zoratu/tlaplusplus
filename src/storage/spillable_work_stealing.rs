@@ -1393,10 +1393,13 @@ where
         const DRAIN_TIMEOUT: Duration = Duration::from_secs(300); // 5 minute timeout
         const PROGRESS_INTERVAL: Duration = Duration::from_secs(30); // Log progress every 30s
 
-        let num_threads = std::thread::available_parallelism()
+        let raw_nt = std::thread::available_parallelism()
             .map(|p| p.get())
-            .unwrap_or(4)
-            .min(32);
+            .unwrap_or(4);
+        #[cfg(not(feature = "verus"))]
+        let num_threads = raw_nt.min(32);
+        #[cfg(feature = "verus")]
+        let num_threads = crate::storage::verus_smoke::min_usize(raw_nt, 32);
 
         let spill_dir = self.overflow.get_spill_dir().to_path_buf();
         std::fs::create_dir_all(&spill_dir)?;
@@ -1670,10 +1673,13 @@ where
         const MAX_RETRIES: u32 = 1000;
 
         // Get number of parallel threads
-        let num_threads = std::thread::available_parallelism()
+        let raw_nt2 = std::thread::available_parallelism()
             .map(|p| p.get())
-            .unwrap_or(4)
-            .min(32);
+            .unwrap_or(4);
+        #[cfg(not(feature = "verus"))]
+        let num_threads = raw_nt2.min(32);
+        #[cfg(feature = "verus")]
+        let num_threads = crate::storage::verus_smoke::min_usize(raw_nt2, 32);
 
         // First, collect all items into batches
         let mut batches: Vec<Vec<T>> = Vec::new();
