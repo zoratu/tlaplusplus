@@ -535,4 +535,23 @@ verus! {
     {
         within / 32
     }
+
+    /// Shard ID via bitwise AND of the *lower* bits with the shard
+    /// mask. Mirrors `(fp as usize) & self.shard_mask` at
+    /// `BloomFingerprintStore::shard_id` (line 114).
+    ///
+    /// Differs from `compute_shard_idx_from_mask` (which uses the
+    /// upper 32 bits via `fp >> 32`): the bloom store hashes from the
+    /// lower bits directly, since its internal bloom filter already
+    /// pre-mixes the bits before the shard-routing step.
+    ///
+    /// Verified: `ensures shard_id <= shard_mask`. Same u64-width
+    /// bit_vector discharge.
+    pub fn compute_shard_id_from_lower_bits(fp: u64, shard_mask: usize) -> (shard_id: usize)
+        ensures shard_id <= shard_mask,
+    {
+        let mask_u64: u64 = shard_mask as u64;
+        assert((fp & mask_u64) <= mask_u64) by(bit_vector);
+        (fp & mask_u64) as usize
+    }
 }

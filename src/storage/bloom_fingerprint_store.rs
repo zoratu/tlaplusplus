@@ -44,6 +44,25 @@ pub struct BloomFingerprintStore {
     persist_drops: AtomicU64,
 }
 
+/// Shard ID via AND with lower-bits mask (T13.4 Phase 2).
+///
+/// Cfg-split: default uses `(fp as usize) & shard_mask`; under
+/// `--features verus` delegates to the verified
+/// `compute_shard_id_from_lower_bits` whose ensures
+/// (`shard_id <= shard_mask`) is discharged via u64-width
+/// bit_vector reasoning.
+#[cfg(not(feature = "verus"))]
+#[inline]
+fn compute_shard_id_from_lower_bits(fp: u64, shard_mask: usize) -> usize {
+    (fp as usize) & shard_mask
+}
+
+#[cfg(feature = "verus")]
+#[inline]
+fn compute_shard_id_from_lower_bits(fp: u64, shard_mask: usize) -> usize {
+    crate::storage::verus_smoke::compute_shard_id_from_lower_bits(fp, shard_mask)
+}
+
 impl BloomFingerprintStore {
     /// Create new bloom filter store
     ///
@@ -111,7 +130,7 @@ impl BloomFingerprintStore {
     /// Get the shard ID for a fingerprint
     #[inline]
     fn shard_id(&self, fp: u64) -> usize {
-        (fp as usize) & self.shard_mask
+        compute_shard_id_from_lower_bits(fp, self.shard_mask)
     }
 
     /// Get home NUMA node for a fingerprint (for NUMA-aware queue routing)
