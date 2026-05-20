@@ -10,7 +10,10 @@ pub struct FlurmJobLifecycleModel {
 impl FlurmJobLifecycleModel {
     pub fn new(max_jobs: usize, max_time_limit: u16) -> Self {
         Self {
+            #[cfg(not(feature = "verus"))]
             max_jobs: max_jobs.max(1),
+            #[cfg(feature = "verus")]
+            max_jobs: crate::storage::verus_smoke::max_usize(max_jobs, 1),
             max_time_limit: max_time_limit.max(1),
         }
     }

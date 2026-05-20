@@ -125,8 +125,12 @@ where
     let total_tx_cap: usize = per_shard.iter().map(|(t, _, _)| t.len()).sum();
     let unique_cap: usize = per_shard.iter().map(|(_, s, _)| s.len()).max().unwrap_or(0);
     let mut tx_triples_local: Vec<(u64, u64, String)> = Vec::with_capacity(total_tx_cap);
+    #[cfg(not(feature = "verus"))]
+    let unique_cap_floor = unique_cap.max(64);
+    #[cfg(feature = "verus")]
+    let unique_cap_floor = crate::storage::verus_smoke::max_usize(unique_cap, 64);
     let mut state_by_fp_local: HashMap<u64, M::State> =
-        HashMap::with_capacity(unique_cap.max(64));
+        HashMap::with_capacity(unique_cap_floor);
     let mut total_tx_local = 0usize;
     for (mut triples, states, count) in per_shard {
         total_tx_local += count;
