@@ -211,7 +211,11 @@ pub(super) fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usiz
                             let mut indices = vec![0usize; field_specs.len()];
                             let total: u64 =
                                 field_specs.iter().map(|(_, v)| v.len() as u64).product();
-                            ctx.check_budget(total.min(500_000_000) as usize)?;
+                            #[cfg(not(feature = "verus"))]
+                            let capped_total = total.min(500_000_000) as usize;
+                            #[cfg(feature = "verus")]
+                            let capped_total = crate::storage::verus_smoke::min_u64(total, 500_000_000) as usize;
+                            ctx.check_budget(capped_total)?;
 
                             let mut rec = BTreeMap::new();
                             for (fname, vals) in &field_specs {

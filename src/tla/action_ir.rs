@@ -56,7 +56,11 @@ pub(crate) fn split_action_body_clauses(expr: &str) -> Vec<String> {
         .into_iter()
         .flat_map(|part| split_inline_action_conjuncts(&part))
         .collect::<Vec<_>>();
-    let mut merged = Vec::with_capacity(expanded.len().max(1));
+    #[cfg(not(feature = "verus"))]
+    let merged_cap = expanded.len().max(1);
+    #[cfg(feature = "verus")]
+    let merged_cap = crate::storage::verus_smoke::max_usize(expanded.len(), 1);
+    let mut merged = Vec::with_capacity(merged_cap);
     let mut idx = 0usize;
     while idx < expanded.len() {
         let part = normalize_multiline_action_indentation(expanded[idx].trim())
@@ -624,7 +628,11 @@ pub fn parse_action_exists(expr: &str) -> Option<(&str, &str)> {
 
 pub fn compile_action_ir(def: &TlaDefinition) -> ActionIr {
     let conjuncts = split_action_body_clauses(&def.body);
-    let mut clauses = Vec::with_capacity(conjuncts.len().max(1));
+    #[cfg(not(feature = "verus"))]
+    let clauses_cap = conjuncts.len().max(1);
+    #[cfg(feature = "verus")]
+    let clauses_cap = crate::storage::verus_smoke::max_usize(conjuncts.len(), 1);
+    let mut clauses = Vec::with_capacity(clauses_cap);
 
     if conjuncts.is_empty() {
         clauses.push(ActionClause::Guard {
