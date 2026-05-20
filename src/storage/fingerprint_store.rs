@@ -72,7 +72,11 @@ impl FingerprintStore {
 
     #[inline]
     fn shard_for(&self, fp: u64) -> &FingerprintShard {
-        &self.shards[(fp as usize) & self.shard_mask]
+        #[cfg(not(feature = "verus"))]
+        let idx = (fp as usize) & self.shard_mask;
+        #[cfg(feature = "verus")]
+        let idx = crate::storage::verus_smoke::compute_shard_id_from_lower_bits(fp, self.shard_mask);
+        &self.shards[idx]
     }
 
     pub fn contains_or_insert(&self, fp: u64) -> bool {
@@ -118,7 +122,10 @@ impl FingerprintStore {
         let mut shard_groups: Vec<Vec<(usize, u64)>> = vec![Vec::new(); self.shards.len()];
 
         for (idx, &fp) in fps.iter().enumerate() {
+            #[cfg(not(feature = "verus"))]
             let shard_id = (fp as usize) & self.shard_mask;
+            #[cfg(feature = "verus")]
+            let shard_id = crate::storage::verus_smoke::compute_shard_id_from_lower_bits(fp, self.shard_mask);
             shard_groups[shard_id].push((idx, fp));
         }
 
