@@ -977,7 +977,12 @@ fn handle_explore_msg<M: Model>(
         local_fp_cache.insert(fp);
     }
     *total_distinct += 1;
-    if state_by_fp.len() < (max_trace_states as usize).max(8192) {
+    if state_by_fp.len() < {
+        #[cfg(not(feature = "verus"))]
+        { (max_trace_states as usize).max(8192) }
+        #[cfg(feature = "verus")]
+        { crate::storage::verus_smoke::max_usize(max_trace_states as usize, 8192) }
+    } {
         state_by_fp
             .entry(fp)
             .or_insert_with(|| state.clone());
@@ -1189,7 +1194,12 @@ fn advance_one_step<M: Model>(
                 local_fp_cache.insert(next_fp);
             }
             *total_distinct += 1;
-            if state_by_fp.len() < (max_trace_states as usize).max(8192) {
+            if state_by_fp.len() < {
+        #[cfg(not(feature = "verus"))]
+        { (max_trace_states as usize).max(8192) }
+        #[cfg(feature = "verus")]
+        { crate::storage::verus_smoke::max_usize(max_trace_states as usize, 8192) }
+    } {
                 state_by_fp
                     .entry(next_fp)
                     .or_insert_with(|| next_state.clone());

@@ -46,11 +46,19 @@ pub(super) fn calculate_optimal_shard_count(
 
         if per_shard_bytes < MIN_SHARD_SIZE {
             // Shards too small - reduce count
+            #[cfg(not(feature = "verus"))]
             let min_count = (total_memory_bytes / MAX_SHARD_SIZE).max(1);
+            #[cfg(feature = "verus")]
+            let min_count =
+                crate::storage::verus_smoke::max_usize(total_memory_bytes / MAX_SHARD_SIZE, 1);
             min_count.next_power_of_two()
         } else if per_shard_bytes > MAX_SHARD_SIZE {
             // Shards too large - increase count
+            #[cfg(not(feature = "verus"))]
             let max_count = (total_memory_bytes / MIN_SHARD_SIZE).max(1);
+            #[cfg(feature = "verus")]
+            let max_count =
+                crate::storage::verus_smoke::max_usize(total_memory_bytes / MIN_SHARD_SIZE, 1);
             max_count.next_power_of_two()
         } else {
             candidate
