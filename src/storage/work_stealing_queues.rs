@@ -436,7 +436,10 @@ impl<T: 'static> WorkStealingQueues<T> {
                 return None;
             }
             let start = compute_steal_start(worker_state.id, local_workers.len());
+            #[cfg(not(feature = "verus"))]
             let max_attempts = local_workers.len().min(MAX_LOCAL_STEAL_ATTEMPTS);
+            #[cfg(feature = "verus")]
+            let max_attempts = crate::storage::verus_smoke::min_usize(local_workers.len(), MAX_LOCAL_STEAL_ATTEMPTS);
             for i in 0..max_attempts {
                 let idx = compute_steal_idx(start, i, local_workers.len());
                 let target = local_workers[idx];
@@ -493,7 +496,10 @@ impl<T: 'static> WorkStealingQueues<T> {
 
             // Try a few workers from this remote node
             let start = compute_steal_start(worker_state.id, remote_workers.len());
+            #[cfg(not(feature = "verus"))]
             let max_attempts = remote_workers.len().min(MAX_REMOTE_STEAL_ATTEMPTS);
+            #[cfg(feature = "verus")]
+            let max_attempts = crate::storage::verus_smoke::min_usize(remote_workers.len(), MAX_REMOTE_STEAL_ATTEMPTS);
             for i in 0..max_attempts {
                 let idx = compute_steal_idx(start, i, remote_workers.len());
                 let target = remote_workers[idx];
