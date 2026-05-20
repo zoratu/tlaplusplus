@@ -489,11 +489,14 @@ Landed in v1.1.0:
   (real or `queue_spill_fail=return` failpoint) now release `inflight_spilled`
   and account dropped items in `QueueStats::spill_lost_permanently`.
 
-Deferred to v1.1.x:
-- T5.4, T5.5: Streaming Init enumeration, joint Init+Solution symbolic encoding (Einstein-class workloads).
-- T10.2: Streaming SCC discovery for 100M+ liveness.
-- T13.4 (full): Verus tracked-pointer integration of the production `FingerprintShard` (the shadow methods in `shard_methods.rs` are the working blueprint).
-- T13.5 (`state_machines!` port): the constructive proof in `reader_liveness_v2.rs` discharges the headline `theorem_no_starvation` with 0 axioms; an LTL-native restatement via `state_machines!` is optional polish, no longer load-bearing.
+Landed since v1.0.0 (formerly listed as deferred):
+- T5.4 (v1.1.0): Streaming Init enumeration via a producer thread overlapping with worker exploration.
+- T5.5 (v1.1.0): Joint Init+invariant Z3 encoding — Einstein-class spec 44 min → 14 ms.
+- T10.2 (v1.1.0 + v1.2.1/v1.2.2/v1.2.4/v1.2.6): Streaming SCC discovery. Phase 1 oracle + phase 2 stages 1–5 (PageAlignedColorMap, protocol variants, hot-loop DFS lift, in-band fairness, multi-node cluster routing) all shipped. The streaming-SCC memory win is realized — DFS exploration no longer materializes the labeled-transitions adjacency map. Only the `--dfs-cluster-listen` user-facing CLI flag remains queued.
+- T13.5 (v1.2.1, `state_machines!` port): shipped at `verification/verus/reader_liveness_state_machine.rs` (15 verified items, Tier A.8). Optional polish; the constructive proof in `reader_liveness_v2.rs` already discharged `theorem_no_starvation` with 0 axioms.
+
+Still defensibly parked:
+- T13.4 (full) — production `FingerprintShard` tracked-pointer integration. Reframed in `verification/verus/T13.4-PHASE2-CLOSURE.md`: original blockers (atomic-pointer swap, mmap-tracked permissions, `&self` + linear-ghost) all resolved in standalone verified artifacts (186 verified items across 11 files). What remains is mechanical Cargo.toml/feature-gate work + per-method annotation lifts using the validated prototype patterns — no verification-research debt. Phase 2 in-place annotation is live: `cargo verus check --features verus` runs on the main crate with 49 verified items in `src/storage/verus_smoke.rs` driving 176 shipping call sites across 31 files.
 - See `RELEASE_1.0.0_PLAN.md` for the full v1.1.x backlog.
 
 ## Key Implementation Notes

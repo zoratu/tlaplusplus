@@ -443,7 +443,11 @@ impl S3Persistence {
             let now = std::time::Instant::now();
             if now.duration_since(last_progress_time).as_secs() >= 2 || downloaded_files % 100 == 0
             {
-                let pct = (downloaded_files as f64 / total_files.max(1) as f64) * 100.0;
+                #[cfg(not(feature = "verus"))]
+                let tf_floor = total_files.max(1);
+                #[cfg(feature = "verus")]
+                let tf_floor = crate::storage::verus_smoke::max_usize(total_files, 1);
+                let pct = (downloaded_files as f64 / tf_floor as f64) * 100.0;
                 let elapsed = now.duration_since(start_time).as_secs_f64();
                 let rate_mbps = if elapsed > 0.0 {
                     (downloaded_bytes as f64 / 1_048_576.0) / elapsed
