@@ -758,6 +758,18 @@ verus! {
         if a < b { b } else { a }
     }
 
+    /// u32 counterpart to `min_usize`. Used at
+    /// `storage::work_stealing_queues` (line 419) for the
+    /// exponential-backoff shift cap:
+    ///     `1 << spin_count.min(6)`
+    /// The .min(6) bounds the shift amount so `1 << shift_amt` on
+    /// a (default int = i32) literal stays well-defined.
+    pub fn min_u32(a: u32, b: u32) -> (r: u32)
+        ensures r <= a, r <= b, r == a || r == b,
+    {
+        if a < b { a } else { b }
+    }
+
     /// Replace `usize::min` since Verus doesn't yet have a spec for
     /// `Ord::min`. Returns the lesser of `a` and `b`.
     ///

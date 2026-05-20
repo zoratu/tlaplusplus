@@ -416,7 +416,11 @@ impl<T: 'static> WorkStealingQueues<T> {
             // Exponential backoff
             spin_count += 1;
             if spin_count < MAX_SPINS {
-                for _ in 0..(1 << spin_count.min(6)) {
+                #[cfg(not(feature = "verus"))]
+                let shift_amt = spin_count.min(6);
+                #[cfg(feature = "verus")]
+                let shift_amt = crate::storage::verus_smoke::min_u32(spin_count, 6);
+                for _ in 0..(1 << shift_amt) {
                     std::hint::spin_loop();
                 }
             } else {
