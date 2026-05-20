@@ -520,14 +520,21 @@ where
 
     // Auto-calculate optimal shard count if user specified 0 or default
     let shard_count = if config.fp_shards == 0 {
+        #[cfg(not(feature = "verus"))]
+        let nnu = worker_plan.numa_nodes_used.max(1);
+        #[cfg(feature = "verus")]
+        let nnu = crate::storage::verus_smoke::max_usize(worker_plan.numa_nodes_used, 1);
         calculate_optimal_shard_count(
             worker_plan.worker_count,
-            worker_plan.numa_nodes_used.max(1),
+            nnu,
             total_bytes_needed,
         )
     } else {
         // User specified explicit count - round to power of 2
-        config.fp_shards.next_power_of_two().max(2)
+        #[cfg(not(feature = "verus"))]
+        { config.fp_shards.next_power_of_two().max(2) }
+        #[cfg(feature = "verus")]
+        { crate::storage::verus_smoke::max_usize(config.fp_shards.next_power_of_two(), 2) }
     };
 
     // Only calculate shard_size_mb for page-aligned mode
@@ -605,7 +612,10 @@ where
         expected_items: config.fp_expected_items,
         false_positive_rate: config.fp_false_positive_rate,
         shard_size_mb,
+        #[cfg(not(feature = "verus"))]
         num_numa_nodes: worker_plan.numa_nodes_used.max(1),
+        #[cfg(feature = "verus")]
+        num_numa_nodes: crate::storage::verus_smoke::max_usize(worker_plan.numa_nodes_used, 1),
         auto_switch_config,
         backing_dir: fp_backing_dir,
     };
@@ -861,7 +871,10 @@ where
     let active_workers = Arc::new(AtomicUsize::new(0));
     let live_workers = Arc::new(AtomicUsize::new(worker_plan.worker_count));
     let pause = Arc::new(PauseController::default());
+    #[cfg(not(feature = "verus"))]
     let max_violations = config.max_violations.max(1);
+    #[cfg(feature = "verus")]
+    let max_violations = crate::storage::verus_smoke::max_usize(config.max_violations, 1);
     let (violation_tx, violation_rx) = crossbeam_channel::bounded(max_violations + 1);
     let violation_count = Arc::new(AtomicUsize::new(0));
     // Error channel: workers send fatal errors here. Bounded(1) here would
@@ -1302,7 +1315,11 @@ where
         // unit tests in `page_aligned_color_map.rs`. NUMA node 0 is the
         // single-node fallback used throughout the runtime when no
         // explicit topology is requested.
+        #[cfg(not(feature = "verus"))]
         let cm_capacity = config.fp_expected_items.max(1024).next_power_of_two();
+        #[cfg(feature = "verus")]
+        let cm_capacity =
+            crate::storage::verus_smoke::max_usize(config.fp_expected_items, 1024).next_power_of_two();
         let color_map = match crate::storage::page_aligned_color_map::PageAlignedColorMap::new(
             cm_capacity,
             1,
@@ -1422,7 +1439,10 @@ where
             max_violations,
             error_tx: error_tx.clone(),
             stop_on_violation: config.stop_on_violation,
+            #[cfg(not(feature = "verus"))]
             fp_batch_size: config.fp_batch_size.max(1),
+            #[cfg(feature = "verus")]
+            fp_batch_size: crate::storage::verus_smoke::max_usize(config.fp_batch_size, 1),
             cpu: worker_plan.assigned_cpus.get(worker_id).copied().flatten(),
             numa_node: worker_plan
                 .worker_numa_nodes
