@@ -58,8 +58,12 @@ pub(super) fn next_quiescence_timeout_secs(attempt_index: u32, elapsed: Duration
     }
 
     let remaining_secs = QUIESCENCE_MAX_TOTAL_TIMEOUT_SECS - elapsed_secs;
+    #[cfg(not(feature = "verus"))]
+    let shift_amt = attempt_index.min(62);
+    #[cfg(feature = "verus")]
+    let shift_amt = crate::storage::verus_smoke::clamp_shift_to_lt_64(attempt_index);
     let planned_timeout =
-        QUIESCENCE_INITIAL_TIMEOUT_SECS.saturating_mul(1u64 << attempt_index.min(62));
+        QUIESCENCE_INITIAL_TIMEOUT_SECS.saturating_mul(1u64 << shift_amt);
     Some(planned_timeout.min(remaining_secs.max(1)))
 }
 

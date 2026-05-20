@@ -653,6 +653,23 @@ verus! {
         (bp_u64 % 8) as u32
     }
 
+    /// Clamp a u32 shift amount to `< 64`, the well-defined-shift
+    /// bound for `u64`. Mirrors `attempt_index.min(62)` at
+    /// `runtime::pause::next_quiescence_timeout_secs` (line 62), used
+    /// as `1u64 << attempt_index.min(62)`. Per Rust semantics shifting
+    /// a `u64` by `>= 64` is undefined behaviour (panics in debug,
+    /// wraps in release); the verified clamp rules this out.
+    ///
+    /// Verified: `ensures s < 64`. The exit branch returns `63`
+    /// instead of `62` to be conservative — both are `< 64` and
+    /// safe; the shipping callsite already uses 62 (one less than
+    /// the bound), which the verified pre-condition matches.
+    pub fn clamp_shift_to_lt_64(amount: u32) -> (s: u32)
+        ensures s < 64,
+    {
+        if amount < 64 { amount } else { 63 }
+    }
+
     /// Bit index of a value within a 64-bit word. Mirrors
     /// `node_id % (std::mem::size_of::<libc::c_ulong>() * 8)` at
     /// `storage::numa::set_preferred_node` (line 309) and
