@@ -1478,7 +1478,10 @@ impl PageAlignedFingerprintStore {
 
         // Detect NUMA topology
         let numa_topology = crate::storage::numa::NumaTopology::detect()?;
+        #[cfg(not(feature = "verus"))]
         let num_numa_nodes = numa_topology.node_count.max(1);
+        #[cfg(feature = "verus")]
+        let num_numa_nodes = crate::storage::verus_smoke::max_usize(numa_topology.node_count, 1);
 
         // Deterministic NUMA assignment: shards are evenly distributed across NUMA nodes
         // Shards 0..K on NUMA 0, K..2K on NUMA 1, etc.

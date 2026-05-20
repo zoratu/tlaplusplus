@@ -670,6 +670,20 @@ verus! {
         if amount < 64 { amount } else { 63 }
     }
 
+    /// Replace `usize::max` since Verus doesn't yet have a spec for
+    /// `Ord::max`. Returns the greater of `a` and `b`.
+    ///
+    /// Verified: `ensures r >= a, r >= b, (r == a || r == b)`. The
+    /// most useful instance is `max_usize(value, 1)`: shipping callers
+    /// rely on `r >= 1` to avoid divide-by-zero or empty-collection
+    /// bugs. The verified post-condition lifts that bound into the
+    /// callsite.
+    pub fn max_usize(a: usize, b: usize) -> (r: usize)
+        ensures r >= a, r >= b, r == a || r == b,
+    {
+        if a < b { b } else { a }
+    }
+
     /// Clamp a usize value into the inclusive interval `[min, max]`.
     /// Replaces shipping `.clamp(min, max)` calls under
     /// `--features verus` since Verus doesn't yet have a spec for

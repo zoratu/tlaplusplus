@@ -111,7 +111,10 @@ impl BloomFingerprintStore {
         Ok(Self {
             shards,
             shard_mask: shard_count - 1,
+            #[cfg(not(feature = "verus"))]
             num_numa_nodes: num_numa_nodes.max(1),
+            #[cfg(feature = "verus")]
+            num_numa_nodes: crate::storage::verus_smoke::max_usize(num_numa_nodes, 1),
             persist_tx: None,
             checks: AtomicU64::new(0),
             hits: AtomicU64::new(0),

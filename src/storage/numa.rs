@@ -526,7 +526,11 @@ impl NumaDiagnostics {
         fingerprint_store_nodes: Vec<usize>,
     ) -> Self {
         // Build workers_by_node mapping
-        let mut workers_by_node: Vec<Vec<usize>> = vec![Vec::new(); topology.node_count.max(1)];
+        #[cfg(not(feature = "verus"))]
+        let nc = topology.node_count.max(1);
+        #[cfg(feature = "verus")]
+        let nc = crate::storage::verus_smoke::max_usize(topology.node_count, 1);
+        let mut workers_by_node: Vec<Vec<usize>> = vec![Vec::new(); nc];
         for (worker_id, &node) in worker_numa_nodes.iter().enumerate() {
             if node < workers_by_node.len() {
                 workers_by_node[node].push(worker_id);
