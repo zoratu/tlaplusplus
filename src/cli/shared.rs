@@ -91,6 +91,12 @@ pub(crate) fn build_engine_config(
         donate_states_tx: None,
         donate_states_rx: None,
         stolen_states_tx: None,
+        // T10.2 phase 2 stage 5 Layer B — set later when
+        // --dfs-cluster-listen is specified.
+        dfs_cluster_transport: None,
+        dfs_cluster_node_id: 0,
+        dfs_cluster_num_nodes: 0,
+        dfs_cluster_tokio_handle: None,
         // T10.2 — opt-in streaming-SCC liveness oracle. When enabled, the
         // post-exploration phase runs nested-DFS over the same fingerprint
         // adjacency and cross-validates against Tarjan-based fairness.

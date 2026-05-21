@@ -118,6 +118,27 @@ pub struct EngineConfig {
     pub donate_states_rx: Option<crossbeam_channel::Receiver<Vec<u8>>>,
     /// Sender end of the stolen-states channel — passed to the inbound handler.
     pub stolen_states_tx: Option<crossbeam_channel::Sender<StolenState>>,
+    /// T10.2 phase 2 stage 5 Layer B — DFS-cluster transport bridge.
+    ///
+    /// When `Some` and the runtime is in DFS-pool mode, the pool's workers
+    /// route remote-partition successors via this transport instead of the
+    /// in-process channel. When `None` (the default), the DFS pool stays
+    /// single-node. Must be set in tandem with `dfs_cluster_node_id`,
+    /// `dfs_cluster_num_nodes`, and `dfs_cluster_tokio_handle`.
+    ///
+    /// Wired from the user-facing `--dfs-cluster-listen` CLI flag in
+    /// `cli/run_tla.rs`; tests can construct the bridge directly via
+    /// `dfs_cluster_test_api::run_one_cluster_node`.
+    pub dfs_cluster_transport: Option<Arc<dyn crate::distributed::transport::Transport>>,
+    /// This node's ID in the DFS cluster. Ignored when
+    /// `dfs_cluster_transport` is `None`.
+    pub dfs_cluster_node_id: u32,
+    /// Total number of nodes in the DFS cluster (this node + peers). Ignored
+    /// when `dfs_cluster_transport` is `None`.
+    pub dfs_cluster_num_nodes: u32,
+    /// Tokio runtime handle for the DFS-cluster transport's async tasks.
+    /// Ignored when `dfs_cluster_transport` is `None`.
+    pub dfs_cluster_tokio_handle: Option<tokio::runtime::Handle>,
     /// T10.2 — opt-in streaming-SCC liveness checker (nested DFS).
     ///
     /// When `true`, after the BFS exploration finishes the runtime runs a
@@ -232,6 +253,10 @@ impl Default for EngineConfig {
             donate_states_tx: None,
             donate_states_rx: None,
             stolen_states_tx: None,
+            dfs_cluster_transport: None,
+            dfs_cluster_node_id: 0,
+            dfs_cluster_num_nodes: 0,
+            dfs_cluster_tokio_handle: None,
             liveness_streaming: false,
             liveness_streaming_exploration: false,
             dfs_workers: 0,
@@ -1420,13 +1445,28 @@ where
                 trace_count: Arc::clone(&trace_state_count),
                 max_trace_states,
                 dfs_inband_verdict_done: Arc::clone(&dfs_inband_verdict_done),
-                // Layer B is not wired into `run_model` itself for v1.2.6
-                // — the multi-node DFS pool is exercised end-to-end via
-                // the `tests/dfs_cluster_layer_b.rs` rig that constructs
-                // the pool directly with a `DfsPoolClusterCtx` in hand.
-                // Keeping the runtime entrypoint single-node preserves
-                // gates 1-9 and avoids a flag-day for the cluster CLI.
-                cluster: None,
+                // T10.2 phase 2 stage 5 Layer B: when the user wired
+                // `--dfs-cluster-listen` (or a test installed the bridge
+                // via `EngineConfig.dfs_cluster_transport`), construct the
+                // multi-node `DfsPoolClusterCtx` so the pool routes
+                // remote-partition successors through the network transport
+                // instead of the in-process channel. When `None`, the pool
+                // stays single-node.
+                cluster: match (
+                    &config.dfs_cluster_transport,
+                    &config.dfs_cluster_tokio_handle,
+                ) {
+                    (Some(transport), Some(handle)) => {
+                        Some(dfs_pool::DfsPoolClusterCtx {
+                            transport: Arc::clone(transport),
+                            node_id: config.dfs_cluster_node_id,
+                            num_nodes: config.dfs_cluster_num_nodes,
+                            tokio_handle: handle.clone(),
+                            _phantom: std::marker::PhantomData,
+                        })
+                    }
+                    _ => None,
+                },
             };
 
             eprintln!(

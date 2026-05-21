@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::distributed::ClusterConfig;
 use crate::distributed::handler::StolenState;
-use crate::distributed::transport::ClusterTransport;
+use crate::distributed::transport::{ClusterTransport, Transport};
 use crate::distributed::work_stealer::DistributedWorkStealer;
 use crate::models::tla_native::TlaModel;
 use crate::tla::{TlaValue, eval_expr};
@@ -311,6 +311,85 @@ pub(crate) fn handle(
             cluster.node_id, num_nodes
         );
         cluster_stealer = Some(stealer);
+    }
+
+    // T10.2 phase 2 stage 5 Layer B: multi-node DFS-cluster pool.
+    // Mutually exclusive with --cluster-listen (the T6 BFS path above).
+    if let Some(ref dfs_listen_str) = cluster.dfs_cluster_listen {
+        if cluster.cluster_listen.is_some() {
+            anyhow::bail!(
+                "--dfs-cluster-listen and --cluster-listen are mutually exclusive; pick one cluster mode per run"
+            );
+        }
+        let listen_addr: std::net::SocketAddr = dfs_listen_str.parse().map_err(|e| {
+            anyhow::anyhow!(
+                "invalid --dfs-cluster-listen address '{}': {}",
+                dfs_listen_str,
+                e
+            )
+        })?;
+        let peers: Vec<std::net::SocketAddr> = cluster
+            .cluster_peers
+            .iter()
+            .map(|s| {
+                s.parse()
+                    .map_err(|e| anyhow::anyhow!("invalid peer address '{}': {}", s, e))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        let cluster_config = ClusterConfig {
+            node_id: cluster.node_id,
+            listen_addr,
+            peers: peers.clone(),
+        };
+        let num_nodes = cluster_config.num_nodes();
+
+        let tokio_rt = tokio::runtime::Runtime::new()
+            .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {}", e))?;
+        let tokio_handle = tokio_rt.handle().clone();
+
+        let transport = tokio_handle
+            .block_on(async { ClusterTransport::new(cluster_config.clone()).await })?;
+
+        println!(
+            "[dfs-cluster] node {} listening on {}, connecting to {} peers...",
+            cluster.node_id,
+            listen_addr,
+            peers.len()
+        );
+        tokio_handle.block_on(async {
+            for attempt in 0..30 {
+                match transport.connect_to_peers().await {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        if attempt < 29 {
+                            eprintln!(
+                                "[dfs-cluster] peer connection attempt {} failed: {}, retrying...",
+                                attempt + 1, e
+                            );
+                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+            unreachable!()
+        })?;
+        println!("[dfs-cluster] connected to all peers");
+
+        engine_config.dfs_cluster_transport = Some(transport.clone() as Arc<dyn Transport>);
+        engine_config.dfs_cluster_node_id = cluster.node_id;
+        engine_config.dfs_cluster_num_nodes = num_nodes;
+        engine_config.dfs_cluster_tokio_handle = Some(tokio_handle.clone());
+
+        // Leak the tokio runtime so its tasks survive `run_model_with_s3`.
+        std::mem::forget(tokio_rt);
+
+        println!(
+            "[dfs-cluster] T10.2 stage 5 Layer B active: node {}, {} total nodes",
+            cluster.node_id, num_nodes
+        );
     }
 
     let mut outcome = run_model_with_s3(model, engine_config, &s3).map_err(|e| {

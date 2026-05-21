@@ -260,16 +260,28 @@ pub(crate) struct S3Args {
 
 #[derive(Args, Clone, Debug)]
 pub(crate) struct ClusterArgs {
-    /// Listen address for distributed cluster communication (e.g., 0.0.0.0:7878).
-    /// When set, enables distributed mode.
+    /// Listen address for T6 independent-exploration cluster mode
+    /// (e.g., 0.0.0.0:7878). When set, enables BFS-based multi-node
+    /// model checking with cross-node work stealing. Mutually exclusive
+    /// with `--dfs-cluster-listen` — pick one cluster mode per run.
     #[arg(long)]
     pub(crate) cluster_listen: Option<String>,
-    /// Comma-separated peer addresses (e.g., 10.0.0.2:7878,10.0.0.3:7878)
+    /// Comma-separated peer addresses (e.g., 10.0.0.2:7878,10.0.0.3:7878).
+    /// Used by both `--cluster-listen` (T6 BFS) and `--dfs-cluster-listen`
+    /// (T10.2 DFS pool).
     #[arg(long, value_delimiter = ',')]
     pub(crate) cluster_peers: Vec<String>,
-    /// This node's ID in the cluster (must be unique per node)
+    /// This node's ID in the cluster (must be unique per node). Shared
+    /// by both cluster modes.
     #[arg(long, default_value_t = 0)]
     pub(crate) node_id: u32,
+    /// Listen address for T10.2 phase 2 stage 5 Layer B DFS-cluster pool
+    /// (e.g., 0.0.0.0:7900). When set, enables multi-node fingerprint-
+    /// partitioned DFS exploration with cross-partition routing over the
+    /// network transport. Mutually exclusive with `--cluster-listen`.
+    /// Use the same `--cluster-peers` and `--node-id` as the BFS mode.
+    #[arg(long)]
+    pub(crate) dfs_cluster_listen: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
