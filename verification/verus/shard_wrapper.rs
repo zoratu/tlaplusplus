@@ -514,10 +514,10 @@ pub fn cas_insert_or_observe(
         fp != empty_slot(),
         old(perm).view().patomic == shard.slots@[idx as int].id(),
     ensures
-        perm.view().patomic == old(perm).view().patomic,
+        final(perm).view().patomic == old(perm).view().patomic,
         ({
             let pre = old(perm).view().value;
-            let post = perm.view().value;
+            let post = final(perm).view().value;
             match result {
                 CasOutcome::Inserted => pre == empty_slot() && post == fp,
                 CasOutcome::AlreadyPresent => pre == fp && post == fp,
@@ -597,17 +597,17 @@ pub fn bounded_contains_or_insert_loop(
         shard.capacity <= u64::MAX as usize,
     ensures
         // Permissions remain well-formed across the call.
-        perms_wf(*shard, *perms),
+        perms_wf(*shard, *final(perms)),
         // After the call: a `NewlyInserted` outcome implies the slot
         // observed by the caller now contains fp.
         result is NewlyInserted ==> exists|j: int|
             0 <= j < shard.capacity
-            && #[trigger] shard_view(*shard, *perms)[j] == fp,
+            && #[trigger] shard_view(*shard, *final(perms))[j] == fp,
         // An `AlreadyPresent` outcome implies fp was already in the
         // abstract view (since we observed it via load).
         result is AlreadyPresent ==> exists|j: int|
             0 <= j < shard.capacity
-            && #[trigger] shard_view(*shard, *perms)[j] == fp,
+            && #[trigger] shard_view(*shard, *final(perms))[j] == fp,
 {
     let cap = shard.capacity;
     let cap_u64: u64 = cap as u64;

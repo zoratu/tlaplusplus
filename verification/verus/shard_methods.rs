@@ -247,10 +247,10 @@ pub fn cas_insert_or_observe(
         fp != empty_slot(),
         old(perm).view().patomic == cells.slots@[idx as int].id(),
     ensures
-        perm.view().patomic == old(perm).view().patomic,
+        final(perm).view().patomic == old(perm).view().patomic,
         ({
             let pre = old(perm).view().value;
-            let post = perm.view().value;
+            let post = final(perm).view().value;
             match result {
                 CasOutcome::Inserted => pre == empty_slot() && post == fp,
                 CasOutcome::AlreadyPresent => pre == fp && post == fp,
@@ -308,13 +308,13 @@ pub fn rehash_one_step(
         fp != empty_slot(),
         old(perm).view().patomic == new_cells.slots@[idx as int].id(),
     ensures
-        perm.view().patomic == old(perm).view().patomic,
+        final(perm).view().patomic == old(perm).view().patomic,
         // If settled, the post-state slot holds fp.
-        settled ==> perm.view().value == fp,
+        settled ==> final(perm).view().value == fp,
         // If not settled, slot still holds something other than 0 or fp
         // (caller must continue probing).
         !settled ==> {
-            let post = perm.view().value;
+            let post = final(perm).view().value;
             post != empty_slot() && post != fp
         },
 {
@@ -703,10 +703,10 @@ pub fn contains_or_insert_step(
         fp != empty_slot(),
         old(perm).view().patomic == cells.slots@[idx as int].id(),
     ensures
-        perm.view().patomic == old(perm).view().patomic,
+        final(perm).view().patomic == old(perm).view().patomic,
         ({
             let pre = old(perm).view().value;
-            let post = perm.view().value;
+            let post = final(perm).view().value;
             match result {
                 InsertStepOutcome::AlreadyPresent =>
                     pre == fp && post == fp,
