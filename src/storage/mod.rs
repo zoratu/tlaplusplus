@@ -29,6 +29,10 @@ pub mod queue;
 // marked `#[verifier::external]` without losing the verified items.
 #[cfg(feature = "verus")]
 pub mod verus_smoke;
+// T13.4 full lift Phase A.1 — verified parallel shard struct. See
+// `verification/verus/T13.4-FULL-LIFT-PLAN.md`.
+#[cfg(feature = "verus")]
+pub mod verified_fp_shard;
 #[cfg_attr(feature = "verus", verifier::external)]
 pub mod s3_persistence;
 #[cfg_attr(feature = "verus", verifier::external)]
