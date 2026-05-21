@@ -29,9 +29,10 @@ standalone artifacts; what remains is mechanical engineering work.
 | `scripts/chaos_smoke.sh` (swarm-mode auto) | 12/12 failpoints, 39 concurrent pairs, 0 div, 0 hangs |
 | `cargo verus check --features verus` (shipping) | 49 verified, 0 errors |
 | Verus standalone (9 of 11 tiers) | 144 verified, 0 errors |
+| `scripts/chaos_soak.sh --duration 86400 --swarm-mode auto` (post-release; cut short by spot reclaim at ~12.7h) | 2,526 iters, 100% verdict=ok, 0 div, 0 hangs |
 
 See `RELEASE_1.2.7_SUMMARY.md` for the full helper inventory, file-coverage list,
-and the T13.4 closure-status update.
+the T13.4 closure-status update, and the extended chaos-soak detail.
 
 Drop-in for v1.2.0–v1.2.6. No public-API or CLI changes.
 

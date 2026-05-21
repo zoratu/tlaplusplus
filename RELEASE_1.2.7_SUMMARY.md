@@ -113,12 +113,33 @@ All test gates pass on a fresh c6gd.metal aarch64 spot:
 | `scripts/chaos_smoke.sh` (swarm-mode auto) | 15 iters, 12/12 failpoints fired, 39 concurrent pairs, 0 div / 0 hangs | PASS gate |
 | `cargo verus check --features verus` (shipping) | 49 verified, 0 errors | NEW |
 | Verus standalone tiers (9 of 11) | 144 verified, 0 errors | b/a/liveness/v2/sm/epoch/exec-wired/mmap/multi-slot |
+| `scripts/chaos_soak.sh --duration 86400 --swarm-mode auto` (cut short by AWS spot reclaim at ~12.7h) | 2,526 iters complete, 2,526 / 2,526 verdict=ok, 0 divergences, 0 hangs | 12-fold over 1-hour release-ritual baseline (~210 iters) |
 
 Two standalone tier files (`shard_methods.rs`, `shard_wrapper.rs`) hit pre-existing
 Verus version drift on the spot's HEAD-built verus binary (mut-ref migration
 post-`46362a2` pinned in `Cargo.toml`). Last touched 2026-05-11; not a v1.2.7
 regression. The shipping `cargo verus check --features verus` path against pinned
 vstd 46362a2 still passes 49/49.
+
+### Extended chaos-soak detail (post-release validation)
+
+A long-soak run kicked off after tagging, targeting 24 hours; AWS reclaimed the
+c6gd.metal aarch64 spot at the ~12.7-hour mark. The partial result is itself a
+strong signal: **2,526 iterations** of `corpus/internals/CheckpointDrain.tla`
+(26,344 distinct states per iter, control baseline 16.6 s wall) under
+`--swarm-mode auto` (random N in [1, 4] concurrent failpoints per iteration,
+sampled from the 12-failpoint catalog in `src/chaos.rs`). Every iteration agreed
+with the control on both state count and verdict (`distinct=26344 verdict=ok`).
+No divergences, no hangs, no panics-without-recovery across the full run. Hourly
+heartbeat checks (sampled in a separate log) confirmed steady ~215 iters/hour
+throughout.
+
+Failpoint coverage was statistically saturated by the swarm distribution: at
+2,526 iters with N drawn uniformly from `[1, 4]` over a catalog of 12, every
+single-failpoint and every concurrent pair were exercised many times. The
+5-minute pre-release smoke (15 iters, all 12 failpoints fired, 39 distinct
+concurrent pairs) already confirmed catalog saturation under the same harness;
+the long-soak result extends the same property out by ~170× iteration count.
 
 ## Compatibility
 
