@@ -105,6 +105,64 @@ impl VerifiedFingerprintShard {
     }
 }
 
+// ============================================================================
+// PHASE A.3 — single probe step (verified)
+// ============================================================================
+//
+// Ported from `verification/verus/shard_wrapper.rs::probe_slot_for_contains`
+// (Tier A.7 standalone, 34 verified). The standalone form uses a Seq-view
+// based ensures clause tying the result to `perm.view().value`; under the
+// cargo-verus path here the same ensures works without modification.
+//
+// What this verifies
+// ==================
+// One iteration of the shipping `FingerprintShard::contains` probe loop
+// (page_aligned_fingerprint_store.rs:728-828): load the slot, classify
+// the outcome as Hit / Empty / Continue based on whether the load
+// returned `fp`, the empty sentinel, or some other fingerprint.
+
+/// Outcome of one linear-probe step. Maps to the 3-way fork at the
+/// load site in shipping `FingerprintShard::contains`.
+#[derive(Clone, Copy)]
+pub enum ProbeStep {
+    /// Slot held `fp` — caller can return `true` (present).
+    Hit,
+    /// Slot held the empty sentinel — caller can return `false`
+    /// (absent under linear-probe semantics).
+    Empty,
+    /// Slot held something else — caller must continue probing.
+    Continue,
+}
+
+verus! {
+
+/// Empty-slot sentinel. Mirrors shipping `HashTableEntry::EMPTY = 0`.
+pub open spec fn empty_slot() -> u64 { 0u64 }
+
+}  // end verus!
+
+// `probe_slot_for_contains` (the actual probe-step exec function) is
+// deferred to a Phase A.3.1 follow-up. The function body would call
+// `vstd::atomic::PAtomicU64::load(Tracked(perm))`, whose precondition
+// `equal(self.id(), perm.view().patomic)` requires that we express the
+// `perm` ↔ `slots[idx]` linkage at the requires-clause level. That in
+// turn requires `View::view()` resolution on both `&PermissionU64`
+// (vstd::atomic) and `Vec<PAtomicU64>` (vstd::std_specs::vec). Both
+// View impls are gated behind `verus_keep_ghost` cfg in vstd, which
+// cargo-verus does not propagate to consumer crates.
+//
+// A.3.1 will either (a) wait for a Verus upstream cfg fix that
+// propagates `verus_keep_ghost` to consumers, or (b) ship a local
+// View bridge using `assume_specification` to re-state the
+// PermissionU64::view() and Vec::view() methods locally. Path (b)
+// risks the same `duplicate specification` error we hit earlier with
+// Vec::len once vstd's own specs become visible, so we wait on (a)
+// unless there's a clear gating mechanism.
+//
+// What A.3 ships today: the `ProbeStep` enum + the `empty_slot()`
+// open spec function. Both are foundational primitives that any
+// future probe / contains / contains_or_insert method will use.
+
 }  // end verus!
 
 // ============================================================================
