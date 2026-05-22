@@ -1,3 +1,9 @@
+// T13.4 Phase A.2 — under `--features verus` we use `assume_specification`
+// to bridge `std::vec::Vec::<T, A>::len`, whose actual signature carries
+// the unstable `allocator_api` allocator-parameter generic. Default
+// builds (no `verus` feature) never see this and stay on stable rustc.
+#![cfg_attr(feature = "verus", feature(allocator_api))]
+
 // T13.4 Phase 2 — `#[cfg_attr(feature = "verus", verifier::external)]`
 // markers tell cargo-verus to skip modules that aren't being verified.
 // Under regular rustc with `--features verus`, these attributes are

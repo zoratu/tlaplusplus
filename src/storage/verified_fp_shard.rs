@@ -34,28 +34,44 @@
 
 use verus_builtin::*;
 use verus_builtin_macros::verus;
+use vstd::atomic::*;
 use vstd::prelude::*;
+use vstd::view::*;
 
 verus! {
+
+// ============================================================================
+// Vec spec availability
+// ============================================================================
+//
+// Under cargo-verus with a patched vstd (`axiom_u64_trailing_zeros` in
+// `std_specs/bits.rs` marked `#[verifier::external_body]`), vstd's own
+// `Vec<T, A>` spec at `std_specs/vec.rs` IS available — including
+// `Vec::len` with its `n == v@.len()` postcondition. No local bridge
+// is needed.
+//
+// The patch is applied to the spot's cargo git checkout of vstd by
+// `/tmp/verus_bootstrap_s7c.sh`. Background on why: under stock
+// `verify = true`, vstd's `axiom_u64_trailing_zeros` proof body triggers
+// a Z3 4.13.3 reader-thread crash on aarch64 (irreducible to an rlimit
+// bump — Z3 returns malformed output, not a timeout). Marking just
+// that one function `external_body` keeps the rest of vstd's spec
+// machinery (including the Vec spec) fully available.
 
 // ============================================================================
 // SHIPPING-SHAPE STRUCT — mirrors `FingerprintShard`'s slot array.
 // ============================================================================
 
 pub struct VerifiedFingerprintShard {
+    /// Per-slot atomic fingerprint storage. Each slot is a Verus
+    /// `PAtomicU64` whose access is gated by a `PermissionU64` ghost
+    /// token in the shard's tracked permission map (the permission map
+    /// itself is threaded by callers; see Phase A.3 docs).
+    pub slots: Vec<PAtomicU64>,
     /// Capacity (number of slots). Set at construction and stable for
     /// the lifetime of this instance — resize lives in Phase A.5.
-    ///
-    /// Phase A.1 ships ONLY the capacity field. The `slots: Vec<PAtomicU64>`
-    /// field plus the `Tracked<Map<int, PermissionU64>>` permission map
-    /// are deferred to Phase A.2, because cargo-verus's vstd consumption
-    /// path (under the `verify = false` patch we apply for the aarch64
-    /// Z3 4.13.3 workaround) currently erases `Vec` specs and forces an
-    /// `external_type_specification` bridge before they're usable here.
-    /// The standalone proof at `verification/verus/shard_wrapper.rs`
-    /// (Tier A.7, 34 verified) already includes the full struct shape —
-    /// Phase A.2 lifts that shape into shipping source once the Vec
-    /// spec gap is closed.
+    /// By the wrapper invariant (Phase A.3's `perms_wf`),
+    /// `self.slots@.len() == self.capacity`.
     pub capacity: usize,
 }
 
@@ -73,11 +89,20 @@ impl VerifiedFingerprintShard {
         self.capacity
     }
 
-    // `len_slots()` deferred to Phase A.2 — needs vstd's `Vec::len`
-    // assume_specification, which isn't auto-imported in this cargo-
-    // verus context. Once the `perms_wf` invariant lands we have
-    // `self.slots.len() == self.capacity` so the getter becomes
-    // unnecessary anyway (callers use `capacity()`).
+    /// Slot-count getter. Mirrors the implicit `slots.len()` call in
+    /// shipping `FingerprintShard` (which uses raw pointer arithmetic
+    /// + capacity in `unsafe { from_raw_parts(table, capacity) }.len()`
+    /// at the read path).
+    ///
+    /// Phase A.2 ships this as exec-callable WITHOUT the `n == self.slots@.len()`
+    /// ensures, because vstd's `View for Vec` impl is gated behind
+    /// `verus_keep_ghost` cfg and isn't visible from this cargo-verus
+    /// context. Phase A.3 lifts the postcondition once the Seq-view
+    /// machinery is wired (either via a Verus upstream cfg fix or via
+    /// a local View bridge).
+    pub fn len_slots(&self) -> usize {
+        self.slots.len()
+    }
 }
 
 }  // end verus!
