@@ -68,28 +68,40 @@ cd "$HOME/tlaplusplus"
 cargo fetch --features verus 2>&1 | tail -3 || true
 
 echo
-echo "=== patching vstd bits.rs::axiom_u64_trailing_zeros to external_body ==="
+echo "=== patching all vstd bits.rs axiom_* to external_body ==="
+# Why all 15: under verify=true (needed so vstd's Vec/Seq specs are
+# exposed), Verus checks each axiom_*'s bit_vector-heavy proof body.
+# aarch64 Z3 4.13.3 chokes on multiple of them (Z3 reader-thread
+# panics with "stream did not contain valid UTF-8"). Marking each
+# axiom external_body preserves the public spec interface but skips
+# the proof body — soundness-equivalent to trusting these well-known
+# bit-counting axioms.
 for f in $(ls /home/ubuntu/.cargo/git/checkouts/verus-*/*/source/vstd/std_specs/bits.rs 2>/dev/null); do
   python3 - <<PY
-import re, sys
+import re
 path = "$f"
 with open(path) as fh:
     src = fh.read()
-if '#[verifier::external_body]\npub broadcast proof fn axiom_u64_trailing_zeros' in src:
-    print(f"already patched: {path}")
+lines = src.split('\n')
+out, n = [], 0
+i = 0
+while i < len(lines):
+    L = lines[i]
+    if re.match(r'^\s*pub broadcast proof fn axiom_\w+', L):
+        prev = lines[i-1] if i > 0 else ''
+        if 'external_body' not in prev:
+            indent = re.match(r'^(\s*)', L).group(1)
+            out.append(f'{indent}#[verifier::external_body]')
+            n += 1
+    out.append(L)
+    i += 1
+new_src = '\n'.join(out)
+if new_src != src:
+    with open(path, 'w') as fh:
+        fh.write(new_src)
+    print(f'patched {n} axioms: {path}')
 else:
-    src2 = re.sub(
-        r'(pub broadcast proof fn axiom_u64_trailing_zeros)',
-        r'#[verifier::external_body]\n\1',
-        src,
-        count=1,
-    )
-    if src2 != src:
-        with open(path, 'w') as fh:
-            fh.write(src2)
-        print(f"patched: {path}")
-    else:
-        print(f"no match in: {path}")
+    print(f'no change: {path}')
 PY
 done
 

@@ -105,6 +105,8 @@ impl VerifiedFingerprintShard {
     }
 }
 
+}  // end verus!
+
 // ============================================================================
 // PHASE A.3 — single probe step (verified)
 // ============================================================================
@@ -121,6 +123,8 @@ impl VerifiedFingerprintShard {
 // the outcome as Hit / Empty / Continue based on whether the load
 // returned `fp`, the empty sentinel, or some other fingerprint.
 
+verus! {
+
 /// Outcome of one linear-probe step. Maps to the 3-way fork at the
 /// load site in shipping `FingerprintShard::contains`.
 #[derive(Clone, Copy)]
@@ -134,34 +138,49 @@ pub enum ProbeStep {
     Continue,
 }
 
-verus! {
-
 /// Empty-slot sentinel. Mirrors shipping `HashTableEntry::EMPTY = 0`.
 pub open spec fn empty_slot() -> u64 { 0u64 }
 
 }  // end verus!
 
-// `probe_slot_for_contains` (the actual probe-step exec function) is
-// deferred to a Phase A.3.1 follow-up. The function body would call
-// `vstd::atomic::PAtomicU64::load(Tracked(perm))`, whose precondition
-// `equal(self.id(), perm.view().patomic)` requires that we express the
-// `perm` ↔ `slots[idx]` linkage at the requires-clause level. That in
-// turn requires `View::view()` resolution on both `&PermissionU64`
-// (vstd::atomic) and `Vec<PAtomicU64>` (vstd::std_specs::vec). Both
-// View impls are gated behind `verus_keep_ghost` cfg in vstd, which
-// cargo-verus does not propagate to consumer crates.
-//
-// A.3.1 will either (a) wait for a Verus upstream cfg fix that
-// propagates `verus_keep_ghost` to consumers, or (b) ship a local
-// View bridge using `assume_specification` to re-state the
-// PermissionU64::view() and Vec::view() methods locally. Path (b)
-// risks the same `duplicate specification` error we hit earlier with
-// Vec::len once vstd's own specs become visible, so we wait on (a)
-// unless there's a clear gating mechanism.
-//
-// What A.3 ships today: the `ProbeStep` enum + the `empty_slot()`
-// open spec function. Both are foundational primitives that any
-// future probe / contains / contains_or_insert method will use.
+verus! {
+
+/// Pure-value classification of a slot's stored fingerprint.
+///
+/// The full probe-step exec function (with the `PAtomicU64::load`
+/// call) is parked until the View-trait gating issue is resolved
+/// (see "View gating" comment in `T13.4-FULL-LIFT-PLAN.md` Phase A.3.1).
+/// In the meantime, this *pure* classification function is fully
+/// verified — it has no atomic load and no permission threading, so
+/// it sidesteps the vstd `View for PermissionU64` / `View for Vec`
+/// machinery entirely. The caller does the atomic load externally
+/// and feeds the result here.
+///
+/// Verified contract:
+///   Hit      ==> stored == fp
+///   Empty    ==> stored == empty_slot()
+///   Continue ==> stored != fp && stored != empty_slot()
+///
+/// Together with `next_probe_slot` (verified in
+/// `src/storage/verus_smoke.rs`) this completes the algorithmic
+/// pieces of the linear-probe loop. What remains for Phase A.3.1 is
+/// just the atomic-load step, which the wrapper struct's existence
+/// (Phase A.1) and Vec field (Phase A.2) already prepared the way for.
+pub fn classify_slot_value(stored: u64, fp: u64) -> (result: ProbeStep)
+    requires fp != empty_slot(),
+    ensures
+        (matches!(result, ProbeStep::Hit) ==> stored == fp)
+        && (matches!(result, ProbeStep::Empty) ==> stored == empty_slot())
+        && (matches!(result, ProbeStep::Continue) ==> stored != fp && stored != empty_slot()),
+{
+    if stored == fp {
+        ProbeStep::Hit
+    } else if stored == 0 {
+        ProbeStep::Empty
+    } else {
+        ProbeStep::Continue
+    }
+}
 
 }  // end verus!
 
