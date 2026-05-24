@@ -106,6 +106,30 @@ PY
 done
 
 echo
+echo "=== patching vstd endian.rs::to_big_single to external_body ==="
+# Same rationale as bits.rs axiom_*: the spinoff_prover proof body uses
+# heavy bit_vector reasoning that Z3 4.13.3 chokes on (Z3 reader-thread
+# panics with "stream did not contain valid UTF-8"). external_body
+# preserves the public spec interface while skipping the proof body.
+for f in $(ls /home/ubuntu/.cargo/git/checkouts/verus-*/*/source/vstd/endian.rs 2>/dev/null); do
+  python3 - <<PY
+import re
+path = "$f"
+with open(path) as fh:
+    src = fh.read()
+m = re.search(r"#\[verifier::spinoff_prover\]\n(\s+)pub proof fn to_big_single", src)
+if m and "external_body" not in src[max(0, m.start()-50):m.start()]:
+    indent = m.group(1)
+    src = src[:m.start()] + f"#[verifier::external_body]\n{indent}" + src[m.start():]
+    with open(path, "w") as fh:
+        fh.write(src)
+    print(f"patched: {path}")
+else:
+    print(f"no change: {path}")
+PY
+done
+
+echo
 echo "=== ensuring vstd verify = true (so spec items are exposed) ==="
 for f in $(ls /home/ubuntu/.cargo/git/checkouts/verus-*/*/source/vstd/Cargo.toml 2>/dev/null); do
   sed -i 's/^verify = false$/verify = true/' "$f"
