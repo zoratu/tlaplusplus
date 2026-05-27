@@ -106,6 +106,12 @@ pub struct WorkStealingQueues<T> {
     global_popped: AtomicU64,
     /// Flag set when first work is taken - prevents premature termination during startup
     has_started: AtomicBool,
+    /// Flag set once Init enumeration is complete (producer finished or there is
+    /// no producer). Releases the `has_started` startup guard so a run that pops
+    /// zero states — e.g. resume where every initial state is already in the
+    /// fp-store, or a spec with no reachable states — can still terminate
+    /// instead of spinning forever in `pop_slow_path`. See should_terminate.
+    init_complete: AtomicBool,
     /// Flag to prevent termination during checkpoint (queues may be temporarily empty)
     checkpoint_in_progress: AtomicBool,
     /// Flag to indicate pause is requested - workers should exit pop_slow_path
@@ -196,6 +202,7 @@ impl<T: 'static> WorkStealingQueues<T> {
             global_pushed: AtomicU64::new(0),
             global_popped: AtomicU64::new(0),
             has_started: AtomicBool::new(false),
+            init_complete: AtomicBool::new(false),
             checkpoint_in_progress: AtomicBool::new(false),
             pause_requested: AtomicBool::new(false),
             disk_has_pending_work: AtomicBool::new(false),
@@ -553,7 +560,16 @@ impl<T: 'static> WorkStealingQueues<T> {
         // simultaneously, one gets the initial state, and others see empty queues
         // with 0 active workers (the winner hasn't called worker_start yet) and
         // incorrectly terminate.
-        if !self.has_started.load(Ordering::Acquire) {
+        //
+        // EXCEPTION: once Init enumeration is complete (`init_complete`), the
+        // startup race is over — no more states will ever be pushed. An empty
+        // queue is then genuinely terminal even if nothing was ever popped
+        // (e.g. resume where every initial state is already in the fp-store, or
+        // a spec with no reachable states). Without this exception the workers
+        // spin forever in `pop_slow_path`. See bug_checkpoint_resume_hang.
+        if !self.has_started.load(Ordering::Acquire)
+            && !self.init_complete.load(Ordering::Acquire)
+        {
             return false;
         }
 
@@ -585,6 +601,14 @@ impl<T: 'static> WorkStealingQueues<T> {
         }
 
         true
+    }
+
+    /// Signal that Init enumeration is finished (producer done, or there was
+    /// no producer). Releases the `has_started` startup guard in
+    /// `should_terminate` so a run that never pops a state can still terminate.
+    #[inline]
+    pub fn mark_init_complete(&self) {
+        self.init_complete.store(true, Ordering::Release);
     }
 
     /// Mark worker as active using per-NUMA counter
