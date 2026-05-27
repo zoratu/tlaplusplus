@@ -562,7 +562,7 @@ impl Model for TlaModel {
     }
 
     fn fingerprint(&self, state: &Self::State) -> u64 {
-        use ahash::AHasher;
+        use crate::model::fingerprint_hasher;
         use std::hash::Hasher;
 
         // Symmetry canonicalization is handled by canonicalize() in the
@@ -573,7 +573,7 @@ impl Model for TlaModel {
             match self.evaluate_view(state) {
                 Ok(view_value) => {
                     if let Ok(bytes) = bincode::serialize(&view_value) {
-                        let mut hasher = AHasher::default();
+                        let mut hasher = fingerprint_hasher();
                         hasher.write(&bytes);
                         return hasher.finish();
                     }
@@ -585,7 +585,7 @@ impl Model for TlaModel {
         }
 
         // No view or view failed - hash the full state using serialization
-        let mut hasher = AHasher::default();
+        let mut hasher = fingerprint_hasher();
         if let Ok(bytes) = bincode::serialize(state) {
             hasher.write(&bytes);
         }

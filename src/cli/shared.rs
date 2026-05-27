@@ -193,9 +193,8 @@ pub(crate) fn run_system_checks(skip: bool) {
 /// If any ASSUME evaluates to FALSE, prints an error and exits.
 
 pub(crate) fn model_fingerprint(state: &TlaState) -> u64 {
-    use ahash::AHasher;
     use std::hash::{Hash, Hasher};
-    let mut h = AHasher::default();
+    let mut h = crate::model::fingerprint_hasher();
     state.hash(&mut h);
     h.finish()
 }

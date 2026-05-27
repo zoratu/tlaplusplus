@@ -247,13 +247,13 @@ pub fn symmetric_fingerprint<S>(state: &S, symmetry: Option<&SymmetrySpec>) -> u
 where
     S: Clone + Debug + Hash + Serialize + for<'de> Deserialize<'de>,
 {
-    use ahash::AHasher;
+    use crate::model::fingerprint_hasher;
     use std::hash::Hasher;
 
     if let Some(spec) = symmetry {
         // Compute canonical form and fingerprint it
         let canonical = canonicalize_state(state, spec);
-        let mut hasher = AHasher::default();
+        let mut hasher = fingerprint_hasher();
 
         // Serialize to get deterministic hash
         if let Ok(bytes) = bincode::serialize(&canonical) {
@@ -263,7 +263,7 @@ where
         hasher.finish()
     } else {
         // No symmetry - use regular fingerprint
-        let mut hasher = AHasher::default();
+        let mut hasher = fingerprint_hasher();
 
         if let Ok(bytes) = bincode::serialize(state) {
             hasher.write(&bytes);
