@@ -655,7 +655,7 @@ where
     let mut fp_store = UnifiedFingerprintStore::new(fp_config, &worker_plan.assigned_cpus)?;
 
     // Set up fingerprint persistence for resume support
-    let _fp_persist_runtime = if config.enable_fp_persistence {
+    let fp_persist = if config.enable_fp_persistence {
         // Create persist channels (one per shard)
         let (persist_tx, persist_rx) = create_persist_channels(shard_count, 10_000);
         fp_store.enable_persistence(persist_tx);
@@ -668,21 +668,25 @@ where
             .build()
             .context("Failed to create fingerprint I/O runtime")?;
 
-        // Spawn writer tasks for each shard
+        // Spawn writer tasks for each shard. Keep the JoinHandles so the
+        // teardown path can await a clean final flush (see the post-orchestrate
+        // block at the end of run_model) — otherwise the writers are aborted
+        // mid-flush when this runtime drops, leaving a partial segment.bin.
         let work_dir = config.work_dir.clone();
+        let mut writer_handles = Vec::with_capacity(shard_count);
         for (shard_id, rx) in persist_rx.into_iter().enumerate() {
             let wd = work_dir.clone();
-            runtime.spawn(async move {
+            writer_handles.push(runtime.spawn(async move {
                 if let Err(e) = fingerprint_writer_task(shard_id, rx, wd).await {
                     // Channel disconnected is expected on shutdown
                     if !e.to_string().contains("disconnected") {
                         eprintln!("Fingerprint writer shard {} error: {}", shard_id, e);
                     }
                 }
-            });
+            }));
         }
 
-        Some(runtime)
+        Some((runtime, writer_handles))
     } else {
         None
     };
@@ -1548,7 +1552,7 @@ where
     // sequence is documented in `docs/runtime-refactor-plan.md`
     // "Concurrency-coupling analysis" §7; see shutdown.rs module docs
     // for the per-step rationale and ordering invariants.
-    shutdown::ShutdownContext::<M> {
+    let outcome = shutdown::ShutdownContext::<M> {
         workers,
         stop: Arc::clone(&stop),
         init_producer,
@@ -1574,7 +1578,32 @@ where
         labeled_transitions: labeled_transitions_for_shutdown,
         dfs_inband_verdict_done,
     }
-    .orchestrate()
+    .orchestrate();
+
+    // Flush async fingerprint persistence so the checkpoint's per-shard
+    // segment.bin captures the COMPLETE fp set before we return. orchestrate()
+    // has joined every thread holding an fp_store clone (workers, init
+    // producer, checkpoint, progress, mem-monitor) and consumed the
+    // ShutdownContext's clone, so `fp_store` here is the last Arc — dropping it
+    // closes the persist channels and each writer task flushes its final batch
+    // on channel disconnect. Without this, the writers are aborted mid-flush
+    // when the I/O runtime drops at function exit, leaving a partial
+    // segment.bin that makes a later resume re-explore and over-count the
+    // un-flushed states. The timeout is a defensive bound (the await completes
+    // sub-second in practice once the senders drop).
+    if let Some((rt, writer_handles)) = fp_persist {
+        drop(fp_store);
+        rt.block_on(async move {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                for h in writer_handles {
+                    let _ = h.await;
+                }
+            })
+            .await;
+        });
+    }
+
+    outcome
 }
 
 /// Reconstruct trace to a violating state using post-processing
@@ -1816,19 +1845,15 @@ mod tests {
             started.elapsed()
         );
         assert!(resumed.violation.is_none(), "resume verdict must match");
-        // Resume must preserve all explored progress: it loads the checkpoint's
-        // distinct counter (== the first run's) and only adds from there. It can
-        // legitimately re-count states whose fingerprints the async fp-writer
-        // hadn't flushed to disk before the first run exited — so under load the
-        // resumed count can EXCEED the first run's (a sound re-exploration, not a
-        // loss). Asserting `>=` is therefore the deterministic invariant; exact
-        // equality is flaky because the flushed-fp subset depends on writer
-        // timing. See bug_checkpoint_resume_hang (async-flush re-count note).
-        assert!(
-            resumed.stats.states_distinct >= first.stats.states_distinct,
-            "resume must not lose explored progress: resumed {} < first {}",
-            resumed.stats.states_distinct,
-            first.stats.states_distinct
+        // Exact distinct-count match: the first run drains its async fp-writer
+        // before exit (see the post-orchestrate flush in run_model), so
+        // segment.bin holds the COMPLETE fp set. Resume reloads all of them, so
+        // re-seeding Init dedups every state and adds nothing — the resumed
+        // count equals the first run's. (Before that flush fix this was flaky:
+        // un-flushed fps got re-counted, inflating the resumed total under load.)
+        assert_eq!(
+            resumed.stats.states_distinct, first.stats.states_distinct,
+            "resume must report the same distinct count as the original run"
         );
 
         let _ = std::fs::remove_dir_all(work_dir);
