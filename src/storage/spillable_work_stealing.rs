@@ -1155,6 +1155,13 @@ where
         self.hot.pending_count()
     }
 
+    /// Signal that Init enumeration is finished so worker termination can
+    /// release its startup guard even if no state was ever popped. Delegates
+    /// to the hot work-stealing layer. See WorkStealingQueues::mark_init_complete.
+    pub fn mark_init_complete(&self) {
+        self.hot.mark_init_complete();
+    }
+
     /// Get total pending count including spilled items on disk and items
     /// resident in the in-memory compressed ring.
     pub fn total_pending_count(&self) -> u64 {

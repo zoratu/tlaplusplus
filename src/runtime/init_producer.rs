@@ -23,6 +23,8 @@ use crate::storage::unified_fingerprint_store::UnifiedFingerprintStore;
 use anyhow::Result;
 use crossbeam_channel::Sender;
 use dashmap::DashMap;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -74,14 +76,29 @@ where
             .spawn(move || -> Result<u64> {
                 // Drop guard ensures `init_producing` is cleared even if
                 // the producer panics or returns Err early — workers will
-                // not hang waiting for an Init stream that has died.
-                struct Guard(Arc<AtomicBool>);
-                impl Drop for Guard {
+                // not hang waiting for an Init stream that has died. It also
+                // signals the queue that Init enumeration is complete so the
+                // work-stealing termination check can release its `has_started`
+                // startup guard even when ZERO states were enqueued (e.g. resume
+                // where every initial state is already in the fp-store). Without
+                // this, workers spin forever in `pop_slow_path`. See
+                // bug_checkpoint_resume_hang.
+                struct Guard<St>(Arc<AtomicBool>, Arc<SpillableWorkStealingQueues<St>>)
+                where
+                    St: Serialize + DeserializeOwned + Send + Sync + Clone + 'static;
+                impl<St> Drop for Guard<St>
+                where
+                    St: Serialize + DeserializeOwned + Send + Sync + Clone + 'static,
+                {
                     fn drop(&mut self) {
                         self.0.store(false, Ordering::Release);
+                        self.1.mark_init_complete();
                     }
                 }
-                let _guard = Guard(producer_done_flag);
+                let _guard = Guard::<M::State>(
+                    producer_done_flag,
+                    Arc::clone(&producer_queue),
+                );
 
                 // Batch initial states for fingerprint-store insertion to
                 // amortize CAS overhead. The batch size mirrors the worker

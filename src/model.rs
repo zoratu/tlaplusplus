@@ -4,6 +4,31 @@ use serde::de::DeserializeOwned;
 use std::fmt::Debug;
 use std::hash::Hash;
 
+/// Fixed-seed hasher for state fingerprints.
+///
+/// State fingerprints MUST be identical across processes for the same
+/// logical state: multi-node cluster partitioning
+/// (`partition_for_fp_cluster`) decides each state's owner node from its
+/// fingerprint, and checkpoint/resume reloads persisted fingerprints into
+/// a fresh process. `ahash::AHasher::default()` seeds its keys from the OS
+/// RNG once per process (ahash's `runtime-rng` feature), so the same state
+/// hashes to different values in different processes — which silently
+/// breaks both. Always build state-fingerprint hashers via this helper.
+///
+/// The seed constants are arbitrary (hex digits of pi); any fixed values
+/// work, but they must not change across builds that share checkpoints.
+#[inline]
+pub(crate) fn fingerprint_hasher() -> ahash::AHasher {
+    use std::hash::BuildHasher;
+    ahash::RandomState::with_seeds(
+        0x243F_6A88_85A3_08D3,
+        0x1319_8A2E_0370_7344,
+        0xA409_3822_299F_31D0,
+        0x082E_FA98_EC4E_6C89,
+    )
+    .build_hasher()
+}
+
 /// Action label for tracking which actions are taken in transitions
 /// This is optional and only used by models that support fairness checking
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -142,10 +167,9 @@ pub trait Model: Send + Sync + 'static {
     ///
     /// Default implementation uses standard hashing of the full state.
     fn fingerprint(&self, state: &Self::State) -> u64 {
-        use ahash::AHasher;
         use std::hash::Hasher;
 
-        let mut hasher = AHasher::default();
+        let mut hasher = fingerprint_hasher();
         state.hash(&mut hasher);
         hasher.finish()
     }
@@ -176,5 +200,78 @@ pub trait Model: Send + Sync + 'static {
     ) {
         let _ = enabled_mask;
         self.next_states(state, out);
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_determinism_tests {
+    use super::fingerprint_hasher;
+    use std::hash::Hasher;
+
+    /// Cross-process determinism guard for the state-fingerprint hasher.
+    ///
+    /// The expected constant was captured in a SEPARATE process (a
+    /// standalone binary built against the same ahash version with the
+    /// same seeds). If `fingerprint_hasher`'s seeds ever change — or if
+    /// someone reintroduces `AHasher::default()` (per-process random
+    /// seed) — this constant stops matching and the test fails.
+    ///
+    /// Why this matters: multi-node cluster partitioning
+    /// (`partition_for_fp_cluster`) derives each state's owner node from
+    /// its fingerprint, and checkpoint/resume reloads persisted
+    /// fingerprints into a fresh process. Both silently break (no
+    /// scaling / re-explore-everything) if the same state hashes
+    /// differently across processes.
+    #[test]
+    fn fingerprint_hasher_seed_is_stable_across_processes() {
+        let mut h = fingerprint_hasher();
+        h.write(b"tlaplusplus-fingerprint-determinism-probe");
+        assert_eq!(
+            h.finish(),
+            0x2C20_A680_A4EA_7496,
+            "fingerprint_hasher seed changed — this breaks cluster \
+             partitioning and checkpoint/resume across processes"
+        );
+    }
+
+    /// The default `Model::fingerprint` of a fixed state must also be a
+    /// stable constant (it routes through `fingerprint_hasher`).
+    #[test]
+    fn default_model_fingerprint_is_stable() {
+        use super::Model;
+        use crate::fairness::FairnessConstraint;
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
+        struct S {
+            a: u32,
+            b: String,
+        }
+        struct M;
+        impl Model for M {
+            type State = S;
+            fn name(&self) -> &'static str {
+                "fp-test"
+            }
+            fn initial_states(&self) -> Vec<S> {
+                vec![]
+            }
+            fn next_states(&self, _s: &S, _out: &mut Vec<S>) {}
+            fn check_invariants(&self, _s: &S) -> Result<(), String> {
+                Ok(())
+            }
+            fn fairness_constraints(&self) -> Vec<FairnessConstraint> {
+                vec![]
+            }
+        }
+        let fp = M.fingerprint(&S {
+            a: 42,
+            b: "hello".into(),
+        });
+        assert_eq!(
+            fp, 2_207_073_645_509_949_576,
+            "default Model::fingerprint of a fixed state must be a stable \
+             cross-process constant"
+        );
     }
 }

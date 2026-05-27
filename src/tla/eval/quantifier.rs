@@ -169,7 +169,11 @@ fn choose_candidates_without_domain(
 }
 
 fn stable_choose_model_value(var: &str, predicate: &str, idx: usize) -> TlaValue {
-    let mut hasher = ahash::AHasher::default();
+    // Must be deterministic across processes: the minted ModelValue name
+    // becomes part of the state, so a per-process random seed would make
+    // the same CHOOSE produce divergent state content on different cluster
+    // nodes. Use the fixed-seed fingerprint hasher.
+    let mut hasher = crate::model::fingerprint_hasher();
     var.hash(&mut hasher);
     predicate.trim().hash(&mut hasher);
     let digest = hasher.finish();

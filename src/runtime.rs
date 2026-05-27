@@ -730,7 +730,18 @@ where
                     .collect::<Vec<_>>()
             });
 
-            // Insert loaded fingerprints into store
+            // Insert loaded fingerprints into store.
+            //
+            // CROSS-PROCESS INVARIANT: these are raw fingerprints written by
+            // the *checkpointing* process. They only dedup correctly against
+            // the resuming process's freshly-computed successor fingerprints
+            // if `Model::fingerprint` is deterministic across processes — see
+            // `crate::model::fingerprint_hasher` (fixed-seed). If that ever
+            // regresses to a per-process-random hasher (e.g. plain
+            // `ahash::AHasher::default()`), reloaded fps would never match,
+            // the resume would silently re-explore everything, and — since
+            // counters resume from the checkpoint's distinct count — overcount.
+            // Guarded by `model::fingerprint_determinism_tests`.
             let mut total_loaded = 0usize;
             for (_shard_id, fps) in loaded.into_iter().enumerate() {
                 total_loaded += fps.len();
@@ -1733,47 +1744,92 @@ mod tests {
     // moved to runtime/pause.rs::tests.
 
 
+    /// Checkpoint/resume round-trip: a completed run's exit checkpoint can be
+    /// resumed in a fresh `run_model` call that (a) TERMINATES (does not hang)
+    /// and (b) reports a result consistent with the original run.
+    ///
+    /// This replaces an older `#[ignore]`'d test that resumed *after a
+    /// violation* — a pathological case where the violation-stopped run drops
+    /// its frontier (per-worker local deques) so the checkpoint captures
+    /// nothing, and the resume then HUNG forever in `pop_slow_path` because
+    /// `WorkStealingQueues::should_terminate` never released its `has_started`
+    /// startup guard on an empty queue. That hang is now fixed via
+    /// `mark_init_complete` (the init producer signals completion so an
+    /// all-deduped / empty resume can terminate). See bug_checkpoint_resume_hang.
+    ///
+    /// Scope note: the engine has no public mid-run interruption hook, so this
+    /// can't exercise "continue a partially-explored frontier" — it validates
+    /// checkpoint write + fingerprint persist/reload + no-hang resume +
+    /// result consistency. The model is non-violating (max_sum >= max_x+max_y)
+    /// so the verdict and distinct count are stable across the round-trip.
     #[test]
-    #[ignore = "checkpoint/resume requires DiskBackedQueue; work-stealing queues use in-memory deques that cannot be serialized to disk"]
-    fn resumes_from_disk_queue_checkpoint() -> Result<()> {
-        let work_dir = temp_work_dir("resume");
+    fn checkpoint_resume_round_trip_terminates_and_matches() -> Result<()> {
+        use std::time::{Duration, Instant};
+        let work_dir = temp_work_dir("resume-roundtrip");
 
-        let model = CounterGridModel::new(100, 100, 3);
-        let initial_config = EngineConfig {
-            workers: 1,
+        // 6x6 = 36 reachable states, never violates (max sum 10 <= 100). Low
+        // in-memory limit exercises the spill-to-disk + reload path.
+        let base = EngineConfig {
+            workers: 2,
             enforce_cgroups: false,
             numa_pinning: false,
-            clean_work_dir: true,
-            resume_from_checkpoint: false,
             checkpoint_interval_secs: 0,
             checkpoint_on_exit: true,
-            queue_inmem_limit: 32,
-            queue_spill_batch: 8,
+            queue_inmem_limit: 8,
+            queue_spill_batch: 4,
             work_dir: work_dir.clone(),
             ..EngineConfig::default()
         };
-        let first = run_model(model, initial_config)?;
-        assert!(first.violation.is_some());
-        // Note: With bulk dequeue, workers hold items locally so spilling may not occur
-        // assert!(first.stats.queue.spilled_items > 0);
 
-        let resume_model = CounterGridModel::new(100, 100, 3);
-        let resume_config = EngineConfig {
-            workers: 1,
-            enforce_cgroups: false,
-            numa_pinning: false,
-            clean_work_dir: false,
-            resume_from_checkpoint: true,
-            checkpoint_interval_secs: 0,
-            checkpoint_on_exit: true,
-            queue_inmem_limit: 32,
-            queue_spill_batch: 8,
-            work_dir: work_dir.clone(),
-            ..EngineConfig::default()
-        };
-        let resumed = run_model(resume_model, resume_config)?;
-        assert!(resumed.stats.resumed_from_checkpoint);
-        assert!(resumed.violation.is_some());
+        // Run 1: explore to completion, write the exit checkpoint.
+        let first = run_model(
+            CounterGridModel::new(5, 5, 100),
+            EngineConfig {
+                clean_work_dir: true,
+                resume_from_checkpoint: false,
+                ..base.clone()
+            },
+        )?;
+        assert!(
+            first.violation.is_none(),
+            "grid with max_sum=100 must not violate"
+        );
+        assert!(
+            first.stats.states_distinct > 0,
+            "first run must explore states"
+        );
+
+        // Run 2: resume. Must terminate (the hang regression guard) and report
+        // the same distinct count + verdict.
+        let started = Instant::now();
+        let resumed = run_model(
+            CounterGridModel::new(5, 5, 100),
+            EngineConfig {
+                clean_work_dir: false,
+                resume_from_checkpoint: true,
+                ..base.clone()
+            },
+        )?;
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "resume must terminate, not hang (took {:?})",
+            started.elapsed()
+        );
+        assert!(resumed.violation.is_none(), "resume verdict must match");
+        // Resume must preserve all explored progress: it loads the checkpoint's
+        // distinct counter (== the first run's) and only adds from there. It can
+        // legitimately re-count states whose fingerprints the async fp-writer
+        // hadn't flushed to disk before the first run exited — so under load the
+        // resumed count can EXCEED the first run's (a sound re-exploration, not a
+        // loss). Asserting `>=` is therefore the deterministic invariant; exact
+        // equality is flaky because the flushed-fp subset depends on writer
+        // timing. See bug_checkpoint_resume_hang (async-flush re-count note).
+        assert!(
+            resumed.stats.states_distinct >= first.stats.states_distinct,
+            "resume must not lose explored progress: resumed {} < first {}",
+            resumed.stats.states_distinct,
+            first.stats.states_distinct
+        );
 
         let _ = std::fs::remove_dir_all(work_dir);
         Ok(())
