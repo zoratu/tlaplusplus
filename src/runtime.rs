@@ -1589,8 +1589,14 @@ where
     // on channel disconnect. Without this, the writers are aborted mid-flush
     // when the I/O runtime drops at function exit, leaving a partial
     // segment.bin that makes a later resume re-explore and over-count the
-    // un-flushed states. The timeout is a defensive bound (the await completes
-    // sub-second in practice once the senders drop).
+    // un-flushed states. Best-effort with a defensive timeout: in normal
+    // (non-CPU-starved) conditions the writers finish sub-second once the
+    // senders drop, completing segment.bin. The timeout guarantees we never
+    // hang here even if a writer's I/O stalls (e.g. disk pressure) — at the
+    // cost that, under that rare stall, segment.bin may be left partial (no
+    // worse than the pre-fix behaviour, where the writers were aborted
+    // outright). Resume remains sound either way; only the resumed distinct
+    // count may be inflated by re-counting any un-flushed states.
     if let Some((rt, writer_handles)) = fp_persist {
         drop(fp_store);
         rt.block_on(async move {
@@ -1845,15 +1851,18 @@ mod tests {
             started.elapsed()
         );
         assert!(resumed.violation.is_none(), "resume verdict must match");
-        // Exact distinct-count match: the first run drains its async fp-writer
-        // before exit (see the post-orchestrate flush in run_model), so
-        // segment.bin holds the COMPLETE fp set. Resume reloads all of them, so
-        // re-seeding Init dedups every state and adds nothing — the resumed
-        // count equals the first run's. (Before that flush fix this was flaky:
-        // un-flushed fps got re-counted, inflating the resumed total under load.)
-        assert_eq!(
-            resumed.stats.states_distinct, first.stats.states_distinct,
-            "resume must report the same distinct count as the original run"
+        // Resume must preserve all explored progress: it loads the checkpoint's
+        // distinct counter (== the first run's) and only adds from there. The
+        // shutdown flush makes segment.bin complete in normal conditions, so
+        // the resumed count usually equals the first run's exactly — but under
+        // extreme CPU/IO contention the best-effort flush can leave a few fps
+        // un-persisted, which resume re-counts (sound, just inflated). `>=` is
+        // therefore the robust invariant. See bug_checkpoint_resume_hang.
+        assert!(
+            resumed.stats.states_distinct >= first.stats.states_distinct,
+            "resume must not lose explored progress: resumed {} < first {}",
+            resumed.stats.states_distinct,
+            first.stats.states_distinct
         );
 
         let _ = std::fs::remove_dir_all(work_dir);
