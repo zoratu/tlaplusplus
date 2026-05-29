@@ -210,6 +210,17 @@ impl BloomFingerprintStore {
         }
     }
 
+    /// Read-only membership check (no insert).
+    ///
+    /// Returns true if the fingerprint MIGHT have been seen (bloom filters
+    /// have no false negatives, so a `false` is definitive). Used by the
+    /// checkpoint-resume load to verify durability of just-loaded fps.
+    pub fn contains(&self, fp: u64) -> bool {
+        let shard_id = self.shard_id(fp);
+        let bloom = self.shards[shard_id].read();
+        bloom.check(&fp)
+    }
+
     /// Batch check and insert fingerprints
     ///
     /// Optimized: Single write lock per shard instead of lock-per-item

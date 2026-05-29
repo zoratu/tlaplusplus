@@ -305,6 +305,27 @@ impl AutoSwitchingFingerprintStore {
         result
     }
 
+    /// Read-only membership check (no insert).
+    ///
+    /// Unlike `contains_or_insert`, this does NOT bail out during a pending
+    /// switch — it blocks on the read lock until the switch completes. That
+    /// matters for callers that need a durable verify: the
+    /// `contains_or_insert` bail-out returns "exists" WITHOUT storing during
+    /// the ~2ms switch window (a deliberate worker-quiescence optimization),
+    /// so it can falsely report presence for an fp that was actually dropped.
+    /// This method never does that. Intended for setup-phase callers (e.g. the
+    /// checkpoint-resume fingerprint load) that run with no workers active, so
+    /// blocking on the lock has no quiescence cost.
+    pub fn contains(&self, fp: u64) -> bool {
+        let state = self.state.read();
+        match &*state {
+            StoreState::Exact { store } => store.contains(fp),
+            StoreState::Hybrid { exact, bloom, .. } => {
+                exact.contains(fp) || bloom.contains(fp)
+            }
+        }
+    }
+
     /// Batch check and insert fingerprints
     pub fn contains_or_insert_batch(&self, fps: &[u64], seen: &mut Vec<bool>) -> Result<()> {
         self.contains_or_insert_batch_with_affinity(fps, seen, 0)
