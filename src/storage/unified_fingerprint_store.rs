@@ -125,6 +125,18 @@ impl UnifiedFingerprintStore {
         }
     }
 
+    /// Read-only membership check (no insert). For the AutoSwitch variant this
+    /// blocks rather than bailing during a switch, so it never falsely reports
+    /// presence — used by the checkpoint-resume load to verify fps were
+    /// durably stored. See the per-variant `contains` docs.
+    pub fn contains(&self, fp: u64) -> bool {
+        match self {
+            Self::PageAligned(store) => store.contains(fp),
+            Self::Bloom(store) => store.contains(fp),
+            Self::AutoSwitch(store) => store.contains(fp),
+        }
+    }
+
     /// Batch check and insert fingerprints
     pub fn contains_or_insert_batch(&self, fps: &[u64], seen: &mut Vec<bool>) -> Result<()> {
         match self {
