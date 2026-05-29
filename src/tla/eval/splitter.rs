@@ -119,6 +119,23 @@ pub(super) fn split_top_level(expr: &str, delim: &str, keyword: bool) -> Vec<Str
     // bug). The eprintln was leftover from one-off model debugging; safe to
     // drop entirely. (T101.1 fuzz pass surfaced this; same bug class as the
     // T101 char-boundary fixes in compiled_expr.rs / module.rs.)
+
+    // Fast path: `split_top_level` only ever returns >1 part — or a non-
+    // trivial single part — by matching `delim` at top level, or by matching a
+    // bare `\` (set-minus) at top level (see the `ch == '\\'` branch below). If
+    // the string contains NEITHER byte-sequence anywhere, neither can fire, so
+    // the full stateful scan would just return `vec![expr.trim().to_string()]`.
+    // Short-circuit that with two cheap substring scans and skip the per-call
+    // `Vec` allocation + character walk. This is the dominant hot path: the
+    // string evaluator tests every atomic sub-expression (e.g. `i < j`,
+    // `ss[i] =< ss[j]`) against `=>`, `<=>`, `\/`, `/\`, `\cdot` in turn while
+    // enumerating large filtered sets — none of those occur in such atoms.
+    // (When `delim` itself contains `\`, the backslash check conservatively
+    // forces the full scan, which is always correct, just not maximally fast.)
+    if !expr.contains(delim) && !expr.as_bytes().contains(&b'\\') {
+        return vec![expr.trim().to_string()];
+    }
+
     let mut out = Vec::new();
     let mut start = 0usize;
 
