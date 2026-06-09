@@ -21,6 +21,7 @@ mod quantifier;
 mod set;
 mod operator;
 mod action;
+mod dispatch;
 mod expr;
 
 // pub(crate) re-export of operator::eval_operator_call preserves the
