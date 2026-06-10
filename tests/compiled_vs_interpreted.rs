@@ -42,6 +42,7 @@ use proptest::prelude::*;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use tlaplusplus::tla::hashed_arc::HashedArc;
 use tlaplusplus::tla::{
     EvalContext, TlaDefinition, TlaState, TlaValue, compile_expr, eval_compiled, eval_expr,
     tla_state,
@@ -93,11 +94,11 @@ fn build_state() -> TlaState {
         ("x", TlaValue::Int(3)),
         ("y", TlaValue::Int(7)),
         ("b", TlaValue::Bool(true)),
-        ("S", TlaValue::Set(Arc::new(s))),
-        ("T", TlaValue::Set(Arc::new(t))),
-        ("sq", TlaValue::Seq(Arc::new(sq))),
-        ("r", TlaValue::Record(Arc::new(rec))),
-        ("f", TlaValue::Function(Arc::new(func))),
+        ("S", TlaValue::Set(HashedArc::new(s))),
+        ("T", TlaValue::Set(HashedArc::new(t))),
+        ("sq", TlaValue::Seq(HashedArc::new(sq))),
+        ("r", TlaValue::Record(HashedArc::new(rec))),
+        ("f", TlaValue::Function(HashedArc::new(func))),
     ])
 }
 

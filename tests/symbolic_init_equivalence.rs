@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use proptest::prelude::*;
+use tlaplusplus::tla::hashed_arc::HashedArc;
 use tlaplusplus::tla::eval::EvalContext;
 use tlaplusplus::tla::module::TlaModuleInstance;
 use tlaplusplus::tla::symbolic_init::{
@@ -103,7 +104,7 @@ fn brute_force(field_specs: &[(String, Vec<TlaValue>)], pred: &str) -> BTreeSet<
                 let mut rec = BTreeMap::new();
                 rec.insert("a".to_string(), TlaValue::Int(a));
                 rec.insert("b".to_string(), TlaValue::Int(b));
-                out.insert(TlaValue::Record(Arc::new(rec)));
+                out.insert(TlaValue::Record(HashedArc::new(rec)));
             }
         }
     }
@@ -192,7 +193,7 @@ fn brute_force_seqs(n: usize, range_max: i64, pred: &str) -> std::collections::B
         };
         if satisfies {
             let s: Vec<TlaValue> = idx.iter().map(|&v| TlaValue::Int(v)).collect();
-            out.insert(TlaValue::Seq(Arc::new(s)));
+            out.insert(TlaValue::Seq(HashedArc::new(s)));
         }
         // Increment odometer (1..=range_max).
         let mut carry = true;

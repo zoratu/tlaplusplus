@@ -8,6 +8,7 @@
 //! paths in EXCEPT.
 
 use anyhow::{Context, Result, anyhow};
+use crate::tla::hashed_arc::HashedArc;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -38,7 +39,7 @@ pub(super) fn eval_bracket_expression(expr: &str, ctx: &EvalContext<'_>, depth: 
             let mut assignments = BTreeMap::new();
             let mut map = BTreeMap::new();
             collect_function_mapping(0, &binders, rhs, &mut assignments, &mut map, ctx, depth + 1)?;
-            return Ok(TlaValue::Function(Arc::new(map)));
+            return Ok(TlaValue::Function(HashedArc::new(map)));
         }
 
         let mut record = BTreeMap::new();
@@ -49,7 +50,7 @@ pub(super) fn eval_bracket_expression(expr: &str, ctx: &EvalContext<'_>, depth: 
             let value = eval_expr_inner(value_text.trim(), ctx, depth + 1)?;
             record.insert(key, value);
         }
-        return Ok(TlaValue::Record(Arc::new(record)));
+        return Ok(TlaValue::Record(HashedArc::new(record)));
     }
 
     // Check for function set: [Domain -> Range]
@@ -75,13 +76,13 @@ pub(super) fn eval_bracket_expression(expr: &str, ctx: &EvalContext<'_>, depth: 
             // Only one function from empty domain: the empty function
             let empty_func = BTreeMap::new();
             let mut result = BTreeSet::new();
-            result.insert(TlaValue::Function(Arc::new(empty_func)));
-            return Ok(TlaValue::Set(Arc::new(result)));
+            result.insert(TlaValue::Function(HashedArc::new(empty_func)));
+            return Ok(TlaValue::Set(HashedArc::new(result)));
         }
 
         if range_elems.is_empty() {
             // No functions from non-empty domain to empty range
-            return Ok(TlaValue::Set(Arc::new(BTreeSet::new())));
+            return Ok(TlaValue::Set(HashedArc::new(BTreeSet::new())));
         }
 
         let n = domain_elems.len();
@@ -111,7 +112,7 @@ pub(super) fn eval_bracket_expression(expr: &str, ctx: &EvalContext<'_>, depth: 
             for (i, d) in domain_elems.iter().enumerate() {
                 func.insert(d.clone(), range_elems[indices[i]].clone());
             }
-            result.insert(TlaValue::Function(Arc::new(func)));
+            result.insert(TlaValue::Function(HashedArc::new(func)));
 
             // Increment indices (like counting in base m)
             let mut carry = true;
@@ -130,7 +131,7 @@ pub(super) fn eval_bracket_expression(expr: &str, ctx: &EvalContext<'_>, depth: 
             }
         }
 
-        return Ok(TlaValue::Set(Arc::new(result)));
+        return Ok(TlaValue::Set(HashedArc::new(result)));
     }
 
     // Check for record set construction: [field: Set, field2: Set, ...]
@@ -327,7 +328,7 @@ fn set_path_value(base: &TlaValue, path: &[PathSegment], new_value: TlaValue) ->
                 let updated = set_path_value(&current, &path[1..], new_value)?;
                 let mut next = (**map).clone();
                 next.insert(name.clone(), updated);
-                Ok(TlaValue::Record(Arc::new(next)))
+                Ok(TlaValue::Record(HashedArc::new(next)))
             }
             _ => Err(anyhow!("field update on non-record value {base:?}")),
         },
@@ -337,7 +338,7 @@ fn set_path_value(base: &TlaValue, path: &[PathSegment], new_value: TlaValue) ->
                 let updated = set_path_value(&current, &path[1..], new_value)?;
                 let mut next = (**map).clone();
                 next.insert(key.clone(), updated);
-                Ok(TlaValue::Function(Arc::new(next)))
+                Ok(TlaValue::Function(HashedArc::new(next)))
             }
             TlaValue::Record(map) => {
                 let record_key = record_key_from_value(key)?;
@@ -345,7 +346,7 @@ fn set_path_value(base: &TlaValue, path: &[PathSegment], new_value: TlaValue) ->
                 let updated = set_path_value(&current, &path[1..], new_value)?;
                 let mut next = (**map).clone();
                 next.insert(record_key, updated);
-                Ok(TlaValue::Record(Arc::new(next)))
+                Ok(TlaValue::Record(HashedArc::new(next)))
             }
             TlaValue::Seq(values) => {
                 let idx = key.as_int()?;
@@ -360,7 +361,7 @@ fn set_path_value(base: &TlaValue, path: &[PathSegment], new_value: TlaValue) ->
                 let updated = set_path_value(&values[zero], &path[1..], new_value)?;
                 let mut next = (**values).clone();
                 next[zero] = updated;
-                Ok(TlaValue::Seq(Arc::new(next)))
+                Ok(TlaValue::Seq(HashedArc::new(next)))
             }
             _ => Err(anyhow!("index update on unsupported value {base:?}")),
         },
@@ -389,7 +390,7 @@ pub(super) fn eval_bracket_index_key(expr: &str, ctx: &EvalContext<'_>, depth: u
     match args.len() {
         0 => Err(anyhow!("empty bracket index")),
         1 => Ok(args.into_iter().next().expect("single arg exists")),
-        _ => Ok(TlaValue::Seq(Arc::new(args))),
+        _ => Ok(TlaValue::Seq(HashedArc::new(args))),
     }
 }
 

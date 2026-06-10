@@ -12,6 +12,7 @@
 //! table, which is a separate refactor.
 
 use anyhow::{Result, anyhow};
+use crate::tla::hashed_arc::HashedArc;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -64,7 +65,7 @@ pub(super) fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usiz
         let set: BTreeSet<TlaValue> = [TlaValue::Bool(false), TlaValue::Bool(true)]
             .into_iter()
             .collect();
-        return Ok(TlaValue::Set(Arc::new(set)));
+        return Ok(TlaValue::Set(HashedArc::new(set)));
     }
     if expr == "@" {
         return ctx
@@ -281,11 +282,11 @@ pub(super) fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usiz
                 for lhs_val in lhs_set {
                     for rhs_val in rhs_set {
                         let tuple =
-                            TlaValue::Seq(Arc::new(vec![lhs_val.clone(), rhs_val.clone()]));
+                            TlaValue::Seq(HashedArc::new(vec![lhs_val.clone(), rhs_val.clone()]));
                         product.insert(tuple);
                     }
                 }
-                result = TlaValue::Set(Arc::new(product));
+                result = TlaValue::Set(HashedArc::new(product));
             }
             return Ok(result);
         }
@@ -299,7 +300,7 @@ pub(super) fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usiz
                 for (k, v) in right_func.iter() {
                     result.insert(k.clone(), v.clone());
                 }
-                out = TlaValue::Function(Arc::new(result));
+                out = TlaValue::Function(HashedArc::new(result));
             }
             return Ok(out);
         }
@@ -308,7 +309,7 @@ pub(super) fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usiz
             let val = eval_expr_inner(&rhs, ctx, depth + 1)?;
             let mut func = BTreeMap::new();
             func.insert(key, val);
-            return Ok(TlaValue::Function(Arc::new(func)));
+            return Ok(TlaValue::Function(HashedArc::new(func)));
         }
         Op::Xor { lhs, rhs } => {
             let left = eval_expr_inner(&lhs, ctx, depth + 1)?.as_int()?;
@@ -332,7 +333,7 @@ pub(super) fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usiz
             } else {
                 BTreeSet::new()
             };
-            return Ok(TlaValue::Set(Arc::new(range_set)));
+            return Ok(TlaValue::Set(HashedArc::new(range_set)));
         }
         Op::Additive { lhs, op, rhs } => {
             let left = eval_expr_inner(&lhs, ctx, depth + 1)?.as_int()?;
@@ -420,7 +421,7 @@ pub(super) fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usiz
     if starts_with_keyword(expr, "SUBSET") {
         let rest = expr["SUBSET".len()..].trim();
         let set = eval_expr_inner(rest, ctx, depth + 1)?;
-        return Ok(TlaValue::Set(Arc::new(powerset(set.as_set()?, ctx)?)));
+        return Ok(TlaValue::Set(HashedArc::new(powerset(set.as_set()?, ctx)?)));
     }
 
     if starts_with_keyword(expr, "UNION") {
@@ -429,7 +430,7 @@ pub(super) fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usiz
         for set in eval_expr_inner(rest, ctx, depth + 1)?.as_set()? {
             union.extend(set.as_set()?.iter().cloned());
         }
-        return Ok(TlaValue::Set(Arc::new(union)));
+        return Ok(TlaValue::Set(HashedArc::new(union)));
     }
 
     if let Some(rest) = expr.strip_prefix('-')

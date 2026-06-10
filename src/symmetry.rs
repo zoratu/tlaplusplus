@@ -1,4 +1,5 @@
 use crate::tla::{TlaState, TlaValue};
+use crate::tla::hashed_arc::HashedArc;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Debug;
@@ -207,21 +208,21 @@ fn apply_permutation_to_value(value: &TlaValue, permutation: &HashMap<String, St
                 .iter()
                 .map(|item| apply_permutation_to_value(item, permutation))
                 .collect();
-            TlaValue::Set(Arc::new(new_items))
+            TlaValue::Set(HashedArc::new(new_items))
         }
         TlaValue::Seq(items) => {
             let new_items: Vec<TlaValue> = items
                 .iter()
                 .map(|item| apply_permutation_to_value(item, permutation))
                 .collect();
-            TlaValue::Seq(Arc::new(new_items))
+            TlaValue::Seq(HashedArc::new(new_items))
         }
         TlaValue::Record(fields) => {
             let new_fields: BTreeMap<String, TlaValue> = fields
                 .iter()
                 .map(|(k, v)| (k.clone(), apply_permutation_to_value(v, permutation)))
                 .collect();
-            TlaValue::Record(Arc::new(new_fields))
+            TlaValue::Record(HashedArc::new(new_fields))
         }
         TlaValue::Function(map) => {
             let new_map: BTreeMap<TlaValue, TlaValue> = map
@@ -233,7 +234,7 @@ fn apply_permutation_to_value(value: &TlaValue, permutation: &HashMap<String, St
                     )
                 })
                 .collect();
-            TlaValue::Function(Arc::new(new_map))
+            TlaValue::Function(HashedArc::new(new_map))
         }
         _ => value.clone(),
     }

@@ -14,6 +14,7 @@
 //! `super::eval_operator_call`.
 
 use anyhow::{Result, anyhow};
+use crate::tla::hashed_arc::HashedArc;
 use std::sync::Arc;
 
 use crate::tla::TlaValue;
@@ -191,7 +192,7 @@ pub(super) fn parse_base<'a>(
             }
             out.push(eval_expr_inner(&part, ctx, depth + 1)?);
         }
-        return Ok((TlaValue::Seq(Arc::new(out)), rest));
+        return Ok((TlaValue::Seq(HashedArc::new(out)), rest));
     }
 
     if s.starts_with('{') {

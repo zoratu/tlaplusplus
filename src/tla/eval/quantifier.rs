@@ -7,6 +7,7 @@
 //! (still in eval.rs) and the bracket / set submodules call.
 
 use anyhow::{Result, anyhow};
+use crate::tla::hashed_arc::HashedArc;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -153,8 +154,8 @@ fn choose_candidates_without_domain(
     for idx in 0..4usize {
         candidates.push(stable_choose_model_value(var, predicate, idx));
     }
-    candidates.push(TlaValue::Set(Arc::new(BTreeSet::new())));
-    candidates.push(TlaValue::Seq(Arc::new(Vec::new())));
+    candidates.push(TlaValue::Set(HashedArc::new(BTreeSet::new())));
+    candidates.push(TlaValue::Seq(HashedArc::new(Vec::new())));
     candidates.push(TlaValue::Bool(false));
     candidates.push(TlaValue::Int(0));
 
@@ -572,6 +573,6 @@ fn binder_key(
                 );
             }
         }
-        Ok(TlaValue::Seq(Arc::new(items)))
+        Ok(TlaValue::Seq(HashedArc::new(items)))
     }
 }

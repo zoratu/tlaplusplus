@@ -5,6 +5,7 @@ pub mod compiled_eval;
 pub mod compiled_expr;
 pub mod eval;
 pub mod formula;
+pub mod hashed_arc;
 pub mod module;
 pub mod por;
 pub mod scan;

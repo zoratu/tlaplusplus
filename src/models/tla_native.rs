@@ -1,4 +1,5 @@
 use crate::fairness::{FairnessConstraint, LabeledTransition};
+use crate::tla::hashed_arc::HashedArc;
 use crate::model::Model;
 use crate::symmetry::{SymmetrySpec, canonicalize_tla_state};
 use crate::tla::module::TlaModuleInstance;
@@ -712,7 +713,7 @@ impl TlaModel {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.clone()))
                 .collect();
-            Ok(TlaValue::Record(Arc::new(record)))
+            Ok(TlaValue::Record(HashedArc::new(record)))
         }
     }
 
@@ -3143,10 +3144,10 @@ fn config_value_to_tla(value: &ConfigValue) -> Option<TlaValue> {
         ConfigValue::String(v) => Some(TlaValue::String(v.clone())),
         ConfigValue::ModelValue(v) => Some(TlaValue::ModelValue(v.clone())),
         ConfigValue::OperatorRef(_) => None,
-        ConfigValue::Tuple(values) => Some(TlaValue::Seq(Arc::new(
+        ConfigValue::Tuple(values) => Some(TlaValue::Seq(HashedArc::new(
             values.iter().filter_map(config_value_to_tla).collect(),
         ))),
-        ConfigValue::Set(values) => Some(TlaValue::Set(Arc::new(
+        ConfigValue::Set(values) => Some(TlaValue::Set(HashedArc::new(
             values.iter().filter_map(config_value_to_tla).collect(),
         ))),
     }

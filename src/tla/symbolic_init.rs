@@ -32,6 +32,7 @@
 
 #[cfg(feature = "symbolic-init")]
 use std::collections::BTreeMap;
+use crate::tla::hashed_arc::HashedArc;
 #[cfg(feature = "symbolic-init")]
 use std::sync::Arc;
 
@@ -124,13 +125,13 @@ pub(crate) fn build_record(field_assignments: Vec<(String, TlaValue)>) -> TlaVal
     for (k, v) in field_assignments {
         rec.insert(k, v);
     }
-    TlaValue::Record(Arc::new(rec))
+    TlaValue::Record(HashedArc::new(rec))
 }
 
 /// Build a Seq `TlaValue` from a Vec of element values.
 #[cfg(feature = "symbolic-init")]
 pub(crate) fn build_seq(elems: Vec<TlaValue>) -> TlaValue {
-    TlaValue::Seq(Arc::new(elems))
+    TlaValue::Seq(HashedArc::new(elems))
 }
 
 // ============================================================================
@@ -2872,7 +2873,7 @@ mod tests {
             for b in 1..=4 {
                 for c in 1..=4 {
                     if a != b && a + b == 5 && c == 1 {
-                        brute.push(TlaValue::Seq(Arc::new(vec![
+                        brute.push(TlaValue::Seq(HashedArc::new(vec![
                             TlaValue::Int(a),
                             TlaValue::Int(b),
                             TlaValue::Int(c),

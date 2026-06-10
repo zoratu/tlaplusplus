@@ -4,6 +4,7 @@
 //! the overhead of string parsing on every evaluation.
 
 use crate::tla::compiled_expr::{CompiledExpr, compile_expr, find_top_level_colon};
+use crate::tla::hashed_arc::HashedArc;
 use crate::tla::eval::{
     EvalContext, apply_value, eval_expr, eval_operator_call, normalize_param_name,
 };
@@ -364,7 +365,7 @@ fn eval_compiled_inner(
             for e in exprs {
                 set.insert(eval_compiled_inner(e, ctx, depth)?);
             }
-            Ok(TlaValue::Set(Arc::new(set)))
+            Ok(TlaValue::Set(HashedArc::new(set)))
         }
         CompiledExpr::SetRange(a, b) => {
             let start = eval_compiled_inner(a, ctx, depth)?.as_int()?;
@@ -382,7 +383,7 @@ fn eval_compiled_inner(
                 ctx.check_budget(cost)?;
             }
             let set: BTreeSet<TlaValue> = (start..=end).map(TlaValue::Int).collect();
-            Ok(TlaValue::Set(Arc::new(set)))
+            Ok(TlaValue::Set(HashedArc::new(set)))
         }
         CompiledExpr::Union(a, b) => {
             let left = eval_compiled_inner(a, ctx, depth)?;
@@ -390,7 +391,7 @@ fn eval_compiled_inner(
             let left_set = left.as_set()?;
             let right_set = right.as_set()?;
             let union: BTreeSet<TlaValue> = left_set.union(&right_set).cloned().collect();
-            Ok(TlaValue::Set(Arc::new(union)))
+            Ok(TlaValue::Set(HashedArc::new(union)))
         }
         CompiledExpr::Intersect(a, b) => {
             let left = eval_compiled_inner(a, ctx, depth)?;
@@ -399,7 +400,7 @@ fn eval_compiled_inner(
             let right_set = right.as_set()?;
             let intersect: BTreeSet<TlaValue> =
                 left_set.intersection(&right_set).cloned().collect();
-            Ok(TlaValue::Set(Arc::new(intersect)))
+            Ok(TlaValue::Set(HashedArc::new(intersect)))
         }
         CompiledExpr::SetMinus(a, b) => {
             let left = eval_compiled_inner(a, ctx, depth)?;
@@ -407,7 +408,7 @@ fn eval_compiled_inner(
             let left_set = left.as_set()?;
             let right_set = right.as_set()?;
             let diff: BTreeSet<TlaValue> = left_set.difference(&right_set).cloned().collect();
-            Ok(TlaValue::Set(Arc::new(diff)))
+            Ok(TlaValue::Set(HashedArc::new(diff)))
         }
         CompiledExpr::CartesianProduct(a, b) => {
             let left = eval_compiled_inner(a, ctx, depth)?;
@@ -418,11 +419,11 @@ fn eval_compiled_inner(
             let mut product = BTreeSet::new();
             for lhs_val in left_set {
                 for rhs_val in right_set {
-                    let tuple = TlaValue::Seq(Arc::new(vec![lhs_val.clone(), rhs_val.clone()]));
+                    let tuple = TlaValue::Seq(HashedArc::new(vec![lhs_val.clone(), rhs_val.clone()]));
                     product.insert(tuple);
                 }
             }
-            Ok(TlaValue::Set(Arc::new(product)))
+            Ok(TlaValue::Set(HashedArc::new(product)))
         }
         CompiledExpr::Subset(a, b) => {
             let left = eval_compiled_inner(a, ctx, depth)?;
@@ -449,7 +450,7 @@ fn eval_compiled_inner(
                 ));
             }
             if n >= 64 {
-                return Ok(TlaValue::Set(Arc::new(BTreeSet::new())));
+                return Ok(TlaValue::Set(HashedArc::new(BTreeSet::new())));
             }
             let total = 1u64 << n;
             ctx.check_budget(total as usize)?;
@@ -461,9 +462,9 @@ fn eval_compiled_inner(
                         subset.insert(elements[i].clone());
                     }
                 }
-                powerset.insert(TlaValue::Set(Arc::new(subset)));
+                powerset.insert(TlaValue::Set(HashedArc::new(subset)));
             }
-            Ok(TlaValue::Set(Arc::new(powerset)))
+            Ok(TlaValue::Set(HashedArc::new(powerset)))
         }
 
         // Sequence operations
@@ -472,7 +473,7 @@ fn eval_compiled_inner(
             for e in exprs {
                 seq.push(eval_compiled_inner(e, ctx, depth)?);
             }
-            Ok(TlaValue::Seq(Arc::new(seq)))
+            Ok(TlaValue::Seq(HashedArc::new(seq)))
         }
         CompiledExpr::Head(e) => {
             let seq = eval_compiled_inner(e, ctx, depth)?;
@@ -490,7 +491,7 @@ fn eval_compiled_inner(
             if seq.is_empty() {
                 return Err(anyhow!("Tail of empty sequence"));
             }
-            Ok(TlaValue::Seq(Arc::new(seq[1..].to_vec())))
+            Ok(TlaValue::Seq(HashedArc::new(seq[1..].to_vec())))
         }
         CompiledExpr::Append(a, b) => {
             let seq = eval_compiled_inner(a, ctx, depth)?;
@@ -498,7 +499,7 @@ fn eval_compiled_inner(
             let mut seq =
                 sequence_like_values(&seq).ok_or_else(|| anyhow!("expected Seq, got {seq:?}"))?;
             seq.push(elem);
-            Ok(TlaValue::Seq(Arc::new(seq)))
+            Ok(TlaValue::Seq(HashedArc::new(seq)))
         }
         CompiledExpr::Concat(a, b) => {
             let lhs = eval_compiled_inner(a, ctx, depth)?;
@@ -525,7 +526,7 @@ fn eval_compiled_inner(
                         ));
                     };
                     lhs_seq.extend(rhs_seq);
-                    Ok(TlaValue::Seq(Arc::new(lhs_seq)))
+                    Ok(TlaValue::Seq(HashedArc::new(lhs_seq)))
                 }
             }
         }
@@ -551,9 +552,9 @@ fn eval_compiled_inner(
             let start = (m - 1) as usize;
             let end = (n as usize).min(seq.len());
             if start > seq.len() {
-                return Ok(TlaValue::Seq(Arc::new(vec![])));
+                return Ok(TlaValue::Seq(HashedArc::new(vec![])));
             }
-            Ok(TlaValue::Seq(Arc::new(seq[start..end].to_vec())))
+            Ok(TlaValue::Seq(HashedArc::new(seq[start..end].to_vec())))
         }
 
         // Record operations
@@ -562,7 +563,7 @@ fn eval_compiled_inner(
             for (name, expr) in fields {
                 rec.insert(name.clone(), eval_compiled_inner(expr, ctx, depth)?);
             }
-            Ok(TlaValue::Record(Arc::new(rec)))
+            Ok(TlaValue::Record(HashedArc::new(rec)))
         }
         CompiledExpr::RecordAccess(e, field) => {
             let rec = eval_compiled_inner(e, ctx, depth)?;
@@ -583,7 +584,7 @@ fn eval_compiled_inner(
 
             // Check for empty sets - if any field has an empty domain, the result is empty
             if field_sets.iter().any(|(_, elems)| elems.is_empty()) {
-                return Ok(TlaValue::Set(Arc::new(BTreeSet::new())));
+                return Ok(TlaValue::Set(HashedArc::new(BTreeSet::new())));
             }
 
             // Calculate total number of records (product of all set sizes)
@@ -613,7 +614,7 @@ fn eval_compiled_inner(
                 for (i, (field_name, elements)) in field_sets.iter().enumerate() {
                     record.insert(field_name.clone(), elements[indices[i]].clone());
                 }
-                result.insert(TlaValue::Record(Arc::new(record)));
+                result.insert(TlaValue::Record(HashedArc::new(record)));
 
                 // Increment indices (like counting in mixed-radix number system)
                 let mut carry = true;
@@ -632,7 +633,7 @@ fn eval_compiled_inner(
                 }
             }
 
-            Ok(TlaValue::Set(Arc::new(result)))
+            Ok(TlaValue::Set(HashedArc::new(result)))
         }
 
         // Function operations
@@ -643,7 +644,7 @@ fn eval_compiled_inner(
                 let val = eval_compiled_inner(val_expr, ctx, depth)?;
                 func.insert(key, val);
             }
-            Ok(TlaValue::Function(Arc::new(func)))
+            Ok(TlaValue::Function(HashedArc::new(func)))
         }
         CompiledExpr::FuncApply(f, args) => {
             if std::env::var("TLAPP_TRACE_FUNCAPPLY").is_ok() {
@@ -671,7 +672,7 @@ fn eval_compiled_inner(
                             .iter()
                             .map(|a| eval_compiled_inner(a, ctx, depth))
                             .collect::<Result<_>>()?;
-                        TlaValue::Seq(Arc::new(tuple))
+                        TlaValue::Seq(HashedArc::new(tuple))
                     };
                     map.get(&key).cloned().ok_or_else(|| {
                         // Build helpful error message with key and domain
@@ -752,17 +753,17 @@ fn eval_compiled_inner(
             match &val {
                 TlaValue::Function(map) => {
                     let domain: BTreeSet<TlaValue> = map.keys().cloned().collect();
-                    Ok(TlaValue::Set(Arc::new(domain)))
+                    Ok(TlaValue::Set(HashedArc::new(domain)))
                 }
                 TlaValue::Seq(seq) => {
                     let domain: BTreeSet<TlaValue> =
                         (1..=seq.len()).map(|i| TlaValue::Int(i as i64)).collect();
-                    Ok(TlaValue::Set(Arc::new(domain)))
+                    Ok(TlaValue::Set(HashedArc::new(domain)))
                 }
                 TlaValue::Record(rec) => {
                     let domain: BTreeSet<TlaValue> =
                         rec.keys().map(|k| TlaValue::String(k.clone())).collect();
-                    Ok(TlaValue::Set(Arc::new(domain)))
+                    Ok(TlaValue::Set(HashedArc::new(domain)))
                 }
                 _ => Err(anyhow!("DOMAIN requires function/sequence/record")),
             }
@@ -778,7 +779,7 @@ fn eval_compiled_inner(
             let val = eval_compiled_inner(val_expr, ctx, depth)?;
             let mut func = BTreeMap::new();
             func.insert(key, val);
-            Ok(TlaValue::Function(Arc::new(func)))
+            Ok(TlaValue::Function(HashedArc::new(func)))
         }
 
         // TLC module: Function override (f @@ g merges functions, g takes precedence)
@@ -795,7 +796,7 @@ fn eval_compiled_inner(
             for (k, v) in right_func.iter() {
                 result.insert(k.clone(), v.clone());
             }
-            Ok(TlaValue::Function(Arc::new(result)))
+            Ok(TlaValue::Function(HashedArc::new(result)))
         }
 
         // Self-reference (@ in EXCEPT) - check if @ is bound in context
@@ -912,7 +913,7 @@ fn eval_compiled_inner(
                 let val = eval_compiled_inner(body, &new_ctx, depth)?;
                 result.insert(val);
             }
-            Ok(TlaValue::Set(Arc::new(result)))
+            Ok(TlaValue::Set(HashedArc::new(result)))
         }
 
         // Function construction
@@ -929,7 +930,7 @@ fn eval_compiled_inner(
                 let val = eval_compiled_inner(body, &new_ctx, depth)?;
                 func.insert(elem.clone(), val);
             }
-            Ok(TlaValue::Function(Arc::new(func)))
+            Ok(TlaValue::Function(HashedArc::new(func)))
         }
 
         // Function set: [Domain -> Range] - set of all functions from Domain to Range
@@ -948,13 +949,13 @@ fn eval_compiled_inner(
                 // Only one function from empty domain: the empty function
                 let empty_func = BTreeMap::new();
                 let mut result = BTreeSet::new();
-                result.insert(TlaValue::Function(Arc::new(empty_func)));
-                return Ok(TlaValue::Set(Arc::new(result)));
+                result.insert(TlaValue::Function(HashedArc::new(empty_func)));
+                return Ok(TlaValue::Set(HashedArc::new(result)));
             }
 
             if range_elems.is_empty() {
                 // No functions from non-empty domain to empty range
-                return Ok(TlaValue::Set(Arc::new(BTreeSet::new())));
+                return Ok(TlaValue::Set(HashedArc::new(BTreeSet::new())));
             }
 
             let n = domain_elems.len();
@@ -988,7 +989,7 @@ fn eval_compiled_inner(
                 for (i, d) in domain_elems.iter().enumerate() {
                     func.insert(d.clone(), range_elems[indices[i]].clone());
                 }
-                result.insert(TlaValue::Function(Arc::new(func)));
+                result.insert(TlaValue::Function(HashedArc::new(func)));
 
                 // Increment indices (like counting in base m)
                 let mut carry = true;
@@ -1008,7 +1009,7 @@ fn eval_compiled_inner(
                 }
             }
 
-            Ok(TlaValue::Set(Arc::new(result)))
+            Ok(TlaValue::Set(HashedArc::new(result)))
         }
 
         // Operator call - evaluate using compiled expressions
@@ -1028,7 +1029,7 @@ fn eval_compiled_inner(
             let set: BTreeSet<TlaValue> = [TlaValue::Bool(false), TlaValue::Bool(true)]
                 .into_iter()
                 .collect();
-            Ok(TlaValue::Set(Arc::new(set)))
+            Ok(TlaValue::Set(HashedArc::new(set)))
         }
 
         // Lambda
@@ -1417,7 +1418,7 @@ fn set_nested_value(value: TlaValue, keys: &[TlaValue], new_val: TlaValue) -> Re
                 let updated = set_nested_value(inner, remaining, new_val)?;
                 new_func.insert(key.clone(), updated);
             }
-            Ok(TlaValue::Function(Arc::new(new_func)))
+            Ok(TlaValue::Function(HashedArc::new(new_func)))
         }
         TlaValue::Seq(s) => {
             let idx = key.as_int()? as usize;
@@ -1431,7 +1432,7 @@ fn set_nested_value(value: TlaValue, keys: &[TlaValue], new_val: TlaValue) -> Re
                 let inner = s[idx - 1].clone();
                 new_seq[idx - 1] = set_nested_value(inner, remaining, new_val)?;
             }
-            Ok(TlaValue::Seq(Arc::new(new_seq)))
+            Ok(TlaValue::Seq(HashedArc::new(new_seq)))
         }
         TlaValue::Record(r) => {
             let field = match key {
@@ -1448,7 +1449,7 @@ fn set_nested_value(value: TlaValue, keys: &[TlaValue], new_val: TlaValue) -> Re
                     .ok_or_else(|| anyhow!("field not found: {}", field))?;
                 new_rec.insert(field, set_nested_value(inner, remaining, new_val)?);
             }
-            Ok(TlaValue::Record(Arc::new(new_rec)))
+            Ok(TlaValue::Record(HashedArc::new(new_rec)))
         }
         _ => Err(anyhow!("cannot update nested path in {:?}", value)),
     }
@@ -1544,7 +1545,7 @@ fn eval_compiled_opcall(
             if seq.is_empty() {
                 return Err(anyhow!("Tail of empty sequence"));
             }
-            return Ok(TlaValue::Seq(Arc::new(seq[1..].to_vec())));
+            return Ok(TlaValue::Seq(HashedArc::new(seq[1..].to_vec())));
         }
         "Append" => {
             if arg_values.len() != 2 {
@@ -1553,7 +1554,7 @@ fn eval_compiled_opcall(
             let mut seq = sequence_like_values(&arg_values[0])
                 .ok_or_else(|| anyhow!("expected Seq, got {:?}", arg_values[0]))?;
             seq.push(arg_values[1].clone());
-            return Ok(TlaValue::Seq(Arc::new(seq)));
+            return Ok(TlaValue::Seq(HashedArc::new(seq)));
         }
         "SubSeq" => {
             if arg_values.len() != 3 {
@@ -1574,10 +1575,10 @@ fn eval_compiled_opcall(
             let end = (n as usize).min(seq.len());
 
             if start > seq.len() {
-                return Ok(TlaValue::Seq(Arc::new(vec![])));
+                return Ok(TlaValue::Seq(HashedArc::new(vec![])));
             }
 
-            return Ok(TlaValue::Seq(Arc::new(seq[start..end].to_vec())));
+            return Ok(TlaValue::Seq(HashedArc::new(seq[start..end].to_vec())));
         }
         "SelectSeq" => {
             if arg_values.len() != 2 {
@@ -1637,7 +1638,7 @@ fn eval_compiled_opcall(
                     result.push(elem.clone());
                 }
             }
-            return Ok(TlaValue::Seq(Arc::new(result)));
+            return Ok(TlaValue::Seq(HashedArc::new(result)));
         }
         "DOMAIN" => {
             if arg_values.len() != 1 {
@@ -1646,17 +1647,17 @@ fn eval_compiled_opcall(
             match &arg_values[0] {
                 TlaValue::Function(map) => {
                     let keys: BTreeSet<TlaValue> = map.keys().cloned().collect();
-                    return Ok(TlaValue::Set(Arc::new(keys)));
+                    return Ok(TlaValue::Set(HashedArc::new(keys)));
                 }
                 TlaValue::Record(map) => {
                     let keys: BTreeSet<TlaValue> =
                         map.keys().map(|k| TlaValue::String(k.clone())).collect();
-                    return Ok(TlaValue::Set(Arc::new(keys)));
+                    return Ok(TlaValue::Set(HashedArc::new(keys)));
                 }
                 TlaValue::Seq(seq) => {
                     let indices: BTreeSet<TlaValue> =
                         (1..=seq.len() as i64).map(TlaValue::Int).collect();
-                    return Ok(TlaValue::Set(Arc::new(indices)));
+                    return Ok(TlaValue::Set(HashedArc::new(indices)));
                 }
                 _ => {
                     return Err(anyhow!("DOMAIN expects a function, record, or sequence"));
@@ -1672,17 +1673,17 @@ fn eval_compiled_opcall(
             match &arg_values[0] {
                 TlaValue::Function(map) => {
                     let values: BTreeSet<TlaValue> = map.values().cloned().collect();
-                    return Ok(TlaValue::Set(Arc::new(values)));
+                    return Ok(TlaValue::Set(HashedArc::new(values)));
                 }
                 TlaValue::Seq(seq) => {
                     // Range of a sequence is the set of all its elements
                     let values: BTreeSet<TlaValue> = seq.iter().cloned().collect();
-                    return Ok(TlaValue::Set(Arc::new(values)));
+                    return Ok(TlaValue::Set(HashedArc::new(values)));
                 }
                 TlaValue::Record(map) => {
                     // Range of a record is the set of all its field values
                     let values: BTreeSet<TlaValue> = map.values().cloned().collect();
-                    return Ok(TlaValue::Set(Arc::new(values)));
+                    return Ok(TlaValue::Set(HashedArc::new(values)));
                 }
                 _ => {
                     return Err(anyhow!("Range expects a function, sequence, or record"));
@@ -1728,7 +1729,7 @@ fn eval_compiled_opcall(
                 let val = func.apply(&key)?.clone();
                 result.push(val);
             }
-            return Ok(TlaValue::Seq(Arc::new(result)));
+            return Ok(TlaValue::Seq(HashedArc::new(result)));
         }
         // === Community module: SequencesExt ===
         "SeqOf" if arg_values.len() == 2 && !user_defined_shadow => {
@@ -1774,7 +1775,7 @@ fn eval_compiled_opcall(
             let a = arg_values[0].as_set()?;
             let b = arg_values[1].as_set()?;
             let result: BTreeSet<TlaValue> = a.symmetric_difference(&b).cloned().collect();
-            return Ok(TlaValue::Set(Arc::new(result)));
+            return Ok(TlaValue::Set(HashedArc::new(result)));
         }
         "FlattenSet" if arg_values.len() == 1 && !user_defined_shadow => {
             return eval_operator_call("FlattenSet", arg_values.clone(), ctx, depth);
@@ -1822,7 +1823,7 @@ fn eval_compiled_opcall(
             }
             let mut result = seq[..i - 1].to_vec();
             result.extend_from_slice(&seq[i..]);
-            return Ok(TlaValue::Seq(Arc::new(result)));
+            return Ok(TlaValue::Seq(HashedArc::new(result)));
         }
         // === Community module: Functions ===
         "FoldFunction" if arg_values.len() == 3 && !user_defined_shadow => {
@@ -1847,7 +1848,7 @@ fn eval_compiled_opcall(
             let den = p.select_key("den")?.as_int()?;
             let new_den = den * 2;
             let g = gcd(num.unsigned_abs(), new_den as u64) as i64;
-            return Ok(TlaValue::Record(Arc::new(BTreeMap::from([
+            return Ok(TlaValue::Record(HashedArc::new(BTreeMap::from([
                 ("num".to_string(), TlaValue::Int(num / g)),
                 ("den".to_string(), TlaValue::Int(new_den / g)),
             ]))));
@@ -1864,7 +1865,7 @@ fn eval_compiled_opcall(
                 let lcm = pd.max(qd);
                 let new_num = pn * (lcm / pd) + qn * (lcm / qd);
                 let g = gcd(new_num.unsigned_abs(), lcm as u64) as i64;
-                return Ok(TlaValue::Record(Arc::new(BTreeMap::from([
+                return Ok(TlaValue::Record(HashedArc::new(BTreeMap::from([
                     ("num".to_string(), TlaValue::Int(new_num / g)),
                     ("den".to_string(), TlaValue::Int(lcm / g)),
                 ]))));
@@ -1987,7 +1988,7 @@ fn eval_builtin_bounded_seq(domain: &TlaValue, max_len: i64) -> Result<TlaValue>
 
     let mut out = BTreeSet::new();
     let mut current = vec![Vec::<TlaValue>::new()];
-    out.insert(TlaValue::Seq(Arc::new(Vec::new())));
+    out.insert(TlaValue::Seq(HashedArc::new(Vec::new())));
 
     for _ in 0..max_len {
         let mut next = Vec::new();
@@ -1995,21 +1996,21 @@ fn eval_builtin_bounded_seq(domain: &TlaValue, max_len: i64) -> Result<TlaValue>
             for value in &elements {
                 let mut seq = prefix.clone();
                 seq.push(value.clone());
-                out.insert(TlaValue::Seq(Arc::new(seq.clone())));
+                out.insert(TlaValue::Seq(HashedArc::new(seq.clone())));
                 next.push(seq);
             }
         }
         current = next;
     }
 
-    Ok(TlaValue::Set(Arc::new(out)))
+    Ok(TlaValue::Set(HashedArc::new(out)))
 }
 
 fn eval_builtin_tlc_get(key: &TlaValue) -> Result<TlaValue> {
     match key {
         TlaValue::String(name) if name == "level" => Ok(TlaValue::Int(0)),
         TlaValue::String(name) if name == "config" => {
-            Ok(TlaValue::Record(Arc::new(BTreeMap::from([
+            Ok(TlaValue::Record(HashedArc::new(BTreeMap::from([
                 ("mode".to_string(), TlaValue::String("bfs".to_string())),
                 ("worker".to_string(), TlaValue::Int(1)),
             ]))))
@@ -2617,7 +2618,7 @@ mod tests {
         // Test Tail
         let result = eval_compiled(&compile_expr("Tail(<<5, 6, 7>>)"), &ctx).unwrap();
         let expected: Vec<TlaValue> = vec![TlaValue::Int(6), TlaValue::Int(7)];
-        assert_eq!(result, TlaValue::Seq(Arc::new(expected)));
+        assert_eq!(result, TlaValue::Seq(HashedArc::new(expected)));
 
         assert_eq!(
             eval_compiled(&compile_expr("Max({1, 4, 2})"), &ctx).unwrap(),
@@ -2637,7 +2638,7 @@ mod tests {
         );
         assert_eq!(
             eval_compiled(&compile_expr("<<1, 2>> \\circ <<3>>"), &ctx).unwrap(),
-            TlaValue::Seq(Arc::new(vec![
+            TlaValue::Seq(HashedArc::new(vec![
                 TlaValue::Int(1),
                 TlaValue::Int(2),
                 TlaValue::Int(3),
@@ -2670,17 +2671,17 @@ mod tests {
         let mut state = TlaState::new();
         state.insert(
             Arc::from("1bMessage"),
-            TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(1)]))),
+            TlaValue::Set(HashedArc::new(BTreeSet::from([TlaValue::Int(1)]))),
         );
         state.insert(
             Arc::from("2bMessage"),
-            TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(2)]))),
+            TlaValue::Set(HashedArc::new(BTreeSet::from([TlaValue::Int(2)]))),
         );
         let ctx = EvalContext::new(&state);
 
         assert_eq!(
             eval_compiled(&compile_expr("1bMessage \\cup 2bMessage"), &ctx).unwrap(),
-            TlaValue::Set(Arc::new(BTreeSet::from([
+            TlaValue::Set(HashedArc::new(BTreeSet::from([
                 TlaValue::Int(1),
                 TlaValue::Int(2),
             ])))
@@ -3052,31 +3053,31 @@ mod tests {
         let state = tla_state([
             (
                 "Participants",
-                TlaValue::Set(Arc::new(BTreeSet::from([alice.clone(), bob.clone()]))),
+                TlaValue::Set(HashedArc::new(BTreeSet::from([alice.clone(), bob.clone()]))),
             ),
             (
                 "referencePrice",
-                TlaValue::Function(Arc::new(BTreeMap::from([(
+                TlaValue::Function(HashedArc::new(BTreeMap::from([(
                     asset.clone(),
                     TlaValue::Int(15),
                 )]))),
             ),
             (
                 "positions",
-                TlaValue::Function(Arc::new(BTreeMap::from([
+                TlaValue::Function(HashedArc::new(BTreeMap::from([
                     (alice.clone(), TlaValue::Int(1)),
                     (bob.clone(), TlaValue::Int(-1)),
                 ]))),
             ),
             (
                 "balances",
-                TlaValue::Function(Arc::new(BTreeMap::from([
+                TlaValue::Function(HashedArc::new(BTreeMap::from([
                     (alice.clone(), TlaValue::Int(100)),
                     (bob.clone(), TlaValue::Int(100)),
                 ]))),
             ),
         ]);
-        let future = TlaValue::Record(Arc::new(BTreeMap::from([
+        let future = TlaValue::Record(HashedArc::new(BTreeMap::from([
             ("asset".to_string(), asset),
             ("price".to_string(), TlaValue::Int(10)),
         ])));
@@ -3114,36 +3115,36 @@ IN
         let state = tla_state([
             (
                 "Sellers",
-                TlaValue::Set(Arc::new(BTreeSet::from([seller.clone()]))),
+                TlaValue::Set(HashedArc::new(BTreeSet::from([seller.clone()]))),
             ),
             (
                 "Assets",
-                TlaValue::Set(Arc::new(BTreeSet::from([asset.clone()]))),
+                TlaValue::Set(HashedArc::new(BTreeSet::from([asset.clone()]))),
             ),
-            ("ccpTrades", TlaValue::Set(Arc::new(BTreeSet::new()))),
+            ("ccpTrades", TlaValue::Set(HashedArc::new(BTreeSet::new()))),
             (
                 "ccpPositions",
-                TlaValue::Function(Arc::new(BTreeMap::from([
+                TlaValue::Function(HashedArc::new(BTreeMap::from([
                     (
                         bot.clone(),
-                        TlaValue::Function(Arc::new(BTreeMap::from([(
+                        TlaValue::Function(HashedArc::new(BTreeMap::from([(
                             asset.clone(),
                             TlaValue::Int(0),
                         )]))),
                     ),
                     (
                         seller.clone(),
-                        TlaValue::Function(Arc::new(BTreeMap::from([(
+                        TlaValue::Function(HashedArc::new(BTreeMap::from([(
                             asset.clone(),
                             TlaValue::Int(3),
                         )]))),
                     ),
                 ]))),
             ),
-            ("deployments", TlaValue::Set(Arc::new(BTreeSet::new()))),
+            ("deployments", TlaValue::Set(HashedArc::new(BTreeSet::new()))),
             (
                 "actionCount",
-                TlaValue::Function(Arc::new(BTreeMap::from([(bot.clone(), TlaValue::Int(0))]))),
+                TlaValue::Function(HashedArc::new(BTreeMap::from([(bot.clone(), TlaValue::Int(0))]))),
             ),
         ]);
         let ctx = EvalContext::new(&state).with_local_value("bot", bot.clone());
@@ -3222,7 +3223,7 @@ IN
         let mut func = BTreeMap::new();
         func.insert(TlaValue::Int(1), TlaValue::Int(5));
         func.insert(TlaValue::Int(2), TlaValue::Int(10));
-        let func_val = TlaValue::Function(Arc::new(func));
+        let func_val = TlaValue::Function(HashedArc::new(func));
 
         let ctx_with_table = ctx.with_local_value("table", func_val);
 
@@ -3251,7 +3252,7 @@ IN
         let mut rec = BTreeMap::new();
         rec.insert("flag".to_string(), TlaValue::Bool(true));
         rec.insert("count".to_string(), TlaValue::Int(5));
-        let rec_val = TlaValue::Record(Arc::new(rec));
+        let rec_val = TlaValue::Record(HashedArc::new(rec));
 
         let ctx_with_rec = ctx.with_local_value("rec", rec_val);
 
@@ -3277,7 +3278,7 @@ IN
         let mut rec = BTreeMap::new();
         rec.insert("flag".to_string(), TlaValue::Bool(false));
         rec.insert("count".to_string(), TlaValue::Int(10));
-        let rec_val = TlaValue::Record(Arc::new(rec));
+        let rec_val = TlaValue::Record(HashedArc::new(rec));
 
         let ctx_with_rec = ctx.with_local_value("rec", rec_val);
 
@@ -3435,8 +3436,8 @@ IN
         let mut inner = std::collections::BTreeMap::new();
         inner.insert("b".to_string(), TlaValue::Int(5));
         let mut outer = std::collections::BTreeMap::new();
-        outer.insert("a".to_string(), TlaValue::Record(std::sync::Arc::new(inner)));
-        let val = TlaValue::Record(std::sync::Arc::new(outer));
+        outer.insert("a".to_string(), TlaValue::Record(HashedArc::new(inner)));
+        let val = TlaValue::Record(HashedArc::new(outer));
 
         // get_nested_value(val, &["a", "b"]) should be Int(5)
         let path: Vec<TlaValue> = vec![
@@ -3453,7 +3454,7 @@ IN
     fn t207c_get_nested_missing_field_errs() {
         let mut rec = std::collections::BTreeMap::new();
         rec.insert("a".to_string(), TlaValue::Int(1));
-        let val = TlaValue::Record(std::sync::Arc::new(rec));
+        let val = TlaValue::Record(HashedArc::new(rec));
         let path: Vec<TlaValue> = vec![TlaValue::String("missing".to_string())];
         assert!(super::get_nested_value(&val, &path).is_err());
     }
@@ -3463,7 +3464,7 @@ IN
         let mut rec = std::collections::BTreeMap::new();
         rec.insert("a".to_string(), TlaValue::Int(1));
         rec.insert("b".to_string(), TlaValue::Int(2));
-        let val = TlaValue::Record(std::sync::Arc::new(rec));
+        let val = TlaValue::Record(HashedArc::new(rec));
         let path: Vec<TlaValue> = vec![TlaValue::String("a".to_string())];
         let r = super::set_nested_value(val, &path, TlaValue::Int(99));
         match r {
@@ -3479,7 +3480,7 @@ IN
 
     #[test]
     fn t207c_sequence_like_values_seq() {
-        let s = TlaValue::Seq(std::sync::Arc::new(vec![TlaValue::Int(1)]));
+        let s = TlaValue::Seq(HashedArc::new(vec![TlaValue::Int(1)]));
         let r = super::sequence_like_values(&s);
         assert!(r.is_some());
         assert_eq!(r.unwrap().len(), 1);
@@ -3513,13 +3514,13 @@ mod forall_tests {
         rec2.insert("id".to_string(), TlaValue::Int(2));
 
         let listings_set: BTreeSet<TlaValue> = [
-            TlaValue::Record(Arc::new(rec1)),
-            TlaValue::Record(Arc::new(rec2)),
+            TlaValue::Record(HashedArc::new(rec1)),
+            TlaValue::Record(HashedArc::new(rec2)),
         ]
         .into_iter()
         .collect();
 
-        state.insert(Arc::from("listings"), TlaValue::Set(Arc::new(listings_set)));
+        state.insert(Arc::from("listings"), TlaValue::Set(HashedArc::new(listings_set)));
         state.insert(Arc::from("MinPrice"), TlaValue::Int(5));
 
         // Create context
@@ -3592,11 +3593,11 @@ mod forall_tests {
     fn t1_4_paxos_phase2a_guard_with_empty_msgs_is_false() {
         let mut state = TlaState::new();
         // msgs == {} (empty set, mimicking initial Paxos state)
-        state.insert(Arc::from("msgs"), TlaValue::Set(Arc::new(BTreeSet::new())));
+        state.insert(Arc::from("msgs"), TlaValue::Set(HashedArc::new(BTreeSet::new())));
         let mut q_set = BTreeSet::new();
         q_set.insert(TlaValue::ModelValue("a1".to_string()));
         q_set.insert(TlaValue::ModelValue("a2".to_string()));
-        let ctx = EvalContext::new(&state).with_local_value("Q", TlaValue::Set(Arc::new(q_set)));
+        let ctx = EvalContext::new(&state).with_local_value("Q", TlaValue::Set(HashedArc::new(q_set)));
         // Mimic the Phase2a guard inside `\E Q \in Quorum : LET ... IN ...`:
         //   Q1b == {m \in msgs : ...} -- becomes {} here
         //   Body : \A a \in Q : \E m \in Q1b : m.acc = a
@@ -3645,14 +3646,14 @@ fn test_full_typeok_pattern_cluster_lease_failover() {
         .iter()
         .map(|s| TlaValue::ModelValue(s.to_string()))
         .collect();
-    state.insert(Arc::from("Shards"), TlaValue::Set(Arc::new(shards_set)));
+    state.insert(Arc::from("Shards"), TlaValue::Set(HashedArc::new(shards_set)));
 
     // Create Clients set
     let clients_set: BTreeSet<TlaValue> = ["c1", "c2"]
         .iter()
         .map(|s| TlaValue::ModelValue(s.to_string()))
         .collect();
-    state.insert(Arc::from("Clients"), TlaValue::Set(Arc::new(clients_set)));
+    state.insert(Arc::from("Clients"), TlaValue::Set(HashedArc::new(clients_set)));
 
     // Create shardTerm function: s1 -> 1, s2 -> 2, s3 -> 3, s4 -> 4
     let mut shardterm_map = BTreeMap::new();
@@ -3664,7 +3665,7 @@ fn test_full_typeok_pattern_cluster_lease_failover() {
     }
     state.insert(
         Arc::from("shardTerm"),
-        TlaValue::Function(Arc::new(shardterm_map)),
+        TlaValue::Function(HashedArc::new(shardterm_map)),
     );
 
     // Create shardLeader function: s1 -> "stable", s2 -> "none", etc.
@@ -3679,7 +3680,7 @@ fn test_full_typeok_pattern_cluster_lease_failover() {
     }
     state.insert(
         Arc::from("shardLeader"),
-        TlaValue::Function(Arc::new(shardleader_map)),
+        TlaValue::Function(HashedArc::new(shardleader_map)),
     );
 
     // Create leases nested function: leases[s][c] = {held: TRUE, grantedTerm: 1, access: "read"}
@@ -3694,17 +3695,17 @@ fn test_full_typeok_pattern_cluster_lease_failover() {
             lease_rec.insert("access".to_string(), TlaValue::String("read".to_string()));
             inner_map.insert(
                 TlaValue::ModelValue(client.to_string()),
-                TlaValue::Record(Arc::new(lease_rec)),
+                TlaValue::Record(HashedArc::new(lease_rec)),
             );
         }
         leases_outer.insert(
             TlaValue::ModelValue(shard.to_string()),
-            TlaValue::Function(Arc::new(inner_map)),
+            TlaValue::Function(HashedArc::new(inner_map)),
         );
     }
     state.insert(
         Arc::from("leases"),
-        TlaValue::Function(Arc::new(leases_outer)),
+        TlaValue::Function(HashedArc::new(leases_outer)),
     );
 
     state.insert(Arc::from("MaxTerm"), TlaValue::Int(10));
@@ -3777,9 +3778,9 @@ fn test_full_price_bands_invariant() {
     let mut rec1 = BTreeMap::new();
     rec1.insert("price".to_string(), TlaValue::Int(10));
 
-    let listings_set: BTreeSet<TlaValue> = [TlaValue::Record(Arc::new(rec1))].into_iter().collect();
+    let listings_set: BTreeSet<TlaValue> = [TlaValue::Record(HashedArc::new(rec1))].into_iter().collect();
 
-    state.insert(Arc::from("listings"), TlaValue::Set(Arc::new(listings_set)));
+    state.insert(Arc::from("listings"), TlaValue::Set(HashedArc::new(listings_set)));
     state.insert(Arc::from("MinPrice"), TlaValue::Int(5));
     state.insert(Arc::from("MaxPrice"), TlaValue::Int(20));
 
@@ -3806,14 +3807,14 @@ fn test_nested_quantifiers_typeok_evaluation() {
         .iter()
         .map(|s| TlaValue::ModelValue(s.to_string()))
         .collect();
-    state.insert(Arc::from("Shards"), TlaValue::Set(Arc::new(shards_set)));
+    state.insert(Arc::from("Shards"), TlaValue::Set(HashedArc::new(shards_set)));
 
     // Create Clients set
     let clients_set: BTreeSet<TlaValue> = ["c1", "c2"]
         .iter()
         .map(|s| TlaValue::ModelValue(s.to_string()))
         .collect();
-    state.insert(Arc::from("Clients"), TlaValue::Set(Arc::new(clients_set)));
+    state.insert(Arc::from("Clients"), TlaValue::Set(HashedArc::new(clients_set)));
 
     // Create shardTerm function: s1 -> 1, s2 -> 2
     let mut shardterm_map = BTreeMap::new();
@@ -3821,7 +3822,7 @@ fn test_nested_quantifiers_typeok_evaluation() {
     shardterm_map.insert(TlaValue::ModelValue("s2".to_string()), TlaValue::Int(2));
     state.insert(
         Arc::from("shardTerm"),
-        TlaValue::Function(Arc::new(shardterm_map)),
+        TlaValue::Function(HashedArc::new(shardterm_map)),
     );
 
     // Create leases nested function: leases[s][c] = {held: TRUE, ...}
@@ -3834,17 +3835,17 @@ fn test_nested_quantifiers_typeok_evaluation() {
             lease_rec.insert("grantedTerm".to_string(), TlaValue::Int(1));
             inner_map.insert(
                 TlaValue::ModelValue(client.to_string()),
-                TlaValue::Record(Arc::new(lease_rec)),
+                TlaValue::Record(HashedArc::new(lease_rec)),
             );
         }
         leases_outer.insert(
             TlaValue::ModelValue(shard.to_string()),
-            TlaValue::Function(Arc::new(inner_map)),
+            TlaValue::Function(HashedArc::new(inner_map)),
         );
     }
     state.insert(
         Arc::from("leases"),
-        TlaValue::Function(Arc::new(leases_outer)),
+        TlaValue::Function(HashedArc::new(leases_outer)),
     );
 
     state.insert(Arc::from("MaxTerm"), TlaValue::Int(10));
@@ -3888,9 +3889,9 @@ fn test_compiled_cartesian_product_times() {
     assert_eq!(result_x, result_times);
 
     // Verify the result is correct: {<<1, 3>>, <<2, 3>>}
-    let expected = TlaValue::Set(Arc::new(BTreeSet::from([
-        TlaValue::Seq(Arc::new(vec![TlaValue::Int(1), TlaValue::Int(3)])),
-        TlaValue::Seq(Arc::new(vec![TlaValue::Int(2), TlaValue::Int(3)])),
+    let expected = TlaValue::Set(HashedArc::new(BTreeSet::from([
+        TlaValue::Seq(HashedArc::new(vec![TlaValue::Int(1), TlaValue::Int(3)])),
+        TlaValue::Seq(HashedArc::new(vec![TlaValue::Int(2), TlaValue::Int(3)])),
     ])));
     assert_eq!(result_times, expected);
 }
@@ -3900,14 +3901,14 @@ fn test_compiled_sequence_builtins_accept_sequence_like_functions() {
     let state = tla_state([
         (
             "seq_like",
-            TlaValue::Function(Arc::new(BTreeMap::from([
+            TlaValue::Function(HashedArc::new(BTreeMap::from([
                 (TlaValue::Int(1), TlaValue::Int(1)),
                 (TlaValue::Int(2), TlaValue::Int(2)),
             ]))),
         ),
         (
             "other",
-            TlaValue::Function(Arc::new(BTreeMap::from([(
+            TlaValue::Function(HashedArc::new(BTreeMap::from([(
                 TlaValue::Int(1),
                 TlaValue::Int(3),
             )]))),
@@ -3925,11 +3926,11 @@ fn test_compiled_sequence_builtins_accept_sequence_like_functions() {
     );
     assert_eq!(
         eval_compiled(&compile_expr("Tail(seq_like)"), &ctx).unwrap(),
-        TlaValue::Seq(Arc::new(vec![TlaValue::Int(2)]))
+        TlaValue::Seq(HashedArc::new(vec![TlaValue::Int(2)]))
     );
     assert_eq!(
         eval_compiled(&compile_expr("Append(seq_like, 4)"), &ctx).unwrap(),
-        TlaValue::Seq(Arc::new(vec![
+        TlaValue::Seq(HashedArc::new(vec![
             TlaValue::Int(1),
             TlaValue::Int(2),
             TlaValue::Int(4),
@@ -3937,11 +3938,11 @@ fn test_compiled_sequence_builtins_accept_sequence_like_functions() {
     );
     assert_eq!(
         eval_compiled(&compile_expr("SubSeq(seq_like, 1, 2)"), &ctx).unwrap(),
-        TlaValue::Seq(Arc::new(vec![TlaValue::Int(1), TlaValue::Int(2)]))
+        TlaValue::Seq(HashedArc::new(vec![TlaValue::Int(1), TlaValue::Int(2)]))
     );
     assert_eq!(
         eval_compiled(&compile_expr("seq_like \\o other"), &ctx).unwrap(),
-        TlaValue::Seq(Arc::new(vec![
+        TlaValue::Seq(HashedArc::new(vec![
             TlaValue::Int(1),
             TlaValue::Int(2),
             TlaValue::Int(3),
@@ -3977,7 +3978,7 @@ mod compiled_action_correctness_tests {
     fn forall_guard_blocks_when_false() {
         let state = tla_state([(
             "locked",
-            TlaValue::Function(Arc::new(BTreeMap::from([
+            TlaValue::Function(HashedArc::new(BTreeMap::from([
                 (TlaValue::String("p1".to_string()), TlaValue::Bool(true)),
                 (TlaValue::String("p2".to_string()), TlaValue::Bool(false)),
             ]))),
@@ -4017,7 +4018,7 @@ mod compiled_action_correctness_tests {
     fn forall_guard_passes_when_true() {
         let state = tla_state([(
             "locked",
-            TlaValue::Function(Arc::new(BTreeMap::from([
+            TlaValue::Function(HashedArc::new(BTreeMap::from([
                 (TlaValue::String("p1".to_string()), TlaValue::Bool(false)),
                 (TlaValue::String("p2".to_string()), TlaValue::Bool(false)),
             ]))),
@@ -4340,7 +4341,7 @@ mod compiled_action_correctness_tests {
     fn test_compiled_sequence_operations_in_guard() {
         let state = tla_state([(
             "msgs",
-            TlaValue::Seq(Arc::new(vec![
+            TlaValue::Seq(HashedArc::new(vec![
                 TlaValue::String("msg1".to_string()),
                 TlaValue::String("msg2".to_string()),
                 TlaValue::String("msg3".to_string()),
@@ -4363,14 +4364,14 @@ mod compiled_action_correctness_tests {
         );
         assert_eq!(result.len(), 1, "Len guard should pass: {result:?}");
         let succ_msgs = result[0].get("msgs").unwrap();
-        let expected = TlaValue::Seq(Arc::new(vec![
+        let expected = TlaValue::Seq(HashedArc::new(vec![
             TlaValue::String("msg2".to_string()),
             TlaValue::String("msg3".to_string()),
         ]));
         assert_eq!(succ_msgs, &expected, "Tail should remove first element");
 
         // Empty sequence: Len = 0, guard should block
-        let state_empty = tla_state([("msgs", TlaValue::Seq(Arc::new(vec![])))]);
+        let state_empty = tla_state([("msgs", TlaValue::Seq(HashedArc::new(vec![])))]);
         let ctx_empty = EvalContext::new(&state_empty);
 
         let result2 = compile_and_run(
@@ -4397,7 +4398,7 @@ mod compiled_action_correctness_tests {
     fn test_compiled_function_construction_in_assignment() {
         let state = tla_state([(
             "f",
-            TlaValue::Function(Arc::new(BTreeMap::from([
+            TlaValue::Function(HashedArc::new(BTreeMap::from([
                 (TlaValue::String("n1".to_string()), TlaValue::Int(0)),
                 (TlaValue::String("n2".to_string()), TlaValue::Int(0)),
             ]))),
@@ -4423,7 +4424,7 @@ mod compiled_action_correctness_tests {
             &ctx,
         );
         assert_eq!(result.len(), 1, "should produce one successor: {result:?}");
-        let expected = TlaValue::Function(Arc::new(BTreeMap::from([
+        let expected = TlaValue::Function(HashedArc::new(BTreeMap::from([
             (TlaValue::String("n1".to_string()), TlaValue::Int(1)),
             (TlaValue::String("n2".to_string()), TlaValue::Int(1)),
         ])));
@@ -4437,17 +4438,17 @@ mod compiled_action_correctness_tests {
     /// Nested EXCEPT: [data EXCEPT !["a"]["x"] = 99].
     #[test]
     fn test_compiled_nested_except() {
-        let inner_a = TlaValue::Record(Arc::new(BTreeMap::from([
+        let inner_a = TlaValue::Record(HashedArc::new(BTreeMap::from([
             ("x".to_string(), TlaValue::Int(1)),
             ("y".to_string(), TlaValue::Int(2)),
         ])));
-        let inner_b = TlaValue::Record(Arc::new(BTreeMap::from([
+        let inner_b = TlaValue::Record(HashedArc::new(BTreeMap::from([
             ("x".to_string(), TlaValue::Int(3)),
             ("y".to_string(), TlaValue::Int(4)),
         ])));
         let state = tla_state([(
             "data",
-            TlaValue::Function(Arc::new(BTreeMap::from([
+            TlaValue::Function(HashedArc::new(BTreeMap::from([
                 (TlaValue::String("a".to_string()), inner_a),
                 (TlaValue::String("b".to_string()), inner_b.clone()),
             ]))),
@@ -4510,7 +4511,7 @@ mod compiled_action_correctness_tests {
         // vals = {1, 2, 3, 4, 5}: 2 elements > 3 → guard passes
         let state_pass = tla_state([(
             "vals",
-            TlaValue::Set(Arc::new(BTreeSet::from([
+            TlaValue::Set(HashedArc::new(BTreeSet::from([
                 TlaValue::Int(1),
                 TlaValue::Int(2),
                 TlaValue::Int(3),
@@ -4541,7 +4542,7 @@ mod compiled_action_correctness_tests {
         // vals = {1, 2, 3}: 0 elements > 3 → guard blocks
         let state_block = tla_state([(
             "vals",
-            TlaValue::Set(Arc::new(BTreeSet::from([
+            TlaValue::Set(HashedArc::new(BTreeSet::from([
                 TlaValue::Int(1),
                 TlaValue::Int(2),
                 TlaValue::Int(3),
@@ -4575,7 +4576,7 @@ mod compiled_action_correctness_tests {
         let state = tla_state([
             (
                 "items",
-                TlaValue::Set(Arc::new(BTreeSet::from([
+                TlaValue::Set(HashedArc::new(BTreeSet::from([
                     TlaValue::Int(10),
                     TlaValue::Int(20),
                     TlaValue::Int(30),
@@ -4824,7 +4825,7 @@ mod seq_membership_tests {
     #[test]
     fn function_with_seq_domain_is_in_seq_set() {
         // Create a function {1 |-> "a", 2 |-> "b", 3 |-> "a"} which is sequence-shaped
-        let func = TlaValue::Function(Arc::new(BTreeMap::from([
+        let func = TlaValue::Function(HashedArc::new(BTreeMap::from([
             (TlaValue::Int(1), TlaValue::String("a".into())),
             (TlaValue::Int(2), TlaValue::String("b".into())),
             (TlaValue::Int(3), TlaValue::String("a".into())),
@@ -4834,7 +4835,7 @@ mod seq_membership_tests {
             ("f", func.clone()),
             (
                 "S",
-                TlaValue::Set(Arc::new(
+                TlaValue::Set(HashedArc::new(
                     [TlaValue::String("a".into()), TlaValue::String("b".into())]
                         .into_iter()
                         .collect(),
@@ -4852,7 +4853,7 @@ mod seq_membership_tests {
     /// A function with non-sequential domain should NOT be in Seq(S).
     #[test]
     fn function_with_non_seq_domain_not_in_seq_set() {
-        let func = TlaValue::Function(Arc::new(BTreeMap::from([
+        let func = TlaValue::Function(HashedArc::new(BTreeMap::from([
             (TlaValue::Int(0), TlaValue::String("a".into())),
             (TlaValue::Int(1), TlaValue::String("b".into())),
         ])));
@@ -4861,7 +4862,7 @@ mod seq_membership_tests {
             ("f", func),
             (
                 "S",
-                TlaValue::Set(Arc::new(
+                TlaValue::Set(HashedArc::new(
                     [TlaValue::String("a".into()), TlaValue::String("b".into())]
                         .into_iter()
                         .collect(),
@@ -4880,7 +4881,7 @@ mod seq_membership_tests {
     /// compiled FunctionSet arm, without enumerating all possible functions.
     #[test]
     fn function_set_membership_checked_structurally() {
-        let func = TlaValue::Function(Arc::new(BTreeMap::from([
+        let func = TlaValue::Function(HashedArc::new(BTreeMap::from([
             (TlaValue::Int(1), TlaValue::Bool(true)),
             (TlaValue::Int(2), TlaValue::Bool(false)),
         ])));
@@ -4889,7 +4890,7 @@ mod seq_membership_tests {
             ("f", func),
             (
                 "D",
-                TlaValue::Set(Arc::new(
+                TlaValue::Set(HashedArc::new(
                     [TlaValue::Int(1), TlaValue::Int(2)].into_iter().collect(),
                 )),
             ),
