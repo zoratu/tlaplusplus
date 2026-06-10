@@ -1,0 +1,144 @@
+name: ci
+
+# Per-PR / per-push gate. Two jobs run in parallel:
+#
+# - `tests`: full release suite (cargo test --release) on a cross-arch matrix.
+#   Catches regressions in the cluster / determinism / checkpoint integration
+#   tests added in PRs #77-82 (tests/dfs_cluster_real_tcp.rs,
+#   tests/dfs_cluster_layer_b.rs, fingerprint_determinism_tests,
+#   checkpoint_resume_round_trip_terminates_and_matches) that the previous
+#   `cargo test --lib --bins` subset missed.
+#
+# - `diff-tlc`: differential testing against the reference TLC checker on a
+#   curated subset of small specs. Catches silent semantic divergence; needs
+#   JDK to run TLC. Also runs the compiled-vs-interpreted proptest equivalence
+#   gate (T2) at PROPTEST_CASES=128.
+#
+# Hybrid CI model: heavy gates (chaos smoke, --features failpoints,
+# --features symbolic-init, Verus proofs) run via an external spot-CI driver,
+# not here. See CLAUDE.md for the chaos-smoke / Verus gate descriptions.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: short
+
+jobs:
+  tests:
+    name: cargo test --release (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-tests-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-tests-${{ runner.os }}-${{ matrix.arch }}-
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build (release)
+        run: cargo build --release --tests
+
+      - name: Run full release test suite
+        # Includes lib + bins + tests/* integration tests. Critical for the
+        # PR #77-82 regression guards: dfs_cluster_real_tcp, dfs_cluster_layer_b,
+        # fingerprint determinism, checkpoint round-trip, eval-dispatch.
+        run: cargo test --release
+
+  diff-tlc:
+    name: tlaplusplus vs TLC (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-diff-tlc-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-diff-tlc-${{ runner.os }}-${{ matrix.arch }}-
+
+      - name: Verify tla2tools.jar is vendored
+        run: |
+          if [[ ! -f tools/tla2tools.jar ]]; then
+            echo "ERROR: tools/tla2tools.jar missing — should be vendored in the repo" >&2
+            exit 1
+          fi
+          ls -la tools/tla2tools.jar
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build tlaplusplus (debug)
+        # diff_tlc.sh uses target/debug/tlaplusplus by default. Debug build is
+        # ~3x faster than release here and the harness is I/O bound on TLC's
+        # JVM startup anyway.
+        run: cargo build --bin tlaplusplus
+
+      - name: Run differential test harness (13 specs vs TLC v2.19)
+        env:
+          TLAPLUSPLUS_BIN: ${{ github.workspace }}/target/debug/tlaplusplus
+          TLA2TOOLS_JAR: ${{ github.workspace }}/tools/tla2tools.jar
+          DIFF_TIMEOUT_SECS: "120"
+        run: ./scripts/diff_tlc.sh
+
+      - name: Run compiled-vs-interpreted proptest equivalence (T2)
+        env:
+          PROPTEST_CASES: "128"
+        run: cargo test --test compiled_vs_interpreted
+
+      - name: Upload diff harness logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diff-tlc-logs-${{ matrix.arch }}
+          path: .diff-tlc-out/
+          if-no-files-found: ignore
+          retention-days: 7
