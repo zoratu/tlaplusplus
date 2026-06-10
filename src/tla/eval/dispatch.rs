@@ -324,9 +324,18 @@ pub(super) fn classify_op(expr: &str) -> Op {
 
 const CACHE_CAP: usize = 8192;
 
+// Use ahash for the cache's HashMap because std's default SipHash is ~3x
+// slower per lookup. ahash::AHasher::default() uses a per-process random
+// seed — fine here because this cache is thread-local scratch space that
+// never escapes the process (so the seed doesn't need to be deterministic
+// across processes; the determinism rule applies only to `Model::fingerprint`
+// — see `crate::model::fingerprint_hasher`).
+type CacheMap = std::collections::HashMap<String, Op, ahash::RandomState>;
+
 thread_local! {
-    static OP_CACHE: std::cell::RefCell<std::collections::HashMap<String, Op>> =
-        std::cell::RefCell::new(std::collections::HashMap::with_capacity(CACHE_CAP));
+    static OP_CACHE: std::cell::RefCell<CacheMap> = std::cell::RefCell::new(
+        CacheMap::with_capacity_and_hasher(CACHE_CAP, ahash::RandomState::new())
+    );
 }
 
 /// Cached entrypoint mirroring `classify_op`. Looks up the trimmed `expr` in
