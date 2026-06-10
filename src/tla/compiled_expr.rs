@@ -9,6 +9,7 @@
 //! Benchmarks show this can provide 3-5x speedup on expression-heavy workloads.
 
 use std::sync::Arc;
+use crate::tla::hashed_arc::HashedArc;
 
 /// Compiled TLA+ expression - parsed once, evaluated many times
 #[derive(Debug, Clone)]
@@ -3753,7 +3754,7 @@ IN
         let mut rec: BTreeMap<String, TlaValue> = BTreeMap::new();
         rec.insert("a".to_string(), TlaValue::Int(1));
         rec.insert("b".to_string(), TlaValue::Int(2));
-        let state: TlaState = tla_state([("r", TlaValue::Record(Arc::new(rec)))]);
+        let state: TlaState = tla_state([("r", TlaValue::Record(HashedArc::new(rec)))]);
         let defs: BTreeMap<String, crate::tla::TlaDefinition> = BTreeMap::new();
         let ctx = EvalContext::with_definitions(&state, &defs);
 

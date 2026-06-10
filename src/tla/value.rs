@@ -3,18 +3,28 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use crate::tla::hashed_arc::HashedArc;
+
 /// TLA+ values with Arc-wrapped collection types for zero-copy cloning.
 /// Cloning a TlaValue with nested collections now only increments reference counts.
+///
+/// Collection variants (Set/Seq/Record/Function) use `HashedArc` instead of
+/// plain `Arc` to cache a `u64` fingerprint hash at construction time. This
+/// makes `Ord::cmp` between two collection-bearing TlaValues fast-fail on
+/// hash inequality (the common case during BTreeMap/BTreeSet inserts during
+/// state exploration), instead of recursing structurally on every compare —
+/// the hotspot the eval-perf profiling on MCBinarySearch surfaced. See
+/// `src/tla/hashed_arc.rs` for the soundness invariants.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum TlaValue {
     Bool(bool),
     Int(i64),
     String(String),
     ModelValue(String),
-    Set(Arc<BTreeSet<TlaValue>>),
-    Seq(Arc<Vec<TlaValue>>),
-    Record(Arc<BTreeMap<String, TlaValue>>),
-    Function(Arc<BTreeMap<TlaValue, TlaValue>>),
+    Set(HashedArc<BTreeSet<TlaValue>>),
+    Seq(HashedArc<Vec<TlaValue>>),
+    Record(HashedArc<BTreeMap<String, TlaValue>>),
+    Function(HashedArc<BTreeMap<TlaValue, TlaValue>>),
     Lambda {
         params: Arc<Vec<String>>,
         body: String,
@@ -78,7 +88,7 @@ impl TlaValue {
         for value in other.as_set()? {
             out.insert(value.clone());
         }
-        Ok(Self::Set(Arc::new(out)))
+        Ok(Self::Set(HashedArc::new(out)))
     }
 
     pub fn set_intersection(&self, other: &Self) -> Result<Self> {
@@ -89,7 +99,7 @@ impl TlaValue {
             .filter(|v| rhs.contains(*v))
             .cloned()
             .collect::<BTreeSet<_>>();
-        Ok(Self::Set(Arc::new(out)))
+        Ok(Self::Set(HashedArc::new(out)))
     }
 
     pub fn set_minus(&self, other: &Self) -> Result<Self> {
@@ -100,7 +110,7 @@ impl TlaValue {
             .filter(|v| !rhs.contains(*v))
             .cloned()
             .collect::<BTreeSet<_>>();
-        Ok(Self::Set(Arc::new(out)))
+        Ok(Self::Set(HashedArc::new(out)))
     }
 
     pub fn contains(&self, value: &Self) -> Result<bool> {
@@ -176,11 +186,11 @@ mod tests {
 
     #[test]
     fn set_ops_work() {
-        let a = TlaValue::Set(Arc::new(BTreeSet::from([
+        let a = TlaValue::Set(HashedArc::new(BTreeSet::from([
             TlaValue::Int(1),
             TlaValue::Int(2),
         ])));
-        let b = TlaValue::Set(Arc::new(BTreeSet::from([
+        let b = TlaValue::Set(HashedArc::new(BTreeSet::from([
             TlaValue::Int(2),
             TlaValue::Int(3),
         ])));
@@ -196,14 +206,14 @@ mod tests {
 
     #[test]
     fn sequence_and_record_access_work() {
-        let seq = TlaValue::Seq(Arc::new(vec![TlaValue::ModelValue("a".to_string())]));
+        let seq = TlaValue::Seq(HashedArc::new(vec![TlaValue::ModelValue("a".to_string())]));
         assert_eq!(
             seq.apply(&TlaValue::Int(1))
                 .expect("sequence index should work"),
             &TlaValue::ModelValue("a".to_string())
         );
 
-        let rec = TlaValue::Record(Arc::new(BTreeMap::from([(
+        let rec = TlaValue::Record(HashedArc::new(BTreeMap::from([(
             "x".to_string(),
             TlaValue::Int(7),
         )])));
@@ -233,13 +243,13 @@ mod proptests {
 
     /// Generate a set of TlaValues
     fn arb_tla_set() -> impl Strategy<Value = TlaValue> {
-        prop::collection::btree_set(arb_tla_value(), 0..10).prop_map(|s| TlaValue::Set(Arc::new(s)))
+        prop::collection::btree_set(arb_tla_value(), 0..10).prop_map(|s| TlaValue::Set(HashedArc::new(s)))
     }
 
     /// Generate a sequence of TlaValues
     #[allow(dead_code)]
     fn arb_tla_seq() -> impl Strategy<Value = TlaValue> {
-        prop::collection::vec(arb_tla_value(), 0..10).prop_map(|v| TlaValue::Seq(Arc::new(v)))
+        prop::collection::vec(arb_tla_value(), 0..10).prop_map(|v| TlaValue::Seq(HashedArc::new(v)))
     }
 
     proptest! {
@@ -326,14 +336,14 @@ mod proptests {
         /// Sequence length matches vec length
         #[test]
         fn seq_length_correct(items in prop::collection::vec(arb_tla_value(), 0..20)) {
-            let seq = TlaValue::Seq(Arc::new(items.clone()));
+            let seq = TlaValue::Seq(HashedArc::new(items.clone()));
             prop_assert_eq!(seq.len().unwrap(), items.len());
         }
 
         /// Sequence indexing (1-based)
         #[test]
         fn seq_indexing_works(items in prop::collection::vec(arb_tla_value(), 1..10)) {
-            let seq = TlaValue::Seq(Arc::new(items.clone()));
+            let seq = TlaValue::Seq(HashedArc::new(items.clone()));
             for (i, expected) in items.iter().enumerate() {
                 let idx = TlaValue::Int((i + 1) as i64); // 1-based indexing
                 let actual = seq.apply(&idx).unwrap();

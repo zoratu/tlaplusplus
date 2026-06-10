@@ -7,6 +7,7 @@
 //! my t207c didn't drive. This file adds one deep-recursion path per
 //! remaining built-in, plus shape coverage for compiled_membership_contains.
 
+use tlaplusplus::tla::hashed_arc::HashedArc;
 use tlaplusplus::tla::value::{TlaState, TlaValue};
 use tlaplusplus::tla::{EvalContext, compile_expr, eval_compiled};
 
@@ -358,7 +359,7 @@ fn t207e_funasseq_zero_b_returns_empty() {
         &ctx,
     )
     .unwrap();
-    assert_eq!(r, TlaValue::Seq(std::sync::Arc::new(vec![])));
+    assert_eq!(r, TlaValue::Seq(HashedArc::new(vec![])));
 }
 
 #[test]
@@ -367,7 +368,7 @@ fn t207e_subseq_n_zero_with_m_one() {
     let s = TlaState::new();
     let ctx = EvalContext::new(&s);
     let r = eval_compiled(&compile_expr("SubSeq(<<1, 2, 3>>, 1, 0)"), &ctx).unwrap();
-    assert_eq!(r, TlaValue::Seq(std::sync::Arc::new(vec![])));
+    assert_eq!(r, TlaValue::Seq(HashedArc::new(vec![])));
 }
 
 #[test]

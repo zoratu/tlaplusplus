@@ -7,6 +7,7 @@
 //! `docs/main-refactor-plan.md` Risk #2 for the analysis.
 
 use std::collections::{BTreeMap, BTreeSet};
+use crate::tla::hashed_arc::HashedArc;
 use std::sync::Arc;
 
 use crate::tla::module::TlaModuleInstance;
@@ -346,7 +347,7 @@ pub(crate) fn representative_value_from_type_constraint(
         }
         TypeInvariantConstraintKind::Subset => {
             representative_member_from_domain_expr(constraint.1.as_str(), ctx)
-                .map(|member| TlaValue::Set(Arc::new(BTreeSet::from([member]))))
+                .map(|member| TlaValue::Set(HashedArc::new(BTreeSet::from([member]))))
         }
     }
 }
@@ -634,9 +635,9 @@ pub(crate) fn representative_member_from_domain_expr(expr: &str, ctx: &EvalConte
             {
                 let sample =
                     representative_member_from_domain_expr(inner, ctx).unwrap_or(TlaValue::Int(0));
-                Some(TlaValue::Seq(Arc::new(vec![sample])))
+                Some(TlaValue::Seq(HashedArc::new(vec![sample])))
             } else if trimmed.starts_with("SUBSET ") {
-                Some(TlaValue::Set(Arc::new(BTreeSet::new())))
+                Some(TlaValue::Set(HashedArc::new(BTreeSet::new())))
             } else if let Some(record) = try_create_representative_record(trimmed, ctx) {
                 Some(record)
             } else {
@@ -665,13 +666,13 @@ pub(crate) fn try_create_representative_value_from_type_expr(
         .and_then(|rest| rest.strip_suffix(')'))
     {
         let sample = representative_member_from_domain_expr(inner, ctx).unwrap_or(TlaValue::Int(0));
-        return Some(TlaValue::Seq(Arc::new(vec![sample])));
+        return Some(TlaValue::Seq(HashedArc::new(vec![sample])));
     }
 
     match trimmed {
         "Nat" | "Int" => Some(TlaValue::Int(0)),
         "BOOLEAN" => Some(TlaValue::Bool(false)),
-        _ if trimmed.starts_with("SUBSET ") => Some(TlaValue::Set(Arc::new(BTreeSet::new()))),
+        _ if trimmed.starts_with("SUBSET ") => Some(TlaValue::Set(HashedArc::new(BTreeSet::new()))),
         _ => None,
     }
 }
@@ -771,7 +772,7 @@ pub(crate) fn try_create_representative_record(set_expr: &str, ctx: &EvalContext
     if fields.is_empty() {
         None
     } else {
-        Some(TlaValue::Record(Arc::new(fields)))
+        Some(TlaValue::Record(HashedArc::new(fields)))
     }
 }
 
@@ -1824,7 +1825,7 @@ pub(crate) fn seed_nonempty_sequence_probe_locals(
         }
 
         let element = element_hints.get(&var).cloned().unwrap_or(TlaValue::Int(0));
-        locals.insert(var, TlaValue::Seq(Arc::new(vec![element])));
+        locals.insert(var, TlaValue::Seq(HashedArc::new(vec![element])));
     }
 }
 
@@ -1880,7 +1881,7 @@ pub(crate) fn infer_sequence_element_probe_values(
             record.insert(field.clone(), guess_probe_field_value(&field, &ctx));
         }
         if !record.is_empty() {
-            out.insert(var, TlaValue::Record(Arc::new(record)));
+            out.insert(var, TlaValue::Record(HashedArc::new(record)));
         }
     }
     for (var, function_names) in domains_by_var {
@@ -3026,7 +3027,7 @@ pub(crate) fn try_create_representative_function(set_expr: &str, ctx: &EvalConte
         func.insert(elem.clone(), repr_val.clone());
     }
 
-    Some(TlaValue::Function(Arc::new(func)))
+    Some(TlaValue::Function(HashedArc::new(func)))
 }
 
 #[cfg(test)]
@@ -3209,7 +3210,7 @@ Next ==
         let mut probe_state = tla_state([
             (
                 "Symbols",
-                TlaValue::Set(Arc::new(BTreeSet::from([
+                TlaValue::Set(HashedArc::new(BTreeSet::from([
                     TlaValue::ModelValue("A".to_string()),
                     TlaValue::ModelValue("B".to_string()),
                 ]))),
@@ -3507,7 +3508,7 @@ INVARIANTS TypeOK
             assert_eq!(f.len(), 2, "function should have 2 entries");
             // All values should be the representative element of B
             // (pick_representative_from_set uses probe_value_score heuristics)
-            let repr = pick_representative_from_set(&TlaValue::Set(Arc::new(BTreeSet::from([
+            let repr = pick_representative_from_set(&TlaValue::Set(HashedArc::new(BTreeSet::from([
                 TlaValue::Int(10),
                 TlaValue::Int(20),
             ]))))
@@ -3545,7 +3546,7 @@ INVARIANTS TypeOK
         let mut state = TlaState::new();
         state.insert(
             Arc::from("N"),
-            TlaValue::Set(Arc::new(
+            TlaValue::Set(HashedArc::new(
                 [
                     TlaValue::ModelValue("n1".to_string()),
                     TlaValue::ModelValue("n2".to_string()),
@@ -3556,7 +3557,7 @@ INVARIANTS TypeOK
         );
         state.insert(
             Arc::from("R"),
-            TlaValue::Set(Arc::new(
+            TlaValue::Set(HashedArc::new(
                 [TlaValue::Int(0), TlaValue::Int(1), TlaValue::Int(2)]
                     .into_iter()
                     .collect(),
@@ -3592,7 +3593,7 @@ INVARIANTS TypeOK
         let mut probe_state = TlaState::new();
         probe_state.insert(
             Arc::from("Readers"),
-            TlaValue::Set(Arc::new(
+            TlaValue::Set(HashedArc::new(
                 [
                     TlaValue::ModelValue("r1".to_string()),
                     TlaValue::ModelValue("r2".to_string()),
@@ -3639,17 +3640,37 @@ INVARIANTS TypeOK
             }
             other => panic!("expected record representative for chan, got {other:?}"),
         }
-        assert_eq!(
-            probe_state.get("pending"),
-            Some(&TlaValue::Set(Arc::new(BTreeSet::from([
-                TlaValue::ModelValue("r2".to_string()),
-            ]))))
-        );
+        // `pending \in SUBSET Readers` has multiple valid representatives;
+        // probe picks one via `max_by_key(probe_value_score)`, and on a
+        // score tie (sets of model values all score the same) falls back
+        // to the BTreeSet's iteration order. Either `{r2}` or `{r1, r2}`
+        // is a sound representative — assert membership rather than a
+        // specific pick so the test isn't brittle to TlaValue's ordering
+        // implementation. (The hash-cached Ord on Set/Record/Function
+        // changes structural iteration order to hash-iteration order
+        // without changing soundness.)
+        match probe_state.get("pending") {
+            Some(TlaValue::Set(values)) => {
+                assert!(
+                    values.iter().all(|v| matches!(
+                        v,
+                        TlaValue::ModelValue(s) if s == "r1" || s == "r2"
+                    )),
+                    "expected pending to be a subset of {{r1, r2}}, got {:?}",
+                    values
+                );
+                assert!(
+                    !values.is_empty(),
+                    "expected pending to be a non-empty subset, got empty"
+                );
+            }
+            other => panic!("expected Set representative for pending, got {other:?}"),
+        }
     }
 
     #[test]
     fn seeds_probe_state_from_subset_type_invariants() {
-        let mut probe_state = tla_state([("msgs", TlaValue::Set(Arc::new(BTreeSet::new())))]);
+        let mut probe_state = tla_state([("msgs", TlaValue::Set(HashedArc::new(BTreeSet::new())))]);
         let module = TlaModule {
             name: "SubsetSeed".to_string(),
             path: String::new(),
@@ -3703,7 +3724,7 @@ INVARIANTS TypeOK
         let no_val = TlaValue::ModelValue("NoVal".to_string());
         let mut probe_state = tla_state([(
             "buf",
-            TlaValue::Function(Arc::new(BTreeMap::from([(
+            TlaValue::Function(HashedArc::new(BTreeMap::from([(
                 proc_id.clone(),
                 no_val.clone(),
             )]))),
@@ -3777,7 +3798,7 @@ INVARIANTS TypeOK
         let mut probe_state = tla_state([
             (
                 "buf",
-                TlaValue::Function(Arc::new(BTreeMap::from([(
+                TlaValue::Function(HashedArc::new(BTreeMap::from([(
                     proc_id.clone(),
                     no_val.clone(),
                 )]))),
@@ -3950,13 +3971,13 @@ INVARIANTS TypeOK
 
     #[test]
     fn structured_function_replacements_outrank_placeholder_values() {
-        let current = TlaValue::Function(Arc::new(BTreeMap::from([(
+        let current = TlaValue::Function(HashedArc::new(BTreeMap::from([(
             TlaValue::ModelValue("p1".to_string()),
             TlaValue::ModelValue("NoVal".to_string()),
         )])));
-        let replacement = TlaValue::Function(Arc::new(BTreeMap::from([(
+        let replacement = TlaValue::Function(HashedArc::new(BTreeMap::from([(
             TlaValue::ModelValue("p1".to_string()),
-            TlaValue::Record(Arc::new(BTreeMap::from([(
+            TlaValue::Record(HashedArc::new(BTreeMap::from([(
                 "op".to_string(),
                 TlaValue::String("Wr".to_string()),
             )]))),
@@ -3967,7 +3988,7 @@ INVARIANTS TypeOK
 
     #[test]
     fn smaller_type_representatives_do_not_replace_initialized_functions() {
-        let current = TlaValue::Function(Arc::new(BTreeMap::from([
+        let current = TlaValue::Function(HashedArc::new(BTreeMap::from([
             (
                 TlaValue::ModelValue("h1".to_string()),
                 TlaValue::ModelValue("[Nano]NoBlockVal".to_string()),
@@ -3981,9 +4002,9 @@ INVARIANTS TypeOK
                 TlaValue::ModelValue("[Nano]NoBlockVal".to_string()),
             ),
         ])));
-        let replacement = TlaValue::Function(Arc::new(BTreeMap::from([(
+        let replacement = TlaValue::Function(HashedArc::new(BTreeMap::from([(
             TlaValue::ModelValue("h1".to_string()),
-            TlaValue::Record(Arc::new(BTreeMap::from([(
+            TlaValue::Record(HashedArc::new(BTreeMap::from([(
                 "source".to_string(),
                 TlaValue::ModelValue("n1".to_string()),
             )]))),
@@ -3997,7 +4018,7 @@ INVARIANTS TypeOK
         let mut probe_state = tla_state([
             (
                 "Hash",
-                TlaValue::Set(Arc::new(BTreeSet::from([
+                TlaValue::Set(HashedArc::new(BTreeSet::from([
                     TlaValue::ModelValue("h1".to_string()),
                     TlaValue::ModelValue("h2".to_string()),
                     TlaValue::ModelValue("h3".to_string()),
@@ -4006,7 +4027,7 @@ INVARIANTS TypeOK
             ("NoBlock", TlaValue::ModelValue("NoBlockVal".to_string())),
             (
                 "hashFunction",
-                TlaValue::Function(Arc::new(BTreeMap::from([
+                TlaValue::Function(HashedArc::new(BTreeMap::from([
                     (
                         TlaValue::ModelValue("h1".to_string()),
                         TlaValue::ModelValue("NoBlockVal".to_string()),
@@ -4077,7 +4098,7 @@ INVARIANTS TypeOK
 
     #[test]
     fn indeterminate_type_constraints_do_not_replace_initialized_functions() {
-        let expected = TlaValue::Function(Arc::new(BTreeMap::from([
+        let expected = TlaValue::Function(HashedArc::new(BTreeMap::from([
             (
                 TlaValue::ModelValue("h1".to_string()),
                 TlaValue::ModelValue("NoBlockVal".to_string()),
@@ -4246,7 +4267,7 @@ INVARIANTS TypeOK
     #[test]
     fn infers_action_params_from_quantified_next_calls() {
         let acceptor = TlaValue::ModelValue("a1".to_string());
-        let msg = TlaValue::Record(Arc::new(BTreeMap::from([
+        let msg = TlaValue::Record(HashedArc::new(BTreeMap::from([
             ("type".to_string(), TlaValue::String("2a".to_string())),
             ("bal".to_string(), TlaValue::Int(1)),
             ("val".to_string(), TlaValue::ModelValue("v1".to_string())),
@@ -4254,26 +4275,26 @@ INVARIANTS TypeOK
         let probe_state = tla_state([
             (
                 "maxBal",
-                TlaValue::Function(Arc::new(BTreeMap::from([(
+                TlaValue::Function(HashedArc::new(BTreeMap::from([(
                     acceptor.clone(),
                     TlaValue::Int(0),
                 )]))),
             ),
             (
                 "maxVBal",
-                TlaValue::Function(Arc::new(BTreeMap::from([(
+                TlaValue::Function(HashedArc::new(BTreeMap::from([(
                     acceptor.clone(),
                     TlaValue::Int(0),
                 )]))),
             ),
             (
                 "maxVal",
-                TlaValue::Function(Arc::new(BTreeMap::from([(
+                TlaValue::Function(HashedArc::new(BTreeMap::from([(
                     acceptor.clone(),
                     TlaValue::ModelValue("None".to_string()),
                 )]))),
             ),
-            ("msgs", TlaValue::Set(Arc::new(BTreeSet::from([msg])))),
+            ("msgs", TlaValue::Set(HashedArc::new(BTreeSet::from([msg])))),
         ]);
         let definitions = BTreeMap::from([
             (
@@ -5006,7 +5027,7 @@ INVARIANTS TypeInvariant
         let val = TlaValue::ModelValue("v1".to_string());
         let probe_state = tla_state([(
             "ctl",
-            TlaValue::Function(Arc::new(BTreeMap::from([(
+            TlaValue::Function(HashedArc::new(BTreeMap::from([(
                 proc_id.clone(),
                 TlaValue::String("busy".to_string()),
             )]))),
@@ -5102,14 +5123,14 @@ INVARIANTS TypeInvariant
         assert_eq!(locals.get("p"), Some(&proc_id));
         assert_eq!(
             locals.get("octl'"),
-            Some(&TlaValue::Function(Arc::new(BTreeMap::from([(
+            Some(&TlaValue::Function(HashedArc::new(BTreeMap::from([(
                 proc_id.clone(),
                 TlaValue::String("done".to_string()),
             )]))))
         );
         assert_eq!(
             locals.get("omem'"),
-            Some(&TlaValue::Function(Arc::new(BTreeMap::from([(adr, val)]))))
+            Some(&TlaValue::Function(HashedArc::new(BTreeMap::from([(adr, val)]))))
         );
     }
 
@@ -5120,26 +5141,26 @@ INVARIANTS TypeInvariant
         let mut probe_state = tla_state([
             (
                 "wmem",
-                TlaValue::Function(Arc::new(BTreeMap::from([(
+                TlaValue::Function(HashedArc::new(BTreeMap::from([(
                     TlaValue::ModelValue("a1".to_string()),
                     TlaValue::ModelValue("v1".to_string()),
                 )]))),
             ),
             (
                 "ctl",
-                TlaValue::Function(Arc::new(BTreeMap::from([(
+                TlaValue::Function(HashedArc::new(BTreeMap::from([(
                     proc_id.clone(),
                     TlaValue::String("waiting".to_string()),
                 )]))),
             ),
             (
                 "buf",
-                TlaValue::Function(Arc::new(BTreeMap::from([(
+                TlaValue::Function(HashedArc::new(BTreeMap::from([(
                     proc_id.clone(),
                     no_val.clone(),
                 )]))),
             ),
-            ("memInt", TlaValue::Set(Arc::new(BTreeSet::new()))),
+            ("memInt", TlaValue::Set(HashedArc::new(BTreeSet::new()))),
             ("NoVal", no_val),
         ]);
         let module = TlaModule {
@@ -5287,26 +5308,26 @@ INVARIANTS TypeInvariant
         let mut probe_state = tla_state([
             (
                 "maxBal",
-                TlaValue::Function(Arc::new(BTreeMap::from([(
+                TlaValue::Function(HashedArc::new(BTreeMap::from([(
                     acceptor.clone(),
                     TlaValue::Int(-1),
                 )]))),
             ),
             (
                 "maxVBal",
-                TlaValue::Function(Arc::new(BTreeMap::from([(
+                TlaValue::Function(HashedArc::new(BTreeMap::from([(
                     acceptor.clone(),
                     TlaValue::Int(-1),
                 )]))),
             ),
             (
                 "maxVal",
-                TlaValue::Function(Arc::new(BTreeMap::from([(
+                TlaValue::Function(HashedArc::new(BTreeMap::from([(
                     acceptor.clone(),
                     TlaValue::ModelValue("None".to_string()),
                 )]))),
             ),
-            ("msgs", TlaValue::Set(Arc::new(BTreeSet::new()))),
+            ("msgs", TlaValue::Set(HashedArc::new(BTreeSet::new()))),
         ]);
         let module = TlaModule {
             name: "PaxosProbe".to_string(),
@@ -5719,7 +5740,7 @@ INVARIANTS TypeInvariant
         let state = tla_state([
             (
                 "store",
-                TlaValue::Function(Arc::new(BTreeMap::from([(
+                TlaValue::Function(HashedArc::new(BTreeMap::from([(
                     TlaValue::ModelValue("node1".to_string()),
                     TlaValue::Int(7),
                 )]))),
@@ -5764,7 +5785,7 @@ INVARIANTS TypeInvariant
         let state = tla_state([
             (
                 "signalled",
-                TlaValue::Function(Arc::new(BTreeMap::<TlaValue, TlaValue>::new())),
+                TlaValue::Function(HashedArc::new(BTreeMap::<TlaValue, TlaValue>::new())),
             ),
             ("light", TlaValue::String("off".to_string())),
         ]);
@@ -5814,7 +5835,7 @@ INVARIANTS TypeInvariant
         );
         assert_eq!(
             ctx.locals.get("signalled'"),
-            Some(&TlaValue::Function(Arc::new(BTreeMap::new())))
+            Some(&TlaValue::Function(HashedArc::new(BTreeMap::new())))
         );
     }
 
@@ -5879,7 +5900,7 @@ INVARIANTS TypeInvariant
             ("VictoryThreshold", TlaValue::Int(3)),
             (
                 "signalled",
-                TlaValue::Function(Arc::new(BTreeMap::<TlaValue, TlaValue>::new())),
+                TlaValue::Function(HashedArc::new(BTreeMap::<TlaValue, TlaValue>::new())),
             ),
             ("DesignatedCounter", TlaValue::ModelValue("p1".to_string())),
         ]);
@@ -5930,7 +5951,7 @@ INVARIANTS TypeInvariant
         assert_eq!(ctx.locals.get("announced'"), Some(&TlaValue::Bool(true)));
         assert_eq!(
             ctx.locals.get("signalled'"),
-            Some(&TlaValue::Function(Arc::new(BTreeMap::new())))
+            Some(&TlaValue::Function(HashedArc::new(BTreeMap::new())))
         );
     }
 
@@ -5938,16 +5959,16 @@ INVARIANTS TypeInvariant
     fn expr_probe_handles_move_elevator_style_let_actions() {
         let elevator_1 = TlaValue::ModelValue("e1".to_string());
         let elevator_2 = TlaValue::ModelValue("e2".to_string());
-        let e1_state = TlaValue::Record(Arc::new(BTreeMap::from([
+        let e1_state = TlaValue::Record(HashedArc::new(BTreeMap::from([
             ("floor".to_string(), TlaValue::Int(1)),
             ("direction".to_string(), TlaValue::String("Up".to_string())),
             ("doorsOpen".to_string(), TlaValue::Bool(false)),
             (
                 "buttonsPressed".to_string(),
-                TlaValue::Set(Arc::new(BTreeSet::new())),
+                TlaValue::Set(HashedArc::new(BTreeSet::new())),
             ),
         ])));
-        let e2_state = TlaValue::Record(Arc::new(BTreeMap::from([
+        let e2_state = TlaValue::Record(HashedArc::new(BTreeMap::from([
             ("floor".to_string(), TlaValue::Int(2)),
             (
                 "direction".to_string(),
@@ -5956,37 +5977,37 @@ INVARIANTS TypeInvariant
             ("doorsOpen".to_string(), TlaValue::Bool(false)),
             (
                 "buttonsPressed".to_string(),
-                TlaValue::Set(Arc::new(BTreeSet::new())),
+                TlaValue::Set(HashedArc::new(BTreeSet::new())),
             ),
         ])));
 
         let state = tla_state([
             (
                 "Elevator",
-                TlaValue::Set(Arc::new(BTreeSet::from([
+                TlaValue::Set(HashedArc::new(BTreeSet::from([
                     elevator_1.clone(),
                     elevator_2.clone(),
                 ]))),
             ),
             (
                 "Floor",
-                TlaValue::Set(Arc::new(BTreeSet::from([
+                TlaValue::Set(HashedArc::new(BTreeSet::from([
                     TlaValue::Int(1),
                     TlaValue::Int(2),
                 ]))),
             ),
             (
                 "ElevatorState",
-                TlaValue::Function(Arc::new(BTreeMap::from([
+                TlaValue::Function(HashedArc::new(BTreeMap::from([
                     (elevator_1.clone(), e1_state),
                     (elevator_2, e2_state),
                 ]))),
             ),
             (
                 "ActiveElevatorCalls",
-                TlaValue::Set(Arc::new(BTreeSet::new())),
+                TlaValue::Set(HashedArc::new(BTreeSet::new())),
             ),
-            ("PersonState", TlaValue::Function(Arc::new(BTreeMap::new()))),
+            ("PersonState", TlaValue::Function(HashedArc::new(BTreeMap::new()))),
         ]);
         let defs = BTreeMap::from([(
             "CanServiceCall".to_string(),
@@ -6080,7 +6101,7 @@ INVARIANTS TypeInvariant
         let mut state = TlaState::new();
         state.insert(
             Arc::from("Boats"),
-            TlaValue::Set(Arc::new(
+            TlaValue::Set(HashedArc::new(
                 [
                     TlaValue::ModelValue("leftBoat".to_string()),
                     TlaValue::ModelValue("rightBoat".to_string()),
@@ -6091,7 +6112,7 @@ INVARIANTS TypeInvariant
         );
         state.insert(
             Arc::from("Sides"),
-            TlaValue::Set(Arc::new(
+            TlaValue::Set(HashedArc::new(
                 [
                     TlaValue::String("left".to_string()),
                     TlaValue::String("right".to_string()),
@@ -6134,7 +6155,7 @@ INVARIANTS TypeInvariant
         let proc = TlaValue::ModelValue("p1".to_string());
         let state = tla_state([(
             "Proc",
-            TlaValue::Set(Arc::new(BTreeSet::from([proc.clone()]))),
+            TlaValue::Set(HashedArc::new(BTreeSet::from([proc.clone()]))),
         )]);
         let defs = BTreeMap::from([(
             "Receive".to_string(),
@@ -6170,7 +6191,7 @@ INVARIANTS TypeInvariant
         let proc = TlaValue::ModelValue("p1".to_string());
         let state = tla_state([(
             "Proc",
-            TlaValue::Set(Arc::new(BTreeSet::from([proc.clone()]))),
+            TlaValue::Set(HashedArc::new(BTreeSet::from([proc.clone()]))),
         )]);
         let defs = BTreeMap::from([(
             "Receive".to_string(),
@@ -6359,11 +6380,11 @@ INVARIANTS TypeInvariant
         let state = tla_state([
             (
                 "Proc",
-                TlaValue::Set(Arc::new(BTreeSet::from([proc.clone()]))),
+                TlaValue::Set(HashedArc::new(BTreeSet::from([proc.clone()]))),
             ),
             (
                 "nRcvdE",
-                TlaValue::Function(Arc::new(BTreeMap::from([(proc.clone(), TlaValue::Int(0))]))),
+                TlaValue::Function(HashedArc::new(BTreeMap::from([(proc.clone(), TlaValue::Int(0))]))),
             ),
             ("nSntE", TlaValue::Int(0)),
             ("nByz", TlaValue::Int(1)),
@@ -6393,7 +6414,7 @@ INVARIANTS TypeInvariant
         let mut state = TlaState::new();
         state.insert(
             Arc::from("Workers"),
-            TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::ModelValue(
+            TlaValue::Set(HashedArc::new(BTreeSet::from([TlaValue::ModelValue(
                 "w1".to_string(),
             )]))),
         );
@@ -6579,9 +6600,9 @@ INVARIANTS TypeInvariant
         let fake = TlaValue::ModelValue("fa1".to_string());
         let state = tla_state([(
             "knowsSent",
-            TlaValue::Function(Arc::new(BTreeMap::from([(
+            TlaValue::Function(HashedArc::new(BTreeMap::from([(
                 good.clone(),
-                TlaValue::Set(Arc::new(BTreeSet::new())),
+                TlaValue::Set(HashedArc::new(BTreeSet::new())),
             )]))),
         )]);
         let defs = BTreeMap::new();
@@ -6611,10 +6632,10 @@ INVARIANTS TypeInvariant
     fn build_action_expr_probe_context_seeds_sequence_heads_from_function_domains() {
         let car = TlaValue::ModelValue("r1".to_string());
         let state = tla_state([
-            ("WaitingBeforeBridge", TlaValue::Seq(Arc::new(Vec::new()))),
+            ("WaitingBeforeBridge", TlaValue::Seq(HashedArc::new(Vec::new()))),
             (
                 "Location",
-                TlaValue::Function(Arc::new(BTreeMap::from([(car.clone(), TlaValue::Int(8))]))),
+                TlaValue::Function(HashedArc::new(BTreeMap::from([(car.clone(), TlaValue::Int(8))]))),
             ),
         ]);
         let defs = BTreeMap::new();
@@ -6627,7 +6648,7 @@ INVARIANTS TypeInvariant
 
         assert_eq!(
             ctx.locals.get("WaitingBeforeBridge"),
-            Some(&TlaValue::Seq(Arc::new(vec![car])))
+            Some(&TlaValue::Seq(HashedArc::new(vec![car])))
         );
     }
 
@@ -6635,10 +6656,10 @@ INVARIANTS TypeInvariant
     fn build_action_expr_probe_context_seeds_sequence_heads_from_direct_function_indexes() {
         let car = TlaValue::ModelValue("r1".to_string());
         let state = tla_state([
-            ("WaitingBeforeBridge", TlaValue::Seq(Arc::new(Vec::new()))),
+            ("WaitingBeforeBridge", TlaValue::Seq(HashedArc::new(Vec::new()))),
             (
                 "Location",
-                TlaValue::Function(Arc::new(BTreeMap::from([(car.clone(), TlaValue::Int(8))]))),
+                TlaValue::Function(HashedArc::new(BTreeMap::from([(car.clone(), TlaValue::Int(8))]))),
             ),
         ]);
         let defs = BTreeMap::new();
@@ -6651,7 +6672,7 @@ INVARIANTS TypeInvariant
 
         assert_eq!(
             ctx.locals.get("WaitingBeforeBridge"),
-            Some(&TlaValue::Seq(Arc::new(vec![car])))
+            Some(&TlaValue::Seq(HashedArc::new(vec![car])))
         );
     }
 
@@ -6659,12 +6680,12 @@ INVARIANTS TypeInvariant
     fn build_action_expr_probe_context_seeds_sequence_heads_for_parsed_enter_bridge() {
         let car = TlaValue::ModelValue("r1".to_string());
         let state = tla_state([
-            ("WaitingBeforeBridge", TlaValue::Seq(Arc::new(Vec::new()))),
+            ("WaitingBeforeBridge", TlaValue::Seq(HashedArc::new(Vec::new()))),
             (
                 "Location",
-                TlaValue::Function(Arc::new(BTreeMap::from([(car.clone(), TlaValue::Int(8))]))),
+                TlaValue::Function(HashedArc::new(BTreeMap::from([(car.clone(), TlaValue::Int(8))]))),
             ),
-            ("CarsInBridge", TlaValue::Set(Arc::new(BTreeSet::new()))),
+            ("CarsInBridge", TlaValue::Set(HashedArc::new(BTreeSet::new()))),
         ]);
         let defs = BTreeMap::from([
             (
@@ -6742,7 +6763,7 @@ INVARIANTS TypeInvariant
 
         assert_eq!(
             ctx.locals.get("WaitingBeforeBridge"),
-            Some(&TlaValue::Seq(Arc::new(vec![car])))
+            Some(&TlaValue::Seq(HashedArc::new(vec![car])))
         );
 
         for clause in &branches[0].clauses {
@@ -6757,9 +6778,9 @@ INVARIANTS TypeInvariant
         let mut state = TlaState::new();
         state.insert(
             Arc::from("rcvd"),
-            TlaValue::Function(Arc::new(BTreeMap::from([(
+            TlaValue::Function(HashedArc::new(BTreeMap::from([(
                 TlaValue::Int(1),
-                TlaValue::Set(Arc::new(BTreeSet::new())),
+                TlaValue::Set(HashedArc::new(BTreeSet::new())),
             )]))),
         );
         let defs = BTreeMap::new();
@@ -6772,7 +6793,7 @@ INVARIANTS TypeInvariant
 
     #[test]
     fn build_action_expr_probe_context_seeds_empty_sequences_used_by_head_or_tail() {
-        let state = tla_state([("AuthChannel", TlaValue::Seq(Arc::new(vec![])))]);
+        let state = tla_state([("AuthChannel", TlaValue::Seq(HashedArc::new(vec![])))]);
         let defs = BTreeMap::new();
         let instances = BTreeMap::new();
         let clauses = vec![
@@ -6789,13 +6810,13 @@ INVARIANTS TypeInvariant
 
         assert_eq!(
             ctx.locals.get("AuthChannel"),
-            Some(&TlaValue::Seq(Arc::new(vec![TlaValue::Int(0)])))
+            Some(&TlaValue::Seq(HashedArc::new(vec![TlaValue::Int(0)])))
         );
     }
 
     #[test]
     fn build_action_expr_probe_context_seeds_record_elements_for_head_field_access() {
-        let state = tla_state([("FwCtlChannel", TlaValue::Seq(Arc::new(vec![])))]);
+        let state = tla_state([("FwCtlChannel", TlaValue::Seq(HashedArc::new(vec![])))]);
         let defs = BTreeMap::new();
         let instances = BTreeMap::new();
         let clauses = vec![ActionClause::Guard {
@@ -6818,32 +6839,32 @@ INVARIANTS TypeInvariant
         let mut state = TlaState::new();
         state.insert(
             Arc::from("Key"),
-            TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::ModelValue(
+            TlaValue::Set(HashedArc::new(BTreeSet::from([TlaValue::ModelValue(
                 "k1".to_string(),
             )]))),
         );
         state.insert(
             Arc::from("TxId"),
-            TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::ModelValue(
+            TlaValue::Set(HashedArc::new(BTreeSet::from([TlaValue::ModelValue(
                 "t1".to_string(),
             )]))),
         );
         state.insert(
             Arc::from("Val"),
-            TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::ModelValue(
+            TlaValue::Set(HashedArc::new(BTreeSet::from([TlaValue::ModelValue(
                 "v1".to_string(),
             )]))),
         );
         state.insert(
             Arc::from("signalled"),
-            TlaValue::Function(Arc::new(BTreeMap::from([(
+            TlaValue::Function(HashedArc::new(BTreeMap::from([(
                 TlaValue::String("Bob".to_string()),
                 TlaValue::Int(0),
             )]))),
         );
         state.insert(
             Arc::from("pc"),
-            TlaValue::Function(Arc::new(BTreeMap::from([(
+            TlaValue::Function(HashedArc::new(BTreeMap::from([(
                 TlaValue::ModelValue("writer-1".to_string()),
                 TlaValue::String("Advance".to_string()),
             )]))),
@@ -6891,7 +6912,7 @@ INVARIANTS TypeInvariant
     fn sample_param_value_with_context_prefers_proc_sets_for_generic_p() {
         let state = tla_state([(
             "wmem",
-            TlaValue::Function(Arc::new(BTreeMap::from([(
+            TlaValue::Function(HashedArc::new(BTreeMap::from([(
                 TlaValue::ModelValue("a1".to_string()),
                 TlaValue::ModelValue("v1".to_string()),
             )]))),
@@ -6942,7 +6963,7 @@ INVARIANTS TypeInvariant
         let state = tla_state([
             (
                 "Symbols",
-                TlaValue::Set(Arc::new(BTreeSet::from([
+                TlaValue::Set(HashedArc::new(BTreeSet::from([
                     TlaValue::ModelValue("A".to_string()),
                     TlaValue::ModelValue("B".to_string()),
                 ]))),
@@ -6992,7 +7013,7 @@ INVARIANTS TypeInvariant
         let state = tla_state([
             (
                 "Symbols",
-                TlaValue::Set(Arc::new(BTreeSet::from([
+                TlaValue::Set(HashedArc::new(BTreeSet::from([
                     TlaValue::ModelValue("A".to_string()),
                     TlaValue::ModelValue("B".to_string()),
                 ]))),
@@ -7065,7 +7086,7 @@ INVARIANTS TypeInvariant
         let mut probe_state = tla_state([
             (
                 "Symbols",
-                TlaValue::Set(Arc::new(BTreeSet::from([
+                TlaValue::Set(HashedArc::new(BTreeSet::from([
                     TlaValue::ModelValue("A".to_string()),
                     TlaValue::ModelValue("B".to_string()),
                 ]))),
@@ -7274,7 +7295,7 @@ INVARIANTS TypeInvariant
         let mut probe_state = tla_state([
             (
                 "Symbols",
-                TlaValue::Set(Arc::new(BTreeSet::from([
+                TlaValue::Set(HashedArc::new(BTreeSet::from([
                     TlaValue::ModelValue("A".to_string()),
                     TlaValue::ModelValue("B".to_string()),
                 ]))),
@@ -7599,7 +7620,7 @@ INVARIANTS TypeInvariant
             ("x", TlaValue::Int(0)),
             (
                 "c1",
-                TlaValue::Function(Arc::new(BTreeMap::from([(
+                TlaValue::Function(HashedArc::new(BTreeMap::from([(
                     TlaValue::Int(1),
                     TlaValue::Int(0),
                 )]))),
@@ -7631,7 +7652,7 @@ INVARIANTS TypeInvariant
         let mut ctx = build_probe_eval_context(&state, &definitions, &instances);
         std::rc::Rc::make_mut(&mut ctx.locals).insert(
             "c1'".to_string(),
-            TlaValue::Function(Arc::new(BTreeMap::from([(
+            TlaValue::Function(HashedArc::new(BTreeMap::from([(
                 TlaValue::Int(1),
                 TlaValue::Int(9),
             )]))),
@@ -7649,7 +7670,7 @@ INVARIANTS TypeInvariant
             ("x", TlaValue::Int(0)),
             (
                 "c1",
-                TlaValue::Function(Arc::new(BTreeMap::from([(
+                TlaValue::Function(HashedArc::new(BTreeMap::from([(
                     TlaValue::String("j1".to_string()),
                     TlaValue::Int(0),
                 )]))),
@@ -7851,11 +7872,11 @@ INVARIANTS TypeInvariant
                 },
             ),
         ]);
-        let capacity_1 = TlaValue::Function(Arc::new(BTreeMap::from([
+        let capacity_1 = TlaValue::Function(HashedArc::new(BTreeMap::from([
             (TlaValue::String("j1".to_string()), TlaValue::Int(5)),
             (TlaValue::String("j2".to_string()), TlaValue::Int(3)),
         ])));
-        let capacity_2 = TlaValue::Function(Arc::new(BTreeMap::from([
+        let capacity_2 = TlaValue::Function(HashedArc::new(BTreeMap::from([
             (TlaValue::String("j1".to_string()), TlaValue::Int(5)),
             (TlaValue::String("j2".to_string()), TlaValue::Int(3)),
             (TlaValue::String("j3".to_string()), TlaValue::Int(3)),
@@ -7897,7 +7918,7 @@ INVARIANTS TypeInvariant
             ("Goal", TlaValue::Int(4)),
             (
                 "Capacities",
-                TlaValue::Seq(Arc::new(vec![capacity_1, capacity_2])),
+                TlaValue::Seq(HashedArc::new(vec![capacity_1, capacity_2])),
             ),
         ]);
 
@@ -7986,7 +8007,7 @@ INVARIANTS TypeInvariant
     fn existential_guard_without_witness_disables_following_clauses() {
         let state = tla_state([
             ("aCounter", TlaValue::Int(0)),
-            ("aSession", TlaValue::Set(Arc::new(BTreeSet::new()))),
+            ("aSession", TlaValue::Set(HashedArc::new(BTreeSet::new()))),
         ]);
         let defs = BTreeMap::new();
         let instances = BTreeMap::new();
@@ -8046,8 +8067,8 @@ INVARIANTS TypeInvariant
     #[test]
     fn helper_action_with_empty_sequence_precondition_gap_is_probeable() {
         let state = tla_state([
-            ("AuthChannel", TlaValue::Seq(Arc::new(vec![]))),
-            ("ReplaySession", TlaValue::Set(Arc::new(BTreeSet::new()))),
+            ("AuthChannel", TlaValue::Seq(HashedArc::new(vec![]))),
+            ("ReplaySession", TlaValue::Set(HashedArc::new(BTreeSet::new()))),
             ("ReplayCount", TlaValue::Int(0)),
         ]);
         let defs = BTreeMap::from([(
@@ -8276,7 +8297,7 @@ INVARIANTS TypeInvariant
         let state = tla_state([
             (
                 "rmState",
-                TlaValue::Function(Arc::new(BTreeMap::from([
+                TlaValue::Function(HashedArc::new(BTreeMap::from([
                     (rm1.clone(), TlaValue::String("working".to_string())),
                     (rm2.clone(), TlaValue::String("working".to_string())),
                     (rm3.clone(), TlaValue::String("prepared".to_string())),
@@ -8285,7 +8306,7 @@ INVARIANTS TypeInvariant
             ("tmState", TlaValue::String("commit".to_string())),
             (
                 "pc",
-                TlaValue::Function(Arc::new(BTreeMap::from([
+                TlaValue::Function(HashedArc::new(BTreeMap::from([
                     (rm1.clone(), TlaValue::String("RS".to_string())),
                     (rm2.clone(), TlaValue::String("RS".to_string())),
                     (rm3.clone(), TlaValue::String("RS".to_string())),
@@ -8386,7 +8407,7 @@ INVARIANTS TypeInvariant
         let state = tla_state([
             (
                 "RM",
-                TlaValue::Set(Arc::new(BTreeSet::from([
+                TlaValue::Set(HashedArc::new(BTreeSet::from([
                     rm1.clone(),
                     rm2.clone(),
                     rm3.clone(),
@@ -8396,7 +8417,7 @@ INVARIANTS TypeInvariant
             ("TMMAYFAIL", TlaValue::Bool(false)),
             (
                 "rmState",
-                TlaValue::Function(Arc::new(BTreeMap::from([
+                TlaValue::Function(HashedArc::new(BTreeMap::from([
                     (rm1.clone(), TlaValue::String("working".to_string())),
                     (rm2.clone(), TlaValue::String("working".to_string())),
                     (rm3.clone(), TlaValue::String("prepared".to_string())),
@@ -8405,7 +8426,7 @@ INVARIANTS TypeInvariant
             ("tmState", TlaValue::String("commit".to_string())),
             (
                 "pc",
-                TlaValue::Function(Arc::new(BTreeMap::from([
+                TlaValue::Function(HashedArc::new(BTreeMap::from([
                     (TlaValue::Int(0), TlaValue::String("TS".to_string())),
                     (TlaValue::Int(10), TlaValue::String("BTS".to_string())),
                     (rm1.clone(), TlaValue::String("RS".to_string())),
@@ -8458,7 +8479,7 @@ INVARIANTS TypeInvariant
         let state = tla_state([
             (
                 "RM",
-                TlaValue::Set(Arc::new(BTreeSet::from([
+                TlaValue::Set(HashedArc::new(BTreeSet::from([
                     rm1.clone(),
                     rm2.clone(),
                     rm3.clone(),
@@ -8468,7 +8489,7 @@ INVARIANTS TypeInvariant
             ("TMMAYFAIL", TlaValue::Bool(true)),
             (
                 "rmState",
-                TlaValue::Function(Arc::new(BTreeMap::from([
+                TlaValue::Function(HashedArc::new(BTreeMap::from([
                     (rm1.clone(), TlaValue::String("working".to_string())),
                     (rm2.clone(), TlaValue::String("working".to_string())),
                     (rm3.clone(), TlaValue::String("working".to_string())),
@@ -8477,7 +8498,7 @@ INVARIANTS TypeInvariant
             ("tmState", TlaValue::String("init".to_string())),
             (
                 "pc",
-                TlaValue::Function(Arc::new(BTreeMap::from([
+                TlaValue::Function(HashedArc::new(BTreeMap::from([
                     (TlaValue::Int(0), TlaValue::String("TS".to_string())),
                     (TlaValue::Int(10), TlaValue::String("BTS".to_string())),
                     (rm1.clone(), TlaValue::String("RS".to_string())),

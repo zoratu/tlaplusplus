@@ -1,4 +1,5 @@
 use crate::fairness::{ActionLabel, LabeledTransition};
+use crate::tla::hashed_arc::HashedArc;
 use crate::tla::eval::apply_action_ir_with_context_multi;
 use crate::tla::module::TlaModuleInstance;
 use crate::tla::{
@@ -1389,7 +1390,7 @@ Next == TManager \/ BTManager
             ("y", TlaValue::Int(7)),
             (
                 "S",
-                TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(1)]))),
+                TlaValue::Set(HashedArc::new(BTreeSet::from([TlaValue::Int(1)]))),
             ),
         ]);
 
@@ -1451,40 +1452,40 @@ Next == TManager \/ BTManager
         let state = tla_state([
             (
                 "TxId",
-                TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::String(
+                TlaValue::Set(HashedArc::new(BTreeSet::from([TlaValue::String(
                     "t1".to_string(),
                 )]))),
             ),
             (
                 "tx",
-                TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::String(
+                TlaValue::Set(HashedArc::new(BTreeSet::from([TlaValue::String(
                     "t1".to_string(),
                 )]))),
             ),
             (
                 "Key",
-                TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::String(
+                TlaValue::Set(HashedArc::new(BTreeSet::from([TlaValue::String(
                     "k1".to_string(),
                 )]))),
             ),
             (
                 "Val",
-                TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::String(
+                TlaValue::Set(HashedArc::new(BTreeSet::from([TlaValue::String(
                     "v1".to_string(),
                 )]))),
             ),
             (
                 "store",
-                TlaValue::Function(Arc::new(BTreeMap::from([(
+                TlaValue::Function(HashedArc::new(BTreeMap::from([(
                     TlaValue::String("k1".to_string()),
                     TlaValue::String("old".to_string()),
                 )]))),
             ),
             (
                 "snapshotStore",
-                TlaValue::Function(Arc::new(BTreeMap::from([(
+                TlaValue::Function(HashedArc::new(BTreeMap::from([(
                     TlaValue::String("t1".to_string()),
-                    TlaValue::Function(Arc::new(BTreeMap::from([(
+                    TlaValue::Function(HashedArc::new(BTreeMap::from([(
                         TlaValue::String("k1".to_string()),
                         TlaValue::String("old".to_string()),
                     )]))),
@@ -1492,16 +1493,16 @@ Next == TManager \/ BTManager
             ),
             (
                 "written",
-                TlaValue::Function(Arc::new(BTreeMap::from([(
+                TlaValue::Function(HashedArc::new(BTreeMap::from([(
                     TlaValue::String("t1".to_string()),
-                    TlaValue::Set(Arc::new(BTreeSet::new())),
+                    TlaValue::Set(HashedArc::new(BTreeSet::new())),
                 )]))),
             ),
             (
                 "missed",
-                TlaValue::Function(Arc::new(BTreeMap::from([(
+                TlaValue::Function(HashedArc::new(BTreeMap::from([(
                     TlaValue::String("t1".to_string()),
-                    TlaValue::Set(Arc::new(BTreeSet::new())),
+                    TlaValue::Set(HashedArc::new(BTreeSet::new())),
                 )]))),
             ),
         ]);
@@ -1694,7 +1695,7 @@ CONSTANTS
             ("x", TlaValue::Int(0)),
             (
                 "c1",
-                TlaValue::Function(Arc::new(BTreeMap::from([(
+                TlaValue::Function(HashedArc::new(BTreeMap::from([(
                     TlaValue::Int(1),
                     TlaValue::Int(0),
                 )]))),
@@ -1702,7 +1703,7 @@ CONSTANTS
         ]);
         let locals = BTreeMap::from([(
             "c1'".to_string(),
-            TlaValue::Function(Arc::new(BTreeMap::from([(
+            TlaValue::Function(HashedArc::new(BTreeMap::from([(
                 TlaValue::Int(1),
                 TlaValue::Int(7),
             )]))),
@@ -1962,7 +1963,7 @@ CONSTANTS
             ("y", TlaValue::Int(0)),
             (
                 "pendingOps",
-                TlaValue::Set(Arc::new(BTreeSet::from([
+                TlaValue::Set(HashedArc::new(BTreeSet::from([
                     TlaValue::Int(1),
                     TlaValue::Int(2),
                 ]))),
@@ -2040,7 +2041,7 @@ CONSTANTS
             ("y", TlaValue::Int(0)),
             (
                 "pendingOps",
-                TlaValue::Set(Arc::new(BTreeSet::from([
+                TlaValue::Set(HashedArc::new(BTreeSet::from([
                     TlaValue::Int(1),
                     TlaValue::Int(2),
                 ]))),
@@ -2107,14 +2108,14 @@ CONSTANTS
             ("tm", TlaValue::Int(0)),
             (
                 "pc",
-                TlaValue::Function(Arc::new(BTreeMap::from([
+                TlaValue::Function(HashedArc::new(BTreeMap::from([
                     (TlaValue::Int(1), TlaValue::String("Run".to_string())),
                     (TlaValue::Int(10), TlaValue::String("Run".to_string())),
                 ]))),
             ),
             (
                 "RM",
-                TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(1)]))),
+                TlaValue::Set(HashedArc::new(BTreeSet::from([TlaValue::Int(1)]))),
             ),
         ]);
 
@@ -2140,7 +2141,7 @@ CONSTANTS
         let state = tla_state([
             (
                 "RM",
-                TlaValue::Set(Arc::new(BTreeSet::from([
+                TlaValue::Set(HashedArc::new(BTreeSet::from([
                     rm1.clone(),
                     rm2.clone(),
                     rm3.clone(),
@@ -2150,7 +2151,7 @@ CONSTANTS
             ("TMMAYFAIL", TlaValue::Bool(false)),
             (
                 "rmState",
-                TlaValue::Function(Arc::new(BTreeMap::from([
+                TlaValue::Function(HashedArc::new(BTreeMap::from([
                     (rm1.clone(), TlaValue::String("working".to_string())),
                     (rm2.clone(), TlaValue::String("working".to_string())),
                     (rm3.clone(), TlaValue::String("prepared".to_string())),
@@ -2159,7 +2160,7 @@ CONSTANTS
             ("tmState", TlaValue::String("commit".to_string())),
             (
                 "pc",
-                TlaValue::Function(Arc::new(BTreeMap::from([
+                TlaValue::Function(HashedArc::new(BTreeMap::from([
                     (TlaValue::Int(0), TlaValue::String("TS".to_string())),
                     (TlaValue::Int(10), TlaValue::String("BTS".to_string())),
                     (rm1.clone(), TlaValue::String("RS".to_string())),
@@ -2224,7 +2225,7 @@ CONSTANTS
             ("threshold", TlaValue::Int(7)),
             (
                 "Prisoner",
-                TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::String(
+                TlaValue::Set(HashedArc::new(BTreeSet::from([TlaValue::String(
                     "alice".to_string(),
                 )]))),
             ),
@@ -2277,7 +2278,7 @@ CONSTANTS
         let state = tla_state([
             (
                 "Pos",
-                TlaValue::Set(Arc::new(BTreeSet::from([
+                TlaValue::Set(HashedArc::new(BTreeSet::from([
                     TlaValue::Int(1),
                     TlaValue::Int(2),
                     TlaValue::Int(3),
@@ -2285,9 +2286,9 @@ CONSTANTS
             ),
             (
                 "board",
-                TlaValue::Set(Arc::new(BTreeSet::from([
-                    TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(1)]))),
-                    TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(3)]))),
+                TlaValue::Set(HashedArc::new(BTreeSet::from([
+                    TlaValue::Set(HashedArc::new(BTreeSet::from([TlaValue::Int(1)]))),
+                    TlaValue::Set(HashedArc::new(BTreeSet::from([TlaValue::Int(3)]))),
                 ]))),
             ),
         ]);
@@ -2336,7 +2337,7 @@ CONSTANTS
             ("flag", TlaValue::Bool(true)),
             (
                 "Proc",
-                TlaValue::Set(Arc::new(BTreeSet::from([TlaValue::Int(1)]))),
+                TlaValue::Set(HashedArc::new(BTreeSet::from([TlaValue::Int(1)]))),
             ),
         ]);
 
@@ -2351,15 +2352,15 @@ CONSTANTS
         let a1 = TlaValue::ModelValue("a1".to_string());
         let a2 = TlaValue::ModelValue("a2".to_string());
         let v1 = TlaValue::ModelValue("v1".to_string());
-        let quorum = TlaValue::Set(Arc::new(BTreeSet::from([a1.clone(), a2.clone()])));
-        let msg_a1 = TlaValue::Record(Arc::new(BTreeMap::from([
+        let quorum = TlaValue::Set(HashedArc::new(BTreeSet::from([a1.clone(), a2.clone()])));
+        let msg_a1 = TlaValue::Record(HashedArc::new(BTreeMap::from([
             ("type".to_string(), TlaValue::String("1b".to_string())),
             ("acc".to_string(), a1.clone()),
             ("bal".to_string(), TlaValue::Int(1)),
             ("mbal".to_string(), TlaValue::Int(1)),
             ("mval".to_string(), v1.clone()),
         ])));
-        let msg_a2 = TlaValue::Record(Arc::new(BTreeMap::from([
+        let msg_a2 = TlaValue::Record(HashedArc::new(BTreeMap::from([
             ("type".to_string(), TlaValue::String("1b".to_string())),
             ("acc".to_string(), a2.clone()),
             ("bal".to_string(), TlaValue::Int(1)),
@@ -2423,9 +2424,9 @@ CONSTANTS
         let state = tla_state([
             (
                 "msgs",
-                TlaValue::Set(Arc::new(BTreeSet::from([msg_a1, msg_a2]))),
+                TlaValue::Set(HashedArc::new(BTreeSet::from([msg_a1, msg_a2]))),
             ),
-            ("Quorum", TlaValue::Set(Arc::new(BTreeSet::from([quorum])))),
+            ("Quorum", TlaValue::Set(HashedArc::new(BTreeSet::from([quorum])))),
             ("sent", TlaValue::Bool(false)),
             ("v1", v1),
         ]);
@@ -2829,7 +2830,7 @@ SPECIFICATION
             ("x", TlaValue::Int(0)),
             (
                 "S",
-                TlaValue::Set(Arc::new(BTreeSet::from([
+                TlaValue::Set(HashedArc::new(BTreeSet::from([
                     TlaValue::Int(1),
                     TlaValue::Int(2),
                     TlaValue::Int(3),
@@ -3109,7 +3110,7 @@ SPECIFICATION
         let state = tla_state([
             ("x", TlaValue::Int(0)),
             ("y", TlaValue::Int(0)),
-            ("broken", TlaValue::Function(Arc::new(BTreeMap::new()))),
+            ("broken", TlaValue::Function(HashedArc::new(BTreeMap::new()))),
         ]);
 
         let next_body = &defs.get("Next").expect("Next defined").body;

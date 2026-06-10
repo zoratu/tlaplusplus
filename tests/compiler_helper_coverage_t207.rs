@@ -20,6 +20,7 @@
 //! Each test is shaped so a typical mutation (operator swap, comparison
 //! flip, returning `true`/`false` from a match guard) breaks an assertion.
 
+use tlaplusplus::tla::hashed_arc::HashedArc;
 use std::collections::BTreeMap;
 use tlaplusplus::tla::module::{TlaDefinition, parse_tla_module_text};
 use tlaplusplus::tla::value::{TlaState, TlaValue};
@@ -122,10 +123,10 @@ fn t207_tail_singleton_yields_empty() {
     let state = TlaState::new();
     let ctx = EvalContext::new(&state);
     // Catches `seq[1..]` → `seq[0..]` (would still have 7 in result)
-    assert_eq!(eval_c("Tail(<<7>>)", &ctx).unwrap(), TlaValue::Seq(std::sync::Arc::new(vec![])));
+    assert_eq!(eval_c("Tail(<<7>>)", &ctx).unwrap(), TlaValue::Seq(HashedArc::new(vec![])));
     assert_eq!(
         eval_c("Tail(<<10, 20, 30>>)", &ctx).unwrap(),
-        TlaValue::Seq(std::sync::Arc::new(vec![TlaValue::Int(20), TlaValue::Int(30)]))
+        TlaValue::Seq(HashedArc::new(vec![TlaValue::Int(20), TlaValue::Int(30)]))
     );
 }
 
@@ -142,7 +143,7 @@ fn t207_append_correct() {
     let r = eval_c("Append(<<1, 2>>, 3)", &ctx).unwrap();
     assert_eq!(
         r,
-        TlaValue::Seq(std::sync::Arc::new(vec![
+        TlaValue::Seq(HashedArc::new(vec![
             TlaValue::Int(1),
             TlaValue::Int(2),
             TlaValue::Int(3)
@@ -150,7 +151,7 @@ fn t207_append_correct() {
     );
     // Append to empty seq
     let r2 = eval_c("Append(<<>>, 99)", &ctx).unwrap();
-    assert_eq!(r2, TlaValue::Seq(std::sync::Arc::new(vec![TlaValue::Int(99)])));
+    assert_eq!(r2, TlaValue::Seq(HashedArc::new(vec![TlaValue::Int(99)])));
 }
 
 #[test]
@@ -170,13 +171,13 @@ fn t207_subseq_boundary_indices() {
     let r = eval_c("SubSeq(<<1, 2, 3>>, 1, 2)", &ctx).unwrap();
     assert_eq!(
         r,
-        TlaValue::Seq(std::sync::Arc::new(vec![TlaValue::Int(1), TlaValue::Int(2)]))
+        TlaValue::Seq(HashedArc::new(vec![TlaValue::Int(1), TlaValue::Int(2)]))
     );
     // n past end clamps; catches `(n as usize).min(seq.len())` mutations
     let r2 = eval_c("SubSeq(<<1, 2, 3>>, 1, 99)", &ctx).unwrap();
     assert_eq!(
         r2,
-        TlaValue::Seq(std::sync::Arc::new(vec![
+        TlaValue::Seq(HashedArc::new(vec![
             TlaValue::Int(1),
             TlaValue::Int(2),
             TlaValue::Int(3)
@@ -184,7 +185,7 @@ fn t207_subseq_boundary_indices() {
     );
     // start > seq.len() returns empty; catches `if start > seq.len()` flips
     let r3 = eval_c("SubSeq(<<1, 2>>, 99, 100)", &ctx).unwrap();
-    assert_eq!(r3, TlaValue::Seq(std::sync::Arc::new(vec![])));
+    assert_eq!(r3, TlaValue::Seq(HashedArc::new(vec![])));
 }
 
 #[test]
@@ -341,7 +342,7 @@ fn t207_funasseq_basic() {
     let r = eval_c("FunAsSeq([i \\in 1..3 |-> i * 10], 1, 3)", &ctx).unwrap();
     assert_eq!(
         r,
-        TlaValue::Seq(std::sync::Arc::new(vec![
+        TlaValue::Seq(HashedArc::new(vec![
             TlaValue::Int(10),
             TlaValue::Int(20),
             TlaValue::Int(30)
@@ -959,5 +960,5 @@ fn t207_subseq_typed_variant_start_past_end_returns_empty() {
     let state = TlaState::new();
     let ctx = EvalContext::new(&state);
     let r = eval_c("SubSeq(<<1, 2>>, 5, 9)", &ctx).unwrap();
-    assert_eq!(r, TlaValue::Seq(std::sync::Arc::new(vec![])));
+    assert_eq!(r, TlaValue::Seq(HashedArc::new(vec![])));
 }

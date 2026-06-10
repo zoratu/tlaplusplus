@@ -13,6 +13,7 @@
 //! they support T5's Z3-backed symbolic Init enumeration.
 
 use anyhow::{Context, Result, anyhow};
+use crate::tla::hashed_arc::HashedArc;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -31,7 +32,7 @@ use super::split_once_top_level;
 pub(super) fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<TlaValue> {
     let inner = expr.trim();
     if inner.is_empty() {
-        return Ok(TlaValue::Set(Arc::new(BTreeSet::new())));
+        return Ok(TlaValue::Set(HashedArc::new(BTreeSet::new())));
     }
 
     if let Some(colon_idx) = find_top_level_char(inner, ':') {
@@ -163,13 +164,13 @@ pub(super) fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usiz
                                         let records: Vec<TlaValue> = pairs
                                             .into_iter()
                                             .map(|(a, b)| {
-                                                TlaValue::Record(Arc::new(BTreeMap::from([
+                                                TlaValue::Record(HashedArc::new(BTreeMap::from([
                                                     (f0_name.clone(), TlaValue::Int(a)),
                                                     (f1_name.clone(), TlaValue::Int(b)),
                                                 ])))
                                             })
                                             .collect();
-                                        return Ok(TlaValue::Seq(Arc::new(records)));
+                                        return Ok(TlaValue::Seq(HashedArc::new(records)));
                                     }
                                 }
                             }
@@ -200,7 +201,7 @@ pub(super) fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usiz
                                                 .product::<u64>()
                                         );
                                     }
-                                    return Ok(TlaValue::Seq(Arc::new(records)));
+                                    return Ok(TlaValue::Seq(HashedArc::new(records)));
                                 }
                             }
 
@@ -228,11 +229,11 @@ pub(super) fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usiz
                                 for (i, (fname, vals)) in field_specs.iter().enumerate() {
                                     *rec.get_mut(fname).unwrap() = vals[indices[i]].clone();
                                 }
-                                let record_arc = Arc::new(rec.clone());
+                                let record_arc = HashedArc::new(rec.clone());
                                 let mut iter_locals = base_locals.clone();
                                 iter_locals.insert(
                                     var_key.clone(),
-                                    TlaValue::Record(Arc::clone(&record_arc)),
+                                    TlaValue::Record(record_arc.clone()),
                                 );
                                 let child = EvalContext {
                                     state: ctx.state,
@@ -263,7 +264,7 @@ pub(super) fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usiz
                                     break;
                                 }
                             }
-                            return Ok(TlaValue::Set(Arc::new(out)));
+                            return Ok(TlaValue::Set(HashedArc::new(out)));
                         }
                     }
                 }
@@ -303,7 +304,7 @@ pub(super) fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usiz
                                 );
                             }
                             let set: BTreeSet<TlaValue> = seqs.into_iter().collect();
-                            return Ok(TlaValue::Set(Arc::new(set)));
+                            return Ok(TlaValue::Set(HashedArc::new(set)));
                         }
                     }
                 }
@@ -347,7 +348,7 @@ pub(super) fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usiz
                                     );
                                 }
                                 let set: BTreeSet<TlaValue> = seqs.into_iter().collect();
-                                return Ok(TlaValue::Set(Arc::new(set)));
+                                return Ok(TlaValue::Set(HashedArc::new(set)));
                             }
                         }
                     }
@@ -366,7 +367,7 @@ pub(super) fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usiz
                 ctx,
                 depth + 1,
             )?;
-            return Ok(TlaValue::Set(Arc::new(out)));
+            return Ok(TlaValue::Set(HashedArc::new(out)));
         }
 
         // T5.1 — FunAsSeq wrapper recognition.
@@ -380,14 +381,14 @@ pub(super) fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usiz
             if std::env::var("TLAPLUSPLUS_DEBUG_SYMBOLIC_INIT").is_ok() {
                 eprintln!("Symbolic Init (FunAsSeq wrapper): {} sequences", seqs.len());
             }
-            return Ok(TlaValue::Set(Arc::new(seqs.into_iter().collect())));
+            return Ok(TlaValue::Set(HashedArc::new(seqs.into_iter().collect())));
         }
 
         let binders = parse_binders(rhs, ctx, depth + 1)?;
         let mut assignments = BTreeMap::new();
         let mut out = BTreeSet::new();
         collect_binder_map_set(0, &binders, lhs, &mut assignments, &mut out, ctx, depth + 1)?;
-        return Ok(TlaValue::Set(Arc::new(out)));
+        return Ok(TlaValue::Set(HashedArc::new(out)));
     }
 
     let mut out = BTreeSet::new();
@@ -399,7 +400,7 @@ pub(super) fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usiz
         out.insert(eval_expr_inner(item, ctx, depth + 1)?);
     }
 
-    Ok(TlaValue::Set(Arc::new(out)))
+    Ok(TlaValue::Set(HashedArc::new(out)))
 }
 
 /// T5.1 helper. Resolve `dom_text -> range_text` to (seq_len, range_values)
@@ -791,7 +792,7 @@ pub(super) fn try_eval_record_set(
 
     // Check for empty sets - if any field has an empty domain, the result is empty
     if field_sets.iter().any(|(_, elems)| elems.is_empty()) {
-        return Ok(Some(TlaValue::Set(Arc::new(BTreeSet::new()))));
+        return Ok(Some(TlaValue::Set(HashedArc::new(BTreeSet::new()))));
     }
 
     // Calculate total number of records (product of all set sizes)
@@ -821,7 +822,7 @@ pub(super) fn try_eval_record_set(
         for (i, (field_name, elements)) in field_sets.iter().enumerate() {
             record.insert(field_name.clone(), elements[indices[i]].clone());
         }
-        result.insert(TlaValue::Record(Arc::new(record)));
+        result.insert(TlaValue::Record(HashedArc::new(record)));
 
         // Increment indices (like counting in mixed-radix number system)
         let mut carry = true;
@@ -840,7 +841,7 @@ pub(super) fn try_eval_record_set(
         }
     }
 
-    Ok(Some(TlaValue::Set(Arc::new(result))))
+    Ok(Some(TlaValue::Set(HashedArc::new(result))))
 }
 
 pub(super) fn powerset(input: &BTreeSet<TlaValue>, ctx: &EvalContext<'_>) -> Result<BTreeSet<TlaValue>> {
@@ -876,7 +877,7 @@ pub(super) fn powerset(input: &BTreeSet<TlaValue>, ctx: &EvalContext<'_>) -> Res
                 subset.insert(value.clone());
             }
         }
-        subsets.insert(TlaValue::Set(Arc::new(subset)));
+        subsets.insert(TlaValue::Set(HashedArc::new(subset)));
     }
 
     Ok(subsets)
