@@ -16,13 +16,39 @@ use anyhow::{Result, anyhow};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 // Thread-local cache for compiled operator bodies
 // Using thread-local storage eliminates cross-thread contention entirely
 thread_local! {
     static THREAD_LOCAL_OPERATOR_CACHE: RefCell<HashMap<String, Arc<CompiledExpr>>> =
         RefCell::new(HashMap::with_capacity(256));
+}
+
+// Cache the TLAPP_TRACE_* env-var probes once per process. These were
+// previously called inline on every `CompiledExpr::Var` lookup and every
+// `get_or_compile_operator` hit — millions of times per second under full-MC,
+// burning ~10% of CPU on `getenv`/global-env-mutex acquisition for an
+// off-by-default debug path. `OnceLock` makes each probe a single
+// monomorphic load after the first call.
+fn trace_var_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("TLAPP_TRACE_VAR").is_some())
+}
+
+fn trace_opcache_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("TLAPP_TRACE_OPCACHE").is_some())
+}
+
+fn trace_funcapply_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("TLAPP_TRACE_FUNCAPPLY").is_some())
+}
+
+fn trace_forall_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("TLAPP_TRACE_FORALL").is_some())
 }
 
 /// Get or compile an operator body expression (thread-local, zero contention)
@@ -36,7 +62,7 @@ fn get_or_compile_operator(name: &str, body: &str) -> Arc<CompiledExpr> {
         }
 
         // Debug: trace operator compilation
-        if std::env::var("TLAPP_TRACE_OPCACHE").is_ok() {
+        if trace_opcache_enabled() {
             eprintln!(
                 "OPCACHE compiling '{}': {}",
                 name,
@@ -152,7 +178,7 @@ fn eval_compiled_inner(
         CompiledExpr::Var(name) => {
             // First check local variables
             if let Some(v) = ctx.runtime_value(name) {
-                if std::env::var("TLAPP_TRACE_VAR").is_ok() {
+                if trace_var_enabled() {
                     eprintln!("VAR {} -> Ok({:?})", name, v);
                 }
                 return Ok(v);
@@ -164,7 +190,7 @@ fn eval_compiled_inner(
                     // Get or compile the operator body
                     let compiled_body = get_or_compile_operator(name, &def.body);
                     let result = eval_compiled_inner(&compiled_body, ctx, depth);
-                    if std::env::var("TLAPP_TRACE_VAR").is_ok() {
+                    if trace_var_enabled() {
                         eprintln!("VAR {} (operator) -> {:?}", name, result);
                     }
                     return result.map_err(|e| anyhow!("failed to resolve {}: {}", name, e));
@@ -175,7 +201,7 @@ fn eval_compiled_inner(
                     body: def.body.clone(),
                     captured_locals: Arc::new((*ctx.locals).clone()),
                 };
-                if std::env::var("TLAPP_TRACE_VAR").is_ok() {
+                if trace_var_enabled() {
                     eprintln!("VAR {} (operator value) -> Ok({:?})", name, value);
                 }
                 return Ok(value);
@@ -190,7 +216,7 @@ fn eval_compiled_inner(
             }
 
             // Fall back to model value for undefined identifiers
-            if std::env::var("TLAPP_TRACE_VAR").is_ok() {
+            if trace_var_enabled() {
                 eprintln!("VAR {} -> ModelValue", name);
             }
             Ok(TlaValue::ModelValue(name.to_string()))
@@ -647,11 +673,11 @@ fn eval_compiled_inner(
             Ok(TlaValue::Function(HashedArc::new(func)))
         }
         CompiledExpr::FuncApply(f, args) => {
-            if std::env::var("TLAPP_TRACE_FUNCAPPLY").is_ok() {
+            if trace_funcapply_enabled() {
                 eprintln!("FUNCAPPLY: {:?}[{:?}]", f, args);
             }
             let func = eval_compiled_inner(f, ctx, depth)?;
-            if std::env::var("TLAPP_TRACE_FUNCAPPLY").is_ok() {
+            if trace_funcapply_enabled() {
                 eprintln!("  func evaluated to: {}", tla_value_to_string(&func));
             }
 
@@ -859,7 +885,7 @@ fn eval_compiled_inner(
         CompiledExpr::Forall { var, domain, body } => {
             let domain_val = eval_compiled_inner(domain, ctx, depth)?;
             let domain_set = domain_val.as_set()?;
-            if std::env::var("TLAPP_TRACE_FORALL").is_ok() {
+            if trace_forall_enabled() {
                 eprintln!(
                     "FORALL {} in {:?}, ctx.locals: {:?}, depth: {}",
                     var, domain, ctx.locals, depth
@@ -867,7 +893,7 @@ fn eval_compiled_inner(
             }
             for elem in domain_set.iter() {
                 let new_ctx = ctx.with_local_value(var, elem.clone());
-                if std::env::var("TLAPP_TRACE_FORALL").is_ok() {
+                if trace_forall_enabled() {
                     eprintln!(
                         "  FORALL {} = {:?}, new_ctx.locals: {:?}, depth: {}",
                         var, elem, new_ctx.locals, depth
