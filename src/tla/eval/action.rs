@@ -754,6 +754,43 @@ pub(super) fn matches_membership_expr(
                 }
             }
 
+            // Filter-set comprehension fast path: `x \in {y \in S : P(y)}`
+            // semantically equals `x \in S /\ P[y := x]`. Without this the
+            // fallthrough at the bottom materializes the whole filter set
+            // (potentially millions of elements) before testing membership.
+            // See `project_mcbinarysearch_stall_root_cause_2026-06-11.md`
+            // for the motivating workload — SortedSeqs on a 488K-candidate
+            // domain.
+            if rhs_trimmed.starts_with('{')
+                && rhs_trimmed.ends_with('}')
+                && let inner = &rhs_trimmed[1..rhs_trimmed.len() - 1]
+                && let Some(colon_idx) = crate::tla::compiled_expr::find_top_level_colon(inner)
+            {
+                let lhs = inner[..colon_idx].trim();
+                let filter_expr = inner[colon_idx + 1..].trim();
+                if let Some(in_idx) =
+                    super::splitter::find_top_level_keyword_index(lhs, "\\in")
+                {
+                    let var = lhs[..in_idx].trim();
+                    let domain_expr = lhs[in_idx + "\\in".len()..].trim();
+                    // Only treat as filter form when the LHS binder is a
+                    // simple identifier (not a tuple destructure like
+                    // `<<a, b>> \in S` and not a comma-list binder). Those
+                    // would need different rebinding semantics.
+                    if !var.is_empty()
+                        && !var.contains(',')
+                        && !var.contains('<')
+                        && !var.contains(' ')
+                    {
+                        if !matches_membership_expr(value, domain_expr, ctx, depth + 1)? {
+                            return Ok(false);
+                        }
+                        let scoped = ctx.with_local_value(var, value.clone());
+                        return Ok(eval_expr_inner(filter_expr, &scoped, depth + 1)?.as_bool()?);
+                    }
+                }
+            }
+
             if rhs_trimmed.starts_with('[') && rhs_trimmed.ends_with(']') {
                 let inner = &rhs_trimmed[1..rhs_trimmed.len() - 1];
 
