@@ -1098,12 +1098,50 @@ fn compiled_membership_contains(
             if let Some(def) = ctx.definition(name)
                 && def.params.is_empty()
             {
+                // Dispatch on the compiled body when possible — this lets
+                // a downstream `SetComprehension { filter: Some(...) }` arm
+                // short-circuit `x \in {y \in S : P(y)}` to
+                // `x \in S /\ P[y := x]` instead of materializing the
+                // filter set. Falls back to the text path on compile errors
+                // (preserves the prior interpreted-path behavior).
+                let compiled_body = get_or_compile_operator(name, &def.body);
+                if !matches!(&*compiled_body, CompiledExpr::Unparsed(_)) {
+                    return compiled_membership_contains(value, &compiled_body, ctx, depth);
+                }
                 return membership_matches_text(value, &def.body, ctx, depth);
             }
             let set_val = eval_compiled_inner(set_expr, ctx, depth)?;
             set_val.contains(value)
         }
         CompiledExpr::Unparsed(text) => membership_matches_text(value, text, ctx, depth),
+        // Filter-set comprehension fast path: `x \in {y \in S : P(y)}`
+        // semantically equals `x \in S /\ P[y := x]` — no need to enumerate S.
+        // Only applies when the body is the identity `Var(var)`, which is how
+        // compile_expr lowers the filter form `{var \in domain : filter}`
+        // (see `try_parse_set_comprehension`). Non-identity bodies (i.e.
+        // map-set comprehensions `{f(y) : y \in S}`) still fall through to
+        // enumeration since the projection `f` would have to be inverted.
+        CompiledExpr::SetComprehension {
+            var,
+            domain,
+            body,
+            filter,
+        } => {
+            if let CompiledExpr::Var(b) = body.as_ref()
+                && b == var
+            {
+                if !compiled_membership_contains(value, domain, ctx, depth)? {
+                    return Ok(false);
+                }
+                if let Some(filter_expr) = filter {
+                    let scoped = ctx.with_local_value(var.clone(), value.clone());
+                    return Ok(eval_compiled_inner(filter_expr, &scoped, depth)?.as_bool()?);
+                }
+                return Ok(true);
+            }
+            let set_val = eval_compiled_inner(set_expr, ctx, depth)?;
+            set_val.contains(value)
+        }
         // Handle Seq(S) - check if value is a sequence with all elements in S
         CompiledExpr::OpCall { name, args } if name == "Seq" && args.len() == 1 => {
             match value {
