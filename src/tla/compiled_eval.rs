@@ -1170,6 +1170,31 @@ fn compiled_membership_contains(
                 _ => Ok(false),
             }
         }
+        // Handle [field: Domain, ...] record-set membership structurally.
+        // Materializing the cross product is asymptotically wrong for the
+        // membership test and trips the 1M-record cap on CoffeeCan-class
+        // workloads (TypeInvariant ~ can ∈ [black: 0..N, white: 0..N]
+        // tries to construct (N+1)² records). Same shape of fix as the
+        // SetComprehension filter short-circuit (PR #87).
+        CompiledExpr::RecordSet(fields) => {
+            match value {
+                TlaValue::Record(rec) => {
+                    if rec.len() != fields.len() {
+                        return Ok(false);
+                    }
+                    for (field_name, domain_expr) in fields {
+                        let Some(field_val) = rec.get(field_name) else {
+                            return Ok(false);
+                        };
+                        if !compiled_membership_contains(field_val, domain_expr, ctx, depth)? {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
+        }
         // Handle [Domain -> Range] membership structurally instead of enumerating
         CompiledExpr::FunctionSet { domain, range } => {
             match value {
