@@ -71,7 +71,7 @@ pub struct FingerprintStoreConfig {
 impl Default for FingerprintStoreConfig {
     fn default() -> Self {
         Self {
-            shard_count: 128, // Power of 2 for fast modulo
+            shard_count: 256, // Power of 2 for fast modulo
             expected_items: 100_000_000,
             shard_size_mb: 1024, // 1GB per shard = 128GB total
         }
