@@ -14,7 +14,18 @@
 use anyhow::{Result, anyhow};
 use crate::tla::hashed_arc::HashedArc;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+// Cache the TLAPP_TRACE_EVAL env probe once per process. Without this
+// cache, `eval_expr_inner` does a fresh `std::env::var(...).is_ok()` on
+// every interpreted-eval call — millions of times under full-MC, sitting
+// at ~7% self-time on MCKVSSafetyMedium even after PR #85 caught the
+// compiled-side traces. Same pattern as `trace_var_enabled` in
+// `tla::compiled_eval`.
+fn trace_eval_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("TLAPP_TRACE_EVAL").is_some())
+}
 
 use crate::tla::TlaValue;
 
@@ -30,7 +41,7 @@ use super::{
 
 pub(super) fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<TlaValue> {
     // DEBUG: Track expression evaluation path when depth is high
-    if std::env::var("TLAPP_TRACE_EVAL").is_ok() && depth >= 3 {
+    if trace_eval_enabled() && depth >= 3 {
         let preview_len = if raw_expr.starts_with("LET") {
             1000
         } else {

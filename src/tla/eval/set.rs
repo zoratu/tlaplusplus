@@ -16,7 +16,17 @@ use anyhow::{Context, Result, anyhow};
 use crate::tla::hashed_arc::HashedArc;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+// Cache the TLAPLUSPLUS_DEBUG_SYMBOLIC_INIT env probe — checked 4 times
+// inside set-eval hot paths (`try_eval_record_set` constraint propagation,
+// filter-set fast paths). Without caching, the global env mutex acquisition
+// dominated set-eval-heavy workloads. Same pattern as `trace_eval_enabled`
+// in expr.rs.
+fn debug_symbolic_init_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("TLAPLUSPLUS_DEBUG_SYMBOLIC_INIT").is_some())
+}
 
 use crate::tla::TlaValue;
 
@@ -191,7 +201,7 @@ pub(super) fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usiz
                                         ctx,
                                     )
                                 {
-                                    if std::env::var("TLAPLUSPLUS_DEBUG_SYMBOLIC_INIT").is_ok() {
+                                    if debug_symbolic_init_enabled() {
                                         eprintln!(
                                             "Symbolic Init enumeration: {} records (brute-force candidate count: {})",
                                             records.len(),
@@ -295,7 +305,7 @@ pub(super) fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usiz
                                 ctx,
                             )
                         {
-                            if std::env::var("TLAPLUSPLUS_DEBUG_SYMBOLIC_INIT").is_ok() {
+                            if debug_symbolic_init_enabled() {
                                 eprintln!(
                                     "Symbolic Init (FunAsSeq+filter): {} sequences (len={}, range={})",
                                     seqs.len(),
@@ -339,7 +349,7 @@ pub(super) fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usiz
                                     ctx,
                                 )
                             {
-                                if std::env::var("TLAPLUSPLUS_DEBUG_SYMBOLIC_INIT").is_ok() {
+                                if debug_symbolic_init_enabled() {
                                     eprintln!(
                                         "Symbolic Init (function-set): {} sequences (len={}, range={})",
                                         seqs.len(),
@@ -378,7 +388,7 @@ pub(super) fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usiz
         // the symbolic path produces natively).
         #[cfg(feature = "symbolic-init")]
         if let Some(seqs) = try_funasseq_wrapper_symbolic(lhs, rhs, ctx, depth + 1) {
-            if std::env::var("TLAPLUSPLUS_DEBUG_SYMBOLIC_INIT").is_ok() {
+            if debug_symbolic_init_enabled() {
                 eprintln!("Symbolic Init (FunAsSeq wrapper): {} sequences", seqs.len());
             }
             return Ok(TlaValue::Set(HashedArc::new(seqs.into_iter().collect())));
