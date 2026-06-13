@@ -12,17 +12,26 @@ use crate::tla::formula::split_top_level;
 use crate::tla::value::TlaValue;
 #[cfg(test)]
 use crate::tla::value::tla_state;
+use ahash::AHashMap;
 use anyhow::{Result, anyhow};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
 
-// Thread-local cache for compiled operator bodies
-// Using thread-local storage eliminates cross-thread contention entirely
+// Thread-local cache for compiled operator bodies.
+// Thread-local storage eliminates cross-thread contention entirely.
+// Key is the operator BODY only — the body text uniquely determines the
+// compiled expression (the operator name is just a debug label and would
+// be redundant in the key). Skipping the name lets us look up by `&str`
+// without `format!`-allocating a fresh key string on every hit, which
+// previously fired millions of times per minute under full-MC.
+// `AHashMap` swaps SIP for ahash — these caches are thread-local with
+// non-adversarial keys, so SIP's HashDoS resistance is unnecessary
+// overhead.
 thread_local! {
-    static THREAD_LOCAL_OPERATOR_CACHE: RefCell<HashMap<String, Arc<CompiledExpr>>> =
-        RefCell::new(HashMap::with_capacity(256));
+    static THREAD_LOCAL_OPERATOR_CACHE: RefCell<AHashMap<String, Arc<CompiledExpr>>> =
+        RefCell::new(AHashMap::with_capacity(256));
 }
 
 // Cache the TLAPP_TRACE_* env-var probes once per process. These were
@@ -51,13 +60,15 @@ fn trace_forall_enabled() -> bool {
     *V.get_or_init(|| std::env::var_os("TLAPP_TRACE_FORALL").is_some())
 }
 
-/// Get or compile an operator body expression (thread-local, zero contention)
+/// Get or compile an operator body expression (thread-local, zero contention).
+///
+/// Cache key is the body text alone — the body uniquely determines the
+/// compiled expression; the name is just a debug label. Looking up by
+/// `&str` avoids the per-hit `format!` allocation that the old
+/// `format!("{}:{}", name, body)` key required.
 fn get_or_compile_operator(name: &str, body: &str) -> Arc<CompiledExpr> {
-    let cache_key = format!("{}:{}", name, body);
-
     THREAD_LOCAL_OPERATOR_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if let Some(cached) = cache.get(&cache_key) {
+        if let Some(cached) = cache.borrow().get(body) {
             return Arc::clone(cached);
         }
 
@@ -70,9 +81,11 @@ fn get_or_compile_operator(name: &str, body: &str) -> Arc<CompiledExpr> {
             );
         }
 
-        // Compile and cache
+        // Compile and cache (one allocation per unique body, on miss only)
         let compiled = Arc::new(compile_expr(body));
-        cache.insert(cache_key, Arc::clone(&compiled));
+        cache
+            .borrow_mut()
+            .insert(body.to_string(), Arc::clone(&compiled));
         compiled
     })
 }

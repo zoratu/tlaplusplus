@@ -19,33 +19,41 @@ static PREWARMED_ACTION_CACHE: LazyLock<DashMap<String, Arc<CompiledActionIr>>> 
     LazyLock::new(DashMap::new);
 
 // Thread-local cache for runtime-compiled action IRs
-// Using thread-local storage eliminates cross-thread contention entirely
+// Using thread-local storage eliminates cross-thread contention entirely.
+// Key is the action BODY only — the body uniquely determines the compiled
+// IR (the action name is just a debug label). Looking up by `&str`
+// avoids a `format!`-allocated cache key on every hit, which fired
+// millions of times per minute on full-MC. The pre-warmed DashMap key is
+// kept aligned (see `warm_up_action_cache` in models/tla_native.rs).
+// `AHashMap` swaps SIP for ahash — these caches are thread-local with
+// non-adversarial keys.
 thread_local! {
-    static THREAD_LOCAL_ACTION_CACHE: RefCell<HashMap<String, Arc<CompiledActionIr>>> =
-        RefCell::new(HashMap::with_capacity(64));
+    static THREAD_LOCAL_ACTION_CACHE: RefCell<ahash::AHashMap<String, Arc<CompiledActionIr>>> =
+        RefCell::new(ahash::AHashMap::with_capacity(64));
 }
 
 /// Get or compile an action IR with compiled expressions (thread-local, zero contention)
 fn get_or_compile_action(def: &TlaDefinition) -> Arc<CompiledActionIr> {
-    // Use body as cache key (name could have duplicates with different bodies)
-    let cache_key = format!("{}:{}", def.name, def.body);
-
-    // Check pre-warmed global cache first (read-only, no contention)
-    if let Some(cached) = PREWARMED_ACTION_CACHE.get(&cache_key) {
+    // Check pre-warmed global cache first (read-only, no contention).
+    // DashMap defaults to ahash so the hash itself is cheap; the only
+    // remaining cost is the `&str` lookup.
+    if let Some(cached) = PREWARMED_ACTION_CACHE.get(def.body.as_str()) {
         return Arc::clone(&cached);
     }
 
     // Check thread-local cache
     THREAD_LOCAL_ACTION_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if let Some(cached) = cache.get(&cache_key) {
+        if let Some(cached) = cache.borrow().get(def.body.as_str()) {
             return Arc::clone(cached);
         }
 
-        // Compile and cache in thread-local storage
+        // Compile and cache in thread-local storage (one allocation per
+        // unique body, on miss only).
         let ir = compile_action_ir(def);
         let compiled = Arc::new(CompiledActionIr::from_ir(&ir));
-        cache.insert(cache_key, Arc::clone(&compiled));
+        cache
+            .borrow_mut()
+            .insert(def.body.clone(), Arc::clone(&compiled));
         compiled
     })
 }
