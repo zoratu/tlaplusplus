@@ -3429,9 +3429,10 @@ fn warm_up_action_cache(
 ) {
     for (name, compiled_ir) in compiled_actions {
         if let Some(def) = definitions.get(name) {
-            // Use the same cache key format as get_or_compile_action
-            let cache_key = format!("{}:{}", def.name, def.body);
-            insert_compiled_action(cache_key, Arc::clone(compiled_ir));
+            // Use the same cache key as `get_or_compile_action` — the body
+            // alone. Avoids both the `format!` allocation here and a
+            // per-lookup allocation at runtime.
+            insert_compiled_action(def.body.clone(), Arc::clone(compiled_ir));
         }
     }
 }
