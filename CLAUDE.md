@@ -24,10 +24,10 @@ Key performance features:
 # Build release binary
 cargo build --release
 
-# Run all tests (1,227 tests)
+# Run all tests (1,232 tests as of v1.2.8)
 cargo test --release
 
-# Run with chaos/failpoint testing (1,249 tests)
+# Run with chaos/failpoint testing (1,254 tests)
 cargo test --release --features failpoints
 
 # Run with Z3-backed symbolic Init enumeration (T5)
@@ -433,9 +433,9 @@ Periodic checkpoints (`--checkpoint-interval-secs`) persist state for crash reco
 **Working (TLC feature parity + 1.0.0 additions)**:
 
 Test suite & gates:
-- **1,227 default tests**, 0 failures, 11 ignored (`cargo test --release`)
-- **1,249 tests with `--features failpoints`**, 0 failures
-- **1,254 tests with `--features symbolic-init`**, 0 failures
+- **1,232 default tests**, 0 failures, 10 ignored (`cargo test --release`)
+- **1,254 tests with `--features failpoints`**, 0 failures
+- **1,259 tests with `--features symbolic-init`**, 0 failures
 - **13/13 differential-vs-TLC specs** pass via `scripts/diff_tlc.sh` (state counts agree exactly with TLC v2.19); CI gate via `scripts/REDACTED` (run on a fresh EC2 spot per push) runs on a `[ubuntu-latest, ubuntu-24.04-arm]` cross-arch matrix
 - **T2 proptest equivalence**: compiled-vs-interpreted on Int/Bool/Set/Seq/Record/Str expressions, clean across 9 seeds at `PROPTEST_CASES=2048`; CI runs at 128
 - **T16a swarm proptest**: random subset of 17 shape categories per case (Regehr-style); kept alongside the uniform regression

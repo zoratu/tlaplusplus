@@ -2,8 +2,8 @@
 
 A Rust implementation of TLA+ model checking with TLC feature parity, achieving **10.7x faster** state exploration than Java TLC on many-core systems. 182/182 (100%) of the [tlaplus/Examples](https://github.com/tlaplus/Examples) corpus passes analysis; **174/182 (95.6%)** also pass full model checking at 60s.
 
-**v1.0.0 (2026-04-27)** ships with:
-- 756 default tests + 776 with failpoints + 774 with symbolic-init, 0 failures
+**v1.2.8 (2026-06-13)** ships with:
+- 1,232 default tests + 1,254 with failpoints + 1,259 with symbolic-init, 0 failures
 - Differential CI gate vs TLC (13/13 specs match exactly)
 - Compiled-vs-interpreted proptest equivalence (clean across 9 seeds at 2048 cases)
 - State-graph snapshot tests (12 specs pinned to 128-bit XxHash3 digests)
@@ -37,6 +37,25 @@ Tested on real-world Raft/consensus specs with 30-minute runs:
 - **1.0–1.75M states/min** sustained with zero checkpoint stalls
 - **31–53M states** explored per 30-minute run
 - Lightweight periodic checkpoints (0ms pause, no queue drain)
+
+### Eval-path improvements (v1.2.8, 2026-06-13)
+
+Six PRs (#84 — #89) compound through the interpreted/compiled hot paths
+and the fingerprint store. Measured on a 64-worker c7g.16xlarge running
+MCKVSSafetyMedium for 600s:
+
+| Build  | Distinct @ 600s | Distinct / min | States generated / min |
+|--------|-----------------:|---------------:|------------------------:|
+| Pre-#84 baseline | 4,826,272 | 482,627 | 4,860,000 |
+| Post-#89 (current main) | **31,482,090** | **1,654,245** | **56,655,212** |
+| Δ | **+6.5×** | **+3.4×** | **+11.7×** |
+
+Two previously-timing-out specs now solve in seconds:
+
+| Spec | Pre-#87 | Post-#88 |
+|------|---------|----------|
+| MCBinarySearch full-MC (Init+BFS+liveness) | stuck at 6,430 distinct ∞ | **1 second** (27,953 distinct) |
+| CoffeeCan-1000 full-MC | crashed: "record set too large" | **9 seconds** (501,500 distinct) |
 
 ### TLC Comparison (8 workers, tlaplus/Examples corpus)
 
