@@ -135,11 +135,10 @@ pub(crate) fn apply_action_ir_with_context_multi(
     let mut out = Vec::with_capacity(branches.len());
     for branch in branches {
         let mut next = current.clone();
-        for var in branch.unchanged_vars {
-            if let Some(old) = current.get(var.as_str()) {
-                next.insert(Arc::from(var), old.clone());
-            }
-        }
+        // Mirror of `apply_compiled_action_ir_multi` — the loop B insert
+        // below already covers unchanged vars because every Unchanged
+        // handler `or_insert`s into `branch.staged`. See the longer note
+        // on the compiled-side function for the full rationale.
         for (var, value) in branch.staged {
             next.insert(Arc::from(var), value);
         }

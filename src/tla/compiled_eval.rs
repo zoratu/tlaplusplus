@@ -2169,11 +2169,17 @@ pub fn apply_compiled_action_ir_multi(
     let mut out = Vec::with_capacity(branches.len());
     for branch in branches {
         let mut next = current.clone();
-        for var in branch.unchanged_vars {
-            if let Some(old) = current.get(var.as_str()) {
-                next.insert(Arc::from(var), old.clone());
-            }
-        }
+        // NOTE: there used to be a `for var in branch.unchanged_vars { ... }`
+        // loop here that copied `current`'s values into `next` for each
+        // unchanged variable. Every Unchanged-clause handler — both compiled
+        // (`CompiledActionClause::Unchanged`, ~30 lines below) and
+        // interpreted (the three `ActionClause::Unchanged` arms in
+        // `src/tla/eval/action.rs`) — already `entry(var).or_insert_with(||
+        // current_value.clone())`s the unchanged value into `branch.staged`,
+        // so the loop below already writes the same key with the same value.
+        // The old loop was O(unchanged_vars) Arc<str> allocations + BTreeMap
+        // inserts per successor on top of `next = current.clone()`, which
+        // already contains all of current's keys.
         for (var, value) in branch.staged {
             next.insert(Arc::from(var), value);
         }
