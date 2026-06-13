@@ -1,5 +1,42 @@
 # Changelog
 
+## v1.2.8 (2026-06-13)
+
+Eval-path performance batch. Six merged PRs (#84 — #89) compound through
+the interpreted/compiled hot paths and the fingerprint store. Net result on
+MCKVSSafetyMedium full-MC (c7g.16xlarge eu-north-1, 64 workers, 600s budget):
+distinct@600s **4,826,272 → 31,482,090 (+6.5×)**; states/min generated
+**4.86M → 56.66M (+11.7×)**.
+
+| PR  | What                                                       | Win on MCKVSSafetyMedium |
+|----:|------------------------------------------------------------|--------------------------|
+| #84 | `HashedArc<T>` — cache structural hash on TlaValue arcs     | ~neutral on full-MC (-14% on `analyze-tla` MCBinarySearch) |
+| #85 | Cache `TLAPP_TRACE_*` env probes (compiled-side) in `OnceLock` | distinct@600s 4.78M → 10.53M (+2.5×) |
+| #86 | Bump default `shard_count` 128 → 256                        | distinct@600s 10.45M → 11.23M (+7.5%) |
+| #87 | Short-circuit `x ∈ {y ∈ S : P(y)}` filter-set membership    | MCBinarySearch full-MC ∞ → 1s (~17,000×); CoffeeCan-100 unlocked |
+| #88 | Structural short-circuit for record-set `x ∈ [field: D, …]` | CoffeeCan-1000/3000 unlocked from `record set too large` cap |
+| #89 | Cache `TLAPP_TRACE_EVAL` / `TLAPLUSPLUS_DEBUG_SYMBOLIC_INIT` env probes | distinct@600s 11.85M → 31.48M (+2.66×) |
+
+Three previously-timing-out specs are now solved or progressing under 60s
+budgets (MCBinarySearch, CoffeeCan-100/-1000/-3000, plus Einstein under
+`--features symbolic-init`). c1cs and btree remain genuinely
+exploration-bound at minutes-scale.
+
+| Gate | Result |
+|---|---|
+| `cargo test --release` | 1,232 pass / 0 fail / 10 ignored |
+| `cargo test --release --features failpoints` | 1,254 pass / 0 fail / 10 ignored |
+| `cargo test --release --features symbolic-init` | 1,259 pass / 0 fail / 10 ignored |
+| `scripts/diff_tlc.sh` | 13 / 13 specs match TLC v2.19 |
+| `PROPTEST_CASES=2048 cargo test --release --test compiled_vs_interpreted` | 17 / 0 (17 strategies × 2048 cases ≈ 34K) |
+| `scripts/chaos_smoke.sh` (swarm-mode auto) | 12/12 failpoints, 0 divergences, 0 hangs |
+
+Drop-in for v1.2.7. No public-API or CLI changes — all wins are runtime
+defaults and eval-path micro-optimizations. Caching debug-trace env probes
+in `OnceLock` means the trace-eprintln paths still fire if the env var is
+set at process start; setting them mid-run is unsupported (was racy before;
+deterministically off now).
+
 ## v1.2.7 (2026-05-20)
 
 Verus T13.4 Phase 2 in-place annotation expansion. `src/storage/verus_smoke.rs` grows
