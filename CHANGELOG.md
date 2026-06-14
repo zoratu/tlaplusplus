@@ -44,9 +44,13 @@ Of the remaining three:
   than pre-#84 (62K distinct in 15 min vs ~2K previously), but the
   state space is large enough that a 15-minute budget still doesn't
   finish.
-- **MCCheckpointCoordination** hits a config-parsing error
-  ("Init does not assign variables: LatestCheckpoint, ReplicatedLog")
-  — separate from perf, worth its own investigation.
+- **MCCheckpointCoordination** runs correctly when the MC wrapper
+  module is used (`MCCheckpointCoordination.tla`, not the base
+  `CheckpointCoordination.tla`). At 5 minutes / 64 workers it has
+  explored 7M distinct states with the queue still growing —
+  exploration-bound rather than algorithmic-stall. The cfg comment
+  ("Finishes in around one minute") suggests TLC's symmetry reduction
+  is more effective on this spec than ours; worth a separate look.
 - **MCKVSSafety Medium/Large** remain "bounded": they still don't
   fully enumerate at 600s, but throughput on them more than tripled
   (1.4M distinct/min Medium, 2.4M distinct/min Large).
