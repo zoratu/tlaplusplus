@@ -2,7 +2,7 @@
 
 A Rust implementation of TLA+ model checking with TLC feature parity, achieving **10.7x faster** state exploration than Java TLC on many-core systems. 182/182 (100%) of the [tlaplus/Examples](https://github.com/tlaplus/Examples) corpus passes analysis; **174/182 (95.6%)** also pass full model checking at 60s.
 
-**v1.2.8 (2026-06-13)** ships with:
+**v1.2.9 (2026-06-14)** ships with:
 - 1,232 default tests + 1,254 with failpoints + 1,259 with symbolic-init, 0 failures
 - Differential CI gate vs TLC (13/13 specs match exactly)
 - Compiled-vs-interpreted proptest equivalence (clean across 9 seeds at 2048 cases)
@@ -50,12 +50,22 @@ MCKVSSafetyMedium for 600s:
 | Post-#89 (current main) | **31,482,090** | **1,654,245** | **56,655,212** |
 | Δ | **+6.5×** | **+3.4×** | **+11.7×** |
 
-Two previously-timing-out specs now solve in seconds:
+Eight previously-timing-out specs from `tlaplus/Examples` now solve
+within minutes (corpus re-sweep 2026-06-14, c6g.metal 64w):
 
-| Spec | Pre-#87 | Post-#88 |
-|------|---------|----------|
-| MCBinarySearch full-MC (Init+BFS+liveness) | stuck at 6,430 distinct ∞ | **1 second** (27,953 distinct) |
-| CoffeeCan-1000 full-MC | crashed: "record set too large" | **9 seconds** (501,500 distinct) |
+| Spec | Was | Now |
+|------|-----|------|
+| MCBinarySearch (Init+BFS+liveness) | stuck at 6,430 distinct ∞ | **1 s** (27,953 distinct) |
+| CoffeeCan-100 | timeout | **16 s** |
+| CoffeeCan-1000 | crashed: "record set too large" | **9 s** (501,500 distinct) |
+| CoffeeCan-3000 | crashed → timeout | **1 min 23 s** (4,504,500 distinct) |
+| btree | timeout @ 331K distinct | **33 s** (finds fairness violation) |
+| Elevator-SafetyMedium | timeout | **1 s** (finds 2 invariant violations) |
+| Elevator-SafetyLarge | timeout | **6 s** (390,625 distinct, finds 2 violations) |
+| Einstein | timeout (199M Init cross-product) | **1 s** under `--features symbolic-init` |
+
+Note: the "violations found" rows are correct model-checker output, not
+runtime bugs.
 
 ### TLC Comparison (8 workers, tlaplus/Examples corpus)
 

@@ -1,5 +1,75 @@
 # Changelog
 
+## v1.2.9 (2026-06-14)
+
+Tail-end perf cleanups (PRs #91, #92) and a corpus re-sweep that closes
+**8 of the original 11 timeout specs** on `tlaplus/Examples`.
+
+- **PR #91**: skip a redundant `unchanged_vars` re-insert loop in the
+  successor-state constructor. Every Unchanged-clause handler already
+  populates `branch.staged` with the unchanged value via
+  `entry(var).or_insert_with(|| current_value.clone())`, so the
+  subsequent staged-iteration loop already covers the same key with the
+  same value. +2% distinct@600s on MCKVSSafetyMedium; mostly a cleanup.
+- **PR #92**: drop `format!` from the operator/action compile-cache
+  lookup hot path. Both `THREAD_LOCAL_OPERATOR_CACHE` (compiled_eval)
+  and `THREAD_LOCAL_ACTION_CACHE` (action_exec) keyed each lookup on
+  `format!("{}:{}", name, body)` — a per-hit heap allocation. The cache
+  value is determined by body alone (name was a debug label), so we now
+  look up by `&str` and skip the allocation. Both caches also switch
+  `std::HashMap` → `ahash::AHashMap` (SIP's HashDoS resistance is
+  unnecessary overhead for thread-local non-adversarial keys; the
+  pre-warmed `DashMap` already defaults to ahash). Perf-neutral on
+  this measurement, contained cleanup.
+
+### Corpus unlocks on current main (cumulative over PRs #84 — #92)
+
+Re-sweep on c6g.metal ap-south-1, 64 workers, against the original
+"11 timeout specs" list:
+
+| Spec                      | Was             | Now |
+|---------------------------|-----------------|------|
+| MCBinarySearch            | ∞ stuck         | **1 s**  (27,953 distinct, fairness verified) |
+| CoffeeCan-100             | timeout         | **16 s** (5,150 distinct) |
+| CoffeeCan-1000            | record-set cap crash | **9 s** (501,500 distinct) |
+| CoffeeCan-3000            | crash → timeout | **1 min 23 s** (4,504,500 distinct) |
+| btree                     | timeout @ 331K  | **33 s** — finds fairness violation in an 11,340-state SCC |
+| Elevator-SafetyMedium     | timeout         | **1 s** — finds 2 invariant violations |
+| Elevator-SafetyLarge      | timeout         | **6 s** (390,625 distinct) — finds 2 violations |
+| Einstein                  | timeout (199M cross-product) | **1 s** under `--features symbolic-init` |
+| MCKVSSafety Medium/Large | bounded         | **31.5M / 22.6M distinct @ 600s** (+6.5× / +2.5× since pre-#84) |
+
+Of the remaining three:
+- **c1cs** is genuinely exploration-bound — throughput is ~30× higher
+  than pre-#84 (62K distinct in 15 min vs ~2K previously), but the
+  state space is large enough that a 15-minute budget still doesn't
+  finish.
+- **MCCheckpointCoordination** hits a config-parsing error
+  ("Init does not assign variables: LatestCheckpoint, ReplicatedLog")
+  — separate from perf, worth its own investigation.
+- **MCKVSSafety Medium/Large** remain "bounded": they still don't
+  fully enumerate at 600s, but throughput on them more than tripled
+  (1.4M distinct/min Medium, 2.4M distinct/min Large).
+
+The four newly-found violations on Elevator + btree are model checker
+output (the runtime does its job), not runtime bugs; whether they
+indicate real spec issues is a separate question for the spec authors.
+
+### Cargo features
+
+`--features symbolic-init` builds need
+`BINDGEN_EXTRA_CLANG_ARGS="-I/usr/include/z3"` on Amazon Linux 2023
+where the `z3-devel` package installs headers under `/usr/include/z3/`
+instead of `/usr/include/`. This is an env-var-only workaround; no
+Cargo/build changes required.
+
+| Gate | Result |
+|---|---|
+| `cargo test --release` | 1,232 pass / 0 fail / 10 ignored |
+| `scripts/diff_tlc.sh` | 13 / 13 specs match TLC v2.19 |
+
+Drop-in for v1.2.8. No public-API or CLI changes.
+
 ## v1.2.8 (2026-06-13)
 
 Eval-path performance batch. Six merged PRs (#84 — #89) compound through
