@@ -88,51 +88,118 @@ where
     state.clone()
 }
 
-/// Specialized canonicalization for TlaState that directly manipulates the structure
+/// Specialized canonicalization for TlaState that directly manipulates the structure.
+///
+/// Enumerates all permutations of each symmetric group (subject to
+/// `MAX_GROUP_SIZE_FOR_FULL_ENUM`), applies every combination to the
+/// state, and returns the lexicographically smallest candidate. Two
+/// states in the same symmetry orbit therefore collapse to the same
+/// canonical form, which is the contract the fingerprint store relies on.
+///
+/// The previous implementation just sorted the values that *appeared*
+/// in the state and mapped them to the alphabetically-first labels.
+/// That degenerates to identity whenever all symmetric values appear
+/// (the common case for late-exploration states), producing no
+/// reduction — which is why MCCheckpointCoord (3-element Node group)
+/// previously explored ~6× more states than TLC.
 pub fn canonicalize_tla_state(state: &TlaState, symmetry: &SymmetrySpec) -> TlaState {
     let groups = match &symmetry.symmetry_groups {
         Some(g) if !g.is_empty() => g,
         _ => return state.clone(),
     };
 
-    // First, find all symmetric values that appear in the state
-    let mut found_values: Vec<HashSet<String>> = groups.iter().map(|_| HashSet::new()).collect();
-    collect_model_values_in_state(state, groups, &mut found_values);
+    // Safety valve: enumerating N! permutations gets expensive fast.
+    // 5! = 120 is tolerable; 6! = 720 starts to bite; 7! = 5040 is too
+    // much per-state work. Groups bigger than the cap fall back to
+    // identity (no reduction), preserving correctness but losing the
+    // win for those groups specifically. Any real TLA+ spec we've seen
+    // uses 2–4 element symmetric groups.
+    const MAX_GROUP_SIZE_FOR_FULL_ENUM: usize = 5;
 
-    // For each group, compute the canonical permutation based on found values
-    let mut full_permutation: HashMap<String, String> = HashMap::new();
-    #[allow(unused_variables)]
-    for (group_idx, (group, found)) in groups.iter().zip(found_values.iter()).enumerate() {
-        if found.is_empty() {
-            continue;
-        }
+    // For each group, pre-compute the sorted canonical order and the
+    // set of value-permutations we'll try. A permutation here is a Vec
+    // matching `sorted_canonical` positionally — element i of `perm`
+    // is the value that should map *to* `sorted_canonical[i]`.
+    let group_data: Vec<(Vec<String>, Vec<Vec<String>>)> = groups
+        .iter()
+        .map(|g| {
+            let mut sorted: Vec<String> = g.iter().cloned().collect();
+            sorted.sort();
+            let perms = if sorted.len() <= MAX_GROUP_SIZE_FOR_FULL_ENUM {
+                all_permutations(&sorted)
+            } else {
+                vec![sorted.clone()]
+            };
+            (sorted, perms)
+        })
+        .collect();
 
-        let found_vec: Vec<String> = found.iter().cloned().collect();
-        let group_permutation = compute_canonical_permutation(&found_vec, group);
+    // Iterate over the cross-product of per-group permutations as a
+    // mixed-radix counter. For each combination, build the combined
+    // value-remapping HashMap, apply to state, and track the lex-min.
+    let mut best: Option<TlaState> = None;
+    let mut indices = vec![0usize; group_data.len()];
 
-        // Debug: print first permutation (only in debug builds)
-        #[cfg(debug_assertions)]
-        {
-            static DEBUG_PERM: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if !DEBUG_PERM.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                eprintln!("DEBUG group {}: found values {:?}", group_idx, found);
-                eprintln!(
-                    "DEBUG group {}: permutation {:?}",
-                    group_idx, group_permutation
-                );
+    'outer: loop {
+        let mut perm_map: HashMap<String, String> = HashMap::new();
+        for (group_idx, perm_idx) in indices.iter().enumerate() {
+            let (sorted_canonical, perms) = &group_data[group_idx];
+            let permuted = &perms[*perm_idx];
+            // `permuted[i]` is the source value that should become
+            // `sorted_canonical[i]`. The HashMap is source -> canonical.
+            for (i, canonical_label) in sorted_canonical.iter().enumerate() {
+                perm_map.insert(permuted[i].clone(), canonical_label.clone());
             }
         }
 
-        full_permutation.extend(group_permutation);
+        let candidate = if perm_map.iter().all(|(k, v)| k == v) {
+            state.clone()
+        } else {
+            apply_permutation_to_state(state, &perm_map)
+        };
+
+        match &best {
+            None => best = Some(candidate),
+            Some(b) if &candidate < b => best = Some(candidate),
+            _ => {}
+        }
+
+        // Increment indices (mixed-radix); stop when we overflow.
+        let mut i = 0;
+        loop {
+            if i >= indices.len() {
+                break 'outer;
+            }
+            indices[i] += 1;
+            if indices[i] < group_data[i].1.len() {
+                break;
+            }
+            indices[i] = 0;
+            i += 1;
+        }
     }
 
-    if full_permutation.is_empty() || full_permutation.iter().all(|(k, v)| k == v) {
-        return state.clone();
-    }
+    best.unwrap_or_else(|| state.clone())
+}
 
-    // Apply the permutation to the state
-    apply_permutation_to_state(state, &full_permutation)
+/// All permutations of a slice. O(n!) — caller bounds n.
+fn all_permutations(items: &[String]) -> Vec<Vec<String>> {
+    let mut current = items.to_vec();
+    let mut result = Vec::new();
+    permute_helper(&mut current, 0, &mut result);
+    result
+}
+
+fn permute_helper(arr: &mut Vec<String>, start: usize, result: &mut Vec<Vec<String>>) {
+    if start >= arr.len() {
+        result.push(arr.clone());
+        return;
+    }
+    for i in start..arr.len() {
+        arr.swap(start, i);
+        permute_helper(arr, start + 1, result);
+        arr.swap(start, i);
+    }
 }
 
 /// Recursively collect all ModelValue strings that appear in a state
@@ -350,6 +417,79 @@ mod tests {
         assert!(perm.contains_key("a"));
         assert!(perm.contains_key("b"));
         assert!(perm.contains_key("c"));
+    }
+
+    /// Regression test: states in the same symmetry orbit must produce
+    /// the same canonical form. Before the lex-min-over-permutations
+    /// fix, the previous algorithm degenerated to identity whenever
+    /// all symmetric values appeared, so {x→n2, y→n1} and {x→n1, y→n2}
+    /// were kept as separate states.
+    #[test]
+    fn canonicalize_collapses_orbit_when_all_symmetric_values_appear() {
+        use std::sync::Arc;
+        let mut spec = SymmetrySpec::new("NodeSymmetric".to_string());
+        spec.initialize_with_groups(vec![
+            ["n1", "n2"].iter().map(|s| s.to_string()).collect(),
+        ]);
+
+        let state_a: TlaState = [
+            (Arc::<str>::from("x"), TlaValue::ModelValue("n1".to_string())),
+            (Arc::<str>::from("y"), TlaValue::ModelValue("n2".to_string())),
+        ]
+        .into_iter()
+        .collect();
+        let state_b: TlaState = [
+            (Arc::<str>::from("x"), TlaValue::ModelValue("n2".to_string())),
+            (Arc::<str>::from("y"), TlaValue::ModelValue("n1".to_string())),
+        ]
+        .into_iter()
+        .collect();
+
+        let canon_a = canonicalize_tla_state(&state_a, &spec);
+        let canon_b = canonicalize_tla_state(&state_b, &spec);
+        assert_eq!(
+            canon_a, canon_b,
+            "states in the same orbit must have identical canonical forms"
+        );
+        // The lex-min representative is the one with x=n1, y=n2
+        // (because x sorts before y; n1 < n2).
+        assert_eq!(canon_a, state_a);
+    }
+
+    /// 3-element symmetry group (matches MCCheckpointCoord's Node = {n1,n2,n3}).
+    /// All 6 permutations should collapse states in the same orbit.
+    #[test]
+    fn canonicalize_collapses_three_element_orbit() {
+        use std::sync::Arc;
+        let mut spec = SymmetrySpec::new("NodeSym".to_string());
+        spec.initialize_with_groups(vec![
+            ["n1", "n2", "n3"].iter().map(|s| s.to_string()).collect(),
+        ]);
+
+        let make_state = |a: &str, b: &str, c: &str| -> TlaState {
+            [
+                (Arc::<str>::from("a"), TlaValue::ModelValue(a.to_string())),
+                (Arc::<str>::from("b"), TlaValue::ModelValue(b.to_string())),
+                (Arc::<str>::from("c"), TlaValue::ModelValue(c.to_string())),
+            ]
+            .into_iter()
+            .collect()
+        };
+
+        // All 6 permutations of (n1, n2, n3) across the 3 distinct variables.
+        let orbit = [
+            make_state("n1", "n2", "n3"),
+            make_state("n1", "n3", "n2"),
+            make_state("n2", "n1", "n3"),
+            make_state("n2", "n3", "n1"),
+            make_state("n3", "n1", "n2"),
+            make_state("n3", "n2", "n1"),
+        ];
+
+        let canons: Vec<_> = orbit.iter().map(|s| canonicalize_tla_state(s, &spec)).collect();
+        for c in &canons[1..] {
+            assert_eq!(&canons[0], c, "all 6 orbit members must canonicalize identically");
+        }
     }
 
     #[test]
