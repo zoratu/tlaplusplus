@@ -302,6 +302,28 @@ impl<T: 'static> WorkStealingQueues<T> {
         count
     }
 
+    /// Increment local_popped and periodically flush to global_popped.
+    ///
+    /// Mirrors the local_pushed flush pattern. Without periodic flushes,
+    /// `global_popped` stays at zero until the worker exits (via
+    /// `flush_worker_counters`), which makes `pending_count() =
+    /// global_pushed - global_popped` over-report queue depth during the
+    /// run. `has_pending_work()` is unaffected because it checks the
+    /// real deque/injector state, but the progress meter (and any
+    /// caller of `pending_count()` for live telemetry) saw a stale
+    /// queue-depth number — looking like the runtime was hung when it
+    /// was actually still draining the real queue. Symmetric flush
+    /// here keeps reported queue depth in sync with reality.
+    #[inline]
+    fn bump_local_popped(&self, worker_state: &mut WorkerState<T>) {
+        worker_state.local_popped += 1;
+        if worker_state.local_popped >= worker_state.flush_threshold {
+            self.global_popped
+                .fetch_add(worker_state.local_popped, Ordering::Relaxed);
+            worker_state.local_popped = 0;
+        }
+    }
+
     /// Pop work for a specific worker
     /// Uses optimized termination detection without per-state atomic updates
     pub fn pop_for_worker(&self, worker_state: &mut WorkerState<T>) -> Option<T> {
@@ -311,7 +333,7 @@ impl<T: 'static> WorkStealingQueues<T> {
 
         // Fast path: pop from local queue (completely contention-free)
         if let Some(item) = worker_state.worker.pop() {
-            worker_state.local_popped += 1;
+            self.bump_local_popped(worker_state);
             // Mark that exploration has started (prevents premature termination)
             self.has_started.store(true, Ordering::Release);
             return Some(item);
@@ -355,7 +377,7 @@ impl<T: 'static> WorkStealingQueues<T> {
             if my_numa < self.numa_injectors.len() {
                 match self.numa_injectors[my_numa].steal() {
                     Steal::Success(item) => {
-                        worker_state.local_popped += 1;
+                        self.bump_local_popped(worker_state);
                         return Some(item);
                     }
                     Steal::Retry => {
@@ -374,7 +396,7 @@ impl<T: 'static> WorkStealingQueues<T> {
             // 2. Try global queue (for initial states)
             match self.global.steal() {
                 Steal::Success(item) => {
-                    worker_state.local_popped += 1;
+                    self.bump_local_popped(worker_state);
                     return Some(item);
                 }
                 Steal::Retry => {
@@ -404,7 +426,7 @@ impl<T: 'static> WorkStealingQueues<T> {
 
             // Check local queue again
             if let Some(item) = worker_state.worker.pop() {
-                worker_state.local_popped += 1;
+                self.bump_local_popped(worker_state);
                 return Some(item);
             }
 
@@ -461,7 +483,7 @@ impl<T: 'static> WorkStealingQueues<T> {
                 // Try batch steal - steal half the items into our local queue
                 match self.stealers[target].steal_batch_and_pop(&worker_state.worker) {
                     Steal::Success(item) => {
-                        worker_state.local_popped += 1;
+                        self.bump_local_popped(worker_state);
                         return Some(item);
                     }
                     Steal::Empty => continue,
@@ -484,7 +506,7 @@ impl<T: 'static> WorkStealingQueues<T> {
 
             match injector.steal() {
                 Steal::Success(item) => {
-                    worker_state.local_popped += 1;
+                    self.bump_local_popped(worker_state);
                     return Some(item);
                 }
                 Steal::Empty => continue,
@@ -518,7 +540,7 @@ impl<T: 'static> WorkStealingQueues<T> {
                 // For remote NUMA, also use batch stealing
                 match self.stealers[target].steal_batch_and_pop(&worker_state.worker) {
                     Steal::Success(item) => {
-                        worker_state.local_popped += 1;
+                        self.bump_local_popped(worker_state);
                         return Some(item);
                     }
                     Steal::Empty => continue,
