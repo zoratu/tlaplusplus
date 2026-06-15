@@ -1,5 +1,71 @@
 # Changelog
 
+## v1.2.10 (2026-06-15)
+
+Symmetry-reduction correctness fix that unlocks **MCKVSSafetyMedium
+full-MC completion**.
+
+### The bug
+
+`canonicalize_tla_state` in `src/symmetry.rs` claimed to compute the
+lexicographically smallest permutation of symmetric values, but the
+implementation sorted the values that *appeared* in the state and
+mapped them to the alphabetically-first labels of the symmetric group.
+For any state that uses all symmetric values (the common case for
+mid-to-late exploration), this degenerates to the identity permutation
+— no reduction in practice, regardless of the `SYMMETRY` clause.
+
+### The fix (PR #95)
+
+Enumerate all permutations of each symmetric group (capped at 5! = 120
+per group), apply every combination to the state, and return the
+lex-min candidate. Two states in the same symmetry orbit therefore
+collapse to the same canonical form, which is the contract the
+fingerprint store relies on.
+
+### Measured impact (c6g.metal ap-south-1, 64 workers)
+
+| Spec | Before | After |
+|---|---|---|
+| MCKVSSafetyMedium 600s | 32,109,138 distinct, queue growing | **COMPLETES** at 17,210,068 distinct (≈ the 2× orbit size of TxIdSymmetric) |
+| MCCheckpointCoord 5min | 7,053,401 distinct, queue growing | 3,391,543 distinct, queue growing (~2.08×) |
+
+MCKVSSafetyMedium full-MC was previously the most prominent
+"exploration-bound at 600s" spec on the corpus; with correct symmetry
+it completes within the budget. **9 of the original 11 timeout
+specs now resolved.**
+
+MCCheckpointCoord's reduction is ~2× rather than the nominal 6×
+(3-element NodeSymmetry) because not every state variable carries
+symmetric values — expected behavior, not a bug.
+
+### Gauntlet
+
+| Gate | Result |
+|---|---|
+| `cargo test --release` | 1,234 pass / 0 fail / 10 ignored (+2 new symmetry tests) |
+| `cargo test --release --features failpoints` | 1,256 pass / 0 fail / 10 ignored |
+| `cargo test --release --features symbolic-init` | 1,261 pass / 0 fail / 10 ignored |
+| `scripts/diff_tlc.sh` | 13 / 13 specs match TLC v2.19 |
+
+Two new unit tests pin the orbit-collapse contract for 2- and
+3-element symmetric groups.
+
+### Cost
+
+Per-state canonicalize cost goes from O(N) to O(N! × N) where N is the
+symmetry-group size. With the 5-element cap, worst case is 120
+candidates per state. For typical TLA+ specs (2–4 element symmetric
+groups) it's 2–24 candidates. The state-count reduction recovers
+this overhead for any spec where symmetry actually reduces the orbit.
+
+Drop-in for v1.2.9. The semantics change for specs with SYMMETRY:
+fingerprints for symmetric-state pairs now collapse correctly, which
+means state counts on those specs will be lower (correct) than
+before. Spec checkpoints from v1.2.9 and earlier should not be
+resumed under v1.2.10 because the fingerprint shape for symmetric
+states differs.
+
 ## v1.2.9 (2026-06-14)
 
 Tail-end perf cleanups (PRs #91, #92) and a corpus re-sweep that closes
