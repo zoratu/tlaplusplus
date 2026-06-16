@@ -138,6 +138,7 @@ mod tests {
             max_inmem_items: 1_000,
             max_inmem_bytes: 0,
             est_bytes_per_item_seed: 256,
+            rss_spill_bytes: 0,
             spill_dir: dir,
             spill_batch: 100,
             load_existing: false,

@@ -71,6 +71,9 @@ pub struct EngineConfig {
     /// either the item-count or byte budget is crossed. See
     /// `SpillableConfig::max_inmem_bytes`.
     pub queue_max_inmem_bytes: u64,
+    /// Spill when process RSS exceeds this percentage of total RAM (0 = off).
+    /// Ground-truth memory trigger; see `SpillableConfig::rss_spill_bytes`.
+    pub queue_memory_ceiling_pct: u8,
     /// Enable in-memory zstd compression of overflow segments (T8). Sits
     /// between the hot work-stealing queue and the disk-backed overflow:
     /// instead of writing every overflow batch directly to disk, batches
@@ -241,6 +244,7 @@ impl Default for EngineConfig {
             enable_queue_spilling: true,
             queue_max_inmem_items: 50_000_000, // 50M items before spilling
             queue_max_inmem_bytes: 0,          // byte trigger off by default
+            queue_memory_ceiling_pct: 0,       // RSS trigger off by default
             queue_compression: true,
             queue_compression_max_bytes: 256 * 1024 * 1024,
             queue_compression_level: 1,
@@ -912,6 +916,14 @@ where
             0
         },
         est_bytes_per_item_seed: (config.estimated_state_bytes as u64).max(1),
+        // RSS ceiling: percentage of total RAM → bytes. Off (0) unless the
+        // user opts in and spilling is enabled.
+        rss_spill_bytes: if config.enable_queue_spilling && config.queue_memory_ceiling_pct > 0 {
+            let total = crate::system::get_memory_stats().total_bytes;
+            total.saturating_mul(config.queue_memory_ceiling_pct as u64) / 100
+        } else {
+            0
+        },
         spill_dir: config.work_dir.join("queue-spill"),
         spill_batch: config.queue_spill_batch,
         load_existing: config.resume_from_checkpoint,
