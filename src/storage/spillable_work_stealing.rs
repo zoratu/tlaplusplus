@@ -31,6 +31,27 @@ use std::thread::JoinHandle;
 /// it only runs when the byte-based spill trigger is active.
 const BYTE_SAMPLE_INTERVAL: u64 = 4096;
 
+/// Refresh the cached RSS every N `should_spill_now` calls. `should_spill_now`
+/// is called once per push batch (~hundreds to low-thousands per second), so
+/// at 256 this reads `/proc/self/status` only a few times per second — cheap,
+/// while still reacting to memory growth within a few thousand items.
+const RSS_SAMPLE_INTERVAL: u64 = 256;
+
+/// Return freed heap pages to the OS so process RSS reflects items that were
+/// spilled out of the hot queue and dropped. glibc's allocator otherwise
+/// retains freed pages on its free lists, which would pin RSS at its peak and
+/// keep the RSS spill trigger permanently engaged. Linux/glibc only; a no-op
+/// elsewhere (musl's allocator manages its own trimming). Called sparingly
+/// from the spill coordinator — `malloc_trim` walks the free lists, so it is
+/// not free.
+#[inline]
+fn trim_heap() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 /// Configuration for spillable work-stealing queues
 #[derive(Clone, Debug)]
 pub struct SpillableConfig {
@@ -54,6 +75,17 @@ pub struct SpillableConfig {
     /// the `--estimated-state-bytes` CLI flag (default 256). Ignored when
     /// `max_inmem_bytes == 0`.
     pub est_bytes_per_item_seed: u64,
+    /// RSS ceiling in bytes (0 = RSS trigger disabled). When > 0, the queue
+    /// also spills whenever the *actual* process resident-set size crosses
+    /// this ceiling — ground truth, unlike the `max_inmem_bytes` serialized
+    /// estimate which under-counts real heap (nested BTreeMap/Arc/HashedArc
+    /// + allocator overhead). Under RSS pressure the loader also caps the
+    /// hot queue low (keeps workers fed without refilling to the full
+    /// high-water mark), and the coordinator periodically `malloc_trim`s so
+    /// RSS reflects spilled-and-freed memory. Together this bounds the
+    /// process footprint instead of OOM-killing on specs whose in-memory
+    /// queue would otherwise outgrow RAM.
+    pub rss_spill_bytes: u64,
     /// Directory for spill files
     pub spill_dir: PathBuf,
     /// Batch size for spilling (items per segment file)
@@ -90,6 +122,7 @@ impl Default for SpillableConfig {
             max_inmem_items: 10_000_000, // 10M items before spilling
             max_inmem_bytes: 0,          // byte-based trigger off by default
             est_bytes_per_item_seed: 256,
+            rss_spill_bytes: 0, // RSS trigger off by default
             spill_dir: PathBuf::from("./.tlapp/queue"),
             spill_batch: 50_000,
             load_existing: false,
@@ -221,6 +254,19 @@ pub struct SpillableWorkStealingQueues<T> {
     /// `1` in every `BYTE_SAMPLE_INTERVAL` items. Only touched when
     /// `max_inmem_bytes > 0`.
     byte_sample_counter: AtomicU64,
+
+    /// RSS ceiling in bytes (0 = RSS trigger off). See
+    /// `SpillableConfig::rss_spill_bytes`.
+    rss_spill_bytes: u64,
+
+    /// Last sampled process RSS, refreshed every `RSS_SAMPLE_INTERVAL`
+    /// `should_spill_now` calls. Reading `/proc/self/status` on every push
+    /// batch (thousands/sec) would be too costly, so the spill decision uses
+    /// this cached value. Only refreshed when `rss_spill_bytes > 0`.
+    cached_rss: AtomicU64,
+
+    /// Rate-limit counter for `cached_rss` refreshes.
+    rss_sample_counter: AtomicU64,
 
     /// Background spill coordinator thread handle
     coordinator_handle: Option<JoinHandle<()>>,
@@ -381,6 +427,7 @@ where
         let loader_draining = Arc::clone(&checkpoint_draining);
         let loader_ring = compressed_ring.as_ref().map(Arc::clone);
         let loader_inflight = Arc::clone(&inflight_spilled);
+        let loader_rss_spill = config.rss_spill_bytes;
         let loader_handle = std::thread::Builder::new()
             .name("tlapp-queue-loader".to_string())
             .spawn(move || {
@@ -391,6 +438,7 @@ where
                     loader_stop,
                     loader_draining,
                     loader_inflight,
+                    loader_rss_spill,
                 );
             })?;
 
@@ -401,6 +449,9 @@ where
             max_inmem_bytes: config.max_inmem_bytes,
             bytes_per_item: AtomicU64::new(config.est_bytes_per_item_seed.max(1)),
             byte_sample_counter: AtomicU64::new(0),
+            rss_spill_bytes: config.rss_spill_bytes,
+            cached_rss: AtomicU64::new(0),
+            rss_sample_counter: AtomicU64::new(0),
             coordinator_handle: Some(coordinator_handle),
             loader_handle: Some(loader_handle),
             stop_signal,
@@ -475,6 +526,21 @@ where
         let mut idle_post_stop_iters = 0u32;
         const MAX_IDLE_POST_STOP_ITERS: u32 = 200; // ~2s at 10ms timeout
 
+        // Periodically return freed heap to the OS so RSS tracks spilled
+        // memory (see `trim_heap`). Every 64 flushes keeps the amortized
+        // `malloc_trim` cost negligible while keeping RSS responsive.
+        let mut flushes_since_trim: u32 = 0;
+        const TRIM_EVERY_FLUSHES: u32 = 64;
+        let mut maybe_trim = |did_flush: bool| {
+            if did_flush {
+                flushes_since_trim += 1;
+                if flushes_since_trim >= TRIM_EVERY_FLUSHES {
+                    flushes_since_trim = 0;
+                    trim_heap();
+                }
+            }
+        };
+
         loop {
             let stopped = stop.load(Ordering::Acquire);
 
@@ -527,6 +593,7 @@ where
                             &inflight_spilled,
                             &lost_permanently,
                         );
+                        maybe_trim(true);
                     }
                 }
                 CoordTick::Disconnect(recv_idx) => {
@@ -536,12 +603,14 @@ where
                     active_receivers.swap_remove(recv_idx);
                 }
                 CoordTick::Timeout => {
+                    let had_items = !accumulator.is_empty();
                     flush_accumulator(
                         &mut accumulator,
                         &compressed_ring,
                         &inflight_spilled,
                         &lost_permanently,
                     );
+                    maybe_trim(had_items);
                     if stopped {
                         if inflight_spilled.load(Ordering::Acquire) == 0 {
                             break;
@@ -667,14 +736,32 @@ where
         stop: Arc<AtomicBool>,
         checkpoint_draining: Arc<AtomicBool>,
         inflight_spilled: Arc<AtomicU64>,
+        rss_spill_bytes: u64,
     ) {
         // Threshold: start loading when queue drops below this
         // Must be high enough to keep 64+ workers busy while loading more
         const LOW_WATER_MARK: u64 = 500_000;
         // Stop loading when queue reaches this level (avoid OOM)
         const HIGH_WATER_MARK: u64 = 10_000_000;
+        // Under RSS pressure, cap the hot queue much lower so the bulk of
+        // pending state stays on disk. 1M items keeps 64+ workers fed while
+        // bounding the in-memory queue's heap footprint. Paired with the
+        // RSS spill trigger in `should_spill_now`.
+        const RSS_PRESSURE_HIGH_WATER: u64 = 1_000_000;
+        // Resume normal (full) loading once RSS falls back below this lower
+        // hysteresis bound (90% of the ceiling), preventing flapping at the
+        // boundary.
+        let rss_resume_below = rss_spill_bytes.saturating_mul(9) / 10;
         // Load larger batches for efficiency
         const LOAD_BATCH_SIZE: usize = 100_000;
+
+        // RSS-pressure mode (hysteresis): enter when RSS crosses the ceiling,
+        // exit when it falls back below `rss_resume_below`. While engaged, the
+        // loader caps the hot queue at RSS_PRESSURE_HIGH_WATER instead of the
+        // normal HIGH_WATER_MARK. Single-threaded loop state, so a plain bool
+        // is fine.
+        let rss_enabled = rss_spill_bytes > 0;
+        let mut rss_pressure = false;
 
         while !stop.load(Ordering::Acquire) {
             if stop.load(Ordering::Acquire) {
@@ -686,6 +773,21 @@ where
                 std::thread::sleep(std::time::Duration::from_millis(10));
                 continue;
             }
+
+            // Update RSS-pressure mode with hysteresis.
+            if rss_enabled {
+                let rss = crate::system::get_memory_stats().rss_bytes;
+                if rss >= rss_spill_bytes {
+                    rss_pressure = true;
+                } else if rss < rss_resume_below {
+                    rss_pressure = false;
+                }
+            }
+            let effective_high_water = if rss_pressure {
+                RSS_PRESSURE_HIGH_WATER
+            } else {
+                HIGH_WATER_MARK
+            };
 
             // Check if hot queues need refilling
             // CRITICAL: Use actual queue emptiness, not pending_count()!
@@ -721,12 +823,26 @@ where
             // AND covers items still in transit in the spill pipeline (T11.1).
             hot.set_disk_has_pending_work(has_work);
 
-            // Only pause loading if hot queues actually have enough items
-            // AND there's no work on disk. The pending_count() can be misleading
-            // after checkpoint drain, so we also check actual queue state.
-            if pending >= HIGH_WATER_MARK && !hot_queues_empty && !has_work {
-                // Queue is full enough and no disk work, pause to avoid OOM
-                std::thread::sleep(std::time::Duration::from_millis(50));
+            // Pause loading when the hot queue already holds enough items.
+            //
+            // Normal mode: pause only when full AND there's no disk work
+            // (nothing useful to do). pending_count() can be misleading after
+            // checkpoint drain, so we also require the queue to be non-empty.
+            //
+            // RSS-pressure mode: also pause once the hot queue reaches the
+            // (much lower) RSS_PRESSURE_HIGH_WATER — EVEN when disk work is
+            // available — so the bulk of pending state stays on disk and the
+            // in-memory footprint stays bounded. Never pause when the hot
+            // queue is empty, so workers don't starve while disk holds work.
+            let pause_normal = pending >= HIGH_WATER_MARK && !hot_queues_empty && !has_work;
+            let pause_for_rss =
+                rss_pressure && pending >= effective_high_water && !hot_queues_empty;
+            if pause_normal || pause_for_rss {
+                std::thread::sleep(std::time::Duration::from_millis(if rss_pressure {
+                    20
+                } else {
+                    50
+                }));
                 continue;
             }
 
@@ -861,7 +977,25 @@ where
                 return true;
             }
         }
+        if self.rss_spill_bytes > 0 && self.current_rss() >= self.rss_spill_bytes {
+            return true;
+        }
         false
+    }
+
+    /// Cached process RSS, refreshed once per `RSS_SAMPLE_INTERVAL` calls.
+    /// Returns the cached value between refreshes so the spill decision never
+    /// reads `/proc` on the hot path more than a few times per second.
+    #[inline]
+    fn current_rss(&self) -> u64 {
+        let n = self.rss_sample_counter.fetch_add(1, Ordering::Relaxed);
+        if n % RSS_SAMPLE_INTERVAL == 0 {
+            let rss = crate::system::get_memory_stats().rss_bytes;
+            self.cached_rss.store(rss, Ordering::Relaxed);
+            rss
+        } else {
+            self.cached_rss.load(Ordering::Relaxed)
+        }
     }
 
     /// Sample one item's serialized size into the bytes-per-item EWMA, but
@@ -2186,6 +2320,7 @@ mod tests {
             max_inmem_items: 1000,
             max_inmem_bytes: 0,
             est_bytes_per_item_seed: 256,
+            rss_spill_bytes: 0,
             spill_dir: dir.clone(),
             spill_batch: 100,
             load_existing: false,
@@ -2226,6 +2361,7 @@ mod tests {
             max_inmem_items: 50,
             max_inmem_bytes: 0,
             est_bytes_per_item_seed: 256,
+            rss_spill_bytes: 0,
             spill_dir: dir.clone(),
             spill_batch: 20,
             load_existing: false,
@@ -2300,6 +2436,7 @@ mod tests {
             // Seed large so the byte estimate crosses a small budget at a
             // low pending count, independent of the actual u64 item size.
             est_bytes_per_item_seed: 256,
+            rss_spill_bytes: 0,
             spill_dir: dir,
             spill_batch: 64,
             load_existing: false,
@@ -2351,6 +2488,64 @@ mod tests {
         Ok(())
     }
 
+    /// RSS-based spill trigger: with the count and byte caps effectively
+    /// disabled, an RSS ceiling of 1 byte (which any live process exceeds)
+    /// must force the spill path; an RSS ceiling of 0 (off) must not.
+    #[test]
+    fn test_rss_based_spill_trigger() -> Result<()> {
+        let base = |dir: PathBuf, rss_spill_bytes: u64| SpillableConfig {
+            max_inmem_items: 100_000_000, // count cap unreachable here
+            max_inmem_bytes: 0,           // byte trigger off
+            est_bytes_per_item_seed: 256,
+            rss_spill_bytes,
+            spill_dir: dir,
+            spill_batch: 64,
+            load_existing: false,
+            worker_spill_buffer_size: 64,
+            worker_channel_bound: 8,
+            defer_segment_deletion: false,
+            compression_enabled: true,
+            compression_max_bytes: 64 * 1024 * 1024,
+            compression_level: 1,
+        };
+        let push_all = |queues: &Arc<SpillableWorkStealingQueues<u64>>,
+                        workers: &mut [SpillableWorkerState<u64>]| {
+            for chunk_start in (0..4000u64).step_by(50) {
+                let batch: Vec<u64> = (chunk_start..chunk_start + 50).collect();
+                queues.push_local_batch(&mut workers[0], batch.into_iter());
+            }
+            queues.flush_worker_counters(&mut workers[0]);
+        };
+
+        // RSS ceiling 1 byte: real process RSS always exceeds it → must spill.
+        let dir_on = temp_path("spillable-rss-on");
+        let (q_on, mut w_on) =
+            SpillableWorkStealingQueues::<u64>::new(2, vec![0, 0], base(dir_on.clone(), 1))?;
+        push_all(&q_on, &mut w_on);
+        let on_spilled = q_on.stats().spilled_items;
+        assert!(
+            on_spilled > 0,
+            "RSS trigger (ceiling 1B) should have spilled, got spilled_items={}",
+            on_spilled
+        );
+
+        // RSS ceiling 0 (off): with count/byte also off, must NOT spill.
+        let dir_off = temp_path("spillable-rss-off");
+        let (q_off, mut w_off) =
+            SpillableWorkStealingQueues::<u64>::new(2, vec![0, 0], base(dir_off.clone(), 0))?;
+        push_all(&q_off, &mut w_off);
+        let off_spilled = q_off.stats().spilled_items;
+        assert_eq!(
+            off_spilled, 0,
+            "RSS trigger OFF (and count/byte off) must NOT spill, got spilled_items={}",
+            off_spilled
+        );
+
+        let _ = std::fs::remove_dir_all(dir_on);
+        let _ = std::fs::remove_dir_all(dir_off);
+        Ok(())
+    }
+
     #[test]
     fn test_concurrent_spill() -> Result<()> {
         use std::sync::atomic::AtomicUsize;
@@ -2360,6 +2555,7 @@ mod tests {
             max_inmem_items: 100,
             max_inmem_bytes: 0,
             est_bytes_per_item_seed: 256,
+            rss_spill_bytes: 0,
             spill_dir: dir.clone(),
             spill_batch: 50,
             load_existing: false,
@@ -2435,6 +2631,7 @@ mod tests {
             max_inmem_items: 1_000_000, // High limit so items stay in memory
             max_inmem_bytes: 0,
             est_bytes_per_item_seed: 256,
+            rss_spill_bytes: 0,
             spill_dir: dir.clone(),
             spill_batch: 1000,
             load_existing: false,
@@ -2531,6 +2728,7 @@ mod tests {
             max_inmem_items: 10_000_000,
             max_inmem_bytes: 0,
             est_bytes_per_item_seed: 256,
+            rss_spill_bytes: 0,
             spill_dir: dir.clone(),
             spill_batch: 10_000,
             load_existing: false,
@@ -2584,6 +2782,7 @@ mod tests {
             max_inmem_items: 100,
             max_inmem_bytes: 0,
             est_bytes_per_item_seed: 256,
+            rss_spill_bytes: 0,
             spill_dir: dir.clone(),
             spill_batch: 100,
             load_existing: false,
@@ -2697,6 +2896,7 @@ mod tests {
             max_inmem_items: 100,
             max_inmem_bytes: 0,
             est_bytes_per_item_seed: 256,
+            rss_spill_bytes: 0,
             spill_dir: dir.clone(),
             spill_batch: 100,
             load_existing: false,
@@ -2745,6 +2945,7 @@ mod tests {
             max_inmem_items: 100,
             max_inmem_bytes: 0,
             est_bytes_per_item_seed: 256,
+            rss_spill_bytes: 0,
             spill_dir: dir.clone(),
             spill_batch: 200,
             load_existing: false,
@@ -2809,6 +3010,7 @@ mod tests {
             max_inmem_items: 4,
             max_inmem_bytes: 0,
             est_bytes_per_item_seed: 256,
+            rss_spill_bytes: 0,
             spill_dir: dir.clone(),
             spill_batch: 100,
             load_existing: false,
@@ -3056,6 +3258,7 @@ mod t11_4_tests {
             max_inmem_items: 2,
             max_inmem_bytes: 0,
             est_bytes_per_item_seed: 256,
+            rss_spill_bytes: 0,
             spill_dir: dir2.clone(),
             spill_batch: 2,
             load_existing: false,
@@ -3144,6 +3347,7 @@ mod t11_4_tests {
             max_inmem_items: 2,
             max_inmem_bytes: 0,
             est_bytes_per_item_seed: 256,
+            rss_spill_bytes: 0,
             spill_dir: dir.clone(),
             spill_batch: 16,
             load_existing: false,

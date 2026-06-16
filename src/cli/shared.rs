@@ -74,6 +74,7 @@ pub(crate) fn build_engine_config(
         enable_queue_spilling: !storage.disable_queue_spilling,
         queue_max_inmem_items: storage.queue_max_inmem_items,
         queue_max_inmem_bytes: storage.queue_max_inmem_bytes,
+        queue_memory_ceiling_pct: storage.queue_memory_ceiling_pct,
         queue_compression: storage.queue_compression,
         queue_compression_max_bytes: storage.queue_compression_max_bytes,
         queue_compression_level: storage.queue_compression_level,
