@@ -2,51 +2,21 @@
 
 ## v1.2.11 (2026-06-16)
 
-Two related runtime fixes that surfaced when investigating an apparent
-hang on MCKVSSafetyLarge.
+Two related runtime fixes that surfaced when investigating an apparent hang on MCKVSSafetyLarge.
 
 ### PR #97 — flush local_popped at threshold
 
-`WorkStealingQueues` already flushed `local_pushed` to `global_pushed`
-every `flush_threshold` pushes, but the symmetric `local_popped`
-counter was only flushed when a worker exited. During a normal run
-`pending_count() = global_pushed - global_popped` over-reported queue
-depth — the progress meter showed "stabilizing" / no progress for
-specs that were actually still draining. Workers themselves were
-unaffected (termination uses `has_pending_work()` which reads real
-deque state). Fix: symmetric `bump_local_popped` helper applied at
-all 7 pop sites.
+`WorkStealingQueues` already flushed `local_pushed` to `global_pushed` every `flush_threshold` pushes, but the symmetric `local_popped` counter was only flushed when a worker exited. During a normal run `pending_count() = global_pushed - global_popped` over-reported queue depth — the progress meter showed "stabilizing" / no progress for specs that were actually still draining. Workers themselves were unaffected (termination uses `has_pending_work()` which reads real deque state). Fix: symmetric `bump_local_popped` helper applied at all 7 pop sites.
 
 ### PR #98 — auto-switch FP store self-deadlock + silent state drop
 
-With #97 making the queue depth visible, MCKVSSafetyLarge still
-didn't terminate within a 30-minute budget, with the log filling up
-with `auto_switch: batch try_read exceeded 10 attempts,
-switch_pending=true`.
+With #97 making the queue depth visible, MCKVSSafetyLarge still didn't terminate within a 30-minute budget, with the log filling up with `auto_switch: batch try_read exceeded 10 attempts, switch_pending=true`.
 
-Root cause:
-`AutoSwitchingFingerprintStore::contains_or_insert{,_batch}` called
-`maybe_trigger_switch()` **inside** the `match &*state` block — while
-still holding a read guard on `self.state`. `maybe_trigger_switch` →
-`switch_to_hybrid` → `self.state.write()` then self-deadlocks on
-parking-lot RwLock (calling thread holds a read guard on the same
-lock). Other workers' `try_read` keeps failing (writer queued), they
-bail out at attempt 21, but the original switching thread stays
-permanently stuck and `switch_pending` stays `true`.
+Root cause: `AutoSwitchingFingerprintStore::contains_or_insert{,_batch}` called `maybe_trigger_switch()` **inside** the `match &*state` block — while still holding a read guard on `self.state`. `maybe_trigger_switch` → `switch_to_hybrid` → `self.state.write()` then self-deadlocks on parking-lot RwLock (calling thread holds a read guard on the same lock). Other workers' `try_read` keeps failing (writer queued, no new readers admitted), they bail out at attempt 21, but the original switching thread stays permanently stuck and `switch_pending` stays `true`.
 
-**Important secondary discovery**: the bail-out path marks
-fingerprints as "seen" (duplicates) **without inserting them**. During
-the livelock window — which lasted indefinitely once it started —
-newly-found states were silently dropped from the FP store. The
-previously-reported "MCKVSSafetyLarge converged at 20,571,284
-distinct" was an undercount; with the deadlock fixed and bail-out no
-longer firing indefinitely, the same spec finds 24M+ distinct states
-(and is still climbing past the wall budget on this run — exposes a
-separate scaling issue worth its own fix where the bloom-store
-auto-switch doesn't fire before in-memory FP store OOMs).
+**Important secondary discovery**: the bail-out path marks fingerprints as "seen" (duplicates) **without inserting them**. During the livelock window — which lasted indefinitely once it started — newly-found states were silently dropped from the FP store. The previously-reported "MCKVSSafetyLarge converged at 20,571,284 distinct" was an undercount; with the deadlock fixed and bail-out no longer firing indefinitely, the same spec finds 24M+ distinct states (and is still climbing past the wall budget on this run — exposes a separate scaling issue worth its own fix where the bloom-store auto-switch doesn't fire before in-memory FP store OOMs).
 
-Fix: defer `maybe_trigger_switch` until after explicitly dropping
-the state read guard in both paths.
+Fix: defer `maybe_trigger_switch` until after explicitly dropping the state read guard in both paths.
 
 ### Gauntlet
 
@@ -57,17 +27,9 @@ the state read guard in both paths.
 
 ### Follow-up open
 
-`maybe_trigger_switch`'s memory-pressure detection currently fires
-only on a `check_interval`-based sampling cadence. On
-MCKVSSafetyLarge-scale specs with high state-generation rate the
-in-memory FP store outgrows 85% RAM faster than the next sampled
-check, so the bloom transition never fires and OOM-killer terminates
-the run. Tuning either `check_interval` or the memory-pressure
-trigger is the natural next step; not in this release.
+`maybe_trigger_switch`'s memory-pressure detection currently fires only on a `check_interval`-based sampling cadence. On MCKVSSafetyLarge-scale specs with high state-generation rate the in-memory FP store outgrows 85% RAM faster than the next sampled check, so the bloom transition never fires and OOM-killer terminates the run. Tuning either `check_interval` or the memory-pressure trigger is the natural next step; not in this release.
 
-Drop-in for v1.2.10. State-count reductions previously reported on
-MCKVSSafetyLarge under prior releases were likely undercounts due to
-the silent-drop bug above; re-running gives larger (correct) counts.
+Drop-in for v1.2.10. State-count reductions previously reported on MCKVSSafetyLarge under prior releases were likely undercounts due to the silent-drop bug above; re-running gives larger (correct) counts.
 
 ## v1.2.10 (2026-06-15)
 
