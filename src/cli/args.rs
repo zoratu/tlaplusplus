@@ -206,6 +206,16 @@ pub(crate) struct StorageArgs {
     /// Max items in memory before spilling to disk (when enable_queue_spilling is true)
     #[arg(long, default_value_t = 50_000_000)]
     pub(crate) queue_max_inmem_items: u64,
+    /// Max BYTES of in-memory pending state before spilling to disk
+    /// (supports units: 80GB, 10GiB, 512MB; 0 = byte-based trigger off).
+    /// When set, the queue spills if EITHER the item-count cap above OR this
+    /// byte budget is crossed — whichever fires first. This bounds memory on
+    /// specs with large states, where a pending count well under
+    /// --queue-max-inmem-items can still occupy tens of GB. The byte
+    /// footprint is estimated from a sampled serialized-size EWMA seeded by
+    /// --estimated-state-bytes.
+    #[arg(long, default_value_t = 0, value_parser = parse_byte_size)]
+    pub(crate) queue_max_inmem_bytes: u64,
     /// Enable in-memory zstd compression for overflow segments (T8).
     /// When on, batches that would otherwise spill to disk are first
     /// compressed and held in a bounded in-memory ring (default 256MB).

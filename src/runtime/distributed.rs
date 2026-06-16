@@ -136,6 +136,8 @@ mod tests {
         let dir = temp_spill_dir(prefix);
         let cfg = SpillableConfig {
             max_inmem_items: 1_000,
+            max_inmem_bytes: 0,
+            est_bytes_per_item_seed: 256,
             spill_dir: dir,
             spill_batch: 100,
             load_existing: false,
