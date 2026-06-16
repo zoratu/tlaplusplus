@@ -268,6 +268,17 @@ impl AutoSwitchingFingerprintStore {
         } else {
             self.state.read()
         };
+        // Determine result + whether we may need to trigger a switch.
+        // CRITICAL: `maybe_trigger_switch` MUST NOT be called while we hold
+        // the `state` read guard — it tries to acquire the SAME RwLock for
+        // writing (via `switch_to_hybrid` → `self.state.write()`), which
+        // self-deadlocks on parking-lot RwLock when the current thread
+        // already holds a read guard. Other workers then spin on try_read
+        // forever waiting for the switch that never completes. This
+        // manifested on MCKVSSafetyLarge as the runtime never terminating
+        // even with an empty queue (see #97 for the upstream visibility
+        // fix that exposed this latent bug).
+        let mut new_insert_into_exact = false;
         let result = match &*state {
             StoreState::Exact { store } => {
                 let existed = store.contains_or_insert(fp);
@@ -276,7 +287,7 @@ impl AutoSwitchingFingerprintStore {
                     self.stats.exact_hits.fetch_add(1, Ordering::Relaxed);
                 } else {
                     self.stats.inserts.fetch_add(1, Ordering::Relaxed);
-                    self.maybe_trigger_switch();
+                    new_insert_into_exact = true;
                 }
                 existed
             }
@@ -301,6 +312,10 @@ impl AutoSwitchingFingerprintStore {
                 }
             }
         };
+        drop(state);
+        if new_insert_into_exact {
+            self.maybe_trigger_switch();
+        }
 
         result
     }
@@ -396,6 +411,11 @@ impl AutoSwitchingFingerprintStore {
             // No switch pending - safe to block on read lock
             self.state.read()
         };
+        // Same self-deadlock concern as in `contains_or_insert`:
+        // `maybe_trigger_switch` MUST be called AFTER we drop the read
+        // guard on `state`, or it self-deadlocks on its own write-lock
+        // acquisition. Track whether to call it; defer until after drop.
+        let mut new_inserts_into_exact: u64 = 0;
         match &*state {
             StoreState::Exact { store } => {
                 store.contains_or_insert_batch_with_affinity(fps, seen, worker_id)?;
@@ -412,7 +432,7 @@ impl AutoSwitchingFingerprintStore {
                 }
                 if inserts > 0 {
                     self.stats.inserts.fetch_add(inserts, Ordering::Relaxed);
-                    self.maybe_trigger_switch();
+                    new_inserts_into_exact = inserts;
                 }
             }
             StoreState::Hybrid { exact, bloom, .. } => {
@@ -456,6 +476,10 @@ impl AutoSwitchingFingerprintStore {
                     }
                 }
             }
+        }
+        drop(state);
+        if new_inserts_into_exact > 0 {
+            self.maybe_trigger_switch();
         }
 
         Ok(())
