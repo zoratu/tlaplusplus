@@ -66,6 +66,11 @@ pub struct EngineConfig {
     pub enable_queue_spilling: bool,
     /// Max items in memory before spilling (when enable_queue_spilling is true)
     pub queue_max_inmem_items: u64,
+    /// Max BYTES of in-memory pending state before spilling (0 = byte trigger
+    /// off; count-based `queue_max_inmem_items` only). When > 0, spills if
+    /// either the item-count or byte budget is crossed. See
+    /// `SpillableConfig::max_inmem_bytes`.
+    pub queue_max_inmem_bytes: u64,
     /// Enable in-memory zstd compression of overflow segments (T8). Sits
     /// between the hot work-stealing queue and the disk-backed overflow:
     /// instead of writing every overflow batch directly to disk, batches
@@ -235,6 +240,7 @@ impl Default for EngineConfig {
             queue_spill_channel_bound: 128,
             enable_queue_spilling: true,
             queue_max_inmem_items: 50_000_000, // 50M items before spilling
+            queue_max_inmem_bytes: 0,          // byte trigger off by default
             queue_compression: true,
             queue_compression_max_bytes: 256 * 1024 * 1024,
             queue_compression_level: 1,
@@ -897,6 +903,15 @@ where
         } else {
             u64::MAX // Effectively disable spilling
         },
+        // Byte-based trigger: honor the user budget only when spilling is
+        // enabled; 0 keeps it off (count-based behavior). When spilling is
+        // disabled entirely, force 0 so the byte trigger can't fire either.
+        max_inmem_bytes: if config.enable_queue_spilling {
+            config.queue_max_inmem_bytes
+        } else {
+            0
+        },
+        est_bytes_per_item_seed: (config.estimated_state_bytes as u64).max(1),
         spill_dir: config.work_dir.join("queue-spill"),
         spill_batch: config.queue_spill_batch,
         load_existing: config.resume_from_checkpoint,

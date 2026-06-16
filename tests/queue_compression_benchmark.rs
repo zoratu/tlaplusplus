@@ -60,6 +60,8 @@ fn run_workload(
     let config = SpillableConfig {
         // Tight memory budget so the spill path engages.
         max_inmem_items: 5_000,
+        max_inmem_bytes: 0,
+        est_bytes_per_item_seed: 256,
         spill_dir: dir.clone(),
         spill_batch: 4_096,
         load_existing: false,

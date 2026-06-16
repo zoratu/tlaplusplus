@@ -252,6 +252,8 @@ mod tests {
     fn build_queue() -> Arc<SpillableWorkStealingQueues<TinyState>> {
         let cfg = SpillableConfig {
             max_inmem_items: 10_000,
+            max_inmem_bytes: 0,
+            est_bytes_per_item_seed: 256,
             spill_dir: temp_dir("queue"),
             spill_batch: 200,
             load_existing: false,
@@ -442,6 +444,8 @@ mod tests {
         // Build a real worker_state to drain the queue post-producer.
         let cfg = SpillableConfig {
             max_inmem_items: 10_000,
+            max_inmem_bytes: 0,
+            est_bytes_per_item_seed: 256,
             spill_dir: temp_dir("drain"),
             spill_batch: 200,
             load_existing: false,

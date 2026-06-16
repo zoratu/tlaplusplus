@@ -25,11 +25,35 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
+/// Sample 1 in every N items for the byte-per-item EWMA. At 56M states/min
+/// across 64 workers this is ~230 `serialized_size` calls/sec — each a few
+/// microseconds — so the steady-state sampling overhead is negligible, and
+/// it only runs when the byte-based spill trigger is active.
+const BYTE_SAMPLE_INTERVAL: u64 = 4096;
+
 /// Configuration for spillable work-stealing queues
 #[derive(Clone, Debug)]
 pub struct SpillableConfig {
     /// Maximum items to keep in memory before spilling to disk
     pub max_inmem_items: u64,
+    /// Maximum *bytes* of in-memory pending state before spilling to disk
+    /// (0 = byte-based trigger disabled; count-based `max_inmem_items` only).
+    ///
+    /// When > 0, the queue spills if EITHER the item-count cap OR the byte
+    /// budget is crossed, whichever fires first. The byte estimate is
+    /// `pending_count() * bytes_per_item`, where `bytes_per_item` is a
+    /// sampled EWMA of `bincode::serialized_size` (seeded from
+    /// `est_bytes_per_item_seed`). This bounds in-memory footprint
+    /// regardless of how large individual states are — the count-based cap
+    /// alone over-commits memory on specs with large states (e.g. an item
+    /// count well under the cap can still be tens of GB when each state
+    /// carries large nested records / logs).
+    pub max_inmem_bytes: u64,
+    /// Initial bytes-per-item estimate, used to seed the sampled EWMA so
+    /// the byte trigger is sane before the first sample lands. Wired from
+    /// the `--estimated-state-bytes` CLI flag (default 256). Ignored when
+    /// `max_inmem_bytes == 0`.
+    pub est_bytes_per_item_seed: u64,
     /// Directory for spill files
     pub spill_dir: PathBuf,
     /// Batch size for spilling (items per segment file)
@@ -64,6 +88,8 @@ impl Default for SpillableConfig {
     fn default() -> Self {
         Self {
             max_inmem_items: 10_000_000, // 10M items before spilling
+            max_inmem_bytes: 0,          // byte-based trigger off by default
+            est_bytes_per_item_seed: 256,
             spill_dir: PathBuf::from("./.tlapp/queue"),
             spill_batch: 50_000,
             load_existing: false,
@@ -178,8 +204,23 @@ pub struct SpillableWorkStealingQueues<T> {
     /// Overflow disk queue (for loading back from disk)
     overflow: Arc<DiskBackedQueue<T>>,
 
-    /// Threshold for spilling
+    /// Item-count threshold for spilling
     max_inmem_items: u64,
+
+    /// Byte threshold for spilling (0 = byte trigger disabled). See
+    /// `SpillableConfig::max_inmem_bytes`.
+    max_inmem_bytes: u64,
+
+    /// Sampled EWMA of serialized bytes per item, used with `pending_count()`
+    /// to estimate in-memory byte footprint for the byte-based spill trigger.
+    /// Only updated when `max_inmem_bytes > 0`. Stored as a plain integer
+    /// byte count; seeded from `est_bytes_per_item_seed`.
+    bytes_per_item: AtomicU64,
+
+    /// Monotonic counter of items seen by the byte sampler; used to sample
+    /// `1` in every `BYTE_SAMPLE_INTERVAL` items. Only touched when
+    /// `max_inmem_bytes > 0`.
+    byte_sample_counter: AtomicU64,
 
     /// Background spill coordinator thread handle
     coordinator_handle: Option<JoinHandle<()>>,
@@ -357,6 +398,9 @@ where
             hot,
             overflow,
             max_inmem_items: config.max_inmem_items,
+            max_inmem_bytes: config.max_inmem_bytes,
+            bytes_per_item: AtomicU64::new(config.est_bytes_per_item_seed.max(1)),
+            byte_sample_counter: AtomicU64::new(0),
             coordinator_handle: Some(coordinator_handle),
             loader_handle: Some(loader_handle),
             stop_signal,
@@ -798,6 +842,53 @@ where
         self.hot.push_global(item);
     }
 
+    /// Decide whether to spill, based on BOTH the item-count cap and the
+    /// optional byte budget. Spills if either is crossed.
+    ///
+    /// The byte estimate is `pending_count() * bytes_per_item`. Both inputs
+    /// are cheap atomic loads; `pending_count()` is the existing
+    /// batch-flushed approximate count.
+    #[inline]
+    fn should_spill_now(&self) -> bool {
+        let pending = self.hot.pending_count();
+        if pending >= self.max_inmem_items {
+            return true;
+        }
+        if self.max_inmem_bytes > 0 {
+            let est_bytes =
+                pending.saturating_mul(self.bytes_per_item.load(Ordering::Relaxed));
+            if est_bytes >= self.max_inmem_bytes {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Sample one item's serialized size into the bytes-per-item EWMA, but
+    /// only on a `1`-in-`BYTE_SAMPLE_INTERVAL` cadence. Called per item from
+    /// the push hot path via `Iterator::inspect`, but only wired in when
+    /// `max_inmem_bytes > 0`, so it's a no-op (not even constructed) for the
+    /// default count-based configuration.
+    ///
+    /// EWMA with alpha = 1/8: smooths transient size spikes while still
+    /// tracking states that grow over the run (logs, accumulating records).
+    #[inline]
+    fn maybe_sample_item_bytes(&self, item: &T) {
+        let n = self.byte_sample_counter.fetch_add(1, Ordering::Relaxed);
+        if n % BYTE_SAMPLE_INTERVAL == 0 {
+            if let Ok(sz) = bincode::serialized_size(item) {
+                let old = self.bytes_per_item.load(Ordering::Relaxed);
+                let updated = if sz >= old {
+                    old + (sz - old) / 8
+                } else {
+                    old - (old - sz) / 8
+                };
+                self.bytes_per_item
+                    .store(updated.max(1), Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Push batch to worker's local queue, spilling to disk if over threshold
     /// This is the HOT PATH - optimized for zero contention
     pub fn push_local_batch(
@@ -805,12 +896,18 @@ where
         worker_state: &mut SpillableWorkerState<T>,
         items: impl Iterator<Item = T>,
     ) -> usize {
-        let pending = self.hot.pending_count();
-        let should_spill = pending >= self.max_inmem_items;
+        let should_spill = self.should_spill_now();
 
         if !should_spill {
-            // Fast path: push to in-memory work-stealing queue (lock-free)
-            self.hot.push_local_batch(&mut worker_state.inner, items)
+            // Fast path: push to in-memory work-stealing queue (lock-free).
+            // When the byte trigger is active, sample item sizes in-flight
+            // via `inspect` (no buffering) so the EWMA stays current.
+            if self.max_inmem_bytes > 0 {
+                let sampled = items.inspect(|item| self.maybe_sample_item_bytes(item));
+                self.hot.push_local_batch(&mut worker_state.inner, sampled)
+            } else {
+                self.hot.push_local_batch(&mut worker_state.inner, items)
+            }
         } else {
             // Spill path: accumulate in worker's local buffer, send batches async
             let mut count = 0;
@@ -853,12 +950,17 @@ where
         worker_state: &mut SpillableWorkerState<T>,
         items: impl Iterator<Item = (T, usize)>,
     ) -> usize {
-        let pending = self.hot.pending_count();
-        let should_spill = pending >= self.max_inmem_items;
+        let should_spill = self.should_spill_now();
 
         if !should_spill {
-            // Fast path: push to in-memory work-stealing queue with NUMA routing
-            self.hot.push_batch_to_numa(&mut worker_state.inner, items)
+            // Fast path: push to in-memory work-stealing queue with NUMA routing.
+            // Sample item sizes in-flight when the byte trigger is active.
+            if self.max_inmem_bytes > 0 {
+                let sampled = items.inspect(|(item, _numa)| self.maybe_sample_item_bytes(item));
+                self.hot.push_batch_to_numa(&mut worker_state.inner, sampled)
+            } else {
+                self.hot.push_batch_to_numa(&mut worker_state.inner, items)
+            }
         } else {
             // Spill path: accumulate in worker's local buffer (ignoring NUMA routing)
             // When loaded back from disk, items will be pushed to global queue
@@ -2082,6 +2184,8 @@ mod tests {
         let dir = temp_path("spillable-basic");
         let config = SpillableConfig {
             max_inmem_items: 1000,
+            max_inmem_bytes: 0,
+            est_bytes_per_item_seed: 256,
             spill_dir: dir.clone(),
             spill_batch: 100,
             load_existing: false,
@@ -2120,6 +2224,8 @@ mod tests {
         let dir = temp_path("spillable-spill");
         let config = SpillableConfig {
             max_inmem_items: 50,
+            max_inmem_bytes: 0,
+            est_bytes_per_item_seed: 256,
             spill_dir: dir.clone(),
             spill_batch: 20,
             load_existing: false,
@@ -2180,6 +2286,71 @@ mod tests {
         Ok(())
     }
 
+    /// Byte-based spill trigger: with the item-count cap effectively
+    /// disabled (huge) but a small byte budget, pushing enough items must
+    /// cross the byte budget and take the spill path. The control case
+    /// (same config, byte budget 0) must NOT spill, proving the byte
+    /// trigger — not the count cap — is what fired.
+    #[test]
+    fn test_byte_based_spill_trigger() -> Result<()> {
+        let base = |dir: PathBuf, max_inmem_bytes: u64| SpillableConfig {
+            // Count cap effectively unreachable for this test's volume.
+            max_inmem_items: 100_000_000,
+            max_inmem_bytes,
+            // Seed large so the byte estimate crosses a small budget at a
+            // low pending count, independent of the actual u64 item size.
+            est_bytes_per_item_seed: 256,
+            spill_dir: dir,
+            spill_batch: 64,
+            load_existing: false,
+            worker_spill_buffer_size: 64,
+            worker_channel_bound: 8,
+            defer_segment_deletion: false,
+            compression_enabled: true,
+            compression_max_bytes: 64 * 1024 * 1024,
+            compression_level: 1,
+        };
+
+        // Push 4000 items in small batches so pending_count flushes
+        // (flush threshold is 256) and grows past the byte trigger point.
+        let push_all = |queues: &Arc<SpillableWorkStealingQueues<u64>>,
+                        workers: &mut [SpillableWorkerState<u64>]| {
+            for chunk_start in (0..4000u64).step_by(50) {
+                let batch: Vec<u64> = (chunk_start..chunk_start + 50).collect();
+                queues.push_local_batch(&mut workers[0], batch.into_iter());
+            }
+            queues.flush_worker_counters(&mut workers[0]);
+        };
+
+        // --- byte trigger ON: budget = 256 bytes/item * ~250 items = 64000 ---
+        let dir_on = temp_path("spillable-byte-on");
+        let (q_on, mut w_on) =
+            SpillableWorkStealingQueues::<u64>::new(2, vec![0, 0], base(dir_on.clone(), 64_000))?;
+        push_all(&q_on, &mut w_on);
+        let on_spilled = q_on.stats().spilled_items;
+        assert!(
+            on_spilled > 0,
+            "byte trigger ON should have spilled (byte budget crossed), got spilled_items={}",
+            on_spilled
+        );
+
+        // --- byte trigger OFF: same volume, count cap huge, bytes 0 ---
+        let dir_off = temp_path("spillable-byte-off");
+        let (q_off, mut w_off) =
+            SpillableWorkStealingQueues::<u64>::new(2, vec![0, 0], base(dir_off.clone(), 0))?;
+        push_all(&q_off, &mut w_off);
+        let off_spilled = q_off.stats().spilled_items;
+        assert_eq!(
+            off_spilled, 0,
+            "byte trigger OFF with huge count cap must NOT spill, got spilled_items={}",
+            off_spilled
+        );
+
+        let _ = std::fs::remove_dir_all(dir_on);
+        let _ = std::fs::remove_dir_all(dir_off);
+        Ok(())
+    }
+
     #[test]
     fn test_concurrent_spill() -> Result<()> {
         use std::sync::atomic::AtomicUsize;
@@ -2187,6 +2358,8 @@ mod tests {
         let dir = temp_path("spillable-concurrent");
         let config = SpillableConfig {
             max_inmem_items: 100,
+            max_inmem_bytes: 0,
+            est_bytes_per_item_seed: 256,
             spill_dir: dir.clone(),
             spill_batch: 50,
             load_existing: false,
@@ -2260,6 +2433,8 @@ mod tests {
         let dir = temp_path("spillable-streaming-drain");
         let config = SpillableConfig {
             max_inmem_items: 1_000_000, // High limit so items stay in memory
+            max_inmem_bytes: 0,
+            est_bytes_per_item_seed: 256,
             spill_dir: dir.clone(),
             spill_batch: 1000,
             load_existing: false,
@@ -2354,6 +2529,8 @@ mod tests {
         let dir = temp_path("spillable-streaming-memory");
         let config = SpillableConfig {
             max_inmem_items: 10_000_000,
+            max_inmem_bytes: 0,
+            est_bytes_per_item_seed: 256,
             spill_dir: dir.clone(),
             spill_batch: 10_000,
             load_existing: false,
@@ -2405,6 +2582,8 @@ mod tests {
         let config = SpillableConfig {
             // Tiny in-memory budget forces overflow path immediately.
             max_inmem_items: 100,
+            max_inmem_bytes: 0,
+            est_bytes_per_item_seed: 256,
             spill_dir: dir.clone(),
             spill_batch: 100,
             load_existing: false,
@@ -2516,6 +2695,8 @@ mod tests {
         let dir = temp_path("spillable-comp-off");
         let config = SpillableConfig {
             max_inmem_items: 100,
+            max_inmem_bytes: 0,
+            est_bytes_per_item_seed: 256,
             spill_dir: dir.clone(),
             spill_batch: 100,
             load_existing: false,
@@ -2562,6 +2743,8 @@ mod tests {
         let dir = temp_path("spillable-comp-overflow");
         let config = SpillableConfig {
             max_inmem_items: 100,
+            max_inmem_bytes: 0,
+            est_bytes_per_item_seed: 256,
             spill_dir: dir.clone(),
             spill_batch: 200,
             load_existing: false,
@@ -2624,6 +2807,8 @@ mod tests {
         let config = SpillableConfig {
             // tiny cap forces the spill path immediately
             max_inmem_items: 4,
+            max_inmem_bytes: 0,
+            est_bytes_per_item_seed: 256,
             spill_dir: dir.clone(),
             spill_batch: 100,
             load_existing: false,
@@ -2869,6 +3054,8 @@ mod t11_4_tests {
         let dir2 = temp_path("t11-4-end-to-end");
         let cfg = SpillableConfig {
             max_inmem_items: 2,
+            max_inmem_bytes: 0,
+            est_bytes_per_item_seed: 256,
             spill_dir: dir2.clone(),
             spill_batch: 2,
             load_existing: false,
@@ -2955,6 +3142,8 @@ mod t11_4_tests {
         let dir = temp_path("t11-4-clean");
         let config = SpillableConfig {
             max_inmem_items: 2,
+            max_inmem_bytes: 0,
+            est_bytes_per_item_seed: 256,
             spill_dir: dir.clone(),
             spill_batch: 16,
             load_existing: false,
