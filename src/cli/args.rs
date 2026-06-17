@@ -217,14 +217,16 @@ pub(crate) struct StorageArgs {
     #[arg(long, default_value_t = 0, value_parser = parse_byte_size)]
     pub(crate) queue_max_inmem_bytes: u64,
     /// Spill to disk when actual process RSS exceeds this percentage of total
-    /// RAM (0 = off). Unlike --queue-max-inmem-bytes (a serialized-size
-    /// estimate that under-counts real heap), this uses ground-truth process
-    /// memory: when RSS crosses the ceiling, workers spill successors to disk,
-    /// the loader caps the hot queue low so the bulk of pending state stays on
-    /// disk, and freed heap is returned to the OS — bounding the footprint
-    /// instead of OOM-killing on specs whose in-memory queue would outgrow RAM.
-    /// Recommended around 70–80 for big specs; leave 0 for specs that fit.
-    #[arg(long, default_value_t = 0)]
+    /// RAM (default 75; 0 = off). Unlike --queue-max-inmem-bytes (a
+    /// serialized-size estimate that under-counts real heap), this uses
+    /// ground-truth process memory: when RSS crosses the ceiling, workers
+    /// spill successors to disk, the loader caps the hot queue low so the bulk
+    /// of pending state stays on disk, and freed heap is returned to the OS —
+    /// bounding the footprint instead of OOM-killing on specs whose in-memory
+    /// queue would outgrow RAM. Specs whose peak RSS stays under the ceiling
+    /// never spill, so the default is protective without penalizing runs that
+    /// fit in memory. Set 0 to disable, or lower (e.g. 60) for more headroom.
+    #[arg(long, default_value_t = 75)]
     pub(crate) queue_memory_ceiling_pct: u8,
     /// Enable in-memory zstd compression for overflow segments (T8).
     /// When on, batches that would otherwise spill to disk are first

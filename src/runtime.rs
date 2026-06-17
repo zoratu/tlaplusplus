@@ -244,7 +244,7 @@ impl Default for EngineConfig {
             enable_queue_spilling: true,
             queue_max_inmem_items: 50_000_000, // 50M items before spilling
             queue_max_inmem_bytes: 0,          // byte trigger off by default
-            queue_memory_ceiling_pct: 0,       // RSS trigger off by default
+            queue_memory_ceiling_pct: 75,      // RSS trigger on by default (75% of RAM)
             queue_compression: true,
             queue_compression_max_bytes: 256 * 1024 * 1024,
             queue_compression_level: 1,
