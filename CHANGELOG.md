@@ -1,5 +1,28 @@
 # Changelog
 
+## v1.2.12 (2026-06-17)
+
+Memory-bounded queue spilling. Two opt-in spill triggers that let the in-memory state queue stay bounded on specs whose pending set would otherwise outgrow RAM. Both default off, so existing runs are unchanged.
+
+### PR #101 — byte-based spill trigger (`--queue-max-inmem-bytes`)
+
+The queue previously spilled to disk only when the in-memory item COUNT crossed `--queue-max-inmem-items` (default 50M). For specs with large states that over-commits memory — an item count well under the cap can still be tens of GB when each state carries large nested records or accumulating logs. This adds a byte budget (accepts unit suffixes: `80GB`, `512MB`) that spills when either the count cap or the byte budget is crossed. The byte footprint is estimated from a sampled `bincode::serialized_size` EWMA seeded by `--estimated-state-bytes`. Sampling (1-in-4096 via `Iterator::inspect`) runs only when the budget is active, so the default count-based config pays zero new cost. E2E-verified: CoffeeCan-100 with a 1MB budget forces heavy spilling and still finds the identical 5,150 distinct states as the baseline.
+
+### PR #102 — RSS-based spill trigger (`--queue-memory-ceiling-pct`)
+
+The byte estimate above under-counts actual heap — a `TlaState`'s nested `BTreeMap`/`Arc`/`HashedArc` plus allocator overhead occupy ~1.5–2× the serialized size — so on a big spec the budget can stay under its threshold while real memory drives the box into swap. This adds a ground-truth trigger that spills based on actual process RSS. When RSS crosses the configured percentage of total RAM, workers spill successors to disk, the loader caps the hot queue at ~1M items under pressure (with hysteresis, never starving workers), and the spill coordinator periodically `malloc_trim()`s so freed heap returns to the OS and RSS reflects the spill.
+
+Validated on MCKVSSafetyLarge (c6g.metal, 64 workers, `--queue-memory-ceiling-pct 75`, 20 min): RSS bounded — oscillates 81–95 GB instead of growing unbounded — the box stays responsive, throughput holds at ~2.1M distinct/min, and the run reaches 39.2M distinct and keeps climbing. The serialized-estimate approach on the same spec collapsed to ~5K states/min in swap thrash. MCKVSSafetyMedium with the same flag completes at the identical 17,220,672 distinct and never spills (peak RSS stays under the ceiling), so the trigger is dormant for specs that fit — no regression.
+
+### Gauntlet
+
+| Gate | Result |
+|---|---|
+| `cargo test --release` | 1,236 pass / 0 fail / 10 ignored (+2 new spill-trigger tests) |
+| `scripts/diff_tlc.sh` | 13 / 13 specs match TLC v2.19 |
+
+Drop-in for v1.2.11. No default-behavior change — both triggers are opt-in. Auto-enabling a sane RSS ceiling by default is a candidate follow-up pending broad corpus no-regression validation.
+
 ## v1.2.11 (2026-06-16)
 
 Two related runtime fixes that surfaced when investigating an apparent hang on MCKVSSafetyLarge.
