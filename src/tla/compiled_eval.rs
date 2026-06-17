@@ -2194,7 +2194,19 @@ pub fn apply_compiled_action_ir_multi(
         // inserts per successor on top of `next = current.clone()`, which
         // already contains all of current's keys.
         for (var, value) in branch.staged {
-            next.insert(Arc::from(var), value);
+            // State variables are a fixed set already present in `current`
+            // (hence in `next`, its clone), so a staged var is almost always
+            // an UPDATE of an existing key. Update in place via `get_mut`:
+            // this reuses the existing `Arc<str>` key (no `Arc::from` heap
+            // alloc) and avoids the BTreeMap insert-rebalance — only the value
+            // slot is overwritten. Fall back to `insert` for the rare var that
+            // isn't already in the state (defensive; shouldn't happen for a
+            // well-formed spec where Next only assigns declared variables).
+            if let Some(slot) = next.get_mut(var.as_str()) {
+                *slot = value;
+            } else {
+                next.insert(Arc::from(var), value);
+            }
         }
         out.push(next);
     }
