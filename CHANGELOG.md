@@ -1,5 +1,28 @@
 # Changelog
 
+## v1.2.13 (2026-06-17)
+
+RSS-based queue spilling is now on by default, plus a small successor-construction allocation win.
+
+### PR #104 — `--queue-memory-ceiling-pct` defaults to 75 (RSS spill on by default)
+
+v1.2.12 shipped the RSS-based spill trigger as opt-in (default 0/off). This makes it default-on at 75% of total RAM, so the in-memory state queue is memory-bounded out of the box: a run whose pending set would outgrow RAM spills to disk and stays responsive instead of getting OOM-killed. `0` still means explicit-off; lower it (e.g. 60) for more headroom. This is the one default-behavior change in the release — specs whose peak RSS stays under the ceiling never spill, so runs that fit in memory are unaffected.
+
+Broadly validated on a 126 GB box (94 GB ceiling): `cargo test` 1,236/0/10, `diff_tlc` 13/13 (the gate runs 13 real specs through the binary with the new default on), and MCBinarySearch / CoffeeCan-100 / MCKVSSafetyMedium all complete with identical distinct counts. MCKVSSafetyMedium — the largest spec that fits — finishes with an empty spill directory (peak RSS under the ceiling, trigger never fires), confirming no regression for memory-fitting runs. Big specs get the protection validated in v1.2.12 (MCKVSSafetyLarge: RSS bounded 81–95 GB, responsive, ~2.1M distinct/min sustained where it previously OOM-thrashed).
+
+### PR #105 — reuse existing key Arc on successor update
+
+Per-successor state construction did `next.insert(Arc::from(var), value)` for every changed variable, where `next` is a clone of the parent state. Since the parent already contains every (fixed) state-variable key, a changed var is an update of an existing key — so the `Arc::from` allocation and the BTreeMap rebalance were unnecessary. Now `*next.get_mut(var) = value` reuses the existing key Arc and overwrites the value in place. Byte-identical result (fingerprints/serialization unchanged); +1.7% throughput on MCKVSSafetyMedium in a same-box A/B. The larger per-successor cost — the parent-state BTreeMap clone itself — remains; reducing it needs a structurally-shared map and is gated on fingerprint/serialization equivalence, so it's deferred.
+
+### Gauntlet
+
+| Gate | Result |
+|---|---|
+| `cargo test --release` | 1,236 pass / 0 fail / 10 ignored |
+| `scripts/diff_tlc.sh` | 13 / 13 specs match TLC v2.19 |
+
+Drop-in for v1.2.12 except the one intended default change above (RSS spill ceiling, which is transparent for memory-fitting runs and protective for the rest).
+
 ## v1.2.12 (2026-06-17)
 
 Memory-bounded queue spilling. Two opt-in spill triggers that let the in-memory state queue stay bounded on specs whose pending set would otherwise outgrow RAM. Both default off, so existing runs are unchanged.
