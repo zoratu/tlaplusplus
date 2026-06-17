@@ -140,7 +140,14 @@ pub(crate) fn apply_action_ir_with_context_multi(
         // handler `or_insert`s into `branch.staged`. See the longer note
         // on the compiled-side function for the full rationale.
         for (var, value) in branch.staged {
-            next.insert(Arc::from(var), value);
+            // Update in place to reuse the existing key Arc and skip the
+            // BTreeMap insert-rebalance — see the longer note on
+            // `apply_compiled_action_ir_multi` (compiled_eval.rs).
+            if let Some(slot) = next.get_mut(var.as_str()) {
+                *slot = value;
+            } else {
+                next.insert(Arc::from(var), value);
+            }
         }
         out.push(next);
     }
