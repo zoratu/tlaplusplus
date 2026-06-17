@@ -2,9 +2,9 @@
 
 A Rust implementation of TLA+ model checking with TLC feature parity, achieving **10.7x faster** state exploration than Java TLC on many-core systems. 182/182 (100%) of the [tlaplus/Examples](https://github.com/tlaplus/Examples) corpus passes analysis; **174/182 (95.6%)** also pass full model checking at 60s.
 
-**v1.2.11 (2026-06-16)** ships with:
-- 1,234 default tests + 1,256 with failpoints + 1,261 with symbolic-init, 0 failures
-- Auto-switching fingerprint store self-deadlock fix (was silently dropping states on big specs)
+**v1.2.12 (2026-06-17)** ships with:
+- 1,236 default tests + 1,258 with failpoints + 1,263 with symbolic-init, 0 failures
+- Memory-bounded queue spilling: opt-in byte budget (`--queue-max-inmem-bytes`) and RSS ceiling (`--queue-memory-ceiling-pct`) keep big specs from OOM-killing
 - Differential CI gate vs TLC (13/13 specs match exactly)
 - Compiled-vs-interpreted proptest equivalence (clean across 9 seeds at 2048 cases)
 - State-graph snapshot tests (12 specs pinned to 128-bit XxHash3 digests)
