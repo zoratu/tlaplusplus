@@ -657,15 +657,37 @@ fn expand_action_exists_branches(
     Ok(out)
 }
 
+/// Return a context with each `var` in `staged` bound as the primed local
+/// `var'`. Clones the `locals` BTreeMap **once** and inserts every primed
+/// entry into that single clone, rather than folding `with_local_value` over
+/// the map — which re-cloned the whole (growing) locals map once per staged
+/// var, i.e. O(staged * locals) allocations per action clause on the hot eval
+/// path. Inserting `var'` entries is order-independent (distinct `var` names
+/// yield distinct keys; values come from `staged`, not from each other), so
+/// the result is identical to the fold.
 fn ctx_with_staged_primes<'a>(
     ctx: &EvalContext<'a>,
     staged: &BTreeMap<String, TlaValue>,
 ) -> EvalContext<'a> {
-    let mut out = ctx.clone();
-    for (var, value) in staged {
-        out = out.with_local_value(&format!("{}'", var), value.clone());
+    if staged.is_empty() {
+        return ctx.clone();
     }
-    out
+    let mut new_locals = (*ctx.locals).clone();
+    for (var, value) in staged {
+        // `var'` without a format! allocation.
+        let mut key = String::with_capacity(var.len() + 1);
+        key.push_str(var);
+        key.push('\'');
+        new_locals.insert(key, value.clone());
+    }
+    EvalContext {
+        state: ctx.state,
+        locals: std::rc::Rc::new(new_locals),
+        local_definitions: std::rc::Rc::clone(&ctx.local_definitions),
+        definitions: ctx.definitions,
+        instances: ctx.instances,
+        eval_budget: ctx.eval_budget.clone(),
+    }
 }
 
 pub(crate) fn parse_action_binder_specs(expr: &str) -> Result<Vec<(String, String)>> {

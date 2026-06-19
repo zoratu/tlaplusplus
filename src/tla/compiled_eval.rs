@@ -2561,15 +2561,62 @@ fn expand_compiled_exists_branches<'a>(
     Ok(out)
 }
 
+/// See `eval::action::ctx_with_staged_primes` — same single-clone construction
+/// of the primed-locals context, on the compiled action-exec path.
 fn ctx_with_staged_primes<'a>(
     ctx: &EvalContext<'a>,
     staged: &BTreeMap<String, TlaValue>,
 ) -> EvalContext<'a> {
-    let mut out = ctx.clone();
-    for (var, value) in staged {
-        out = out.with_local_value(&format!("{}'", var), value.clone());
+    if staged.is_empty() {
+        return ctx.clone();
     }
-    out
+    let mut new_locals = (*ctx.locals).clone();
+    for (var, value) in staged {
+        let mut key = String::with_capacity(var.len() + 1);
+        key.push_str(var);
+        key.push('\'');
+        new_locals.insert(key, value.clone());
+    }
+    EvalContext {
+        state: ctx.state,
+        locals: std::rc::Rc::new(new_locals),
+        local_definitions: std::rc::Rc::clone(&ctx.local_definitions),
+        definitions: ctx.definitions,
+        instances: ctx.instances,
+        eval_budget: ctx.eval_budget.clone(),
+    }
+}
+
+#[cfg(test)]
+mod staged_primes_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// Pins that the single-clone `ctx_with_staged_primes` produces the same
+    /// locals as the original `with_local_value` fold over `var'` keys.
+    #[test]
+    fn ctx_with_staged_primes_matches_fold() {
+        let state = crate::tla::value::tla_state([("x", TlaValue::Int(1))]);
+        let base = EvalContext::new(&state).with_local_value("self", TlaValue::Int(7));
+
+        let mut staged = BTreeMap::new();
+        staged.insert("a".to_string(), TlaValue::Int(10));
+        staged.insert("b".to_string(), TlaValue::Bool(true));
+        staged.insert("c".to_string(), TlaValue::ModelValue("m".to_string()));
+
+        let mut folded = base.clone();
+        for (var, value) in &staged {
+            folded = folded.with_local_value(format!("{}'", var), value.clone());
+        }
+
+        let bulk = ctx_with_staged_primes(&base, &staged);
+        assert_eq!(*bulk.locals, *folded.locals);
+        assert_eq!(bulk.locals.get("a'"), Some(&TlaValue::Int(10)));
+        assert_eq!(bulk.locals.get("self"), Some(&TlaValue::Int(7)));
+
+        let empty = BTreeMap::new();
+        assert_eq!(*ctx_with_staged_primes(&base, &empty).locals, *base.locals);
+    }
 }
 
 #[cfg(test)]
