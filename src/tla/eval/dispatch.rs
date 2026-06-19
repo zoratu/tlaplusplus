@@ -330,7 +330,14 @@ const CACHE_CAP: usize = 8192;
 // never escapes the process (so the seed doesn't need to be deterministic
 // across processes; the determinism rule applies only to `Model::fingerprint`
 // — see `crate::model::fingerprint_hasher`).
-type CacheMap = std::collections::HashMap<String, Op, ahash::RandomState>;
+// Cache values are wrapped in `Rc` so a cache hit is a refcount bump rather
+// than a deep clone of the `Op`'s owned `Vec<String>` / `String` payloads.
+// The dispatcher in `expr.rs` consumes the `Op` purely by reference (every
+// arm passes `&str` slices to `eval_expr_inner`), so it never needs to own
+// the strings — borrowing through the `Rc` is sufficient. `Rc` (not `Arc`)
+// because `OP_CACHE` is thread-local and the returned handle never crosses
+// threads.
+type CacheMap = std::collections::HashMap<String, std::rc::Rc<Op>, ahash::RandomState>;
 
 thread_local! {
     static OP_CACHE: std::cell::RefCell<CacheMap> = std::cell::RefCell::new(
@@ -340,18 +347,19 @@ thread_local! {
 
 /// Cached entrypoint mirroring `classify_op`. Looks up the trimmed `expr` in
 /// the thread-local cache; on miss, runs `classify_op` and inserts the result.
-/// Returns a cloned `Op`.
-pub(super) fn classify_op_cached(expr: &str) -> Op {
+/// Returns a shared `Rc<Op>` — cloning it on a hit is a refcount bump, not a
+/// reallocation of the cascade parts.
+pub(super) fn classify_op_cached(expr: &str) -> std::rc::Rc<Op> {
     OP_CACHE.with(|cell| {
         let mut cache = cell.borrow_mut();
         if let Some(op) = cache.get(expr) {
-            return op.clone();
+            return std::rc::Rc::clone(op);
         }
         if cache.len() >= CACHE_CAP {
             cache.clear();
         }
-        let op = classify_op(expr);
-        cache.insert(expr.to_string(), op.clone());
+        let op = std::rc::Rc::new(classify_op(expr));
+        cache.insert(expr.to_string(), std::rc::Rc::clone(&op));
         op
     })
 }
