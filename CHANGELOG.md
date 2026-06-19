@@ -1,5 +1,27 @@
 # Changelog
 
+## v1.2.14 (2026-06-19)
+
+Two eval-path allocation wins from the eval-allocation recon — one on the interpreted probe path, one on the compiled model-checking hot loop.
+
+### PR #107 — build staged primed-locals in one clone, not a fold (+2.5% compiled MC throughput)
+
+`ctx_with_staged_primes` runs per action clause on both the interpreted and compiled action-exec paths. It built the primed-locals context by folding `with_local_value` over the staged variable map, and since each `with_local_value` clones the entire `locals` map, staging k primed vars re-cloned the whole (growing) map k times plus a `format!` allocation per var — O(staged × locals) allocations per clause. It now clones `locals` once and inserts every `var'` entry into that single clone (order-independent, so the result is identical to the fold; a new `ctx_with_staged_primes_matches_fold` test pins this). Because this sits on the compiled action-exec hot loop, it lifts actual model-checking throughput: `run-tla MCKVSSafetyMedium --workers 16` gains ~2.5% states/min (two independent 4-trial A/B batches, +2.4% and +2.6%, non-overlapping), with the interpreted `analyze-tla` path neutral. Notably, an earlier cut that centralized the logic into an `EvalContext` method regressed analyze-tla ~1.2% (the new method perturbed inlining of the EvalContext impl block, which is on the analyze-tla hot path); keeping the optimization as two in-place free functions made the probe path codegen-neutral while preserving the compiled win.
+
+### PR #106 — cache classify_op as Rc<Op> to avoid clone-on-hit (−8.4% analyze-tla user time)
+
+`classify_op_cached`, the thread-local cache in front of the interpreted-eval precedence cascade, returned a deep clone of the cached `Op` on every hit, reallocating its `Vec<String>`/`String` cascade parts inside `eval_expr_inner`'s hot loop. The dispatcher consumes the `Op` purely by reference (every match arm passes `&str` slices to `eval_expr_inner`; none owns the strings), so the cache now stores `Rc<Op>` and the dispatcher matches on `&Op` — a hit is a refcount bump instead of a reallocation. `Rc` (not `Arc`) since the cache is thread-local. No semantic change. On `analyze-tla MCBinarySearch` (the interpreted-eval-bound workload that surfaced this cost), user time drops ~8.4% (19.40s → 17.77s, 5 trials each, non-overlapping). Interpreted-path only — the compiled action path doesn't route through `classify_op_cached`.
+
+### Gauntlet
+
+| Gate | Result |
+|---|---|
+| `cargo test --release` | 1,237 pass / 0 fail / 10 ignored |
+| `scripts/diff_tlc.sh` | 13 / 13 specs match TLC v2.19 |
+| CI | green on x86_64 + aarch64 (both gates each) |
+
+Both changes are semantically transparent (identical fingerprints, distinct-state counts, and checker verdicts); they only remove allocations from the eval hot paths. Drop-in for v1.2.13.
+
 ## v1.2.13 (2026-06-17)
 
 RSS-based queue spilling is now on by default, plus a small successor-construction allocation win.
