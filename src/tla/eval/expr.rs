@@ -113,6 +113,8 @@ pub(super) fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usiz
     // precedence here.
     use super::dispatch::{Op, classify_op_cached, is_low_op};
     let op = classify_op_cached(expr);
+    // `op` is an `Rc<Op>`; dispatch on `&Op` (via `op.as_ref()` below) so a
+    // cache hit costs a refcount bump, not a re-clone of the cascade parts.
     // PRECEDENCE: the original cascade probed defined-infix BETWEEN the
     // comparison arm and the set-op arms. Defined-infix is ctx-dependent so
     // it can't live in the cached classify. We preserve the precedence by
@@ -124,10 +126,10 @@ pub(super) fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usiz
         let right = eval_expr_inner(rhs, ctx, depth + 1)?;
         return eval_operator_call(&op_name, vec![left, right], ctx, depth);
     }
-    match op {
+    match op.as_ref() {
         Op::IndentedAnd(parts) => {
             for part in parts {
-                if !eval_expr_inner(&part, ctx, depth + 1)?.as_bool()? {
+                if !eval_expr_inner(part, ctx, depth + 1)?.as_bool()? {
                     return Ok(TlaValue::Bool(false));
                 }
             }
@@ -135,7 +137,7 @@ pub(super) fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usiz
         }
         Op::IndentedOr(parts) => {
             for part in parts {
-                if eval_expr_inner(&part, ctx, depth + 1)?.as_bool()? {
+                if eval_expr_inner(part, ctx, depth + 1)?.as_bool()? {
                     return Ok(TlaValue::Bool(true));
                 }
             }
@@ -145,7 +147,7 @@ pub(super) fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usiz
             // <=> is right-associative-equivalent (a <=> b <=> c is rare; treat as fold).
             // We evaluate left-to-right reducing pairs by ==.
             let mut acc: Option<bool> = None;
-            for part in &parts {
+            for part in parts {
                 let v = eval_expr_inner(part, ctx, depth + 1)?.as_bool()?;
                 acc = Some(match acc {
                     None => v,
@@ -156,14 +158,14 @@ pub(super) fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usiz
         }
         Op::Implies(parts) => {
             return Ok(TlaValue::Bool(eval_implies_parts(
-                &parts,
+                parts,
                 ctx,
                 depth + 1,
             )?));
         }
         Op::Or(parts) => {
             for part in parts {
-                if eval_expr_inner(&part, ctx, depth + 1)?.as_bool()? {
+                if eval_expr_inner(part, ctx, depth + 1)?.as_bool()? {
                     return Ok(TlaValue::Bool(true));
                 }
             }
@@ -180,7 +182,7 @@ pub(super) fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usiz
         }
         Op::And(parts) => {
             for part in parts {
-                if !eval_expr_inner(&part, ctx, depth + 1)?.as_bool()? {
+                if !eval_expr_inner(part, ctx, depth + 1)?.as_bool()? {
                     return Ok(TlaValue::Bool(false));
                 }
             }
@@ -205,24 +207,24 @@ pub(super) fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usiz
             // For expression evaluation purposes (probing), treat as conjunction —
             // both sides must evaluate successfully. Return the result of the last part.
             let mut result = TlaValue::Bool(true);
-            for part in &parts {
+            for part in parts {
                 result = eval_expr_inner(part, ctx, depth + 1)?;
             }
             return Ok(result);
         }
         Op::Comparison { lhs, op, rhs } => {
-            let left = eval_expr_inner(&lhs, ctx, depth + 1)?;
+            let left = eval_expr_inner(lhs, ctx, depth + 1)?;
             return match op.as_str() {
                 "=" => {
-                    let right = eval_expr_inner(&rhs, ctx, depth + 1)?;
+                    let right = eval_expr_inner(rhs, ctx, depth + 1)?;
                     Ok(TlaValue::Bool(left == right))
                 }
                 "/=" | "#" => {
-                    let right = eval_expr_inner(&rhs, ctx, depth + 1)?;
+                    let right = eval_expr_inner(rhs, ctx, depth + 1)?;
                     Ok(TlaValue::Bool(left != right))
                 }
                 "<" | "<=" | "=<" | "\\leq" | ">" | ">=" | "\\geq" => {
-                    let right = eval_expr_inner(&rhs, ctx, depth + 1)?;
+                    let right = eval_expr_inner(rhs, ctx, depth + 1)?;
                     let cmp = match op.as_str() {
                         "<" => left.as_int()? < right.as_int()?,
                         "<=" | "=<" | "\\leq" => left.as_int()? <= right.as_int()?,
@@ -245,7 +247,7 @@ pub(super) fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usiz
                     depth + 1,
                 )?)),
                 "\\subseteq" => {
-                    let right = eval_expr_inner(&rhs, ctx, depth + 1)?;
+                    let right = eval_expr_inner(rhs, ctx, depth + 1)?;
                     let lhs_set = left.as_set()?;
                     let rhs_set = right.as_set()?;
                     Ok(TlaValue::Bool(lhs_set.iter().all(|v| rhs_set.contains(v))))
@@ -316,20 +318,20 @@ pub(super) fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usiz
             return Ok(out);
         }
         Op::FuncPair { lhs, rhs } => {
-            let key = eval_expr_inner(&lhs, ctx, depth + 1)?;
-            let val = eval_expr_inner(&rhs, ctx, depth + 1)?;
+            let key = eval_expr_inner(lhs, ctx, depth + 1)?;
+            let val = eval_expr_inner(rhs, ctx, depth + 1)?;
             let mut func = BTreeMap::new();
             func.insert(key, val);
             return Ok(TlaValue::Function(HashedArc::new(func)));
         }
         Op::Xor { lhs, rhs } => {
-            let left = eval_expr_inner(&lhs, ctx, depth + 1)?.as_int()?;
-            let right = eval_expr_inner(&rhs, ctx, depth + 1)?.as_int()?;
+            let left = eval_expr_inner(lhs, ctx, depth + 1)?.as_int()?;
+            let right = eval_expr_inner(rhs, ctx, depth + 1)?.as_int()?;
             return Ok(TlaValue::Int(left ^ right));
         }
         Op::Range { lhs, rhs } => {
-            let left = eval_expr_inner(&lhs, ctx, depth + 1)?;
-            let right = eval_expr_inner(&rhs, ctx, depth + 1)?;
+            let left = eval_expr_inner(lhs, ctx, depth + 1)?;
+            let right = eval_expr_inner(rhs, ctx, depth + 1)?;
             let start = left.as_int()?;
             let end = right.as_int()?;
             let range_set: BTreeSet<TlaValue> = if start <= end {
@@ -347,9 +349,9 @@ pub(super) fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usiz
             return Ok(TlaValue::Set(HashedArc::new(range_set)));
         }
         Op::Additive { lhs, op, rhs } => {
-            let left = eval_expr_inner(&lhs, ctx, depth + 1)?.as_int()?;
-            let right = eval_expr_inner(&rhs, ctx, depth + 1)?.as_int()?;
-            return match op {
+            let left = eval_expr_inner(lhs, ctx, depth + 1)?.as_int()?;
+            let right = eval_expr_inner(rhs, ctx, depth + 1)?.as_int()?;
+            return match *op {
                 '+' => left
                     .checked_add(right)
                     .map(TlaValue::Int)
@@ -362,8 +364,8 @@ pub(super) fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usiz
             };
         }
         Op::Multiplicative { lhs, op, rhs } => {
-            let left = eval_expr_inner(&lhs, ctx, depth + 1)?.as_int()?;
-            let right = eval_expr_inner(&rhs, ctx, depth + 1)?.as_int()?;
+            let left = eval_expr_inner(lhs, ctx, depth + 1)?.as_int()?;
+            let right = eval_expr_inner(rhs, ctx, depth + 1)?.as_int()?;
             return match op.as_str() {
                 "*" => left
                     .checked_mul(right)
@@ -391,8 +393,8 @@ pub(super) fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usiz
             };
         }
         Op::Exp { lhs, rhs } => {
-            let left = eval_expr_inner(&lhs, ctx, depth + 1)?.as_int()?;
-            let right = eval_expr_inner(&rhs, ctx, depth + 1)?.as_int()?;
+            let left = eval_expr_inner(lhs, ctx, depth + 1)?.as_int()?;
+            let right = eval_expr_inner(rhs, ctx, depth + 1)?.as_int()?;
             if right < 0 {
                 return Err(anyhow!("exponent must be non-negative, got {right}"));
             }
