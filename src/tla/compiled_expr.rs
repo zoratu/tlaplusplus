@@ -387,23 +387,36 @@ fn parse_string_literal(expr: &str) -> Option<(String, &str)> {
 /// is equivalent to `trim_start`. Unlike `trim()`, it never de-indents one line
 /// relative to the others — which is exactly what the indentation-sensitive
 /// boolean splitter relies on to distinguish a quantifier/junction head from
-/// its deeper body. Trailing whitespace is also trimmed from the whole string.
+/// its deeper body.
+///
+/// Leading and trailing BLANK lines are dropped so the first real line's prefix
+/// checks behave like `trim()`'s: after a binary split (e.g. `=>`) the right
+/// operand often begins with a newline (`"\n    \A x : ..."`), and callers test
+/// `starts_with("\\A ")` etc. on the (re-`compile_expr`'d) result. If a leading
+/// blank line survived, those checks would fail and a quantifier/LET head would
+/// silently not be recognised — mis-evaluating the expression (observed as a
+/// false `SegmentsRecoverable` violation on QueueSegmentSync). Relative indent
+/// among the *non-blank* lines is still preserved.
 fn dedent_common(expr: &str) -> String {
-    let trimmed = expr.trim_end();
-    if trimmed.is_empty() {
+    let lines: Vec<&str> = expr.lines().collect();
+    let Some(start) = lines.iter().position(|l| !l.trim().is_empty()) else {
         return String::new();
-    }
-    let min_indent = trimmed
-        .lines()
+    };
+    let end = lines
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .unwrap_or(start);
+    let body = &lines[start..=end];
+    let min_indent = body
+        .iter()
         .filter(|l| !l.trim().is_empty())
         .map(|l| l.len() - l.trim_start().len())
         .min()
         .unwrap_or(0);
     if min_indent == 0 {
-        return trimmed.to_string();
+        return body.join("\n");
     }
-    trimmed
-        .lines()
+    body.iter()
         .map(|l| {
             if l.len() >= min_indent {
                 &l[min_indent..]
