@@ -413,16 +413,18 @@ fn dedent_common(expr: &str) -> String {
         .map(|l| l.len() - l.trim_start().len())
         .min()
         .unwrap_or(0);
-    if min_indent == 0 {
-        return body.join("\n");
-    }
     body.iter()
         .map(|l| {
-            if l.len() >= min_indent {
+            let dedented = if l.len() >= min_indent {
                 &l[min_indent..]
             } else {
                 l.trim_start()
-            }
+            };
+            // Trim trailing whitespace per line so a single-operand result like
+            // `"0 "` (e.g. the low bound split out of `0 .. N-1`) re-compiles to
+            // `Int(0)`, not `Unparsed("0 ")`. The pre-rewrite `dedent_common`
+            // did this via a leading `trim_end()`.
+            dedented.trim_end()
         })
         .collect::<Vec<_>>()
         .join("\n")
