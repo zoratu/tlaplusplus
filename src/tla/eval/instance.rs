@@ -31,14 +31,32 @@ pub(super) fn eval_module_instance_call(
         ));
     }
 
-    // Get the module instance
-    let instances = ctx
-        .instances
-        .ok_or_else(|| anyhow!("no module instances available in context"))?;
+    // Module-level instance (`Alias == INSTANCE M` at module scope) first.
+    let instance = ctx.instances.and_then(|instances| instances.get(alias));
 
-    let instance = instances
-        .get(alias)
-        .ok_or_else(|| anyhow!("module instance '{}' not found", alias))?;
+    let Some(instance) = instance else {
+        // Fallback: an INLINE instance bound in a LET, i.e.
+        // `LET alias == INSTANCE M [WITH ...] IN ... alias!Op(...) ...`.
+        // The LET binding is recorded as a local definition whose body is
+        // `INSTANCE M ...`; resolve `alias!Op` against it. Without this,
+        // the inline instance binding errors, silently swallowing the
+        // operator that referenced it (the MCCheckpointCoordination
+        // ShouldReplaceLease-override soundness bug).
+        if let Some(def) = ctx.local_definitions.get(alias) {
+            if let Some(rest) = def.body.trim_start().strip_prefix("INSTANCE") {
+                if rest.starts_with(char::is_whitespace) {
+                    return eval_inline_instance_call(
+                        rest.trim_start(),
+                        operator_name,
+                        args,
+                        ctx,
+                        depth,
+                    );
+                }
+            }
+        }
+        return Err(anyhow!("module instance '{}' not found", alias));
+    };
 
     // Get the module
     let module = instance.module.as_ref().ok_or_else(|| {
@@ -89,6 +107,86 @@ pub(super) fn eval_module_instance_call(
 
     // Evaluate the operator body
     eval_expr_inner(&operator_def.body, &child_ctx, depth + 1)
+}
+
+/// Evaluate `alias!Op(args)` where `alias` is an INLINE instance bound by a
+/// `LET alias == INSTANCE M [WITH p <- v, ...] IN ...` rather than a
+/// module-level `INSTANCE` declaration.
+///
+/// `instance_spec` is the text after `INSTANCE` in the LET binding body, e.g.
+/// `"CheckpointCoordination"` or `"CheckpointCoordination WITH N <- Nodes"`.
+///
+/// The instantiated module is the one the enclosing module `EXTENDS`, so its
+/// definitions are already flattened into the evaluation scope. The one
+/// subtlety is config operator-overrides: `M!Op` must reference M's *original*
+/// `Op`, not a `CONSTANT Op <- ...` / definition override applied to the
+/// instantiating module. `inject_constants_into_definitions` preserves the
+/// pre-override definition under `__Original_<Op>__`, so we prefer that.
+fn eval_inline_instance_call(
+    instance_spec: &str,
+    operator_name: &str,
+    args: Vec<TlaValue>,
+    ctx: &EvalContext<'_>,
+    depth: usize,
+) -> Result<TlaValue> {
+    if depth > MAX_EVAL_DEPTH {
+        return Err(anyhow!(
+            "inline instance recursion depth exceeded at !{operator_name}"
+        ));
+    }
+
+    // Resolve the operator, preferring the pre-override original.
+    let backup = format!("__Original_{operator_name}__");
+    let def = ctx
+        .definition(&backup)
+        .or_else(|| ctx.definition(operator_name))
+        .ok_or_else(|| {
+            anyhow!("operator '{operator_name}' not found for inline INSTANCE '{instance_spec}'")
+        })?;
+
+    if def.params.len() != args.len() {
+        return Err(anyhow!(
+            "inline instance operator '{operator_name}' arity mismatch: expected {}, got {}",
+            def.params.len(),
+            args.len()
+        ));
+    }
+
+    let mut child = ctx.clone();
+    {
+        let locals_mut = std::rc::Rc::make_mut(&mut child.locals);
+        // Apply any `WITH param <- expr` substitutions, evaluated in the
+        // caller's context, before binding the operator's own parameters.
+        for (param, sub_expr) in parse_instance_with_substitutions(instance_spec) {
+            let value = eval_expr_inner(&sub_expr, ctx, depth + 1)?;
+            bind_param_value(locals_mut, &param, value)?;
+        }
+        for (param, arg) in def.params.iter().zip(args.into_iter()) {
+            bind_param_value(locals_mut, param, arg)?;
+        }
+    }
+
+    eval_expr_inner(&def.body, &child, depth + 1)
+}
+
+/// Parse the `WITH p1 <- e1, p2 <- e2, ...` clause of an INSTANCE spec into
+/// `(param, expr)` pairs. Returns empty if there is no `WITH`.
+fn parse_instance_with_substitutions(instance_spec: &str) -> Vec<(String, String)> {
+    let Some(with_idx) = super::find_top_level_keyword_index(instance_spec, "WITH") else {
+        return Vec::new();
+    };
+    let subs_text = &instance_spec[with_idx + "WITH".len()..];
+    let mut out = Vec::new();
+    for part in crate::tla::split_top_level(subs_text, ",") {
+        if let Some((param, expr)) = part.split_once("<-") {
+            let param = param.trim();
+            let expr = expr.trim();
+            if !param.is_empty() && !expr.is_empty() {
+                out.push((param.to_string(), expr.to_string()));
+            }
+        }
+    }
+    out
 }
 
 pub(super) fn effective_instance_scope<'a>(

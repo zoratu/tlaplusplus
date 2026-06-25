@@ -2507,6 +2507,19 @@ fn try_parse_let(expr: &str) -> Option<CompiledExpr> {
         // Skip comments (lines starting with \*)
         let name = name.lines().last().unwrap_or("").trim();
 
+        // A LET binding whose value is `INSTANCE M [WITH ...]` defines a
+        // module instance, not a value. The compiled `Let` evaluator binds
+        // each value eagerly, but a bare INSTANCE has no value — it errors,
+        // which would silently swallow the whole LET. Hand the entire LET to
+        // the interpreted evaluator (via `Unparsed`), which registers the
+        // inline instance so `alias!Op(...)` resolves in the body. See
+        // `eval::control::eval_let_expression` / `eval::instance`.
+        if value.trim_start().starts_with("INSTANCE ")
+            || value.trim_start().starts_with("INSTANCE\n")
+        {
+            return Some(CompiledExpr::Unparsed(expr.to_string()));
+        }
+
         // Name should be a simple identifier (possibly with params in brackets)
         if let Some(_bracket_idx) = name.find('[') {
             // Has parameters like sumF[S \in SUBSET opts] - skip these recursive defs
