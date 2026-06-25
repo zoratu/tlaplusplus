@@ -382,8 +382,66 @@ fn parse_string_literal(expr: &str) -> Option<(String, &str)> {
 }
 
 /// Compile a TLA+ expression string to a CompiledExpr
+/// Remove the common leading whitespace shared by every non-empty line,
+/// preserving relative indentation between lines. For a single-line input this
+/// is equivalent to `trim_start`. Unlike `trim()`, it never de-indents one line
+/// relative to the others — which is exactly what the indentation-sensitive
+/// boolean splitter relies on to distinguish a quantifier/junction head from
+/// its deeper body.
+///
+/// Leading and trailing BLANK lines are dropped so the first real line's prefix
+/// checks behave like `trim()`'s: after a binary split (e.g. `=>`) the right
+/// operand often begins with a newline (`"\n    \A x : ..."`), and callers test
+/// `starts_with("\\A ")` etc. on the (re-`compile_expr`'d) result. If a leading
+/// blank line survived, those checks would fail and a quantifier/LET head would
+/// silently not be recognised — mis-evaluating the expression (observed as a
+/// false `SegmentsRecoverable` violation on QueueSegmentSync). Relative indent
+/// among the *non-blank* lines is still preserved.
+fn dedent_common(expr: &str) -> String {
+    let lines: Vec<&str> = expr.lines().collect();
+    let Some(start) = lines.iter().position(|l| !l.trim().is_empty()) else {
+        return String::new();
+    };
+    let end = lines
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .unwrap_or(start);
+    let body = &lines[start..=end];
+    let min_indent = body
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    body.iter()
+        .map(|l| {
+            let dedented = if l.len() >= min_indent {
+                &l[min_indent..]
+            } else {
+                l.trim_start()
+            };
+            // Trim trailing whitespace per line so a single-operand result like
+            // `"0 "` (e.g. the low bound split out of `0 .. N-1`) re-compiles to
+            // `Int(0)`, not `Unparsed("0 ")`. The pre-rewrite `dedent_common`
+            // did this via a leading `trim_end()`.
+            dedented.trim_end()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub fn compile_expr(expr: &str) -> CompiledExpr {
-    let expr = expr.trim();
+    // Re-base the expression while PRESERVING relative indentation: strip the
+    // common leading whitespace shared by all non-empty lines instead of
+    // `trim()`-ing line 1 to column 0. A bare `trim()` de-indents the first
+    // line independently, destroying the column relationship between a
+    // junction/quantifier head and its deeper body (the head lands at column 0
+    // while its body keeps its original indent) — making an indented body
+    // indistinguishable from a sibling junction item. `dedent_common` keeps
+    // heads and bodies at consistent relative columns so the indented-boolean
+    // splitter can tell siblings from nested bodies.
+    let dedented = dedent_common(expr);
+    let expr = dedented.as_str();
 
     if expr.is_empty() {
         return CompiledExpr::Unparsed(expr.to_string());
@@ -577,6 +635,49 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
 
     // Logical operators (in precedence order)
 
+    // INDENTATION-based boolean splitting comes BEFORE infix `=>`/`<=>`.
+    //
+    // For a multiline TLA+ bulleted junction list, the alignment of the `/\`
+    // (or `\/`) bullets is the top-level structure, and each bullet is itself a
+    // full expression that may contain `=>`/`<=>` — exactly TLA+'s bulleted-list
+    // semantics. So:
+    //
+    //   /\ a
+    //   /\ b => c        parses as   a /\ (b => c)
+    //
+    // i.e. the bullet split outranks the infix `=>`. `split_indented_top_level_
+    // boolean` returns None when line 1 is NOT itself a bullet at the base
+    // indent (e.g. `L = N =>` followed by an indented `/\` block), so a genuine
+    // top-level `=>` whose consequent is a junction list still defers to the
+    // `=>` split below. For single-line input it also returns None (no newline
+    // to align on), so ordinary infix precedence applies there too.
+    //
+    // The body-delimiter-based `formula::split_top_level` cannot distinguish
+    // "\\/ inside an indented sub-block" from "\\/ at the top level"; for
+    //
+    //   /\ \A a \in Q : \E m \in Q1b : m.acc = a
+    //   /\ \/ Q1bv = {}
+    //      \/ \E m \in Q1bv : ...
+    //
+    // it would mis-split on the indented `\\/` and produce a flat
+    // `Or([Forall, Eq, Exists])` instead of `And([Forall, Or([Eq, Exists])])`.
+    // With `Q1bv = {}` true at the initial state, the mis-compiled `Or`
+    // evaluated TRUE — silently passing universally-quantified existential
+    // guards (Paxos `Phase2a`). (T1.4)
+    if let Some(parts) = split_indented_top_level_boolean(expr, "/\\") {
+        if parts.len() == 1 {
+            // Single `/\ X` wrapper — `X` (re-dedented) is the real expression.
+            return compile_expr(&parts[0]);
+        }
+        return CompiledExpr::And(parts.into_iter().map(|s| compile_expr(&s)).collect());
+    }
+    if let Some(parts) = split_indented_top_level_boolean(expr, "\\/") {
+        if parts.len() == 1 {
+            return compile_expr(&parts[0]);
+        }
+        return CompiledExpr::Or(parts.into_iter().map(|s| compile_expr(&s)).collect());
+    }
+
     // Equivalence (biconditional): <=>
     // MUST be split BEFORE `=>` because `split_binary_op(expr, "=>")` would
     // otherwise match the `=>` *inside* `<=>` (no `<` look-back protection).
@@ -588,28 +689,6 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
     // Implication: =>
     if let Some((left, right)) = split_binary_op(expr, "=>") {
         return CompiledExpr::Implies(Box::new(compile_expr(left)), Box::new(compile_expr(right)));
-    }
-
-    // T1.4 fix: when the expression spans multiple lines, prefer
-    // INDENTATION-based boolean splitting before symbol-based splitting.
-    // The body-delimiter-based `formula::split_top_level` cannot reliably
-    // distinguish "\\/ inside an indented sub-block" from "\\/ at the
-    // top level of the expression"; for shapes like
-    //
-    //   /\ \A a \in Q : \E m \in Q1b : m.acc = a
-    //   /\ \/ Q1bv = {}
-    //      \/ \E m \in Q1bv : ...
-    //
-    // it would mis-split on the indented `\\/` and produce a flat
-    // `Or([Forall, Eq, Exists])` instead of an
-    // `And([Forall, Or([Eq, Exists])])`. With `Q1bv = {}` true at the
-    // initial state, the mis-compiled `Or` evaluated as TRUE — silently
-    // passing universally-quantified existential guards (Paxos `Phase2a`).
-    if let Some(parts) = split_indented_top_level_boolean(expr, "/\\") {
-        return CompiledExpr::And(parts.into_iter().map(|s| compile_expr(&s)).collect());
-    }
-    if let Some(parts) = split_indented_top_level_boolean(expr, "\\/") {
-        return CompiledExpr::Or(parts.into_iter().map(|s| compile_expr(&s)).collect());
     }
 
     // Disjunction: \/
@@ -1117,7 +1196,13 @@ fn split_indented_top_level_boolean(expr: &str, delim: &str) -> Option<Vec<Strin
         return None;
     }
 
-    let normalized = normalize_multiline_boolean_indentation(expr);
+    // NOTE: we operate on `expr` directly and do NOT re-normalize indentation
+    // here. `compile_expr` re-bases every (sub)expression with `dedent_common`
+    // at entry, which preserves the relative columns of bullets and their
+    // bodies. The previous `normalize_multiline_boolean_indentation` step
+    // de-indented line 1 independently of the rest, collapsing an indented
+    // body onto its head's column and making nested bodies look like siblings.
+    let normalized = expr;
 
     // Pass 1: find the smallest indent at which a line begins with `delim`.
     let mut min_indent: Option<usize> = None;
@@ -1168,8 +1253,20 @@ fn split_indented_top_level_boolean(expr: &str, delim: &str) -> Option<Vec<Strin
                 current.clear();
                 saw_top_level = true;
             }
-            let body = trimmed.trim_start_matches(delim).trim_start();
-            current.push_str(body);
+            // Column-preserving extraction: replace the leading `delim` with
+            // an equal run of spaces so the bullet's body stays at its ORIGINAL
+            // column. This keeps a deeper body (e.g. a quantifier's `/\` list)
+            // distinguishable from a sibling bullet at the bullet column, after
+            // the recursive `compile_expr` re-bases the clause with
+            // `dedent_common`. (The old `trim_start().trim_start_matches(delim)`
+            // pinned the body to column 0, destroying that distinction.)
+            let after = trimmed.strip_prefix(delim).unwrap_or(trimmed);
+            let lead_ws = after.len() - after.trim_start().len();
+            let col = indent + delim.len() + lead_ws;
+            for _ in 0..col {
+                current.push(' ');
+            }
+            current.push_str(after.trim_start());
             continue;
         }
         if !saw_top_level {
@@ -1187,57 +1284,19 @@ fn split_indented_top_level_boolean(expr: &str, delim: &str) -> Option<Vec<Strin
         clauses.push(current.trim_end().to_string());
     }
 
-    if clauses.len() <= 1 {
+    // A single top-level clause is still a meaningful result: it means the
+    // expression is a `delim`-prefixed wrapper around one body (e.g.
+    // `/\ \A n : ...` with the quantifier's own `/\` body indented deeper).
+    // Returning it lets `compile_expr` strip the leading bullet and recurse on
+    // the body, where re-dedenting realigns the inner bullets — instead of
+    // falling through to the symbol-based `/\`/`\/` split, which cannot tell
+    // the deeper body bullets from top-level siblings. `clauses` is empty only
+    // when no base-indent `delim` line was ever consumed.
+    if clauses.is_empty() {
         return None;
     }
 
     Some(clauses)
-}
-
-/// Strip the smallest common left-indent (excluding the first line) so
-/// that subsequent indent comparisons use a well-defined base. Mirrors
-/// the helper of the same name in `eval.rs` but kept private here to
-/// avoid coupling the two modules.
-fn normalize_multiline_boolean_indentation(expr: &str) -> String {
-    let mut lines = expr.lines();
-    let Some(first) = lines.next() else {
-        return String::new();
-    };
-    let rest: Vec<&str> = lines.collect();
-    if rest.is_empty() {
-        return expr.to_string();
-    }
-    let dedent = rest
-        .iter()
-        .filter_map(|line| {
-            let trimmed = line.trim_start();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(line.len().saturating_sub(trimmed.len()))
-            }
-        })
-        .min()
-        .unwrap_or(0);
-    if dedent == 0 {
-        return expr.to_string();
-    }
-    let mut out = String::with_capacity(expr.len());
-    out.push_str(first);
-    for line in rest {
-        out.push('\n');
-        let trimmed = line.trim_start();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let indent = line.len().saturating_sub(trimmed.len());
-        let keep = indent.saturating_sub(dedent);
-        for _ in 0..keep {
-            out.push(' ');
-        }
-        out.push_str(trimmed);
-    }
-    out
 }
 
 /// Check if a keyword appears at position i with word boundaries
@@ -2613,6 +2672,15 @@ fn try_parse_exists(expr: &str) -> Option<CompiledExpr> {
 
     let colon_idx = find_top_level_colon(rest)?;
     let binding = rest[..colon_idx].trim();
+    // Body uses `.trim()` (NOT `dedent_common`). The body is re-`compile_expr`'d,
+    // which re-bases it with `dedent_common` anyway, so within-body conjunction
+    // bullets still split correctly via the entry dedent + symbol fallback. We
+    // deliberately do NOT realign the body here: re-indenting a quantifier body
+    // before it reaches the action-IR layer flips the IR's guard-vs-action-
+    // existential classification of an inner `\E ... : <pure guard>` (it starts
+    // enumerating witnesses as successors). Keeping the de-indenting `.trim()`
+    // preserves the shape the action IR expects. Regression: Paxos `Phase2a`
+    // generated 2 (duplicate) successors instead of 1.
     let body = rest[colon_idx + 1..].trim();
 
     if contains_tuple_binder(binding) {
@@ -2669,6 +2737,9 @@ fn try_parse_forall(expr: &str) -> Option<CompiledExpr> {
 
     let colon_idx = find_top_level_colon(rest)?;
     let binding = rest[..colon_idx].trim();
+    // Body uses `.trim()` (NOT `dedent_common`); see try_parse_exists for why
+    // realigning a quantifier body here breaks action-IR existential
+    // classification (Paxos `Phase2a` duplicate-successor regression).
     let body = rest[colon_idx + 1..].trim();
 
     if contains_tuple_binder(binding) {
@@ -3201,6 +3272,66 @@ fn find_line_start_before(text: &str, pos: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Compact structural shape of a compiled expression, for asserting on the
+    /// parse tree of indentation-sensitive boolean shapes without depending on
+    /// leaf details. e.g. `And[_,Or[_,_]]`, `Forall(And[_,_])`.
+    fn shape(e: &CompiledExpr) -> String {
+        match e {
+            CompiledExpr::And(xs) => {
+                format!("And[{}]", xs.iter().map(shape).collect::<Vec<_>>().join(","))
+            }
+            CompiledExpr::Or(xs) => {
+                format!("Or[{}]", xs.iter().map(shape).collect::<Vec<_>>().join(","))
+            }
+            CompiledExpr::Implies(a, b) => format!("Implies({},{})", shape(a), shape(b)),
+            CompiledExpr::Iff(a, b) => format!("Iff({},{})", shape(a), shape(b)),
+            CompiledExpr::Not(a) => format!("Not({})", shape(a)),
+            CompiledExpr::Forall { body, .. } => format!("Forall({})", shape(body)),
+            CompiledExpr::Exists { body, .. } => format!("Exists({})", shape(body)),
+            CompiledExpr::Let { body, .. } => format!("Let({})", shape(body)),
+            CompiledExpr::Unparsed(s) if s.trim().is_empty() => "EMPTY".to_string(),
+            _ => "_".to_string(),
+        }
+    }
+
+    /// Indentation-aware boolean parsing: these shapes must parse by their
+    /// TLA+ bulleted-list/quantifier-body structure, NOT by flat symbol
+    /// splitting. They pin the two ambiguous cases that a naive
+    /// first-line-de-basing splitter conflates:
+    ///   - sibling junction items (`\/ A` / `\/ B`, aligned) -> separate items
+    ///   - a quantifier/LET head's indented body -> stays inside the head
+    /// See the MCCheckpointCoordination SafetyInvariant + Paxos Phase2a specs.
+    #[test]
+    fn indented_boolean_disambiguates_siblings_from_nested_bodies() {
+        // (1) Nested quantifier body: `\A n : /\ a /\ b` — the body is the
+        // quantifier's, NOT sibling conjuncts. (The MCCheckpointCoordination
+        // SafetyInvariant bug: this flattened to And[Forall(EMPTY),_,_].)
+        let q = compile_expr("/\\ \\A n \\in Node :\n      /\\ a = 1\n      /\\ b = 2");
+        assert_eq!(shape(&q), "Forall(And[_,_])", "nested quantifier body");
+
+        // (2) Sibling disjunction after a conjunct (Phase2a): the second
+        // conjunct's two aligned `\/` items are siblings.
+        let p = compile_expr("/\\ x = 1\n/\\ \\/ a = 1\n   \\/ b = 2");
+        assert_eq!(shape(&p), "And[_,Or[_,_]]", "sibling disjunction");
+
+        // (3) Disjunct that is a quantifier with an indented body (Phase2a):
+        // the `\E m` body stays inside the Exists.
+        let d = compile_expr("\\/ a = 1\n\\/ \\E m \\in S :\n     /\\ p = 1\n     /\\ q = 2");
+        assert_eq!(shape(&d), "Or[_,Exists(And[_,_])]", "nested exists body");
+
+        // (4) Implication consequent that is an indented conjunction with a
+        // nested implication (the SafetyInvariant top shape):
+        // `P => /\ A /\ (R => B)`.
+        let i = compile_expr(
+            "L = N =>\n  /\\ a = 1\n  /\\ c = 2 =>\n    /\\ \\A n \\in Node : d = 1",
+        );
+        assert_eq!(
+            shape(&i),
+            "Implies(_,And[_,Implies(_,Forall(_))])",
+            "implication consequent as indented conjunction with nested implication"
+        );
+    }
 
     #[test]
     fn test_compile_literals() {

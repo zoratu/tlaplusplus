@@ -105,7 +105,21 @@ pub fn probe_next_disjuncts_with_instances(
         match execute_branch(disj.trim(), &BTreeMap::new(), definitions, instances, state) {
             Ok(successors) => {
                 probe.supported_disjuncts += 1;
-                probe.generated_successors += successors.len();
+                // Count DISTINCT successor states, matching the real model
+                // checker (which dedupes by fingerprint). A pure-guard
+                // existential — `\E m \in S : <no primed assignment>` — is a
+                // boolean condition, but the action evaluator expands it into
+                // one branch per satisfying witness; since the witness cannot
+                // affect the post-state, those branches are byte-identical and
+                // collapse to a single successor. Counting raw branches would
+                // over-report (e.g. Paxos `Phase2a` reported 2 identical
+                // successors for one enabled action). Deduping here is also a
+                // strict improvement for bad-opt detection: genuinely spurious
+                // over-generation (T1.4) yields *distinct* states (different
+                // Send payloads per Quorum×Value), which survive the dedup.
+                let mut seen = std::collections::HashSet::new();
+                probe.generated_successors +=
+                    successors.into_iter().filter(|s| seen.insert(s.clone())).count();
             }
             Err(err) => {
                 if is_probe_sampling_limitation(&err) {
