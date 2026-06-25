@@ -3202,6 +3202,66 @@ fn find_line_start_before(text: &str, pos: usize) -> usize {
 mod tests {
     use super::*;
 
+    /// Compact structural shape of a compiled expression, for asserting on the
+    /// parse tree of indentation-sensitive boolean shapes without depending on
+    /// leaf details. e.g. `And[_,Or[_,_]]`, `Forall(And[_,_])`.
+    fn shape(e: &CompiledExpr) -> String {
+        match e {
+            CompiledExpr::And(xs) => {
+                format!("And[{}]", xs.iter().map(shape).collect::<Vec<_>>().join(","))
+            }
+            CompiledExpr::Or(xs) => {
+                format!("Or[{}]", xs.iter().map(shape).collect::<Vec<_>>().join(","))
+            }
+            CompiledExpr::Implies(a, b) => format!("Implies({},{})", shape(a), shape(b)),
+            CompiledExpr::Iff(a, b) => format!("Iff({},{})", shape(a), shape(b)),
+            CompiledExpr::Not(a) => format!("Not({})", shape(a)),
+            CompiledExpr::Forall { body, .. } => format!("Forall({})", shape(body)),
+            CompiledExpr::Exists { body, .. } => format!("Exists({})", shape(body)),
+            CompiledExpr::Let { body, .. } => format!("Let({})", shape(body)),
+            CompiledExpr::Unparsed(s) if s.trim().is_empty() => "EMPTY".to_string(),
+            _ => "_".to_string(),
+        }
+    }
+
+    /// Indentation-aware boolean parsing: these shapes must parse by their
+    /// TLA+ bulleted-list/quantifier-body structure, NOT by flat symbol
+    /// splitting. They pin the two ambiguous cases that a naive
+    /// first-line-de-basing splitter conflates:
+    ///   - sibling junction items (`\/ A` / `\/ B`, aligned) -> separate items
+    ///   - a quantifier/LET head's indented body -> stays inside the head
+    /// See the MCCheckpointCoordination SafetyInvariant + Paxos Phase2a specs.
+    #[test]
+    fn indented_boolean_disambiguates_siblings_from_nested_bodies() {
+        // (1) Nested quantifier body: `\A n : /\ a /\ b` — the body is the
+        // quantifier's, NOT sibling conjuncts. (The MCCheckpointCoordination
+        // SafetyInvariant bug: this flattened to And[Forall(EMPTY),_,_].)
+        let q = compile_expr("/\\ \\A n \\in Node :\n      /\\ a = 1\n      /\\ b = 2");
+        assert_eq!(shape(&q), "Forall(And[_,_])", "nested quantifier body");
+
+        // (2) Sibling disjunction after a conjunct (Phase2a): the second
+        // conjunct's two aligned `\/` items are siblings.
+        let p = compile_expr("/\\ x = 1\n/\\ \\/ a = 1\n   \\/ b = 2");
+        assert_eq!(shape(&p), "And[_,Or[_,_]]", "sibling disjunction");
+
+        // (3) Disjunct that is a quantifier with an indented body (Phase2a):
+        // the `\E m` body stays inside the Exists.
+        let d = compile_expr("\\/ a = 1\n\\/ \\E m \\in S :\n     /\\ p = 1\n     /\\ q = 2");
+        assert_eq!(shape(&d), "Or[_,Exists(And[_,_])]", "nested exists body");
+
+        // (4) Implication consequent that is an indented conjunction with a
+        // nested implication (the SafetyInvariant top shape):
+        // `P => /\ A /\ (R => B)`.
+        let i = compile_expr(
+            "L = N =>\n  /\\ a = 1\n  /\\ c = 2 =>\n    /\\ \\A n \\in Node : d = 1",
+        );
+        assert_eq!(
+            shape(&i),
+            "Implies(_,And[_,Implies(_,Forall(_))])",
+            "implication consequent as indented conjunction with nested implication"
+        );
+    }
+
     #[test]
     fn test_compile_literals() {
         assert!(matches!(compile_expr("TRUE"), CompiledExpr::Bool(true)));
