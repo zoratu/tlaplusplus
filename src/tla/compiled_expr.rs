@@ -2657,13 +2657,16 @@ fn try_parse_exists(expr: &str) -> Option<CompiledExpr> {
 
     let colon_idx = find_top_level_colon(rest)?;
     let binding = rest[..colon_idx].trim();
-    // Re-base the body preserving relative indentation (NOT `.trim()`, which
-    // de-indents line 1 and would make an indented `/\`/`\/` body misalign with
-    // its continuation bullets — turning a quantifier's junction-list body into
-    // a flat split). `compile_expr` re-dedents anyway, but doing it here keeps
-    // the bullets aligned before that recursion.
-    let body_owned = dedent_common(&rest[colon_idx + 1..]);
-    let body = body_owned.as_str();
+    // Body uses `.trim()` (NOT `dedent_common`). The body is re-`compile_expr`'d,
+    // which re-bases it with `dedent_common` anyway, so within-body conjunction
+    // bullets still split correctly via the entry dedent + symbol fallback. We
+    // deliberately do NOT realign the body here: re-indenting a quantifier body
+    // before it reaches the action-IR layer flips the IR's guard-vs-action-
+    // existential classification of an inner `\E ... : <pure guard>` (it starts
+    // enumerating witnesses as successors). Keeping the de-indenting `.trim()`
+    // preserves the shape the action IR expects. Regression: Paxos `Phase2a`
+    // generated 2 (duplicate) successors instead of 1.
+    let body = rest[colon_idx + 1..].trim();
 
     if contains_tuple_binder(binding) {
         return Some(CompiledExpr::Unparsed(expr.to_string()));
@@ -2719,9 +2722,10 @@ fn try_parse_forall(expr: &str) -> Option<CompiledExpr> {
 
     let colon_idx = find_top_level_colon(rest)?;
     let binding = rest[..colon_idx].trim();
-    // Re-base the body preserving relative indentation (see try_parse_exists).
-    let body_owned = dedent_common(&rest[colon_idx + 1..]);
-    let body = body_owned.as_str();
+    // Body uses `.trim()` (NOT `dedent_common`); see try_parse_exists for why
+    // realigning a quantifier body here breaks action-IR existential
+    // classification (Paxos `Phase2a` duplicate-successor regression).
+    let body = rest[colon_idx + 1..].trim();
 
     if contains_tuple_binder(binding) {
         return Some(CompiledExpr::Unparsed(expr.to_string()));
