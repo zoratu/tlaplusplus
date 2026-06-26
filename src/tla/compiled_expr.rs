@@ -3327,7 +3327,7 @@ mod tests {
         );
         assert_eq!(
             shape(&e),
-            "Implies(_,And[_,Implies(_,Forall(And[_,_]))])",
+            "Implies(_,And[_,Implies(_,Forall(And[Not(_),Not(_)]))])",
             "deeply nested quantifier body with trailing subscript must not become FuncApply"
         );
     }
