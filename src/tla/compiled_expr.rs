@@ -441,6 +441,23 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
     // heads and bodies at consistent relative columns so the indented-boolean
     // splitter can tell siblings from nested bodies.
     let dedented = dedent_common(expr);
+    // If the first line is over-indented relative to the rest, strip its leading
+    // whitespace. This happens for a quantifier/LET head whose bulleted body
+    // aligns to the ENCLOSING bullet, so the body sits LESS indented than the
+    // head (e.g. a deeply nested `=> /\ \A n : /\ f /\ g`). dedent_common re-bases
+    // by the global min — the body — leaving the head with a leading space, which
+    // would break the prefix checks below (starts_with quantifier/LET/operator)
+    // and let a trailing subscript `[x]` be mis-read as a function application
+    // over the whole quantifier expression (observed: MCCheckpointCoordination
+    // SafetyInvariant compiled `\A n : ... ~g[n]` to `FuncApply(Unparsed(...), n)`).
+    let dedented = if dedented.starts_with([' ', '\t']) {
+        match dedented.split_once('\n') {
+            Some((first, rest)) => format!("{}\n{}", first.trim_start(), rest),
+            None => dedented.trim_start().to_string(),
+        }
+    } else {
+        dedented
+    };
     let expr = dedented.as_str();
 
     if expr.is_empty() {
@@ -3293,6 +3310,26 @@ mod tests {
             CompiledExpr::Unparsed(s) if s.trim().is_empty() => "EMPTY".to_string(),
             _ => "_".to_string(),
         }
+    }
+
+    /// 3-level nested implication where the innermost `\A` head is MORE indented
+    /// than its bulleted body (the body aligns to the enclosing bullet) and the
+    /// body ends in a subscript `[n]`. Regression for the MCCheckpointCoordination
+    /// `SafetyInvariant` mis-parse: the over-indented `\A` kept a leading space
+    /// after `dedent_common`, so `starts_with("\\A ")` failed and the trailing
+    /// `[n]` was mis-read as a function application over the whole quantifier
+    /// (`FuncApply(Unparsed("\\A n : ... ~g"), [n])`), making the invariant
+    /// evaluate to a Function instead of a Boolean.
+    #[test]
+    fn deeply_nested_implication_quantifier_body_with_trailing_subscript() {
+        let e = compile_expr(
+            "  /\\ p = 0 =>\n    /\\ q = 1\n    /\\ r = 2 =>\n      /\\ \\A n \\in S :\n        /\\ ~f[n]\n        /\\ ~g[n]",
+        );
+        assert_eq!(
+            shape(&e),
+            "Implies(_,And[_,Implies(_,Forall(And[_,_]))])",
+            "deeply nested quantifier body with trailing subscript must not become FuncApply"
+        );
     }
 
     /// Indentation-aware boolean parsing: these shapes must parse by their
