@@ -288,12 +288,12 @@ fn eval_compiled_inner(
         CompiledExpr::Eq(a, b) => {
             let left = eval_compiled_inner(a, ctx, depth)?;
             let right = eval_compiled_inner(b, ctx, depth)?;
-            Ok(TlaValue::Bool(left == right))
+            Ok(TlaValue::Bool(left.semantic_eq(&right)))
         }
         CompiledExpr::Neq(a, b) => {
             let left = eval_compiled_inner(a, ctx, depth)?;
             let right = eval_compiled_inner(b, ctx, depth)?;
-            Ok(TlaValue::Bool(left != right))
+            Ok(TlaValue::Bool(!left.semantic_eq(&right)))
         }
         CompiledExpr::Lt(a, b) => {
             let left = eval_compiled_inner(a, ctx, depth)?.as_int()?;
