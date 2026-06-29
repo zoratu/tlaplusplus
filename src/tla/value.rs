@@ -40,6 +40,26 @@ pub fn tla_state<const N: usize>(pairs: [(&str, TlaValue); N]) -> TlaState {
     pairs.into_iter().map(|(k, v)| (Arc::from(k), v)).collect()
 }
 
+/// Normalize every `1..n`-domain function in a state to its `Seq` form (see
+/// [`TlaValue::normalize_seq_functions`]), returning the rewritten state — but
+/// only when at least one variable actually changes. Returns `None` for an
+/// already-normal state so hot-path callers (state fingerprinting) avoid
+/// cloning and reallocating untouched states.
+pub fn normalize_state_if_changed(state: &TlaState) -> Option<TlaState> {
+    let updates: Vec<(Arc<str>, TlaValue)> = state
+        .iter()
+        .filter_map(|(k, v)| v.normalize_seq_changed().map(|nv| (k.clone(), nv)))
+        .collect();
+    if updates.is_empty() {
+        return None;
+    }
+    let mut normalized = state.clone();
+    for (k, nv) in updates {
+        normalized.insert(k, nv);
+    }
+    Some(normalized)
+}
+
 impl TlaValue {
     /// TLA+ value equality, treating a `Seq` and a `Function` whose domain is
     /// `1..Len` as equal — because in TLA+ a sequence IS a function over
@@ -93,6 +113,111 @@ impl TlaValue {
         for (i, elem) in s.iter().enumerate() {
             match f.get(&TlaValue::Int(i as i64 + 1)) {
                 Some(v) if elem.semantic_eq(v) => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// In TLA+ a sequence IS a function whose domain is `1..Len`, so
+    /// `<<a,b,c>>` and `[i \in 1..3 |-> ...]` are *equal*. Our `TlaValue` keeps
+    /// them as distinct variants (`Seq` vs `Function`), so logically-equal
+    /// values built two ways (e.g. a log as `[i \in 1..n |-> e]` vs via
+    /// `Append`) compare unequal and hash differently — inflating the state
+    /// space because the fingerprint store fails to dedup them.
+    ///
+    /// `normalize_seq_functions` rewrites every function with domain exactly
+    /// `{1,...,n}` (n >= 1) into its `Seq` form, recursively, giving one
+    /// canonical representation. Returns `None` when nothing changed so callers
+    /// on the hot path (state canonicalization) avoid reallocating untouched
+    /// states. The empty function is left as-is (conservative; non-empty
+    /// 1..n-domain functions are the ones that cause the dedup split in practice).
+    pub(crate) fn normalize_seq_changed(&self) -> Option<TlaValue> {
+        match self {
+            TlaValue::Function(map) => {
+                let mut any = false;
+                let mut nmap: BTreeMap<TlaValue, TlaValue> = BTreeMap::new();
+                for (k, v) in map.iter() {
+                    let nk = k.normalize_seq_changed();
+                    let nv = v.normalize_seq_changed();
+                    any |= nk.is_some() || nv.is_some();
+                    nmap.insert(nk.unwrap_or_else(|| k.clone()), nv.unwrap_or_else(|| v.clone()));
+                }
+                if Self::is_one_to_n_domain(&nmap) {
+                    Some(TlaValue::Seq(HashedArc::new(nmap.into_values().collect())))
+                } else if any {
+                    Some(TlaValue::Function(HashedArc::new(nmap)))
+                } else {
+                    None
+                }
+            }
+            TlaValue::Seq(items) => {
+                let mut any = false;
+                let nitems: Vec<TlaValue> = items
+                    .iter()
+                    .map(|v| match v.normalize_seq_changed() {
+                        Some(n) => {
+                            any = true;
+                            n
+                        }
+                        None => v.clone(),
+                    })
+                    .collect();
+                any.then(|| TlaValue::Seq(HashedArc::new(nitems)))
+            }
+            TlaValue::Set(items) => {
+                let mut any = false;
+                let nitems: BTreeSet<TlaValue> = items
+                    .iter()
+                    .map(|v| match v.normalize_seq_changed() {
+                        Some(n) => {
+                            any = true;
+                            n
+                        }
+                        None => v.clone(),
+                    })
+                    .collect();
+                any.then(|| TlaValue::Set(HashedArc::new(nitems)))
+            }
+            TlaValue::Record(fields) => {
+                let mut any = false;
+                let nfields: BTreeMap<String, TlaValue> = fields
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            k.clone(),
+                            match v.normalize_seq_changed() {
+                                Some(n) => {
+                                    any = true;
+                                    n
+                                }
+                                None => v.clone(),
+                            },
+                        )
+                    })
+                    .collect();
+                any.then(|| TlaValue::Record(HashedArc::new(nfields)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Owned-return convenience wrapper around [`Self::normalize_seq_changed`].
+    pub fn normalize_seq_functions(&self) -> TlaValue {
+        self.normalize_seq_changed().unwrap_or_else(|| self.clone())
+    }
+
+    /// True when `map`'s keys are exactly `Int(1), Int(2), ..., Int(n)` for some
+    /// `n >= 1` — i.e. the function is a TLA+ sequence. `BTreeMap` iterates keys
+    /// in sorted order and all `Int` keys sort numerically within the `Int`
+    /// variant, so positional comparison is sound.
+    fn is_one_to_n_domain(map: &BTreeMap<TlaValue, TlaValue>) -> bool {
+        if map.is_empty() {
+            return false;
+        }
+        for (i, k) in map.keys().enumerate() {
+            match k {
+                TlaValue::Int(v) if *v == (i as i64 + 1) => {}
                 _ => return false,
             }
         }

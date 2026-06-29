@@ -585,9 +585,26 @@ impl Model for TlaModel {
             }
         }
 
-        // No view or view failed - hash the full state using serialization
+        // No view or view failed - hash the full state using serialization.
+        //
+        // Normalize 1..n-domain functions to their Seq form FOR THE HASH ONLY
+        // (a TLA+ sequence IS a function over 1..Len). A value built as
+        // `[i \in 1..n |-> e]` and the same value built via `Append`/`<<...>>`
+        // are distinct `TlaValue` variants and otherwise serialize differently,
+        // so logically-equal states would fail to dedup — inflating the explored
+        // state space (MCCheckpointCoordination explored ~8x more states than
+        // TLC because logs (`Log == Seq(...)`) are built both ways). We hash the
+        // normalized form but the runtime keeps exploring the original state, so
+        // invariant evaluation is untouched (normalizing the *stored* state can
+        // expose ops that treat Seq vs Function inconsistently and yield false
+        // violations — this avoids that entirely). Only allocates when a
+        // 1..n-domain function is actually present.
         let mut hasher = fingerprint_hasher();
-        if let Ok(bytes) = bincode::serialize(state) {
+        let bytes = match crate::tla::value::normalize_state_if_changed(state) {
+            Some(normalized) => bincode::serialize(&normalized),
+            None => bincode::serialize(state),
+        };
+        if let Ok(bytes) = bytes {
             hasher.write(&bytes);
         }
         hasher.finish()
