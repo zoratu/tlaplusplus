@@ -134,10 +134,26 @@ pub fn canonicalize_tla_state(state: &TlaState, symmetry: &SymmetrySpec) -> TlaS
         })
         .collect();
 
-    // Iterate over the cross-product of per-group permutations as a
-    // mixed-radix counter. For each combination, build the combined
-    // value-remapping HashMap, apply to state, and track the lex-min.
-    let mut best: Option<TlaState> = None;
+    // Compute the lex-min over the SEQ-NORMALIZED state, but return the winning
+    // permutation applied to the ORIGINAL (un-normalized) state.
+    //
+    // Two representations of the same logical state (e.g. a log built as
+    // `[i \in 1..n |-> e]` (Function) vs as a `Seq` via `Append`) must pick the
+    // SAME canonical node permutation — otherwise the later fingerprint-time
+    // Seq normalization (which makes them structurally equal) still can't dedup
+    // them, because they'd carry different node permutations from this step.
+    // Comparing on the normalized form makes the chosen permutation
+    // representation-independent. We then apply that permutation to the original
+    // state so invariant evaluation continues to see the original representation
+    // (normalizing the *stored* state can expose ops that treat Seq vs Function
+    // inconsistently and produce false violations).
+    let norm_owned = crate::tla::value::normalize_state_if_changed(state);
+    let state_norm: &TlaState = norm_owned.as_ref().unwrap_or(state);
+
+    // Iterate over the cross-product of per-group permutations as a mixed-radix
+    // counter, tracking the permutation whose normalized image is lex-min.
+    let mut best_norm: Option<TlaState> = None;
+    let mut best_perm: Option<HashMap<String, String>> = None;
     let mut indices = vec![0usize; group_data.len()];
 
     'outer: loop {
@@ -152,16 +168,15 @@ pub fn canonicalize_tla_state(state: &TlaState, symmetry: &SymmetrySpec) -> TlaS
             }
         }
 
-        let candidate = if perm_map.iter().all(|(k, v)| k == v) {
-            state.clone()
+        let candidate_norm = if perm_map.iter().all(|(k, v)| k == v) {
+            state_norm.clone()
         } else {
-            apply_permutation_to_state(state, &perm_map)
+            apply_permutation_to_state(state_norm, &perm_map)
         };
 
-        match &best {
-            None => best = Some(candidate),
-            Some(b) if &candidate < b => best = Some(candidate),
-            _ => {}
+        if best_norm.as_ref().map_or(true, |b| &candidate_norm < b) {
+            best_norm = Some(candidate_norm);
+            best_perm = Some(perm_map);
         }
 
         // Increment indices (mixed-radix); stop when we overflow.
@@ -179,7 +194,12 @@ pub fn canonicalize_tla_state(state: &TlaState, symmetry: &SymmetrySpec) -> TlaS
         }
     }
 
-    best.unwrap_or_else(|| state.clone())
+    match best_perm {
+        Some(perm_map) if !perm_map.iter().all(|(k, v)| k == v) => {
+            apply_permutation_to_state(state, &perm_map)
+        }
+        _ => state.clone(),
+    }
 }
 
 /// All permutations of a slice. O(n!) — caller bounds n.
@@ -490,6 +510,60 @@ mod tests {
         for c in &canons[1..] {
             assert_eq!(&canons[0], c, "all 6 orbit members must canonicalize identically");
         }
+    }
+
+    /// The crux of the full-scale dedup regression: two representations of the
+    /// SAME logical state — a log built as a `Function` over `1..n` vs as a
+    /// `Seq` — must produce the same dedup key under symmetry. The runtime key
+    /// is `fingerprint(canonicalize(state))` and `fingerprint` normalizes
+    /// `1..n` functions to `Seq`, so they dedup iff
+    /// `normalize(canonicalize(S)) == normalize(canonicalize(T))`. The logs
+    /// contain node values so symmetry actually permutes their contents (the
+    /// case that only shows up at MaxLog>=2 with node-bearing logs).
+    #[test]
+    fn seq_and_function_log_states_share_dedup_key_under_symmetry() {
+        use crate::tla::value::normalize_state_if_changed;
+        use std::sync::Arc;
+
+        let mut spec = SymmetrySpec::new("NodeSym".to_string());
+        spec.initialize_with_groups(vec![
+            ["n1", "n2", "n3"].iter().map(|s| s.to_string()).collect(),
+        ]);
+        let nv = |s: &str| TlaValue::ModelValue(s.to_string());
+
+        // n1's log is the sequence <<n2, n3>>, expressed two ways.
+        let log_func = TlaValue::Function(HashedArc::new(BTreeMap::from([
+            (TlaValue::Int(1), nv("n2")),
+            (TlaValue::Int(2), nv("n3")),
+        ])));
+        let log_seq = TlaValue::Seq(HashedArc::new(vec![nv("n2"), nv("n3")]));
+
+        // ReplicatedLog = [node |-> log]; only n1's log representation differs.
+        let make = |n1_log: TlaValue| -> TlaState {
+            let rlog = TlaValue::Function(HashedArc::new(BTreeMap::from([
+                (nv("n1"), n1_log),
+                (nv("n2"), TlaValue::Seq(HashedArc::new(vec![]))),
+                (nv("n3"), TlaValue::Seq(HashedArc::new(vec![]))),
+            ])));
+            [
+                (Arc::<str>::from("Leader"), nv("n1")),
+                (Arc::<str>::from("ReplicatedLog"), rlog),
+            ]
+            .into_iter()
+            .collect()
+        };
+
+        let dedup_key = |st: &TlaState| -> TlaState {
+            let canon = canonicalize_tla_state(st, &spec);
+            normalize_state_if_changed(&canon).unwrap_or(canon)
+        };
+
+        assert_eq!(
+            dedup_key(&make(log_func)),
+            dedup_key(&make(log_seq)),
+            "Function-log and Seq-log representations of the same logical state \
+             must produce the same dedup key under symmetry"
+        );
     }
 
     #[test]
