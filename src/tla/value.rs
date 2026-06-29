@@ -41,6 +41,64 @@ pub fn tla_state<const N: usize>(pairs: [(&str, TlaValue); N]) -> TlaState {
 }
 
 impl TlaValue {
+    /// TLA+ value equality, treating a `Seq` and a `Function` whose domain is
+    /// `1..Len` as equal — because in TLA+ a sequence IS a function over
+    /// `1..Len`, so `<<a,b,c>> = [i \in 1..3 |-> ...]` is TRUE. Our `TlaValue`
+    /// keeps `Seq` and `Function` as distinct variants, so the derived `==`
+    /// reports them unequal; this is the semantics the `=`/`#`/`/=` operators
+    /// must use. Recurses through Set/Seq/Record/Function so nested sequences
+    /// (e.g. a record field or set element built two different ways) also
+    /// compare equal.
+    pub fn semantic_eq(&self, other: &TlaValue) -> bool {
+        match (self, other) {
+            (TlaValue::Seq(s), TlaValue::Function(f))
+            | (TlaValue::Function(f), TlaValue::Seq(s)) => Self::seq_eq_function(s, f),
+            (TlaValue::Seq(a), TlaValue::Seq(b)) => {
+                a.len() == b.len()
+                    && a.iter().zip(b.iter()).all(|(x, y)| x.semantic_eq(y))
+            }
+            (TlaValue::Function(a), TlaValue::Function(b)) => {
+                // Keys of equal functions sort identically (function keys are
+                // Int/ModelValue/String/etc., whose order is representation-
+                // independent), so positional comparison is sound and avoids an
+                // O(n^2) cross match on the hot path.
+                a.len() == b.len()
+                    && a.iter().zip(b.iter()).all(|((k1, v1), (k2, v2))| {
+                        k1.semantic_eq(k2) && v1.semantic_eq(v2)
+                    })
+            }
+            (TlaValue::Record(a), TlaValue::Record(b)) => {
+                a.len() == b.len()
+                    && a.iter()
+                        .zip(b.iter())
+                        .all(|((k1, v1), (k2, v2))| k1 == k2 && v1.semantic_eq(v2))
+            }
+            (TlaValue::Set(a), TlaValue::Set(b)) => {
+                // Set equality is by membership; a Seq element and its Function
+                // twin must match, so we can't rely on `BTreeSet ==`.
+                a.len() == b.len()
+                    && a.iter().all(|x| b.iter().any(|y| x.semantic_eq(y)))
+            }
+            // Primitives and genuinely-different variants: derived equality.
+            _ => self == other,
+        }
+    }
+
+    /// True when sequence `s` equals function `f` viewed as a TLA+ sequence:
+    /// `f`'s domain is exactly `1..s.len()` and `f[i]` equals `s[i-1]`.
+    fn seq_eq_function(s: &[TlaValue], f: &BTreeMap<TlaValue, TlaValue>) -> bool {
+        if s.len() != f.len() {
+            return false;
+        }
+        for (i, elem) in s.iter().enumerate() {
+            match f.get(&TlaValue::Int(i as i64 + 1)) {
+                Some(v) if elem.semantic_eq(v) => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+
     pub fn as_bool(&self) -> Result<bool> {
         match self {
             Self::Bool(v) => Ok(*v),
@@ -183,6 +241,55 @@ impl TlaValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A TLA+ sequence IS a function over `1..Len`, so `=` must treat them as
+    /// equal even though our `TlaValue` keeps them as distinct variants.
+    #[test]
+    fn semantic_eq_treats_seq_as_function_over_one_to_n() {
+        let seq = TlaValue::Seq(HashedArc::new(vec![
+            TlaValue::Int(7),
+            TlaValue::Int(8),
+            TlaValue::Int(9),
+        ]));
+        let func = TlaValue::Function(HashedArc::new(BTreeMap::from([
+            (TlaValue::Int(1), TlaValue::Int(7)),
+            (TlaValue::Int(2), TlaValue::Int(8)),
+            (TlaValue::Int(3), TlaValue::Int(9)),
+        ])));
+        // Equal both directions; the derived `==` (which we must NOT use for `=`)
+        // would report them unequal.
+        assert!(seq.semantic_eq(&func));
+        assert!(func.semantic_eq(&seq));
+        assert_ne!(seq, func, "derived eq distinguishes the variants (as expected)");
+
+        // Different values / wrong domain / different length are NOT equal.
+        let func_diff = TlaValue::Function(HashedArc::new(BTreeMap::from([
+            (TlaValue::Int(1), TlaValue::Int(7)),
+            (TlaValue::Int(2), TlaValue::Int(8)),
+            (TlaValue::Int(3), TlaValue::Int(0)),
+        ])));
+        assert!(!seq.semantic_eq(&func_diff));
+        let func_0based = TlaValue::Function(HashedArc::new(BTreeMap::from([
+            (TlaValue::Int(0), TlaValue::Int(7)),
+            (TlaValue::Int(1), TlaValue::Int(8)),
+            (TlaValue::Int(2), TlaValue::Int(9)),
+        ])));
+        assert!(!seq.semantic_eq(&func_0based), "0-based function is not this sequence");
+
+        // Nested: a record/set carrying the two forms compares equal too.
+        let rec_seq = TlaValue::Record(HashedArc::new(BTreeMap::from([(
+            "log".to_string(),
+            seq.clone(),
+        )])));
+        let rec_func = TlaValue::Record(HashedArc::new(BTreeMap::from([(
+            "log".to_string(),
+            func.clone(),
+        )])));
+        assert!(rec_seq.semantic_eq(&rec_func));
+        let set_seq = TlaValue::Set(HashedArc::new(BTreeSet::from([seq.clone()])));
+        let set_func = TlaValue::Set(HashedArc::new(BTreeSet::from([func.clone()])));
+        assert!(set_seq.semantic_eq(&set_func));
+    }
 
     #[test]
     fn set_ops_work() {

@@ -217,11 +217,11 @@ pub(super) fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usiz
             return match op.as_str() {
                 "=" => {
                     let right = eval_expr_inner(rhs, ctx, depth + 1)?;
-                    Ok(TlaValue::Bool(left == right))
+                    Ok(TlaValue::Bool(left.semantic_eq(&right)))
                 }
                 "/=" | "#" => {
                     let right = eval_expr_inner(rhs, ctx, depth + 1)?;
-                    Ok(TlaValue::Bool(left != right))
+                    Ok(TlaValue::Bool(!left.semantic_eq(&right)))
                 }
                 "<" | "<=" | "=<" | "\\leq" | ">" | ">=" | "\\geq" => {
                     let right = eval_expr_inner(rhs, ctx, depth + 1)?;
