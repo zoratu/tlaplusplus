@@ -568,45 +568,32 @@ impl Model for TlaModel {
 
         // Symmetry canonicalization is handled by canonicalize() in the
         // runtime before fingerprinting, so we fingerprint the state directly.
-
-        // If view function is defined, fingerprint only the view
-        if self.view.is_some() {
-            match self.evaluate_view(state) {
-                Ok(view_value) => {
-                    if let Ok(bytes) = bincode::serialize(&view_value) {
-                        let mut hasher = fingerprint_hasher();
-                        hasher.write(&bytes);
-                        return hasher.finish();
-                    }
-                }
-                Err(_) => {
-                    // View evaluation failed - fall back to full state fingerprint
-                }
-            }
-        }
-
-        // No view or view failed - hash the full state using serialization.
-        //
-        // Normalize 1..n-domain functions to their Seq form FOR THE HASH ONLY
-        // (a TLA+ sequence IS a function over 1..Len). A value built as
-        // `[i \in 1..n |-> e]` and the same value built via `Append`/`<<...>>`
-        // are distinct `TlaValue` variants and otherwise serialize differently,
-        // so logically-equal states would fail to dedup — inflating the explored
-        // state space (MCCheckpointCoordination explored ~8x more states than
-        // TLC because logs (`Log == Seq(...)`) are built both ways). We hash the
-        // normalized form but the runtime keeps exploring the original state, so
-        // invariant evaluation is untouched (normalizing the *stored* state can
-        // expose ops that treat Seq vs Function inconsistently and yield false
-        // violations — this avoids that entirely). Only allocates when a
-        // 1..n-domain function is actually present.
         let mut hasher = fingerprint_hasher();
-        let bytes = match crate::tla::value::normalize_state_if_changed(state) {
-            Some(normalized) => bincode::serialize(&normalized),
-            None => bincode::serialize(state),
-        };
-        if let Ok(bytes) = bytes {
-            hasher.write(&bytes);
+
+        // If a view function is defined, fingerprint only the view.
+        if self.view.is_some() {
+            if let Ok(view_value) = self.evaluate_view(state) {
+                view_value.hash_normalized(&mut hasher);
+                return hasher.finish();
+            }
+            // View evaluation failed — fall through to full-state fingerprint.
         }
+
+        // Hash the full state structurally in ONE pass, normalizing every
+        // 1..n-domain function to its Seq shape inline (a TLA+ sequence IS a
+        // function over 1..Len). A value built as `[i \in 1..n |-> e]` and the
+        // same value built via `Append`/`<<...>>` are distinct `TlaValue`
+        // variants, so without this they hash differently and the FP store
+        // fails to dedup them — inflating the state space (MCCheckpointCoord
+        // explored ~8x more states than TLC because logs (`Log == Seq(...)`)
+        // are built both ways). Hashing inline (vs the old
+        // normalize-then-`bincode::serialize`-then-hash) avoids cloning the
+        // state, rebuilding values, and the intermediate `Vec<u8>` — one
+        // traversal, no allocation. The runtime keeps exploring the ORIGINAL
+        // state, so invariant evaluation is untouched (normalizing the stored
+        // state can expose ops that treat Seq vs Function inconsistently and
+        // yield false violations — this avoids that entirely).
+        crate::tla::value::hash_state_normalized(state, &mut hasher);
         hasher.finish()
     }
 

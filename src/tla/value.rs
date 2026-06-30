@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::Hasher;
 use std::sync::Arc;
 
 use crate::tla::hashed_arc::HashedArc;
@@ -58,6 +59,24 @@ pub fn normalize_state_if_changed(state: &TlaState) -> Option<TlaState> {
         normalized.insert(k, nv);
     }
     Some(normalized)
+}
+
+/// Feed a state's fingerprint into `hasher` in ONE structural pass, normalizing
+/// any `1..n`-domain function to its `Seq` shape inline (a TLA+ sequence IS a
+/// function over `1..Len`). This is the fingerprint hot path: it avoids the
+/// previous `normalize_state_if_changed` (clone + rebuild) + `bincode::serialize`
+/// (a second walk into an intermediate `Vec<u8>`); there is no allocation and a
+/// single traversal. Determinism (required for cross-process/cluster dedup and
+/// for the `Seq`/`Function`-over-`1..n` collapse) comes from writing a per-variant
+/// tag byte, fixed-width `u64` lengths, and feeding a `Function`-over-`1..n` with
+/// the SAME tag and layout as the equivalent `Seq`.
+pub fn hash_state_normalized<H: Hasher>(state: &TlaState, hasher: &mut H) {
+    hasher.write_u64(state.len() as u64);
+    for (name, value) in state.iter() {
+        hasher.write_u64(name.len() as u64);
+        hasher.write(name.as_bytes());
+        value.hash_normalized(hasher);
+    }
 }
 
 impl TlaValue {
@@ -224,6 +243,99 @@ impl TlaValue {
         true
     }
 
+    /// Structural fingerprint hash with inline `Seq`/`Function`-over-`1..n`
+    /// normalization. A `Function` whose domain is `1..n` is hashed with the
+    /// SAME tag/layout as the equivalent `Seq`, so the two representations of a
+    /// logically-equal value collapse to the same fingerprint (the dedup
+    /// property). Every other variant gets a distinct leading tag byte and
+    /// fixed-width `u64` length prefixes, so distinct values stay distinct
+    /// (collision profile is the 64-bit baseline, same as the prior
+    /// serialize-then-hash path). See [`hash_state_normalized`].
+    pub fn hash_normalized<H: Hasher>(&self, h: &mut H) {
+        match self {
+            TlaValue::Bool(b) => {
+                h.write_u8(0);
+                h.write_u8(*b as u8);
+            }
+            TlaValue::Int(i) => {
+                h.write_u8(1);
+                h.write_u64(*i as u64);
+            }
+            TlaValue::String(s) => {
+                h.write_u8(2);
+                h.write_u64(s.len() as u64);
+                h.write(s.as_bytes());
+            }
+            TlaValue::ModelValue(s) => {
+                h.write_u8(3);
+                h.write_u64(s.len() as u64);
+                h.write(s.as_bytes());
+            }
+            TlaValue::Set(items) => {
+                h.write_u8(4);
+                h.write_u64(items.len() as u64);
+                for e in items.iter() {
+                    e.hash_normalized(h);
+                }
+            }
+            // A 1..n-domain function IS a sequence: hash it identically to a Seq.
+            TlaValue::Seq(items) => {
+                h.write_u8(5);
+                h.write_u64(items.len() as u64);
+                for e in items.iter() {
+                    e.hash_normalized(h);
+                }
+            }
+            TlaValue::Function(map) if Self::is_one_to_n_domain(map) => {
+                h.write_u8(5);
+                h.write_u64(map.len() as u64);
+                for v in map.values() {
+                    v.hash_normalized(h);
+                }
+            }
+            TlaValue::Function(map) => {
+                h.write_u8(6);
+                h.write_u64(map.len() as u64);
+                for (k, v) in map.iter() {
+                    k.hash_normalized(h);
+                    v.hash_normalized(h);
+                }
+            }
+            TlaValue::Record(fields) => {
+                h.write_u8(7);
+                h.write_u64(fields.len() as u64);
+                for (k, v) in fields.iter() {
+                    h.write_u64(k.len() as u64);
+                    h.write(k.as_bytes());
+                    v.hash_normalized(h);
+                }
+            }
+            TlaValue::Lambda {
+                params,
+                body,
+                captured_locals,
+            } => {
+                h.write_u8(8);
+                h.write_u64(params.len() as u64);
+                for p in params.iter() {
+                    h.write_u64(p.len() as u64);
+                    h.write(p.as_bytes());
+                }
+                h.write_u64(body.len() as u64);
+                h.write(body.as_bytes());
+                h.write_u64(captured_locals.len() as u64);
+                for (k, v) in captured_locals.iter() {
+                    h.write_u64(k.len() as u64);
+                    h.write(k.as_bytes());
+                    v.hash_normalized(h);
+                }
+            }
+            TlaValue::Undefined => {
+                h.write_u8(9);
+            }
+        }
+    }
+
     pub fn as_bool(&self) -> Result<bool> {
         match self {
             Self::Bool(v) => Ok(*v),
@@ -366,6 +478,54 @@ impl TlaValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The structural fingerprint hash must collapse a `Seq` and a `Function`
+    /// over `1..n` (the dedup property) while keeping everything else distinct.
+    #[test]
+    fn hash_normalized_collapses_seq_and_function_over_one_to_n() {
+        use crate::model::fingerprint_hasher;
+        let h = |v: &TlaValue| {
+            let mut hh = fingerprint_hasher();
+            v.hash_normalized(&mut hh);
+            hh.finish()
+        };
+        let seq = TlaValue::Seq(HashedArc::new(vec![TlaValue::Int(7), TlaValue::Int(8)]));
+        let func = TlaValue::Function(HashedArc::new(BTreeMap::from([
+            (TlaValue::Int(1), TlaValue::Int(7)),
+            (TlaValue::Int(2), TlaValue::Int(8)),
+        ])));
+        assert_eq!(h(&seq), h(&func), "Seq and Function-over-1..n must hash equal");
+
+        // Different content, a non-1..n (e.g. 0-based) function, and a Set with
+        // the same elements must NOT collide with the sequence.
+        let func_diff = TlaValue::Function(HashedArc::new(BTreeMap::from([
+            (TlaValue::Int(1), TlaValue::Int(7)),
+            (TlaValue::Int(2), TlaValue::Int(9)),
+        ])));
+        assert_ne!(h(&seq), h(&func_diff));
+        let func_0based = TlaValue::Function(HashedArc::new(BTreeMap::from([
+            (TlaValue::Int(0), TlaValue::Int(7)),
+            (TlaValue::Int(1), TlaValue::Int(8)),
+        ])));
+        assert_ne!(h(&seq), h(&func_0based), "0-based function is not this sequence");
+        let set = TlaValue::Set(HashedArc::new(BTreeSet::from([
+            TlaValue::Int(7),
+            TlaValue::Int(8),
+        ])));
+        assert_ne!(h(&seq), h(&set));
+
+        // Nested: the collapse recurses (a record field / set element built
+        // both ways hashes equal).
+        let rec_seq = TlaValue::Record(HashedArc::new(BTreeMap::from([(
+            "f".to_string(),
+            seq.clone(),
+        )])));
+        let rec_func = TlaValue::Record(HashedArc::new(BTreeMap::from([(
+            "f".to_string(),
+            func.clone(),
+        )])));
+        assert_eq!(h(&rec_seq), h(&rec_func));
+    }
 
     /// A TLA+ sequence IS a function over `1..Len`, so `=` must treat them as
     /// equal even though our `TlaValue` keeps them as distinct variants.
