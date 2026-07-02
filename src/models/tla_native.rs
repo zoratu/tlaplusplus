@@ -125,10 +125,18 @@ impl TlaModel {
             None
         };
 
-        let initial_states_vec = match joint_solved {
+        let mut initial_states_vec = match joint_solved {
             Some(states) => states,
             None => evaluate_init_states(&module, &config, &init_name)?,
         };
+        if let Some(first_state) = initial_states_vec.first() {
+            let names: Vec<Arc<str>> = first_state.keys().cloned().collect();
+            crate::tla::value::set_active_schema(names);
+            initial_states_vec = initial_states_vec
+                .into_iter()
+                .map(|state| state.into_iter().collect())
+                .collect();
+        }
         let temporal_properties = resolve_temporal_properties(&module, &config)?;
         let mut fairness_constraints = extract_fairness_constraints(&temporal_properties);
 
@@ -1659,7 +1667,7 @@ fn try_joint_init_invariant_solve(
 
         // Build an EvalContext seeded with config constants.
         let definition_scope = merged_definition_scope(module);
-        let mut base_state = BTreeMap::new();
+        let mut base_state = TlaState::new();
         for (k, v) in &cfg.constants {
             if let Some(tv) = config_value_to_tla(v) {
                 base_state.insert(Arc::from(k.as_str()), tv);
@@ -1726,7 +1734,7 @@ fn try_joint_init_invariant_solve(
                      found in {:.3}s",
                     elapsed.as_secs_f64()
                 );
-                let mut tla_state: TlaState = base_state.clone();
+                let mut tla_state = base_state.clone();
                 for (name, value) in state {
                     tla_state.insert(Arc::from(name.as_str()), value);
                 }
@@ -1966,7 +1974,7 @@ fn evaluate_init_states(
                 );
 
                 // Evaluate domain
-                let temp_state = BTreeMap::new();
+                let temp_state = TlaState::new();
                 let ctx = EvalContext::with_definitions_and_instances(
                     &temp_state,
                     &definition_scope,
@@ -1974,7 +1982,7 @@ fn evaluate_init_states(
                 );
 
                 // Inject constants into temp state for domain eval
-                let mut eval_state = BTreeMap::new();
+                let mut eval_state = TlaState::new();
                 for (k, v) in &cfg.constants {
                     if let Some(tv) = config_value_to_tla(v) {
                         eval_state.insert(Arc::from(k.as_str()), tv);
@@ -2051,7 +2059,7 @@ fn evaluate_init_states(
     }
 
     // Start with constants from config
-    let mut base_state = BTreeMap::new();
+    let mut base_state = TlaState::new();
     let mut deferred_operator_refs = Vec::new();
     for (k, v) in &cfg.constants {
         match v {
