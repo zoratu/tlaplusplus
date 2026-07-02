@@ -281,6 +281,19 @@ impl TlaState {
     pub fn slot_of(&self, name: &str) -> Option<u32> {
         self.schema.slot_of.get(name).copied()
     }
+
+    /// Build a new state by mapping each value, PRESERVING the schema `Arc` and
+    /// slot order. This is the hot-path way to transform a state whose variable
+    /// set is unchanged (e.g. symmetry permutes the ModelValues *inside* values
+    /// but never the variable names): it avoids the `iter().collect()` round-trip
+    /// through `StateBuilder`/`from_entries`, which would re-derive a schema
+    /// (sort + HashMap build) and clone every key+value twice.
+    pub fn map_values(&self, f: impl Fn(&TlaValue) -> TlaValue) -> TlaState {
+        TlaState {
+            schema: Arc::clone(&self.schema),
+            values: self.values.iter().map(f).collect(),
+        }
+    }
 }
 
 impl<'a> TlaStateEntry<'a> {
@@ -352,9 +365,17 @@ impl Ord for TlaState {
 
 impl Hash for TlaState {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        // Delegate to the old representation so Stage 1 preserves BTreeMap hash
-        // semantics exactly, including any std implementation details.
-        self.as_btree_map().hash(state);
+        // Hash the (name, value) pairs in schema (sorted) order — consistent
+        // with `Eq`/`Ord` (equal states hash equally) and with `BTreeMap`'s
+        // length-then-entries scheme. Avoids rebuilding a `BTreeMap` per hash
+        // (which cloned every Arc<str> key + value). `Hash` is only used for
+        // in-memory HashSet/HashMap keys within a run, so the exact value need
+        // not match the old impl — only Eq-consistency matters.
+        state.write_usize(self.len());
+        for (name, value) in self.iter() {
+            name.hash(state);
+            value.hash(state);
+        }
     }
 }
 
