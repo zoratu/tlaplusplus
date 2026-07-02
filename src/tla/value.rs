@@ -446,22 +446,19 @@ pub fn tla_state<const N: usize>(pairs: [(&str, TlaValue); N]) -> TlaState {
 /// already-normal state so hot-path callers (state fingerprinting) avoid
 /// cloning and reallocating untouched states.
 pub fn normalize_state_if_changed(state: &TlaState) -> Option<TlaState> {
-    let mut values = state.values.clone();
-    let mut changed = false;
+    // Defer cloning the values vec until the first slot actually changes, so a
+    // state with no 1..n-domain functions (the common case, and this is a
+    // fingerprint/symmetry hot path) allocates nothing.
+    let mut values: Option<Vec<TlaValue>> = None;
     for (idx, value) in state.values.iter().enumerate() {
         if let Some(normalized) = value.normalize_seq_changed() {
-            values[idx] = normalized;
-            changed = true;
+            values.get_or_insert_with(|| state.values.clone())[idx] = normalized;
         }
     }
-    if changed {
-        Some(TlaState {
-            schema: Arc::clone(&state.schema),
-            values,
-        })
-    } else {
-        None
-    }
+    values.map(|values| TlaState {
+        schema: Arc::clone(&state.schema),
+        values,
+    })
 }
 
 impl TlaValue {
