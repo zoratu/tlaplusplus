@@ -1,6 +1,11 @@
-use anyhow::{Result, anyhow};
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use anyhow::{anyhow, Result};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::cell::RefCell;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use crate::tla::hashed_arc::HashedArc;
@@ -33,7 +38,381 @@ pub enum TlaValue {
     Undefined,
 }
 
-pub type TlaState = BTreeMap<Arc<str>, TlaValue>;
+#[derive(Clone, Debug)]
+pub struct StateSchema {
+    pub names: Vec<Arc<str>>,
+    slot_of: HashMap<Arc<str>, u32>,
+}
+
+thread_local! {
+    static ACTIVE_SCHEMA: RefCell<Option<Arc<StateSchema>>> = RefCell::new(None);
+}
+
+impl StateSchema {
+    pub fn new(mut names: Vec<Arc<str>>) -> Self {
+        names.sort();
+        names.dedup();
+        assert!(
+            names.len() <= u32::MAX as usize,
+            "TlaState schema has too many slots"
+        );
+        let slot_of = names
+            .iter()
+            .enumerate()
+            .map(|(slot, name)| (Arc::clone(name), slot as u32))
+            .collect();
+        Self { names, slot_of }
+    }
+
+    pub fn same_names(&self, other: &Self) -> bool {
+        self.names == other.names
+    }
+
+    pub fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+}
+
+pub fn set_active_schema(names: Vec<Arc<str>>) {
+    ACTIVE_SCHEMA.with(|active| {
+        *active.borrow_mut() = Some(Arc::new(StateSchema::new(names)));
+    });
+}
+
+pub fn clear_active_schema() {
+    ACTIVE_SCHEMA.with(|active| {
+        *active.borrow_mut() = None;
+    });
+}
+
+fn schema_for_names(names: Vec<Arc<str>>) -> Arc<StateSchema> {
+    let schema = StateSchema::new(names);
+    ACTIVE_SCHEMA.with(|active| {
+        if let Some(active_schema) = active.borrow().as_ref() {
+            if active_schema.same_names(&schema) {
+                return Arc::clone(active_schema);
+            }
+        }
+        Arc::new(schema)
+    })
+}
+
+#[derive(Clone)]
+pub struct TlaState {
+    schema: Arc<StateSchema>,
+    values: Vec<TlaValue>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct StateBuilder {
+    entries: BTreeMap<Arc<str>, TlaValue>,
+}
+
+pub struct TlaStateIter<'a> {
+    names: std::slice::Iter<'a, Arc<str>>,
+    values: std::slice::Iter<'a, TlaValue>,
+}
+
+pub enum TlaStateEntry<'a> {
+    Occupied(&'a mut TlaValue),
+    Vacant {
+        state: &'a mut TlaState,
+        name: Arc<str>,
+    },
+}
+
+impl<'a> Iterator for TlaStateIter<'a> {
+    type Item = (&'a Arc<str>, &'a TlaValue);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        Some((self.names.next()?, self.values.next()?))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.values.size_hint()
+    }
+}
+
+impl ExactSizeIterator for TlaStateIter<'_> {}
+
+impl StateBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&mut self, name: Arc<str>, value: TlaValue) -> Option<TlaValue> {
+        self.entries.insert(name, value)
+    }
+
+    pub fn remove(&mut self, name: &str) -> Option<TlaValue> {
+        self.entries.remove(name)
+    }
+
+    pub fn get(&self, name: &str) -> Option<&TlaValue> {
+        self.entries.get(name)
+    }
+
+    pub fn contains_key(&self, name: &str) -> bool {
+        self.entries.contains_key(name)
+    }
+
+    pub fn finish(self) -> TlaState {
+        TlaState::from_entries(self.entries)
+    }
+}
+
+impl FromIterator<(Arc<str>, TlaValue)> for StateBuilder {
+    fn from_iter<T: IntoIterator<Item = (Arc<str>, TlaValue)>>(iter: T) -> Self {
+        Self {
+            entries: iter.into_iter().collect(),
+        }
+    }
+}
+
+impl TlaState {
+    pub fn new() -> Self {
+        Self {
+            schema: schema_for_names(Vec::new()),
+            values: Vec::new(),
+        }
+    }
+
+    fn from_entries(entries: BTreeMap<Arc<str>, TlaValue>) -> Self {
+        let names: Vec<Arc<str>> = entries.keys().cloned().collect();
+        let schema = schema_for_names(names);
+        let values = schema
+            .names
+            .iter()
+            .map(|name| {
+                entries
+                    .get(name)
+                    .expect("schema names must match StateBuilder entries")
+                    .clone()
+            })
+            .collect();
+        Self { schema, values }
+    }
+
+    fn same_schema_names(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.schema, &other.schema) || self.schema.same_names(&other.schema)
+    }
+
+    fn as_btree_map(&self) -> BTreeMap<Arc<str>, TlaValue> {
+        self.iter()
+            .map(|(k, v)| (Arc::clone(k), v.clone()))
+            .collect()
+    }
+
+    pub fn get(&self, name: &str) -> Option<&TlaValue> {
+        self.slot_of(name)
+            .and_then(|slot| self.values.get(slot as usize))
+    }
+
+    pub fn get_mut(&mut self, name: &str) -> Option<&mut TlaValue> {
+        self.slot_of(name)
+            .and_then(|slot| self.values.get_mut(slot as usize))
+    }
+
+    pub fn contains_key(&self, name: &str) -> bool {
+        self.slot_of(name).is_some()
+    }
+
+    pub fn insert(&mut self, name: Arc<str>, value: TlaValue) -> Option<TlaValue> {
+        if let Some(slot) = self.slot_of(name.as_ref()) {
+            return Some(std::mem::replace(&mut self.values[slot as usize], value));
+        }
+
+        let mut entries = self.as_btree_map();
+        entries.insert(name, value);
+        *self = Self::from_entries(entries);
+        None
+    }
+
+    pub fn entry(&mut self, name: Arc<str>) -> TlaStateEntry<'_> {
+        match self.slot_of(name.as_ref()) {
+            Some(slot) => TlaStateEntry::Occupied(&mut self.values[slot as usize]),
+            None => TlaStateEntry::Vacant { state: self, name },
+        }
+    }
+
+    pub fn remove(&mut self, name: &str) -> Option<TlaValue> {
+        self.slot_of(name)?;
+        let mut entries = self.as_btree_map();
+        let removed = entries.remove(name);
+        *self = Self::from_entries(entries);
+        removed
+    }
+
+    pub fn iter(&self) -> TlaStateIter<'_> {
+        TlaStateIter {
+            names: self.schema.names.iter(),
+            values: self.values.iter(),
+        }
+    }
+
+    pub fn keys(&self) -> std::slice::Iter<'_, Arc<str>> {
+        self.schema.names.iter()
+    }
+
+    pub fn values(&self) -> std::slice::Iter<'_, TlaValue> {
+        self.values.iter()
+    }
+
+    pub fn values_mut(&mut self) -> std::slice::IterMut<'_, TlaValue> {
+        self.values.iter_mut()
+    }
+
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    pub fn get_slot(&self, slot: u32) -> Option<&TlaValue> {
+        self.values.get(slot as usize)
+    }
+
+    pub fn slot_of(&self, name: &str) -> Option<u32> {
+        self.schema.slot_of.get(name).copied()
+    }
+}
+
+impl<'a> TlaStateEntry<'a> {
+    pub fn or_insert(self, default: TlaValue) -> &'a mut TlaValue {
+        match self {
+            Self::Occupied(value) => value,
+            Self::Vacant { state, name } => {
+                state.insert(Arc::clone(&name), default);
+                state
+                    .get_mut(name.as_ref())
+                    .expect("inserted TlaState entry must be present")
+            }
+        }
+    }
+
+    pub fn or_insert_with(self, default: impl FnOnce() -> TlaValue) -> &'a mut TlaValue {
+        match self {
+            Self::Occupied(value) => value,
+            Self::Vacant { state, name } => {
+                state.insert(Arc::clone(&name), default());
+                state
+                    .get_mut(name.as_ref())
+                    .expect("inserted TlaState entry must be present")
+            }
+        }
+    }
+}
+
+impl Default for TlaState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for TlaState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map().entries(self.iter()).finish()
+    }
+}
+
+impl PartialEq for TlaState {
+    fn eq(&self, other: &Self) -> bool {
+        if self.len() != other.len() {
+            return false;
+        }
+        if self.same_schema_names(other) {
+            return self.values == other.values;
+        }
+        self.iter().eq(other.iter())
+    }
+}
+
+impl Eq for TlaState {}
+
+impl PartialOrd for TlaState {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TlaState {
+    fn cmp(&self, other: &Self) -> Ordering {
+        if self.same_schema_names(other) {
+            return self.values.cmp(&other.values);
+        }
+        self.iter().cmp(other.iter())
+    }
+}
+
+impl Hash for TlaState {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Delegate to the old representation so Stage 1 preserves BTreeMap hash
+        // semantics exactly, including any std implementation details.
+        self.as_btree_map().hash(state);
+    }
+}
+
+impl std::ops::Index<&str> for TlaState {
+    type Output = TlaValue;
+
+    fn index(&self, index: &str) -> &Self::Output {
+        self.get(index)
+            .unwrap_or_else(|| panic!("TlaState missing key '{index}'"))
+    }
+}
+
+impl Serialize for TlaState {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(self.len()))?;
+        for (name, value) in self.iter() {
+            map.serialize_entry(name, value)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for TlaState {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let entries = BTreeMap::<Arc<str>, TlaValue>::deserialize(deserializer)?;
+        Ok(Self::from_entries(entries))
+    }
+}
+
+impl FromIterator<(Arc<str>, TlaValue)> for TlaState {
+    fn from_iter<T: IntoIterator<Item = (Arc<str>, TlaValue)>>(iter: T) -> Self {
+        StateBuilder::from_iter(iter).finish()
+    }
+}
+
+impl IntoIterator for TlaState {
+    type Item = (Arc<str>, TlaValue);
+    type IntoIter = std::vec::IntoIter<Self::Item>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.schema
+            .names
+            .clone()
+            .into_iter()
+            .zip(self.values)
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a TlaState {
+    type Item = (&'a Arc<str>, &'a TlaValue);
+    type IntoIter = TlaStateIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
 
 /// Build a [`TlaState`] from `(&str, TlaValue)` pairs, converting keys to `Arc<str>`.
 pub fn tla_state<const N: usize>(pairs: [(&str, TlaValue); N]) -> TlaState {
@@ -46,18 +425,22 @@ pub fn tla_state<const N: usize>(pairs: [(&str, TlaValue); N]) -> TlaState {
 /// already-normal state so hot-path callers (state fingerprinting) avoid
 /// cloning and reallocating untouched states.
 pub fn normalize_state_if_changed(state: &TlaState) -> Option<TlaState> {
-    let updates: Vec<(Arc<str>, TlaValue)> = state
-        .iter()
-        .filter_map(|(k, v)| v.normalize_seq_changed().map(|nv| (k.clone(), nv)))
-        .collect();
-    if updates.is_empty() {
-        return None;
+    let mut values = state.values.clone();
+    let mut changed = false;
+    for (idx, value) in state.values.iter().enumerate() {
+        if let Some(normalized) = value.normalize_seq_changed() {
+            values[idx] = normalized;
+            changed = true;
+        }
     }
-    let mut normalized = state.clone();
-    for (k, nv) in updates {
-        normalized.insert(k, nv);
+    if changed {
+        Some(TlaState {
+            schema: Arc::clone(&state.schema),
+            values,
+        })
+    } else {
+        None
     }
-    Some(normalized)
 }
 
 impl TlaValue {
@@ -74,8 +457,7 @@ impl TlaValue {
             (TlaValue::Seq(s), TlaValue::Function(f))
             | (TlaValue::Function(f), TlaValue::Seq(s)) => Self::seq_eq_function(s, f),
             (TlaValue::Seq(a), TlaValue::Seq(b)) => {
-                a.len() == b.len()
-                    && a.iter().zip(b.iter()).all(|(x, y)| x.semantic_eq(y))
+                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.semantic_eq(y))
             }
             (TlaValue::Function(a), TlaValue::Function(b)) => {
                 // Keys of equal functions sort identically (function keys are
@@ -83,9 +465,9 @@ impl TlaValue {
                 // independent), so positional comparison is sound and avoids an
                 // O(n^2) cross match on the hot path.
                 a.len() == b.len()
-                    && a.iter().zip(b.iter()).all(|((k1, v1), (k2, v2))| {
-                        k1.semantic_eq(k2) && v1.semantic_eq(v2)
-                    })
+                    && a.iter()
+                        .zip(b.iter())
+                        .all(|((k1, v1), (k2, v2))| k1.semantic_eq(k2) && v1.semantic_eq(v2))
             }
             (TlaValue::Record(a), TlaValue::Record(b)) => {
                 a.len() == b.len()
@@ -96,8 +478,7 @@ impl TlaValue {
             (TlaValue::Set(a), TlaValue::Set(b)) => {
                 // Set equality is by membership; a Seq element and its Function
                 // twin must match, so we can't rely on `BTreeSet ==`.
-                a.len() == b.len()
-                    && a.iter().all(|x| b.iter().any(|y| x.semantic_eq(y)))
+                a.len() == b.len() && a.iter().all(|x| b.iter().any(|y| x.semantic_eq(y)))
             }
             // Primitives and genuinely-different variants: derived equality.
             _ => self == other,
@@ -141,7 +522,10 @@ impl TlaValue {
                     let nk = k.normalize_seq_changed();
                     let nv = v.normalize_seq_changed();
                     any |= nk.is_some() || nv.is_some();
-                    nmap.insert(nk.unwrap_or_else(|| k.clone()), nv.unwrap_or_else(|| v.clone()));
+                    nmap.insert(
+                        nk.unwrap_or_else(|| k.clone()),
+                        nv.unwrap_or_else(|| v.clone()),
+                    );
                 }
                 if Self::is_one_to_n_domain(&nmap) {
                     Some(TlaValue::Seq(HashedArc::new(nmap.into_values().collect())))
@@ -385,7 +769,10 @@ mod tests {
         // would report them unequal.
         assert!(seq.semantic_eq(&func));
         assert!(func.semantic_eq(&seq));
-        assert_ne!(seq, func, "derived eq distinguishes the variants (as expected)");
+        assert_ne!(
+            seq, func,
+            "derived eq distinguishes the variants (as expected)"
+        );
 
         // Different values / wrong domain / different length are NOT equal.
         let func_diff = TlaValue::Function(HashedArc::new(BTreeMap::from([
@@ -399,7 +786,10 @@ mod tests {
             (TlaValue::Int(1), TlaValue::Int(8)),
             (TlaValue::Int(2), TlaValue::Int(9)),
         ])));
-        assert!(!seq.semantic_eq(&func_0based), "0-based function is not this sequence");
+        assert!(
+            !seq.semantic_eq(&func_0based),
+            "0-based function is not this sequence"
+        );
 
         // Nested: a record/set carrying the two forms compares equal too.
         let rec_seq = TlaValue::Record(HashedArc::new(BTreeMap::from([(
@@ -454,6 +844,70 @@ mod tests {
             &TlaValue::Int(7)
         );
     }
+
+    #[test]
+    fn state_matches_old_btreemap_eq_hash_order_and_serialization() {
+        use std::collections::hash_map::DefaultHasher;
+
+        fn hash_of<T: Hash>(value: &T) -> u64 {
+            let mut hasher = DefaultHasher::new();
+            value.hash(&mut hasher);
+            hasher.finish()
+        }
+
+        let old: BTreeMap<Arc<str>, TlaValue> = BTreeMap::from([
+            (Arc::from("x"), TlaValue::Int(1)),
+            (Arc::from("y"), TlaValue::Bool(true)),
+        ]);
+        let old_larger: BTreeMap<Arc<str>, TlaValue> = BTreeMap::from([
+            (Arc::from("x"), TlaValue::Int(2)),
+            (Arc::from("y"), TlaValue::Bool(true)),
+        ]);
+
+        let state_from_map: TlaState = old.clone().into_iter().collect();
+        let state_from_pairs = tla_state([("y", TlaValue::Bool(true)), ("x", TlaValue::Int(1))]);
+        let state_larger: TlaState = old_larger.clone().into_iter().collect();
+
+        assert_eq!(state_from_map, state_from_pairs);
+        assert_eq!(hash_of(&old), hash_of(&state_from_map));
+        assert_eq!(old.cmp(&old_larger), state_from_map.cmp(&state_larger));
+        assert_eq!(
+            bincode::serialize(&old).expect("old map should serialize"),
+            bincode::serialize(&state_from_map).expect("state should serialize")
+        );
+    }
+
+    #[test]
+    fn state_names_are_part_of_identity() {
+        let x = tla_state([("x", TlaValue::Int(1))]);
+        let y = tla_state([("y", TlaValue::Int(1))]);
+
+        assert_ne!(x, y);
+    }
+
+    #[test]
+    fn state_bincode_round_trip_preserves_entries() {
+        let state = tla_state([("x", TlaValue::Int(1)), ("y", TlaValue::Bool(false))]);
+        let bytes = bincode::serialize(&state).expect("state should serialize");
+        let decoded: TlaState = bincode::deserialize(&bytes).expect("state should deserialize");
+
+        assert_eq!(decoded, state);
+        assert_eq!(decoded.get("x"), Some(&TlaValue::Int(1)));
+        assert_eq!(decoded.get("y"), Some(&TlaValue::Bool(false)));
+    }
+
+    #[test]
+    fn state_slots_are_available_after_building() {
+        let state = tla_state([("y", TlaValue::Bool(true)), ("x", TlaValue::Int(5))]);
+
+        let x_slot = state.slot_of("x").expect("x slot should exist");
+        let y_slot = state.slot_of("y").expect("y slot should exist");
+
+        assert_eq!(x_slot, 0);
+        assert_eq!(y_slot, 1);
+        assert_eq!(state.get_slot(x_slot), Some(&TlaValue::Int(5)));
+        assert_eq!(state.get_slot(y_slot), Some(&TlaValue::Bool(true)));
+    }
 }
 
 /// Property-based tests using proptest
@@ -475,7 +929,8 @@ mod proptests {
 
     /// Generate a set of TlaValues
     fn arb_tla_set() -> impl Strategy<Value = TlaValue> {
-        prop::collection::btree_set(arb_tla_value(), 0..10).prop_map(|s| TlaValue::Set(HashedArc::new(s)))
+        prop::collection::btree_set(arb_tla_value(), 0..10)
+            .prop_map(|s| TlaValue::Set(HashedArc::new(s)))
     }
 
     /// Generate a sequence of TlaValues
