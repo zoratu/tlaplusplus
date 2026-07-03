@@ -3,13 +3,15 @@
 //! This module provides evaluation of pre-compiled expressions, avoiding
 //! the overhead of string parsing on every evaluation.
 
-use crate::tla::compiled_expr::{CompiledExpr, compile_expr, find_top_level_colon};
+use crate::tla::compiled_expr::{
+    CompiledExpr, compile_expr, find_top_level_colon, resolve_state_vars_with_binders,
+};
 use crate::tla::hashed_arc::HashedArc;
 use crate::tla::eval::{
     EvalContext, apply_value, eval_expr, eval_operator_call, normalize_param_name,
 };
 use crate::tla::formula::split_top_level;
-use crate::tla::value::TlaValue;
+use crate::tla::value::{TlaValue, get_resolution_schema};
 #[cfg(test)]
 use crate::tla::value::tla_state;
 use ahash::AHashMap;
@@ -21,11 +23,9 @@ use std::sync::{Arc, OnceLock};
 
 // Thread-local cache for compiled operator bodies.
 // Thread-local storage eliminates cross-thread contention entirely.
-// Key is the operator BODY only — the body text uniquely determines the
-// compiled expression (the operator name is just a debug label and would
-// be redundant in the key). Skipping the name lets us look up by `&str`
-// without `format!`-allocating a fresh key string on every hit, which
-// previously fired millions of times per minute under full-MC.
+// No-param operators use the body text directly as the key so hot lookups
+// still avoid allocation. Parameterized operators include params in the key
+// because slot resolution must treat params as binders.
 // `AHashMap` swaps SIP for ahash — these caches are thread-local with
 // non-adversarial keys, so SIP's HashDoS resistance is unnecessary
 // overhead.
@@ -62,13 +62,33 @@ fn trace_forall_enabled() -> bool {
 
 /// Get or compile an operator body expression (thread-local, zero contention).
 ///
-/// Cache key is the body text alone — the body uniquely determines the
-/// compiled expression; the name is just a debug label. Looking up by
-/// `&str` avoids the per-hit `format!` allocation that the old
-/// `format!("{}:{}", name, body)` key required.
-fn get_or_compile_operator(name: &str, body: &str) -> Arc<CompiledExpr> {
+/// Cache key is the body text for no-param operators, or body plus parameter
+/// names for parameterized operators. Slot resolution is parameter-sensitive
+/// because params shadow state vars, so parameterized operators cannot safely
+/// share a body-only compiled expression.
+fn operator_cache_key(body: &str, params: &[String]) -> String {
+    if params.is_empty() {
+        return body.to_string();
+    }
+    let params_len = params.iter().map(String::len).sum::<usize>();
+    let mut key = String::with_capacity(body.len() + params_len + params.len());
+    key.push_str(body);
+    for param in params {
+        key.push('\0');
+        key.push_str(param);
+    }
+    key
+}
+
+fn get_or_compile_operator(name: &str, body: &str, params: &[String]) -> Arc<CompiledExpr> {
     THREAD_LOCAL_OPERATOR_CACHE.with(|cache| {
-        if let Some(cached) = cache.borrow().get(body) {
+        let cache_key = if params.is_empty() {
+            None
+        } else {
+            Some(operator_cache_key(body, params))
+        };
+        let lookup_key = cache_key.as_deref().unwrap_or(body);
+        if let Some(cached) = cache.borrow().get(lookup_key) {
             return Arc::clone(cached);
         }
 
@@ -82,10 +102,19 @@ fn get_or_compile_operator(name: &str, body: &str) -> Arc<CompiledExpr> {
         }
 
         // Compile and cache (one allocation per unique body, on miss only)
-        let compiled = Arc::new(compile_expr(body));
-        cache
-            .borrow_mut()
-            .insert(body.to_string(), Arc::clone(&compiled));
+        let mut compiled_expr = compile_expr(body);
+        if let Some(schema) = get_resolution_schema() {
+            resolve_state_vars_with_binders(
+                &mut compiled_expr,
+                schema.as_ref(),
+                params.iter().map(|param| normalize_param_name(param)),
+            );
+        }
+        let compiled = Arc::new(compiled_expr);
+        cache.borrow_mut().insert(
+            cache_key.clone().unwrap_or_else(|| body.to_string()),
+            Arc::clone(&compiled),
+        );
         compiled
     })
 }
@@ -167,6 +196,53 @@ pub fn eval_compiled(expr: &CompiledExpr, ctx: &EvalContext<'_>) -> Result<TlaVa
     eval_compiled_inner(expr, ctx, 0)
 }
 
+fn eval_var_by_name(name: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<TlaValue> {
+    // First check local variables
+    if let Some(v) = ctx.runtime_value(name) {
+        if trace_var_enabled() {
+            eprintln!("VAR {} -> Ok({:?})", name, v);
+        }
+        return Ok(v);
+    }
+
+    // Then check if it's a no-arg operator - use compiled evaluation
+    if let Some(def) = ctx.definition(name) {
+        if def.params.is_empty() {
+            // Get or compile the operator body
+            let compiled_body = get_or_compile_operator(name, &def.body, &def.params);
+            let result = eval_compiled_inner(&compiled_body, ctx, depth);
+            if trace_var_enabled() {
+                eprintln!("VAR {} (operator) -> {:?}", name, result);
+            }
+            return result.map_err(|e| anyhow!("failed to resolve {}: {}", name, e));
+        }
+
+        let value = TlaValue::Lambda {
+            params: Arc::new(def.params.clone()),
+            body: def.body.clone(),
+            captured_locals: Arc::new((*ctx.locals).clone()),
+        };
+        if trace_var_enabled() {
+            eprintln!("VAR {} (operator value) -> Ok({:?})", name, value);
+        }
+        return Ok(value);
+    }
+
+    // T205: known zero-arg built-ins must be evaluated even when bare
+    // (interpreter does this in resolve_identifier). Without this the
+    // compiler returns ModelValue("IOEnv") while the interpreter
+    // returns the actual env Record — surfaced by fuzz_tla_swarm.
+    if matches!(name, "IOEnv" | "EmptyBag") {
+        return crate::tla::eval::eval_operator_call(name, Vec::new(), ctx, depth);
+    }
+
+    // Fall back to model value for undefined identifiers
+    if trace_var_enabled() {
+        eprintln!("VAR {} -> ModelValue", name);
+    }
+    Ok(TlaValue::ModelValue(name.to_string()))
+}
+
 fn eval_compiled_inner(
     expr: &CompiledExpr,
     ctx: &EvalContext<'_>,
@@ -188,51 +264,20 @@ fn eval_compiled_inner(
         CompiledExpr::ModelValue(s) => Ok(TlaValue::ModelValue(s.clone())),
 
         // Variable reference
-        CompiledExpr::Var(name) => {
-            // First check local variables
-            if let Some(v) = ctx.runtime_value(name) {
-                if trace_var_enabled() {
-                    eprintln!("VAR {} -> Ok({:?})", name, v);
-                }
-                return Ok(v);
-            }
+        CompiledExpr::Var(name) => eval_var_by_name(name, ctx, depth),
 
-            // Then check if it's a no-arg operator - use compiled evaluation
-            if let Some(def) = ctx.definition(name) {
-                if def.params.is_empty() {
-                    // Get or compile the operator body
-                    let compiled_body = get_or_compile_operator(name, &def.body);
-                    let result = eval_compiled_inner(&compiled_body, ctx, depth);
-                    if trace_var_enabled() {
-                        eprintln!("VAR {} (operator) -> {:?}", name, result);
-                    }
-                    return result.map_err(|e| anyhow!("failed to resolve {}: {}", name, e));
-                }
-
-                let value = TlaValue::Lambda {
-                    params: Arc::new(def.params.clone()),
-                    body: def.body.clone(),
-                    captured_locals: Arc::new((*ctx.locals).clone()),
-                };
-                if trace_var_enabled() {
-                    eprintln!("VAR {} (operator value) -> Ok({:?})", name, value);
-                }
-                return Ok(value);
+        CompiledExpr::StateVar { slot, name } => {
+            if !ctx.locals.contains_key(name.as_ref())
+                && let Some(schema_name) = ctx.state.schema_name_at(*slot)
+                && Arc::ptr_eq(schema_name, name)
+            {
+                return Ok(ctx
+                    .state
+                    .get_slot(*slot)
+                    .expect("schema slot must have a value")
+                    .clone());
             }
-
-            // T205: known zero-arg built-ins must be evaluated even when bare
-            // (interpreter does this in resolve_identifier). Without this the
-            // compiler returns ModelValue("IOEnv") while the interpreter
-            // returns the actual env Record — surfaced by fuzz_tla_swarm.
-            if matches!(name.as_str(), "IOEnv" | "EmptyBag") {
-                return crate::tla::eval::eval_operator_call(name, Vec::new(), ctx, depth);
-            }
-
-            // Fall back to model value for undefined identifiers
-            if trace_var_enabled() {
-                eprintln!("VAR {} -> ModelValue", name);
-            }
-            Ok(TlaValue::ModelValue(name.to_string()))
+            eval_var_by_name(name.as_ref(), ctx, depth)
         }
 
         // Primed variable reference (next-state value)
@@ -1117,7 +1162,7 @@ fn compiled_membership_contains(
                 // `x \in S /\ P[y := x]` instead of materializing the
                 // filter set. Falls back to the text path on compile errors
                 // (preserves the prior interpreted-path behavior).
-                let compiled_body = get_or_compile_operator(name, &def.body);
+                let compiled_body = get_or_compile_operator(name, &def.body, &def.params);
                 if !matches!(&*compiled_body, CompiledExpr::Unparsed(_)) {
                     return compiled_membership_contains(value, &compiled_body, ctx, depth);
                 }
@@ -2018,7 +2063,7 @@ fn eval_compiled_opcall(
     }
 
     // Get or compile the operator body
-    let compiled_body = get_or_compile_operator(name, &def.body);
+    let compiled_body = get_or_compile_operator(name, &def.body, &def.params);
 
     // Create new context with parameter bindings
     let mut new_ctx = ctx.clone();

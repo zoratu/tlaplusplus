@@ -6,7 +6,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::tla::hashed_arc::HashedArc;
 
@@ -48,6 +48,8 @@ thread_local! {
     static ACTIVE_SCHEMA: RefCell<Option<Arc<StateSchema>>> = RefCell::new(None);
 }
 
+static RESOLUTION_SCHEMA: RwLock<Option<Arc<StateSchema>>> = RwLock::new(None);
+
 impl StateSchema {
     pub fn new(mut names: Vec<Arc<str>>) -> Self {
         names.sort();
@@ -68,6 +70,14 @@ impl StateSchema {
         self.names == other.names
     }
 
+    pub fn slot_of(&self, name: &str) -> Option<u32> {
+        self.slot_of.get(name).copied()
+    }
+
+    pub fn name_at(&self, slot: u32) -> Option<&Arc<str>> {
+        self.names.get(slot as usize)
+    }
+
     pub fn len(&self) -> usize {
         self.names.len()
     }
@@ -78,27 +88,50 @@ impl StateSchema {
 }
 
 pub fn set_active_schema(names: Vec<Arc<str>>) {
+    let schema = Arc::new(StateSchema::new(names));
     ACTIVE_SCHEMA.with(|active| {
-        *active.borrow_mut() = Some(Arc::new(StateSchema::new(names)));
+        *active.borrow_mut() = Some(Arc::clone(&schema));
     });
+    *RESOLUTION_SCHEMA
+        .write()
+        .expect("resolution schema lock poisoned") = Some(schema);
 }
 
 pub fn clear_active_schema() {
     ACTIVE_SCHEMA.with(|active| {
         *active.borrow_mut() = None;
     });
+    *RESOLUTION_SCHEMA
+        .write()
+        .expect("resolution schema lock poisoned") = None;
+}
+
+pub fn get_resolution_schema() -> Option<Arc<StateSchema>> {
+    RESOLUTION_SCHEMA
+        .read()
+        .expect("resolution schema lock poisoned")
+        .as_ref()
+        .map(Arc::clone)
 }
 
 fn schema_for_names(names: Vec<Arc<str>>) -> Arc<StateSchema> {
     let schema = StateSchema::new(names);
-    ACTIVE_SCHEMA.with(|active| {
+    if let Some(active_schema) = ACTIVE_SCHEMA.with(|active| {
         if let Some(active_schema) = active.borrow().as_ref() {
             if active_schema.same_names(&schema) {
-                return Arc::clone(active_schema);
+                return Some(Arc::clone(active_schema));
             }
         }
-        Arc::new(schema)
-    })
+        None
+    }) {
+        return active_schema;
+    }
+    if let Some(resolution_schema) = get_resolution_schema() {
+        if resolution_schema.same_names(&schema) {
+            return resolution_schema;
+        }
+    }
+    Arc::new(schema)
 }
 
 #[derive(Clone)]
@@ -278,8 +311,12 @@ impl TlaState {
         self.values.get(slot as usize)
     }
 
+    pub fn schema_name_at(&self, slot: u32) -> Option<&Arc<str>> {
+        self.schema.name_at(slot)
+    }
+
     pub fn slot_of(&self, name: &str) -> Option<u32> {
-        self.schema.slot_of.get(name).copied()
+        self.schema.slot_of(name)
     }
 
     /// Build a new state by mapping each value, PRESERVING the schema `Arc` and
