@@ -1,5 +1,6 @@
 use crate::fairness::{FairnessConstraint, LabeledTransition};
 use crate::tla::hashed_arc::HashedArc;
+use crate::tla::compiled_expr::{resolve_state_vars, resolve_state_vars_in_action_ir};
 use crate::model::Model;
 use crate::symmetry::{SymmetrySpec, canonicalize_tla_state};
 use crate::tla::module::TlaModuleInstance;
@@ -125,10 +126,20 @@ impl TlaModel {
             None
         };
 
-        let initial_states_vec = match joint_solved {
+        let mut initial_states_vec = match joint_solved {
             Some(states) => states,
             None => evaluate_init_states(&module, &config, &init_name)?,
         };
+        if let Some(first_state) = initial_states_vec.first() {
+            let names: Vec<Arc<str>> = first_state.keys().cloned().collect();
+            crate::tla::value::set_active_schema(names);
+            initial_states_vec = initial_states_vec
+                .into_iter()
+                .map(|state| state.into_iter().collect())
+                .collect();
+        } else {
+            crate::tla::value::clear_active_schema();
+        }
         let temporal_properties = resolve_temporal_properties(&module, &config)?;
         let mut fairness_constraints = extract_fairness_constraints(&temporal_properties);
 
@@ -1659,7 +1670,7 @@ fn try_joint_init_invariant_solve(
 
         // Build an EvalContext seeded with config constants.
         let definition_scope = merged_definition_scope(module);
-        let mut base_state = BTreeMap::new();
+        let mut base_state = TlaState::new();
         for (k, v) in &cfg.constants {
             if let Some(tv) = config_value_to_tla(v) {
                 base_state.insert(Arc::from(k.as_str()), tv);
@@ -1726,7 +1737,7 @@ fn try_joint_init_invariant_solve(
                      found in {:.3}s",
                     elapsed.as_secs_f64()
                 );
-                let mut tla_state: TlaState = base_state.clone();
+                let mut tla_state = base_state.clone();
                 for (name, value) in state {
                     tla_state.insert(Arc::from(name.as_str()), value);
                 }
@@ -1966,7 +1977,7 @@ fn evaluate_init_states(
                 );
 
                 // Evaluate domain
-                let temp_state = BTreeMap::new();
+                let temp_state = TlaState::new();
                 let ctx = EvalContext::with_definitions_and_instances(
                     &temp_state,
                     &definition_scope,
@@ -1974,7 +1985,7 @@ fn evaluate_init_states(
                 );
 
                 // Inject constants into temp state for domain eval
-                let mut eval_state = BTreeMap::new();
+                let mut eval_state = TlaState::new();
                 for (k, v) in &cfg.constants {
                     if let Some(tv) = config_value_to_tla(v) {
                         eval_state.insert(Arc::from(k.as_str()), tv);
@@ -2051,7 +2062,7 @@ fn evaluate_init_states(
     }
 
     // Start with constants from config
-    let mut base_state = BTreeMap::new();
+    let mut base_state = TlaState::new();
     let mut deferred_operator_refs = Vec::new();
     for (k, v) in &cfg.constants {
         match v {
@@ -3412,12 +3423,17 @@ fn precompile_actions(
     definitions: &BTreeMap<String, TlaDefinition>,
 ) -> BTreeMap<String, Arc<CompiledActionIr>> {
     let mut compiled = BTreeMap::new();
+    let resolution_schema = crate::tla::value::get_resolution_schema();
 
     for (name, def) in definitions {
         // Only compile definitions that look like actions (contain primed variables or UNCHANGED)
         if looks_like_action(def) {
             let ir = compile_action_ir(def);
-            let compiled_ir = Arc::new(CompiledActionIr::from_ir(&ir));
+            let mut compiled_ir = CompiledActionIr::from_ir(&ir);
+            if let Some(schema) = resolution_schema.as_ref() {
+                resolve_state_vars_in_action_ir(&mut compiled_ir, schema.as_ref());
+            }
+            let compiled_ir = Arc::new(compiled_ir);
             compiled.insert(name.clone(), compiled_ir);
         }
     }
@@ -3427,10 +3443,15 @@ fn precompile_actions(
 
 /// Pre-compile a list of (name, expression) pairs into compiled expressions
 fn precompile_expressions(exprs: &[(String, String)]) -> Vec<(String, Arc<CompiledExpr>)> {
+    let resolution_schema = crate::tla::value::get_resolution_schema();
     exprs
         .iter()
         .map(|(name, expr)| {
-            let compiled = Arc::new(compile_expr(expr));
+            let mut compiled_expr = compile_expr(expr);
+            if let Some(schema) = resolution_schema.as_ref() {
+                resolve_state_vars(&mut compiled_expr, schema.as_ref());
+            }
+            let compiled = Arc::new(compiled_expr);
             (name.clone(), compiled)
         })
         .collect()
@@ -3446,10 +3467,9 @@ fn warm_up_action_cache(
 ) {
     for (name, compiled_ir) in compiled_actions {
         if let Some(def) = definitions.get(name) {
-            // Use the same cache key as `get_or_compile_action` — the body
-            // alone. Avoids both the `format!` allocation here and a
-            // per-lookup allocation at runtime.
-            insert_compiled_action(def.body.clone(), Arc::clone(compiled_ir));
+            // Use the same parameter-sensitive cache key as
+            // `get_or_compile_action`.
+            insert_compiled_action(def, Arc::clone(compiled_ir));
         }
     }
 }

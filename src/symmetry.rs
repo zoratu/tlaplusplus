@@ -275,10 +275,11 @@ fn collect_model_values_in_value(
 
 /// Apply a permutation to all ModelValue instances in a state
 fn apply_permutation_to_state(state: &TlaState, permutation: &HashMap<String, String>) -> TlaState {
-    state
-        .iter()
-        .map(|(k, v)| (k.clone(), apply_permutation_to_value(v, permutation)))
-        .collect()
+    // A permutation renames symmetric ModelValues *inside* the values; the
+    // variable names (schema) are unchanged. Map values while preserving the
+    // schema Arc so we don't re-derive a schema or double-clone keys/values on
+    // every canonicalization (the symmetry hot path).
+    state.map_values(|v| apply_permutation_to_value(v, permutation))
 }
 
 fn apply_permutation_to_value(value: &TlaValue, permutation: &HashMap<String, String>) -> TlaValue {

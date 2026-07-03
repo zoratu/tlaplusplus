@@ -8,8 +8,10 @@
 //!
 //! Benchmarks show this can provide 3-5x speedup on expression-heavy workloads.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use crate::tla::hashed_arc::HashedArc;
+use crate::tla::value::StateSchema;
 
 /// Compiled TLA+ expression - parsed once, evaluated many times
 #[derive(Debug, Clone)]
@@ -22,6 +24,11 @@ pub enum CompiledExpr {
 
     // Variable/identifier reference
     Var(String),
+
+    // Resolved state-variable reference. The name is the Arc from the schema
+    // used during resolution; eval only takes the slot fast path when the
+    // runtime state's schema has the exact same Arc at that slot.
+    StateVar { slot: u32, name: Arc<str> },
 
     // Primed variable reference (e.g., x' - the next-state value)
     PrimedVar(String),
@@ -281,11 +288,513 @@ impl CompiledExpr {
             | CompiledExpr::String(_)
             | CompiledExpr::ModelValue(_)
             | CompiledExpr::Var(_)
+            | CompiledExpr::StateVar { .. }
             | CompiledExpr::PrimedVar(_)
             | CompiledExpr::SelfRef
             | CompiledExpr::NatSet
             | CompiledExpr::IntSet
             | CompiledExpr::BooleanSet => true,
+        }
+    }
+}
+
+pub fn resolve_state_vars(expr: &mut CompiledExpr, schema: &StateSchema) {
+    resolve_state_vars_with_binders(expr, schema, std::iter::empty::<&str>());
+}
+
+pub fn resolve_state_vars_with_binders<'a, I>(
+    expr: &mut CompiledExpr,
+    schema: &StateSchema,
+    external_binders: I,
+) where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut binders = BTreeSet::new();
+    for binder in external_binders {
+        insert_binder_name(&mut binders, binder);
+    }
+    collect_expr_binders(expr, &mut binders);
+    resolve_expr_slots(expr, schema, &binders);
+}
+
+pub fn resolve_state_vars_in_action_ir(action: &mut CompiledActionIr, schema: &StateSchema) {
+    let mut binders = BTreeSet::new();
+    for param in &action.params {
+        insert_binder_name(&mut binders, param);
+    }
+    collect_action_binders(&action.clauses, &mut binders);
+    resolve_action_clause_slots(&mut action.clauses, schema, &binders);
+}
+
+fn insert_binder_name(binders: &mut BTreeSet<String>, name: &str) {
+    let name = normalize_binder_name(name);
+    if name.is_empty() {
+        return;
+    }
+    if is_identifier(name) {
+        binders.insert(name.to_string());
+    } else {
+        collect_identifier_names(name, binders);
+    }
+}
+
+fn normalize_binder_name(name: &str) -> &str {
+    let name = name.trim();
+    let name = if let Some(in_pos) = name.find("\\in") {
+        name[..in_pos].trim()
+    } else {
+        name
+    };
+    if let Some(paren_pos) = name.find('(') {
+        name[..paren_pos].trim()
+    } else {
+        name.trim()
+    }
+}
+
+fn collect_identifier_names(text: &str, binders: &mut BTreeSet<String>) {
+    let mut start = None;
+    for (idx, ch) in text.char_indices() {
+        if ch.is_alphanumeric() || ch == '_' {
+            if start.is_none() {
+                start = Some(idx);
+            }
+        } else if let Some(s) = start.take() {
+            let ident = &text[s..idx];
+            if ident
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphabetic() || c == '_')
+                && is_identifier(ident)
+            {
+                insert_binder_name(binders, ident);
+            }
+        }
+    }
+    if let Some(s) = start {
+        let ident = &text[s..];
+        if ident
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphabetic() || c == '_')
+            && is_identifier(ident)
+        {
+            insert_binder_name(binders, ident);
+        }
+    }
+}
+
+fn collect_action_binder_names(text: &str, binders: &mut BTreeSet<String>) {
+    for segment in split_top_level(text, ",") {
+        let lhs = segment
+            .split_once("\\in")
+            .map(|(vars, _)| vars)
+            .unwrap_or(segment.as_str());
+        collect_identifier_names(lhs, binders);
+    }
+}
+
+fn collect_expr_binders(expr: &CompiledExpr, binders: &mut BTreeSet<String>) {
+    match expr {
+        CompiledExpr::Bool(_)
+        | CompiledExpr::Int(_)
+        | CompiledExpr::String(_)
+        | CompiledExpr::ModelValue(_)
+        | CompiledExpr::Var(_)
+        | CompiledExpr::StateVar { .. }
+        | CompiledExpr::PrimedVar(_)
+        | CompiledExpr::SelfRef
+        | CompiledExpr::NatSet
+        | CompiledExpr::IntSet
+        | CompiledExpr::BooleanSet
+        | CompiledExpr::Unparsed(_) => {}
+        CompiledExpr::And(exprs)
+        | CompiledExpr::Or(exprs)
+        | CompiledExpr::SetLiteral(exprs)
+        | CompiledExpr::SeqLiteral(exprs) => {
+            for expr in exprs {
+                collect_expr_binders(expr, binders);
+            }
+        }
+        CompiledExpr::Not(expr)
+        | CompiledExpr::Neg(expr)
+        | CompiledExpr::Cardinality(expr)
+        | CompiledExpr::PowerSet(expr)
+        | CompiledExpr::Head(expr)
+        | CompiledExpr::Tail(expr)
+        | CompiledExpr::Len(expr)
+        | CompiledExpr::Domain(expr)
+        | CompiledExpr::RecordAccess(expr, _) => collect_expr_binders(expr, binders),
+        CompiledExpr::Implies(left, right)
+        | CompiledExpr::Iff(left, right)
+        | CompiledExpr::Eq(left, right)
+        | CompiledExpr::Neq(left, right)
+        | CompiledExpr::Lt(left, right)
+        | CompiledExpr::Le(left, right)
+        | CompiledExpr::Gt(left, right)
+        | CompiledExpr::Ge(left, right)
+        | CompiledExpr::In(left, right)
+        | CompiledExpr::NotIn(left, right)
+        | CompiledExpr::Add(left, right)
+        | CompiledExpr::Sub(left, right)
+        | CompiledExpr::Mul(left, right)
+        | CompiledExpr::Pow(left, right)
+        | CompiledExpr::Div(left, right)
+        | CompiledExpr::Mod(left, right)
+        | CompiledExpr::SetRange(left, right)
+        | CompiledExpr::Union(left, right)
+        | CompiledExpr::Intersect(left, right)
+        | CompiledExpr::SetMinus(left, right)
+        | CompiledExpr::CartesianProduct(left, right)
+        | CompiledExpr::Subset(left, right)
+        | CompiledExpr::Append(left, right)
+        | CompiledExpr::Concat(left, right)
+        | CompiledExpr::FuncPair(left, right)
+        | CompiledExpr::FuncOverride(left, right)
+        | CompiledExpr::FunctionSet {
+            domain: left,
+            range: right,
+        } => {
+            collect_expr_binders(left, binders);
+            collect_expr_binders(right, binders);
+        }
+        CompiledExpr::SubSeq(seq, start, end) => {
+            collect_expr_binders(seq, binders);
+            collect_expr_binders(start, binders);
+            collect_expr_binders(end, binders);
+        }
+        CompiledExpr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            collect_expr_binders(cond, binders);
+            collect_expr_binders(then_branch, binders);
+            collect_expr_binders(else_branch, binders);
+        }
+        CompiledExpr::Case { arms, other } => {
+            for (cond, value) in arms {
+                collect_expr_binders(cond, binders);
+                collect_expr_binders(value, binders);
+            }
+            if let Some(other) = other {
+                collect_expr_binders(other, binders);
+            }
+        }
+        CompiledExpr::Let { bindings, body } => {
+            for (name, value) in bindings {
+                insert_binder_name(binders, name);
+                collect_expr_binders(value, binders);
+            }
+            collect_expr_binders(body, binders);
+        }
+        CompiledExpr::Exists { var, domain, body }
+        | CompiledExpr::Forall { var, domain, body }
+        | CompiledExpr::Choose { var, domain, body }
+        | CompiledExpr::FuncConstruct { var, domain, body } => {
+            insert_binder_name(binders, var);
+            collect_expr_binders(domain, binders);
+            collect_expr_binders(body, binders);
+        }
+        CompiledExpr::SetComprehension {
+            var,
+            domain,
+            body,
+            filter,
+        } => {
+            insert_binder_name(binders, var);
+            collect_expr_binders(domain, binders);
+            collect_expr_binders(body, binders);
+            if let Some(filter) = filter {
+                collect_expr_binders(filter, binders);
+            }
+        }
+        CompiledExpr::RecordLiteral(fields) | CompiledExpr::RecordSet(fields) => {
+            for (_, value) in fields {
+                collect_expr_binders(value, binders);
+            }
+        }
+        CompiledExpr::FuncLiteral(entries) => {
+            for (key, value) in entries {
+                collect_expr_binders(key, binders);
+                collect_expr_binders(value, binders);
+            }
+        }
+        CompiledExpr::FuncApply(func, args) => {
+            collect_expr_binders(func, binders);
+            for arg in args {
+                collect_expr_binders(arg, binders);
+            }
+        }
+        CompiledExpr::FuncExcept(base, updates) => {
+            collect_expr_binders(base, binders);
+            for (path, value) in updates {
+                for path_expr in path {
+                    collect_expr_binders(path_expr, binders);
+                }
+                collect_expr_binders(value, binders);
+            }
+        }
+        CompiledExpr::OpCall { args, .. } => {
+            for arg in args {
+                collect_expr_binders(arg, binders);
+            }
+        }
+        CompiledExpr::Lambda { params, body, .. } => {
+            for param in params {
+                insert_binder_name(binders, param);
+            }
+            collect_expr_binders(body, binders);
+        }
+    }
+}
+
+fn resolve_expr_slots(expr: &mut CompiledExpr, schema: &StateSchema, binders: &BTreeSet<String>) {
+    match expr {
+        CompiledExpr::Var(name) => {
+            let replacement = if binders.contains(name.as_str()) {
+                None
+            } else {
+                schema.slot_of(name.as_str()).map(|slot| {
+                    let schema_name = Arc::clone(
+                        schema
+                            .name_at(slot)
+                            .expect("slot from schema map must have a name"),
+                    );
+                    (slot, schema_name)
+                })
+            };
+            if let Some((slot, name)) = replacement {
+                *expr = CompiledExpr::StateVar { slot, name };
+            }
+        }
+        CompiledExpr::Bool(_)
+        | CompiledExpr::Int(_)
+        | CompiledExpr::String(_)
+        | CompiledExpr::ModelValue(_)
+        | CompiledExpr::StateVar { .. }
+        | CompiledExpr::PrimedVar(_)
+        | CompiledExpr::SelfRef
+        | CompiledExpr::NatSet
+        | CompiledExpr::IntSet
+        | CompiledExpr::BooleanSet
+        | CompiledExpr::Unparsed(_) => {}
+        CompiledExpr::And(exprs)
+        | CompiledExpr::Or(exprs)
+        | CompiledExpr::SetLiteral(exprs)
+        | CompiledExpr::SeqLiteral(exprs) => {
+            for expr in exprs {
+                resolve_expr_slots(expr, schema, binders);
+            }
+        }
+        CompiledExpr::Not(expr)
+        | CompiledExpr::Neg(expr)
+        | CompiledExpr::Cardinality(expr)
+        | CompiledExpr::PowerSet(expr)
+        | CompiledExpr::Head(expr)
+        | CompiledExpr::Tail(expr)
+        | CompiledExpr::Len(expr)
+        | CompiledExpr::Domain(expr)
+        | CompiledExpr::RecordAccess(expr, _) => resolve_expr_slots(expr, schema, binders),
+        CompiledExpr::Implies(left, right)
+        | CompiledExpr::Iff(left, right)
+        | CompiledExpr::Eq(left, right)
+        | CompiledExpr::Neq(left, right)
+        | CompiledExpr::Lt(left, right)
+        | CompiledExpr::Le(left, right)
+        | CompiledExpr::Gt(left, right)
+        | CompiledExpr::Ge(left, right)
+        | CompiledExpr::In(left, right)
+        | CompiledExpr::NotIn(left, right)
+        | CompiledExpr::Add(left, right)
+        | CompiledExpr::Sub(left, right)
+        | CompiledExpr::Mul(left, right)
+        | CompiledExpr::Pow(left, right)
+        | CompiledExpr::Div(left, right)
+        | CompiledExpr::Mod(left, right)
+        | CompiledExpr::SetRange(left, right)
+        | CompiledExpr::Union(left, right)
+        | CompiledExpr::Intersect(left, right)
+        | CompiledExpr::SetMinus(left, right)
+        | CompiledExpr::CartesianProduct(left, right)
+        | CompiledExpr::Subset(left, right)
+        | CompiledExpr::Append(left, right)
+        | CompiledExpr::Concat(left, right)
+        | CompiledExpr::FuncPair(left, right)
+        | CompiledExpr::FuncOverride(left, right)
+        | CompiledExpr::FunctionSet {
+            domain: left,
+            range: right,
+        } => {
+            resolve_expr_slots(left, schema, binders);
+            resolve_expr_slots(right, schema, binders);
+        }
+        CompiledExpr::SubSeq(seq, start, end) => {
+            resolve_expr_slots(seq, schema, binders);
+            resolve_expr_slots(start, schema, binders);
+            resolve_expr_slots(end, schema, binders);
+        }
+        CompiledExpr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            resolve_expr_slots(cond, schema, binders);
+            resolve_expr_slots(then_branch, schema, binders);
+            resolve_expr_slots(else_branch, schema, binders);
+        }
+        CompiledExpr::Case { arms, other } => {
+            for (cond, value) in arms {
+                resolve_expr_slots(cond, schema, binders);
+                resolve_expr_slots(value, schema, binders);
+            }
+            if let Some(other) = other {
+                resolve_expr_slots(other, schema, binders);
+            }
+        }
+        CompiledExpr::Let { bindings, body } => {
+            for (_, value) in bindings {
+                resolve_expr_slots(value, schema, binders);
+            }
+            resolve_expr_slots(body, schema, binders);
+        }
+        CompiledExpr::Exists { domain, body, .. }
+        | CompiledExpr::Forall { domain, body, .. }
+        | CompiledExpr::Choose { domain, body, .. }
+        | CompiledExpr::FuncConstruct { domain, body, .. } => {
+            resolve_expr_slots(domain, schema, binders);
+            resolve_expr_slots(body, schema, binders);
+        }
+        CompiledExpr::SetComprehension {
+            domain,
+            body,
+            filter,
+            ..
+        } => {
+            resolve_expr_slots(domain, schema, binders);
+            resolve_expr_slots(body, schema, binders);
+            if let Some(filter) = filter {
+                resolve_expr_slots(filter, schema, binders);
+            }
+        }
+        CompiledExpr::RecordLiteral(fields) | CompiledExpr::RecordSet(fields) => {
+            for (_, value) in fields {
+                resolve_expr_slots(value, schema, binders);
+            }
+        }
+        CompiledExpr::FuncLiteral(entries) => {
+            for (key, value) in entries {
+                resolve_expr_slots(key, schema, binders);
+                resolve_expr_slots(value, schema, binders);
+            }
+        }
+        CompiledExpr::FuncApply(func, args) => {
+            resolve_expr_slots(func, schema, binders);
+            for arg in args {
+                resolve_expr_slots(arg, schema, binders);
+            }
+        }
+        CompiledExpr::FuncExcept(base, updates) => {
+            resolve_expr_slots(base, schema, binders);
+            for (path, value) in updates {
+                for path_expr in path {
+                    resolve_expr_slots(path_expr, schema, binders);
+                }
+                resolve_expr_slots(value, schema, binders);
+            }
+        }
+        CompiledExpr::OpCall { args, .. } => {
+            for arg in args {
+                resolve_expr_slots(arg, schema, binders);
+            }
+        }
+        CompiledExpr::Lambda { body, .. } => resolve_expr_slots(body, schema, binders),
+    }
+}
+
+fn collect_action_binders(clauses: &[CompiledActionClause], binders: &mut BTreeSet<String>) {
+    for clause in clauses {
+        match clause {
+            CompiledActionClause::PrimedAssignment { expr, .. } => {
+                collect_expr_binders(expr, binders);
+            }
+            CompiledActionClause::PrimedMembership { set_expr, .. } => {
+                collect_expr_binders(set_expr, binders);
+            }
+            CompiledActionClause::Unchanged { .. } => {}
+            CompiledActionClause::Guard { expr, .. } => {
+                collect_expr_binders(expr, binders);
+            }
+            CompiledActionClause::Exists {
+                binders: action_binders,
+                body_clauses,
+            } => {
+                collect_action_binder_names(action_binders, binders);
+                collect_action_binders(body_clauses, binders);
+            }
+            CompiledActionClause::Conditional {
+                condition,
+                then_clauses,
+                else_clauses,
+            } => {
+                collect_expr_binders(condition, binders);
+                collect_action_binders(then_clauses, binders);
+                collect_action_binders(else_clauses, binders);
+            }
+            CompiledActionClause::CompiledLetWithPrimes {
+                bindings,
+                body_clauses,
+            } => {
+                for (name, expr) in bindings {
+                    insert_binder_name(binders, name);
+                    collect_expr_binders(expr, binders);
+                }
+                collect_action_binders(body_clauses, binders);
+            }
+            CompiledActionClause::LetWithPrimes { .. } => {}
+        }
+    }
+}
+
+fn resolve_action_clause_slots(
+    clauses: &mut [CompiledActionClause],
+    schema: &StateSchema,
+    binders: &BTreeSet<String>,
+) {
+    for clause in clauses {
+        match clause {
+            CompiledActionClause::PrimedAssignment { expr, .. } => {
+                resolve_expr_slots(expr, schema, binders);
+            }
+            CompiledActionClause::PrimedMembership { set_expr, .. } => {
+                resolve_expr_slots(set_expr, schema, binders);
+            }
+            CompiledActionClause::Unchanged { .. } => {}
+            CompiledActionClause::Guard { expr, .. } => {
+                resolve_expr_slots(expr, schema, binders);
+            }
+            CompiledActionClause::Exists { body_clauses, .. } => {
+                resolve_action_clause_slots(body_clauses, schema, binders);
+            }
+            CompiledActionClause::Conditional {
+                condition,
+                then_clauses,
+                else_clauses,
+            } => {
+                resolve_expr_slots(condition, schema, binders);
+                resolve_action_clause_slots(then_clauses, schema, binders);
+                resolve_action_clause_slots(else_clauses, schema, binders);
+            }
+            CompiledActionClause::CompiledLetWithPrimes {
+                bindings,
+                body_clauses,
+            } => {
+                for (_, expr) in bindings {
+                    resolve_expr_slots(expr, schema, binders);
+                }
+                resolve_action_clause_slots(body_clauses, schema, binders);
+            }
+            CompiledActionClause::LetWithPrimes { .. } => {}
         }
     }
 }
@@ -5259,4 +5768,3 @@ fn has_chained_top_level_arithmetic(expr: &str) -> bool {
     }
     false
 }
-

@@ -1,7 +1,9 @@
 use crate::fairness::{ActionLabel, LabeledTransition};
+use crate::tla::compiled_expr::resolve_state_vars_in_action_ir;
 use crate::tla::hashed_arc::HashedArc;
 use crate::tla::eval::apply_action_ir_with_context_multi;
 use crate::tla::module::TlaModuleInstance;
+use crate::tla::value::get_resolution_schema;
 use crate::tla::{
     ActionClause, ActionIr, CompiledActionIr, EvalContext, TlaDefinition, TlaState, TlaValue,
     apply_compiled_action_ir_multi, compile_action_ir, eval_expr, normalize_param_name,
@@ -20,11 +22,10 @@ static PREWARMED_ACTION_CACHE: LazyLock<DashMap<String, Arc<CompiledActionIr>>> 
 
 // Thread-local cache for runtime-compiled action IRs
 // Using thread-local storage eliminates cross-thread contention entirely.
-// Key is the action BODY only — the body uniquely determines the compiled
-// IR (the action name is just a debug label). Looking up by `&str`
-// avoids a `format!`-allocated cache key on every hit, which fired
-// millions of times per minute on full-MC. The pre-warmed DashMap key is
-// kept aligned (see `warm_up_action_cache` in models/tla_native.rs).
+// Key is the action BODY for no-param actions, or BODY plus parameter names
+// for parameterized actions. Slot resolution is parameter-sensitive because
+// params shadow state vars, so parameterized actions cannot share a body-only
+// compiled IR.
 // `AHashMap` swaps SIP for ahash — these caches are thread-local with
 // non-adversarial keys.
 thread_local! {
@@ -32,28 +33,54 @@ thread_local! {
         RefCell::new(ahash::AHashMap::with_capacity(64));
 }
 
+fn action_cache_key(def: &TlaDefinition) -> String {
+    if def.params.is_empty() {
+        return def.body.clone();
+    }
+    let params_len = def.params.iter().map(String::len).sum::<usize>();
+    let mut key = String::with_capacity(def.body.len() + params_len + def.params.len());
+    key.push_str(&def.body);
+    for param in &def.params {
+        key.push('\0');
+        key.push_str(param);
+    }
+    key
+}
+
 /// Get or compile an action IR with compiled expressions (thread-local, zero contention)
 fn get_or_compile_action(def: &TlaDefinition) -> Arc<CompiledActionIr> {
+    let cache_key = if def.params.is_empty() {
+        None
+    } else {
+        Some(action_cache_key(def))
+    };
+    let lookup_key = cache_key.as_deref().unwrap_or(def.body.as_str());
+
     // Check pre-warmed global cache first (read-only, no contention).
     // DashMap defaults to ahash so the hash itself is cheap; the only
     // remaining cost is the `&str` lookup.
-    if let Some(cached) = PREWARMED_ACTION_CACHE.get(def.body.as_str()) {
+    if let Some(cached) = PREWARMED_ACTION_CACHE.get(lookup_key) {
         return Arc::clone(&cached);
     }
 
     // Check thread-local cache
     THREAD_LOCAL_ACTION_CACHE.with(|cache| {
-        if let Some(cached) = cache.borrow().get(def.body.as_str()) {
+        if let Some(cached) = cache.borrow().get(lookup_key) {
             return Arc::clone(cached);
         }
 
         // Compile and cache in thread-local storage (one allocation per
         // unique body, on miss only).
         let ir = compile_action_ir(def);
-        let compiled = Arc::new(CompiledActionIr::from_ir(&ir));
-        cache
-            .borrow_mut()
-            .insert(def.body.clone(), Arc::clone(&compiled));
+        let mut compiled_ir = CompiledActionIr::from_ir(&ir);
+        if let Some(schema) = get_resolution_schema() {
+            resolve_state_vars_in_action_ir(&mut compiled_ir, schema.as_ref());
+        }
+        let compiled = Arc::new(compiled_ir);
+        cache.borrow_mut().insert(
+            cache_key.clone().unwrap_or_else(|| def.body.clone()),
+            Arc::clone(&compiled),
+        );
         compiled
     })
 }
@@ -63,8 +90,8 @@ fn get_or_compile_action(def: &TlaDefinition) -> Arc<CompiledActionIr> {
 /// This is used to warm up the cache at model load time with actions
 /// that have already been compiled. The global cache is read-only during
 /// model checking, so there's no contention.
-pub fn insert_compiled_action(cache_key: String, compiled: Arc<CompiledActionIr>) {
-    PREWARMED_ACTION_CACHE.insert(cache_key, compiled);
+pub fn insert_compiled_action(def: &TlaDefinition, compiled: Arc<CompiledActionIr>) {
+    PREWARMED_ACTION_CACHE.insert(action_cache_key(def), compiled);
 }
 
 #[derive(Debug, Clone, Default)]
