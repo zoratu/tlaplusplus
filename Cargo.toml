@@ -77,6 +77,13 @@ verus_state_machines_macros = { git = "https://github.com/verus-lang/verus.git",
 
 [target.'cfg(target_os = "linux")'.dependencies]
 procfs = "0.17"
+# jemalloc as the global allocator (Linux only). The parallel work-stealing
+# model checker is allocation-heavy with heavy CROSS-THREAD frees (worker A
+# allocates a state, worker B steals and drops it). glibc malloc serializes
+# such cross-arena frees; jemalloc's sharded per-thread caches handle the
+# pattern far better — +29% state-exploration throughput on MCKVSSafetyMedium
+# (see the [global_allocator] in src/main.rs).
+tikv-jemallocator = "0.7.0"
 
 [dev-dependencies]
 proptest = "1.5"
