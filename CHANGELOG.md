@@ -1,5 +1,35 @@
 # Changelog
 
+## v1.2.15 (2026-07-03)
+
+Switch the global allocator to jemalloc on Linux — the single highest-leverage change for many-core state exploration.
+
+### PR #114 — jemalloc global allocator (+29% state-exploration throughput)
+
+A `perf` profile of `run-tla MCKVSSafetyMedium --workers 32` showed ~39% of self-time inside glibc allocator internals (`_int_free` 13.5%, `malloc` 12.1%, `_int_malloc` 6.2%, `cfree` 5.3%). The allocation is diffuse across the successor-generation path — `EXCEPT` map rebuilds, binder-expansion branch structures, per-clause `staged`/`locals` maps, symmetry value rebuilding, `normalize_seq`, and bincode fingerprint buffers — so there is no single hot allocation site to remove. But the *pattern* is uniform: the engine is a work-stealing scheduler, so a state is allocated on the worker that generates it and freed on whichever worker steals and processes it. These **cross-thread frees** are exactly what glibc malloc handles worst — it returns blocks to the originating arena under a per-arena lock, serializing workers. A sharded allocator fixes the whole class at once.
+
+An A/B on MCKVSSafetyMedium (c7g.16xlarge, 32 workers, 5 interleaved samples, states generated in a fixed window) put jemalloc clearly ahead of both glibc and mimalloc:
+
+| allocator | median states / window | vs glibc | run-to-run spread |
+|---|---|---|---|
+| glibc (baseline) | 51.06M | — | ±0.1% |
+| mimalloc | 59.73M | +17% | noisy (51.4–61.0M) |
+| **jemalloc** | **65.81M** | **+29%** | stable (62.8–67.5M) |
+
+jemalloc's *worst* sample beat glibc's *best* by +23%; it was chosen over mimalloc for both the higher median and the far tighter variance. Peak RSS rose ~4% in the same window — but that window explored ~29% more states, so RSS-per-state is actually lower and peak stays well bounded. The change is `tikv-jemallocator` behind a `#[global_allocator]`, both gated under `cfg(target_os = "linux")` so non-Linux builds fall back to the system allocator; the runtime is already Linux-oriented (NUMA `set_mempolicy`, cgroup probing) and CI covers Linux x86_64 + aarch64.
+
+### Gauntlet
+
+| Gate | Result |
+|---|---|
+| `cargo test --release` | green on x86_64 + aarch64 |
+| `scripts/diff_tlc.sh` | 13 / 13 specs match TLC v2.19 (runs the jemalloc binary end-to-end) |
+| compiled-vs-interpreted proptest @ 512 | 17 / 17 |
+| state-graph snapshots | 12 / 12 |
+| CI | green on x86_64 + aarch64 (both gates each) |
+
+The allocator is behaviour-transparent: identical fingerprints, distinct-state counts, and checker verdicts. Drop-in for v1.2.14.
+
 ## v1.2.14 (2026-06-19)
 
 Two eval-path allocation wins from the eval-allocation recon — one on the interpreted probe path, one on the compiled model-checking hot loop.
