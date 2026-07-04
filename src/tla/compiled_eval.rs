@@ -2068,6 +2068,20 @@ fn eval_compiled_opcall(
         _ => {}
     }
 
+    // A name may refer to a local value that is a Lambda — a higher-order
+    // operator parameter, e.g. `ChooseOne(S, P(_)) == CHOOSE x \in S : P(x)`
+    // called as `ChooseOne(Ingredients, LAMBDA x : ...)`. The interpreted path
+    // (`eval_operator_call`) checks this before definition lookup; mirror it
+    // here so compiled bodies apply the passed Lambda instead of erroring
+    // "unknown operator". Without this, `P(x)` failed and CHOOSE fell back to
+    // the first domain element, producing spurious successors (CigaretteSmokers
+    // 12 distinct vs TLC's 6).
+    if let Some(local_val) = ctx.runtime_value(name) {
+        if matches!(local_val, TlaValue::Lambda { .. }) {
+            return apply_value(&local_val, arg_values, ctx, depth + 1);
+        }
+    }
+
     // Look up user-defined operator
     let def = lookup_definition(name, ctx)
         .ok_or_else(|| anyhow!("unknown operator/function '{}'", name))?;
@@ -2960,6 +2974,58 @@ mod tests {
             eval_compiled(&compile_expr("Sum(sc, {<<1, 2>>, <<3, 4>>})"), &ctx)
                 .expect("compiled higher-order recursion should work"),
             TlaValue::Int(10)
+        );
+    }
+
+    #[test]
+    fn test_compiled_higher_order_operator_param_applies_lambda() {
+        // Regression: a higher-order operator formal invoked as `P(x)` inside a
+        // COMPILED body must apply the passed Lambda, not fail "unknown
+        // operator 'P'". This mirrors CigaretteSmokers' `stopSmoking` action,
+        // which selects a smoker via
+        //   ChooseOne(S, P(_)) == CHOOSE x \in S : P(x) /\ \A y \in S : P(y) => y = x
+        // called with a LAMBDA. Before the fix, `P(x)` erred, the CHOOSE
+        // predicate collapsed, and the fallback returned the first domain
+        // element unconditionally — yielding spurious successors (12 distinct
+        // states vs TLC's 6). The interpreted path already handled this; the
+        // compiled path did not.
+        let defs = BTreeMap::from([
+            (
+                "Apply".to_string(),
+                TlaDefinition {
+                    name: "Apply".to_string(),
+                    params: vec!["x".to_string(), "P".to_string()],
+                    body: "P(x)".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "ChooseOne".to_string(),
+                TlaDefinition {
+                    name: "ChooseOne".to_string(),
+                    params: vec!["S".to_string(), "P".to_string()],
+                    body: r#"CHOOSE x \in S : P(x) /\ \A y \in S : P(y) => y = x"#
+                        .to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+        let state = TlaState::new();
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        // Direct application of the Lambda-valued formal.
+        assert_eq!(
+            eval_compiled(&compile_expr("Apply(5, LAMBDA n : n * 2)"), &ctx)
+                .expect("higher-order Lambda formal must resolve in compiled body"),
+            TlaValue::Int(10)
+        );
+
+        // The CigaretteSmokers shape: only element 2 uniquely satisfies `x > 1`
+        // in {1, 2}, so CHOOSE must pick 2 (previously fell back to first = 1).
+        assert_eq!(
+            eval_compiled(&compile_expr("ChooseOne({1, 2}, LAMBDA x : x > 1)"), &ctx)
+                .expect("higher-order Lambda formal must resolve in compiled CHOOSE"),
+            TlaValue::Int(2)
         );
     }
 
