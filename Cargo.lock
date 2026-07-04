@@ -2778,7 +2778,7 @@ dependencies = [
 
 [[package]]
 name = "tlaplusplus"
-version = "1.2.19"
+version = "1.2.20"
 dependencies = [
  "ahash",
  "anyhow",
