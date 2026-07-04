@@ -1320,6 +1320,14 @@ pub(crate) fn eval_operator_call(
     let mut child = ctx.clone();
     {
         let locals_mut = Rc::make_mut(&mut child.locals);
+        // A module-level operator is lexically scoped to the module: its body
+        // must not see the caller's dynamic locals (a free variable would else
+        // bind to a same-named caller local). Clear them, keeping only the
+        // params bound below. A LET-local operator may reference an enclosing
+        // bound variable, so it keeps the caller locals.
+        if !ctx.local_definitions.contains_key(name) {
+            locals_mut.clear();
+        }
         for (param, arg) in def.params.iter().zip(args.into_iter()) {
             bind_param_value(locals_mut, param, arg)?;
         }

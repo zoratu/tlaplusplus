@@ -210,7 +210,16 @@ fn eval_var_by_name(name: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<T
         if def.params.is_empty() {
             // Get or compile the operator body
             let compiled_body = get_or_compile_operator(name, &def.body, &def.params);
-            let result = eval_compiled_inner(&compiled_body, ctx, depth);
+            // A module-level no-arg operator is lexically scoped and must not see
+            // the caller's dynamic locals. Only clean when there are locals to
+            // leak (top-level evaluation — the hot case — keeps the fast path).
+            let result = if !ctx.locals.is_empty() && !ctx.local_definitions.contains_key(name) {
+                let mut clean = ctx.clone();
+                clean.locals = Rc::new(BTreeMap::new());
+                eval_compiled_inner(&compiled_body, &clean, depth)
+            } else {
+                eval_compiled_inner(&compiled_body, ctx, depth)
+            };
             if trace_var_enabled() {
                 eprintln!("VAR {} (operator) -> {:?}", name, result);
             }
@@ -2083,6 +2092,14 @@ fn eval_compiled_opcall(
 
     // Create new context with parameter bindings
     let mut new_ctx = ctx.clone();
+    // A module-level operator is lexically scoped to the module: its body must
+    // not see the caller's dynamic locals (a free variable would otherwise bind
+    // to a same-named caller local). Clear them before binding params. A
+    // LET-local operator may reference an enclosing bound variable, so it keeps
+    // the caller locals.
+    if !ctx.local_definitions.contains_key(name) {
+        new_ctx.locals = Rc::new(BTreeMap::new());
+    }
     for (param, value) in def.params.iter().zip(arg_values.into_iter()) {
         new_ctx = new_ctx.with_local_value(normalize_param_name(param), value);
     }
