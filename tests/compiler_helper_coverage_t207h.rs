@@ -423,3 +423,45 @@ fn t207h_parity_assorted_builtins() {
     parity("Range([a |-> 10, b |-> 20])");
     parity("ToString(42)");
 }
+
+// ============================================================
+// IsPrefix / IsStrictPrefix / IsSuffix / IsStrictSuffix — SequencesExt.
+// ============================================================
+
+#[test]
+fn seqext_is_prefix() {
+    let s = TlaState::new();
+    let ctx = EvalContext::new(&s);
+    let t = |e: &str| eval_compiled(&compile_expr(e), &ctx).unwrap();
+    assert_eq!(t("IsPrefix(<<1, 2>>, <<1, 2, 3>>)"), TlaValue::Bool(true));
+    assert_eq!(t("IsPrefix(<<1, 2, 3>>, <<1, 2, 3>>)"), TlaValue::Bool(true)); // equal seqs
+    assert_eq!(t("IsPrefix(<<>>, <<1>>)"), TlaValue::Bool(true)); // empty is a prefix
+    assert_eq!(t("IsPrefix(<<2>>, <<1, 2, 3>>)"), TlaValue::Bool(false)); // wrong element
+    assert_eq!(t("IsPrefix(<<1, 2, 3>>, <<1, 2>>)"), TlaValue::Bool(false)); // longer
+    // strict: prefix and not equal
+    assert_eq!(t("IsStrictPrefix(<<1, 2>>, <<1, 2, 3>>)"), TlaValue::Bool(true));
+    assert_eq!(t("IsStrictPrefix(<<1, 2, 3>>, <<1, 2, 3>>)"), TlaValue::Bool(false));
+}
+
+#[test]
+fn seqext_is_suffix() {
+    let s = TlaState::new();
+    let ctx = EvalContext::new(&s);
+    let t = |e: &str| eval_compiled(&compile_expr(e), &ctx).unwrap();
+    assert_eq!(t("IsSuffix(<<2, 3>>, <<1, 2, 3>>)"), TlaValue::Bool(true));
+    assert_eq!(t("IsSuffix(<<1, 2, 3>>, <<1, 2, 3>>)"), TlaValue::Bool(true));
+    assert_eq!(t("IsSuffix(<<>>, <<1>>)"), TlaValue::Bool(true));
+    assert_eq!(t("IsSuffix(<<1, 2>>, <<1, 2, 3>>)"), TlaValue::Bool(false)); // matches head, not tail
+    assert_eq!(t("IsSuffix(<<1, 2, 3>>, <<2, 3>>)"), TlaValue::Bool(false)); // longer
+    assert_eq!(t("IsStrictSuffix(<<2, 3>>, <<1, 2, 3>>)"), TlaValue::Bool(true));
+    assert_eq!(t("IsStrictSuffix(<<1, 2, 3>>, <<1, 2, 3>>)"), TlaValue::Bool(false));
+}
+
+#[test]
+fn seqext_prefix_suffix_parity() {
+    parity("IsPrefix(<<1, 2>>, <<1, 2, 3>>)");
+    parity("IsStrictPrefix(<<1, 2>>, <<1, 2, 3>>)");
+    parity("IsSuffix(<<2, 3>>, <<1, 2, 3>>)");
+    parity("IsStrictSuffix(<<2, 3>>, <<1, 2, 3>>)");
+    parity("IsPrefix(<<1>>, <<2, 3>>)");
+}

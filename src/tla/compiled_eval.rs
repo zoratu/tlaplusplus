@@ -1883,6 +1883,11 @@ fn eval_compiled_opcall(
             // Delegate to text-based eval (set construction is complex)
             return eval_operator_call("SeqOf", arg_values.clone(), ctx, depth);
         }
+        "IsPrefix" | "IsStrictPrefix" | "IsSuffix" | "IsStrictSuffix"
+            if arg_values.len() == 2 && !user_defined_shadow =>
+        {
+            return eval_operator_call(name, arg_values.clone(), ctx, depth);
+        }
         // === Community module: Folds ===
         "MapThenFoldSet" if arg_values.len() == 5 && !user_defined_shadow => {
             return eval_operator_call("MapThenFoldSet", arg_values.clone(), ctx, depth);
