@@ -238,12 +238,29 @@ impl<'a> EvalContext<'a> {
     fn with_local_definitions(&self, defs: BTreeMap<String, TlaDefinition>) -> Self {
         // Copy-on-write: only clone the local_definitions map, reuse the rest
         let mut new_defs = (*self.local_definitions).clone();
+        // A LET binding must shadow any outer binding of the same name — including
+        // a dynamic `locals` entry. `local_definitions` is resolved AFTER `locals`
+        // (see runtime_value / resolve_identifier), so if a LET-bound name also
+        // exists in `locals` the stale local would win and the LET would silently
+        // fail to shadow. This bites when an operator's body re-`LET`s a name that
+        // leaked into `locals` via a callee Lambda's captured_locals: e.g. both
+        // `MoveElevator` and `CanServiceCall` use `LET eState == ElevatorState[e]`,
+        // and `CanServiceCall[e2, ...]` would otherwise read the caller's `eState`
+        // (the wrong elevator) instead of its own. Drop shadowed names from
+        // `locals` so the LET definitions take effect.
+        let mut locals = Rc::clone(&self.locals);
+        if defs.keys().any(|name| self.locals.contains_key(name.as_str())) {
+            let owned = Rc::make_mut(&mut locals);
+            for name in defs.keys() {
+                owned.remove(name.as_str());
+            }
+        }
         for (name, def) in defs {
             new_defs.insert(name, def);
         }
         Self {
             state: self.state,
-            locals: Rc::clone(&self.locals),
+            locals,
             local_definitions: Rc::new(new_defs),
             definitions: self.definitions,
             instances: self.instances,
@@ -428,6 +445,38 @@ mod tests {
     use crate::tla::tla_state;
     use proptest::prelude::*;
     use std::collections::BTreeSet;
+
+    /// Regression: a `LET` binding inside an applied operator's body must
+    /// shadow a same-named variable that leaked into `locals` (here via the
+    /// enclosing `\A` binder + operator application capturing caller locals).
+    /// `local_definitions` (where the LET goes) is resolved AFTER `locals`, so
+    /// before the fix the LET silently failed to shadow and `Inner(2)` returned
+    /// the outer bound `x` (7) instead of 2. This is the mechanism behind the
+    /// MultiCarElevator vs TLC state-space divergence: `CanServiceCall`'s
+    /// `LET eState` vs `MoveElevator`'s leaked `eState`.
+    #[test]
+    fn let_binding_shadows_same_named_leaked_local() {
+        use crate::tla::{compile_expr, eval_compiled};
+        let defs = std::collections::BTreeMap::from([(
+            "Inner".to_string(),
+            TlaDefinition {
+                name: "Inner".to_string(),
+                params: vec!["y".to_string()],
+                body: "LET x == y IN x".to_string(),
+                is_recursive: false,
+            },
+        )]);
+        let state = tla_state([]);
+        let ctx = EvalContext::with_definitions(&state, &defs);
+        // `\A x \in {7} : Inner(2) = 2` binds x=7 in locals; Inner(2)'s
+        // `LET x == y(=2)` must shadow it, so Inner(2) = 2 and the formula holds.
+        let expr = "\\A x \\in {7} : Inner(2) = 2";
+        assert_eq!(eval_expr(expr, &ctx).unwrap(), TlaValue::Bool(true));
+        assert_eq!(
+            eval_compiled(&compile_expr(expr), &ctx).unwrap(),
+            TlaValue::Bool(true)
+        );
+    }
 
     #[test]
     fn normalizes_binder_and_higher_order_param_names() {
