@@ -683,6 +683,7 @@ fn ctx_with_staged_primes<'a>(
     EvalContext {
         state: ctx.state,
         locals: std::rc::Rc::new(new_locals),
+        lexical_locals: std::rc::Rc::clone(&ctx.lexical_locals),
         local_definitions: std::rc::Rc::clone(&ctx.local_definitions),
         definitions: ctx.definitions,
         instances: ctx.instances,
