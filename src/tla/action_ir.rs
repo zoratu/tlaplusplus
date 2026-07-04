@@ -49,6 +49,27 @@ pub(crate) fn split_action_body_clauses(expr: &str) -> Vec<String> {
     if trimmed.starts_with("\\E") || trimmed.starts_with("\\A") {
         return vec![trimmed.to_string()];
     }
+    // A body that *is* a bare `IF cond THEN ... ELSE ...` is one clause, not a
+    // conjunction. Crucially, its condition can be a multi-line bulleted
+    // conjunction — `IF /\ A\n   /\ B THEN ...` — and the indentation-based
+    // conjunct splitter below (`split_indented_action_conjuncts`) would treat
+    // the condition's `/\ B` continuation line as a *top-level* conjunct,
+    // shredding the IF into `["IF /\ A", "B\nTHEN", "<then>\nELSE", "<else>"]`.
+    // That mis-split silently drops the action's successors (the shredded
+    // first clause `IF /\ A` has no THEN, so it compiles to a dead branch).
+    // Nested IFs inside an outer IF's THEN/ELSE branch hit exactly this shape
+    // (e.g. DiningPhilosophers' `Loop`, PlusCal-generated elsif chains).
+    // `\E`/`\A`/comment-`\/` above are guarded for the same reason; `IF` was
+    // simply missing. Keep the whole IF together and let the recursive
+    // `compile_action_clause_text` / `parse_action_if` handle its structure.
+    if trimmed.starts_with("IF")
+        && trimmed[2..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+    {
+        return vec![trimmed.to_string()];
+    }
 
     let raw = split_indented_action_conjuncts(original)
         .unwrap_or_else(|| split_top_level(trimmed, "/\\"));
@@ -356,7 +377,18 @@ fn split_indented_action_conjuncts(expr: &str) -> Option<Vec<String>> {
         let indent = line.len().saturating_sub(trimmed.len());
         if trimmed.starts_with("/\\") {
             let top_level_indent = *base_indent.get_or_insert(indent);
-            if indent == top_level_indent {
+            // A `/\` at the base indent normally starts a new top-level
+            // conjunct — UNLESS the conjunct we're building is an as-yet
+            // unterminated `IF` whose *condition* is a multi-line bulleted
+            // list. In `IF /\ A` / `   /\ B` / `   THEN ...`, the `/\ B` line
+            // is a continuation of the IF condition, not a sibling conjunct.
+            // Because `normalize_multiline_action_indentation` dedents the
+            // condition-continuation lines down to the base indent, they would
+            // otherwise be mis-split, shredding the IF (dropping the action's
+            // successors — DiningPhilosophers `Loop`, PlusCal elsif chains).
+            // Guard with `has_open_if_condition`: true iff `current` has more
+            // top-level `IF`s than `THEN`s so far.
+            if indent == top_level_indent && !has_open_if_condition(&current) {
                 if !current.trim().is_empty() {
                     clauses.push(current.trim().to_string());
                     current.clear();
@@ -976,6 +1008,65 @@ fn matches_keyword_at(chars: &[char], i: usize, keyword: &str) -> bool {
         return false;
     }
     true
+}
+
+/// True iff `text` contains an `IF` at top level (outside parens/brackets/
+/// braces/angles) that has not yet been closed by a matching `THEN` — i.e. we
+/// are still inside an IF *condition*. Used by `split_indented_action_conjuncts`
+/// so a base-indent `/\` continuation line of a multi-line IF condition
+/// (`IF /\ A\n/\ B\nTHEN ...`) is not mis-read as a sibling top-level conjunct.
+/// Nested IFs are counted with a depth counter; each `THEN` closes the most
+/// recent `IF` condition. Bracket/angle depth tracking mirrors
+/// `find_action_keyword`.
+fn has_open_if_condition(text: &str) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0usize;
+    let mut paren = 0usize;
+    let mut bracket = 0usize;
+    let mut brace = 0usize;
+    let mut angle = 0usize;
+    let mut open_if = 0usize;
+
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        match c {
+            '(' => paren += 1,
+            ')' => paren = paren.saturating_sub(1),
+            '[' => bracket += 1,
+            ']' => bracket = bracket.saturating_sub(1),
+            '{' => brace += 1,
+            '}' => brace = brace.saturating_sub(1),
+            '<' if next == Some('<') => {
+                angle += 1;
+                i += 2;
+                continue;
+            }
+            '>' if next == Some('>') => {
+                angle = angle.saturating_sub(1);
+                i += 2;
+                continue;
+            }
+            _ => {}
+        }
+
+        if paren == 0 && bracket == 0 && brace == 0 && angle == 0 {
+            if matches_keyword_at(&chars, i, "IF") {
+                open_if += 1;
+                i += 2;
+                continue;
+            }
+            if open_if > 0 && matches_keyword_at(&chars, i, "THEN") {
+                open_if -= 1;
+                i += 4;
+                continue;
+            }
+        }
+
+        i += 1;
+    }
+
+    open_if > 0
 }
 
 #[cfg(test)]

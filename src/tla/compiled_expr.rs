@@ -1161,6 +1161,27 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
 
     // Logical operators (in precedence order)
 
+    // Negation of a *bulleted* junction: `~ /\ A /\ B` / `~ \/ A \/ B`.
+    //
+    // `~` binds tighter than `/\`/`\/`, so `~A /\ B` = `(~A) /\ B` and is
+    // correctly handled by the And/Or splits below (first conjunct `~A` is a
+    // well-formed operand). The ONE shape those splits get wrong is a `~`
+    // prefixing a bulleted list: `split_top_level("~ /\ A /\ B", "/\\")`
+    // slices off a bare `~` as the first "conjunct", which then compiles to
+    // `Not(compile_expr(""))` and errors with "empty expression" at eval time.
+    // We must intercept it here — BEFORE the And/Or splits — and route the
+    // whole junction list to `Not`, matching TLA+ semantics `~(A /\ B)`.
+    // (TCommit's `TCConsistent == \A rm1,rm2 : ~ /\ ... /\ ...` compiled to a
+    // broken `And(["", ...])` and false-violated every state, including the
+    // initial one. The interpreted evaluator's `dispatch::classify_op` has the
+    // mirror-image guard for the same reason.)
+    if let Some(after_tilde) = expr.strip_prefix('~') {
+        let t = after_tilde.trim_start();
+        if t.starts_with("/\\") || t.starts_with("\\/") {
+            return CompiledExpr::Not(Box::new(compile_expr(t)));
+        }
+    }
+
     // INDENTATION-based boolean splitting comes BEFORE infix `=>`/`<=>`.
     //
     // For a multiline TLA+ bulleted junction list, the alignment of the `/\`
