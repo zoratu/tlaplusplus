@@ -1331,7 +1331,7 @@ pub(crate) fn eval_operator_call(
         let lexical_mut = Rc::make_mut(&mut child.lexical_locals);
         for (param, arg) in def.params.iter().zip(args.into_iter()) {
             bind_param_value(locals_mut, param, arg)?;
-            lexical_mut.insert(normalize_param_name(param).to_string());
+            lexical_mut.insert(super::normalize_param_name(param).to_string());
         }
     }
     eval_expr_inner(&def.body, &child, depth + 1)

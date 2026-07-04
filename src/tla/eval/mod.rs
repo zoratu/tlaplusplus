@@ -505,6 +505,46 @@ mod tests {
     use proptest::prelude::*;
     use std::collections::BTreeSet;
 
+    /// A module-level operator is lexically scoped and must NOT see the caller's
+    /// dynamic locals. `Op(y) == z + y` references the free name `z` (a
+    /// module-level definition = 5); called from `\A z \in {7} : ...` the `z`
+    /// bound by the `\A` must not leak into `Op`, so `Op(10) = 15`. Before the
+    /// lexical-locals tagging, operator application inherited the caller's locals
+    /// and `z` resolved to 7, giving 17. Unlike the LET-shadow case, `Op` does
+    /// not rebind `z`, so only removing the leak fixes it.
+    #[test]
+    fn module_operator_does_not_capture_caller_locals() {
+        use crate::tla::{compile_expr, eval_compiled};
+        let defs = std::collections::BTreeMap::from([
+            (
+                "z".to_string(),
+                TlaDefinition {
+                    name: "z".to_string(),
+                    params: vec![],
+                    body: "5".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Op".to_string(),
+                TlaDefinition {
+                    name: "Op".to_string(),
+                    params: vec!["y".to_string()],
+                    body: "z + y".to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+        let state = tla_state([]);
+        let ctx = EvalContext::with_definitions(&state, &defs);
+        let expr = "\\A z \\in {7} : Op(10) = 15";
+        assert_eq!(eval_expr(expr, &ctx).unwrap(), TlaValue::Bool(true));
+        assert_eq!(
+            eval_compiled(&compile_expr(expr), &ctx).unwrap(),
+            TlaValue::Bool(true)
+        );
+    }
+
     /// Regression: a `LET` binding inside an applied operator's body must
     /// shadow a same-named variable that leaked into `locals` (here via the
     /// enclosing `\A` binder + operator application capturing caller locals).
