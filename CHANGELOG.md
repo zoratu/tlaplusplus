@@ -1,5 +1,34 @@
 # Changelog
 
+## v1.2.18 (2026-07-04)
+
+Two correctness/coverage fixes surfaced by a fresh analyze-tla scan of the tlaplus/Examples corpus on current main.
+
+### PR #118 — LET bindings shadow same-named dynamic locals (fixes a state-space superset vs TLC)
+
+A `LET` binding failed to shadow a same-named **dynamic local**, so the checker could explore a *superset* of the correct state space — a latent false-positive risk on safety specs. `EvalContext::with_local_definitions` (entered on every `LET`) added the LET's definitions to `local_definitions` but left `locals` untouched, and identifier resolution checks `locals` **before** `local_definitions` (`runtime_value` / `resolve_identifier`). So when a LET-bound name also existed in `locals`, the stale local won and the LET silently failed to shadow it.
+
+This surfaced through `apply_value`, which evaluates an applied operator's body with the *caller's* locals captured as the Lambda's `captured_locals` (a dynamic-scope leak). In MultiCarElevator, both `MoveElevator` and `CanServiceCall` use `LET eState == ElevatorState[e]`; inside `MoveElevator(e)`'s guard, evaluating the consequent `\E e2 \in Elevator : e /= e2 /\ CanServiceCall[e2, call]`, `MoveElevator`'s `eState` (the *calling* elevator's state) leaked into `CanServiceCall`, whose own `LET eState == ElevatorState[e2]` could not shadow it — so `CanServiceCall[e2, call]` read the wrong elevator, the guard became too permissive, and `MoveElevator` fired when it shouldn't. On `ElevatorSafetySmall` that was **4232 distinct states (ours) vs 4122 (TLC)**.
+
+The fix: when entering a `LET`, drop any `locals` entry whose name the LET rebinds, so the LET definition wins. The fast path is unchanged when there is no name collision. MultiCarElevator now matches TLC exactly (**4122 distinct / 14296 generated**). This is a general fix — any spec with a LET name colliding with a captured or bound local was affected, not just the elevator. Isolated via a state-graph diff (dump ours + TLC, canonicalize, set-diff) down to the exact bad transition, then `TLAPP_TRACE_FUNCAPPLY` + `TLAPP_TRACE_VAR` on a pinned reproduction exposed the leaked `eState`.
+
+### PR #117 — SequencesExt `IsPrefix` / `IsSuffix` family (closes 4 corpus specs)
+
+Implements the previously-missing SequencesExt operators `IsPrefix`, `IsStrictPrefix`, `IsSuffix`, `IsStrictSuffix`. Four tlaplus/Examples specs (`tcp_APtcp`, `tcp_MCtcp`, `tcp_IndInv_apa`, `tcp_IndInv_apa_init`) failed with `unknown operator/function 'IsPrefix'`. Standard SequencesExt semantics (`IsPrefix(s,t) == DOMAIN s ⊆ DOMAIN t ∧ ∀ i ∈ DOMAIN s : s[i] = t[i]`, and so on); element comparison uses `semantic_eq` (a Seq and a `1..n` Function compare equal, matching the `=` operator). Implemented on the interpreted path with a delegating arm on the compiled path.
+
+### Gauntlet
+
+| Gate | Result |
+|---|---|
+| `cargo test --release` | pass (x86_64 + aarch64) |
+| `scripts/diff_tlc.sh` | 13 / 13 specs match TLC v2.19 |
+| compiled-vs-interpreted proptest @ 512 | 17 / 17 (interpreted and compiled still agree) |
+| state-graph snapshots | 12 / 12 |
+| tlaplus/Examples corpus re-scan | 219 / 226 full_pass, no crashes / no new parse errors |
+| CI | green on x86_64 + aarch64 (both gates each) |
+
+Drop-in for v1.2.17.
+
 ## v1.2.17 (2026-07-03)
 
 Switch the global allocator to jemalloc on Linux — the single highest-leverage change for many-core state exploration.
