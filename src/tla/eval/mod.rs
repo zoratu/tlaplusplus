@@ -293,20 +293,28 @@ impl<'a> EvalContext<'a> {
         self.state.get(name).cloned()
     }
 
-    /// The locals a module-level operator's body may see: only the staged
-    /// next-state (primed, `x'`) bindings, never the caller's lexical locals
-    /// (quantifier/operator binders). A module-level operator is lexically
-    /// scoped to the module, so a free variable in its body must not bind to a
-    /// same-named caller local; but primed staging is part of the surrounding
-    /// action's evaluation environment (like the current state) and must remain
-    /// visible. LET-local operators keep all locals (they may reference an
-    /// enclosing bound variable) and do not use this.
-    pub(crate) fn primed_only_locals(&self) -> BTreeMap<String, TlaValue> {
+    /// The locals a module-level operator's body may see. A module-level
+    /// operator is lexically scoped to the module, so a free variable in its
+    /// body must NOT bind to a same-named caller lexical local (quantifier /
+    /// operator binder). But two kinds of `locals` entry are part of the
+    /// surrounding evaluation environment, not caller lexical scope, and must
+    /// stay visible: staged primed (`x'`) next-state bindings, and the unprimed
+    /// state-variable shadow bindings that `with_primed_state_shadow_bindings`
+    /// installs for `Op'` evaluation. Both are keyed either with a trailing
+    /// `'` or by a state-variable name; everything else is a lexical binder and
+    /// is dropped. LET-local operators keep all locals and do not use this.
+    pub(crate) fn module_operator_locals(&self) -> BTreeMap<String, TlaValue> {
         self.locals
             .iter()
-            .filter(|(k, _)| k.ends_with('\''))
+            .filter(|(k, _)| self.keep_for_module_operator(k))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
+    }
+
+    /// Whether a `locals` key survives into a module-level operator's scope.
+    /// See [`module_operator_locals`].
+    pub(crate) fn keep_for_module_operator(&self, key: &str) -> bool {
+        key.ends_with('\'') || self.state.contains_key(key)
     }
 
     pub(crate) fn definition(&self, name: &str) -> Option<TlaDefinition> {
@@ -376,11 +384,11 @@ impl<'a> EvalContext<'a> {
             // variable in its body bind to a same-named caller local); it keeps
             // only staged primed (next-state) bindings. A LET-local operator may
             // reference an enclosing bound variable, so it keeps all locals.
-            let primed = self.primed_only_locals();
+            let visible = self.module_operator_locals();
             let captured = if self.local_definitions.contains_key(name) {
                 self.locals.as_ref()
             } else {
-                &primed
+                &visible
             };
             return Ok(definition_as_lambda(&def, captured));
         }

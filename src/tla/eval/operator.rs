@@ -1326,7 +1326,7 @@ pub(crate) fn eval_operator_call(
         // primed (next-state) bindings plus the params bound below. A LET-local
         // operator may reference an enclosing bound variable, so it keeps them.
         if !ctx.local_definitions.contains_key(name) {
-            locals_mut.retain(|k, _| k.ends_with('\''));
+            locals_mut.retain(|k, _| ctx.keep_for_module_operator(k));
         }
         for (param, arg) in def.params.iter().zip(args.into_iter()) {
             bind_param_value(locals_mut, param, arg)?;

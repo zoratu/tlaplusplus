@@ -216,10 +216,11 @@ fn eval_var_by_name(name: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<T
             // top-level evaluation (no locals) and action eval (primed-only
             // locals) keep the fast path.
             let needs_clean = !ctx.local_definitions.contains_key(name)
-                && ctx.locals.keys().any(|k| !k.ends_with('\''));
+                && ctx.locals.keys().any(|k| !ctx.keep_for_module_operator(k));
             let result = if needs_clean {
                 let mut clean = ctx.clone();
-                std::rc::Rc::make_mut(&mut clean.locals).retain(|k, _| k.ends_with('\''));
+                std::rc::Rc::make_mut(&mut clean.locals)
+                    .retain(|k, _| ctx.keep_for_module_operator(k));
                 eval_compiled_inner(&compiled_body, &clean, depth)
             } else {
                 eval_compiled_inner(&compiled_body, ctx, depth)
@@ -244,7 +245,7 @@ fn eval_var_by_name(name: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<T
             captured_locals: if ctx.local_definitions.contains_key(name) {
                 Arc::new((*ctx.locals).clone())
             } else {
-                Arc::new(ctx.primed_only_locals())
+                Arc::new(ctx.module_operator_locals())
             },
         };
         if trace_var_enabled() {
@@ -2103,7 +2104,7 @@ fn eval_compiled_opcall(
     // bindings) before binding params. A LET-local operator may reference an
     // enclosing bound variable, so it keeps the caller locals.
     if !ctx.local_definitions.contains_key(name) {
-        std::rc::Rc::make_mut(&mut new_ctx.locals).retain(|k, _| k.ends_with('\''));
+        std::rc::Rc::make_mut(&mut new_ctx.locals).retain(|k, _| ctx.keep_for_module_operator(k));
     }
     for (param, value) in def.params.iter().zip(arg_values.into_iter()) {
         new_ctx = new_ctx.with_local_value(normalize_param_name(param), value);
