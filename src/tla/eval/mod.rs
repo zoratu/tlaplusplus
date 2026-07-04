@@ -355,7 +355,17 @@ impl<'a> EvalContext<'a> {
             if def.params.is_empty() {
                 return eval_operator_call(name, Vec::new(), self, depth);
             }
-            return Ok(definition_as_lambda(&def, self.locals.as_ref()));
+            // A module-level operator is lexically scoped to the module and must
+            // NOT capture the caller's dynamic locals (that would let a free
+            // variable in its body bind to a same-named caller local). Only a
+            // LET-local operator may reference an enclosing bound variable.
+            let empty = BTreeMap::new();
+            let captured = if self.local_definitions.contains_key(name) {
+                self.locals.as_ref()
+            } else {
+                &empty
+            };
+            return Ok(definition_as_lambda(&def, captured));
         }
 
         // Check for known zero-arg built-in operators used as bare identifiers
@@ -445,6 +455,46 @@ mod tests {
     use crate::tla::tla_state;
     use proptest::prelude::*;
     use std::collections::BTreeSet;
+
+    /// Regression: a module-level operator is lexically scoped and must NOT see
+    /// the caller's dynamic locals. Here `Op(y) == z + y` references the free
+    /// name `z` (a module-level definition = 5); called from `\A z \in {7} : ...`
+    /// the `z` bound by the `\A` must NOT capture into `Op`, so `Op(10) = 15`.
+    /// Before the fix, operator application captured the caller's locals, so
+    /// `z` resolved to the loop's 7 and `Op(10)` was 17. Unlike the LET-shadow
+    /// case, `Op` does not rebind `z`, so only removing the capture fixes it.
+    #[test]
+    fn module_operator_does_not_capture_caller_locals() {
+        use crate::tla::{compile_expr, eval_compiled};
+        let defs = std::collections::BTreeMap::from([
+            (
+                "z".to_string(),
+                TlaDefinition {
+                    name: "z".to_string(),
+                    params: vec![],
+                    body: "5".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Op".to_string(),
+                TlaDefinition {
+                    name: "Op".to_string(),
+                    params: vec!["y".to_string()],
+                    body: "z + y".to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+        let state = tla_state([]);
+        let ctx = EvalContext::with_definitions(&state, &defs);
+        let expr = "\\A z \\in {7} : Op(10) = 15";
+        assert_eq!(eval_expr(expr, &ctx).unwrap(), TlaValue::Bool(true));
+        assert_eq!(
+            eval_compiled(&compile_expr(expr), &ctx).unwrap(),
+            TlaValue::Bool(true)
+        );
+    }
 
     /// Regression: a `LET` binding inside an applied operator's body must
     /// shadow a same-named variable that leaked into `locals` (here via the

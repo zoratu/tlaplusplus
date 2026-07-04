@@ -217,10 +217,21 @@ fn eval_var_by_name(name: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<T
             return result.map_err(|e| anyhow!("failed to resolve {}: {}", name, e));
         }
 
+        // A module-level operator is lexically scoped to the module: its body
+        // sees only its own params, the module definitions, and the state — NOT
+        // the caller's dynamic locals. Capturing caller locals here is a
+        // dynamic-scope leak (a free variable in the body could bind to a
+        // same-named local of whatever code called the operator). A LET-local
+        // operator (name present in `local_definitions`) may legitimately
+        // reference an enclosing bound variable, so it keeps the capture.
         let value = TlaValue::Lambda {
             params: Arc::new(def.params.clone()),
             body: def.body.clone(),
-            captured_locals: Arc::new((*ctx.locals).clone()),
+            captured_locals: if ctx.local_definitions.contains_key(name) {
+                Arc::new((*ctx.locals).clone())
+            } else {
+                Arc::new(BTreeMap::new())
+            },
         };
         if trace_var_enabled() {
             eprintln!("VAR {} (operator value) -> Ok({:?})", name, value);
