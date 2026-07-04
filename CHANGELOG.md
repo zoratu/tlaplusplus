@@ -1,6 +1,6 @@
 # Changelog
 
-## v1.2.15 (2026-07-03)
+## v1.2.17 (2026-07-03)
 
 Switch the global allocator to jemalloc on Linux — the single highest-leverage change for many-core state exploration.
 
@@ -28,7 +28,53 @@ jemalloc's *worst* sample beat glibc's *best* by +23%; it was chosen over mimall
 | state-graph snapshots | 12 / 12 |
 | CI | green on x86_64 + aarch64 (both gates each) |
 
-The allocator is behaviour-transparent: identical fingerprints, distinct-state counts, and checker verdicts. Drop-in for v1.2.14.
+The allocator is behaviour-transparent: identical fingerprints, distinct-state counts, and checker verdicts. Drop-in for v1.2.16.
+
+## v1.2.16 (2026-07-03)
+
+Slot-indexed state representation — O(1) variable lookup on the eval hot path, replacing the `memcmp`-bound `BTreeMap` key search.
+
+### PR #113 — slot-indexed `TlaState` + compile-time `StateVar` resolution (+7.4% single-thread eval)
+
+`TlaState` was a `BTreeMap<Arc<str>, TlaValue>`, so every variable read walked the map comparing interned name strings — `EvalContext::runtime_value`'s `memcmp` was ~15–18% of eval self-time. `TlaState` becomes a schema-shared slot-indexed `Vec<TlaValue>`: all states of a model share one `Arc<StateSchema>` (sorted variable names → slot indices), so a variable lives at a fixed `Vec` offset. A compile-time pass then rewrites each free state-variable `Var(name)` in the compiled action/invariant IR to `CompiledExpr::StateVar { slot, name }`, resolved conservatively (only when `name` is a state variable and never shadowed as a binder anywhere in the expression — an exhaustive binder walk over `CompiledExpr` *and* `CompiledActionClause`, including operator parameters). Evaluation is then an O(1) `get_slot`, guarded by a `!locals.contains_key(name)` shadow check plus an `Arc::ptr_eq` schema-match so partial/`Init` states fall back to the exact old name-based path.
+
+The representation change is byte-transparent — custom `Eq`/`Ord`/`Hash`/`Serialize` reproduce the old sorted `(name, value)`-pair semantics and serialized shape, so fingerprints, checkpoints, and snapshots are unchanged. Measured on MCCheckpointCoordination at 1 worker (isolating the eval hot path from allocator/FP-store contention): **+7.4% state-exploration throughput**, run-to-run variance < 0.5%. Designed, implemented, and reviewed in collaboration with the `codex` CLI, which caught three real safety gaps in the initial design (operator parameters are binders; action-level binders live in `CompiledActionClause`; a separately-compiled operator body can run under outer dynamic locals that shadow a state variable — hence the `locals` guard before `ptr_eq`).
+
+### Gauntlet
+
+| Gate | Result |
+|---|---|
+| `cargo test --release` | 898 lib+bin suites pass, 0 fail |
+| `scripts/diff_tlc.sh` | 13 / 13 specs match TLC v2.19 |
+| compiled-vs-interpreted proptest @ 512 | 17 / 17 |
+| state-graph snapshots | 12 / 12 |
+| CI | green on x86_64 + aarch64 (both gates each) |
+
+Behaviour-transparent (identical fingerprints, distinct-state counts, verdicts). Drop-in for v1.2.15.
+
+## v1.2.15 (2026-06-29)
+
+Fix a soundness/efficiency bug where a TLA+ sequence and the same value written as a function over `1..n` were treated as different — TLA+ says they are equal (a sequence *is* a function over `1..Len`).
+
+### PR #112 — dedup Seq vs Function-over-`1..n` state representations (fixes ~8x state inflation)
+
+A value built as `[i \in 1..n |-> e]` and the same value built via `Append`/`<<...>>` are equal in TLA+, but `TlaValue` keeps `Seq` and `Function` as distinct variants, so logically-equal states hashed differently and the fingerprint store failed to dedup them. MCCheckpointCoordination explored ~8x more states than TLC for exactly this reason (its log is `Seq(...)`). The fix normalizes every `1..n`-domain function to its `Seq` form **for the fingerprint only** (`TlaValue::normalize_seq_changed`, no allocation when nothing changes); the runtime keeps exploring the original state, so invariant evaluation is untouched (normalizing the *stored* state would expose operators that treat Seq vs Function inconsistently and produce false violations — hashing the normalized form cannot). Under symmetry the canonical permutation must also be chosen on the normalized state, so `canonicalize_tla_state` now computes the lex-min over the seq-normalized state but applies the winning permutation to the original. Result: exact TLC distinct-count match at every scale (small 240, medium 204224, MaxLog=3 901692, sym + nosym). Cost is ~2x per-state on Seq-heavy specs, a net win given ~8x fewer states.
+
+### PR #111 — `=` / `#` / `/=` treat a Seq and a Function over `1..n` as equal
+
+The operator-level counterpart: the derived `==` on `TlaValue` reported `x = <<0,0,0>>` as FALSE where `x == [i \in 1..3 |-> 0]`. Adds `TlaValue::semantic_eq` (recurses through Set/Seq/Record/Function, treating a Seq and a `1..n`-domain Function as equal) and routes the interpreted and compiled `=` / `#` / `/=` operators through it. Equality-semantics only — value storage, hashing, and dedup are unchanged (that is PR #112's job).
+
+### Gauntlet
+
+| Gate | Result |
+|---|---|
+| `cargo test --release` | 894 lib + all binary suites pass |
+| `scripts/diff_tlc.sh` | 13 / 13 specs match TLC v2.19 |
+| compiled-vs-interpreted proptest @ 512 | 17 / 17 |
+| state-graph snapshots | 12 / 12 |
+| CI | green on x86_64 + aarch64 (both gates each) |
+
+Adds regression tests pinning cross-representation `=` semantics and the symmetry-aware dedup key.
 
 ## v1.2.14 (2026-06-19)
 
