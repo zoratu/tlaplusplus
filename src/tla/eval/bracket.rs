@@ -199,17 +199,25 @@ pub(crate) fn apply_value(
                 ));
             }
 
-            // Create a new context with captured locals
+            // Create a new context with captured locals. `captured_locals` is a
+            // frozen environment snapshot (already module-scoped for a
+            // module-level operator — its lexical binders were removed at capture
+            // time), so it carries no lexical binders of THIS invocation. Start
+            // `lexical_locals` fresh; the params bound below are the new lexical
+            // binders.
             let mut lambda_ctx = ctx.clone();
             lambda_ctx.locals = Rc::new((**captured_locals).clone());
+            let mut lexical = std::collections::BTreeSet::new();
 
             // Bind arguments to parameters
             {
                 let locals_mut = Rc::make_mut(&mut lambda_ctx.locals);
                 for (param, arg) in params.iter().zip(args.into_iter()) {
                     bind_param_value(locals_mut, param, arg)?;
+                    lexical.insert(super::normalize_param_name(param).to_string());
                 }
             }
+            lambda_ctx.lexical_locals = Rc::new(lexical);
 
             // Evaluate the lambda body
             eval_expr_inner(body, &lambda_ctx, depth + 1)

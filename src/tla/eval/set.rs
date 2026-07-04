@@ -248,6 +248,7 @@ pub(super) fn eval_set_expression(expr: &str, ctx: &EvalContext<'_>, depth: usiz
                                 let child = EvalContext {
                                     state: ctx.state,
                                     locals: Rc::new(iter_locals),
+                                    lexical_locals: Rc::clone(&ctx.lexical_locals),
                                     local_definitions: Rc::clone(&ctx.local_definitions),
                                     definitions: ctx.definitions,
                                     instances: ctx.instances,

@@ -1317,11 +1317,21 @@ pub(crate) fn eval_operator_call(
         ));
     }
 
-    let mut child = ctx.clone();
+    // A module-level operator is lexically scoped: drop the caller's lexical
+    // locals first (keeping primes / shadows / instance substitutions). A
+    // LET-local operator may reference an enclosing bound variable, so it keeps
+    // them. The bound params become this invocation's lexical binders.
+    let mut child = if ctx.local_definitions.contains_key(name) {
+        ctx.clone()
+    } else {
+        ctx.enter_module_operator_scope()
+    };
     {
         let locals_mut = Rc::make_mut(&mut child.locals);
+        let lexical_mut = Rc::make_mut(&mut child.lexical_locals);
         for (param, arg) in def.params.iter().zip(args.into_iter()) {
             bind_param_value(locals_mut, param, arg)?;
+            lexical_mut.insert(normalize_param_name(param).to_string());
         }
     }
     eval_expr_inner(&def.body, &child, depth + 1)

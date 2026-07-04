@@ -7,7 +7,7 @@ use crate::tla::hashed_arc::HashedArc;
 use crate::tla::{ActionClause, ActionIr};
 use anyhow::{Result, anyhow};
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -144,6 +144,15 @@ use splitter::{
 pub struct EvalContext<'a> {
     pub state: &'a TlaState,
     pub locals: Rc<BTreeMap<String, TlaValue>>,
+    /// Names in `locals` that are LEXICAL binders (quantifier / operator / LET
+    /// binders), as opposed to environment bindings that also live in `locals`
+    /// (staged primes `x'`, primed state-var shadows, INSTANCE substitutions).
+    /// A module-level operator is lexically scoped, so on entry we drop exactly
+    /// these names from `locals` (see `enter_module_operator_scope`) while
+    /// keeping the environment bindings. Populated only at lexical binder sites;
+    /// anything untagged is treated as environment (kept) — a safe default, so a
+    /// missed tag under-fixes the leak rather than regressing a real mechanism.
+    pub lexical_locals: Rc<BTreeSet<String>>,
     pub local_definitions: Rc<BTreeMap<String, TlaDefinition>>,
     pub definitions: Option<&'a BTreeMap<String, TlaDefinition>>,
     pub instances: Option<&'a BTreeMap<String, crate::tla::module::TlaModuleInstance>>,
@@ -168,6 +177,7 @@ impl<'a> EvalContext<'a> {
         Self {
             state,
             locals: Rc::new(BTreeMap::new()),
+            lexical_locals: Rc::new(BTreeSet::new()),
             local_definitions: Rc::new(BTreeMap::new()),
             definitions: None,
             instances: None,
@@ -182,6 +192,7 @@ impl<'a> EvalContext<'a> {
         Self {
             state,
             locals: Rc::new(BTreeMap::new()),
+            lexical_locals: Rc::new(BTreeSet::new()),
             local_definitions: Rc::new(BTreeMap::new()),
             definitions: Some(definitions),
             instances: None,
@@ -197,6 +208,7 @@ impl<'a> EvalContext<'a> {
         Self {
             state,
             locals: Rc::new(BTreeMap::new()),
+            lexical_locals: Rc::new(BTreeSet::new()),
             local_definitions: Rc::new(BTreeMap::new()),
             definitions: Some(definitions),
             instances: Some(instances),
@@ -205,12 +217,18 @@ impl<'a> EvalContext<'a> {
     }
 
     pub(crate) fn with_local_value(&self, name: impl Into<String>, value: TlaValue) -> Self {
-        // Copy-on-write: only clone the locals map, reuse the rest
+        // Copy-on-write: only clone the locals map, reuse the rest. This helper
+        // binds a LEXICAL local (quantifier binder, operator param, `@`), so the
+        // name is also recorded in `lexical_locals`.
+        let name = name.into();
         let mut new_locals = (*self.locals).clone();
-        new_locals.insert(name.into(), value);
+        new_locals.insert(name.clone(), value);
+        let mut new_lexical = (*self.lexical_locals).clone();
+        new_lexical.insert(name);
         Self {
             state: self.state,
             locals: Rc::new(new_locals),
+            lexical_locals: Rc::new(new_lexical),
             local_definitions: Rc::clone(&self.local_definitions),
             definitions: self.definitions,
             instances: self.instances,
@@ -220,18 +238,52 @@ impl<'a> EvalContext<'a> {
 
     #[allow(dead_code)]
     fn with_local_values(&self, values: &[(&str, TlaValue)]) -> Self {
-        // Copy-on-write: only clone the locals map, reuse the rest
+        // Copy-on-write: only clone the locals map, reuse the rest. Lexical binders.
         let mut new_locals = (*self.locals).clone();
+        let mut new_lexical = (*self.lexical_locals).clone();
         for (k, v) in values {
             new_locals.insert((*k).to_string(), v.clone());
+            new_lexical.insert((*k).to_string());
         }
         Self {
             state: self.state,
             locals: Rc::new(new_locals),
+            lexical_locals: Rc::new(new_lexical),
             local_definitions: Rc::clone(&self.local_definitions),
             definitions: self.definitions,
             instances: self.instances,
             eval_budget: self.eval_budget.clone(),
+        }
+    }
+
+    /// Enter a module-level operator's body: drop the caller's LEXICAL locals
+    /// (they are out of the module operator's lexical scope) while keeping
+    /// environment bindings (primes, primed state-var shadows, INSTANCE
+    /// substitutions). Returns a context whose `locals` retains only non-lexical
+    /// entries and whose `lexical_locals` is empty (the operator starts a fresh
+    /// lexical scope; its params are added afterwards via `with_local_value`).
+    pub(crate) fn enter_module_operator_scope(&self) -> Self {
+        let mut ctx = self.clone();
+        if !self.lexical_locals.is_empty() {
+            std::rc::Rc::make_mut(&mut ctx.locals).retain(|k, _| !self.lexical_locals.contains(k));
+            ctx.lexical_locals = Rc::new(BTreeSet::new());
+        }
+        ctx
+    }
+
+    /// The `locals` a module-level operator's body should see: the caller's
+    /// `locals` with its LEXICAL binders removed (environment bindings — primes,
+    /// primed state-var shadows, INSTANCE substitutions — kept). Used when
+    /// capturing the environment into an operator Lambda value.
+    pub(crate) fn non_lexical_locals(&self) -> BTreeMap<String, TlaValue> {
+        if self.lexical_locals.is_empty() {
+            (*self.locals).clone()
+        } else {
+            self.locals
+                .iter()
+                .filter(|(k, _)| !self.lexical_locals.contains(k.as_str()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
         }
     }
 
@@ -261,6 +313,7 @@ impl<'a> EvalContext<'a> {
         Self {
             state: self.state,
             locals,
+            lexical_locals: Rc::clone(&self.lexical_locals),
             local_definitions: Rc::new(new_defs),
             definitions: self.definitions,
             instances: self.instances,
@@ -355,7 +408,13 @@ impl<'a> EvalContext<'a> {
             if def.params.is_empty() {
                 return eval_operator_call(name, Vec::new(), self, depth);
             }
-            return Ok(definition_as_lambda(&def, self.locals.as_ref()));
+            // A module-level operator captures only the non-lexical environment
+            // (primes / shadows / instances); a LET-local operator captures the
+            // full caller scope (it may reference an enclosing bound variable).
+            if self.local_definitions.contains_key(name) {
+                return Ok(definition_as_lambda(&def, self.locals.as_ref()));
+            }
+            return Ok(definition_as_lambda(&def, &self.non_lexical_locals()));
         }
 
         // Check for known zero-arg built-in operators used as bare identifiers
@@ -3869,6 +3928,7 @@ Buffer == INSTANCE RingBuffer
         let ctx = EvalContext {
             state: &state,
             locals: Rc::new(BTreeMap::new()),
+            lexical_locals: Rc::new(BTreeSet::new()),
             local_definitions: Rc::new(BTreeMap::new()),
             definitions: None,
             instances: None,

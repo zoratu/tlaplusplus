@@ -207,10 +207,20 @@ fn eval_var_by_name(name: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<T
 
     // Then check if it's a no-arg operator - use compiled evaluation
     if let Some(def) = ctx.definition(name) {
+        // A module-level operator (name not in local_definitions) is lexically
+        // scoped to the module: its body must not see the caller's lexical
+        // locals. A LET-local operator may reference an enclosing bound variable,
+        // so it keeps the full caller scope.
+        let module_level = !ctx.local_definitions.contains_key(name);
         if def.params.is_empty() {
             // Get or compile the operator body
             let compiled_body = get_or_compile_operator(name, &def.body, &def.params);
-            let result = eval_compiled_inner(&compiled_body, ctx, depth);
+            let result = if module_level && !ctx.lexical_locals.is_empty() {
+                let scoped = ctx.enter_module_operator_scope();
+                eval_compiled_inner(&compiled_body, &scoped, depth)
+            } else {
+                eval_compiled_inner(&compiled_body, ctx, depth)
+            };
             if trace_var_enabled() {
                 eprintln!("VAR {} (operator) -> {:?}", name, result);
             }
@@ -220,7 +230,11 @@ fn eval_var_by_name(name: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<T
         let value = TlaValue::Lambda {
             params: Arc::new(def.params.clone()),
             body: def.body.clone(),
-            captured_locals: Arc::new((*ctx.locals).clone()),
+            captured_locals: if module_level {
+                Arc::new(ctx.non_lexical_locals())
+            } else {
+                Arc::new((*ctx.locals).clone())
+            },
         };
         if trace_var_enabled() {
             eprintln!("VAR {} (operator value) -> Ok({:?})", name, value);
@@ -1763,6 +1777,7 @@ fn eval_compiled_opcall(
                         let lambda_ctx = EvalContext {
                             state: ctx.state,
                             locals: std::rc::Rc::new(locals),
+                            lexical_locals: std::rc::Rc::clone(&ctx.lexical_locals),
                             local_definitions: ctx.local_definitions.clone(),
                             definitions: ctx.definitions,
                             instances: ctx.instances,
@@ -2070,8 +2085,14 @@ fn eval_compiled_opcall(
     // Get or compile the operator body
     let compiled_body = get_or_compile_operator(name, &def.body, &def.params);
 
-    // Create new context with parameter bindings
-    let mut new_ctx = ctx.clone();
+    // Create new context with parameter bindings. A module-level operator is
+    // lexically scoped: drop the caller's lexical locals first (keeping primes /
+    // shadows / instance substitutions). A LET-local operator keeps them.
+    let mut new_ctx = if ctx.local_definitions.contains_key(name) {
+        ctx.clone()
+    } else {
+        ctx.enter_module_operator_scope()
+    };
     for (param, value) in def.params.iter().zip(arg_values.into_iter()) {
         new_ctx = new_ctx.with_local_value(normalize_param_name(param), value);
     }
@@ -2630,6 +2651,7 @@ fn ctx_with_staged_primes<'a>(
     EvalContext {
         state: ctx.state,
         locals: std::rc::Rc::new(new_locals),
+        lexical_locals: std::rc::Rc::clone(&ctx.lexical_locals),
         local_definitions: std::rc::Rc::clone(&ctx.local_definitions),
         definitions: ctx.definitions,
         instances: ctx.instances,
