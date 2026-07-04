@@ -2489,14 +2489,30 @@ fn eval_compiled_clause_to_branch<'a>(
 /// interpreted action-body evaluator instead of the boolean guard evaluator.
 fn guard_text_is_action_body(text: &str) -> bool {
     let trimmed = text.trim_start();
-    if !trimmed.starts_with("\\/") {
-        return false;
-    }
-    // Quick scan for a primed identifier (`X'`) or an UNCHANGED clause that
-    // appears outside double-quoted strings. Both indicate an action body.
+    // An action body reaches this function as a `Guard` clause whenever
+    // `compile_action_ir` failed to recognise a top-level disjunction as an
+    // action (it splits on conjunction, not disjunction). That happens for BOTH
+    // the *prefix* bulleted form `\/ A \/ B` AND the *infix* form `A \/ B`
+    // (e.g. the body of `\E i, j \in S : parDie(i) \/ parProgNB(i, j)` in the
+    // ACP specs). Either shape must be routed to the interpreted action-body
+    // evaluator so each disjunct stages its own primed assignments; evaluating
+    // it as a boolean silently drops every successor from the branch — a
+    // soundness bug that masks invariant violations as false negatives.
+    //
+    // We require BOTH:
+    //   (1) a top-level `\/` separator (respecting strings and bracketing), and
+    //   (2) a primed identifier (`X'`) or an `UNCHANGED` clause somewhere,
+    // which together identify a disjunction of actions rather than a pure
+    // boolean guard. (A pure boolean guard never contains primed vars.)
     let bytes = trimmed.as_bytes();
     let mut in_string = false;
     let mut escaped = false;
+    let mut paren = 0usize;
+    let mut bracket = 0usize;
+    let mut brace = 0usize;
+    let mut angle = 0usize;
+    let mut has_top_level_or = false;
+    let mut has_action_marker = false;
     let mut i = 0usize;
     while i < bytes.len() {
         let ch = bytes[i];
@@ -2516,13 +2532,37 @@ fn guard_text_is_action_body(text: &str) -> bool {
             i += 1;
             continue;
         }
+        // Track `<< >>` tuple delimiters so a `\/` inside them isn't top-level.
+        if ch == b'<' && bytes.get(i + 1) == Some(&b'<') {
+            angle += 1;
+            i += 2;
+            continue;
+        }
+        if ch == b'>' && bytes.get(i + 1) == Some(&b'>') {
+            angle = angle.saturating_sub(1);
+            i += 2;
+            continue;
+        }
+        let depth_zero = paren == 0 && bracket == 0 && brace == 0 && angle == 0;
+        match ch {
+            b'(' => paren += 1,
+            b')' => paren = paren.saturating_sub(1),
+            b'[' => bracket += 1,
+            b']' => bracket = bracket.saturating_sub(1),
+            b'{' => brace += 1,
+            b'}' => brace = brace.saturating_sub(1),
+            b'\\' if depth_zero && bytes.get(i + 1) == Some(&b'/') => {
+                has_top_level_or = true;
+            }
+            _ => {}
+        }
         // Detect `IDENT'` (a primed identifier). The apostrophe must follow an
         // identifier character to avoid matching string contents or set
         // displays (already filtered by the `in_string` check above).
         if ch == b'\'' && i > 0 {
             let prev = bytes[i - 1];
             if prev.is_ascii_alphanumeric() || prev == b'_' {
-                return true;
+                has_action_marker = true;
             }
         }
         if ch == b'U'
@@ -2531,12 +2571,12 @@ fn guard_text_is_action_body(text: &str) -> bool {
         {
             let after = i + "UNCHANGED".len();
             if after >= bytes.len() || !is_ident_byte(bytes[after]) {
-                return true;
+                has_action_marker = true;
             }
         }
         i += 1;
     }
-    false
+    has_top_level_or && has_action_marker
 }
 
 fn is_ident_byte(b: u8) -> bool {
@@ -2554,6 +2594,20 @@ fn try_eval_compiled_guard_as_action<'a>(
     text: &str,
     branch: &CompiledActionBranch<'a>,
 ) -> Result<Option<Vec<CompiledActionBranch<'a>>>> {
+    // Soundness fix (ACP specs): a top-level *disjunction* of action calls,
+    // e.g. the body of `\E i, j \in S : parDie(i) \/ parProgNB(i, j)`, reaches
+    // this function as a single `Guard` whose text is `A(..) \/ B(..)`. The
+    // single-call parse below fails (there are two calls), and the primed/
+    // UNCHANGED scan in `guard_text_is_action_body` also misses it because
+    // `parDie(i)`/`parProgNB(i,j)` are operator calls with no literal `X'` in
+    // the disjunction text. Detect this shape explicitly: if the text splits
+    // into >1 top-level disjunct and at least one disjunct resolves to a
+    // user-defined action, route the whole disjunction through the interpreted
+    // action-body evaluator (which stages each disjunct's primes correctly).
+    if let Some(branches) = try_eval_guard_disjunction_as_action(text, branch)? {
+        return Ok(Some(branches));
+    }
+
     let Some((name, _args)) = crate::tla::eval::parse_action_call_expr(text) else {
         return Ok(None);
     };
@@ -2606,6 +2660,180 @@ fn try_eval_compiled_guard_as_action<'a>(
         });
     }
     Ok(Some(out))
+}
+
+/// Resolve `name` to a definition and decide whether a call to it is (possibly
+/// transitively) an *action* — i.e. its body reaches a primed variable or
+/// `UNCHANGED`, directly or through further operator calls.
+///
+/// `looks_like_action` alone only detects *direct* primes, which misses wrapper
+/// operators like `coordProgB == makeDecision \/ \E i : coordProgA(i)` whose
+/// primes live one call deeper. We follow operator-call identifiers found in the
+/// body up to a small depth bound (guards against cycles / runaway recursion).
+fn def_call_is_transitively_action(name: &str, ctx: &EvalContext<'_>, depth: usize) -> bool {
+    const MAX_DEPTH: usize = 8;
+    if depth > MAX_DEPTH {
+        return false;
+    }
+    let def_opt = if let Some((alias, op)) = name.split_once('!') {
+        ctx.instances
+            .and_then(|insts| insts.get(alias))
+            .and_then(|inst| inst.module.as_ref())
+            .and_then(|m| m.definitions.get(op).cloned())
+    } else {
+        lookup_definition(name, ctx)
+    };
+    let Some(def) = def_opt else {
+        return false;
+    };
+    if crate::tla::looks_like_action(&def) {
+        return true;
+    }
+    // Skip obvious non-actions (proofs already filtered by looks_like_action).
+    // Follow bare identifiers in the body that resolve to further definitions.
+    for ident in extract_body_call_idents(&def.body) {
+        if ident == def.name {
+            continue; // direct self-reference
+        }
+        if def_call_is_transitively_action(&ident, ctx, depth + 1) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Extract identifier tokens from an operator body that could be operator
+/// calls. Deliberately over-approximate: returns every identifier-shaped token
+/// (outside string literals). Non-operators simply fail to resolve in
+/// `def_call_is_transitively_action`.
+fn extract_body_call_idents(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = body.as_bytes();
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let ch = bytes[i];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == b'\\' {
+                escaped = true;
+            } else if ch == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if ch == b'"' {
+            in_string = true;
+            i += 1;
+            continue;
+        }
+        if ch.is_ascii_alphabetic() || ch == b'_' {
+            let start = i;
+            while i < bytes.len() && is_ident_byte(bytes[i]) {
+                i += 1;
+            }
+            out.push(body[start..i].to_string());
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Detect when a compiled `Guard`'s text is a top-level disjunction of action
+/// calls (rather than a boolean disjunction) and dispatch it through the
+/// interpreted action-body evaluator.
+///
+/// Returns `Ok(Some(..))` when `text` splits into more than one top-level
+/// disjunct and at least one disjunct resolves (after stripping any leading
+/// `\E ... :` binder and parentheses) to a user-defined *action*. Returns
+/// `Ok(None)` when the text is not such a disjunction (caller falls through to
+/// the single-action-call check and, ultimately, boolean guard evaluation).
+fn try_eval_guard_disjunction_as_action<'a>(
+    text: &str,
+    branch: &CompiledActionBranch<'a>,
+) -> Result<Option<Vec<CompiledActionBranch<'a>>>> {
+    let disjuncts = crate::tla::action_ir::split_action_body_disjuncts(text);
+    if disjuncts.len() <= 1 {
+        return Ok(None);
+    }
+
+    let mut any_action = false;
+    for disjunct in &disjuncts {
+        // Peel a leading `\E <binders> : <body>` so `\E j \in S : Act(i, j)`
+        // is recognised by its inner action call.
+        let mut inner = strip_outer_parens_str(disjunct.trim());
+        while let Some(rest) = inner.strip_prefix("\\E") {
+            if let Some(colon) = crate::tla::compiled_expr::find_top_level_colon(rest) {
+                inner = strip_outer_parens_str(rest[colon + 1..].trim());
+            } else {
+                break;
+            }
+        }
+        let Some((name, _args)) = crate::tla::eval::parse_action_call_expr(inner) else {
+            continue;
+        };
+        if def_call_is_transitively_action(&name, &branch.ctx, 0) {
+            any_action = true;
+            break;
+        }
+    }
+
+    if !any_action {
+        return Ok(None);
+    }
+
+    let outer_ctx = branch.ctx.clone();
+    let interpreted_branches =
+        crate::tla::eval::eval_action_body_multi(text, &branch.ctx, &branch.staged)?;
+    let mut out = Vec::with_capacity(interpreted_branches.len());
+    for (staged, unchanged_vars) in interpreted_branches {
+        let mut merged_unchanged = branch.unchanged_vars.clone();
+        for var in unchanged_vars {
+            if !merged_unchanged.contains(&var) {
+                merged_unchanged.push(var);
+            }
+        }
+        out.push(CompiledActionBranch {
+            ctx: outer_ctx.clone(),
+            staged,
+            unchanged_vars: merged_unchanged,
+        });
+    }
+    Ok(Some(out))
+}
+
+fn strip_outer_parens_str(expr: &str) -> &str {
+    let mut trimmed = expr.trim();
+    loop {
+        if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
+            return trimmed;
+        }
+        // Verify the outer parens match each other before stripping.
+        let bytes = trimmed.as_bytes();
+        let mut depth = 0usize;
+        let mut matched = true;
+        for (idx, &b) in bytes.iter().enumerate() {
+            match b {
+                b'(' => depth += 1,
+                b')' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 && idx != bytes.len() - 1 {
+                        matched = false;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !matched {
+            return trimmed;
+        }
+        trimmed = trimmed[1..trimmed.len() - 1].trim();
+    }
 }
 
 fn expand_compiled_exists_branches<'a>(

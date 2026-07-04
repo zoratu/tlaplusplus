@@ -453,6 +453,74 @@ fn seed_parent_definition_fallbacks(
     }
 }
 
+/// Decide whether calling operator `def` is (possibly transitively) an action.
+///
+/// `looks_like_action` only detects *direct* primes / `UNCHANGED`. Wrapper
+/// operators like `coordProgB == makeDecision \/ \E i : coordProgA(i)` hide
+/// their primes one call deeper, so a disjunct `... \/ coordProgB` was being
+/// treated as a boolean guard and silently dropping every successor (ACP
+/// specs). We follow operator-call identifiers in the body up to a small depth
+/// bound so such wrappers are correctly expanded as actions.
+fn def_is_transitively_action(def: &TlaDefinition, ctx: &EvalContext<'_>, depth: usize) -> bool {
+    const MAX_DEPTH: usize = 8;
+    if looks_like_action(def) {
+        return true;
+    }
+    if depth >= MAX_DEPTH {
+        return false;
+    }
+    for ident in extract_body_call_idents(&def.body) {
+        if ident == def.name {
+            continue;
+        }
+        if let Some(inner) = ctx.definition(&ident) {
+            if def_is_transitively_action(&inner, ctx, depth + 1) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Over-approximate list of identifier tokens in a body that might be operator
+/// calls (outside string literals). Non-operators simply fail to resolve.
+fn extract_body_call_idents(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = body.as_bytes();
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let ch = bytes[i];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == b'\\' {
+                escaped = true;
+            } else if ch == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if ch == b'"' {
+            in_string = true;
+            i += 1;
+            continue;
+        }
+        if ch.is_ascii_alphabetic() || ch == b'_' {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            out.push(body[start..i].to_string());
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
 fn expand_action_call_multi(
     expr: &str,
     ctx: &EvalContext<'_>,
@@ -465,7 +533,9 @@ fn expand_action_call_multi(
         let instance = instances.get(alias)?;
         let module = instance.module.as_ref()?;
         let def = module.definitions.get(operator_name)?.clone();
-        if !looks_like_action(&def) || def.body.trim() == expr.trim() {
+        let mut probe_ctx = ctx.clone();
+        probe_ctx.definitions = Some(&module.definitions);
+        if !def_is_transitively_action(&def, &probe_ctx, 0) || def.body.trim() == expr.trim() {
             return None;
         }
         if def.params.len() != arg_exprs.len() {
@@ -504,7 +574,7 @@ fn expand_action_call_multi(
     }
 
     let def = ctx.definition(&name)?;
-    if !looks_like_action(&def) || def.body.trim() == expr.trim() {
+    if !def_is_transitively_action(&def, ctx, 0) || def.body.trim() == expr.trim() {
         return None;
     }
     if def.params.len() != arg_exprs.len() {
