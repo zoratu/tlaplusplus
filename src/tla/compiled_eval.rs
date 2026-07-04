@@ -215,7 +215,7 @@ fn eval_var_by_name(name: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<T
             // leak (top-level evaluation — the hot case — keeps the fast path).
             let result = if !ctx.locals.is_empty() && !ctx.local_definitions.contains_key(name) {
                 let mut clean = ctx.clone();
-                clean.locals = Rc::new(BTreeMap::new());
+                clean.locals = std::rc::Rc::new(BTreeMap::new());
                 eval_compiled_inner(&compiled_body, &clean, depth)
             } else {
                 eval_compiled_inner(&compiled_body, ctx, depth)
@@ -2098,7 +2098,7 @@ fn eval_compiled_opcall(
     // LET-local operator may reference an enclosing bound variable, so it keeps
     // the caller locals.
     if !ctx.local_definitions.contains_key(name) {
-        new_ctx.locals = Rc::new(BTreeMap::new());
+        new_ctx.locals = std::rc::Rc::new(BTreeMap::new());
     }
     for (param, value) in def.params.iter().zip(arg_values.into_iter()) {
         new_ctx = new_ctx.with_local_value(normalize_param_name(param), value);
