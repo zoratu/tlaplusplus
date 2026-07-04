@@ -1,6 +1,6 @@
 [package]
 name = "tlaplusplus"
-version = "1.2.17"
+version = "1.2.18"
 edition = "2024"
 
 # T13.4 Phase 2 — cargo-verus reads this to know it should verify this
