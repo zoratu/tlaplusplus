@@ -446,6 +446,38 @@ mod tests {
     use proptest::prelude::*;
     use std::collections::BTreeSet;
 
+    /// Regression: a `LET` binding inside an applied operator's body must
+    /// shadow a same-named variable that leaked into `locals` (here via the
+    /// enclosing `\A` binder + operator application capturing caller locals).
+    /// `local_definitions` (where the LET goes) is resolved AFTER `locals`, so
+    /// before the fix the LET silently failed to shadow and `Inner(2)` returned
+    /// the outer bound `x` (7) instead of 2. This is the mechanism behind the
+    /// MultiCarElevator vs TLC state-space divergence: `CanServiceCall`'s
+    /// `LET eState` vs `MoveElevator`'s leaked `eState`.
+    #[test]
+    fn let_binding_shadows_same_named_leaked_local() {
+        use crate::tla::{compile_expr, eval_compiled};
+        let defs = std::collections::BTreeMap::from([(
+            "Inner".to_string(),
+            TlaDefinition {
+                name: "Inner".to_string(),
+                params: vec!["y".to_string()],
+                body: "LET x == y IN x".to_string(),
+                is_recursive: false,
+            },
+        )]);
+        let state = tla_state([]);
+        let ctx = EvalContext::with_definitions(&state, &defs);
+        // `\A x \in {7} : Inner(2) = 2` binds x=7 in locals; Inner(2)'s
+        // `LET x == y(=2)` must shadow it, so Inner(2) = 2 and the formula holds.
+        let expr = "\\A x \\in {7} : Inner(2) = 2";
+        assert_eq!(eval_expr(expr, &ctx).unwrap(), TlaValue::Bool(true));
+        assert_eq!(
+            eval_compiled(&compile_expr(expr), &ctx).unwrap(),
+            TlaValue::Bool(true)
+        );
+    }
+
     #[test]
     fn normalizes_binder_and_higher_order_param_names() {
         assert_eq!(normalize_param_name("leader \\in Node"), "leader");
