@@ -211,11 +211,15 @@ fn eval_var_by_name(name: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<T
             // Get or compile the operator body
             let compiled_body = get_or_compile_operator(name, &def.body, &def.params);
             // A module-level no-arg operator is lexically scoped and must not see
-            // the caller's dynamic locals. Only clean when there are locals to
-            // leak (top-level evaluation — the hot case — keeps the fast path).
-            let result = if !ctx.locals.is_empty() && !ctx.local_definitions.contains_key(name) {
+            // the caller's lexical locals (staged primed next-state bindings are
+            // kept). Only clean when there is an actual lexical local to drop —
+            // top-level evaluation (no locals) and action eval (primed-only
+            // locals) keep the fast path.
+            let needs_clean = !ctx.local_definitions.contains_key(name)
+                && ctx.locals.keys().any(|k| !k.ends_with('\''));
+            let result = if needs_clean {
                 let mut clean = ctx.clone();
-                clean.locals = std::rc::Rc::new(BTreeMap::new());
+                std::rc::Rc::make_mut(&mut clean.locals).retain(|k, _| k.ends_with('\''));
                 eval_compiled_inner(&compiled_body, &clean, depth)
             } else {
                 eval_compiled_inner(&compiled_body, ctx, depth)
@@ -227,19 +231,20 @@ fn eval_var_by_name(name: &str, ctx: &EvalContext<'_>, depth: usize) -> Result<T
         }
 
         // A module-level operator is lexically scoped to the module: its body
-        // sees only its own params, the module definitions, and the state — NOT
-        // the caller's dynamic locals. Capturing caller locals here is a
-        // dynamic-scope leak (a free variable in the body could bind to a
-        // same-named local of whatever code called the operator). A LET-local
-        // operator (name present in `local_definitions`) may legitimately
-        // reference an enclosing bound variable, so it keeps the capture.
+        // sees only its own params, the module definitions, the state, and any
+        // staged primed (next-state) bindings — NOT the caller's lexical locals.
+        // Capturing caller lexical locals here is a dynamic-scope leak (a free
+        // variable in the body could bind to a same-named local of whatever code
+        // called the operator). A LET-local operator (name present in
+        // `local_definitions`) may reference an enclosing bound variable, so it
+        // keeps all locals.
         let value = TlaValue::Lambda {
             params: Arc::new(def.params.clone()),
             body: def.body.clone(),
             captured_locals: if ctx.local_definitions.contains_key(name) {
                 Arc::new((*ctx.locals).clone())
             } else {
-                Arc::new(BTreeMap::new())
+                Arc::new(ctx.primed_only_locals())
             },
         };
         if trace_var_enabled() {
@@ -2093,12 +2098,12 @@ fn eval_compiled_opcall(
     // Create new context with parameter bindings
     let mut new_ctx = ctx.clone();
     // A module-level operator is lexically scoped to the module: its body must
-    // not see the caller's dynamic locals (a free variable would otherwise bind
-    // to a same-named caller local). Clear them before binding params. A
-    // LET-local operator may reference an enclosing bound variable, so it keeps
-    // the caller locals.
+    // not see the caller's lexical locals (a free variable would otherwise bind
+    // to a same-named caller local). Drop them (keeping staged primed next-state
+    // bindings) before binding params. A LET-local operator may reference an
+    // enclosing bound variable, so it keeps the caller locals.
     if !ctx.local_definitions.contains_key(name) {
-        new_ctx.locals = std::rc::Rc::new(BTreeMap::new());
+        std::rc::Rc::make_mut(&mut new_ctx.locals).retain(|k, _| k.ends_with('\''));
     }
     for (param, value) in def.params.iter().zip(arg_values.into_iter()) {
         new_ctx = new_ctx.with_local_value(normalize_param_name(param), value);

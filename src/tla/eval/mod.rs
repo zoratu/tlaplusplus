@@ -293,6 +293,22 @@ impl<'a> EvalContext<'a> {
         self.state.get(name).cloned()
     }
 
+    /// The locals a module-level operator's body may see: only the staged
+    /// next-state (primed, `x'`) bindings, never the caller's lexical locals
+    /// (quantifier/operator binders). A module-level operator is lexically
+    /// scoped to the module, so a free variable in its body must not bind to a
+    /// same-named caller local; but primed staging is part of the surrounding
+    /// action's evaluation environment (like the current state) and must remain
+    /// visible. LET-local operators keep all locals (they may reference an
+    /// enclosing bound variable) and do not use this.
+    pub(crate) fn primed_only_locals(&self) -> BTreeMap<String, TlaValue> {
+        self.locals
+            .iter()
+            .filter(|(k, _)| k.ends_with('\''))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
     pub(crate) fn definition(&self, name: &str) -> Option<TlaDefinition> {
         if let Some(def) = self.local_definitions.get(name) {
             return Some(def.clone());
@@ -356,14 +372,15 @@ impl<'a> EvalContext<'a> {
                 return eval_operator_call(name, Vec::new(), self, depth);
             }
             // A module-level operator is lexically scoped to the module and must
-            // NOT capture the caller's dynamic locals (that would let a free
-            // variable in its body bind to a same-named caller local). Only a
-            // LET-local operator may reference an enclosing bound variable.
-            let empty = BTreeMap::new();
+            // NOT capture the caller's lexical locals (that would let a free
+            // variable in its body bind to a same-named caller local); it keeps
+            // only staged primed (next-state) bindings. A LET-local operator may
+            // reference an enclosing bound variable, so it keeps all locals.
+            let primed = self.primed_only_locals();
             let captured = if self.local_definitions.contains_key(name) {
                 self.locals.as_ref()
             } else {
-                &empty
+                &primed
             };
             return Ok(definition_as_lambda(&def, captured));
         }
