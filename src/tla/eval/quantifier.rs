@@ -362,8 +362,12 @@ fn evaluate_exists(
         let mut child = ctx.clone();
         {
             let locals_mut = std::rc::Rc::make_mut(&mut child.locals);
+            let lexical_mut = std::rc::Rc::make_mut(&mut child.lexical_locals);
             for (k, v) in assignments.iter() {
                 locals_mut.insert(k.clone(), v.clone());
+                // Quantifier binders are lexical: tag so they are dropped when a
+                // module-level operator is applied inside the body.
+                lexical_mut.insert(k.clone());
             }
         }
         return eval_expr_inner(body, &child, depth + 1)?.as_bool();
@@ -394,8 +398,12 @@ fn evaluate_forall(
         let mut child = ctx.clone();
         {
             let locals_mut = std::rc::Rc::make_mut(&mut child.locals);
+            let lexical_mut = std::rc::Rc::make_mut(&mut child.lexical_locals);
             for (k, v) in assignments.iter() {
                 locals_mut.insert(k.clone(), v.clone());
+                // Quantifier binders are lexical: tag so they are dropped when a
+                // module-level operator is applied inside the body.
+                lexical_mut.insert(k.clone());
             }
         }
         return eval_expr_inner(body, &child, depth + 1)?.as_bool();
@@ -430,8 +438,12 @@ pub(super) fn collect_function_mapping(
         let mut child = ctx.clone();
         {
             let locals_mut = std::rc::Rc::make_mut(&mut child.locals);
+            let lexical_mut = std::rc::Rc::make_mut(&mut child.lexical_locals);
             for (k, v) in assignments.iter() {
                 locals_mut.insert(k.clone(), v.clone());
+                // Quantifier binders are lexical: tag so they are dropped when a
+                // module-level operator is applied inside the body.
+                lexical_mut.insert(k.clone());
             }
         }
         let value = eval_expr_inner(body, &child, depth + 1)?;
@@ -468,8 +480,12 @@ pub(super) fn collect_binder_filter_set(
         let mut child = ctx.clone();
         {
             let locals_mut = std::rc::Rc::make_mut(&mut child.locals);
+            let lexical_mut = std::rc::Rc::make_mut(&mut child.lexical_locals);
             for (k, v) in assignments.iter() {
                 locals_mut.insert(k.clone(), v.clone());
+                // Quantifier binders are lexical: tag so they are dropped when a
+                // module-level operator is applied inside the body.
+                lexical_mut.insert(k.clone());
             }
         }
 
@@ -516,8 +532,12 @@ pub(super) fn collect_binder_map_set(
         let mut child = ctx.clone();
         {
             let locals_mut = std::rc::Rc::make_mut(&mut child.locals);
+            let lexical_mut = std::rc::Rc::make_mut(&mut child.lexical_locals);
             for (k, v) in assignments.iter() {
                 locals_mut.insert(k.clone(), v.clone());
+                // Quantifier binders are lexical: tag so they are dropped when a
+                // module-level operator is applied inside the body.
+                lexical_mut.insert(k.clone());
             }
         }
         out.insert(eval_expr_inner(element_expr, &child, depth + 1)?);
