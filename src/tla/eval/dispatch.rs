@@ -128,6 +128,26 @@ pub(super) enum Op {
 ///   keyword-prefix dispatches (`LET`, `IF`, `CASE`, `\E`, `\A`, `CHOOSE`,
 ///   `LAMBDA`) have already not matched.
 pub(super) fn classify_op(expr: &str) -> Op {
+    // ---- ~ applied to a bulleted list: `~ /\ A /\ B` / `~ \/ A \/ B` ----
+    //
+    // In TLA+, `~` binds tighter than `/\`/`\/`/`=>`, so `~A /\ B` is
+    // `(~A) /\ B` and is correctly handled by the And/Or splits below (the
+    // first conjunct `~A` is a well-formed operand). The ONE case those
+    // splits get wrong is when the `~` prefixes a *bulleted conjunction/
+    // disjunction* — `~ /\ A /\ B`. There the negation applies to the whole
+    // list (`~(A /\ B)`), but `split_top_level_symbol(_, "/\\")` slices off a
+    // bare `~` as the first "conjunct", which then evaluates to the empty
+    // expression and errors. Intercept that shape here and route it to
+    // `Op::Not` so the operand `/\ A /\ B` is evaluated as one bulleted list.
+    // (TCommit's `TCConsistent == \A rm1,rm2 : ~ /\ ... /\ ...` is exactly
+    // this shape and previously false-violated the initial state.)
+    if let Some(after_tilde) = expr.strip_prefix('~') {
+        let t = after_tilde.trim_start();
+        if t.starts_with("/\\") || t.starts_with("\\/") {
+            return Op::Not;
+        }
+    }
+
     // ---- indented boolean: /\ / \/ ----
     if expr.starts_with("/\\")
         && let Some(parts) = split_indented_top_level_boolean(expr, "/\\")
