@@ -1,5 +1,28 @@
 # Changelog
 
+## v1.2.20 (2026-07-04)
+
+Three independent soundness fixes surfaced by a corpus-wide differential audit (our checker vs TLC v2.19) over the full tlaplus/Examples corpus. Each was root-caused on the actual diverging spec, and the three were validated together in one integration build: all target specs match TLC exactly, `cargo test --release` 1251 passed / 0 failed, `scripts/diff_tlc.sh` 13/13, compiled-vs-interpreted proptest 17/17, state-graph snapshots 12/12, and a 226-spec analyze-tla corpus scan with zero regressions vs baseline.
+
+### PR #123 — higher-order operator parameters resolve in compiled bodies
+
+A higher-order operator formal invoked as `P(x)` inside a *compiled* operator body was resolved only via `lookup_definition` (module + local definitions), never against `ctx.locals`, where a passed `LAMBDA` value actually lives — so `P(x)` failed with `unknown operator 'P'`. The interpreted evaluator (`eval_operator_call`) already checked `ctx.runtime_value` for a `Lambda` before definition lookup; the compiled path (`eval_compiled_opcall`) was missing that mirror. This surfaced on **CigaretteSmokers**, whose `stopSmoking` selects the smoker via `ChooseOne(S, P(_)) == CHOOSE x \in S : P(x) /\ ...` called with a `LAMBDA`: with `P(x)` erroring, the `CHOOSE` predicate collapsed and the fallback returned the first domain element unconditionally, so only the *matches* smoker was ever cleared — 12 distinct states vs TLC's 6. A general fix for any spec calling a higher-order formal `Op(_)` in a compiled body; `CHOOSE` was the most visible victim. CigaretteSmokers and APCigaretteSmokers now explore 6, matching TLC.
+
+### PR #124 — negation of a bulleted junction; nested multi-line IF condition
+
+Two parser-level causes that made specs halt at 1 distinct state:
+
+- **`~` prefixing a bulleted junction.** `TCConsistent == \A rm1,rm2 \in RM : ~ /\ A /\ B`: the `/\`-split ran before the negation branch (in both `compile_expr` and `dispatch::classify_op`), slicing a bare `~` off as the first "conjunct" → `Not(compile_expr(""))` → "empty expression" reported as an invariant violation on *every* state, including the initial one. `~` immediately followed by `/\`/`\/` is now routed to `Not` over the whole junction before the And/Or splits. `~A /\ B` (tighter-binding `~`) is unaffected. **TCommit** now explores 34 with no violation, matching TLC.
+- **Nested multi-line IF condition.** `IF /\ A` / `   /\ B` / `   THEN …` had its condition-continuation line dedented to base indent and mis-read as a top-level conjunct, shredding the IF into a dead branch and dropping the action's successors. A new `has_open_if_condition` guard makes a base-indent `/\` a new conjunct only when not inside an unterminated IF condition.
+
+### PR #125 — disjunction of transitive-action wrappers expands as an action
+
+A named operator whose body reaches a primed variable only *transitively* (through further operator calls), appearing as a disjunct in `Next`, produced zero successors — the whole branch was silently dropped. Both successor paths gated on `looks_like_action()`, which only checks for a *direct* `'`/`UNCHANGED`. The **ACP** specs layer wrapper operators (`progNNB == parProgNNB \/ coordProgN`, `coordProgB == makeDecision \/ \E i : coordProgA(i)`, …) whose primes live one or more calls deeper, so only the single flat action per spec fired and exploration stalled (`ACP_NB_TLC` 8 vs 4284, `ACP_SB_TLC` 16 vs 54944). A bounded-depth, cycle-guarded `def_is_transitively_action()` replaces the `looks_like_action()` gates in `expand_action_call_multi`; `try_eval_guard_disjunction_as_action()` routes a compiled `Guard` whose text is a top-level `\/` with any transitively-action disjunct through the interpreted action-body evaluator (also generalizing `guard_text_is_action_body` from prefix-`\/`-only to any top-level `\/`). `ACP_NB_TLC` → 4284 and `ACP_SB_TLC` → 54944, both matching TLC. This router also subsumes the direct-action-call disjunction case (`Loop \/ Think \/ Eat`), so together with #124 the PlusCal **DiningPhilosophers** spec explores 67, matching TLC (baseline: 1).
+
+### Known follow-up
+
+`ACP_NB_WRONG_TLC` now explores its full state space but still reports no violation: its safety property `AC1 == [] \A i,j : ...` is declared under `PROPERTIES` (not `INVARIANTS`), and a box-safety `[]P` is not yet lowered to a per-state invariant, so it is never checked. A general missed-violation class (any spec asserting safety via `[]P` under `PROPERTIES`) filed for a dedicated fix.
+
 ## v1.2.19 (2026-07-04)
 
 Completes the operator-scoping soundness fix begun in v1.2.18 (#118): module-level operators are now fully lexically scoped and no longer capture the caller's dynamic locals.
