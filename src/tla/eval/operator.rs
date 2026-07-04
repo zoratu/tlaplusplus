@@ -226,6 +226,44 @@ pub(crate) fn eval_operator_call(
             result.extend_from_slice(&seq[i..]);
             return Ok(TlaValue::Seq(HashedArc::new(result)));
         }
+        // SequencesExt prefix/suffix family.
+        //   IsPrefix(s, t)       == DOMAIN s \subseteq DOMAIN t /\ \A i \in DOMAIN s : s[i] = t[i]
+        //   IsStrictPrefix(s, t) == IsPrefix(s, t) /\ s # t
+        //   IsSuffix(s, t)       == IsPrefix(Reverse(s), Reverse(t))   (s matches the tail of t)
+        //   IsStrictSuffix(s, t) == IsSuffix(s, t) /\ s # t
+        // Element comparison uses TLA+ semantic equality (a Seq and a 1..n
+        // Function are equal), matching the `=` operator.
+        "IsPrefix" | "IsStrictPrefix" if args.len() == 2 && !user_defined_shadow => {
+            let s = sequence_like_values(&args[0])
+                .ok_or_else(|| anyhow!("{} expects a sequence as 1st arg, got {:?}", name, args[0]))?;
+            let t = sequence_like_values(&args[1])
+                .ok_or_else(|| anyhow!("{} expects a sequence as 2nd arg, got {:?}", name, args[1]))?;
+            let is_prefix =
+                s.len() <= t.len() && s.iter().zip(t.iter()).all(|(a, b)| a.semantic_eq(b));
+            // Given `is_prefix`, s # t exactly when the lengths differ.
+            let result = if name == "IsStrictPrefix" {
+                is_prefix && s.len() < t.len()
+            } else {
+                is_prefix
+            };
+            return Ok(TlaValue::Bool(result));
+        }
+        "IsSuffix" | "IsStrictSuffix" if args.len() == 2 && !user_defined_shadow => {
+            let s = sequence_like_values(&args[0])
+                .ok_or_else(|| anyhow!("{} expects a sequence as 1st arg, got {:?}", name, args[0]))?;
+            let t = sequence_like_values(&args[1])
+                .ok_or_else(|| anyhow!("{} expects a sequence as 2nd arg, got {:?}", name, args[1]))?;
+            let is_suffix = s.len() <= t.len() && {
+                let off = t.len() - s.len();
+                s.iter().enumerate().all(|(i, a)| a.semantic_eq(&t[i + off]))
+            };
+            let result = if name == "IsStrictSuffix" {
+                is_suffix && s.len() < t.len()
+            } else {
+                is_suffix
+            };
+            return Ok(TlaValue::Bool(result));
+        }
         // === Community module: Functions ===
         "FoldFunction" if args.len() == 3 && !user_defined_shadow => {
             let op = &args[0];
