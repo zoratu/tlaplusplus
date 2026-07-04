@@ -1,5 +1,28 @@
 # Changelog
 
+## v1.2.19 (2026-07-04)
+
+Completes the operator-scoping soundness fix begun in v1.2.18 (#118): module-level operators are now fully lexically scoped and no longer capture the caller's dynamic locals.
+
+### PR #121 — tag lexical locals so module-level operators aren't dynamically scoped
+
+`EvalContext.locals` is an overloaded channel. It carries lexical binders (quantifier `\A/\E/CHOOSE` variables, operator/Lambda parameters) — which must **not** be visible to a module-level operator's body — alongside three kinds of *environment* binding that **must** stay visible: staged primed next-state bindings (`x'`), the unprimed state-variable shadow bindings installed for `Op'` evaluation, and INSTANCE variable substitutions. Because operator application evaluated the body with the caller's `locals` in scope (dynamic scoping), a *free* variable in a module-level operator's body could bind to a same-named caller local. v1.2.18's #118 fixed the sub-case where the callee re-`LET`s the leaked name; this fixes the general case.
+
+The four binding kinds are indistinguishable by key, so a key-based filter is unworkable (an earlier attempt broke priming and then INSTANCE substitution). Instead, `EvalContext` gains a `lexical_locals` set that is populated **only** at lexical binder sites (`with_local_value`, the interpreted quantifier binder loops, operator-parameter binding); every other `locals` insertion (primes, shadows, instances) is left untagged. On entering a module-level operator the tagged names are dropped and everything else is kept — across all operator-application paths (interpreted/compiled bracket-call `f[args]`, interpreted/compiled paren-call `Op(args)`, and the compiled no-arg path). A LET-local operator may legitimately reference an enclosing bound variable, so it keeps the full caller scope. Tagging the *lexical* side (rather than the environment side) makes a missed tag site merely under-fix the leak instead of regressing a real mechanism — untagged safely defaults to "keep".
+
+### Gauntlet
+
+| Gate | Result |
+|---|---|
+| `cargo test --release` | green (x86_64 + aarch64), incl. the new `module_operator_does_not_capture_caller_locals` and both `*_primes_use_staged_next_state_bindings` tests |
+| `scripts/diff_tlc.sh` | 13 / 13 specs match TLC v2.19 |
+| compiled-vs-interpreted proptest @ 512 | 17 / 17 |
+| state-graph snapshots | 12 / 12 |
+| tlaplus/Examples corpus re-scan | 219 / 226 full_pass, identical to baseline — including `DieHard/MCDieHardest` (INSTANCE substitutions preserved) |
+| CI | green on x86_64 + aarch64 (both gates each) |
+
+MultiCarElevator still matches TLC (4122 distinct). One follow-up remains: lexical binders inside action execution are not yet tagged, so the latent leak in that specific context persists — but by the safe-default design that is under-fixing, not a regression. Drop-in for v1.2.18.
+
 ## v1.2.18 (2026-07-04)
 
 Two correctness/coverage fixes surfaced by a fresh analyze-tla scan of the tlaplus/Examples corpus on current main.
