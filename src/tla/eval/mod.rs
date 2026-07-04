@@ -238,12 +238,29 @@ impl<'a> EvalContext<'a> {
     fn with_local_definitions(&self, defs: BTreeMap<String, TlaDefinition>) -> Self {
         // Copy-on-write: only clone the local_definitions map, reuse the rest
         let mut new_defs = (*self.local_definitions).clone();
+        // A LET binding must shadow any outer binding of the same name — including
+        // a dynamic `locals` entry. `local_definitions` is resolved AFTER `locals`
+        // (see runtime_value / resolve_identifier), so if a LET-bound name also
+        // exists in `locals` the stale local would win and the LET would silently
+        // fail to shadow. This bites when an operator's body re-`LET`s a name that
+        // leaked into `locals` via a callee Lambda's captured_locals: e.g. both
+        // `MoveElevator` and `CanServiceCall` use `LET eState == ElevatorState[e]`,
+        // and `CanServiceCall[e2, ...]` would otherwise read the caller's `eState`
+        // (the wrong elevator) instead of its own. Drop shadowed names from
+        // `locals` so the LET definitions take effect.
+        let mut locals = Rc::clone(&self.locals);
+        if defs.keys().any(|name| self.locals.contains_key(name.as_str())) {
+            let owned = Rc::make_mut(&mut locals);
+            for name in defs.keys() {
+                owned.remove(name.as_str());
+            }
+        }
         for (name, def) in defs {
             new_defs.insert(name, def);
         }
         Self {
             state: self.state,
-            locals: Rc::clone(&self.locals),
+            locals,
             local_definitions: Rc::new(new_defs),
             definitions: self.definitions,
             instances: self.instances,
