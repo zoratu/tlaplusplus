@@ -1370,7 +1370,23 @@ fn find_inline_definition_start(rhs: &str) -> Option<usize> {
 fn is_plausible_inline_definition_head(lhs: &str) -> bool {
     let lhs = lhs.trim();
     let lhs = lhs.strip_prefix("LOCAL ").unwrap_or(lhs).trim();
-    matches!(lhs.chars().next(), Some(c) if c.is_alphabetic() || c == '_')
+    if !matches!(lhs.chars().next(), Some(c) if c.is_alphabetic() || c == '_') {
+        return false;
+    }
+    // The first token cannot be a keyword that opens an expression continuation.
+    // e.g. `LET totalSwitched == ...` inside a definition body has `==` on the
+    // line, but the LHS begins with the reserved word `LET`, so it is an
+    // expression continuation of the enclosing definition, NOT a new
+    // definition head. Treating it as a head orphans the enclosing definition
+    // with an empty body (a soundness bug: the invariant silently disappears).
+    let first_token = lhs
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .next()
+        .unwrap_or("");
+    !matches!(
+        first_token,
+        "LET" | "IN" | "IF" | "THEN" | "ELSE" | "CASE" | "OTHER"
+    )
 }
 
 fn parse_def_head(lhs: &str) -> (String, Vec<String>) {
@@ -3664,5 +3680,54 @@ VARIABLES
             module.variables,
             vec!["lastHash".to_string(), "received".to_string()]
         );
+    }
+
+    #[test]
+    fn nested_let_after_comment_gap_stays_in_definition_body() {
+        // Regression for the Prisoners `CountInvariant` soundness bug: a
+        // definition whose body opens with an indented `LET ... ==` after a
+        // comment block (which `strip_comments` turns into blank lines) must
+        // not have that `LET` line misread as a new top-level definition.
+        // Previously the blank-line gap tripped
+        // `can_start_indented_definition_after_gap`, orphaning the definition
+        // with an empty body so the invariant silently disappeared.
+        let src = r#"
+---- MODULE PrisonersLike ----
+CountInvariant ==
+  (*************************************************************************)
+  (* This is an invariant of Spec.                                         *)
+  (*************************************************************************)
+  LET totalSwitched ==
+        LET sum[S \in SUBSET OtherPrisoner] ==
+              IF S = {} THEN 0
+                        ELSE LET p == CHOOSE pr \in S : TRUE
+                             IN  timesSwitched[p] + sum[S \ {p}]
+        IN  sum[OtherPrisoner]
+      oneIfUp == IF switchAUp THEN 1 ELSE 0
+  IN  count \in {totalSwitched - oneIfUp, totalSwitched - oneIfUp + 1}
+====
+"#;
+
+        let module = parse_tla_module_text(src).expect("parse should work");
+        let inv = module
+            .definitions
+            .get("CountInvariant")
+            .expect("CountInvariant should be defined");
+        assert!(
+            inv.body.contains("LET totalSwitched"),
+            "body should retain the nested LET, got: {:?}",
+            inv.body
+        );
+        assert!(
+            inv.body.contains("count \\in"),
+            "body should retain the IN clause, got: {:?}",
+            inv.body
+        );
+        // The spurious `LET totalSwitched` head must not become its own def.
+        assert!(
+            !module.definitions.contains_key("LET"),
+            "the LET line must not be parsed as a definition head"
+        );
+        assert!(!module.definitions.contains_key("totalSwitched"));
     }
 }
