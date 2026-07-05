@@ -105,7 +105,7 @@ impl TlaModel {
         // Resolve invariants and trivial-Next FIRST so the T5.5 joint
         // Init+invariant solver can use them. (Both are pure analyses over
         // already-parsed module structure; cheap to do up-front.)
-        let invariant_exprs = resolve_invariant_exprs(&module, &config);
+        let mut invariant_exprs = resolve_invariant_exprs(&module, &config);
         let trivial_next = module
             .definitions
             .get(&next_name)
@@ -141,6 +141,26 @@ impl TlaModel {
             crate::tla::value::clear_active_schema();
         }
         let temporal_properties = resolve_temporal_properties(&module, &config)?;
+
+        // Lower box-safety temporal properties (`[] P` where P is a pure
+        // state predicate) into per-state invariants.  Without this, a
+        // property like `AC1 == [] SomeStatePred` declared under PROPERTIES
+        // parses and classifies as safety but is NEVER evaluated per state,
+        // so we would report SAFE on specs TLC flags as VIOLATED (a
+        // missed-violation soundness bug).  See extract_box_safety_invariant
+        // for the conservative guardrail on what is safe to lower.
+        for (prop_name, formula) in &temporal_properties {
+            if let Some(pred_text) = extract_box_safety_invariant(formula) {
+                if std::env::var("TLAPP_TRACE_INVARIANT").is_ok() {
+                    eprintln!(
+                        "Lowering box-safety property '{}' into a per-state invariant: {}",
+                        prop_name, pred_text
+                    );
+                }
+                invariant_exprs.push((prop_name.clone(), pred_text));
+            }
+        }
+
         let mut fairness_constraints = extract_fairness_constraints(&temporal_properties);
 
         // Also extract fairness from SPECIFICATION if present
@@ -918,6 +938,85 @@ fn resolve_temporal_properties(
     }
 
     Ok(properties)
+}
+
+/// Returns true if `text` is a pure, non-temporal, prime-free state predicate
+/// that is safe to evaluate as a per-state invariant.
+///
+/// CONSERVATIVE GUARDRAIL (soundness-critical): we must never lower an action
+/// formula (`[A]_v`, contains primes) or a nested temporal formula as a
+/// per-state invariant — evaluating primes as a state predicate would either
+/// crash or produce false violations, and re-checking a temporal operator per
+/// state is meaningless. When in doubt, reject: leaving a property unchecked
+/// is a missed-violation (bad), but wrongly lowering an action/temporal
+/// formula is a crash/false-violation (worse). We only ever return true for
+/// text we are confident is a plain state predicate.
+fn is_pure_state_predicate_text(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    // Reject `[A]_v` action forms and any leading bracket construct.
+    if t.starts_with('[') {
+        return false;
+    }
+    // Reject primed variables (action formulas). A lone `'` anywhere in the
+    // predicate text means it references a next-state value.
+    if t.contains('\'') {
+        return false;
+    }
+    // Reject nested temporal operators.
+    for pat in ["[]", "<>", "~>", "WF_", "SF_", "\\AA", "\\EE"] {
+        if t.contains(pat) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Given a temporal property formula, return `Some(state_predicate_text)` if it
+/// is a box-safety property `[] P` whose body reduces to a pure state
+/// predicate, suitable for lowering into a per-state invariant. Returns `None`
+/// for anything else (including action/temporal bodies, per the guardrail in
+/// [`is_pure_state_predicate_text`]).
+fn extract_box_safety_invariant(formula: &TemporalFormula) -> Option<String> {
+    match formula {
+        TemporalFormula::Always(inner) => box_body_predicate_text(inner),
+        _ => None,
+    }
+}
+
+/// Reduce the body of an `Always(..)` to a single pure state-predicate text, if
+/// possible. Handles the common shapes:
+///   - `[] P`                       -> StatePredicate("P")
+///   - `[] (P /\ Q)`                -> And of two state predicates
+///   - `[] \AA i \in D : P`         -> TemporalForAll over a state predicate
+fn box_body_predicate_text(inner: &TemporalFormula) -> Option<String> {
+    match inner {
+        TemporalFormula::StatePredicate(text) => {
+            if is_pure_state_predicate_text(text) {
+                Some(text.trim().to_string())
+            } else {
+                None
+            }
+        }
+        TemporalFormula::And(left, right) => {
+            let l = box_body_predicate_text(left)?;
+            let r = box_body_predicate_text(right)?;
+            Some(format!("({}) /\\ ({})", l, r))
+        }
+        TemporalFormula::TemporalForAll {
+            var,
+            domain,
+            formula,
+        } => {
+            // `[] \AA i \in D : P` where P is a state predicate is equivalent to
+            // the per-state invariant `\A i \in D : P`.
+            let body = box_body_predicate_text(formula)?;
+            Some(format!("\\A {} \\in {} : {}", var, domain, body))
+        }
+        _ => None,
+    }
 }
 
 fn resolve_constraint_exprs(module: &TlaModule, cfg: &TlaConfig) -> Vec<(String, String)> {
@@ -3522,6 +3621,53 @@ INVARIANT Inv
         model.next_states(&init[0], &mut next);
         assert!(!next.is_empty());
         assert!(model.check_invariants(&init[0]).is_ok());
+    }
+
+    #[test]
+    fn box_safety_property_lowers_to_state_predicate() {
+        // `[] P` with P a plain state predicate lowers to P.
+        let f = TemporalFormula::parse("[] x > 0").unwrap();
+        assert_eq!(extract_box_safety_invariant(&f).as_deref(), Some("x > 0"));
+
+        // `[] \A i, j : P` — single `\A` falls through to StatePredicate.
+        let f = TemporalFormula::parse("[] \\A i, j : consensus[i] = consensus[j]").unwrap();
+        assert_eq!(
+            extract_box_safety_invariant(&f).as_deref(),
+            Some("\\A i, j : consensus[i] = consensus[j]")
+        );
+
+        // `[] (P /\ Q)` — conjunction of two state predicates.
+        let f = TemporalFormula::parse("[] (a > 0 /\\ b > 0)").unwrap();
+        assert!(matches!(f, TemporalFormula::Always(_)));
+        let lowered = extract_box_safety_invariant(&f).unwrap();
+        assert!(lowered.contains("a > 0") && lowered.contains("b > 0"));
+    }
+
+    #[test]
+    fn box_safety_lowering_rejects_action_and_temporal_bodies() {
+        // Action formula `[][Next]_vars` — must NOT be lowered.
+        let f = TemporalFormula::parse("[][Next]_vars").unwrap();
+        assert_eq!(extract_box_safety_invariant(&f), None);
+
+        // Primed state predicate — must NOT be lowered.
+        let f = TemporalFormula::Always(Box::new(TemporalFormula::StatePredicate(
+            "x' = x + 1".to_string(),
+        )));
+        assert_eq!(extract_box_safety_invariant(&f), None);
+
+        // Nested temporal `[] <> P` (InfinitelyOften) — not a box-safety pred.
+        let f = TemporalFormula::parse("[]<> P").unwrap();
+        assert_eq!(extract_box_safety_invariant(&f), None);
+
+        // Liveness `<> P` — not Always at all.
+        let f = TemporalFormula::parse("<> done").unwrap();
+        assert_eq!(extract_box_safety_invariant(&f), None);
+
+        // Body that embeds a temporal operator — reject conservatively.
+        let f = TemporalFormula::Always(Box::new(TemporalFormula::StatePredicate(
+            "P /\\ <>Q".to_string(),
+        )));
+        assert_eq!(extract_box_safety_invariant(&f), None);
     }
 
     #[test]

@@ -142,6 +142,51 @@ impl TemporalFormula {
             }
         }
 
+        // If the expression contains NO temporal operator at all, it is a pure
+        // state predicate — even if it contains top-level `/\`, `\/`, `\A`,
+        // `\E`, etc. Decomposing such text into temporal `And`/`Or` is wrong:
+        // e.g. `[] \A i,j : (\/ A \/ B)` must stay `Always(StatePredicate(..))`,
+        // not `Or(Always("\A i,j :"), Or(A, B))`. Splitting on `\/`/`/\` is only
+        // meaningful when the operands are themselves temporal formulas. Bail
+        // out to StatePredicate here so the state-predicate evaluator (which
+        // understands quantifiers, `#`, `\/`, function application, etc.)
+        // handles the whole body atomically. This is what makes a
+        // box-safety property like `AC1 == [] \A i,j : ...` parse as
+        // `Always(StatePredicate(...))` and thus be lowerable to an invariant.
+        if !contains_temporal_operator(trimmed) {
+            return Ok(TemporalFormula::StatePredicate(trimmed.to_string()));
+        }
+
+        // Temporal-prefix over a pure state predicate. A prefix operator
+        // (`[]`, `<>`, `[]<>`, `<>[]`) binds tighter than infix `/\`/`\/`/`~>`,
+        // so if the ENTIRE expression is a single prefix applied to a
+        // temporal-operator-free body, build the temporal node directly and
+        // keep the body atomic. This is the AC1 case:
+        //   `[] \A i,j : \/ P \/ Q`  ->  Always(StatePredicate("\A i,j : ..."))
+        // Without this, the top-level `\/` inside the (unparenthesized)
+        // quantifier body would be mis-split into a temporal `Or`. We only take
+        // this path when the body has NO temporal operator, so genuinely mixed
+        // formulas like `[] P /\ <> Q` still fall through to the infix split.
+        for (prefix, ctor) in [
+            ("[]<>", 0usize),
+            ("<>[]", 1),
+            ("[]", 2),
+            ("<>", 3),
+        ] {
+            if let Some(body) = trimmed.strip_prefix(prefix) {
+                let body = body.trim();
+                if !contains_temporal_operator(body) && !body.is_empty() {
+                    let inner = Box::new(TemporalFormula::StatePredicate(body.to_string()));
+                    return Ok(match ctor {
+                        0 => TemporalFormula::InfinitelyOften(inner),
+                        1 => TemporalFormula::EventuallyAlways(inner),
+                        2 => TemporalFormula::Always(inner),
+                        _ => TemporalFormula::Eventually(inner),
+                    });
+                }
+            }
+        }
+
         // Lower precedence: Check for conjunction/disjunction
         if let Some(idx) = find_top_level_operator(trimmed, "/\\") {
             let left = Self::parse(&trimmed[..idx])?;
@@ -246,6 +291,40 @@ fn parse_var_list(input: &str) -> Vec<String> {
 
     // Handle single variable
     vec![input.to_string()]
+}
+
+/// Returns true if `expr` contains any TLA+ temporal operator, i.e. it is not
+/// a pure state predicate. Used to decide whether the temporal parser should
+/// decompose `/\`/`\/`/`~>` into temporal `And`/`Or`/`LeadsTo` nodes, or treat
+/// the whole text atomically as a `StatePredicate`.
+///
+/// Detects: `[]` (box), `<>` (diamond), `[A]_v` (action box), `~>` (leads-to),
+/// `WF_`/`SF_` (fairness), and `\AA`/`\EE` (temporal quantifiers).
+///
+/// Note the `[...]_` action-box form: a leading-bracket subterm immediately
+/// followed by `_` (subscript) is an action formula and IS temporal, even
+/// though it has no `[]`/`<>` prefix.
+fn contains_temporal_operator(expr: &str) -> bool {
+    if expr.contains("[]")
+        || expr.contains("<>")
+        || expr.contains("~>")
+        || expr.contains("WF_")
+        || expr.contains("SF_")
+        || expr.contains("\\AA")
+        || expr.contains("\\EE")
+    {
+        return true;
+    }
+    // Detect `[ ... ]_subscript` action-box forms. Scan for a `]` immediately
+    // followed by `_` whose matching `[` is at the same bracket depth — this is
+    // the `[A]_v` syntax, distinct from record/function bracketing.
+    let bytes = expr.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] == b']' && i + 1 < bytes.len() && bytes[i + 1] == b'_' {
+            return true;
+        }
+    }
+    false
 }
 
 /// Find the index of a top-level operator (not inside parentheses)
@@ -392,6 +471,51 @@ mod tests {
         assert!(matches!(formula, TemporalFormula::And(_, _)));
         // Mixed: safety + liveness = liveness
         assert!(formula.is_liveness_property());
+    }
+
+    #[test]
+    fn test_box_over_quantified_disjunction_stays_state_predicate() {
+        // AC1 shape: `[] \A i,j : \/ A \/ B` must parse as
+        // Always(StatePredicate(..)) — the unparenthesized top-level `\/`
+        // inside the quantifier body must NOT be split into a temporal Or.
+        let f = TemporalFormula::parse(
+            "[] \\A i, j \\in participants :\n  \\/ p[i].decision # commit\n  \\/ p[j].decision # abort",
+        )
+        .unwrap();
+        match &f {
+            TemporalFormula::Always(inner) => {
+                assert!(matches!(inner.as_ref(), TemporalFormula::StatePredicate(_)));
+            }
+            other => panic!("expected Always(StatePredicate), got {:?}", other),
+        }
+        assert!(f.is_safety_property());
+        assert!(!f.is_liveness_property());
+    }
+
+    #[test]
+    fn test_pure_state_predicate_not_decomposed() {
+        // A property that is a plain state predicate with top-level `/\`
+        // (no temporal operator) must stay a single StatePredicate.
+        let f = TemporalFormula::parse("a > 0 /\\ b > 0").unwrap();
+        assert!(matches!(f, TemporalFormula::StatePredicate(_)));
+    }
+
+    #[test]
+    fn test_action_box_still_temporal() {
+        // `[][Next]_vars` must remain temporal (not a bare state predicate).
+        let f = TemporalFormula::parse("[][Next]_vars").unwrap();
+        assert!(matches!(f, TemporalFormula::Always(_)));
+        assert!(contains_temporal_operator("[Next]_vars"));
+        assert!(contains_temporal_operator("x /\\ [][Next]_vars"));
+    }
+
+    #[test]
+    fn test_mixed_temporal_still_splits() {
+        // `[] P /\ <> Q` has genuine temporal operators on both sides and must
+        // still decompose into And(Always, Eventually).
+        let f = TemporalFormula::parse("[] P /\\ <> Q").unwrap();
+        assert!(matches!(f, TemporalFormula::And(_, _)));
+        assert!(f.is_liveness_property());
     }
 
     #[test]
