@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.2.21 (2026-07-05)
+
+A soundness fix for a missed-violation class surfaced by the corpus diff-vs-TLC audit: a **box-safety property** `Inv == [] P` (where `P` is a state predicate) declared under `PROPERTIES` was parsed and correctly classified as safety, but never lowered into the per-state invariant check — so it was silently dropped and our checker reported **SAFE** on specs TLC flags as **VIOLATED**. Reference case: `acp/ACP_NB_WRONG_TLC` explored its full state space but reported no violation while TLC reports "Invariant AC1 is violated."
+
+### PR #127 — lower box-safety `[] P` properties to per-state invariants
+
+Two root causes:
+
+- **No lowering (`src/models/tla_native.rs`).** Per-state invariants were built only from the cfg `INVARIANTS` section; nothing moved a box-safety `Always(state-predicate)` temporal property into `invariant_exprs`. `from_module_and_config` now appends each lowerable box-safety property as `(name, inner_predicate_text)` so it flows through the normal `compiled_invariants` → `check_invariants` path. `extract_box_safety_invariant` matches `Always(inner)` and reduces the body (`[] P`, `[] (P /\ Q)`, `[] \AA i \in D : P`); it uses the inner, already-`[]`-stripped predicate text, sidestepping the "unsupported bracket expression: []" error. A conservative guardrail (`is_pure_state_predicate_text`) lowers **only** a prime-free, non-temporal, non-action predicate — rejecting text that starts with `[` (`[A]_v` action forms), contains `'` (primes), or contains `[]`/`<>`/`~>`/`WF_`/`SF_`/`\AA`/`\EE`. This keeps `[][Next]_vars`-style action formulas out of the invariant path; when in doubt it does not lower (a missed check is safer than a false violation).
+- **Temporal parser mis-split (`src/tla/temporal.rs`).** `[] \A i,j \in P : \/ A \/ B` mis-parsed to `Or(Always(StatePredicate("\A i,j :")), Or(A, B))` — the unparenthesized top-level `\/` inside the quantifier body was treated as a top-level temporal `Or`, so the root was not `Always` and lowering could never fire. A temporal-operator-free expression is now returned as a single `StatePredicate` (not split on `/\`/`\/`/`~>`), and a temporal prefix (`[]`/`<>`/`[]<>`/`<>[]`) over a temporal-free body builds the node with an atomic body. Genuinely mixed formulas (`[] P /\ <> Q`), leads-to, and fairness still decompose.
+
+`ACP_NB_WRONG_TLC` now reports the AC1 violation, matching TLC; `ACP_NB_TLC` (4284) and `ACP_SB_TLC` (54944) still match with no violation. Because this *adds* invariant checks, the change was gated by a verdict-level sweep of all 94 `PROPERTY`/`PROPERTIES` cfgs in tlaplus/Examples (lowering fires on 7): **zero new false violations** — the three specs where our verdict differs from TLC (Prisoners, nbacg_guer01, ewd687a) were all confirmed pre-existing on the clean build and are unrelated bugs, filed as follow-ups. `cargo test --release` green with 7 new tests, `scripts/diff_tlc.sh` 13/13, compiled-vs-interpreted proptest 17/17, state-graph snapshots 12/12.
+
 ## v1.2.20 (2026-07-04)
 
 Three independent soundness fixes surfaced by a corpus-wide differential audit (our checker vs TLC v2.19) over the full tlaplus/Examples corpus. Each was root-caused on the actual diverging spec, and the three were validated together in one integration build: all target specs match TLC exactly, `cargo test --release` 1251 passed / 0 failed, `scripts/diff_tlc.sh` 13/13, compiled-vs-interpreted proptest 17/17, state-graph snapshots 12/12, and a 226-spec analyze-tla corpus scan with zero regressions vs baseline.
