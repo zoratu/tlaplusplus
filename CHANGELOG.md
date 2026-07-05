@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.2.22 (2026-07-05)
+
+A false-violation soundness fix surfaced by the box-safety corpus sweep: `Prisoners.tla`'s `CountInvariant` was silently dropped by the module parser and reported as a violation (`CountInvariant: empty expression`) on the initial state — our checker halted at 4 distinct states where TLC explores 214 with no violation.
+
+### PR #129 — keep nested LET in definition body after a comment gap
+
+`CountInvariant ==` is followed by a comment block and then an indented `LET totalSwitched == ...`. `strip_comments` turns the comment block into blank lines, leaving a blank-line gap before the `LET`. At that line, `can_start_indented_definition_after_gap` fired on the gap and `is_plausible_inline_definition_head("LET totalSwitched")` returned true (it only checked that the first character was alphabetic), so the parser flushed `CountInvariant` with an empty body and treated the `LET` line as a new top-level definition head. The invariant vanished, compiled to `Unparsed("")`, and produced a false violation.
+
+`is_plausible_inline_definition_head` (`src/tla/module.rs`) now rejects a left-hand side whose first token is a reserved keyword that opens an expression continuation (`LET`/`IN`/`IF`/`THEN`/`ELSE`/`CASE`/`OTHER`) — a line beginning with `LET` is body continuation, not a new definition head. No legitimate definition head can start with a reserved keyword, so this cannot cause false rejections; it generally fixes any definition whose body opens with an indented `LET`/`IF`/`CASE` after a comment gap.
+
+Prisoners now explores 214 distinct with no violation, matching TLC exactly. `cargo test --release` green with a new regression test (`nested_let_after_comment_gap_stays_in_definition_body`); `scripts/diff_tlc.sh` 13/13; compiled-vs-interpreted proptest 17/17; state-graph snapshots 12/12; recursive-function spot-checks (Chameneos, MCQuicksort, MCBinarySearch) byte-identical to the prior build.
+
 ## v1.2.21 (2026-07-05)
 
 A soundness fix for a missed-violation class surfaced by the corpus diff-vs-TLC audit: a **box-safety property** `Inv == [] P` (where `P` is a state predicate) declared under `PROPERTIES` was parsed and correctly classified as safety, but never lowered into the per-state invariant check — so it was silently dropped and our checker reported **SAFE** on specs TLC flags as **VIOLATED**. Reference case: `acp/ACP_NB_WRONG_TLC` explored its full state space but reported no violation while TLC reports "Invariant AC1 is violated."
