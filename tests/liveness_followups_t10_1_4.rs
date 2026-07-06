@@ -173,9 +173,15 @@ NeverFires == /\ x = 99 /\ x' = 100
 Next == Toggle \/ NeverFires
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(NeverFires)
+
+\* Liveness property. `NeverFires` is never enabled (x toggles in {0,1}),
+\* so `Reaches100` never holds — a genuine fairness/liveness violation TLC
+\* also reports. Required so the fairness check runs: `WF_vars(...)` alone
+\* with no liveness property is an assumption, not a checkable property.
+Reaches100 == <>(x = 100)
 ====
 "#;
-    let cfg_src = "SPECIFICATION Spec\n";
+    let cfg_src = "SPECIFICATION Spec\nPROPERTIES Reaches100\n";
     let outcome = run_spec("ShardedNeverFires", module_src, cfg_src);
 
     assert_eq!(outcome.stats.states_distinct, 2);

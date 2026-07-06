@@ -113,6 +113,11 @@ NeverFires == /\ x = 99 /\ x' = 100
 Next == Toggle \/ NeverFires
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(NeverFires)
+
+\* Liveness property, required so the fairness check runs (WF_vars alone
+\* with no liveness property is an assumption, not a checkable property).
+\* `NeverFires` never fires, so `Reaches100` never holds — a real violation.
+Reaches100 == <>(x = 100)
 ====
 "#;
 
@@ -169,7 +174,7 @@ fn t10_2_stage3_parity_on_passing_spec() {
 #[serial]
 fn t10_2_stage3_parity_on_failing_spec() {
     // NamedSubaction with WF on NeverFires must violate under all three modes.
-    let cfg = "SPECIFICATION Spec\n";
+    let cfg = "SPECIFICATION Spec\nPROPERTIES Reaches100\n";
     let baseline = run_spec_with_mode(
         "NamedSubactionFairnessExploration",
         NAMED_SUBACTION_MODULE,

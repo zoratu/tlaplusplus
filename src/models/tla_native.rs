@@ -687,6 +687,17 @@ impl Model for TlaModel {
         !self.fairness_constraints.is_empty()
     }
 
+    fn should_check_fairness(&self) -> bool {
+        // Fairness constraints are only *checkable* against a declared
+        // liveness property. With fairness but no liveness property (the
+        // common `SPECIFICATION Spec` + `INVARIANTS ...` shape, e.g.
+        // transaction_commit/2PCwithBTM), TLC checks only the invariants
+        // and never reports a fairness/liveness violation — so neither
+        // should we. Requiring a liveness property here also avoids
+        // collecting the labeled-transition graph for safety-only runs.
+        !self.fairness_constraints.is_empty() && self.has_liveness_properties()
+    }
+
     fn fairness_constraints(&self) -> Vec<FairnessConstraint> {
         self.fairness_constraints.clone()
     }

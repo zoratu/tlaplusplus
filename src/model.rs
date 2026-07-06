@@ -98,6 +98,27 @@ pub trait Model: Send + Sync + 'static {
         false
     }
 
+    /// Whether the runtime should run the post-BFS fairness / liveness
+    /// (SCC) check for this model.
+    ///
+    /// Fairness constraints (`WF_`/`SF_`) declared inside a `SPECIFICATION`
+    /// are *assumptions*, not properties: on their own they can never be
+    /// "violated". TLC only evaluates them relative to a declared temporal
+    /// PROPERTY. So the fairness SCC pass — and the (more expensive)
+    /// labeled-transition collection that feeds it — must run *only* when
+    /// the model actually has a liveness property to verify. Otherwise a
+    /// safety-only spec that happens to carry `WF_vars(...)` in its `Spec`
+    /// would get a spurious liveness "violation" (and pay for building the
+    /// labeled-transition graph) where TLC reports SAFE.
+    ///
+    /// Default: gate purely on the presence of fairness constraints, so
+    /// non-TLA models that override `has_fairness_constraints` keep their
+    /// prior behaviour. `TlaModel` additionally requires a liveness
+    /// property to be present.
+    fn should_check_fairness(&self) -> bool {
+        self.has_fairness_constraints()
+    }
+
     /// Return the fairness constraints for this model
     ///
     /// Default implementation returns an empty list. Models with fairness

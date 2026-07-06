@@ -109,6 +109,13 @@ NeverFires == /\ x = 99 /\ x' = 100
 Next == Toggle \/ NeverFires
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(NeverFires)
+
+\* Liveness property. `NeverFires` is never enabled (x toggles in {0,1}),
+\* so `Reaches100` never holds — a real fairness/liveness violation that
+\* TLC also reports. The PROPERTY is required: `WF_vars(...)` alone with no
+\* liveness property is an assumption, not a checkable property (TLC reports
+\* SAFE for `SPECIFICATION Spec` + only `WF_vars(...)` and no PROPERTIES).
+Reaches100 == <>(x = 100)
 ====
 "#;
 
@@ -163,7 +170,7 @@ fn dfs_path_matches_bfs_on_failing_named_subaction_spec() {
     //   - state count (2 toggle states)
     //   - violation category (Liveness)
     //   - violation message (must mention `NeverFires`)
-    let cfg = "SPECIFICATION Spec\n";
+    let cfg = "SPECIFICATION Spec\nPROPERTIES Reaches100\n";
     let bfs = run_under_path("DfsParityNamedSubaction", FAILING_FAIRNESS_SPEC, cfg, Path::Bfs);
     let dfs = run_under_path("DfsParityNamedSubaction", FAILING_FAIRNESS_SPEC, cfg, Path::Dfs);
 
@@ -252,9 +259,14 @@ Idle == /\ x = 999 /\ UNCHANGED vars
 Next == Cycle \/ Idle
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(Idle)
+
+\* Liveness property. `Idle` is never enabled (x cycles in {0,1,2}), so
+\* `ReachesGoal` never holds — a genuine fairness/liveness violation TLC
+\* also reports. Required so the fairness check runs (see note above).
+ReachesGoal == <>(x = 999)
 ====
 "#;
-    let cfg = "SPECIFICATION Spec\n";
+    let cfg = "SPECIFICATION Spec\nPROPERTIES ReachesGoal\n";
     let bfs = run_under_path("DfsParityThreeCycle", module_src, cfg, Path::Bfs);
     let dfs = run_under_path("DfsParityThreeCycle", module_src, cfg, Path::Dfs);
 

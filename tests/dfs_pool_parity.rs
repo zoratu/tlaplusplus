@@ -97,6 +97,15 @@ NeverFires == /\ x = 99 /\ x' = 100
 Next == Toggle \/ NeverFires
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(NeverFires)
+
+\* Liveness property to verify. Because `NeverFires` is never enabled from
+\* any reachable state (`x` toggles in {0,1}, never reaching 99), the fair
+\* subaction never fires and `Reaches100` can never hold — a genuine
+\* fairness/liveness violation that TLC also reports. The PROPERTY is
+\* required: fairness constraints alone (with no liveness property to
+\* verify) are assumptions, not checkable properties — TLC reports SAFE for
+\* `SPECIFICATION Spec` + only `WF_vars(...)` and no PROPERTIES.
+Reaches100 == <>(x = 100)
 ====
 "#;
 
@@ -125,7 +134,7 @@ fn pool_state_count_matches_single_worker_on_passing_spec() {
 #[test]
 #[serial]
 fn pool_verdict_matches_single_worker_on_failing_spec() {
-    let cfg = "SPECIFICATION Spec\n";
+    let cfg = "SPECIFICATION Spec\nPROPERTIES Reaches100\n";
     let one = run_pool("DfsPoolFailingNamedSubaction", FAILING_FAIRNESS_SPEC, cfg, 1);
     let four = run_pool("DfsPoolFailingNamedSubaction", FAILING_FAIRNESS_SPEC, cfg, 4);
 
