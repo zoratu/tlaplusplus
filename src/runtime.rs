@@ -1056,7 +1056,7 @@ where
     // fingerprints into the fp-store, making the DFS root CAS path see
     // every initial state as "already visited."
     let dfs_dispatch_will_fire = config.liveness_streaming_exploration
-        && model.has_fairness_constraints()
+        && model.should_check_fairness()
         && config.distributed_stealer.is_none();
     let init_producer = if dfs_dispatch_will_fire {
         // Clear the producer-busy flag immediately so the (skipped)
@@ -1320,8 +1320,11 @@ where
         worker_plan.worker_count,
     );
 
-    // Check if we need to collect labeled transitions for fairness checking
-    let collect_labeled_transitions = model.has_fairness_constraints();
+    // Check if we need to collect labeled transitions for fairness checking.
+    // Gated on `should_check_fairness()` (not merely `has_fairness_constraints()`):
+    // fairness constraints without a liveness property to verify are pure
+    // assumptions and must not trigger the SCC pass (see TlaModel override).
+    let collect_labeled_transitions = model.should_check_fairness();
     let labeled_transitions: Option<Arc<DashMap<u64, Vec<LabeledTransition<M::State>>>>> =
         if collect_labeled_transitions {
             eprintln!("Fairness constraints detected - collecting labeled transitions");
@@ -1402,7 +1405,7 @@ where
     // flag. Distributed mode is incompatible with the DFS path (single-
     // node only by design); we fall back to BFS in that case.
     let use_dfs_path = config.liveness_streaming_exploration
-        && model.has_fairness_constraints()
+        && model.should_check_fairness()
         && config.distributed_stealer.is_none();
 
     // Shared with both the DFS worker and the shutdown orchestrator.

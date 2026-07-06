@@ -90,6 +90,11 @@ NeverFires == /\ x = 99 /\ x' = 100
 Next == Toggle \/ NeverFires
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(NeverFires)
+
+\* Liveness property, required so the fairness check runs (WF_vars alone
+\* with no liveness property is an assumption, not a checkable property).
+\* `NeverFires` never fires, so `Reaches100` never holds — a real violation.
+Reaches100 == <>(x = 100)
 ====
 "#;
 
@@ -131,7 +136,7 @@ fn t10_2_oracle_agrees_on_passing_spec() {
 fn t10_2_oracle_agrees_on_failing_spec() {
     // NamedSubactionFairness should violate under both modes (NeverFires
     // is in an SCC of {x=0, x=1} but never occurs there).
-    let cfg = "SPECIFICATION Spec\n";
+    let cfg = "SPECIFICATION Spec\nPROPERTIES Reaches100\n";
     let baseline = run_spec_with_streaming(
         "NamedSubactionFairnessOracle",
         NAMED_SUBACTION_MODULE,

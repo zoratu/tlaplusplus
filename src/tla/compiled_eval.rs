@@ -2664,7 +2664,16 @@ fn try_eval_compiled_guard_as_action<'a>(
     let Some(def) = def_opt else {
         return Ok(None);
     };
-    if !crate::tla::looks_like_action(&def) {
+    // Soundness fix (wrapper-alias actions): use the *transitive* action
+    // check, not the direct `looks_like_action`. A wrapper like
+    // `RManager(self) == RS(self)` has no prime in its own body — the primes
+    // live one call deeper in `RS`. `looks_like_action` only sees direct
+    // primes, so it would classify `RManager` as a boolean guard and the
+    // existential branch `\E self \in RM : RManager(self)` would silently drop
+    // every successor (undercounting the state space and masking violations).
+    // `def_call_is_transitively_action` follows the call chain (bounded depth)
+    // and catches these wrapper actions.
+    if !def_call_is_transitively_action(&name, &branch.ctx, 0) {
         return Ok(None);
     }
     // Avoid infinite recursion when the body is the call itself (already
@@ -2674,6 +2683,70 @@ fn try_eval_compiled_guard_as_action<'a>(
     }
 
     let outer_ctx = branch.ctx.clone();
+
+    // Soundness fix (wrapper-alias + nested disjunction): evaluate the resolved
+    // action through the *compiled* clause evaluator rather than the interpreted
+    // `eval_action_body_multi` text splitter.
+    //
+    // `eval_action_body_multi` re-splits the raw body with
+    // `split_action_body_disjuncts`, whose indentation normalization flattens a
+    // nested `\/ /\ \/ ...` (a disjunction inside a `/\` conjunct inside another
+    // disjunct) down to the outer disjuncts' level. That mis-groups the inner
+    // branches: e.g. in the 2PC `RS` action the branch
+    //   \/ /\ rmState[self]="working" \/ tmState="abort"
+    //      /\ rmState' = [rmState EXCEPT ![self] = "aborted"]
+    // gets split so the `rmState[self]="working"` disjunct of the *guard* is
+    // separated from the assignment, disabling the whole abort branch (it stays
+    // reachable only via `tmState="abort"`). This silently drops states and can
+    // mask violations. The compiled clause evaluator (which the inline, non-alias
+    // path already uses via `CompiledActionClause::Exists`) expands the same
+    // action correctly, so route through it here and only fall back to the
+    // interpreted evaluator if compilation cannot handle the body.
+    if let Some((name2, arg_exprs)) = crate::tla::eval::parse_action_call_expr(text)
+        && name2.split_once('!').is_none()
+        && def.params.len() == arg_exprs.len()
+    {
+        let mut child_ctx = branch.ctx.clone();
+        let mut bind_ok = true;
+        {
+            let staged_ctx = ctx_with_staged_primes(&branch.ctx, &branch.staged);
+            let locals_mut = std::rc::Rc::make_mut(&mut child_ctx.locals);
+            for (param, arg_expr) in def.params.iter().zip(arg_exprs.iter()) {
+                match eval_expr(arg_expr, &staged_ctx) {
+                    Ok(value) => {
+                        locals_mut.insert(
+                            crate::tla::eval::normalize_param_name(param).to_string(),
+                            value,
+                        );
+                    }
+                    Err(_) => {
+                        bind_ok = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if bind_ok {
+            let compiled = CompiledActionIr::from_ir(&crate::tla::compile_action_ir(&def));
+            let seed = CompiledActionBranch {
+                ctx: child_ctx,
+                staged: branch.staged.clone(),
+                unchanged_vars: branch.unchanged_vars.clone(),
+            };
+            if let Ok(inner) = eval_compiled_clause_sequence(&compiled.clauses, vec![seed]) {
+                let out = inner
+                    .into_iter()
+                    .map(|b| CompiledActionBranch {
+                        ctx: outer_ctx.clone(),
+                        staged: b.staged,
+                        unchanged_vars: b.unchanged_vars,
+                    })
+                    .collect();
+                return Ok(Some(out));
+            }
+        }
+    }
+
     let interpreted_branches =
         crate::tla::eval::eval_action_body_multi(text, &branch.ctx, &branch.staged)?;
 
