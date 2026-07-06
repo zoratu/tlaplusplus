@@ -104,6 +104,15 @@ impl LivenessChecker {
                 }
             }
 
+            TemporalFormula::Implies(ante, cons) => {
+                // P => Q holds on the trace iff either the antecedent fails
+                // (vacuously true) or the consequent holds. Matches `¬P \/ Q`.
+                match self.check_formula_on_trace(ante, trace, eval_predicate) {
+                    Err(_) => Ok(()), // antecedent does not hold → implication holds
+                    Ok(()) => self.check_formula_on_trace(cons, trace, eval_predicate),
+                }
+            }
+
             TemporalFormula::Not(inner) => {
                 // Negation of temporal formula
                 match self.check_formula_on_trace(inner, trace, eval_predicate) {
