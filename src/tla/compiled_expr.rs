@@ -1349,25 +1349,41 @@ pub fn compile_expr(expr: &str) -> CompiledExpr {
         );
     }
     if let Some((left, right)) = split_binary_op(expr, "\\") {
-        // Only treat as set minus if right side doesn't start with a known keyword
-        // (this avoids incorrectly splitting \union, \cup, \cap, \intersect, \div, etc.)
-        let right_trimmed = right.trim();
-        if !right_trimmed.starts_with("union")
-            && !right_trimmed.starts_with("cup")
-            && !right_trimmed.starts_with("cap")
-            && !right_trimmed.starts_with("intersect")
-            && !right_trimmed.starts_with("div")
-            && !right_trimmed.starts_with("in")
-            && !right_trimmed.starts_with("notin")
-            && !right_trimmed.starts_with("subseteq")
-            && !right_trimmed.starts_with("E")
-            && !right_trimmed.starts_with("A")
-        {
+        // A `\` immediately followed by a letter is a NAMED operator token
+        // (`\union`, `\cup`, ..., `\in`, `\E`, OR a user-defined infix like
+        // `\preceq` / `\sqsubseteq`), never set difference. Genuine set-minus
+        // `A \ B` always has whitespace after the backslash. `split_binary_op`
+        // returns everything after the `\` in `right`, so a `right` that begins
+        // with a letter (no leading whitespace) means the `\` opened a named
+        // operator and must NOT be split as set-minus. The previous fixed
+        // keyword blocklist missed user-defined operators, causing
+        // `rotation \preceq other.seq` to be mis-parsed as set difference — a
+        // false invariant violation + truncated exploration on
+        // LeastCircularSubstring.
+        let named_op = right
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic())
+            .unwrap_or(false);
+        if !named_op {
             return CompiledExpr::SetMinus(
                 Box::new(compile_expr(left)),
                 Box::new(compile_expr(right)),
             );
         }
+    }
+
+    // User-defined infix operator (`a \preceq b`, `a \sqsubseteq b`, ...): a
+    // top-level `\<letters>` token that is NOT one of the compiler's known
+    // built-ins. The compiler can't know its precedence, and continuing the
+    // cascade would mis-split lower-precedence forms — e.g. `rot \preceq
+    // other.seq` would be parsed as record access `(rot \preceq other).seq`,
+    // dropping the `.seq` and passing the wrong argument. Hand the whole
+    // expression to the interpreter (which resolves user infix operators via
+    // the live definition context). This mirrors the interpreter's own
+    // defined-infix precedence slot (below comparison, above set ops).
+    if has_top_level_user_infix_operator(expr) {
+        return CompiledExpr::Unparsed(expr.to_string());
     }
 
     // Set/sequence range: a..b (TLA+ precedence 9-9). MUST be split BEFORE
@@ -1939,6 +1955,74 @@ fn find_binary_minus_split(expr: &str) -> Option<(&str, &str)> {
         }
     }
     last.map(|(left_end, right_start)| (&expr[..left_end], &expr[right_start..]))
+}
+
+/// True if `expr` contains a top-level `\<letters>` token that is NOT one of
+/// the compiler's known built-in backslash operators — i.e. a user-defined
+/// infix operator whose precedence the compiler cannot resolve. Scans at
+/// bracket/string top level only. Preceded by whitespace (a real infix use,
+/// e.g. `a \preceq b`) — a leading `\word` at expression start is a prefix
+/// keyword form (`\A`, `\E`, `\union`-as-error) handled elsewhere.
+fn has_top_level_user_infix_operator(expr: &str) -> bool {
+    // Known built-in backslash operators the compiler handles directly. A
+    // `\word` NOT in this set is user-defined.
+    const KNOWN: &[&str] = &[
+        "in", "notin", "union", "cup", "intersect", "cap", "subseteq", "supseteq",
+        "div", "mod", "o", "circ", "X", "times", "leq", "geq", "land", "lor",
+        "A", "E", "AA", "EE", "cdot", "equiv", "neg", "lnot",
+    ];
+    let bytes = expr.as_bytes();
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'"' && (i == 0 || bytes[i - 1] != b'\\') {
+            in_string = !in_string;
+            i += 1;
+            continue;
+        }
+        if in_string {
+            i += 1;
+            continue;
+        }
+        match c {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'<' if i + 1 < bytes.len() && bytes[i + 1] == b'<' => {
+                depth += 1;
+                i += 2;
+                continue;
+            }
+            b'>' if i + 1 < bytes.len() && bytes[i + 1] == b'>' => {
+                depth -= 1;
+                i += 2;
+                continue;
+            }
+            b'\\' if depth == 0 && i > 0 && bytes[i - 1].is_ascii_whitespace() => {
+                // Collect the following identifier run.
+                let start = i + 1;
+                let mut j = start;
+                while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                    j += 1;
+                }
+                if j > start {
+                    let word = &expr[start..j];
+                    // Must be followed by whitespace to be a genuine infix use
+                    // (`a \preceq b`), and preceded by an operand (i>0 already).
+                    let followed_by_ws = j < bytes.len() && bytes[j].is_ascii_whitespace();
+                    if followed_by_ws && !KNOWN.contains(&word) {
+                        return true;
+                    }
+                }
+                i = j;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 fn split_binary_op<'a>(expr: &'a str, op: &str) -> Option<(&'a str, &'a str)> {

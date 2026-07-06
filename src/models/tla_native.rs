@@ -2021,6 +2021,50 @@ fn substitute_ident(text: &str, from: &str, to: &str) -> String {
     out
 }
 
+/// True if `expr` textually references any declared module variable other
+/// than `assign_var` itself, at an identifier boundary.
+///
+/// Used by Init enumeration to decide whether an `assign_var = expr`
+/// equality can be resolved eagerly (RHS is constant/self-contained) or must
+/// be deferred until after the membership cross-product binds the referenced
+/// variable(s). Without deferral, an early `eval_expr` on the RHS resolves the
+/// unbound variable to a spurious `ModelValue`, corrupting the state.
+fn expr_references_declared_variable(
+    expr: &str,
+    assign_var: &str,
+    variables: &[String],
+) -> bool {
+    let bytes = expr.as_bytes();
+    for var in variables {
+        if var == assign_var {
+            continue;
+        }
+        let needle = var.as_bytes();
+        if needle.is_empty() || bytes.len() < needle.len() {
+            continue;
+        }
+        let mut i = 0;
+        while i + needle.len() <= bytes.len() {
+            if &bytes[i..i + needle.len()] == needle {
+                let prev_ok =
+                    i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+                let next_idx = i + needle.len();
+                // A trailing `'` marks a primed reference (not this unprimed
+                // variable); a trailing word char means it's a longer ident.
+                let next_ok = next_idx == bytes.len()
+                    || !(bytes[next_idx].is_ascii_alphanumeric()
+                        || bytes[next_idx] == b'_'
+                        || bytes[next_idx] == b'\'');
+                if prev_ok && next_ok {
+                    return true;
+                }
+            }
+            i += 1;
+        }
+    }
+    false
+}
+
 /// Evaluate Init predicate and return all possible initial states.
 /// Handles:
 /// - Equality assignments: var = expr (deterministic)
@@ -2409,7 +2453,20 @@ fn evaluate_init_states(
 
         match classify_clause(&clause) {
             ClauseKind::UnprimedEquality { var, expr } if module.variables.contains(&var) => {
-                equality_assignments.push((var, expr));
+                // If the RHS references another declared variable (e.g.
+                // `ack = rdy` where `rdy \in {0, 1}` is a membership
+                // assignment), the RHS variable is not yet bound during the
+                // eager equality phase. Evaluating it early would resolve the
+                // bare identifier to a bogus `ModelValue("rdy")`, corrupting
+                // the state and both undercounting exploration AND tripping a
+                // false invariant violation. Route it through the guards list
+                // so it lands in `late_equalities`, which re-evaluates the RHS
+                // per-state AFTER the cross-product has bound every variable.
+                if expr_references_declared_variable(&expr, &var, &module.variables) {
+                    guards.push(format!("{} = {}", var, expr));
+                } else {
+                    equality_assignments.push((var, expr));
+                }
             }
             ClauseKind::UnprimedMembership { var, set_expr } if module.variables.contains(&var) => {
                 membership_assignments.push((var, set_expr));
