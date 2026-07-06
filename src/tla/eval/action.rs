@@ -826,6 +826,31 @@ pub(super) fn matches_membership_expr(
         "Int" => Ok(value.as_int().is_ok()),
         "BOOLEAN" => Ok(matches!(value, TlaValue::Bool(_))),
         _ => {
+            // `value \in SUBSET S` holds iff `value` is a set and every element
+            // of it is a member of `S`. Materializing `SUBSET S` (the powerset)
+            // is exponential and trips the eval budget on record-set codomains
+            // like Nano's `received \in [Node -> SUBSET SignedBlock]` (SignedBlock
+            // is a large record set, so `SUBSET SignedBlock` is 2^|SignedBlock|).
+            // Evaluate it structurally instead — this mirrors the compiled path
+            // (`compiled_eval::compiled_membership_contains` / `membership_matches_text`,
+            // commit 459d3aa) and TLC's `x \subseteq S` handling. Without it the
+            // interpreted function-set codomain recursion below erroneously
+            // materialized the powerset and reported a false invariant violation
+            // on the initial state (NanoBlockchain MCNano{Small,Medium}).
+            if let Some(set_expr) = rhs_trimmed.strip_prefix("SUBSET ") {
+                return match value {
+                    TlaValue::Set(elems) => {
+                        for e in elems.iter() {
+                            if !matches_membership_expr(e, set_expr, ctx, depth + 1)? {
+                                return Ok(false);
+                            }
+                        }
+                        Ok(true)
+                    }
+                    _ => Ok(false),
+                };
+            }
+
             if let Some(runtime_value) = ctx.runtime_value(rhs_trimmed) {
                 // A constant substituted to an infinite built-in set (e.g.
                 // `INSTANCE M WITH Values <- Int`) is bound as the runtime
@@ -1314,6 +1339,71 @@ mod tests {
         for next in next_states {
             assert_eq!(next.get("y"), Some(&TlaValue::Int(9)));
         }
+    }
+
+    #[test]
+    fn subset_membership_is_structural_not_powerset_materialized() {
+        use crate::tla::hashed_arc::HashedArc;
+
+        // Regression for the NanoBlockchain MCNano{Small,Medium} false-violation:
+        // `received \in [Node -> SUBSET SignedBlock]` in Nano's TypeInvariant.
+        // At the initial state `received[n] = {}`, so the codomain membership is
+        // `{} \in SUBSET SignedBlock`, which must be TRUE without materializing
+        // the exponential powerset of the (large) record set `SignedBlock`.
+        let state = tla_state([]);
+        let mut defs = BTreeMap::new();
+        // A "large" record set standing in for SignedBlock — enumerating its
+        // powerset would be 2^(3*3) = 512 here, but for the real spec it is
+        // 2^(hundreds), which trips the eval budget. The structural path never
+        // enumerates it.
+        defs.insert(
+            "SignedBlock".to_string(),
+            TlaDefinition {
+                name: "SignedBlock".to_string(),
+                params: vec![],
+                body: "[block : {\"a\", \"b\", \"c\"}, sig : {\"x\", \"y\", \"z\"}]".to_string(),
+                is_recursive: false,
+            },
+        );
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        // {} \in SUBSET SignedBlock  ==>  true (empty set is a subset of anything).
+        let empty = TlaValue::Set(HashedArc::new(BTreeSet::new()));
+        assert!(
+            matches_membership_expr(&empty, "SUBSET SignedBlock", &ctx, 0)
+                .expect("SUBSET membership must not error"),
+            "empty set must be a member of SUBSET SignedBlock"
+        );
+
+        // A set whose element IS a SignedBlock record is a member.
+        let good_elem = TlaValue::Record(HashedArc::new(BTreeMap::from([
+            ("block".to_string(), TlaValue::String("a".to_string())),
+            ("sig".to_string(), TlaValue::String("x".to_string())),
+        ])));
+        let good = TlaValue::Set(HashedArc::new(BTreeSet::from([good_elem])));
+        assert!(
+            matches_membership_expr(&good, "SUBSET SignedBlock", &ctx, 0)
+                .expect("SUBSET membership must not error"),
+            "{{signedBlock}} must be a member of SUBSET SignedBlock"
+        );
+
+        // A set containing a non-member element is NOT a member.
+        let bad_elem = TlaValue::Record(HashedArc::new(BTreeMap::from([
+            ("block".to_string(), TlaValue::String("zzz".to_string())),
+            ("sig".to_string(), TlaValue::String("x".to_string())),
+        ])));
+        let bad = TlaValue::Set(HashedArc::new(BTreeSet::from([bad_elem])));
+        assert!(
+            !matches_membership_expr(&bad, "SUBSET SignedBlock", &ctx, 0)
+                .expect("SUBSET membership must not error"),
+            "a set with a non-SignedBlock element is not in SUBSET SignedBlock"
+        );
+
+        // A non-set value is never a member of a powerset.
+        assert!(
+            !matches_membership_expr(&TlaValue::Int(3), "SUBSET SignedBlock", &ctx, 0)
+                .expect("SUBSET membership must not error"),
+        );
     }
 
     #[test]
