@@ -1,5 +1,25 @@
 # Changelog
 
+## v1.2.23 (2026-07-06)
+
+The first wave of fixes for the `ours=1` false-violation cluster from the corpus diff-vs-TLC audit — four spec families investigated in parallel, then validated together in one integration build (all target configs match TLC exactly; a 226-spec corpus scan in both directions found zero new false violations and zero newly-missed violations; `cargo test --release` 1262 passed / 0 failed; `scripts/diff_tlc.sh` 13/13; compiled-vs-interpreted proptest 17/17; state-graph snapshots 12/12). Beyond the named targets, the fixes also corrected the verdict on ~7 further corpus specs (ewd840 AP-variants, `nbacc_ray97`, both `nbacg_guer01` configs, and others).
+
+### PR #131 — allocator: cfg continuation-line names + `SUBSET`-of-large-set membership
+
+Two general fixes. The cfg parser (`src/tla/cfg.rs`) kept multiple invariant/property names listed on an indented continuation line under a bare `INVARIANTS`/`PROPERTIES` header as one bogus entry (`TypeInvariant ResourceMutex`) that never resolved; it now splits continuation lines on whitespace for all list-valued sections, matching TLC's grammar. And `x \in SUBSET S` for a large `S` (`src/tla/compiled_eval.rs`) tried to materialize 2^36 subsets and raised a spurious "too large" error reported as a violation; it now short-circuits structurally (`x` is a set and every element is in `S`), mirroring the existing Seq/RecordSet/FunctionSet short-circuits. SimpleAllocator 400, SchedulingAllocator 1690, AllocatorImplementation 17701 — all match TLC. Also resolves a spurious SlidingPuzzles powerset error.
+
+### PR #132 — Disruptor: instance membership over infinite/record codomains + instance-action successors
+
+Three cascading fixes (`src/tla/eval/action.rs`, `src/tla/action_exec.rs`, `src/models/tla_native.rs`). Membership against an infinite-set codomain `x \in (Int \union {NULL})` (via `WITH Values <- Int`) now distributes top-level set operators and `UNION {…}` over membership and recognizes a constant substituted to `Int`/`Nat`/`BOOLEAN`. A record set `[f1: S1, …]` was misclassified as a function set because arrow detection matched a `->` nested inside a field type (`UNION { [0..N -> R] }`); it now splits on the top-level `->`. And a compiled action whose LET routes a prime through an instance action (`Buffer!Write`) returned zero successors that were blindly trusted; an empty compiled result is now cross-checked against the interpreted evaluator when the body contains an `Ident!Ident` instance call. Disruptor SPMC 8496, MPMC_liveliness 14365, MPMC 112929 — all match TLC.
+
+### PR #133 — 2PCwithBTM: wrapper-alias successors + fairness only checked with a liveness property
+
+A PlusCal wrapper `RManager(self) == RS(self)` invoked via `\E self : …` was routed through the interpreted text splitter, whose indentation normalization flattened a nested `\/ /\ \/` and dropped the abort branch (undercount 765 vs 1245); the resolved single action-call is now routed through the compiled clause evaluator (`src/tla/compiled_eval.rs`). Separately, `WF_`/`SF_` fairness declared under `SPECIFICATION` with no liveness `PROPERTY` is an assumption, not a checkable property — TLC reports no fairness violation there, but we did. A new `Model::should_check_fairness()` (`src/model.rs`; default `has_fairness_constraints()`, overridden in `TlaModel` to also require `has_liveness_properties()`) gates the SCC/fairness pass (`src/runtime.rs`). 2PCwithBTM now explores 1245 with no violation, matching TLC; TCommit unchanged. Six existing tests that pinned the old TLC-divergent behavior were given a real liveness property and re-validated against TLC. Fairness still runs whenever a liveness property is present (all 51 fairness+liveness corpus specs match TLC, including the WorkQueue diff_tlc gate). Incidentally clears `nbacg_guer01`'s false fairness violation.
+
+### PR #134 — regression test for `~`-before-a-bulleted-junction (byihive)
+
+The byihive Voucher family (Issue/Cancel/Redeem/Transfer) was already fixed by v1.2.20's #124 — its `VTPConsistent` invariant has the same `~ /\ A /\ B` shape. Adds a test-only regression pinning the compile shape; no behavioral change.
+
 ## v1.2.22 (2026-07-05)
 
 A false-violation soundness fix surfaced by the box-safety corpus sweep: `Prisoners.tla`'s `CountInvariant` was silently dropped by the module parser and reported as a violation (`CountInvariant: empty expression`) on the initial state — our checker halted at 4 distinct states where TLC explores 214 with no violation.
