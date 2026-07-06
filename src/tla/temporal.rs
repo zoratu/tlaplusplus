@@ -626,7 +626,18 @@ mod tests {
         {
             assert_eq!(var, "n");
             assert_eq!(domain, "Node");
-            assert!(matches!(*inner, TemporalFormula::StatePredicate(_)));
+            // The body `(n \in Node) => [](n \in Node)` is a temporal
+            // implication (RHS is `[]...`), so it now decomposes into
+            // Implies(StatePredicate, Always(StatePredicate)). Previously the
+            // `=>` was unhandled and the whole body stayed an (unevaluable)
+            // StatePredicate; the decomposed form is more correct.
+            match *inner {
+                TemporalFormula::Implies(ref ante, ref cons) => {
+                    assert!(matches!(ante.as_ref(), TemporalFormula::StatePredicate(_)));
+                    assert!(matches!(cons.as_ref(), TemporalFormula::Always(_)));
+                }
+                other => panic!("expected Implies body, got {:?}", other),
+            }
         } else {
             panic!("Expected TemporalForAll");
         }
@@ -722,11 +733,19 @@ mod tests {
     }
 
     #[test]
-    fn test_leadsto_style_implies_left_temporal() {
-        // `<>P => []Q` — antecedent temporal — builds Implies.
+    fn test_implies_left_temporal_builds_implies() {
+        // `<>P => []Q` — antecedent temporal — builds an Implies node.
+        // Classification: liveness iff the CONSEQUENT is liveness. Here the
+        // consequent `[]Q` is safety, so the whole implication is NOT a pure
+        // liveness property (it is `[]¬P \/ []Q`, a safety-ish disjunction).
         let f = TemporalFormula::parse("<>P => []Q").unwrap();
         assert!(matches!(f, TemporalFormula::Implies(_, _)));
-        assert!(f.is_liveness_property());
+        assert!(!f.is_liveness_property());
+
+        // But `[]P => <>Q` (consequent is liveness) IS classified liveness.
+        let g = TemporalFormula::parse("[]P => <>Q").unwrap();
+        assert!(matches!(g, TemporalFormula::Implies(_, _)));
+        assert!(g.is_liveness_property());
     }
 
     #[test]
