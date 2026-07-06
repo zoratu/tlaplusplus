@@ -107,20 +107,21 @@ impl TemporalFormula {
                 left.is_liveness_property() || right.is_liveness_property()
             }
             // A temporal implication `P => G` is a liveness obligation iff its
-            // consequent is one. `[](P => <>[]Q)` therefore classifies as
-            // liveness (via Always -> Implies -> EventuallyAlways), so the
-            // SCC/graph post-processing pass runs for it. `Always` itself is
-            // not in this match arm, so `Always(Implies(..))` reaches here
-            // through the recursive `Not`/`And`/`Or`/`Implies` cases only when
-            // nested; the top-level `Always(Implies(..))` is handled by the
-            // `Always` arm below.
+            // consequent is one. This is what makes `[](P => <>[]Q)` classify
+            // as liveness (Always -> Implies -> EventuallyAlways) so the
+            // graph post-processing pass runs for it.
             TemporalFormula::Implies(_, consequent) => consequent.is_liveness_property(),
-            // `Always(G)` where `G` carries a liveness obligation (e.g.
-            // `[](P => <>[]Q)`) is itself a liveness property — the box does
-            // not neutralise the inner `<>[]`. Pure box-safety (`[]P` over a
-            // state predicate) still returns false because `StatePredicate`
-            // has no liveness content.
-            TemporalFormula::Always(inner) => inner.is_liveness_property(),
+            // NARROW `Always` arm (blast-radius control): `[]G` is liveness
+            // ONLY when `G` is a temporal implication carrying a liveness
+            // consequent — i.e. exactly the new `[](P => <>[]Q)` shape. Every
+            // other `Always(..)` keeps its prior classification (falls to
+            // `_ => false`), so no existing spec's safety/liveness verdict or
+            // fairness-pass gating changes.
+            TemporalFormula::Always(inner)
+                if matches!(inner.as_ref(), TemporalFormula::Implies(_, _)) =>
+            {
+                inner.is_liveness_property()
+            }
             _ => false,
         }
     }
