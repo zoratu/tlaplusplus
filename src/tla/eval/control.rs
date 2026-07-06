@@ -143,6 +143,14 @@ pub(super) fn parse_let_definitions(defs_text: &str) -> Result<BTreeMap<String, 
         }
         let head = trim_let_edge_comments(&defs_text[cursor..*eq_pos]);
         let body = trim_let_edge_comments(&defs_text[body_start..next_head_start]);
+        // A `RECURSIVE Op(_, ...)` declaration line inside a LET block carries no
+        // `==`, so it is swallowed into the PRECEDING binding's body (e.g.
+        // `s2len == ZLen(b)\n RECURSIVE IsLexLeq(_,_,_)`). Strip such trailing
+        // declaration lines so the binding body stays well-formed — otherwise
+        // evaluating it errors with "unexpected trailing tokens", surfacing as
+        // a spurious violation. The recursion the declaration enables still
+        // works: the recursive operator's own `Op(..) == ...` binding follows.
+        let body = strip_trailing_recursive_decls(body);
         let (name, params) = parse_local_def_head(head);
 
         if !name.is_empty() {
@@ -161,6 +169,22 @@ pub(super) fn parse_let_definitions(defs_text: &str) -> Result<BTreeMap<String, 
     }
 
     Ok(defs)
+}
+
+/// Strip trailing `RECURSIVE <decl>` lines from a LET binding body. Such a
+/// declaration line has no `==`, so the LET-binding splitter merges it into the
+/// preceding binding's body; removing it keeps that body a valid expression.
+fn strip_trailing_recursive_decls(body: &str) -> &str {
+    let mut end = body.len();
+    loop {
+        let head = body[..end].trim_end();
+        let last_line_start = head.rfind('\n').map(|p| p + 1).unwrap_or(0);
+        if head[last_line_start..].trim_start().starts_with("RECURSIVE ") {
+            end = last_line_start;
+        } else {
+            return head;
+        }
+    }
 }
 
 fn trim_let_edge_comments(text: &str) -> &str {

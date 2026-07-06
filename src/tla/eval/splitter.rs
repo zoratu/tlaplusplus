@@ -582,7 +582,25 @@ pub(super) fn split_top_level_set_minus(expr: &str) -> Vec<String> {
         }
 
         let at_top = paren == 0 && bracket == 0 && brace == 0 && angle == 0;
-        if at_top && ch == '\\' && !starts_with_tla_backslash_operator(&expr[i..]) {
+        // A `\` immediately followed by an ASCII letter is a NAMED operator
+        // token — either a built-in (`\in`, `\cup`, ...) or a USER-DEFINED
+        // infix operator (`\preceq`, `\sqsubseteq`, ...). Only the latter is
+        // not in `starts_with_tla_backslash_operator`'s fixed list, so without
+        // this guard `a \preceq b` is mis-split as set-minus `a \ (preceq b)`,
+        // corrupting the expression (invariant/guard eval then errors, which
+        // surfaces as a spurious violation + truncated exploration). Genuine
+        // set difference `A \ B` has the `\` followed by whitespace or an
+        // operand-opening token, never a letter.
+        let followed_by_named_op = expr[i + ch_len..]
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic())
+            .unwrap_or(false);
+        if at_top
+            && ch == '\\'
+            && !followed_by_named_op
+            && !starts_with_tla_backslash_operator(&expr[i..])
+        {
             let prev = expr[..i].chars().next_back();
             let next_char = expr[i + ch_len..].chars().next();
             let ws_before = prev.map(|c| c.is_whitespace()).unwrap_or(false);
@@ -1941,6 +1959,16 @@ mod tests {
         // `match ch '{' / '}' brace-tracker mutants).
         let parts = split_top_level_set_minus("{1 \\ 2}");
         assert_eq!(parts, vec!["{1 \\ 2}".to_string()]);
+
+        // A USER-DEFINED backslash infix operator (not in the fixed built-in
+        // list) must NOT be mis-split as set-minus. `\preceq` / `\sqsubseteq`
+        // are followed immediately by a letter, so the `\` is a named-operator
+        // token, not set difference. Regression for the false-violation +
+        // undercount on LeastCircularSubstring (`rotation \preceq other.seq`).
+        let parts = split_top_level_set_minus("a \\preceq b");
+        assert_eq!(parts, vec!["a \\preceq b".to_string()]);
+        let parts = split_top_level_set_minus("s0 \\sqsubseteq s1");
+        assert_eq!(parts, vec!["s0 \\sqsubseteq s1".to_string()]);
     }
 
     #[test]

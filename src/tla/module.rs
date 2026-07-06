@@ -919,7 +919,20 @@ pub fn parse_tla_module_text(input: &str) -> Result<TlaModule> {
 
         // Parse RECURSIVE declarations
         // Format: RECURSIVE Op1(_), Op2(_, _), ...
-        if let Some(rest) = trimmed.strip_prefix("RECURSIVE ") {
+        //
+        // Only when NOT inside a definition body. A `RECURSIVE` that appears as
+        // a continuation line (indented deeper than the current definition) is
+        // a LET-local recursive declaration, e.g.
+        //   a \preceq b == LET ... RECURSIVE IsLexLeq(_, _, _)
+        //                          IsLexLeq(s1, s2, i) == ... IN ...
+        // Flushing on it would truncate the enclosing definition's body at the
+        // RECURSIVE line and orphan the rest — a soundness bug (the operator
+        // silently loses its `IN` clause). `can_start_definition` is false for
+        // such continuation lines, so guard on it. The declaration itself is
+        // still parsed by the LET evaluator when the body is evaluated.
+        if can_start_definition
+            && let Some(rest) = trimmed.strip_prefix("RECURSIVE ")
+        {
             flush_definition(&mut module, &mut current_def);
             current_def_indent = 0;
             mode = NameListMode::None;
@@ -1345,6 +1358,27 @@ fn find_inline_definition_start(rhs: &str) -> Option<usize> {
             _ => {}
         }
 
+        // Once a top-level `LET` is seen, every subsequent `==` belongs to that
+        // LET block's local definitions (or its body), NOT to a sibling inline
+        // definition of the enclosing operator. Splitting there would truncate
+        // the enclosing definition mid-LET. E.g.
+        //   SumMet == numMeetings = N => LET f[c \in CID] == expr IN ...
+        // must NOT be split at `f[c \in CID] == expr`. Stop scanning at `LET`.
+        if paren == 0
+            && bracket == 0
+            && brace == 0
+            && angle == 0
+            && rhs[byte_idx..].starts_with("LET")
+        {
+            let after = rhs[byte_idx + 3..].chars().next();
+            let before = if i == 0 { None } else { Some(chars[i - 1].1) };
+            let boundary_before = before.map(|c| !(c.is_alphanumeric() || c == '_')).unwrap_or(true);
+            let boundary_after = after.map(|c| !(c.is_alphanumeric() || c == '_')).unwrap_or(true);
+            if boundary_before && boundary_after {
+                return None;
+            }
+        }
+
         if paren == 0 && bracket == 0 && brace == 0 && angle == 0 && ch.is_whitespace() {
             let mut j = i + 1;
             while j < chars.len() && chars[j].1.is_whitespace() {
@@ -1360,7 +1394,6 @@ fn find_inline_definition_start(rhs: &str) -> Option<usize> {
             }
         }
 
-        let _ = byte_idx;
         i += 1;
     }
 
@@ -1383,10 +1416,43 @@ fn is_plausible_inline_definition_head(lhs: &str) -> bool {
         .split(|c: char| !(c.is_alphanumeric() || c == '_'))
         .next()
         .unwrap_or("");
-    !matches!(
+    if matches!(
         first_token,
         "LET" | "IN" | "IF" | "THEN" | "ELSE" | "CASE" | "OTHER"
-    )
+    ) {
+        return false;
+    }
+
+    // A genuine definition head is `Name`, `Name(params)`, `Name[params]`, or an
+    // infix-operator head `a \op b`. It NEVER contains a top-level logical /
+    // implication operator or an embedded reserved keyword. Without this guard,
+    // an expression like `N => LET f[c \in CID] == c IN ...` (the consequent of
+    // an implication whose LET body happens to contain `==`) is mistaken for an
+    // inline definition `N => LET f[c \in CID] == (c IN ...)`, truncating the
+    // ENCLOSING definition's body at `N` and silently dropping the rest — a
+    // soundness bug that surfaced as a spurious invariant violation on
+    // Chameneos (`SumMet == numMeetings = N => LET f[...] == ... IN ...`).
+    const OPERATOR_MARKERS: [&str; 6] = ["=>", "<=>", "~>", "\\/", "/\\", "->"];
+    for marker in OPERATOR_MARKERS {
+        if lhs.contains(marker) {
+            return false;
+        }
+    }
+    for kw in ["LET", "IN", "IF", "THEN", "ELSE", "CASE"] {
+        // Word-boundary search for an embedded reserved keyword.
+        let mut search = lhs;
+        while let Some(pos) = search.find(kw) {
+            let before = search[..pos].chars().next_back();
+            let after = search[pos + kw.len()..].chars().next();
+            let boundary_before = before.map(|c| !(c.is_alphanumeric() || c == '_')).unwrap_or(true);
+            let boundary_after = after.map(|c| !(c.is_alphanumeric() || c == '_')).unwrap_or(true);
+            if boundary_before && boundary_after {
+                return false;
+            }
+            search = &search[pos + kw.len()..];
+        }
+    }
+    true
 }
 
 fn parse_def_head(lhs: &str) -> (String, Vec<String>) {
