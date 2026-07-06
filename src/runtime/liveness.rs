@@ -362,6 +362,84 @@ where
             phase4_start.elapsed()
         );
 
+        // ---- Graph-level liveness check (`[](P => <>[]Q)`) ---------------
+        //
+        // Distinct from the per-SCC fairness check below: `[](P => <>[]Q)`
+        // triggers on a P-state that may live on the STEM (outside any
+        // cycle), and its "bad cycle" is a reachable non-trivial cycle
+        // containing a `¬Q` state. A per-SCC "is P here?" check misses it
+        // (RealTime: P = now≠4 on the stem, the bad {now=4} loop has ¬Q).
+        // We therefore hand the model the FULL adjacency graph, the fp→state
+        // map, the non-trivial SCC list, and a per-SCC fairness flag so it
+        // can do backward-reachability from bad-cycle states to a P-state.
+        //
+        // Fairness flag semantics: an SCC is FAIR (a behaviour may loop in
+        // it forever) iff every declared fairness constraint is satisfied by
+        // the cycle. Absent fairness constraints, stuttering is always
+        // allowed so every non-trivial SCC is fair. With `WF_`/`SF_`, an SCC
+        // where a fair action never occurs is unfair → TLC excludes that
+        // infinite behaviour → it must NOT count as a bad cycle (this is the
+        // guardrail against false-violating ewd840/WorkQueue/etc.).
+        // Note: we do NOT gate on `!non_trivial_sccs.is_empty()` here. Absent
+        // fairness, the bad cycle is a STUTTER self-loop on a `¬Q` state,
+        // which is not a recorded graph edge — so a pure-DAG state graph (e.g.
+        // RealTime, where `now` monotonically advances) still admits the
+        // violation. The model decides internally whether cycles are needed.
+        if model.needs_graph_liveness_check() {
+            let gl_start = std::time::Instant::now();
+            let owned_sccs: Vec<Vec<u64>> =
+                non_trivial_sccs.iter().map(|s| (*s).clone()).collect();
+
+            let constraints = model.fairness_constraints();
+            let fair_scc: Vec<bool> = if constraints.is_empty() {
+                // No fairness → every cycle is a fair (stutter-allowed) loop.
+                vec![true; owned_sccs.len()]
+            } else {
+                let gl_shards = build_action_shard_index(&tx_triples);
+                let next_name = model.next_action_name();
+                owned_sccs
+                    .iter()
+                    .map(|scc| {
+                        let scc_fps: HashSet<u64> = scc.iter().copied().collect();
+                        // Fair iff NO constraint is violated (all actions
+                        // that must occur do occur) in this cycle.
+                        constraints.iter().all(|c| {
+                            check_fairness_on_scc_fp_sharded(
+                                &scc_fps,
+                                c,
+                                &gl_shards,
+                                &adjacency_fp,
+                                next_name,
+                            )
+                            .is_ok()
+                        })
+                    })
+                    .collect()
+            };
+
+            if let Some(bad_state) = model.graph_liveness_violation(
+                &adjacency_fp,
+                &state_by_fp,
+                &owned_sccs,
+                &fair_scc,
+            ) {
+                eprintln!(
+                    "  Graph-level liveness violation ([](P => <>[]Q)) found in {:.2?}",
+                    gl_start.elapsed()
+                );
+                return Some(Violation {
+                    message: "Temporal property violated: []((P) => <>[](Q))".to_string(),
+                    state: bad_state.clone(),
+                    property_type: PropertyType::Liveness,
+                    trace: vec![bad_state],
+                });
+            }
+            eprintln!(
+                "  Graph-level liveness check: no violation ({:.2?})",
+                gl_start.elapsed()
+            );
+        }
+
         if !non_trivial_sccs.is_empty() {
             let constraints = model.fairness_constraints();
 

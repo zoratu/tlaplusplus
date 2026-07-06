@@ -645,7 +645,12 @@ impl Model for TlaModel {
         &self,
         state: &Self::State,
     ) -> Option<Vec<crate::model::LabeledTransition<Self::State>>> {
-        if !self.has_fairness_constraints() {
+        // Produce labeled transitions when the runtime needs the transition
+        // graph for EITHER the fairness SCC pass OR the graph-level
+        // `[](P => <>[]Q)` liveness check (which can hold with no fairness
+        // constraints). Action labels are still emitted in the graph-liveness
+        // case (harmless; the graph-liveness check only uses the adjacency).
+        if !self.has_fairness_constraints() && !self.needs_graph_liveness_check() {
             return None;
         }
 
@@ -730,6 +735,123 @@ impl Model for TlaModel {
             // property). Fall back to the fairness-only verdict.
             None
         }
+    }
+
+    fn needs_graph_liveness_check(&self) -> bool {
+        self.temporal_properties
+            .iter()
+            .any(|(_, f)| graph_liveness_shape(f).is_some())
+    }
+
+    fn graph_liveness_violation(
+        &self,
+        adjacency_fp: &HashMap<u64, Vec<u64>>,
+        state_by_fp: &HashMap<u64, Self::State>,
+        non_trivial_sccs: &[Vec<u64>],
+        fair_scc: &[bool],
+    ) -> Option<Self::State> {
+        // For each `[](P => <>[]Q)` property, look for a genuine violation:
+        // a P-state that can REACH a bad cycle (a reachable FAIR non-trivial
+        // cycle containing a `¬Q` state). Because every state in the graph is
+        // reachable from Init, a P-state that reaches such a cycle witnesses a
+        // behaviour that satisfies P but for which `<>[]Q` fails.
+        let has_fairness = !self.fairness_constraints.is_empty();
+
+        for (_name, formula) in &self.temporal_properties {
+            let Some((p_text, q_text)) = graph_liveness_shape(formula) else {
+                continue;
+            };
+
+            // 1. Identify "bad cycle" fingerprints — states from which a
+            //    behaviour can loop forever while `Q` is always false (so
+            //    `<>[]Q` fails).
+            //
+            //    * NO fairness: stuttering (`[Next]_vars` allows `vars'=vars`)
+            //      is always a legal infinite behaviour, so ANY reachable
+            //      `¬Q` state is a bad cycle — you can stutter on it forever.
+            //      Stutter self-loops are NOT materialised as graph edges, so
+            //      we must NOT restrict to SCC membership here (RealTime: the
+            //      bad `now=4` loop is a stutter self-loop, not a recorded
+            //      graph cycle). This is the RealTime case.
+            //
+            //    * WITH fairness: a stutter-forever behaviour is unfair and
+            //      TLC excludes it, so a bad cycle must be a genuine FAIR
+            //      non-trivial graph cycle (SCC) containing a `¬Q` state.
+            //      Restricting to fair SCCs is the guardrail that prevents
+            //      false violations on fair liveness specs.
+            //
+            //    In both cases we require `Q` to be *confidently* false
+            //    (Some(false)); unevaluable states never establish ¬Q, so an
+            //    uncheckable predicate can only miss a violation, never invent
+            //    one.
+            let mut bad_cycle_fps: HashSet<u64> = HashSet::new();
+            if has_fairness {
+                for (idx, scc) in non_trivial_sccs.iter().enumerate() {
+                    if !fair_scc.get(idx).copied().unwrap_or(true) {
+                        continue; // unfair cycle — TLC excludes it
+                    }
+                    let has_not_q = scc.iter().any(|fp| {
+                        state_by_fp
+                            .get(fp)
+                            .map(|st| self.eval_state_pred_on_state(q_text, st) == Some(false))
+                            .unwrap_or(false)
+                    });
+                    if has_not_q {
+                        for fp in scc {
+                            bad_cycle_fps.insert(*fp);
+                        }
+                    }
+                }
+            } else {
+                // No fairness: every reachable ¬Q state can be stuttered on
+                // forever → each is a bad cycle.
+                for (&fp, st) in state_by_fp.iter() {
+                    if self.eval_state_pred_on_state(q_text, st) == Some(false) {
+                        bad_cycle_fps.insert(fp);
+                    }
+                }
+            }
+
+            if bad_cycle_fps.is_empty() {
+                continue;
+            }
+
+            // 2. Backward-reachability: set of fingerprints that can REACH any
+            //    bad-cycle fingerprint. Build the reverse adjacency once and
+            //    BFS from the bad-cycle set.
+            let mut reverse: HashMap<u64, Vec<u64>> =
+                HashMap::with_capacity(adjacency_fp.len());
+            for (&from, succs) in adjacency_fp.iter() {
+                for &to in succs {
+                    reverse.entry(to).or_default().push(from);
+                }
+            }
+            let mut can_reach_bad: HashSet<u64> = HashSet::new();
+            let mut stack: Vec<u64> = bad_cycle_fps.iter().copied().collect();
+            for &fp in &stack {
+                can_reach_bad.insert(fp);
+            }
+            while let Some(fp) = stack.pop() {
+                if let Some(preds) = reverse.get(&fp) {
+                    for &pred in preds {
+                        if can_reach_bad.insert(pred) {
+                            stack.push(pred);
+                        }
+                    }
+                }
+            }
+
+            // 3. A violation exists iff some reachable P-state can reach a bad
+            //    cycle. Return the P-state as the counterexample witness.
+            for (&fp, st) in state_by_fp.iter() {
+                if can_reach_bad.contains(&fp)
+                    && self.eval_state_pred_on_state(p_text, st) == Some(true)
+                {
+                    return Some(st.clone());
+                }
+            }
+        }
+        None
     }
 
     fn num_next_disjuncts(&self) -> usize {
@@ -1134,6 +1256,38 @@ fn extract_box_safety_invariant(formula: &TemporalFormula) -> Option<String> {
     match formula {
         TemporalFormula::Always(inner) => box_body_predicate_text(inner),
         _ => None,
+    }
+}
+
+/// Recognise the graph-structured liveness shape `[](P => <>[]Q)` where `P`
+/// and `Q` are pure state predicates. Returns `Some((P_text, Q_text))` for
+/// the exactly-supported shape, `None` otherwise.
+///
+/// This is the ONLY graph-level shape the post-processing check handles. It is
+/// deliberately narrow: both operands must be pure, prime-free, non-temporal
+/// state predicates so they can be evaluated per state. Anything else (nested
+/// temporal, action formulas, `<>P` consequents without the `[]`) returns
+/// `None` and is left unchecked (a missed violation is safer than a false one).
+fn graph_liveness_shape(formula: &TemporalFormula) -> Option<(&str, &str)> {
+    let TemporalFormula::Always(inner) = formula else {
+        return None;
+    };
+    let TemporalFormula::Implies(ante, cons) = inner.as_ref() else {
+        return None;
+    };
+    let TemporalFormula::StatePredicate(p) = ante.as_ref() else {
+        return None;
+    };
+    let TemporalFormula::EventuallyAlways(q_inner) = cons.as_ref() else {
+        return None;
+    };
+    let TemporalFormula::StatePredicate(q) = q_inner.as_ref() else {
+        return None;
+    };
+    if is_pure_state_predicate_text(p) && is_pure_state_predicate_text(q) {
+        Some((p.trim(), q.trim()))
+    } else {
+        None
     }
 }
 

@@ -33,6 +33,17 @@ pub enum TemporalFormula {
     /// P \/ Q - Disjunction
     Or(Box<TemporalFormula>, Box<TemporalFormula>),
 
+    /// P => Q - Temporal implication.
+    ///
+    /// Only produced when at least one operand is itself TEMPORAL (contains
+    /// `<>`/`[]`/`~>`/`WF_`/`SF_`). A pure `state-pred => state-pred` is kept
+    /// as a single `StatePredicate` (see the parser guardrail) so box-safety
+    /// lowering (`[](A => B)`) and ACP_NB-style `[]`-safety are not broken.
+    /// The canonical shape this unlocks is
+    /// `[](P => <>[]Q)` ->
+    /// `Always(Implies(StatePredicate(P), EventuallyAlways(StatePredicate(Q))))`.
+    Implies(Box<TemporalFormula>, Box<TemporalFormula>),
+
     /// ~P - Negation
     Not(Box<TemporalFormula>),
 
@@ -95,7 +106,21 @@ impl TemporalFormula {
             TemporalFormula::Or(left, right) => {
                 left.is_liveness_property() || right.is_liveness_property()
             }
-            TemporalFormula::Not(inner) => inner.is_liveness_property(),
+            // A temporal implication `P => G` is a liveness obligation iff its
+            // consequent is one. `[](P => <>[]Q)` therefore classifies as
+            // liveness (via Always -> Implies -> EventuallyAlways), so the
+            // SCC/graph post-processing pass runs for it. `Always` itself is
+            // not in this match arm, so `Always(Implies(..))` reaches here
+            // through the recursive `Not`/`And`/`Or`/`Implies` cases only when
+            // nested; the top-level `Always(Implies(..))` is handled by the
+            // `Always` arm below.
+            TemporalFormula::Implies(_, consequent) => consequent.is_liveness_property(),
+            // `Always(G)` where `G` carries a liveness obligation (e.g.
+            // `[](P => <>[]Q)`) is itself a liveness property — the box does
+            // not neutralise the inner `<>[]`. Pure box-safety (`[]P` over a
+            // state predicate) still returns false because `StatePredicate`
+            // has no liveness content.
+            TemporalFormula::Always(inner) => inner.is_liveness_property(),
             _ => false,
         }
     }
@@ -185,6 +210,42 @@ impl TemporalFormula {
                     });
                 }
             }
+        }
+
+        // Temporal implication `P => Q`. In TLA+, `=>` binds LOOSER than
+        // `/\`/`\/`, so we split on the FIRST top-level `=>` before the
+        // conjunction/disjunction split (a top-level `=>` groups the whole
+        // expression as an implication).
+        //
+        // CRITICAL GUARDRAIL (soundness): only build a temporal `Implies` node
+        // when at least ONE operand is genuinely temporal (contains
+        // `<>`/`[]`/`~>`/`WF_`/`SF_`/action-box). If BOTH operands are pure
+        // state predicates we must NOT decompose — the whole thing is a state
+        // predicate `P => Q` that the state-predicate evaluator handles
+        // atomically, and decomposing it would break box-safety lowering
+        // (`[](A => B)` -> per-state invariant, PR #127) and ACP_NB-style AC1
+        // (`[] \A .. : (P => Q)`). Note we only ever reach this point when the
+        // *overall* expression contains a temporal operator (the
+        // `!contains_temporal_operator` bailout above already returned for
+        // fully non-temporal text) — but the temporal operator might live
+        // outside this particular `=>`'s operands (e.g. `[] P` sitting in a
+        // conjunction), so we re-check each operand independently here.
+        //
+        // We split on `=>` but not on the `>=`/`<=`/`=<` comparison tokens or
+        // the `<=>` equivalence; `find_top_level_implies` handles that.
+        if let Some(idx) = find_top_level_implies(trimmed) {
+            let lhs = trimmed[..idx].trim();
+            let rhs = trimmed[idx + 2..].trim();
+            if contains_temporal_operator(lhs) || contains_temporal_operator(rhs) {
+                let left = Self::parse(lhs)?;
+                let right = Self::parse(rhs)?;
+                return Ok(TemporalFormula::Implies(Box::new(left), Box::new(right)));
+            }
+            // Both operands are pure state predicates: fall through so the
+            // whole `P => Q` is kept atomic (StatePredicate) by the default
+            // arm at the bottom. We must NOT split on `/\`/`\/` inside a
+            // state-predicate implication either, so bail directly.
+            return Ok(TemporalFormula::StatePredicate(trimmed.to_string()));
         }
 
         // Lower precedence: Check for conjunction/disjunction
@@ -344,6 +405,39 @@ fn find_top_level_operator(expr: &str, op: &str) -> Option<usize> {
         }
     }
 
+    None
+}
+
+/// Find the index of the first top-level `=>` implication token (not inside
+/// parentheses/brackets/braces), skipping the `<=>` equivalence operator.
+///
+/// TLA+ implication is `=>`. We must not confuse it with:
+///   * `<=>` (equivalence) — a `=>` immediately preceded by `<`.
+///   * `>=` / `=<` comparisons — these do not contain the two-char `=>`
+///     sequence, so a plain substring scan for `=>` already excludes them
+///     (`>=` is `>` then `=`; `=<` is `=` then `<`).
+///
+/// Returns the byte index of the `=` in the matched `=>`.
+fn find_top_level_implies(expr: &str) -> Option<usize> {
+    let bytes = expr.as_bytes();
+    let mut depth: i32 = 0;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'=' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b'>' => {
+                // Skip `<=>` (equivalence): the `=` is preceded by `<`.
+                if i > 0 && bytes[i - 1] == b'<' {
+                    i += 2;
+                    continue;
+                }
+                return Some(i);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
     None
 }
 
@@ -555,6 +649,83 @@ mod tests {
         } else {
             panic!("Expected TemporalExists");
         }
+    }
+
+    #[test]
+    fn test_box_implies_eventually_always_is_liveness() {
+        // The RealTime shape: `[]((now # 4) => <>[](now # 4))` must parse to
+        // Always(Implies(StatePredicate, EventuallyAlways(StatePredicate))) and
+        // classify as LIVENESS so the graph post-processing pass runs.
+        let f = TemporalFormula::parse("[]((now # 4) => <>[](now # 4))").unwrap();
+        match &f {
+            TemporalFormula::Always(inner) => match inner.as_ref() {
+                TemporalFormula::Implies(p, q) => {
+                    assert!(
+                        matches!(p.as_ref(), TemporalFormula::StatePredicate(_)),
+                        "antecedent should be a state predicate, got {:?}",
+                        p
+                    );
+                    assert!(
+                        matches!(q.as_ref(), TemporalFormula::EventuallyAlways(_)),
+                        "consequent should be <>[]Q, got {:?}",
+                        q
+                    );
+                }
+                other => panic!("expected Implies inside Always, got {:?}", other),
+            },
+            other => panic!("expected Always(Implies(..)), got {:?}", other),
+        }
+        assert!(f.is_liveness_property(), "must classify as liveness");
+        assert!(!f.is_safety_property());
+    }
+
+    #[test]
+    fn test_state_pred_implies_stays_atomic() {
+        // `[](A => B)` where A and B are pure state predicates must NOT be
+        // decomposed into a temporal Implies — it stays Always(StatePredicate)
+        // so box-safety lowering (#127) still fires.
+        let f = TemporalFormula::parse("[](x > 0 => y > 0)").unwrap();
+        match &f {
+            TemporalFormula::Always(inner) => {
+                assert!(
+                    matches!(inner.as_ref(), TemporalFormula::StatePredicate(_)),
+                    "state-pred implication body must stay a single StatePredicate, got {:?}",
+                    inner
+                );
+            }
+            other => panic!("expected Always(StatePredicate), got {:?}", other),
+        }
+        assert!(f.is_safety_property());
+        assert!(!f.is_liveness_property());
+    }
+
+    #[test]
+    fn test_bare_state_pred_implies_not_temporal() {
+        // A top-level `A => B` with no temporal operator anywhere stays a
+        // single StatePredicate (handled by the non-temporal bailout).
+        let f = TemporalFormula::parse("a = 1 => b = 2").unwrap();
+        assert!(matches!(f, TemporalFormula::StatePredicate(_)));
+    }
+
+    #[test]
+    fn test_equivalence_not_split_as_implies() {
+        // `<=>` must not be split on its embedded `=>`. `P <=> <>Q` is temporal
+        // (RHS has `<>`) but the top-level connective is equivalence, not
+        // implication — find_top_level_implies must skip the `<=>`.
+        assert_eq!(find_top_level_implies("P <=> Q"), None);
+        assert_eq!(find_top_level_implies("a >= 1 /\\ b <= 2"), None);
+        // A genuine `=>` is found.
+        assert_eq!(find_top_level_implies("P => Q"), Some(2));
+        // `=>` inside parens is not top-level.
+        assert_eq!(find_top_level_implies("(P => Q) /\\ R"), None);
+    }
+
+    #[test]
+    fn test_leadsto_style_implies_left_temporal() {
+        // `<>P => []Q` — antecedent temporal — builds Implies.
+        let f = TemporalFormula::parse("<>P => []Q").unwrap();
+        assert!(matches!(f, TemporalFormula::Implies(_, _)));
+        assert!(f.is_liveness_property());
     }
 
     #[test]

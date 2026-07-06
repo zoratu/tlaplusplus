@@ -170,6 +170,51 @@ pub trait Model: Send + Sync + 'static {
         None
     }
 
+    /// Whether the runtime should collect the labeled-transition graph and run
+    /// the post-BFS graph-level liveness pass for GRAPH-STRUCTURED temporal
+    /// properties that are NOT expressible per-SCC — chiefly
+    /// `[](P => <>[]Q)` ("whenever P, eventually-always Q").
+    ///
+    /// Distinct from `should_check_fairness`: a spec can have such a property
+    /// with NO fairness constraints (the RealTime `ErrorTemporal` case). When
+    /// this returns true the runtime collects labeled transitions (via
+    /// `next_states_labeled`) and calls `graph_liveness_violation` after
+    /// exploration, even though `should_check_fairness()` is false.
+    ///
+    /// Default: false (no such properties).
+    fn needs_graph_liveness_check(&self) -> bool {
+        false
+    }
+
+    /// Graph-level liveness check for `[](P => <>[]Q)`-shaped properties.
+    ///
+    /// Called once after exploration with the FULL fingerprint adjacency map,
+    /// the fp→state map, and the list of non-trivial SCCs (cycles). Unlike
+    /// `scc_violates_liveness_property` (which judges a single SCC in
+    /// isolation), this receives the whole graph so it can check reachability
+    /// from a P-state (which may lie on the stem) to a bad cycle (a reachable
+    /// non-trivial cycle where `<>[]Q` fails, i.e. containing a `¬Q` state).
+    ///
+    /// `fair_scc` reports, per non-trivial SCC (by index into `non_trivial_sccs`),
+    /// whether the cycle is FAIR — i.e. whether a behaviour may legitimately
+    /// loop in it forever. Absent fairness constraints every non-trivial SCC
+    /// is fair (stuttering is always allowed). With `WF_`/`SF_` constraints an
+    /// unfair cycle is excluded by TLC and must NOT count as a bad cycle.
+    ///
+    /// Returns `Some(representative_bad_cycle_state)` describing a genuine
+    /// violation, or `None` if no property is violated / the model can't judge.
+    ///
+    /// Default: `None`.
+    fn graph_liveness_violation(
+        &self,
+        _adjacency_fp: &std::collections::HashMap<u64, Vec<u64>>,
+        _state_by_fp: &std::collections::HashMap<u64, Self::State>,
+        _non_trivial_sccs: &[Vec<u64>],
+        _fair_scc: &[bool],
+    ) -> Option<Self::State> {
+        None
+    }
+
     fn check_invariants(&self, state: &Self::State) -> Result<(), String>;
 
     /// Check state constraints - returns Ok(()) if state should be explored, Err if pruned

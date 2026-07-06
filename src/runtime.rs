@@ -1324,10 +1324,18 @@ where
     // Gated on `should_check_fairness()` (not merely `has_fairness_constraints()`):
     // fairness constraints without a liveness property to verify are pure
     // assumptions and must not trigger the SCC pass (see TlaModel override).
-    let collect_labeled_transitions = model.should_check_fairness();
+    // Collect the labeled-transition graph when EITHER a fairness/liveness
+    // SCC check is needed OR a graph-structured liveness property
+    // (`[](P => <>[]Q)`) needs the full adjacency graph after exploration.
+    // The latter can hold with NO fairness constraints (the RealTime
+    // ErrorTemporal case), which `should_check_fairness()` alone misses.
+    let collect_labeled_transitions =
+        model.should_check_fairness() || model.needs_graph_liveness_check();
     let labeled_transitions: Option<Arc<DashMap<u64, Vec<LabeledTransition<M::State>>>>> =
         if collect_labeled_transitions {
-            eprintln!("Fairness constraints detected - collecting labeled transitions");
+            eprintln!(
+                "Fairness/graph-liveness properties detected - collecting labeled transitions"
+            );
             Some(Arc::new(DashMap::new()))
         } else {
             None
