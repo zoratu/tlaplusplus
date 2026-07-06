@@ -1377,6 +1377,45 @@ IN
     }
 
     #[test]
+    fn evaluates_choose_with_uniqueness_predicate() {
+        // SlidingPuzzles missed-violation regression at the eval level. The
+        // `CHOOSE x \in S : P(x) /\ \A y \in S : P(y) => y = x` uniqueness idiom
+        // must return the unique element satisfying P. Before the splitter fix,
+        // the `=>` inside the `\A` body was lifted to the top level, parsing the
+        // predicate as `(P(x) /\ \A y : P(y)) => y = x` — vacuously TRUE for the
+        // first element — so CHOOSE returned the wrong value.
+        let state = tla_state([(
+            "S",
+            TlaValue::Set(HashedArc::new(BTreeSet::from([
+                TlaValue::Int(1),
+                TlaValue::Int(2),
+                TlaValue::Int(3),
+                TlaValue::Int(4),
+            ]))),
+        )]);
+        let ctx = EvalContext::new(&state);
+
+        // The predicate `x = 3 /\ \A y \in S : (y = 3) => y = x` holds only for
+        // x = 3, so CHOOSE must return 3 (not the set's first element, 1).
+        assert_eq!(
+            eval_expr(
+                "CHOOSE x \\in S : x = 3 /\\ \\A y \\in S : (y = 3) => y = x",
+                &ctx
+            )
+            .expect("uniqueness CHOOSE should evaluate"),
+            TlaValue::Int(3)
+        );
+
+        // The conjunct-with-implication-in-quantifier-body must not be vacuously
+        // true for a non-matching x: for x = 1 the whole predicate is FALSE.
+        assert_eq!(
+            eval_expr("1 = 3 /\\ \\A y \\in S : (y = 3) => y = 1", &ctx)
+                .expect("predicate should evaluate"),
+            TlaValue::Bool(false)
+        );
+    }
+
+    #[test]
     fn evaluates_choose_without_domain_using_stable_model_value() {
         let state = tla_state([(
             "SignedBlock",
