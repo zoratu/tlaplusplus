@@ -234,12 +234,43 @@ pub fn parse_tla_config(input: &str) -> Result<TlaConfig> {
 
         match section {
             Some(Section::Constants) => parse_constant_line(line, &mut cfg)?,
-            Some(Section::Aliases) => cfg.aliases.push(line.to_string()),
-            Some(Section::Invariants) => cfg.invariants.push(line.to_string()),
-            Some(Section::Properties) => cfg.properties.push(line.to_string()),
-            Some(Section::Postconditions) => cfg.postconditions.push(line.to_string()),
-            Some(Section::Constraints) => cfg.constraints.push(line.to_string()),
-            Some(Section::ActionConstraints) => cfg.action_constraints.push(line.to_string()),
+            // For list-valued sections, TLC treats the operator names as
+            // whitespace/newline-separated identifiers. A continuation line
+            // may list several names (e.g. `TypeInvariant ResourceMutex`), so
+            // split on whitespace just like the inline `INVARIANTS a b c` path
+            // does above. Pushing the raw line verbatim would create a single
+            // bogus entry ("TypeInvariant ResourceMutex") that never resolves
+            // to a definition and surfaces as a false invariant violation.
+            Some(Section::Aliases) => {
+                for item in line.split_whitespace() {
+                    cfg.aliases.push(item.to_string());
+                }
+            }
+            Some(Section::Invariants) => {
+                for item in line.split_whitespace() {
+                    cfg.invariants.push(item.to_string());
+                }
+            }
+            Some(Section::Properties) => {
+                for item in line.split_whitespace() {
+                    cfg.properties.push(item.to_string());
+                }
+            }
+            Some(Section::Postconditions) => {
+                for item in line.split_whitespace() {
+                    cfg.postconditions.push(item.to_string());
+                }
+            }
+            Some(Section::Constraints) => {
+                for item in line.split_whitespace() {
+                    cfg.constraints.push(item.to_string());
+                }
+            }
+            Some(Section::ActionConstraints) => {
+                for item in line.split_whitespace() {
+                    cfg.action_constraints.push(item.to_string());
+                }
+            }
             Some(Section::Specification) => {
                 cfg.specification = Some(line.to_string());
                 section = None;
@@ -708,6 +739,41 @@ mod tests {
 
         assert_eq!(cfg.invariants, vec!["TypeOK", "NotSolved", "Safety"]);
         assert_eq!(cfg.properties, vec!["Liveness", "Progress"]);
+    }
+
+    #[test]
+    fn parses_multiple_names_on_a_section_continuation_line() {
+        // Regression: the allocator specs (SimpleAllocator/SchedulingAllocator/
+        // AllocatorImplementation) list several invariant/property names on a
+        // single indented continuation line under a bare section header. TLC
+        // treats these as separate whitespace-separated operator names; we used
+        // to push the whole line verbatim ("TypeInvariant ResourceMutex") as one
+        // entry, which never resolved to a definition and surfaced as a false
+        // invariant violation at the initial state.
+        let cfg = parse_tla_config(
+            r#"
+            CONSTANTS
+              Clients = {c1,c2,c3}
+              Resources = {r1,r2}
+
+            SPECIFICATION
+              SimpleAllocator
+
+            INVARIANTS
+              TypeInvariant ResourceMutex
+
+            PROPERTIES
+              ClientsWillReturn ClientsWillObtain InfOftenSatisfied
+            "#,
+        )
+        .expect("cfg should parse");
+
+        assert_eq!(cfg.specification.as_deref(), Some("SimpleAllocator"));
+        assert_eq!(cfg.invariants, vec!["TypeInvariant", "ResourceMutex"]);
+        assert_eq!(
+            cfg.properties,
+            vec!["ClientsWillReturn", "ClientsWillObtain", "InfOftenSatisfied"]
+        );
     }
 
     #[test]
