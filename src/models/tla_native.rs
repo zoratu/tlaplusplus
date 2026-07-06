@@ -17,7 +17,7 @@ use crate::tla::{
     split_top_level,
 };
 use anyhow::{Context, Result, anyhow};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
