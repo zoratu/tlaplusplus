@@ -30,6 +30,16 @@ pub struct TlaModel {
     pub invariant_exprs: Vec<(String, String)>,
     pub temporal_properties: Vec<(String, TemporalFormula)>,
     pub fairness_constraints: Vec<FairnessConstraint>,
+    /// True if the behaviour `SPECIFICATION` conjoins a *non-fairness* temporal
+    /// assumption (`[]<>R`, `<>R`, `~>`, `<>[]`, …) beyond `Init /\ [][Next]_vars`
+    /// and `WF_`/`SF_` fairness. Such an assumption can exclude the
+    /// stutter-forever suffix, so the no-fairness stutter-reachability path in
+    /// `graph_liveness_violation` would be UNSOUND (could false-violate). When
+    /// set, that path is skipped (conservative: miss rather than false-flag).
+    /// INIT/NEXT configs have no SPECIFICATION formula → always `false` → safe.
+    /// (Guardrail from a temporal-logic correctness review — see `(d)` in the
+    /// RealTime/LTL design notes.)
+    pub spec_has_non_fairness_liveness: bool,
     pub state_constraints: Vec<(String, String)>,
     pub action_constraints: Vec<(String, String)>,
     pub symmetry: Option<SymmetrySpec>,
@@ -205,6 +215,23 @@ impl TlaModel {
             }
         }
 
+        // (d) guardrail for the no-fairness graph-liveness check: detect a
+        // non-fairness temporal assumption conjoined into the behaviour
+        // SPECIFICATION. Stutter-reachability for `[](P => <>[]Q)` is only
+        // sound when the spec is exactly `Init /\ [][Next]_vars` (stuttering is
+        // always a legal extension). A `SPECIFICATION` that conjoins e.g.
+        // `[]<>R` excludes the stutter suffix; INIT/NEXT configs (no Spec
+        // formula) never do. WF_/SF_ conjuncts are already extracted as
+        // fairness_constraints and route to the fairness path, so they don't
+        // trip this flag on their own.
+        let spec_has_non_fairness_liveness = config
+            .specification
+            .as_ref()
+            .and_then(|name| module.definitions.get(name))
+            .and_then(|def| TemporalFormula::parse(&def.body).ok())
+            .map(|f| formula_has_non_fairness_liveness(&f))
+            .unwrap_or(false);
+
         let state_constraints = resolve_constraint_exprs(&module, &config);
         let action_constraints = resolve_action_constraint_exprs(&module, &config);
         let symmetry = resolve_symmetry(&module, &config);
@@ -239,6 +266,7 @@ impl TlaModel {
             invariant_exprs,
             temporal_properties,
             fairness_constraints,
+            spec_has_non_fairness_liveness,
             state_constraints,
             action_constraints,
             symmetry,
@@ -805,7 +833,15 @@ impl Model for TlaModel {
                 }
             } else {
                 // No fairness: every reachable ¬Q state can be stuttered on
-                // forever → each is a bad cycle.
+                // forever → each is a bad cycle. BUT this stutter-reachability
+                // is only sound when the spec is exactly `Init /\ [][Next]_vars`.
+                // If the SPECIFICATION conjoins a non-fairness temporal
+                // assumption (`[]<>R`, `<>R`, `~>`, …) it excludes the
+                // stutter-forever suffix, so firing here could false-violate —
+                // leave the property unchecked instead ((d) guardrail).
+                if self.spec_has_non_fairness_liveness {
+                    continue;
+                }
                 for (&fp, st) in state_by_fp.iter() {
                     if self.eval_state_pred_on_state(q_text, st) == Some(false) {
                         bad_cycle_fps.insert(fp);
@@ -1272,6 +1308,45 @@ fn extract_box_safety_invariant(formula: &TemporalFormula) -> Option<String> {
     match formula {
         TemporalFormula::Always(inner) => box_body_predicate_text(inner),
         _ => None,
+    }
+}
+
+/// True if `formula` (a behaviour SPECIFICATION) contains a *non-fairness*
+/// temporal-liveness conjunct — `<>P`, `[]<>P`, `<>[]P`, `P ~> Q`, or a temporal
+/// `=>` — as opposed to `Init` (state predicate), `[][Next]_vars` / `[]Inv`
+/// (`Always` of a state predicate — stutter-preserving safety), or `WF_`/`SF_`
+/// fairness (which is extracted separately and routed to the fairness path).
+///
+/// Used to gate the no-fairness stutter-reachability path in
+/// `graph_liveness_violation`: such an assumption can exclude the
+/// stutter-forever suffix, making that path unsound. `WF_`/`SF_` return `false`
+/// here on purpose (they are not "extra" temporal assumptions for this check).
+fn formula_has_non_fairness_liveness(formula: &TemporalFormula) -> bool {
+    match formula {
+        // Fairness is handled by the fairness path — not an "extra" assumption.
+        TemporalFormula::WeakFairness { .. } | TemporalFormula::StrongFairness { .. } => false,
+        // Genuine non-fairness liveness operators.
+        TemporalFormula::Eventually(_)
+        | TemporalFormula::InfinitelyOften(_)
+        | TemporalFormula::EventuallyAlways(_)
+        | TemporalFormula::LeadsTo(_, _) => true,
+        // Recurse structurally.
+        TemporalFormula::And(a, b) | TemporalFormula::Or(a, b) => {
+            formula_has_non_fairness_liveness(a) || formula_has_non_fairness_liveness(b)
+        }
+        TemporalFormula::Implies(a, b) => {
+            formula_has_non_fairness_liveness(a) || formula_has_non_fairness_liveness(b)
+        }
+        TemporalFormula::Not(inner)
+        | TemporalFormula::Always(inner)
+        | TemporalFormula::TemporalForAll { formula: inner, .. }
+        | TemporalFormula::TemporalExists { formula: inner, .. } => {
+            // `[][Next]_vars` / `[]Inv` → Always(StatePredicate) → false (safe);
+            // `[](P => <>[]Q)` as a spec conjunct → Always(Implies(.., temporal))
+            // → recurse catches the temporal consequent.
+            formula_has_non_fairness_liveness(inner)
+        }
+        TemporalFormula::StatePredicate(_) => false,
     }
 }
 
