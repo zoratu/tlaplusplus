@@ -5723,6 +5723,54 @@ fn test_txlifecycle_body_compiles_to_two_conjuncts() {
     }
 }
 
+#[test]
+fn test_negated_bulleted_conjunction_compiles_to_not_of_and() {
+    // Regression: `~` prefixing a *bulleted* junction. Root cause of the
+    // byihive/Voucher{Issue,Cancel,Redeem,Transfer} false-violation
+    // (checker halted at 1 distinct, violation=true). Their VTPConsistent
+    // invariant is
+    //     \A h \in H, i \in I : /\ ~ /\ hState[h] = "holding"
+    //                                 /\ iState[i] = "aborted"
+    //                           /\ ~ /\ hState[h] = "aborted"
+    //                                 /\ iState[i] = "issued"
+    // Before the fix, `~ /\ A /\ B` was fed to the /\-splitter, which sliced
+    // a bare `~` as the first "conjunct" -> Not(compile_expr("")) ->
+    // "empty expression" reported as a violation on every state (incl. Init).
+    // The `~` must bind to the WHOLE bulleted list: `~(A /\ B)`.
+    let body = "~ /\\ hState = \"holding\"\n  /\\ iState = \"aborted\"";
+    let expr = compile_expr(body);
+    match &expr {
+        CompiledExpr::Not(inner) => match inner.as_ref() {
+            CompiledExpr::And(parts) => assert_eq!(
+                parts.len(),
+                2,
+                "negated junction should be Not(And([A, B])), got parts: {:?}",
+                parts
+            ),
+            other => panic!("expected Not(And(..)), got Not({:?})", other),
+        },
+        other => panic!("expected Not(And(..)), got: {:?}", other),
+    }
+
+    // `~ \/ A \/ B` — disjunction variant, same shape.
+    let disj = "~ \\/ a = 1\n  \\/ b = 2";
+    match &compile_expr(disj) {
+        CompiledExpr::Not(inner) => assert!(
+            matches!(inner.as_ref(), CompiledExpr::Or(p) if p.len() == 2),
+            "expected Not(Or([_, _])), got Not({:?})",
+            inner
+        ),
+        other => panic!("expected Not(Or(..)), got: {:?}", other),
+    }
+
+    // Guardrail: tighter `~` on a plain operand (`~A /\ B`) is UNCHANGED —
+    // it must stay `(~A) /\ B`, i.e. a top-level And, NOT Not(And(..)).
+    match &compile_expr("~a = 1 /\\ b = 2") {
+        CompiledExpr::And(parts) => assert_eq!(parts.len(), 2),
+        other => panic!("`~A /\\ B` must be And([~A, B]), got: {:?}", other),
+    }
+}
+
 /// T206: detect expressions with 3+ top-level binary `-` (or `+`) occurrences,
 /// the precise pattern where compiler/interpreter associativity diverges.
 /// Such chains return wrong answers (T206 case: `0-2--442-...^^4` →
