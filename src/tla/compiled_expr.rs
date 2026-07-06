@@ -2440,6 +2440,21 @@ fn try_parse_set_comprehension(inner: &str) -> Option<CompiledExpr> {
 
         // Check if right side is "x \in S" pattern
         if let Some((var, domain)) = parse_in_binding(right) {
+            // MULTI-BINDER MAP FORM: `{ expr : x \in S, y \in T, ... }`.
+            // The compiled `SetComprehension` node models only ONE binder.
+            // `parse_in_binding(right)` above matched the FIRST `\in` greedily
+            // and folded the remaining binders into the domain expression
+            // (`domain = "S, y \in T"`), which would then compile to a broken
+            // `Membership(compile("S, y"), T)` and fail at eval with
+            // "unexpected trailing tokens in expr: S, y" — reported as a false
+            // invariant violation on the initial state (btree/kvstore `TypeOK`,
+            // `args \in {<<k,v>>: k \in Keys, v \in Vals}`). The interpreter's
+            // `eval_set_expression` handles arbitrary multi-binder map
+            // comprehensions correctly (via `parse_binders` +
+            // `collect_binder_map_set`), so defer the whole set expression to it.
+            if parse_multiple_bindings(right).map(|b| b.len()).unwrap_or(1) > 1 {
+                return Some(CompiledExpr::Unparsed(format!("{{{inner}}}")));
+            }
             // {expr : x \in S}
             return Some(CompiledExpr::SetComprehension {
                 var: var.to_string(),
@@ -2451,6 +2466,13 @@ fn try_parse_set_comprehension(inner: &str) -> Option<CompiledExpr> {
 
         // Check if left side is "x \in S" pattern
         if let Some((var, domain)) = parse_in_binding(left) {
+            // Same guard for the filter form `{x \in S : P}`: if the binder
+            // side actually carries multiple bindings (`{<<x,y>> \in S : P}`
+            // is a tuple binder, but `{x \in S, y \in T : P}` is multi-binder),
+            // defer to the interpreter rather than dropping binders.
+            if parse_multiple_bindings(left).map(|b| b.len()).unwrap_or(1) > 1 {
+                return Some(CompiledExpr::Unparsed(format!("{{{inner}}}")));
+            }
             // {x \in S : filter}
             return Some(CompiledExpr::SetComprehension {
                 var: var.to_string(),
