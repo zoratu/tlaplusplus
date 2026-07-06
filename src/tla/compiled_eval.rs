@@ -1242,6 +1242,24 @@ fn compiled_membership_contains(
                 _ => Ok(false),
             }
         }
+        // Handle `x \in SUBSET S` structurally: it holds iff `x` is a set and
+        // every element of `x` is a member of `S`. Materializing `SUBSET S`
+        // (the powerset) is exponential and trips the 20-element cap on specs
+        // like AllocatorImplementation, whose TypeInvariant asserts
+        // `network \in SUBSET Messages` where `Messages` already has 36
+        // elements (2^36 subsets). TLC evaluates this membership as
+        // `x \subseteq S` without enumerating the powerset; this mirrors that.
+        CompiledExpr::PowerSet(inner) => match value {
+            TlaValue::Set(elems) => {
+                for e in elems.iter() {
+                    if !compiled_membership_contains(e, inner, ctx, depth)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            _ => Ok(false),
+        },
         // Handle [field: Domain, ...] record-set membership structurally.
         // Materializing the cross product is asymptotically wrong for the
         // membership test and trips the 1M-record cap on CoffeeCan-class
@@ -1335,6 +1353,23 @@ fn membership_matches_text(
                 && def.params.is_empty()
             {
                 return membership_matches_text(value, &def.body, ctx, depth);
+            }
+
+            // `x \in SUBSET S` iff x is a set and every element of x is in S.
+            // Mirrors the compiled PowerSet short-circuit above and TLC's
+            // handling; avoids materializing an exponential powerset.
+            if let Some(set_expr) = rhs_trimmed.strip_prefix("SUBSET ") {
+                return match value {
+                    TlaValue::Set(elems) => {
+                        for e in elems.iter() {
+                            if !membership_matches_text(e, set_expr, ctx, depth)? {
+                                return Ok(false);
+                            }
+                        }
+                        Ok(true)
+                    }
+                    _ => Ok(false),
+                };
             }
 
             if let Some(inner) = rhs_trimmed.strip_prefix("Seq(") {
@@ -5434,6 +5469,51 @@ mod seq_membership_tests {
         let compiled = compile_expr("f \\in [D -> BOOLEAN]");
         let result = eval_compiled(&compiled, &ctx).unwrap();
         assert_eq!(result, TlaValue::Bool(true));
+    }
+
+    /// Regression: `x \in SUBSET S` must be checked structurally (x is a set
+    /// and every element is in S) rather than by materializing the powerset.
+    /// AllocatorImplementation's TypeInvariant asserts `network \in SUBSET
+    /// Messages` where `Messages` has 36 elements; enumerating 2^36 subsets
+    /// tripped the >20-element cap and surfaced as a false invariant violation.
+    #[test]
+    fn subset_membership_checked_structurally() {
+        // Build a base set S = {1,2,3,4,...,25} (25 elements: 2^25 subsets would
+        // be far past the 20-element powerset cap, so materialization errors).
+        let big: BTreeSet<TlaValue> = (1..=25).map(TlaValue::Int).collect();
+        let subset: BTreeSet<TlaValue> =
+            [TlaValue::Int(2), TlaValue::Int(5)].into_iter().collect();
+        let not_subset: BTreeSet<TlaValue> =
+            [TlaValue::Int(2), TlaValue::Int(99)].into_iter().collect();
+
+        let state = tla_state([
+            ("S", TlaValue::Set(HashedArc::new(big))),
+            ("good", TlaValue::Set(HashedArc::new(subset))),
+            ("bad", TlaValue::Set(HashedArc::new(not_subset))),
+            ("emptyset", TlaValue::Set(HashedArc::new(BTreeSet::new()))),
+        ]);
+        let ctx = EvalContext::new(&state);
+
+        // good = {2,5} \subseteq S  =>  good \in SUBSET S is TRUE
+        let compiled = compile_expr("good \\in SUBSET S");
+        assert_eq!(
+            eval_compiled(&compiled, &ctx).unwrap(),
+            TlaValue::Bool(true)
+        );
+
+        // bad = {2,99}, 99 \notin S  =>  bad \in SUBSET S is FALSE
+        let compiled = compile_expr("bad \\in SUBSET S");
+        assert_eq!(
+            eval_compiled(&compiled, &ctx).unwrap(),
+            TlaValue::Bool(false)
+        );
+
+        // {} \in SUBSET S is always TRUE
+        let compiled = compile_expr("emptyset \\in SUBSET S");
+        assert_eq!(
+            eval_compiled(&compiled, &ctx).unwrap(),
+            TlaValue::Bool(true)
+        );
     }
 
     #[test]
