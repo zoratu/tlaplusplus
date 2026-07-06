@@ -308,9 +308,24 @@ pub(super) fn split_top_level(expr: &str, delim: &str, keyword: bool) -> Vec<Str
                 {
                     // We're in quantifier binders (before :), don't split on conjunctions
                     false
-                } else if in_quantifier_body && (delim == "/\\" || delim == "\\/") {
-                    // Quantifier bodies consume conjunctions and disjunctions to
-                    // the end of the surrounding grouping.
+                } else if in_quantifier_body
+                    && (delim == "/\\" || delim == "\\/" || delim == "=>" || delim == "<=>")
+                {
+                    // A quantifier body `\A x \in S : <body>` (or `\E`, `CHOOSE`)
+                    // extends as far to the right as possible: the body consumes
+                    // every lower-precedence boolean operator — conjunction,
+                    // disjunction, implication, and biconditional — to the end
+                    // of the surrounding grouping. So `X /\ \A y \in S : P => Q`
+                    // parses as `X /\ (\A y \in S : (P => Q))`, NOT as
+                    // `(X /\ \A y \in S : P) => Q`. Suppressing `/\`/`\/` here but
+                    // NOT `=>`/`<=>` (the historical behaviour) mis-lifted an
+                    // implication inside a quantifier body to the top level,
+                    // re-associating `LHS /\ \A y : P => Q` into an implication
+                    // whose antecedent `(LHS /\ \A y : P)` was false — making the
+                    // whole predicate vacuously TRUE. That silently mis-evaluated
+                    // e.g. `ChooseOne(S, P) == CHOOSE x \in S : P(x) /\ \A y \in S
+                    // : P(y) => y = x` (SlidingPuzzles), which returned the wrong
+                    // element and collapsed the reachable state space.
                     false
                 } else {
                     // All other cases: split normally
@@ -1847,6 +1862,34 @@ mod tests {
     fn split_top_level_keeps_simple_quantified_disjunctions_intact() {
         let parts = split_top_level_symbol(r"\E a \in Acceptor : Phase1b(a) \/ Phase2b(a)", "\\/");
         assert_eq!(parts, vec![r"\E a \in Acceptor : Phase1b(a) \/ Phase2b(a)"]);
+    }
+
+    #[test]
+    fn split_top_level_keeps_implication_inside_quantifier_body_intact() {
+        // SlidingPuzzles missed-violation regression. A quantifier body extends
+        // as far right as possible and consumes lower-precedence boolean
+        // operators — including `=>`. `X /\ \A y \in S : P => Q` must stay
+        // grouped as `X /\ (\A y \in S : (P => Q))`; splitting the `=>` at the
+        // top level re-associated it into `(X /\ \A y : P) => Q`, whose false
+        // antecedent made the whole predicate vacuously TRUE. That corrupted
+        // `ChooseOne(S, P) == CHOOSE x \in S : P(x) /\ \A y \in S : P(y) => y = x`
+        // (it returned the wrong element), collapsing SlidingPuzzles to 2 states
+        // and hiding the KlotskiGoal violation.
+        let expr = r"x = 3 /\ \A y \in S : (y = 3) => y = x";
+        assert_eq!(split_top_level_symbol(expr, "=>"), vec![expr]);
+        // The outer `/\` still splits (the quantifier body ends where `x = 3`'s
+        // conjunct begins, i.e. the `/\` is *before* the `\A`, at top level).
+        assert_eq!(
+            split_top_level_symbol(expr, "/\\"),
+            vec![r"x = 3", r"\A y \in S : (y = 3) => y = x"]
+        );
+    }
+
+    #[test]
+    fn split_top_level_keeps_biconditional_inside_quantifier_body_intact() {
+        // Same rule for `<=>`: a quantifier body consumes it too.
+        let expr = r"P /\ \A y \in S : Q(y) <=> R(y)";
+        assert_eq!(split_top_level_symbol(expr, "<=>"), vec![expr]);
     }
 
     #[test]
