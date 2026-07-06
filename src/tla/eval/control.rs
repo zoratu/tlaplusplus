@@ -87,7 +87,7 @@ pub(super) fn eval_let_expression(expr: &str, ctx: &EvalContext<'_>, depth: usiz
     eval_expr_inner(body_text, &child, depth + 1)
 }
 
-pub(super) fn split_outer_let(expr: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_outer_let(expr: &str) -> Option<(&str, &str)> {
     let trimmed = expr.trim();
     let (let_start, after_let) = take_keyword_prefix(trimmed, "LET")?;
     debug_assert!(let_start.is_empty());

@@ -3611,6 +3611,21 @@ fn compile_let_with_primes(expr: &str) -> Option<CompiledActionClause> {
     // Parse: LET defs IN body
     let (defs_text, body_text) = split_let_expression(expr)?;
 
+    // A `LET ... IN CASE cond -> Action [] ...` body is a CASE *of actions*.
+    // The compiled clause path would compile the CASE into a single boolean
+    // `Guard`, which evaluates the winning arm's action in value context and
+    // drops its primed assignment — producing zero successors (ReadersWriters'
+    // `ReadOrWrite`). Bail to the interpreted `LetWithPrimes` path, whose
+    // `eval_case_action_multi` fires each guard-satisfied arm as an action.
+    let body_head = body_text.trim_start();
+    if body_head.strip_prefix("CASE").is_some_and(|rest| {
+        rest.chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+    }) {
+        return None;
+    }
+
     // Parse bindings: name == expr
     let bindings = parse_let_bindings(defs_text)?;
 

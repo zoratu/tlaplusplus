@@ -195,6 +195,29 @@ pub fn split_action_body_disjuncts(expr: &str) -> Vec<String> {
     // the first.  Detect this case and repeat the `\E ... :` prefix on every
     // branch so that bound variables remain in scope.
     if let Some((binders, body)) = parse_action_exists(trimmed) {
+        // SOUNDNESS: if the exists body is itself a quantifier (e.g.
+        // `\E p \in P : \E q \in Q : A(p,q) \/ B(p,q)`), the `\/` lives *inside*
+        // the inner `\E q` scope — its bound variable spans both disjuncts.
+        // Splitting on `\/` here would yield `\E p : \E q : A(p,q)` and
+        // `\E p : B(p,q)` (the inner `\E q :` prefix silently dropped from the
+        // second branch), leaving `q` unbound so that disjunct produces zero
+        // successors — a false-safe under-exploration bug (Lamport's mutex spec).
+        // Keep the whole quantified body as one disjunct and let the recursive
+        // per-branch exists expansion (`eval_exists_action_multi`) handle the
+        // inner `\/` with `q` in scope.
+        let body_head = body.trim_start();
+        let body_is_nested_quantifier = body_head.starts_with("\\E ")
+            || body_head.starts_with("\\A ")
+            || body_head.starts_with("\\E\n")
+            || body_head.starts_with("\\A\n");
+        if body_is_nested_quantifier {
+            // The inner quantifier's scope covers any `\/` in `body`, so this
+            // whole `\E <binders> : <inner quantifier>` is a single disjunct.
+            // Returning it here also prevents the generic `split_top_level` fall-
+            // through below from splitting on that inner `\/` and orphaning the
+            // inner bound variable.
+            return vec![trimmed.to_string()];
+        }
         let body_disjuncts = split_top_level(body, "\\/");
         if body_disjuncts.len() > 1 || body.trim_start().starts_with("\\/") {
             return body_disjuncts
@@ -1407,6 +1430,35 @@ mod tests {
         assert!(disjuncts[0].contains("RespondToRd(proc, reg)"));
         assert!(disjuncts[0].contains("RespondToWr(proc, reg)"));
         assert_eq!(disjuncts[1], "Internal");
+    }
+
+    #[test]
+    fn split_action_body_disjuncts_keeps_inner_exists_disjunction_grouped() {
+        // Regression (Lamport mutex): `\E p : \E q : A(p,q) \/ B(q,p)` — the
+        // `\/` is inside the inner `\E q` scope, so the whole thing is ONE
+        // disjunct. A prior bug split it into `\E p : \E q : A(p,q)` and
+        // `\E p : B(q,p)` (the inner `\E q :` prefix dropped from the second
+        // branch), leaving `q` unbound so that branch produced zero successors.
+        let disjuncts = split_action_body_disjuncts(
+            r#"\E p \in Proc : \E q \in Proc \ {p} : Recv(p, q) \/ Recv(q, p)"#,
+        );
+        assert_eq!(disjuncts.len(), 1, "{disjuncts:?}");
+        assert!(disjuncts[0].contains("\\E q \\in Proc \\ {p}"));
+        assert!(disjuncts[0].contains("Recv(p, q)"));
+        assert!(disjuncts[0].contains("Recv(q, p)"));
+    }
+
+    #[test]
+    fn split_action_body_disjuncts_splits_two_top_level_disjuncts_with_inner_exists_disjunction() {
+        // The top-level `\/` list still splits; only the *inner* `\E q`-scoped
+        // `\/` stays grouped. This is the exact Lamport `Next` shape.
+        let disjuncts = split_action_body_disjuncts(
+            "\\/ \\E p \\in Proc : Request(p)\n\\/ \\E p \\in Proc : \\E q \\in Proc \\ {p} : Recv(p, q) \\/ Recv(q, p)",
+        );
+        assert_eq!(disjuncts.len(), 2, "{disjuncts:?}");
+        assert!(disjuncts[1].contains("\\E q \\in Proc \\ {p}"));
+        assert!(disjuncts[1].contains("Recv(p, q)"));
+        assert!(disjuncts[1].contains("Recv(q, p)"));
     }
 
     #[test]
