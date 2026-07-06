@@ -407,6 +407,7 @@ fn collect_temporal_vars(
         | TemporalFormula::Not(inner) => collect_temporal_vars(inner, module, out),
         TemporalFormula::And(a, b)
         | TemporalFormula::Or(a, b)
+        | TemporalFormula::Implies(a, b)
         | TemporalFormula::LeadsTo(a, b) => {
             collect_temporal_vars(a, module, out);
             collect_temporal_vars(b, module, out);
@@ -3689,6 +3690,7 @@ fn extract_fairness_from_formula(
         }
         TemporalFormula::And(left, right)
         | TemporalFormula::Or(left, right)
+        | TemporalFormula::Implies(left, right)
         | TemporalFormula::LeadsTo(left, right) => {
             extract_fairness_from_formula(left, constraints);
             extract_fairness_from_formula(right, constraints);
