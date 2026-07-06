@@ -224,6 +224,37 @@ pub fn evaluate_next_states_with_instances(
     Ok(out)
 }
 
+/// Heuristic: does this action body contain a module-instance action call of
+/// the form `Alias!Op(...)`? Used to decide whether an *empty* compiled-action
+/// result should be cross-checked against the interpreted evaluator, which
+/// handles primed assignments routed through instance actions inside a LET that
+/// the compiled path can silently drop (Disruptor `BeginWrite` →
+/// `Buffer!Write`).
+///
+/// The instance-member selector is `Ident!Ident`: a word character on both
+/// sides of the `!`. This deliberately excludes the `EXCEPT ![k]` / `EXCEPT
+/// !.f` record/function update syntax, where the `!` is followed by `[` or `.`
+/// — those are not instance calls and must not trigger the fallback (doing so
+/// spuriously re-enabled a guard-blocked transition in the
+/// `exclusive_lease_guard` regression test).
+fn body_has_instance_action_call(body: &str) -> bool {
+    let bytes = body.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'!'
+            && i > 0
+            && is_ident_byte(bytes[i - 1])
+            && bytes.get(i + 1).is_some_and(|&n| is_ident_byte(n))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
 /// Count the number of Next action disjuncts without evaluating them.
 pub fn count_next_disjuncts(next_body: &str) -> usize {
     split_action_disjuncts(next_body).len()
@@ -592,6 +623,31 @@ fn execute_branch(
         // (meaning compilation couldn't handle the expression at all).
         let compiled_ir = get_or_compile_action(def);
         return match apply_compiled_action_ir_multi(&compiled_ir, state, &ctx) {
+            // The compiled action IR can silently drop successors when the
+            // operator body routes a primed variable through a *module-instance
+            // action call* inside a LET, e.g. Disruptor's
+            //   BeginWrite(w) == LET index == Buffer!IndexOf(next) IN
+            //                      ... /\ Buffer!Write(index, w, next) /\ ...
+            // where the compiled `CompiledLetWithPrimes` path fails to stage
+            // `ringbuffer'` and returns `Ok(empty)` even though the action is
+            // enabled. Empty is normally trusted (guards legitimately blocking
+            // the transition), but when the body reaches an instance-action
+            // call `Alias!Op(...)` we cross-check with the interpreted
+            // evaluator (the inline-action path below already does the same
+            // empty→interpreted fallback). Non-empty compiled results are
+            // always trusted; the fallback only fires on an *empty* compiled
+            // result for a body that contains a `!`-qualified action call, so
+            // it cannot mask a correct-empty and adds no cost to the common
+            // path.
+            Ok(successors)
+                if successors.is_empty() && body_has_instance_action_call(&def.body) =>
+            {
+                let interpreted_ir = compile_action_ir(def);
+                match apply_action_ir_with_context_multi(&interpreted_ir, state, &ctx) {
+                    Ok(interp) => Ok(interp),
+                    Err(_) => Ok(successors),
+                }
+            }
             Ok(successors) => Ok(successors),
             Err(_) => {
                 let interpreted_ir = compile_action_ir(def);

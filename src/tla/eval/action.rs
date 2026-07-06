@@ -805,6 +805,15 @@ pub(crate) fn parse_action_binder_specs(expr: &str) -> Result<Vec<(String, Strin
     Ok(binders)
 }
 
+/// Top-level binary set operator recognized by `matches_membership_expr`
+/// for structural (non-materializing) membership testing.
+#[derive(Clone, Copy)]
+enum SetMemberOp {
+    Union,
+    Intersect,
+    Difference,
+}
+
 pub(super) fn matches_membership_expr(
     value: &TlaValue,
     expr: &str,
@@ -818,6 +827,23 @@ pub(super) fn matches_membership_expr(
         "BOOLEAN" => Ok(matches!(value, TlaValue::Bool(_))),
         _ => {
             if let Some(runtime_value) = ctx.runtime_value(rhs_trimmed) {
+                // A constant substituted to an infinite built-in set (e.g.
+                // `INSTANCE M WITH Values <- Int`) is bound as the runtime
+                // value `ModelValue("Int")`, since bare `Int`/`Nat`/`BOOLEAN`
+                // have no enumerable set value. Recognize those names and
+                // apply the built-in membership test rather than calling
+                // `.contains()` on the model value (which errors "expected
+                // Set, got ModelValue"). This is what makes the Disruptor
+                // RingBuffer `TypeOk` codomain `Values \union {NULL}` (with
+                // `Values <- Int`) evaluate correctly.
+                if let TlaValue::ModelValue(name) = &runtime_value {
+                    match name.as_str() {
+                        "Nat" => return Ok(matches!(value.as_int(), Ok(n) if n >= 0)),
+                        "Int" => return Ok(value.as_int().is_ok()),
+                        "BOOLEAN" => return Ok(matches!(value, TlaValue::Bool(_))),
+                        _ => {}
+                    }
+                }
                 return runtime_value.contains(value);
             }
 
@@ -825,6 +851,103 @@ pub(super) fn matches_membership_expr(
                 && def.params.is_empty()
             {
                 return matches_membership_expr(value, &def.body, ctx, depth + 1);
+            }
+
+            // `value \in UNION SS`  <=>  `\E S \in SS : value \in S`. When the
+            // outer set `SS` is an explicit set literal `{ E1, E2, ... }` we can
+            // test membership structurally against each element without
+            // materializing any element (which matters when an element is an
+            // infinite function set like `[D -> Int \union {NULL}]`). This is
+            // the `UNION { [0..N -> Values \union {NULL}] }` idiom used by the
+            // Disruptor RingBuffer TypeOk invariant. Non-literal `UNION` args
+            // fall through to the generic evaluator below.
+            if let Some(rest) = rhs_trimmed.strip_prefix("UNION")
+                && rest
+                    .chars()
+                    .next()
+                    .is_none_or(|c| c.is_whitespace() || c == '{' || c == '(')
+            {
+                let inner = crate::tla::eval::splitter::strip_outer_parens(rest.trim());
+                if inner.starts_with('{') && inner.ends_with('}') {
+                    let body = inner[1..inner.len() - 1].trim();
+                    // Only the explicit-set-literal form (no `\in`/`:`, i.e. not
+                    // a comprehension) is safe to distribute element-wise.
+                    if !body.is_empty()
+                        && crate::tla::eval::splitter::find_top_level_keyword_index(body, "\\in")
+                            .is_none()
+                        && crate::tla::compiled_expr::find_top_level_colon(body).is_none()
+                    {
+                        for element in split_top_level_symbol(body, ",") {
+                            let element = element.trim();
+                            if !element.is_empty()
+                                && matches_membership_expr(value, element, ctx, depth + 1)?
+                            {
+                                return Ok(true);
+                            }
+                        }
+                        return Ok(false);
+                    }
+                }
+            }
+
+            // Structural handling of top-level binary set operators so that
+            // membership tests against expressions involving infinite sets
+            // (e.g. `Int`, `Nat`) never need to materialize an operand.
+            //   value \in (A \union B)     <=>  value \in A  \/  value \in B
+            //   value \in (A \intersect B) <=>  value \in A  /\  value \in B
+            //   value \in (A \ B)          <=>  value \in A  /\  ~(value \in B)
+            // Without this, `value \in (Int \union {NULL})` falls through to
+            // `eval_expr_inner`, which tries to `\union` a bare `Int`
+            // (evaluated as ModelValue) with a set and errors out
+            // ("expected Set, got ModelValue(\"Int\")"). This surfaces in the
+            // Disruptor RingBuffer TypeOk invariant, whose slot codomain is
+            // `Values \union {NULL}` with `Values <- Int`.
+            {
+                let stripped = crate::tla::eval::splitter::strip_outer_parens(rhs_trimmed);
+                for (kw, op) in [
+                    ("\\union", SetMemberOp::Union),
+                    ("\\cup", SetMemberOp::Union),
+                    ("\\intersect", SetMemberOp::Intersect),
+                    ("\\cap", SetMemberOp::Intersect),
+                    ("\\", SetMemberOp::Difference),
+                ] {
+                    if let Some(idx) =
+                        crate::tla::eval::splitter::find_top_level_keyword_index(stripped, kw)
+                    {
+                        // `\` must be the standalone set-difference operator,
+                        // not the leading backslash of another keyword such as
+                        // `\union` / `\in` / `\/`.
+                        if kw == "\\" {
+                            let after = stripped[idx + 1..].trim_start_matches(' ');
+                            if after
+                                .chars()
+                                .next()
+                                .is_none_or(|c| c.is_alphabetic() || c == '/')
+                            {
+                                continue;
+                            }
+                        }
+                        let lhs = stripped[..idx].trim();
+                        let rhs = stripped[idx + kw.len()..].trim();
+                        if lhs.is_empty() || rhs.is_empty() {
+                            continue;
+                        }
+                        return Ok(match op {
+                            SetMemberOp::Union => {
+                                matches_membership_expr(value, lhs, ctx, depth + 1)?
+                                    || matches_membership_expr(value, rhs, ctx, depth + 1)?
+                            }
+                            SetMemberOp::Intersect => {
+                                matches_membership_expr(value, lhs, ctx, depth + 1)?
+                                    && matches_membership_expr(value, rhs, ctx, depth + 1)?
+                            }
+                            SetMemberOp::Difference => {
+                                matches_membership_expr(value, lhs, ctx, depth + 1)?
+                                    && !matches_membership_expr(value, rhs, ctx, depth + 1)?
+                            }
+                        });
+                    }
+                }
             }
 
             if let Some(inner) = rhs_trimmed.strip_prefix("Seq(") {
@@ -893,9 +1016,19 @@ pub(super) fn matches_membership_expr(
             if rhs_trimmed.starts_with('[') && rhs_trimmed.ends_with(']') {
                 let inner = &rhs_trimmed[1..rhs_trimmed.len() - 1];
 
-                if let Some(arrow_idx) = inner.find("->") {
-                    let domain_expr = inner[..arrow_idx].trim();
-                    let codomain_expr = inner[arrow_idx + 2..].trim();
+                // Distinguish a function set `[D -> R]` from a record set
+                // `[f1: S1, ...]` using a *top-level* arrow. A plain
+                // `inner.find("->")` would match an arrow nested inside a
+                // field type (e.g. `[slots: UNION { [0..N -> R] }, ...]`) and
+                // misclassify the record set as a function set — testing a
+                // Record value against a function-set shape then returns false,
+                // spuriously failing the invariant (Disruptor RingBuffer
+                // TypeOk).
+                if let Some((domain_expr, codomain_expr)) =
+                    crate::tla::eval::splitter::split_once_top_level(inner, "->")
+                {
+                    let domain_expr = domain_expr.trim();
+                    let codomain_expr = codomain_expr.trim();
                     return match value {
                         TlaValue::Function(func) => {
                             let domain_val = eval_expr_inner(domain_expr, ctx, depth + 1)?;
