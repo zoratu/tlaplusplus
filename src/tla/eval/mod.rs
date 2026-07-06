@@ -124,6 +124,9 @@ pub(crate) use splitter::{
     find_top_level_char, find_top_level_keyword_index, is_valid_identifier,
     split_once_top_level, split_top_level_keyword, split_top_level_symbol,
 };
+// Re-export the LET splitter so sibling modules (compiled_eval) can unwrap
+// `LET ... IN <body>` when routing CASE-of-actions to the interpreter.
+pub(crate) use control::split_outer_let as split_outer_let_reexport;
 use budget::{MAX_EVAL_DEPTH, get_active_eval_budget};
 use splitter::{
     contains_top_level_keyword, find_outer_else, find_outer_then,

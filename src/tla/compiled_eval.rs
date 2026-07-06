@@ -2370,6 +2370,39 @@ fn eval_compiled_clause_to_branch<'a>(
             // wrapper definition reducing to that shape) silently drops every
             // successor from the existential branch — masking real invariant
             // violations as false negatives.
+            // Soundness fix: a `CASE cond -> Action [] ...` clause (bare, or as a
+            // `LET ... IN CASE`) whose arms are actions must be evaluated as an
+            // action, not a boolean. `compile_action_ir` compiles it into this
+            // `Guard`, and boolean evaluation would run the winning arm's action
+            // in value context — dropping its primed assignment and yielding zero
+            // successors (ReadersWriters' `ReadOrWrite`). Route to the interpreted
+            // action evaluator, whose `eval_case_action_multi` fires each
+            // guard-satisfied arm. We only do this when an arm transitively
+            // references a user-defined action, so pure value CASEs still take the
+            // fast boolean path.
+            if guard_text_is_case_of_actions(text, &branch.ctx) {
+                let interpreted_branches = crate::tla::eval::eval_action_body_multi(
+                    text,
+                    &branch.ctx,
+                    &branch.staged,
+                )?;
+                let outer_ctx = branch.ctx.clone();
+                let mut out = Vec::with_capacity(interpreted_branches.len());
+                for (staged, unchanged_vars) in interpreted_branches {
+                    let mut merged_unchanged = branch.unchanged_vars.clone();
+                    for var in unchanged_vars {
+                        if !merged_unchanged.contains(&var) {
+                            merged_unchanged.push(var);
+                        }
+                    }
+                    out.push(CompiledActionBranch {
+                        ctx: outer_ctx.clone(),
+                        staged,
+                        unchanged_vars: merged_unchanged,
+                    });
+                }
+                return Ok(out);
+            }
             if let Some(branches) = try_eval_compiled_guard_as_action(text, &branch)? {
                 return Ok(branches);
             }
@@ -2618,6 +2651,82 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+/// Detect a `CASE cond -> Action [] ...` clause (optionally wrapped in
+/// `LET ... IN CASE`) whose arms transitively reference a user-defined action.
+/// Such a clause must be evaluated as an action, not a boolean guard.
+fn guard_text_is_case_of_actions(text: &str, ctx: &EvalContext<'_>) -> bool {
+    // Unwrap an outer `LET ... IN <body>` to reach the CASE.
+    let body = match crate::tla::eval::split_outer_let_reexport(text.trim()) {
+        Some((_, body)) => body.trim(),
+        None => text.trim(),
+    };
+    let Some(after_case) = body.strip_prefix("CASE") else {
+        return false;
+    };
+    if after_case
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+    {
+        return false;
+    }
+    for arm in crate::tla::eval::split_top_level_symbol(after_case, "[]") {
+        let arm = arm.trim();
+        if arm.is_empty() {
+            continue;
+        }
+        let Some((_, rhs)) = crate::tla::eval::split_once_top_level(arm, "->") else {
+            continue;
+        };
+        // If the arm RHS is (or begins with) a call to a user-defined action,
+        // the CASE is a CASE-of-actions.
+        if let Some((name, _)) = crate::tla::eval::parse_action_call_expr(rhs.trim())
+            && def_call_is_transitively_action(&name, ctx, 0)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether a call argument is (or contains) a primed reference at the top level
+/// — the signal that the callee is acting as an action via that argument even
+/// when the callee's own body has no syntactic prime (see the CONSTANT-operator
+/// override handling in `try_eval_compiled_guard_as_action`).
+fn arg_expr_is_primed(arg: &str) -> bool {
+    let bytes = arg.as_bytes();
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut depth: i32 = 0;
+    for (i, &ch) in bytes.iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == b'\\' {
+                escaped = true;
+            } else if ch == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            b'"' => in_string = true,
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b'\'' if depth == 0 => {
+                if let Some(prev) = i.checked_sub(1).map(|j| bytes[j]) {
+                    if prev.is_ascii_alphanumeric() || prev == b'_' || prev == b']' || prev == b')'
+                    {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Detect when a compiled `Guard` is actually an action call to a
 /// user-defined action and dispatch through the interpreted action evaluator.
 ///
@@ -2643,7 +2752,7 @@ fn try_eval_compiled_guard_as_action<'a>(
         return Ok(Some(branches));
     }
 
-    let Some((name, _args)) = crate::tla::eval::parse_action_call_expr(text) else {
+    let Some((name, call_args)) = crate::tla::eval::parse_action_call_expr(text) else {
         return Ok(None);
     };
 
@@ -2664,16 +2773,38 @@ fn try_eval_compiled_guard_as_action<'a>(
     let Some(def) = def_opt else {
         return Ok(None);
     };
-    // Soundness fix (wrapper-alias actions): use the *transitive* action
-    // check, not the direct `looks_like_action`. A wrapper like
-    // `RManager(self) == RS(self)` has no prime in its own body — the primes
-    // live one call deeper in `RS`. `looks_like_action` only sees direct
-    // primes, so it would classify `RManager` as a boolean guard and the
-    // existential branch `\E self \in RM : RManager(self)` would silently drop
-    // every successor (undercounting the state space and masking violations).
-    // `def_call_is_transitively_action` follows the call chain (bounded depth)
-    // and catches these wrapper actions.
+    // Soundness fix (CONSTANT-operator override called with a primed argument):
+    // a defined operator whose "actionness" comes only from a primed *argument*
+    // — e.g. the Specifying-Systems memory specs' `Send(p,d,memInt,memInt')`
+    // where `Send <- MCSend`, `MCSend(p,d,om,nm) == nm = <<p,d>>` — is not
+    // detected by `def_call_is_transitively_action` (its body `nm = <<p,d>>` has
+    // no prime). Evaluated as a boolean guard it silently produces zero
+    // successors, so the whole `Next` disjunct never fires and exploration stops
+    // at the initial states (a false-safe soundness bug). Route the call text
+    // through the interpreted action evaluator, which substitutes the primed
+    // argument into the body so `nm = <<p,d>>` surfaces as `memInt' = <<p,d>>`.
+    let has_primed_arg = call_args.iter().any(|a| arg_expr_is_primed(a));
     if !def_call_is_transitively_action(&name, &branch.ctx, 0) {
+        if has_primed_arg && def.body.trim() != text.trim() {
+            let interpreted_branches =
+                crate::tla::eval::eval_action_body_multi(text, &branch.ctx, &branch.staged)?;
+            let outer_ctx = branch.ctx.clone();
+            let mut out = Vec::with_capacity(interpreted_branches.len());
+            for (staged, unchanged_vars) in interpreted_branches {
+                let mut merged_unchanged = branch.unchanged_vars.clone();
+                for var in unchanged_vars {
+                    if !merged_unchanged.contains(&var) {
+                        merged_unchanged.push(var);
+                    }
+                }
+                out.push(CompiledActionBranch {
+                    ctx: outer_ctx.clone(),
+                    staged,
+                    unchanged_vars: merged_unchanged,
+                });
+            }
+            return Ok(Some(out));
+        }
         return Ok(None);
     }
     // Avoid infinite recursion when the body is the call itself (already

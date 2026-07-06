@@ -521,12 +521,144 @@ fn extract_body_call_idents(body: &str) -> Vec<String> {
     out
 }
 
+/// Detect whether an argument expression is (or contains) a primed reference,
+/// i.e. a `'` that primes a variable at the top level (outside string literals
+/// and outside bracketed sub-expressions).
+///
+/// This is the signal that a defined operator called with such an argument is
+/// *acting as an action* even though its own body has no syntactic prime — the
+/// canonical Specifying-Systems shape is a CONSTANT operator override like
+/// `Send(p,d,oldMemInt,newMemInt) == newMemInt = <<p,d>>` invoked as
+/// `Send(p, req, memInt, memInt')`. There, `newMemInt` binds to `memInt'`, so
+/// the body `newMemInt = <<p,d>>` is really the primed assignment
+/// `memInt' = <<p,req>>`. `looks_like_action` inspects only the body text, so
+/// it misses this; the "actionness" comes from the call site.
+fn arg_is_primed_expr(arg: &str) -> bool {
+    let bytes = arg.as_bytes();
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut depth: i32 = 0;
+    for (i, &ch) in bytes.iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == b'\\' {
+                escaped = true;
+            } else if ch == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            b'"' => in_string = true,
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b'\'' if depth == 0 => {
+                // A prime must follow an identifier / closing bracket, not be
+                // part of a string or a `\/`-style token. Preceding an
+                // alphanumeric/`_`/`]`/`)` is the reliable signal.
+                if let Some(prev) = i.checked_sub(1).map(|j| bytes[j]) {
+                    if prev.is_ascii_alphanumeric() || prev == b'_' || prev == b']' || prev == b')'
+                    {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Textually substitute call arguments for parameters in an operator body,
+/// preserving word boundaries. Used when a call passes a primed argument so the
+/// substituted body (e.g. `memInt' = <<p,req>>`) surfaces the primed assignment
+/// that value-binding a next-state variable cannot express.
+fn substitute_params_text(body: &str, params: &[String], args: &[String]) -> String {
+    let mut result = body.to_string();
+    for (param, arg) in params.iter().zip(args.iter()) {
+        let arg = arg.trim();
+        // Parenthesize compound arguments to preserve precedence, but leave
+        // atoms (simple names, primed names, numbers) bare. A bare primed name
+        // is essential: wrapping `m'` as `(m')` would make the substituted
+        // `(m') = <<..>>` fail primed-assignment classification (the LHS no
+        // longer ends in `'`), silently dropping the successor.
+        let replacement = if arg_is_atom(arg) {
+            arg.to_string()
+        } else {
+            format!("({arg})")
+        };
+        result = replace_identifier_word(&result, param, &replacement);
+    }
+    result
+}
+
+/// A substitution argument is an "atom" (needs no protective parentheses) when
+/// it is a simple identifier, a primed identifier, or a numeric literal.
+fn arg_is_atom(arg: &str) -> bool {
+    let core = arg.strip_suffix('\'').unwrap_or(arg);
+    if core.is_empty() {
+        return false;
+    }
+    let mut chars = core.chars();
+    let first = chars.next().unwrap();
+    if first.is_ascii_digit() {
+        return core.chars().all(|c| c.is_ascii_digit());
+    }
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    core.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn replace_identifier_word(expr: &str, from: &str, to: &str) -> String {
+    let mut result = String::with_capacity(expr.len());
+    let mut word = String::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    let flush = |word: &mut String, result: &mut String| {
+        if !word.is_empty() {
+            if word == from {
+                result.push_str(to);
+            } else {
+                result.push_str(word);
+            }
+            word.clear();
+        }
+    };
+    for ch in expr.chars() {
+        if in_string {
+            result.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if ch.is_alphanumeric() || ch == '_' {
+            word.push(ch);
+        } else {
+            flush(&mut word, &mut result);
+            if ch == '"' {
+                in_string = true;
+            }
+            result.push(ch);
+        }
+    }
+    flush(&mut word, &mut result);
+    result
+}
+
 fn expand_action_call_multi(
     expr: &str,
     ctx: &EvalContext<'_>,
     branch: ActionEvalBranch,
 ) -> Option<Result<Vec<ActionEvalBranch>>> {
     let (name, arg_exprs) = parse_action_call_expr(expr)?;
+    let has_primed_arg = arg_exprs.iter().any(|a| arg_is_primed_expr(a));
 
     if let Some((alias, operator_name)) = name.split_once('!') {
         let instances = ctx.instances?;
@@ -535,8 +667,29 @@ fn expand_action_call_multi(
         let def = module.definitions.get(operator_name)?.clone();
         let mut probe_ctx = ctx.clone();
         probe_ctx.definitions = Some(&module.definitions);
-        if !def_is_transitively_action(&def, &probe_ctx, 0) || def.body.trim() == expr.trim() {
+        let looks_action = def_is_transitively_action(&def, &probe_ctx, 0);
+        if (!looks_action && !has_primed_arg) || def.body.trim() == expr.trim() {
             return None;
+        }
+        // A CONSTANT-operator override invoked with a primed argument (e.g.
+        // `Send(p, req, memInt, memInt')`) is an action only via that argument.
+        // Substitute the args into the body textually so the primed assignment
+        // surfaces, then evaluate the substituted body as an action.
+        if !looks_action && has_primed_arg && def.params.len() == arg_exprs.len() {
+            let substituted =
+                substitute_params_text(&def.body, &def.params, &arg_exprs);
+            let mut instance_ctx = ctx.clone();
+            instance_ctx.definitions = Some(&module.definitions);
+            instance_ctx.instances =
+                effective_instance_scope(&module.instances, ctx.instances);
+            seed_implicit_instance_constant_bindings(instance, module, ctx, &mut instance_ctx);
+            {
+                let locals_mut = std::rc::Rc::make_mut(&mut instance_ctx.locals);
+                if let Err(err) = bind_instance_substitutions(instance, ctx, locals_mut) {
+                    return Some(Err(err));
+                }
+            }
+            return Some(eval_action_body_text_multi(&substituted, &instance_ctx, branch));
         }
         if def.params.len() != arg_exprs.len() {
             return Some(Err(anyhow!(
@@ -574,7 +727,8 @@ fn expand_action_call_multi(
     }
 
     let def = ctx.definition(&name)?;
-    if !def_is_transitively_action(&def, ctx, 0) || def.body.trim() == expr.trim() {
+    let looks_action = def_is_transitively_action(&def, ctx, 0);
+    if (!looks_action && !has_primed_arg) || def.body.trim() == expr.trim() {
         return None;
     }
     if def.params.len() != arg_exprs.len() {
@@ -583,6 +737,14 @@ fn expand_action_call_multi(
             def.params.len(),
             arg_exprs.len()
         )));
+    }
+
+    // See the `alias!op` branch: a defined operator called with a primed
+    // argument acts as an action even when its own body has no prime. Perform
+    // textual arg substitution so the primed assignment surfaces.
+    if !looks_action && has_primed_arg {
+        let substituted = substitute_params_text(&def.body, &def.params, &arg_exprs);
+        return Some(eval_action_body_text_multi(&substituted, ctx, branch));
     }
 
     let mut child_ctx = ctx.clone();
@@ -600,6 +762,77 @@ fn expand_action_call_multi(
     }
 
     Some(eval_action_body_text_multi(&def.body, &child_ctx, branch))
+}
+
+/// Evaluate a `CASE`-of-actions clause. Returns `Ok(None)` when `expr` is not a
+/// CASE expression (caller falls through to the other clause handlers) and
+/// `Ok(Some(branches))` when it is — firing every guard-satisfied arm as an
+/// action branch (TLA+'s nondeterministic CASE). `OTHER`/default arms fire only
+/// when no explicit guard held.
+fn eval_case_action_multi(
+    expr: &str,
+    ctx: &EvalContext<'_>,
+    eval_ctx: &EvalContext<'_>,
+    branch: &ActionEvalBranch,
+) -> Result<Option<Vec<ActionEvalBranch>>> {
+    let trimmed = expr.trim();
+    let Some(after_case) = trimmed.strip_prefix("CASE") else {
+        return Ok(None);
+    };
+    // Require a word boundary after `CASE` (not `CASEFOO`).
+    if after_case
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+    {
+        return Ok(None);
+    }
+    let arms = split_top_level_symbol(after_case, "[]");
+    if arms.is_empty() {
+        return Ok(None);
+    }
+
+    let mut out = Vec::new();
+    let mut default_arm: Option<String> = None;
+    let mut any_guard_matched = false;
+    let mut parsed_any_arm = false;
+    for arm in arms {
+        let arm = arm.trim();
+        if arm.is_empty() {
+            continue;
+        }
+        let Some((cond, rhs)) = crate::tla::eval::splitter::split_once_top_level(arm, "->") else {
+            // Not a well-formed CASE arm — this isn't a CASE-of-actions after
+            // all; let the caller's value-based guard path handle it.
+            return Ok(None);
+        };
+        parsed_any_arm = true;
+        if cond.trim() == "OTHER" {
+            default_arm = Some(rhs.trim().to_string());
+            continue;
+        }
+        if eval_guard(cond.trim(), eval_ctx)? {
+            any_guard_matched = true;
+            out.extend(eval_action_body_text_multi(rhs.trim(), ctx, branch.clone())?);
+        }
+    }
+
+    if !parsed_any_arm {
+        return Ok(None);
+    }
+    if !any_guard_matched {
+        if let Some(default_expr) = default_arm {
+            return Ok(Some(eval_action_body_text_multi(
+                &default_expr,
+                ctx,
+                branch.clone(),
+            )?));
+        }
+        // No arm matched and no OTHER: the CASE is a disabled action (like a
+        // failed guard) — no successors.
+        return Ok(Some(Vec::new()));
+    }
+    Ok(Some(out))
 }
 
 fn eval_action_clause_text_multi(
@@ -620,6 +853,18 @@ fn eval_action_clause_text_multi(
             else_branch
         };
         return eval_action_body_text_multi(branch_body, ctx, branch);
+    }
+    // A `CASE cond1 -> Action1 [] cond2 -> Action2 [] OTHER -> Action3` whose
+    // arms are *actions* (they assign primed variables, directly or via an
+    // operator call) must be evaluated as an action, firing each arm whose guard
+    // holds — not as a value expression. `eval_guard` would evaluate the whole
+    // CASE as a boolean, calling the winning arm's action in value context where
+    // its primed assignment errors, so the clause produces zero successors and
+    // the enclosing action never fires (ReadersWriters' `ReadOrWrite`). Mirror
+    // TLA+'s nondeterministic CASE: expand every guard-satisfied arm as an
+    // action branch.
+    if let Some(branches) = eval_case_action_multi(trimmed, ctx, &eval_ctx, &branch)? {
+        return Ok(branches);
     }
     if let Some((binders, body)) = parse_action_exists(trimmed) {
         return eval_exists_action_multi(binders, body, ctx, branch);
@@ -1174,6 +1419,76 @@ mod tests {
             next.get("direction"),
             Some(&TlaValue::String("right".to_string()))
         );
+    }
+
+    #[test]
+    fn case_of_actions_fires_matching_arm_as_action() {
+        // Regression (ReadersWriters `ReadOrWrite`): a `CASE cond -> Action []
+        // ...` whose arms are actions must fire the matching arm as an action,
+        // staging its primed assignment — not evaluate the CASE as a boolean.
+        let state = tla_state([
+            ("mode", TlaValue::String("read".to_string())),
+            ("out", TlaValue::Int(0)),
+        ]);
+        let mut definitions = BTreeMap::new();
+        definitions.insert(
+            "DoRead".to_string(),
+            TlaDefinition {
+                name: "DoRead".to_string(),
+                params: vec![],
+                body: "out' = 1".to_string(),
+                is_recursive: false,
+            },
+        );
+        definitions.insert(
+            "DoWrite".to_string(),
+            TlaDefinition {
+                name: "DoWrite".to_string(),
+                params: vec![],
+                body: "out' = 2".to_string(),
+                is_recursive: false,
+            },
+        );
+        let ctx = EvalContext::with_definitions(&state, &definitions);
+        let branches = eval_action_body_multi(
+            "CASE mode = \"read\" -> DoRead [] mode = \"write\" -> DoWrite",
+            &ctx,
+            &BTreeMap::new(),
+        )
+        .expect("CASE-of-actions should evaluate");
+        assert_eq!(branches.len(), 1, "{branches:?}");
+        assert_eq!(branches[0].0.get("out"), Some(&TlaValue::Int(1)));
+    }
+
+    #[test]
+    fn operator_called_with_primed_argument_stages_assignment() {
+        // Regression (Specifying-Systems memory specs): a defined operator whose
+        // body has no prime but is called with a primed argument acts as an
+        // action — `Send(p, req, memInt, memInt')` with
+        // `Send(p,d,om,nm) == nm = <<p,d>>` means `memInt' = <<p,req>>`.
+        let state = tla_state([("memInt", TlaValue::Int(0))]);
+        let mut definitions = BTreeMap::new();
+        definitions.insert(
+            "Send".to_string(),
+            TlaDefinition {
+                name: "Send".to_string(),
+                params: vec![
+                    "p".to_string(),
+                    "d".to_string(),
+                    "om".to_string(),
+                    "nm".to_string(),
+                ],
+                body: "nm = <<p, d>>".to_string(),
+                is_recursive: false,
+            },
+        );
+        let ctx = EvalContext::with_definitions(&state, &definitions);
+        let branches = eval_action_body_multi("Send(7, 9, memInt, memInt')", &ctx, &BTreeMap::new())
+            .expect("operator with primed arg should evaluate as an action");
+        assert_eq!(branches.len(), 1, "{branches:?}");
+        let memint = branches[0].0.get("memInt").expect("memInt' staged");
+        let expected = eval_expr("<<7, 9>>", &ctx).expect("tuple evaluates");
+        assert_eq!(memint, &expected);
     }
 
     #[test]
