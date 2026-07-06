@@ -1076,6 +1076,21 @@ impl TlaModel {
                     Some(false)
                 }
             }
+            // Temporal implication `P => Q` (e.g. `[]P => <>Q`, or the
+            // `[](P => <>[]Q)` inner). The per-SCC fairness check CANNOT judge
+            // these — the real check is the graph-level `graph_liveness_violation`
+            // pass (for the `<>[]` consequent shape) or nothing at all (for
+            // other shapes, which we deliberately leave unchecked). Crucially,
+            // we must return `Some(false)` here rather than `None`: a declared
+            // `Implies` liveness property makes `has_liveness_properties()` true,
+            // which enables the fairness SCC pass; if this returned `None` the
+            // caller would fall through to a fairness-ONLY verdict and flag an
+            // unfair SCC as a violation TLC does not report (e.g. nbacg_guer01's
+            // `[]P => <>Q` termination property with `WF_vars`). Returning
+            // `Some(false)` says "this implication is not violated per-SCC", so
+            // the spurious fairness-only violation is suppressed. The genuine
+            // `[](P => <>[]Q)` violation is still caught by the graph pass.
+            TemporalFormula::Implies(_, _) => Some(false),
             // Unsupported shapes: let the caller fall back.
             _ => None,
         }
