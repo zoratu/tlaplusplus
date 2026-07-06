@@ -308,9 +308,21 @@ pub(super) fn split_top_level(expr: &str, delim: &str, keyword: bool) -> Vec<Str
                 {
                     // We're in quantifier binders (before :), don't split on conjunctions
                     false
-                } else if in_quantifier_body && (delim == "/\\" || delim == "\\/") {
-                    // Quantifier bodies consume conjunctions and disjunctions to
-                    // the end of the surrounding grouping.
+                } else if in_quantifier_body {
+                    // A quantifier body (`\A x \in S : BODY` / `\E`) has the
+                    // LOWEST precedence in TLA+: `BODY` extends maximally to the
+                    // right, up to the end of the surrounding grouping. So every
+                    // boolean/relational operator appearing after the `:` —
+                    // conjunctions and disjunctions (`/\`, `\/`) AND implications
+                    // (`=>`, `<=>`) AND comparisons — belongs to the body, not to
+                    // the enclosing expression. Previously only `/\`/`\/` were
+                    // suppressed here, so `A /\ \A y \in S : P(y) => Q` was
+                    // mis-split on the body-internal `=>` into
+                    // `(A /\ \A y \in S : P(y)) => Q`, inverting the precedence
+                    // and (because `classify_op` tries `=>` before `/\`)
+                    // silently turning `FALSE /\ \A ...` into a vacuously-true
+                    // implication. Suppress the split for ANY delimiter once we
+                    // are inside a quantifier body.
                     false
                 } else {
                     // All other cases: split normally
@@ -1847,6 +1859,39 @@ mod tests {
     fn split_top_level_keeps_simple_quantified_disjunctions_intact() {
         let parts = split_top_level_symbol(r"\E a \in Acceptor : Phase1b(a) \/ Phase2b(a)", "\\/");
         assert_eq!(parts, vec![r"\E a \in Acceptor : Phase1b(a) \/ Phase2b(a)"]);
+    }
+
+    #[test]
+    fn quantifier_body_consumes_trailing_implication_not_just_conjunction() {
+        // TLA+ precedence: `\A x \in S : BODY` binds its body maximally to the
+        // right. So in `A /\ \A y \in S : P(y) => Q`, the `=>` belongs to the
+        // quantifier body — the whole thing is `A /\ (\A y \in S : P(y) => Q)`,
+        // NOT `(A /\ \A y \in S : P(y)) => Q`.
+        //
+        // Regression for the SlidingPuzzles missed-violation: `ChooseOne`'s
+        // `CHOOSE z \in S : P(z) /\ \A y \in S : P(y) => y = z` was mis-split on
+        // the body-internal `=>` (because `classify_op` tries `=>` before `/\`),
+        // inverting precedence so `FALSE /\ \A ...` became a vacuously-true
+        // implication `FALSE => ...`. That silently under-produced successors and
+        // the puzzle's goal invariant was never reached.
+        //
+        // A top-level `=>` inside a quantifier body must NOT be a split point:
+        let expr = r"P(z) /\ \A y \in S : P(y) => y = z";
+        assert_eq!(split_top_level_symbol(expr, "=>"), vec![expr]);
+        // ...and the same for `<=>`:
+        let iff = r"P(z) /\ \A y \in S : P(y) <=> y = z";
+        assert_eq!(split_top_level_symbol(iff, "<=>"), vec![iff]);
+        // The top-level `/\` (before the quantifier) still splits correctly:
+        assert_eq!(
+            split_top_level_symbol(expr, "/\\"),
+            vec![r"P(z)", r"\A y \in S : P(y) => y = z"]
+        );
+        // But a `=>` that precedes the quantifier (outside any body) still
+        // splits — the quantifier depth is still 0 at that point:
+        assert_eq!(
+            split_top_level_symbol(r"A => \A y \in S : P(y)", "=>"),
+            vec![r"A", r"\A y \in S : P(y)"]
+        );
     }
 
     #[test]

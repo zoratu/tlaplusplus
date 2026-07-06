@@ -1374,6 +1374,50 @@ IN
     }
 
     #[test]
+    fn conjunction_before_quantifier_does_not_leak_body_implication_to_top_level() {
+        // TLA+ precedence: a quantifier body extends maximally to the right, so
+        // `FALSE /\ \A y \in S : y > 0 => y < 10` is
+        // `FALSE /\ (\A y \in S : (y > 0 => y < 10))` = `FALSE /\ TRUE` = FALSE.
+        //
+        // Regression for the SlidingPuzzles missed-violation: the string
+        // evaluator's `classify_op` tries `=>` before `/\`, and the top-level
+        // splitter used to treat the body-internal `=>` as a split point, so the
+        // whole thing mis-parsed as `(FALSE /\ \A y : y > 0) => y < 10` =
+        // `FALSE => ...` = TRUE. In `ChooseOne`'s
+        // `CHOOSE z \in S : P(z) /\ \A y \in S : P(y) => y = z` this made the
+        // CHOOSE pick the wrong piece, so `Next` under-produced successors and
+        // the goal invariant was never reached. TLC evaluates this to FALSE.
+        let state = tla_state([(
+            "S",
+            TlaValue::Set(HashedArc::new(BTreeSet::from([
+                TlaValue::Int(1),
+                TlaValue::Int(2),
+                TlaValue::Int(3),
+            ]))),
+        )]);
+        let ctx = EvalContext::new(&state);
+
+        assert_eq!(
+            eval_expr("FALSE /\\ \\A y \\in S : y > 0 => y < 10", &ctx)
+                .expect("conjunction-before-quantifier should evaluate"),
+            TlaValue::Bool(false)
+        );
+        // The true-first-conjunct case must still evaluate the body correctly:
+        assert_eq!(
+            eval_expr("TRUE /\\ \\A y \\in S : y > 0 => y < 10", &ctx)
+                .expect("conjunction-before-quantifier should evaluate"),
+            TlaValue::Bool(true)
+        );
+        // ...and a body implication that is genuinely false makes the whole
+        // conjunction false (not vacuously true via mis-split):
+        assert_eq!(
+            eval_expr("TRUE /\\ \\A y \\in S : y > 0 => y > 5", &ctx)
+                .expect("conjunction-before-quantifier should evaluate"),
+            TlaValue::Bool(false)
+        );
+    }
+
+    #[test]
     fn evaluates_choose_without_domain_using_stable_model_value() {
         let state = tla_state([(
             "SignedBlock",
