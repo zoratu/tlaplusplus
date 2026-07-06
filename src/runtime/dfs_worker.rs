@@ -786,6 +786,19 @@ pub(super) fn run_inband_fairness_check<M: Model>(
                 next_name,
             );
             if let Err(e) = result {
+                // PROPERTY GATE (TLC parity): a fairness-unfair SCC is only a
+                // liveness counterexample if a declared temporal property
+                // actually fails on it. Mirrors the BFS path in
+                // `runtime/liveness.rs`. `Some(false)` → every checked
+                // property holds on this SCC → suppress.
+                let scc_states: Vec<M::State> =
+                    scc.iter().filter_map(|fp| state_by_fp.get(fp).cloned()).collect();
+                if !scc_states.is_empty()
+                    && model.scc_violates_liveness_property(&scc_states) == Some(false)
+                {
+                    continue;
+                }
+
                 let representative_fp = scc[0];
                 let representative_state = state_by_fp
                     .get(&representative_fp)

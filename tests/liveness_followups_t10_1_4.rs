@@ -199,6 +199,111 @@ Reaches100 == <>(x = 100)
 
 #[test]
 #[serial]
+fn property_gate_suppresses_fairness_unfair_scc_when_leadsto_vacuous() {
+    // Regression: the fairness SCC pass is property-BLIND — it flags ANY
+    // SCC that lacks the fair action. But a fairness-unfair cycle is a
+    // non-fair behaviour TLC EXCLUDES, not a counterexample. This mirrors
+    // the EWD840 shape that produced a FALSE `Liveness` violation:
+    //
+    //   * A "System" action toggles y in {0,1} (the environment-only cycle).
+    //   * A separate "Detect" action fires only when y = 2 (never reached),
+    //     so `detected` never becomes TRUE anywhere in the SCC.
+    //   * `WF_vars(Detect)` is declared, so the fairness pass tentatively
+    //     flags the {y=0,y=1} SCC ("action 'Detect' does not occur in SCC").
+    //   * The declared PROPERTY is `terminated ~> detected`. Since
+    //     `terminated` (y = 99) never holds in the toggle SCC, the leads-to
+    //     is VACUOUSLY satisfied — TLC reports NO violation.
+    //
+    // `Model::scc_violates_liveness_property` must return `Some(false)` for
+    // this SCC (P never triggers → vacuous) so the runtime suppresses the
+    // spurious violation. Before the property gate this reported a false
+    // `Liveness` violation.
+    let module_src = r#"---- MODULE VacuousLeadsToFairness ----
+EXTENDS Naturals
+
+VARIABLES y
+
+vars == <<y>>
+
+Init == y = 0
+
+System == \/ /\ y = 0 /\ y' = 1
+          \/ /\ y = 1 /\ y' = 0
+
+Detect == /\ y = 2 /\ y' = 99
+
+Next == System \/ Detect
+
+terminated == y = 99
+detected == y = 99
+
+Spec == Init /\ [][Next]_vars /\ WF_vars(Detect)
+
+Liveness == terminated ~> detected
+====
+"#;
+    let cfg_src = "SPECIFICATION Spec\nPROPERTIES Liveness\n";
+    let outcome = run_spec("VacuousLeadsToFairness", module_src, cfg_src);
+
+    // Only the {y=0, y=1} toggle is reachable (Detect never enabled).
+    assert_eq!(
+        outcome.stats.states_distinct, 2,
+        "only y = 0 and y = 1 are reachable"
+    );
+    if let Some(v) = &outcome.violation {
+        if v.property_type == PropertyType::Liveness {
+            panic!(
+                "property gate regression: fairness-unfair SCC where `terminated` \
+                 never holds must NOT raise a liveness violation (leads-to is \
+                 vacuously satisfied, matching TLC); got: {}",
+                v.message
+            );
+        }
+    }
+}
+
+#[test]
+#[serial]
+fn property_gate_still_reports_genuine_eventually_violation() {
+    // Dual of the suppression test: the property GENUINELY fails, so the
+    // gate must NOT suppress. `Reach2 == <>(y = 2)` but y toggles in {0,1}
+    // forever and never reaches 2 — a real liveness violation TLC also
+    // reports. `scc_violates_single_property` returns `Some(true)` (P holds
+    // nowhere in the SCC) so the violation flows through.
+    let module_src = r#"---- MODULE GenuineEventuallyFailure ----
+EXTENDS Naturals
+
+VARIABLES y
+
+vars == <<y>>
+
+Init == y = 0
+
+System == \/ /\ y = 0 /\ y' = 1
+          \/ /\ y = 1 /\ y' = 0
+
+Advance == /\ y = 5 /\ y' = 2
+
+Next == System \/ Advance
+
+Spec == Init /\ [][Next]_vars /\ WF_vars(Advance)
+
+Reach2 == <>(y = 2)
+====
+"#;
+    let cfg_src = "SPECIFICATION Spec\nPROPERTIES Reach2\n";
+    let outcome = run_spec("GenuineEventuallyFailure", module_src, cfg_src);
+
+    assert_eq!(outcome.stats.states_distinct, 2, "y toggles in {{0, 1}}");
+    let v = outcome
+        .violation
+        .as_ref()
+        .expect("expected a genuine liveness violation: <>(y = 2) never holds");
+    assert_eq!(v.property_type, PropertyType::Liveness);
+}
+
+#[test]
+#[serial]
 fn t10_3_self_loop_state_survives_trim_and_satisfies_wrapper_next() {
     // A single-state self-loop: x = 0 with `Done == /\ UNCHANGED vars`.
     // The trim must NOT drop the self-loop state (it's a non-trivial

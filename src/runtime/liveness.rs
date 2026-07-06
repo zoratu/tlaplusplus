@@ -415,6 +415,31 @@ where
                                 })
                                 .collect();
 
+                            // PROPERTY GATE (TLC parity): a fairness-unfair SCC
+                            // is not, by itself, a liveness counterexample. Ask
+                            // the model whether a declared temporal PROPERTY
+                            // actually fails on this SCC. `Some(false)` means
+                            // every evaluable property holds here → suppress
+                            // the spurious violation (e.g. EWD840's
+                            // environment-only cycle, where `terminated` never
+                            // holds so `terminated ~> terminationDetected` is
+                            // vacuously satisfied). `Some(true)` (a property
+                            // genuinely fails) and `None` (model can't judge —
+                            // preserve prior fairness-only behaviour) both fall
+                            // through to reporting.
+                            if model.scc_violates_liveness_property(&scc_states) == Some(false) {
+                                if std::env::var("TLAPP_TRACE_INVARIANT").is_ok() {
+                                    eprintln!(
+                                        "  Fairness-unfair SCC {} ({} states) satisfies all \
+                                         checked temporal properties — not a liveness \
+                                         counterexample (suppressed)",
+                                        scc_idx,
+                                        scc_states.len()
+                                    );
+                                }
+                                continue;
+                            }
+
                             eprintln!(
                                 "  Fairness violation in SCC {} ({} states): {}",
                                 scc_idx,

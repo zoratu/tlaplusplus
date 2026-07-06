@@ -141,6 +141,35 @@ pub trait Model: Send + Sync + 'static {
         None
     }
 
+    /// Decide whether a fairness-unfair SCC is an *actual* liveness
+    /// counterexample.
+    ///
+    /// The fairness SCC pass finds cycles in which a fair action is
+    /// continuously/infinitely enabled yet never taken. Such a cycle is a
+    /// *non-fair* behaviour — but a non-fair behaviour is NOT a counterexample
+    /// on its own. TLC only reports a violation when a declared temporal
+    /// PROPERTY (e.g. `<>P`, `[]<>P`, `P ~> Q`) actually fails on a behaviour
+    /// that stays in the cycle. An SCC that is fairness-unfair but still
+    /// satisfies every checked property (e.g. EWD840's environment-only cycle,
+    /// where `terminated` never holds so `terminated ~> terminationDetected`
+    /// is vacuously true) must NOT be flagged — doing so is a false liveness
+    /// violation that TLC does not report.
+    ///
+    /// Returns:
+    ///   * `Some(true)`  — a declared temporal property is definitively
+    ///     violated by this SCC → report the liveness violation.
+    ///   * `Some(false)` — every declared temporal property that we can
+    ///     evaluate is satisfied by this SCC → suppress the violation.
+    ///   * `None`        — the model cannot make a property-level judgement
+    ///     (no evaluable temporal property, or an unsupported property shape).
+    ///     The caller then falls back to the fairness-only verdict (preserving
+    ///     prior behaviour for models that don't implement this).
+    ///
+    /// `scc_states` are the actual states forming the SCC.
+    fn scc_violates_liveness_property(&self, _scc_states: &[Self::State]) -> Option<bool> {
+        None
+    }
+
     fn check_invariants(&self, state: &Self::State) -> Result<(), String>;
 
     /// Check state constraints - returns Ok(()) if state should be explored, Err if pruned

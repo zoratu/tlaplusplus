@@ -217,6 +217,14 @@ pub fn check_fairness_on_scc_fp_sharded(
         false
     };
 
+    // NOTE: this returns Err whenever the fair action does not *occur* inside
+    // the SCC. That is only the FAIRNESS verdict for the cycle — a
+    // fairness-unfair cycle is not, by itself, a liveness counterexample. The
+    // runtime post-processing (`runtime/liveness.rs`) gates this Err through
+    // `Model::scc_violates_liveness_property`, which checks whether a declared
+    // temporal PROPERTY actually fails on the SCC before reporting a
+    // violation — matching TLC, which never reports "action does not occur in
+    // SCC" and only flags a property that a fair behaviour violates.
     if !action_occurs && !scc_fps.is_empty() {
         return Err(anyhow!(
             "Fairness constraint may be violated: action '{}' does not occur in SCC",
@@ -781,7 +789,9 @@ mod tests {
 
     #[test]
     fn test_check_fairness_on_scc_fp_sharded_named_action() {
-        // SCC = {1, 2, 3}, action "Step" occurs only outside SCC → fail.
+        // SCC = {1, 2, 3}, action "Step" occurs only outside SCC → the
+        // *fairness* check flags it (the runtime then gates this on an actual
+        // property failure — see Model::scc_violates_liveness_property).
         let scc_fps: HashSet<u64> = [1u64, 2, 3].into_iter().collect();
         let constraint = FairnessConstraint::Weak {
             vars: vec!["v".to_string()],

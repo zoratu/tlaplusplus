@@ -706,6 +706,32 @@ impl Model for TlaModel {
         Some(&self.next_name)
     }
 
+    fn scc_violates_liveness_property(&self, scc_states: &[Self::State]) -> Option<bool> {
+        if self.temporal_properties.is_empty() || scc_states.is_empty() {
+            return None;
+        }
+
+        let mut any_evaluable = false;
+        for (_name, formula) in &self.temporal_properties {
+            match self.scc_violates_single_property(formula, scc_states) {
+                Some(true) => return Some(true), // a property definitively fails
+                Some(false) => any_evaluable = true,
+                None => {} // unsupported / unevaluable shape — skip it
+            }
+        }
+
+        if any_evaluable {
+            // At least one property could be evaluated and NONE of the
+            // evaluable ones is violated by this SCC → suppress the
+            // fairness-only "violation".
+            Some(false)
+        } else {
+            // No property was evaluable (e.g. only a refinement `TD!Spec`
+            // property). Fall back to the fairness-only verdict.
+            None
+        }
+    }
+
     fn num_next_disjuncts(&self) -> usize {
         let next_def = match self.module.definitions.get(&self.next_name) {
             Some(d) => d,
@@ -816,6 +842,120 @@ impl TlaModel {
         self.temporal_properties
             .iter()
             .any(|(_, formula)| formula.is_liveness_property())
+    }
+
+    /// Evaluate a state-predicate text on a single state, returning
+    /// `Some(bool)` on a clean boolean result and `None` if the predicate
+    /// cannot be evaluated to a boolean (unknown operator, type error, ...).
+    fn eval_state_pred_on_state(&self, pred_text: &str, state: &TlaState) -> Option<bool> {
+        let ctx = EvalContext::with_definitions_and_instances(
+            state,
+            &self.module.definitions,
+            &self.module.instances,
+        );
+        match eval_expr(pred_text, &ctx) {
+            Ok(TlaValue::Bool(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// Decide whether a single temporal property is violated by the states of
+    /// a fairness-unfair SCC. This is what turns "the SCC is unfair" into "the
+    /// SCC is (or is not) an actual counterexample to a declared property".
+    ///
+    /// An SCC is a strongly-connected cycle revisited infinitely often, so a
+    /// behaviour can loop through exactly its states forever. We use that to
+    /// evaluate the recurrent-cycle semantics of the common property shapes:
+    ///
+    ///   * `<>P` (Eventually) / `[]<>P` (InfinitelyOften): the cycle violates
+    ///     it iff `P` holds at NO state of the SCC — an infinite loop through
+    ///     the SCC never makes `P` true.
+    ///   * `P ~> Q` (LeadsTo): violated iff some SCC state satisfies `P` but NO
+    ///     SCC state satisfies `Q` — `P` is triggered yet `Q` is never reached
+    ///     within the recurrent cycle. (If `P` never holds in the SCC, the
+    ///     leads-to is vacuously satisfied — this is exactly the EWD840 case:
+    ///     `terminated` never holds in the environment-only cycle.)
+    ///   * `<>[]P` (EventuallyAlways): violated iff some SCC state has `¬P` —
+    ///     the cycle keeps toggling `P` off, so `P` can never become always-true.
+    ///
+    /// Returns `Some(true)`/`Some(false)` when the shape is evaluable, and
+    /// `None` for shapes we do not check here (refinement `TD!Spec`, nested
+    /// temporal, temporal quantifiers, fairness terms), so the caller can fall
+    /// back conservatively.
+    fn scc_violates_single_property(
+        &self,
+        formula: &TemporalFormula,
+        scc_states: &[TlaState],
+    ) -> Option<bool> {
+        // A state-predicate text that holds at *some* / *no* SCC state.
+        let holds_somewhere = |pred: &str| -> Option<bool> {
+            let mut saw_unevaluable = false;
+            let mut any_true = false;
+            for st in scc_states {
+                match self.eval_state_pred_on_state(pred, st) {
+                    Some(true) => any_true = true,
+                    Some(false) => {}
+                    None => saw_unevaluable = true,
+                }
+            }
+            if any_true {
+                Some(true)
+            } else if saw_unevaluable {
+                // Could not confidently establish "P holds nowhere".
+                None
+            } else {
+                Some(false)
+            }
+        };
+
+        match formula {
+            TemporalFormula::Eventually(inner) | TemporalFormula::InfinitelyOften(inner) => {
+                let TemporalFormula::StatePredicate(p) = inner.as_ref() else {
+                    return None;
+                };
+                // Violated iff P holds nowhere in the SCC.
+                holds_somewhere(p).map(|somewhere| !somewhere)
+            }
+            TemporalFormula::LeadsTo(p, q) => {
+                let (TemporalFormula::StatePredicate(p), TemporalFormula::StatePredicate(q)) =
+                    (p.as_ref(), q.as_ref())
+                else {
+                    return None;
+                };
+                let p_somewhere = holds_somewhere(p)?;
+                if !p_somewhere {
+                    // P never triggers in the cycle → vacuously satisfied.
+                    return Some(false);
+                }
+                let q_somewhere = holds_somewhere(q)?;
+                // Violated iff P triggers but Q is never reached in the cycle.
+                Some(!q_somewhere)
+            }
+            TemporalFormula::EventuallyAlways(inner) => {
+                let TemporalFormula::StatePredicate(p) = inner.as_ref() else {
+                    return None;
+                };
+                // Violated iff some SCC state has ¬P (P can't stay always-true).
+                let mut saw_false = false;
+                let mut saw_unevaluable = false;
+                for st in scc_states {
+                    match self.eval_state_pred_on_state(p, st) {
+                        Some(true) => {}
+                        Some(false) => saw_false = true,
+                        None => saw_unevaluable = true,
+                    }
+                }
+                if saw_false {
+                    Some(true)
+                } else if saw_unevaluable {
+                    None
+                } else {
+                    Some(false)
+                }
+            }
+            // Unsupported shapes: let the caller fall back.
+            _ => None,
+        }
     }
 
     /// Compute next states under partial-order reduction.
