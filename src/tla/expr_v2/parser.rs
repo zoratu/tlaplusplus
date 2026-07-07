@@ -1699,6 +1699,38 @@ impl<'a> Parser<'a> {
         seg_ends.push(end_excl);
         let n_segs = seg_ends.len();
 
+        // Gap-1 fix (Phase 1.6): reject ANY depth-0 `OTHER` token in the CASE
+        // extent unless it is the UNIQUE, FINAL, EXACT `OTHER -> result` arm.
+        //
+        // The per-arm `is_other` recognition below only fires on the EXACT shape
+        // `OTHER ->` (`seg_start + 1 == a`). A malformed depth-0 OTHER segment
+        // like `OTHER /\ q -> b` (in `CASE p -> a [] OTHER /\ q -> b`) would NOT
+        // be recognized as OTHER and would silently parse as a normal guard arm
+        // with guard `OTHER /\ q` — a WRONG parse. Any depth-0 `OTHER` that is
+        // not exactly the lone final `OTHER -> ...` arm is not modeled by v2:
+        // reject → v1 fallback (v1 lowers the whole CASE correctly).
+        {
+            let last_seg_start = *seg_starts
+                .last()
+                .expect("CASE always has at least one segment");
+            let others = self.top_level_positions(end_excl, |k| match k {
+                Tok::Ident(s) => s == "OTHER",
+                _ => false,
+            });
+            for &o in &others {
+                // Must begin the final segment and be immediately followed by `->`.
+                let is_final_lone_other = o == last_seg_start
+                    && o + 1 < end_excl
+                    && matches!(&self.toks[o + 1].kind, Tok::Other(s) if s == "->");
+                if !is_final_lone_other {
+                    return Err(
+                        "CASE with a depth-0 OTHER that is not the lone final `OTHER -> ...` arm → v1"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+
         let mut arms: Vec<(Expr, Expr)> = Vec::new();
         let mut other: Option<Box<Expr>> = None;
 
@@ -1802,26 +1834,42 @@ impl<'a> Parser<'a> {
             // so leaf semantics stay byte-for-byte identical. v2 owns only
             // junctions, `=>`/`<=>`, and the quantifier/LET/IF keyword structure.
             if depth == 0 && consumed {
+                // Gap-2 fix (Phase 1.6): after an absorbed depth-0 CASE operand,
+                // the atom reader cannot know where the CASE extent ends. ANY
+                // v2-owned structural breaker at depth 0 could belong INSIDE a
+                // CASE arm's guard/result rather than to an enclosing construct,
+                // so slicing the atom here risks a WRONG parse. Reject on ANY of
+                // {`=>`,`<=>`,`/\`,`\/`,`IF`,`LET`,`\A`,`\E`,`CHOOSE`,`CASE`} →
+                // v1 fallback (v1 parses `x = CASE ...` correctly). We prefer
+                // over-rejecting to any risk of a bad slice. (The Phase 1.5 fixes
+                // only covered junction bullets and `=>`/`<=>`; `IF`/`LET`/quant/
+                // `CHOOSE`/nested `CASE` could still slice — e.g.
+                // `x = CASE p -> IF q THEN a ELSE b [] OTHER -> c`.)
+                if saw_case_operand {
+                    match &t.kind {
+                        Tok::Implies
+                        | Tok::Iff
+                        | Tok::AndBullet
+                        | Tok::OrBullet
+                        | Tok::If
+                        | Tok::Let
+                        | Tok::Forall
+                        | Tok::Exists
+                        | Tok::Choose => {
+                            return Err(
+                                "CASE operand would be sliced by a v2 structural breaker → v1"
+                                    .to_string(),
+                            );
+                        }
+                        Tok::Ident(w) if w == "CASE" => {
+                            return Err(
+                                "CASE operand followed by a nested CASE → v1".to_string(),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
                 match &t.kind {
-                    Tok::AndBullet | Tok::OrBullet if saw_case_operand => {
-                        // A junction bullet after an absorbed CASE would slice the
-                        // CASE (guards can contain `/\`); reject → v1 fallback.
-                        return Err(
-                            "CASE operand would be sliced by a junction bullet → v1".to_string(),
-                        );
-                    }
-                    // Fix #2: `=>`/`<=>` after an absorbed depth-0 CASE would ALSO
-                    // slice the CASE — the operator belongs INSIDE an arm
-                    // (`x = CASE p -> a => b [] OTHER -> c`, arm result `a => b`),
-                    // not to an outer implication. Absorbing only `x = CASE p ->
-                    // a` and emitting `Implies(that, ...)` is a WRONG parse. The
-                    // atom reader cannot know where the CASE ends, so reject the
-                    // whole atom → v1 fallback (v1 parses `x = CASE ...` correctly).
-                    Tok::Implies | Tok::Iff if saw_case_operand => {
-                        return Err(
-                            "CASE operand would be sliced by =>/<=> → v1".to_string(),
-                        );
-                    }
                     // body-extending logical structure v2 owns
                     Tok::Implies
                     | Tok::Iff

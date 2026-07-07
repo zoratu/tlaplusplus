@@ -729,6 +729,55 @@ fn case_arm_implication_full_matches_v1() {
     assert_lower_matches_v1("CASE p -> a => b [] q -> c [] OTHER -> d");
 }
 
+// ===================== Phase 1.6: CASE conservatism (Codex gaps) =====================
+
+// Gap 1 (Codex): a malformed depth-0 OTHER segment — one that is NOT the exact
+// lone final `OTHER -> ...` arm — must NOT parse as a normal guard arm. Here
+// `OTHER /\ q -> b` would otherwise become an arm with guard `OTHER /\ q` (a
+// WRONG parse). Any depth-0 OTHER outside the unique final `OTHER ->` arm →
+// v1 fallback.
+#[test]
+fn case_malformed_other_guard_falls_back() {
+    assert_v2_rejects("CASE p -> a [] OTHER /\\ q -> b");
+}
+
+// Gap 1 (variant): a bare depth-0 OTHER that isn't followed by `->` at all.
+#[test]
+fn case_other_not_followed_by_arrow_falls_back() {
+    assert_v2_rejects("CASE p -> a [] OTHER b -> c");
+}
+
+// Gap 2 (Codex): a CASE that is a LEAF OPERAND whose arm result contains an
+// `IF ... THEN ... ELSE ...` must NOT be sliced by the atom reader — the
+// `IF`/`THEN`/`ELSE` belong INSIDE the arm. `x = CASE p -> IF q THEN a ELSE b
+// [] OTHER -> c` would otherwise absorb only `x = CASE p -> IF q THEN a ELSE b`
+// and mis-handle the rest. Reject → v1 fallback (v1 parses the whole thing).
+#[test]
+fn case_operand_sliced_by_if_falls_back() {
+    assert_v2_rejects("x = CASE p -> IF q THEN a ELSE b [] OTHER -> c");
+}
+
+// Gap 2 (variant): a CASE operand whose arm result contains a LET.
+#[test]
+fn case_operand_sliced_by_let_falls_back() {
+    assert_v2_rejects("x = CASE p -> LET z == a IN z [] OTHER -> c");
+}
+
+// Gap 2 (variant): a CASE operand whose arm result contains a quantifier.
+#[test]
+fn case_operand_sliced_by_forall_falls_back() {
+    assert_v2_rejects("x = CASE p -> \\A z \\in S : z [] OTHER -> c");
+}
+
+// Positive regression (Phase 1.5 fix-1 must NOT regress): a legit simple CASE
+// with an `=>` arm result still parses as ONE CASE (not sliced at the `=>`).
+#[test]
+fn case_arm_implies_still_one_case() {
+    let s = shape("CASE p -> a => b [] OTHER -> c");
+    assert!(s.starts_with("Case["), "CASE wrongly sliced at =>: {s}");
+    assert_lower_matches_v1("CASE p -> a => b [] OTHER -> c");
+}
+
 // ===================== Phase 1: CHOOSE =====================
 
 #[test]
