@@ -142,6 +142,62 @@ pub enum Expr {
     },
     /// A parenthesized expression (kept explicit so lowering can be exact).
     Paren { inner: Box<Expr>, span: Span },
+
+    // ---- Phase 1 containers (STRUCTURE owned by v2; every sub-expression
+    // recurses through `parse_expr`, so junctions/`=>`/quantifiers inside a
+    // container element are correctly fenced, while leaf operators stay in
+    // `Atom` children lowered by v1). Each variant lowers to the exact
+    // `CompiledExpr` shape v1 produces for the same construct. ----
+    /// Set enumeration `{a, b, c}` (possibly empty). Elements recurse.
+    SetEnum { items: Vec<Expr>, span: Span },
+    /// Set filter comprehension `{x \in S : P}` — single binder.
+    SetFilter {
+        var: String,
+        domain: Box<Expr>,
+        pred: Box<Expr>,
+        span: Span,
+    },
+    /// Set map comprehension `{e : x \in S}` — single binder.
+    SetMap {
+        var: String,
+        domain: Box<Expr>,
+        body: Box<Expr>,
+        span: Span,
+    },
+    /// Tuple / sequence literal `<<a, b, c>>` (possibly empty). Elements recurse.
+    Tuple { items: Vec<Expr>, span: Span },
+    /// Record literal `[a |-> e, b |-> f]`. Field values recurse.
+    RecordLit { fields: Vec<(String, Expr)>, span: Span },
+    /// Record set `[a : S, b : T]`. Field domains recurse.
+    RecordSet { fields: Vec<(String, Expr)>, span: Span },
+    /// Function set `[D -> R]`. Domain / range recurse.
+    FunctionSet {
+        domain: Box<Expr>,
+        range: Box<Expr>,
+        span: Span,
+    },
+    /// Function construction `[x \in S |-> e]` — single binder. Domain/body recurse.
+    FuncConstruct {
+        var: String,
+        domain: Box<Expr>,
+        body: Box<Expr>,
+        span: Span,
+    },
+    /// `CASE p1 -> e1 [] p2 -> e2 [] OTHER -> e3`. Guards / results recurse.
+    Case {
+        arms: Vec<(Expr, Expr)>,
+        other: Option<Box<Expr>>,
+        span: Span,
+    },
+    /// `CHOOSE x \in S : P` (bounded) or `CHOOSE x : P` (unbounded). Pred recurses.
+    Choose {
+        var: String,
+        /// `None` for the unbounded form `CHOOSE x : P`.
+        domain: Option<Box<Expr>>,
+        pred: Box<Expr>,
+        span: Span,
+    },
+
     /// An opaque leaf: text that v2 does not parse structurally. Lowered via the
     /// existing `compile_expr` so leaf semantics are unchanged.
     Atom { text: String, span: Span },
@@ -157,6 +213,16 @@ impl Expr {
             | Expr::Let { span, .. }
             | Expr::If { span, .. }
             | Expr::Paren { span, .. }
+            | Expr::SetEnum { span, .. }
+            | Expr::SetFilter { span, .. }
+            | Expr::SetMap { span, .. }
+            | Expr::Tuple { span, .. }
+            | Expr::RecordLit { span, .. }
+            | Expr::RecordSet { span, .. }
+            | Expr::FunctionSet { span, .. }
+            | Expr::FuncConstruct { span, .. }
+            | Expr::Case { span, .. }
+            | Expr::Choose { span, .. }
             | Expr::Atom { span, .. } => *span,
         }
     }
@@ -195,6 +261,54 @@ impl Expr {
                 format!("If({}, {}, {})", cond.shape(), then_.shape(), else_.shape())
             }
             Expr::Paren { inner, .. } => format!("({})", inner.shape()),
+            Expr::SetEnum { items, .. } => {
+                let inner: Vec<String> = items.iter().map(|i| i.shape()).collect();
+                format!("SetEnum{{{}}}", inner.join(", "))
+            }
+            Expr::SetFilter { var, domain, pred, .. } => {
+                format!("SetFilter({}\\in {} : {})", var, domain.shape(), pred.shape())
+            }
+            Expr::SetMap { var, domain, body, .. } => {
+                format!("SetMap({} : {}\\in {})", body.shape(), var, domain.shape())
+            }
+            Expr::Tuple { items, .. } => {
+                let inner: Vec<String> = items.iter().map(|i| i.shape()).collect();
+                format!("Tuple<<{}>>", inner.join(", "))
+            }
+            Expr::RecordLit { fields, .. } => {
+                let fs: Vec<String> = fields
+                    .iter()
+                    .map(|(n, v)| format!("{}|->{}", n, v.shape()))
+                    .collect();
+                format!("Rec[{}]", fs.join(", "))
+            }
+            Expr::RecordSet { fields, .. } => {
+                let fs: Vec<String> = fields
+                    .iter()
+                    .map(|(n, v)| format!("{}:{}", n, v.shape()))
+                    .collect();
+                format!("RecSet[{}]", fs.join(", "))
+            }
+            Expr::FunctionSet { domain, range, .. } => {
+                format!("FnSet[{} -> {}]", domain.shape(), range.shape())
+            }
+            Expr::FuncConstruct { var, domain, body, .. } => {
+                format!("FnCon[{}\\in {} |-> {}]", var, domain.shape(), body.shape())
+            }
+            Expr::Case { arms, other, .. } => {
+                let as_: Vec<String> = arms
+                    .iter()
+                    .map(|(g, r)| format!("{} -> {}", g.shape(), r.shape()))
+                    .collect();
+                match other {
+                    Some(o) => format!("Case[{} [] OTHER -> {}]", as_.join(" [] "), o.shape()),
+                    None => format!("Case[{}]", as_.join(" [] ")),
+                }
+            }
+            Expr::Choose { var, domain, pred, .. } => match domain {
+                Some(d) => format!("Choose({}\\in {} : {})", var, d.shape(), pred.shape()),
+                None => format!("Choose({} : {})", var, pred.shape()),
+            },
             Expr::Atom { text, .. } => format!("Atom({:?})", text.trim()),
         }
     }

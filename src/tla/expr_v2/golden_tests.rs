@@ -11,6 +11,32 @@ fn shape(src: &str) -> String {
     }
 }
 
+/// Assert that v2 lowers `src` to EXACTLY the same `CompiledExpr` as v1's
+/// `compile_expr_v1` — the shadow-compare fidelity bar for a construct we lower
+/// structurally. (v2 must both PARSE it and lower it identically to v1.)
+fn assert_lower_matches_v1(src: &str) {
+    use crate::tla::compiled_expr::compile_expr_v1;
+    let v1 = compile_expr_v1(src);
+    let v2 = super::parse_and_lower(src)
+        .unwrap_or_else(|e| panic!("v2 failed to parse {src:?}: {e}"));
+    assert_eq!(
+        format!("{v1:?}"),
+        format!("{v2:?}"),
+        "v2 lowering diverged from v1 for {src:?}"
+    );
+}
+
+/// Assert v2 REJECTS `src` (→ v1 fallback). Used for shapes v1 lowers to
+/// `Unparsed`/temporal forms that v2 deliberately does not model.
+fn assert_v2_rejects(src: &str) {
+    let r = parse_ast(src);
+    assert!(
+        r.is_err(),
+        "expected v2 to reject {src:?} (→ v1 fallback), got: {:?}",
+        r.map(|e| e.shape())
+    );
+}
+
 // 1. `P => LET X == v IN /\ Q /\ R` — the consequent is the WHOLE LET (with its
 //    junction), NOT `And([Implies(P, LET..Q), R])`.
 #[test]
@@ -393,4 +419,196 @@ fn unterminated_block_comment_rejects() {
         "unterminated block comment must reject (→ v1 fallback), got: {:?}",
         r.map(|e| e.shape())
     );
+}
+
+// ===================== Phase 1: comment COLUMN preservation ===================
+
+// A single-line block comment must be replaced by whitespace of the SAME width
+// so a token AFTER it on the same line keeps its column (Codex carry-over).
+#[test]
+fn atom_block_comment_preserves_trailing_column() {
+    use super::parser;
+    // `A (* c *) => B` — after stripping, the `=>` (owned by v2) still splits;
+    // the atom `A` text keeps `A` at column 0. Confirm the `(* c *)` region is
+    // replaced by spaces (width 7), not a single space, by checking the atom
+    // text length is preserved to the `=>`.
+    let s = shape("A (* cc *) => B");
+    assert!(s.starts_with("Implies(Atom(\"A\")"), "got: {s}");
+    // Directly exercise strip: the stripped text has no comment body and the
+    // column of the next non-space char after the comment is unchanged.
+    let stripped = parser::strip_comments_for_test("xx(* comment *)yy");
+    // "xx" + 13 spaces (width of "(* comment *)") + "yy"
+    assert_eq!(stripped, "xx             yy", "got {stripped:?}");
+}
+
+// ===================== Phase 1: SETS =====================
+
+#[test]
+fn set_enum_basic() {
+    assert_eq!(shape("{1, 2, 3}"), "SetEnum{Atom(\"1\"), Atom(\"2\"), Atom(\"3\")}");
+    assert_lower_matches_v1("{1, 2, 3}");
+}
+
+#[test]
+fn set_enum_empty() {
+    assert_eq!(shape("{}"), "SetEnum{}");
+    assert_lower_matches_v1("{}");
+}
+
+#[test]
+fn set_filter_form() {
+    assert_eq!(shape("{x \\in S : x > 0}"), "SetFilter(x\\in Atom(\"S\") : Atom(\"x > 0\"))");
+    assert_lower_matches_v1("{x \\in S : x > 0}");
+}
+
+#[test]
+fn set_map_form() {
+    assert_eq!(shape("{x + 1 : x \\in S}"), "SetMap(Atom(\"x + 1\") : x\\in Atom(\"S\"))");
+    assert_lower_matches_v1("{x + 1 : x \\in S}");
+}
+
+// A junction INSIDE a set element must be fenced by v2 (not flattened).
+#[test]
+fn set_element_junction_fenced() {
+    let s = shape("{IF a THEN b ELSE c, d}");
+    assert!(s.starts_with("SetEnum{If("), "got: {s}");
+    assert!(s.ends_with(", Atom(\"d\")}"), "got: {s}");
+}
+
+// A set that is an OPERAND of a leaf operator must NOT be parsed structurally —
+// it stays a single Atom for v1 (so v2 doesn't strand the `\union`).
+#[test]
+fn set_operand_of_leaf_stays_atom() {
+    let s = shape("{1, 2} \\union {3}");
+    assert!(s.starts_with("Atom("), "set operand of \\union should be atom: {s}");
+    assert_lower_matches_v1("{1, 2} \\union {3}");
+}
+
+// ===================== Phase 1: TUPLES =====================
+
+#[test]
+fn tuple_basic() {
+    assert_eq!(shape("<<a, b, c>>"), "Tuple<<Atom(\"a\"), Atom(\"b\"), Atom(\"c\")>>");
+    assert_lower_matches_v1("<<a, b, c>>");
+}
+
+#[test]
+fn tuple_empty() {
+    assert_eq!(shape("<<>>"), "Tuple<<>>");
+    assert_lower_matches_v1("<<>>");
+}
+
+#[test]
+fn tuple_nested() {
+    assert_lower_matches_v1("<<1, <<2, 3>>, 4>>");
+}
+
+// A tuple as a leaf operand stays an atom (with its commas intact).
+#[test]
+fn tuple_operand_stays_atom() {
+    // `<<a, b>> = <<c>>` — the whole thing is one atom for v1.
+    let s = shape("<<a, b>> = <<c>>");
+    assert!(s.starts_with("Atom("), "got: {s}");
+    assert!(s.contains(","), "tuple commas must survive in the atom: {s}");
+    assert_lower_matches_v1("<<a, b>> = <<c>>");
+}
+
+// ===================== Phase 1: [...] family =====================
+
+#[test]
+fn record_literal_basic() {
+    assert_eq!(
+        shape("[a |-> 1, b |-> 2]"),
+        "Rec[a|->Atom(\"1\"), b|->Atom(\"2\")]"
+    );
+    assert_lower_matches_v1("[a |-> 1, b |-> 2]");
+}
+
+#[test]
+fn record_set_basic() {
+    assert_eq!(shape("[a : S, b : T]"), "RecSet[a:Atom(\"S\"), b:Atom(\"T\")]");
+    assert_lower_matches_v1("[a : S, b : T]");
+}
+
+#[test]
+fn function_set_basic() {
+    assert_eq!(shape("[S -> T]"), "FnSet[Atom(\"S\") -> Atom(\"T\")]");
+    assert_lower_matches_v1("[S -> T]");
+}
+
+#[test]
+fn function_construct_basic() {
+    assert_eq!(
+        shape("[x \\in S |-> x + 1]"),
+        "FnCon[x\\in Atom(\"S\") |-> Atom(\"x + 1\")]"
+    );
+    assert_lower_matches_v1("[x \\in S |-> x + 1]");
+}
+
+// A junction inside a record VALUE is fenced by v2.
+#[test]
+fn record_value_junction_fenced() {
+    let s = shape("[ok |-> /\\ A\n            /\\ B, n |-> 0]");
+    assert!(s.starts_with("Rec[ok|->AND["), "got: {s}");
+}
+
+// EXCEPT is left to v1 (Err → fallback), never mis-lowered.
+#[test]
+fn except_rejects_to_v1() {
+    assert_v2_rejects("[f EXCEPT ![k] = v]");
+    assert_v2_rejects("[f EXCEPT !.field = w]");
+}
+
+// Action / stuttering box `[A]_v` is not modeled by v2 → fallback.
+#[test]
+fn action_box_rejects_to_v1() {
+    assert_v2_rejects("[Next]_vars");
+    assert_v2_rejects("[A]_v");
+}
+
+// A bracket that is an operand of a leaf op stays an atom.
+#[test]
+fn bracket_operand_stays_atom() {
+    let s = shape("[a |-> 1].a");
+    assert!(s.starts_with("Atom("), "record access should stay atom: {s}");
+    assert_lower_matches_v1("[a |-> 1].a");
+}
+
+// ===================== Phase 1: CASE =====================
+
+#[test]
+fn case_basic() {
+    assert_lower_matches_v1("CASE p -> e [] q -> f");
+}
+
+#[test]
+fn case_with_other() {
+    assert_lower_matches_v1("CASE p -> e [] q -> f [] OTHER -> g");
+}
+
+// A junction inside a CASE arm result is fenced by v2.
+#[test]
+fn case_arm_junction_fenced() {
+    let s = shape("CASE p -> /\\ A\n          /\\ B [] OTHER -> c");
+    assert!(s.contains("-> AND["), "case arm junction not fenced: {s}");
+}
+
+// ===================== Phase 1: CHOOSE =====================
+
+#[test]
+fn choose_bounded() {
+    assert_eq!(shape("CHOOSE x \\in S : x > 0"), "Choose(x\\in Atom(\"S\") : Atom(\"x > 0\"))");
+    assert_lower_matches_v1("CHOOSE x \\in S : x > 0");
+}
+
+// Unbounded CHOOSE is Unparsed in v1 → v2 falls back rather than mis-lower.
+#[test]
+fn choose_unbounded_rejects() {
+    assert_v2_rejects("CHOOSE x : P(x)");
+}
+
+// Tuple-binder CHOOSE is Unparsed in v1 → v2 falls back.
+#[test]
+fn choose_tuple_binder_rejects() {
+    assert_v2_rejects("CHOOSE <<a, b>> \\in S : a > b");
 }

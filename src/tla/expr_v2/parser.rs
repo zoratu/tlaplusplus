@@ -343,8 +343,191 @@ impl<'a> Parser<'a> {
             Tok::Let => self.parse_let(stop),
             Tok::If => self.parse_if(stop),
             Tok::LParen => self.parse_paren(stop),
+            // ---- Phase 1 containers ----
+            // Each is attempted STRUCTURALLY only when the container is a
+            // "standalone" prefix — i.e. after its balanced span the next token
+            // is a v2 boundary (a stop bullet / hard terminator / EOF, or a
+            // v2-owned `=>`/`<=>`). If instead a LEAF operator follows (e.g.
+            // `{1,2} \union {3}`, `<<a>>[1]`, `r.field`), v2 does NOT own that
+            // operator, so a structural container prefix would strand it → a
+            // trailing-token error. In that case we fall through to `parse_atom`,
+            // which absorbs the WHOLE expression (container + trailing leaf ops)
+            // as one Atom for v1 to lower — identical to v1's own parse.
+            Tok::LBrace if self.container_is_standalone(stop, Tok::LBrace, Tok::RBrace) => {
+                self.parse_set(stop)
+            }
+            Tok::Other(s) if s == "<<" && self.tuple_is_standalone(stop) => {
+                self.parse_tuple(stop)
+            }
+            Tok::LBracket if self.container_is_standalone(stop, Tok::LBracket, Tok::RBracket) => {
+                self.parse_bracket(stop)
+            }
+            Tok::Choose => self.parse_choose(stop),
+            Tok::Ident(w) if w == "CASE" && self.case_is_standalone(stop) => {
+                self.parse_case(stop)
+            }
             _ => self.parse_atom(stop),
         }
+    }
+
+    // ======================= Phase 1 containers =========================
+
+    /// Scan forward from the current `open` token to its matching `close`,
+    /// tracking `()[]{}` and `<<`/`>>` depth, and return the token index just
+    /// AFTER the matching close (or `None` if unbalanced). Used by the
+    /// `*_is_standalone` predicates and by the container element scanners.
+    fn matching_close_index(&self, open: Tok, close: Tok) -> Option<usize> {
+        let mut i = self.pos;
+        let mut depth: i32 = 0;
+        while i < self.toks.len() {
+            let k = &self.toks[i].kind;
+            match k {
+                Tok::Eof => return None,
+                _ if *k == open => depth += 1,
+                _ if *k == close => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i + 1);
+                    }
+                }
+                // Nested brackets of a DIFFERENT kind still need balancing so a
+                // `}` inside `[..]` (or vice versa) doesn't fool us.
+                Tok::LParen | Tok::LBracket | Tok::LBrace if *k != open => {
+                    // balance this nested group opaquely
+                    if let Some(j) = self.balanced_from(i) {
+                        i = j;
+                        continue;
+                    } else {
+                        return None;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Return the token index just after the balanced bracket group that STARTS
+    /// at token index `i` (whose kind must be one of `(`/`[`/`{`). `<<`/`>>`
+    /// are also tracked as a pair. Returns `None` if unbalanced.
+    fn balanced_from(&self, i: usize) -> Option<usize> {
+        let mut depth: i32 = 0;
+        let mut j = i;
+        while j < self.toks.len() {
+            match &self.toks[j].kind {
+                Tok::Eof => return None,
+                Tok::LParen | Tok::LBracket | Tok::LBrace => depth += 1,
+                Tok::RParen | Tok::RBracket | Tok::RBrace => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(j + 1);
+                    }
+                }
+                Tok::Other(s) if s == "<<" => depth += 1,
+                Tok::Other(s) if s == ">>" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(j + 1);
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        None
+    }
+
+    /// Is the token at index `idx` a v2-owned boundary — i.e. something after
+    /// which a structural container prefix is complete and nothing v2 doesn't
+    /// own is stranded? A boundary is: EOF, a hard terminator in `stop`, a stop
+    /// bullet at the fence, or a v2-owned logical operator (`=>`/`<=>`). Any
+    /// OTHER trailing token (a leaf operator, `.field`, `[`, function-apply,
+    /// etc.) means the container is an OPERAND and must be absorbed as an atom.
+    fn is_v2_boundary_at(&self, idx: usize, stop: &Stop) -> bool {
+        let t = &self.toks[idx.min(self.toks.len() - 1)];
+        match &t.kind {
+            Tok::Eof | Tok::Implies | Tok::Iff => true,
+            k if stop.hard_terms.iter().any(|h| h == k) => true,
+            Tok::AndBullet | Tok::OrBullet => {
+                if let Some(col) = stop.bullet_fence_col {
+                    t.had_newline_before && t.span.start_col <= col
+                } else {
+                    // No fence: a following bullet begins a NEW junction that
+                    // would consume the container as its first item — not a clean
+                    // boundary, so treat as non-standalone (absorb as atom).
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
+    fn container_is_standalone(&self, stop: &Stop, open: Tok, close: Tok) -> bool {
+        match self.matching_close_index(open, close) {
+            Some(after) => self.is_v2_boundary_at(after, stop),
+            None => false,
+        }
+    }
+
+    fn tuple_is_standalone(&self, stop: &Stop) -> bool {
+        // Balance `<<` .. `>>` starting at the current token.
+        let mut i = self.pos;
+        let mut depth: i32 = 0;
+        while i < self.toks.len() {
+            match &self.toks[i].kind {
+                Tok::Eof => return false,
+                Tok::Other(s) if s == "<<" => depth += 1,
+                Tok::Other(s) if s == ">>" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return self.is_v2_boundary_at(i + 1, stop);
+                    }
+                }
+                Tok::LParen | Tok::LBracket | Tok::LBrace => {
+                    if let Some(j) = self.balanced_from(i) {
+                        i = j;
+                        continue;
+                    }
+                    return false;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
+    fn case_is_standalone(&self, stop: &Stop) -> bool {
+        // A CASE runs from `CASE` to the enclosing v2 boundary; unlike bracketed
+        // containers it has no explicit closer. Scan forward, respecting bracket
+        // depth, and stop at the first depth-0 v2 boundary; a CASE is standalone
+        // iff that boundary is a clean one (it always is, since the scan itself
+        // ends at a boundary). We simply require that the scan finds SOME arm
+        // structure (`->`) before the boundary; `parse_case` re-validates.
+        let mut i = self.pos + 1; // skip CASE
+        let mut depth: i32 = 0;
+        let mut saw_arrow = false;
+        while i < self.toks.len() {
+            let t = &self.toks[i];
+            match &t.kind {
+                Tok::Eof => break,
+                Tok::LParen | Tok::LBracket | Tok::LBrace => depth += 1,
+                Tok::RParen | Tok::RBracket | Tok::RBrace => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                Tok::Other(s) if s == "<<" => depth += 1,
+                Tok::Other(s) if s == ">>" => depth -= 1,
+                Tok::Other(s) if s == "->" && depth == 0 => saw_arrow = true,
+                _ if depth == 0 && self.is_v2_boundary_at(i, stop) => break,
+                _ => {}
+            }
+            i += 1;
+        }
+        saw_arrow
     }
 
     /// Parse a bulleted junction: bullets aligned at the column of the FIRST
@@ -769,6 +952,613 @@ impl<'a> Parser<'a> {
         })
     }
 
+    // ---- container element helpers ----
+
+    /// Return `true` iff the token at index `i` (which must be inside the
+    /// current container at bracket-depth 0 relative to the container's open)
+    /// is a top-level occurrence of `needle` for the purpose of splitting.
+    /// Callers scan the token range explicitly instead; this documents intent.
+    ///
+    /// Scan the container interior from `self.pos` (just AFTER the opener) up to
+    /// (but not including) the token index `end_excl` (the closer), and return
+    /// the token indices of every DEPTH-0 top-level occurrence of a token kind
+    /// matched by `pred`. Depth tracks `()[]{}` and `<<`/`>>`.
+    fn top_level_positions<F: Fn(&Tok) -> bool>(&self, end_excl: usize, pred: F) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut i = self.pos;
+        let mut depth: i32 = 0;
+        while i < end_excl {
+            match &self.toks[i].kind {
+                Tok::LParen | Tok::LBracket | Tok::LBrace => depth += 1,
+                Tok::RParen | Tok::RBracket | Tok::RBrace => depth -= 1,
+                Tok::Other(s) if s == "<<" => depth += 1,
+                Tok::Other(s) if s == ">>" => depth -= 1,
+                k if depth == 0 && pred(k) => out.push(i),
+                _ => {}
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// Parse a sub-expression occupying the token range `[self.pos, end_excl)`
+    /// EXACTLY (the caller has already located the boundaries). Consumes tokens
+    /// up to `end_excl`; errors if the sub-parse leaves tokens before `end_excl`.
+    /// A temporary barrier at `end_excl` fences the inner `parse_expr` so any
+    /// junction/`=>` inside is correctly scoped to this element.
+    fn parse_subexpr_until(&mut self, end_excl: usize) -> PResult<Expr> {
+        if self.pos >= end_excl {
+            return Err("empty container sub-expression".to_string());
+        }
+        let saved = self.barrier;
+        self.barrier = end_excl.min(saved);
+        let inner_stop = Stop::top();
+        let e = self.parse_expr(&inner_stop);
+        self.barrier = saved;
+        let e = e?;
+        if self.pos != end_excl {
+            return Err(format!(
+                "container sub-expression did not consume its full range \
+                 (at {:?})",
+                self.peek_kind()
+            ));
+        }
+        Ok(e)
+    }
+
+    /// Set: `{a, b, c}` (enum), `{x \in S : P}` (filter), `{e : x \in S}` (map).
+    fn parse_set(&mut self, _outer: &Stop) -> PResult<Expr> {
+        let open = self.advance(); // {
+        let close_idx = self
+            .matching_close_index_from(self.pos - 1, Tok::LBrace, Tok::RBrace)
+            .ok_or_else(|| "unbalanced '{'".to_string())?;
+        let closer = close_idx - 1; // index of the `}`
+
+        // Empty set.
+        if self.pos == closer {
+            let close = self.advance();
+            return Ok(Expr::SetEnum {
+                items: Vec::new(),
+                span: open.span.merge(close.span),
+            });
+        }
+
+        // A top-level `:` distinguishes a comprehension from an enumeration.
+        let colons = self.top_level_positions(closer, |k| matches!(k, Tok::Colon));
+        if let Some(&colon_i) = colons.first() {
+            // Exactly one top-level colon → comprehension; more than one is an
+            // ambiguous/unsupported shape → fall back (atom).
+            if colons.len() != 1 {
+                return Err("multi-colon set shape unsupported by v2".to_string());
+            }
+            // Try FILTER form `{ x \in S : P }` — left side is a single binder.
+            if let Some((var, dom_start, dom_end)) = self.match_single_in_binding(self.pos, colon_i)
+            {
+                // pred = tokens (colon_i, closer)
+                let domain = {
+                    // re-scan domain sub-range
+                    self.pos = dom_start;
+                    self.parse_subexpr_until(dom_end)?
+                };
+                // Move to just after the colon for the predicate.
+                self.pos = colon_i + 1;
+                let pred = self.parse_subexpr_until(closer)?;
+                let close = self.advance(); // }
+                return Ok(Expr::SetFilter {
+                    var,
+                    domain: Box::new(domain),
+                    pred: Box::new(pred),
+                    span: open.span.merge(close.span),
+                });
+            }
+            // Otherwise MAP form `{ e : x \in S }` — right side is a binder.
+            if let Some((var, dom_start, dom_end)) =
+                self.match_single_in_binding(colon_i + 1, closer)
+            {
+                // body = tokens (self.pos, colon_i)
+                let body = self.parse_subexpr_until(colon_i)?;
+                // domain sub-range
+                self.pos = dom_start;
+                let domain = self.parse_subexpr_until(dom_end)?;
+                debug_assert_eq!(dom_end, closer);
+                self.pos = closer;
+                let close = self.advance(); // }
+                return Ok(Expr::SetMap {
+                    var,
+                    domain: Box::new(domain),
+                    body: Box::new(body),
+                    span: open.span.merge(close.span),
+                });
+            }
+            // Neither single-binder form (e.g. multi-binder `{<<k,v>>: k \in K,
+            // v \in V}`): v1 defers these to Unparsed, so we must NOT lower a
+            // partial structure → fall back to atom.
+            return Err("multi/tuple-binder comprehension unsupported by v2".to_string());
+        }
+
+        // Enumeration `{a, b, c}`: split on top-level commas.
+        let commas = self.top_level_positions(closer, |k| matches!(k, Tok::Comma));
+        let items = self.parse_comma_elements(closer, &commas)?;
+        let close = self.advance(); // }
+        Ok(Expr::SetEnum {
+            items,
+            span: open.span.merge(close.span),
+        })
+    }
+
+    /// Tuple / sequence literal `<<a, b, c>>`.
+    fn parse_tuple(&mut self, _outer: &Stop) -> PResult<Expr> {
+        let open = self.advance(); // <<
+        // find matching >> (depth over << >> and ()[]{})
+        let closer = {
+            let mut i = self.pos;
+            let mut depth: i32 = 0;
+            let mut found = None;
+            while i < self.toks.len() {
+                match &self.toks[i].kind {
+                    Tok::Eof => break,
+                    Tok::Other(s) if s == "<<" => depth += 1,
+                    Tok::Other(s) if s == ">>" => {
+                        if depth == 0 {
+                            found = Some(i);
+                            break;
+                        }
+                        depth -= 1;
+                    }
+                    Tok::LParen | Tok::LBracket | Tok::LBrace => depth += 1,
+                    Tok::RParen | Tok::RBracket | Tok::RBrace => depth -= 1,
+                    _ => {}
+                }
+                i += 1;
+            }
+            found.ok_or_else(|| "unbalanced '<<'".to_string())?
+        };
+
+        if self.pos == closer {
+            let close = self.advance(); // >>
+            return Ok(Expr::Tuple {
+                items: Vec::new(),
+                span: open.span.merge(close.span),
+            });
+        }
+        let commas = self.top_level_positions(closer, |k| matches!(k, Tok::Comma));
+        let items = self.parse_comma_elements(closer, &commas)?;
+        let close = self.advance(); // >>
+        Ok(Expr::Tuple {
+            items,
+            span: open.span.merge(close.span),
+        })
+    }
+
+    /// Given the closer index and the token indices of top-level commas, parse
+    /// each comma-separated element as a full sub-expression. `self.pos` must be
+    /// at the first element token; on return it is at `closer`.
+    fn parse_comma_elements(
+        &mut self,
+        closer: usize,
+        commas: &[usize],
+    ) -> PResult<Vec<Expr>> {
+        let mut items = Vec::new();
+        let mut bounds: Vec<usize> = Vec::with_capacity(commas.len() + 1);
+        bounds.extend_from_slice(commas);
+        bounds.push(closer);
+        for &end in &bounds {
+            let e = self.parse_subexpr_until(end)?;
+            items.push(e);
+            // Skip the comma (if we're at one).
+            if self.pos < closer && matches!(self.peek_kind(), Tok::Comma) {
+                self.advance();
+            }
+        }
+        Ok(items)
+    }
+
+    /// Match a single `x \in S` binder occupying the token range `[start, end)`:
+    /// an identifier, then `\in`, then a non-empty domain. Returns the var name
+    /// plus the domain token range `(var, dom_start, dom_end=end)`. Returns
+    /// `None` for tuple binders, multi-binders (a comma or a second `\in` in the
+    /// range), or any non-single-binder shape — the caller then falls back.
+    fn match_single_in_binding(&self, start: usize, end: usize) -> Option<(String, usize, usize)> {
+        // Must start with an identifier.
+        let name = match &self.toks[start].kind {
+            Tok::Ident(n) => n.clone(),
+            _ => return None,
+        };
+        // Next token must be `\in`.
+        if start + 1 >= end || !matches!(self.toks[start + 1].kind, Tok::ElemOf) {
+            return None;
+        }
+        let dom_start = start + 2;
+        if dom_start >= end {
+            return None; // empty domain
+        }
+        // Reject multi-binder / extra `\in` / top-level comma inside the range.
+        let mut i = dom_start;
+        let mut depth: i32 = 0;
+        while i < end {
+            match &self.toks[i].kind {
+                Tok::LParen | Tok::LBracket | Tok::LBrace => depth += 1,
+                Tok::RParen | Tok::RBracket | Tok::RBrace => depth -= 1,
+                Tok::Other(s) if s == "<<" => depth += 1,
+                Tok::Other(s) if s == ">>" => depth -= 1,
+                Tok::ElemOf | Tok::Comma if depth == 0 => return None,
+                _ => {}
+            }
+            i += 1;
+        }
+        Some((name, dom_start, end))
+    }
+
+    /// Like `matching_close_index` but starting from an explicit opener index.
+    fn matching_close_index_from(&self, open_idx: usize, open: Tok, close: Tok) -> Option<usize> {
+        let mut i = open_idx;
+        let mut depth: i32 = 0;
+        while i < self.toks.len() {
+            let k = &self.toks[i].kind;
+            match k {
+                Tok::Eof => return None,
+                _ if *k == open => depth += 1,
+                _ if *k == close => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i + 1);
+                    }
+                }
+                Tok::LParen | Tok::LBracket | Tok::LBrace if *k != open => {
+                    if let Some(j) = self.balanced_from(i) {
+                        i = j;
+                        continue;
+                    }
+                    return None;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// The `[...]` family dispatch. Decides — by looking INSIDE the brackets at
+    /// top level — which of the six forms this is:
+    ///   * `]_v` suffix  → action/stuttering box `[A]_v` → NOT a data bracket;
+    ///     v2 does not model temporal structure, so ABSORB as atom (Err → v1).
+    ///   * ` EXCEPT `    → `[f EXCEPT ![k] = v]` → absorb as atom (Err → v1):
+    ///     the EXCEPT update-path grammar is intricate; v1 lowers it faithfully.
+    ///   * `|->`         → record literal `[a |-> e, ...]` (structural).
+    ///   * top-level `->`→ function set `[D -> R]` (structural).
+    ///   * `x \in S |->` → function construct — handled under `|->` branch.
+    ///   * top-level `:` → record set `[a : S, ...]` (structural).
+    /// Anything else → Err → atom fallback.
+    fn parse_bracket(&mut self, _outer: &Stop) -> PResult<Expr> {
+        let open_idx = self.pos;
+        let close_idx = self
+            .matching_close_index_from(open_idx, Tok::LBracket, Tok::RBracket)
+            .ok_or_else(|| "unbalanced '['".to_string())?;
+        let closer = close_idx - 1; // index of `]`
+        // pos is at `[`; interior is (open_idx+1 .. closer).
+        self.advance(); // consume `[`
+        let interior_start = self.pos;
+
+        if interior_start == closer {
+            // Empty `[]` — not a data bracket (it's the temporal box / CASE
+            // separator handled elsewhere). Absorb as atom.
+            return Err("empty '[]' not a data bracket".to_string());
+        }
+
+        // Action box `[A]_v`: the `]` is immediately followed by `_`. In our
+        // lexer `_` is an ident-continue, so `]_v` tokenizes the `_v` as part of
+        // the following ident. Detect: token right after `]` is an Ident that
+        // starts with `_`, OR an `Other("_")`. Either way → temporal → atom.
+        if let Some(tafter) = self.toks.get(close_idx) {
+            let is_subscript = match &tafter.kind {
+                Tok::Ident(s) => s.starts_with('_'),
+                Tok::Other(s) => s == "_",
+                _ => false,
+            } && !tafter.had_newline_before
+                && tafter.span.start == self.toks[closer].span.end;
+            if is_subscript {
+                return Err("action box [A]_v not modeled by v2".to_string());
+            }
+        }
+
+        // EXCEPT keyword at top level → atom fallback.
+        {
+            let except = self.top_level_positions(closer, |k| match k {
+                Tok::Ident(s) => s == "EXCEPT",
+                _ => false,
+            });
+            if !except.is_empty() {
+                return Err("EXCEPT bracket lowered by v1".to_string());
+            }
+        }
+
+        // `|->` present at top level → record literal OR function construct.
+        let mapsto = self.top_level_positions(closer, |k| matches!(k, Tok::MapsTo));
+        if !mapsto.is_empty() {
+            // Function construct `[x \in S |-> e]` has exactly one `|->` and a
+            // single-binder left side. Otherwise a record literal.
+            if mapsto.len() == 1 {
+                let m = mapsto[0];
+                if let Some((var, dom_start, dom_end)) =
+                    self.match_single_in_binding(interior_start, m)
+                {
+                    self.pos = dom_start;
+                    let domain = self.parse_subexpr_until(dom_end)?;
+                    self.pos = m + 1;
+                    let body = self.parse_subexpr_until(closer)?;
+                    let close = self.advance(); // ]
+                    return Ok(Expr::FuncConstruct {
+                        var,
+                        domain: Box::new(domain),
+                        body: Box::new(body),
+                        span: self.toks[open_idx].span.merge(close.span),
+                    });
+                }
+            }
+            // Record literal `[a |-> e, b |-> f]`.
+            return self.parse_record_literal(open_idx, closer, &mapsto);
+        }
+
+        // Top-level `->` (not `|->`, already handled) → function set `[D -> R]`.
+        let arrows = self.top_level_arrow_positions(closer);
+        if let Some(&a) = arrows.first() {
+            if arrows.len() != 1 {
+                return Err("multi-arrow function set unsupported by v2".to_string());
+            }
+            let domain = self.parse_subexpr_until(a)?;
+            self.pos = a + 1;
+            let range = self.parse_subexpr_until(closer)?;
+            let close = self.advance(); // ]
+            return Ok(Expr::FunctionSet {
+                domain: Box::new(domain),
+                range: Box::new(range),
+                span: self.toks[open_idx].span.merge(close.span),
+            });
+        }
+
+        // Top-level `:` → record set `[a : S, b : T]`.
+        let colons = self.top_level_positions(closer, |k| matches!(k, Tok::Colon));
+        if !colons.is_empty() {
+            return self.parse_record_set(open_idx, closer, &colons);
+        }
+
+        // Anything else in `[...]` (e.g. `[f]`-shaped, function apply, etc.) is
+        // not a v2-modeled bracket form → absorb as atom.
+        Err("unrecognized '[...]' shape for v2".to_string())
+    }
+
+    /// Top-level `->` positions inside a bracket interior, ignoring `|->`.
+    fn top_level_arrow_positions(&self, end_excl: usize) -> Vec<usize> {
+        // `->` tokenizes as `Tok::Other("->")`; `|->` is a distinct `Tok::MapsTo`.
+        self.top_level_positions(end_excl, |k| match k {
+            Tok::Other(s) => s == "->",
+            _ => false,
+        })
+    }
+
+    /// Record literal from the `|->` positions. Each field is
+    /// `name |-> value`; the name must be a single identifier immediately
+    /// before its `|->`. `self.pos` is at the first interior token; on return
+    /// it is at `closer`.
+    fn parse_record_literal(
+        &mut self,
+        open_idx: usize,
+        closer: usize,
+        mapsto: &[usize],
+    ) -> PResult<Expr> {
+        // Split the interior into comma-separated field entries, then within
+        // each entry find its `|->`.
+        let commas = self.top_level_positions(closer, |k| matches!(k, Tok::Comma));
+        let mut entry_bounds: Vec<usize> = Vec::with_capacity(commas.len() + 1);
+        entry_bounds.extend_from_slice(&commas);
+        entry_bounds.push(closer);
+        // Sanity: one `|->` per entry.
+        if mapsto.len() != entry_bounds.len() {
+            return Err("record literal field/|-> count mismatch".to_string());
+        }
+        let mut fields = Vec::new();
+        for (idx, &entry_end) in entry_bounds.iter().enumerate() {
+            let entry_start = self.pos;
+            let m = mapsto[idx];
+            if m <= entry_start || m >= entry_end {
+                return Err("malformed record field".to_string());
+            }
+            // Field name: the tokens [entry_start, m) must be a single ident.
+            if m - entry_start != 1 {
+                return Err("record field name is not a single identifier".to_string());
+            }
+            let name = match &self.toks[entry_start].kind {
+                Tok::Ident(n) => n.clone(),
+                _ => return Err("record field name not an identifier".to_string()),
+            };
+            self.pos = m + 1;
+            let value = self.parse_subexpr_until(entry_end)?;
+            fields.push((name, value));
+            if self.pos < closer && matches!(self.peek_kind(), Tok::Comma) {
+                self.advance();
+            }
+        }
+        if fields.is_empty() {
+            return Err("empty record literal".to_string());
+        }
+        let close = self.advance(); // ]
+        Ok(Expr::RecordLit {
+            fields,
+            span: self.toks[open_idx].span.merge(close.span),
+        })
+    }
+
+    /// Record set `[a : S, b : T]` from the top-level colon positions.
+    fn parse_record_set(
+        &mut self,
+        open_idx: usize,
+        closer: usize,
+        _colons: &[usize],
+    ) -> PResult<Expr> {
+        let commas = self.top_level_positions(closer, |k| matches!(k, Tok::Comma));
+        let mut entry_bounds: Vec<usize> = Vec::with_capacity(commas.len() + 1);
+        entry_bounds.extend_from_slice(&commas);
+        entry_bounds.push(closer);
+        let mut fields = Vec::new();
+        for &entry_end in &entry_bounds {
+            let entry_start = self.pos;
+            // Find the colon within this entry (must be exactly one at depth 0).
+            let entry_colons: Vec<usize> = self
+                .top_level_positions(entry_end, |k| matches!(k, Tok::Colon))
+                .into_iter()
+                .filter(|&c| c >= entry_start)
+                .collect();
+            if entry_colons.len() != 1 {
+                return Err("record set entry needs exactly one ':'".to_string());
+            }
+            let c = entry_colons[0];
+            // Field name: single ident in [entry_start, c).
+            if c - entry_start != 1 {
+                return Err("record set field name not a single identifier".to_string());
+            }
+            let name = match &self.toks[entry_start].kind {
+                Tok::Ident(n) => n.clone(),
+                _ => return Err("record set field name not an identifier".to_string()),
+            };
+            self.pos = c + 1;
+            let set_expr = self.parse_subexpr_until(entry_end)?;
+            fields.push((name, set_expr));
+            if self.pos < closer && matches!(self.peek_kind(), Tok::Comma) {
+                self.advance();
+            }
+        }
+        if fields.is_empty() {
+            return Err("empty record set".to_string());
+        }
+        let close = self.advance(); // ]
+        Ok(Expr::RecordSet {
+            fields,
+            span: self.toks[open_idx].span.merge(close.span),
+        })
+    }
+
+    /// `CHOOSE x \in S : P` (bounded, single non-tuple binder) or
+    /// `CHOOSE x : P` (unbounded). v1 lowers the UNBOUNDED form and any
+    /// TUPLE-binder form to `Unparsed`, so v2 falls back (Err → atom) for those
+    /// and only lowers the bounded single-binder `Choose`.
+    fn parse_choose(&mut self, outer: &Stop) -> PResult<Expr> {
+        let head = self.advance(); // CHOOSE
+        // Variable name.
+        let var = match self.peek_kind() {
+            Tok::Ident(n) => {
+                let n = n.clone();
+                self.advance();
+                n
+            }
+            // Tuple binder `<<a,b>>` or anything else → v1's Unparsed shape.
+            _ => return Err("CHOOSE non-identifier binder → v1".to_string()),
+        };
+        // Bounded form requires `\in Domain`.
+        if !matches!(self.peek_kind(), Tok::ElemOf) {
+            // Unbounded `CHOOSE x : P` — v1 returns Unparsed → fall back.
+            return Err("unbounded CHOOSE → v1".to_string());
+        }
+        self.advance(); // \in
+        let dom_stop = outer.with_hard(&[Tok::Colon]);
+        let domain = self.parse_expr(&dom_stop)?;
+        if !matches!(self.peek_kind(), Tok::Colon) {
+            return Err("expected ':' in CHOOSE".to_string());
+        }
+        self.advance(); // :
+        // Predicate extends with the caller's stop (maximal), like a quantifier.
+        let pred = self.parse_expr(outer)?;
+        let span = head.span.merge(pred.span());
+        Ok(Expr::Choose {
+            var,
+            domain: Some(Box::new(domain)),
+            pred: Box::new(pred),
+            span,
+        })
+    }
+
+    /// `CASE p1 -> e1 [] p2 -> e2 [] OTHER -> e3`. The `[]` is the arm
+    /// separator (context-sensitive: here it is NOT the temporal box). Arms and
+    /// results recurse. Lowers to `CompiledExpr::Case { arms, other }`.
+    fn parse_case(&mut self, outer: &Stop) -> PResult<Expr> {
+        let head = self.advance(); // CASE (an Ident)
+        // Determine the CASE extent: from here to the enclosing v2 boundary at
+        // depth 0.
+        let end_excl = {
+            let mut i = self.pos;
+            let mut depth: i32 = 0;
+            loop {
+                if i >= self.toks.len() {
+                    break i;
+                }
+                let t = &self.toks[i];
+                match &t.kind {
+                    Tok::Eof => break i,
+                    Tok::LParen | Tok::LBracket | Tok::LBrace => depth += 1,
+                    Tok::RParen | Tok::RBracket | Tok::RBrace => {
+                        if depth == 0 {
+                            break i;
+                        }
+                        depth -= 1;
+                    }
+                    Tok::Other(s) if s == "<<" => depth += 1,
+                    Tok::Other(s) if s == ">>" => depth -= 1,
+                    _ if depth == 0 && self.is_v2_boundary_at(i, outer) => break i,
+                    _ => {}
+                }
+                i += 1;
+            }
+        };
+
+        // Arm separators `[]` at depth 0 within [self.pos, end_excl).
+        let seps = self.top_level_positions(end_excl, |k| match k {
+            Tok::Other(s) => s == "[]",
+            _ => false,
+        });
+        // Build the arm-segment bounds.
+        let mut seg_starts = vec![self.pos];
+        for &s in &seps {
+            seg_starts.push(s + 1);
+        }
+        let mut seg_ends: Vec<usize> = seps.clone();
+        seg_ends.push(end_excl);
+
+        let mut arms: Vec<(Expr, Expr)> = Vec::new();
+        let mut other: Option<Box<Expr>> = None;
+
+        for (seg_start, seg_end) in seg_starts.into_iter().zip(seg_ends.into_iter()) {
+            self.pos = seg_start;
+            // An arm is `guard -> result`; find the depth-0 `->` in this segment.
+            let arrows: Vec<usize> = self
+                .top_level_positions(seg_end, |k| match k {
+                    Tok::Other(s) => s == "->",
+                    _ => false,
+                })
+                .into_iter()
+                .filter(|&a| a >= seg_start)
+                .collect();
+            let a = *arrows.first().ok_or_else(|| "CASE arm missing '->'".to_string())?;
+            // Is the guard `OTHER`?
+            let is_other = seg_start + 1 == a
+                && matches!(&self.toks[seg_start].kind, Tok::Ident(s) if s == "OTHER");
+            if is_other {
+                self.pos = a + 1;
+                let res = self.parse_subexpr_until(seg_end)?;
+                other = Some(Box::new(res));
+            } else {
+                let guard = self.parse_subexpr_until(a)?;
+                self.pos = a + 1;
+                let res = self.parse_subexpr_until(seg_end)?;
+                arms.push((guard, res));
+            }
+        }
+        if arms.is_empty() && other.is_none() {
+            return Err("empty CASE".to_string());
+        }
+        self.pos = end_excl;
+        let span = head.span.merge(self.toks[end_excl.saturating_sub(1)].span);
+        Ok(Expr::Case { arms, other, span })
+    }
+
     /// Parse an opaque atom: gather a run of leaf tokens (no structural keyword,
     /// no top-level junction/`=>`/`<=>` at the current fence) into a verbatim
     /// text slice, then wrap in `Atom`.
@@ -826,7 +1616,11 @@ impl<'a> Parser<'a> {
                 }
             }
             // Track bracket depth (so `f[a => b]`—rare—or `Op(x => y)` keep the
-            // inner operator inside the atom; also parenthesized groups).
+            // inner operator inside the atom; also parenthesized groups). `<<`
+            // and `>>` are ALSO tracked as a pair so a tuple `<<a, b>>` absorbed
+            // into an atom (when it is an operand, not a standalone prefix) keeps
+            // its interior commas from splitting the atom — v1 lowers the whole
+            // `SeqLiteral`.
             match &t.kind {
                 Tok::LParen | Tok::LBracket | Tok::LBrace => depth += 1,
                 Tok::RParen | Tok::RBracket | Tok::RBrace => {
@@ -834,6 +1628,12 @@ impl<'a> Parser<'a> {
                         break; // unbalanced closer belongs to an outer group
                     }
                     depth -= 1;
+                }
+                Tok::Other(s) if s == "<<" => depth += 1,
+                Tok::Other(s) if s == ">>" => {
+                    if depth > 0 {
+                        depth -= 1;
+                    }
                 }
                 _ => {}
             }
@@ -902,27 +1702,57 @@ fn strip_comments(s: &str) -> String {
         }
         // Nested block comment `(* ... *)`.
         if b[i] == b'(' && i + 1 < b.len() && b[i + 1] == b'*' {
+            // Column at which this comment's `(*` opens, measured (in CHARACTERS,
+            // skipping UTF-8 continuation bytes) from the last emitted newline in
+            // `out`. Needed so a SINGLE-LINE comment is replaced by whitespace of
+            // the SAME width, keeping the column of the next token on that line.
+            let start_col = {
+                let mut c = 0usize;
+                for &ob in out.iter().rev() {
+                    if ob == b'\n' {
+                        break;
+                    }
+                    if (ob & 0xC0) != 0x80 {
+                        c += 1;
+                    }
+                }
+                c
+            };
             i += 2;
             let mut depth = 1usize;
-            // Fix #3: a block comment may span newlines. Collapsing it to a single
-            // space would DESTROY line structure — the Atom text handed to v1
-            // would have fewer lines than the source the lexer saw, so v1's own
-            // layout-sensitive parsing could interpret the (now single-line)
-            // remainder differently. Preserve the newline COUNT: emit that many
-            // `\n` (plus a separating space) so line/column structure in the
-            // delegated Atom mirrors the source. String-literal contents are left
-            // untouched (handled above; the comment scan never enters strings).
+            // Fix #3 + Codex carry-over: a block comment may span newlines.
+            // Collapsing it to a single space would DESTROY line structure — the
+            // Atom text handed to v1 would have fewer lines than the source the
+            // lexer saw, so v1's own layout-sensitive parsing could interpret the
+            // (now single-line) remainder differently. AND collapsing the final
+            // line to a single space would shift the COLUMN of the next token on
+            // that line, which is equally layout-breaking. So we replace the
+            // comment with whitespace that preserves BOTH: emit the interior
+            // newlines, then pad the final-line portion with spaces to the exact
+            // column width the comment occupied on its LAST line (from the `(*`
+            // opener — or column 0 after an interior newline — through the `*)`
+            // closer, inclusive). Every token AFTER the comment then keeps its
+            // original column. String-literal contents are left untouched
+            // (handled above; the comment scan never enters strings).
             let mut newlines = 0usize;
+            // Columns consumed on the comment's FINAL line. Seeded with the start
+            // column + the 2-col `(*` opener; reset to 0 at each interior newline.
+            let mut final_line_cols = start_col + 2;
             while i < b.len() && depth > 0 {
                 if b[i] == b'(' && i + 1 < b.len() && b[i + 1] == b'*' {
                     depth += 1;
                     i += 2;
+                    final_line_cols += 2;
                 } else if b[i] == b'*' && i + 1 < b.len() && b[i + 1] == b')' {
                     depth -= 1;
                     i += 2;
+                    final_line_cols += 2;
                 } else {
                     if b[i] == b'\n' {
                         newlines += 1;
+                        final_line_cols = 0; // column resets on a newline
+                    } else if (b[i] & 0xC0) != 0x80 {
+                        final_line_cols += 1; // count chars, not bytes
                     }
                     i += 1;
                 }
@@ -930,7 +1760,11 @@ fn strip_comments(s: &str) -> String {
             for _ in 0..newlines {
                 out.push(b'\n');
             }
-            out.push(b' ');
+            // Pad the final line to the exact column width the comment occupied so
+            // the next token keeps its source column.
+            for _ in 0..final_line_cols {
+                out.push(b' ');
+            }
             continue;
         }
         // Regular byte: copy verbatim (preserves multi-byte UTF-8 unchanged; we
@@ -941,6 +1775,12 @@ fn strip_comments(s: &str) -> String {
     // `out` is `s` with whole ASCII-delimited comment regions removed, so it
     // remains valid UTF-8.
     String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+}
+
+/// Test-only accessor for the comment stripper (column-preservation golden).
+#[cfg(test)]
+pub(crate) fn strip_comments_for_test(s: &str) -> String {
+    strip_comments(s)
 }
 
 /// Parse a source string into an [`Expr`] AST.

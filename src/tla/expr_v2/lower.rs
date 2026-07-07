@@ -41,6 +41,61 @@ pub fn lower(expr: &Expr) -> CompiledExpr {
             then_branch: Box::new(lower(then_)),
             else_branch: Box::new(lower(else_)),
         },
+
+        // ---- Phase 1 containers: lower to the EXACT `CompiledExpr` shape v1
+        // produces for the same construct (see `compile_expr` in
+        // `compiled_expr.rs`), so the shadow-compare AGREES. ----
+        Expr::SetEnum { items, .. } => {
+            CompiledExpr::SetLiteral(items.iter().map(lower).collect())
+        }
+        Expr::SetFilter { var, domain, pred, .. } => CompiledExpr::SetComprehension {
+            var: var.clone(),
+            domain: Box::new(lower(domain)),
+            // v1 sets `body = Var(var)` for the filter form `{x \in S : P}`.
+            body: Box::new(CompiledExpr::Var(var.clone())),
+            filter: Some(Box::new(lower(pred))),
+        },
+        Expr::SetMap { var, domain, body, .. } => CompiledExpr::SetComprehension {
+            var: var.clone(),
+            domain: Box::new(lower(domain)),
+            body: Box::new(lower(body)),
+            filter: None,
+        },
+        Expr::Tuple { items, .. } => {
+            CompiledExpr::SeqLiteral(items.iter().map(lower).collect())
+        }
+        Expr::RecordLit { fields, .. } => CompiledExpr::RecordLiteral(
+            fields.iter().map(|(n, v)| (n.clone(), lower(v))).collect(),
+        ),
+        Expr::RecordSet { fields, .. } => CompiledExpr::RecordSet(
+            fields.iter().map(|(n, v)| (n.clone(), lower(v))).collect(),
+        ),
+        Expr::FunctionSet { domain, range, .. } => CompiledExpr::FunctionSet {
+            domain: Box::new(lower(domain)),
+            range: Box::new(lower(range)),
+        },
+        Expr::FuncConstruct { var, domain, body, .. } => CompiledExpr::FuncConstruct {
+            var: var.clone(),
+            domain: Box::new(lower(domain)),
+            body: Box::new(lower(body)),
+        },
+        Expr::Case { arms, other, .. } => CompiledExpr::Case {
+            arms: arms
+                .iter()
+                .map(|(g, r)| (lower(g), lower(r)))
+                .collect(),
+            other: other.as_ref().map(|o| Box::new(lower(o))),
+        },
+        Expr::Choose { var, domain, pred, .. } => CompiledExpr::Choose {
+            var: var.clone(),
+            // v1 lowers an UNBOUNDED `CHOOSE x : P` domain as `Unparsed("")`;
+            // see `try_parse_choose` (bounded → domain, unbounded → empty).
+            domain: Box::new(match domain {
+                Some(d) => lower(d),
+                None => CompiledExpr::Unparsed(String::new()),
+            }),
+            body: Box::new(lower(pred)),
+        },
     }
 }
 
