@@ -384,7 +384,13 @@ pub fn evaluate_next_states_labeled_with_instances(
 }
 
 /// Extract action name from a disjunct expression
-fn extract_action_name(expr: &str) -> Option<String> {
+///
+/// This is the SAME head-identifier extraction the transition labeller uses
+/// (`evaluate_next_states_labeled_with_instances`): `Do(p)` -> "Do",
+/// `\E i \in S : Inc(i)` -> "Inc". Exposed `pub(crate)` so the fairness
+/// checker can map a fairness-action string's disjuncts to the same labels
+/// the shard index is keyed by.
+pub(crate) fn extract_action_name(expr: &str) -> Option<String> {
     let trimmed = strip_outer_parens(expr.trim());
 
     // Handle \E quantifier
@@ -933,7 +939,7 @@ fn split_top_level_cdot(expr: &str) -> Option<Vec<&str>> {
     Some(parts)
 }
 
-fn split_action_disjuncts(expr: &str) -> Vec<String> {
+pub(crate) fn split_action_disjuncts(expr: &str) -> Vec<String> {
     let disjuncts = split_action_body_disjuncts(expr);
     if disjuncts.is_empty() {
         vec![expr.trim().to_string()]
