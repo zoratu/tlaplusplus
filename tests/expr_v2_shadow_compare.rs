@@ -173,6 +173,29 @@ fn shadow_compare_corpus() {
     eprintln!("shadow-compare corpus root: {}", root.display());
 
     let exprs = collect_exprs(&root);
+
+    // Probe mode: if EXPR_V2_PROBE_MODULE=<substr> is set, dump v1-vs-v2 for
+    // every def whose label matches, then return. Used to debug a specific
+    // divergence (e.g. a spec that regresses under the v2 flag).
+    if let Ok(needle) = std::env::var("EXPR_V2_PROBE_MODULE") {
+        for (label, body) in &exprs {
+            if !label.contains(&needle) {
+                continue;
+            }
+            let v1 = canon(&compile_expr_v1(body));
+            let v2 = match expr_v2::parse_and_lower(body) {
+                Ok(c) => canon(&c),
+                Err(e) => format!("<PARSE-ERR: {e}>"),
+            };
+            let tag = if v1 == v2 { "SAME" } else { "DIFF" };
+            eprintln!("[{tag}] {label}");
+            eprintln!("  src: {}", body.replace('\n', "\\n"));
+            eprintln!("  v1 : {v1}");
+            eprintln!("  v2 : {v2}");
+        }
+        return;
+    }
+
     let total = exprs.len();
     let mut agree = 0usize;
     let mut v2_err = 0usize;
