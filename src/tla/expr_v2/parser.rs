@@ -181,20 +181,39 @@ impl<'a> Parser<'a> {
     //  4: set ops (\union \intersect \ \o) and additive (+ -)
     //  5: multiplicative (* \div % ^)
     // function application / .field / f[x] handled in parse_postfix (highest)
-    fn bin_op_at(&self, level: u32) -> Option<(BinOp, bool /*right assoc*/)> {
-        let k = self.peek_kind();
-        match level {
-            // v2 owns ONLY the top-level body-extending logical operators.
-            // Comparisons / arithmetic / set operators are LEFT INSIDE the atom
-            // and lowered by v1 (so their precedence — incl. `..` vs `+` — is
-            // exactly the old parser's). See the atom-reader comment for why.
-            0 => match k {
-                Tok::Iff => Some((BinOp::Iff, true)),
-                Tok::Implies => Some((BinOp::Implies, true)),
-                _ => None,
-            },
-            _ => None,
+    fn bin_op_at(&self, _level: u32) -> Option<(BinOp, bool /*right assoc*/)> {
+        // Level 0 (`<=>`/`=>`) is now handled directly in `parse_bin` /
+        // `parse_implies` with correct relative precedence. Levels 1/2 are
+        // junctions (handled as their own branch); levels 3+ are leaf operators
+        // that stay inside atoms and are lowered by v1. So no generic binary
+        // operator is dispatched here.
+        None
+    }
+
+    /// The `=>` tier: right-associative, body-extending, tighter than `<=>` and
+    /// looser than the `\/`/`/\` junctions. `a => b => c` == `a => (b => c)`.
+    fn parse_implies(&mut self, stop: &Stop) -> PResult<Expr> {
+        let lhs = self.parse_bin(stop, 1)?; // junction level and below
+        if !self.should_stop(stop) && matches!(self.peek_kind(), Tok::Implies) {
+            self.advance(); // =>
+            if self.should_stop(stop) {
+                return Err(format!(
+                    "empty consequent for Implies at fence (token {:?})",
+                    self.peek_kind()
+                ));
+            }
+            // right-assoc + body-extending: recurse at the `=>` tier with the
+            // caller's stop so the consequent extends maximally.
+            let rhs = self.parse_implies(stop)?;
+            let span = lhs.span().merge(rhs.span());
+            return Ok(Expr::Binary {
+                op: BinOp::Implies,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                span,
+            });
         }
+        Ok(lhs)
     }
 
     // Levels: 0 = <=>/=>, 1 = \/, 2 = /\ (junction levels), 3+ = leaf operators
@@ -205,6 +224,36 @@ impl<'a> Parser<'a> {
     fn parse_bin(&mut self, stop: &Stop, level: u32) -> PResult<Expr> {
         if level > Self::MAX_BIN_LEVEL {
             return self.parse_unary(stop);
+        }
+        // Level 0 is the body-extending logical tier. In TLA+ (and v1's compiler)
+        // `=>` binds TIGHTER than `<=>`: `a => b <=> c` == `(a => b) <=> c`, i.e.
+        // `<=>` is the OUTERMOST/loosest. So we split level 0 into two sub-tiers:
+        //   `<=>` (loosest, this branch) whose operands are `=>`-chains
+        //   `=>`   (tighter, `parse_implies`) whose operands are junctions.
+        // (The previous single-level handling made them equal-precedence, which
+        // wrongly produced `a => (b <=> c)`.)
+        if level == 0 {
+            let lhs = self.parse_implies(stop)?;
+            // `<=>` is right-associative and body-extending (RHS parsed with the
+            // caller's stop so it extends maximally).
+            if !self.should_stop(stop) && matches!(self.peek_kind(), Tok::Iff) {
+                self.advance(); // <=>
+                if self.should_stop(stop) {
+                    return Err(format!(
+                        "empty consequent for Iff at fence (token {:?})",
+                        self.peek_kind()
+                    ));
+                }
+                let rhs = self.parse_bin(stop, 0)?; // right-assoc chaining
+                let span = lhs.span().merge(rhs.span());
+                return Ok(Expr::Binary {
+                    op: BinOp::Iff,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                    span,
+                });
+            }
+            return Ok(lhs);
         }
         // Levels 1 (\/) and 2 (/\) are the junction levels. A leading bullet is
         // handled by prefix parsing (parse_junction); here we handle the INFIX
@@ -653,15 +702,18 @@ impl<'a> Parser<'a> {
                         }
                     }
                     Tok::Other(s) if s == "<<" => {
-                        // tuple binder like <<a,b>> — treat opaquely: gather to \in
-                        let start = self.peek().span.start;
-                        while !matches!(self.peek_kind(), Tok::ElemOf | Tok::Colon | Tok::Eof)
-                        {
-                            self.advance();
-                        }
-                        let end = self.peek().span.start;
-                        vars.push(self.text(start, end).trim().to_string());
-                        break;
+                        // Tuple-pattern binder `\A <<p, q>> \in S : ...`. v1 keeps
+                        // the WHOLE quantifier as `Unparsed` (the interpreter
+                        // destructures the tuple binder at eval time); the
+                        // compiled `Forall{var, ..}` has only a single scalar var
+                        // name and cannot represent `<<p, q>>`. Lowering it as a
+                        // var literal `"<<p, q>>"` (the previous behavior) yields a
+                        // WRONG binding (the body's `p`/`q` never resolve). Reject
+                        // → v1 fallback, matching v1's Unparsed shape.
+                        return Err(
+                            "tuple-pattern quantifier binder not modeled by v2 → v1"
+                                .to_string(),
+                        );
                     }
                     _ => break,
                 }
