@@ -199,9 +199,51 @@ impl<'a> Parser<'a> {
         if level > Self::MAX_BIN_LEVEL {
             return self.parse_unary(stop);
         }
-        // Junction levels are handled by prefix parsing; infix \/ and /\ are
-        // uncommon but supported: if the operand parsing yields nothing special
-        // we still allow infix bullets at levels 1/2 via a dedicated path below.
+        // Levels 1 (\/) and 2 (/\) are the junction levels. A leading bullet is
+        // handled by prefix parsing (parse_junction); here we handle the INFIX
+        // form `A \/ B` / `A /\ B` (operands separated by a bullet mid-
+        // expression, e.g. inside a quantifier body `Phase1a \/ Phase2a`). We
+        // collect a flat list and build a Junction so it matches the prefix
+        // form's shape.
+        if level == 1 || level == 2 {
+            let (bullet, jop) = if level == 1 {
+                (Tok::OrBullet, JunctionOp::Or)
+            } else {
+                (Tok::AndBullet, JunctionOp::And)
+            };
+            let first = self.parse_bin(stop, level + 1)?;
+            // If the next token is the infix bullet (and the fence doesn't stop
+            // us), gather a disjunction/conjunction list.
+            if !self.should_stop(stop) && self.peek_kind() == &bullet {
+                let mut items = vec![first];
+                let mut span = items[0].span();
+                let col = self.peek().span.start_col;
+                while !self.should_stop(stop) && self.peek_kind() == &bullet {
+                    self.advance(); // bullet
+                    let it = self.parse_bin(stop, level + 1)?;
+                    span = span.merge(it.span());
+                    items.push(it);
+                }
+                // Flatten: if any item is itself a same-op Junction, splice it in
+                // (keeps `A \/ (B \/ C)` and prefix/infix mixes flat).
+                let mut flat = Vec::new();
+                for it in items {
+                    match it {
+                        Expr::Junction { op, items: inner, .. } if op == jop => {
+                            flat.extend(inner)
+                        }
+                        other => flat.push(other),
+                    }
+                }
+                return Ok(Expr::Junction {
+                    op: jop,
+                    col,
+                    items: flat,
+                    span,
+                });
+            }
+            return Ok(first);
+        }
         let mut lhs = self.parse_bin(stop, level + 1)?;
 
         loop {
