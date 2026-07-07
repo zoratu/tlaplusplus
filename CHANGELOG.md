@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.2.28 (2026-07-07)
+
+Follow-up to v1.2.27: with NanoBlockchain's init false-violation removed, its `Next` evaluation errored (`record access on non-record value ModelValue("block")`) and generated no successors, so ours halted at the single init state while TLC explores 3003. This fixes three cascading action-parse bugs that each silently dropped a `Next` branch's successors.
+
+### PR #148 — three cascading action-parse bugs (record access + dropped successors)
+
+- **`\E`-quantified conjunctive clause orphaned its binder** (the reported error). `ProcessBlock`'s body `\E block \in received[node] : /\ (\/ ProcessOpenBlock(node,block) \/ …) /\ received' = …` fell through `split_action_body_disjuncts` (`src/tla/action_ir.rs`) to `split_top_level(_, "\\/")`, which split the *nested* `\/` at top level and dropped the `block` binder. `block` then resolved through the unknown-identifier fallback to `ModelValue("block")`, so `signedBlock.block` did a record access on a non-record → the error. A single `\E`-quantified conjunctive clause is now kept as one disjunct.
+- **Constant-operator override with a primed argument value-bound instead of substituted.** `CreateGenesisBlock` calls `CalculateHash(genesisBlock, lastHash, lastHash')` (overridden to `CalculateHashImpl`, body `lastHash' = hash`); in `expand_action_call_multi` (`src/tla/eval/action.rs`) the primed arg was value-bound, turning `lastHash' = hash` into a false guard → zero successors. Primed args are now substituted textually; only non-primed args are value-bound.
+- **Trailing assignment-RHS `LET` swallowed its sibling conjunct.** `received' = LET sb == … IN [n \in Node |-> …] /\ UNCHANGED distributedLedger` absorbed the `/\ UNCHANGED` into the LET body, making the primed-assignment RHS a Function used as a Boolean. A trailing assignment-RHS `LET … IN <value>` is now parenthesized (action-LETs and dangling `… IN` heads untouched).
+
+MCNanoSmall goes from 1 to 1563 distinct (no violation, no error); MCNanoMedium from 1 to 136,539. A 226-spec corpus scan in both directions found zero new false violations, zero newly-missed, and only two verdict changes — both NanoBlockchain improving toward TLC — with no other INSTANCE/record-access spec regressed. Gauntlet green: `scripts/diff_tlc.sh` 13/13, lib tests 936 passed / 0 failed (+5 regression tests), compiled-vs-interpreted proptest 17/17, state-graph snapshots 12/12.
+
+Known follow-up (separate, not a regression): MCNanoSmall reaches a correct subset (1563 of TLC's 3003) — `ProcessOpenBlock`/`ProcessReceiveBlock` never enable in the reached space (their `ValidateOpenBlock` guard chain isn't satisfied), a deeper causal-chain issue in the same multi-level-`\E`/LET indentation area. It is a correct subset with no false verdict; full parity is deferred.
+
 ## v1.2.27 (2026-07-07)
 
 An init false-violation fix from the corpus re-baseline: `NanoBlockchain/MCNanoSmall` (and Medium/Large) halted at the initial state reporting a violation (`record access on non-record value NoBlockVal`) where TLC finds none.
