@@ -164,8 +164,6 @@ fn paren_junction() {
 
 // ===================== Fix #1: entry-stop =====================
 
-use super::parse_ast;
-
 // `/\ A =>\n/\ B\n/\ C`: the `=>` consequent must STOP at the second `/\`
 // (same fence column). Item 1 (`A =>`) then has an EMPTY consequent → v2
 // rejects (→ v1 fallback), it does NOT swallow B and C into the consequent.
