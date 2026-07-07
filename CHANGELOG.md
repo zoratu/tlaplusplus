@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.2.26 (2026-07-07)
+
+A false-liveness-violation fix from the v1.2.25 corpus re-baseline: `Liveness/MCLiveInternalMemory` explored 4408 distinct states (matching TLC) but reported `violation=true` where TLC reports no error. The under-exploration that previously masked it was fixed in v1.2.24 (#139), which exposed this pre-existing fairness bug.
+
+### PR #144 — disjunctive/parameterized fair-action occurrence in the SCC fairness check
+
+The spec declares `WF_<<vars>>(Rsp(p))` — weak fairness of a *parameterized* action. `check_fairness_on_scc_fp_sharded` (`src/fairness.rs`) tested whether the fair action occurs in a strongly-connected component by looking up the shard index with the raw fairness-action string `"Rsp(p)"`. But the transition labeller (`extract_action_name`, `src/tla/action_exec.rs`) keys each transition by its disjunct *head identifier* (`"Rsp"`, `"Do"`, `"Req"`), so `shards.get("Rsp(p)")` missed, `action_occurs` came back false, and the SCC was reported as a fairness violation. A disjunctive fair action (`WF_vars(Do(p) \/ Rsp(p))`) has the same defect.
+
+A new `fairness_action_head_labels()` splits the fair action on top-level `\/` and runs each disjunct through the labeller's own `extract_action_name` (now `pub(crate)`), producing the same head labels the shard index uses; the action is considered to occur if any head has an in-SCC edge. The wrapper-`Next` path is unchanged, and an empty extraction falls back to the raw string (prior behaviour). The change is only in the false-positive direction — no speculative enabledness logic that could cause conservative misses. `WF_vars(System)`-style non-parameterized actions were already correct and are unaffected.
+
+`MCLiveInternalMemory` now reports `violation=false` at 4408 distinct, matching TLC; `MCLiveWriteThroughCache` stays 5196 clean. A 226-spec corpus scan in both directions showed the main→branch verdict delta was **exactly one spec** (`MCLiveInternalMemory` ERROR → OK) with nothing else changed, and zero new disagreements with TLC; every other fairness/liveness spec (ewd840, ewd998, DiningPhilosophers, Prisoners, nbacg, CoffeeCan, glowingRaccoon) keeps its verdict. Gauntlet green: `cargo test --release` 1281 passed / 0 failed (+4 fairness unit tests), `scripts/diff_tlc.sh` 13/13 (the `work_queue` fairness+liveness gate), compiled-vs-interpreted proptest 17/17, state-graph snapshots 12/12.
+
 ## v1.2.25 (2026-07-06)
 
 Adds bounded LTL model checking for `[](P => <>[]Q)`-shaped temporal properties, fixing a missed violation on `RealTime/MCRealTimeHourClock` — the highest-severity remaining item from the corpus diff-vs-TLC audit. Ours and TLC both explored 216 distinct states, but ours reported SAFE where TLC violates `PROPERTY ErrorTemporal == []((now # 4) => <>[](now # 4))` (counterexample: reach `now = 4`, then stutter there forever). The property was silently never checked: the temporal parser had no `=>` handling, so it collapsed to `Always(StatePredicate(...))`, which is not classified as liveness, so the liveness post-processing never ran.
