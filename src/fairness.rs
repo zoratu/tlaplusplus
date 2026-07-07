@@ -189,6 +189,58 @@ pub fn scc_has_any_internal_edge(
     false
 }
 
+/// Map a fairness-action source string to the set of head-identifier labels
+/// the transition labeller would attach to its steps.
+///
+/// A fair action such as `WF_vars(Do(p) \/ Rsp(p))` carries the raw text
+/// `Do(p) \/ Rsp(p)` as its action string. The transition labeller
+/// (`evaluate_next_states_labeled_with_instances`) never records that string;
+/// it labels each Next-disjunct by its head identifier (`Do(p)` -> "Do",
+/// `Rsp(p)` -> "Rsp", `\E i \in S : Inc(i)` -> "Inc"). To find which shards
+/// correspond to this fair action we must apply the SAME extraction: split
+/// the action on top-level `\/`, then run each disjunct through
+/// `extract_action_name`.
+///
+/// Falls back to the raw action string as a single label when extraction
+/// yields nothing (e.g. an action shaped in a way the labeller also could not
+/// reduce), preserving the previous exact-match behaviour for that case.
+pub(crate) fn fairness_action_head_labels(action: &str) -> Vec<String> {
+    use crate::tla::action_exec::{extract_action_name, split_action_disjuncts};
+
+    let mut labels: Vec<String> = Vec::new();
+    for disj in split_action_disjuncts(action) {
+        if let Some(head) = extract_action_name(disj.trim()) {
+            if !labels.contains(&head) {
+                labels.push(head);
+            }
+        }
+    }
+    if labels.is_empty() {
+        labels.push(action.trim().to_string());
+    }
+    labels
+}
+
+/// True if any of the fair action's head labels has an edge that stays inside
+/// the SCC (both endpoints in `scc_fps`).
+fn fairness_action_occurs_in_scc(
+    scc_fps: &HashSet<u64>,
+    action: &str,
+    shards: &ActionShardIndex,
+) -> bool {
+    for label in fairness_action_head_labels(action) {
+        if let Some(edges) = shards.get(label.as_str()) {
+            if edges
+                .iter()
+                .any(|(from, to)| scc_fps.contains(from) && scc_fps.contains(to))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// T10.4 — fairness check on SCC using a per-action shard index.
 ///
 /// Iterates only the transitions for the constraint's action, instead of
@@ -207,14 +259,19 @@ pub fn check_fairness_on_scc_fp_sharded(
     let action_occurs = if constraint_is_wrapper_next {
         // Wrapper Next: any in-SCC edge counts, regardless of label.
         scc_has_any_internal_edge(scc_fps, adjacency)
-    } else if let Some(edges) = shards.get(action_name) {
-        // Named action: iterate only this action's edges.
-        edges
-            .iter()
-            .any(|(from, to)| scc_fps.contains(from) && scc_fps.contains(to))
     } else {
-        // Action name not in any transition label at all → cannot occur.
-        false
+        // The fairness-action string is the raw source text of the fair
+        // action, e.g. `Do(p) \/ Rsp(p)` for `WF_vars(Do(p) \/ Rsp(p))` or
+        // `Rsp(p)` for `WF_vars(Rsp(p))`. The shard index, however, is keyed
+        // by the HEAD IDENTIFIER the transition labeller extracts from each
+        // Next-disjunct (`Do(p)` -> "Do", `\E i \in S : Inc(i)` -> "Inc").
+        //
+        // A direct `shards.get(action_name)` therefore MISSES for any
+        // disjunctive or parameterized fair action. Map the action string to
+        // the same head labels the labeller uses (split on top-level `\/`,
+        // then run each disjunct through `extract_action_name`) and treat the
+        // action as occurring if ANY of those heads has an in-SCC edge.
+        fairness_action_occurs_in_scc(scc_fps, action_name, shards)
     };
 
     // NOTE: this returns Err whenever the fair action does not *occur* inside
@@ -868,6 +925,92 @@ mod tests {
         let r =
             check_fairness_on_scc_fp_sharded(&scc_fps, &constraint, &shards, &adj, Some("Next"));
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn test_fairness_action_head_labels_disjunctive_parameterized() {
+        // `WF_vars(Do(p) \/ Rsp(p))` — the raw action string is disjunctive
+        // and parameterized. Head labels must be the labeller's identifiers.
+        let labels = fairness_action_head_labels("Do(p) \\/ Rsp(p)");
+        assert_eq!(labels, vec!["Do".to_string(), "Rsp".to_string()]);
+
+        // Single parameterized action.
+        assert_eq!(
+            fairness_action_head_labels("Rsp(p)"),
+            vec!["Rsp".to_string()]
+        );
+
+        // Existential-quantified disjunct reduces to its head.
+        assert_eq!(
+            fairness_action_head_labels("\\E i \\in S : Inc(i)"),
+            vec!["Inc".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_check_fairness_on_scc_fp_sharded_disjunctive_action_occurs() {
+        // `WF_vars(Do(p) \/ Rsp(p))`: the shard index is keyed by the head
+        // labels "Do" / "Rsp" (what the transition labeller records), NOT by
+        // the raw action string "Do(p) \/ Rsp(p)". An in-SCC "Do" edge must
+        // count as the fair action occurring → no false violation.
+        let scc_fps: HashSet<u64> = [1u64, 2, 3].into_iter().collect();
+        let constraint = FairnessConstraint::Weak {
+            vars: vec!["vars".to_string()],
+            action: "Do(p) \\/ Rsp(p)".to_string(),
+        };
+        let triples = vec![
+            (1, 2, "Do".to_string()),
+            (2, 3, "Other".to_string()),
+            (3, 1, "Other".to_string()),
+        ];
+        let shards = build_action_shard_index(&triples);
+        let mut adj: HashMap<u64, Vec<u64>> = HashMap::new();
+        adj.insert(1, vec![2]);
+        adj.insert(2, vec![3]);
+        adj.insert(3, vec![1]);
+        let r = check_fairness_on_scc_fp_sharded(&scc_fps, &constraint, &shards, &adj, None);
+        assert!(r.is_ok(), "disjunctive action with in-SCC Do edge occurs");
+    }
+
+    #[test]
+    fn test_check_fairness_on_scc_fp_sharded_single_parameterized_action() {
+        // `WF_vars(Rsp(p))` — single parameterized action. Shard key is head
+        // "Rsp". An in-SCC "Rsp" edge → occurs.
+        let scc_fps: HashSet<u64> = [1u64, 2].into_iter().collect();
+        let constraint = FairnessConstraint::Weak {
+            vars: vec!["vars".to_string()],
+            action: "Rsp(p)".to_string(),
+        };
+        let triples = vec![(1, 2, "Rsp".to_string()), (2, 1, "Other".to_string())];
+        let shards = build_action_shard_index(&triples);
+        let mut adj: HashMap<u64, Vec<u64>> = HashMap::new();
+        adj.insert(1, vec![2]);
+        adj.insert(2, vec![1]);
+        let r = check_fairness_on_scc_fp_sharded(&scc_fps, &constraint, &shards, &adj, None);
+        assert!(r.is_ok(), "single parameterized Rsp edge in SCC occurs");
+    }
+
+    #[test]
+    fn test_check_fairness_on_scc_fp_sharded_disjunctive_action_absent() {
+        // Neither "Do" nor "Rsp" edges are inside the SCC → the fair action
+        // genuinely does not occur, so the fairness check must still flag it.
+        let scc_fps: HashSet<u64> = [1u64, 2].into_iter().collect();
+        let constraint = FairnessConstraint::Weak {
+            vars: vec!["vars".to_string()],
+            action: "Do(p) \\/ Rsp(p)".to_string(),
+        };
+        let triples = vec![
+            (1, 2, "Other".to_string()),
+            (2, 1, "Other".to_string()),
+            (5, 6, "Do".to_string()), // outside SCC
+        ];
+        let shards = build_action_shard_index(&triples);
+        let mut adj: HashMap<u64, Vec<u64>> = HashMap::new();
+        adj.insert(1, vec![2]);
+        adj.insert(2, vec![1]);
+        adj.insert(5, vec![6]);
+        let r = check_fairness_on_scc_fp_sharded(&scc_fps, &constraint, &shards, &adj, None);
+        assert!(r.is_err(), "no in-SCC Do/Rsp edge → action does not occur");
     }
 
     #[test]
