@@ -158,6 +158,18 @@ impl<'a> Parser<'a> {
                 self.peek_kind()
             ));
         }
+        // TLA+ label `id:: expr` (e.g. `BP:: /\ ...`, `Export:: ...`). v2 does
+        // not model labels; v1 strips the `id::` and parses the body. If v2
+        // parsed this it would leave a spurious `Unparsed("id::")` conjunct
+        // (a WRONG structure). Reject so the whole expression falls back to v1,
+        // which handles the label correctly.
+        if matches!(self.peek_kind(), Tok::Ident(_)) {
+            if let Some(next) = self.toks.get(self.pos + 1) {
+                if matches!(&next.kind, Tok::Other(s) if s == "::") {
+                    return Err("TLA+ label (id::) not modeled by v2 → v1".to_string());
+                }
+            }
+        }
         self.parse_bin(stop, 0)
     }
 
@@ -1611,6 +1623,13 @@ impl<'a> Parser<'a> {
         let mut consumed = false;
         // bracket/paren depth so an operator INSIDE brackets stays in the atom.
         let mut depth: i32 = 0;
+        // Whether the atom run has absorbed a `CASE` keyword at depth 0. A CASE
+        // appearing as a LEAF OPERAND (e.g. `x = CASE g1 -> e1 [] g2 -> e2`,
+        // where a guard may contain `/\`) cannot be atom-absorbed faithfully:
+        // the atom reader breaks at the first junction bullet in a guard,
+        // mangling the CASE into junction siblings. If that happens we REJECT the
+        // whole atom (→ v1 fallback) rather than emit a mangled structure.
+        let mut saw_case_operand = false;
 
         while !self.at_eof() {
             if depth == 0 && self.at_barrier() {
@@ -1619,6 +1638,15 @@ impl<'a> Parser<'a> {
             let t = self.peek();
             // Respect the stop fence (bullets / hard terms) only at depth 0.
             if depth == 0 && self.should_stop(stop) {
+                // If a CASE was absorbed and we're stopping at a junction bullet
+                // (which would slice the CASE), reject → v1.
+                if saw_case_operand
+                    && matches!(self.peek_kind(), Tok::AndBullet | Tok::OrBullet)
+                {
+                    return Err(
+                        "CASE operand would be sliced by a junction bullet → v1".to_string(),
+                    );
+                }
                 break;
             }
             // At depth 0, ONLY the structural tokens v2 truly owns end an atom.
@@ -1632,6 +1660,13 @@ impl<'a> Parser<'a> {
             // junctions, `=>`/`<=>`, and the quantifier/LET/IF keyword structure.
             if depth == 0 && consumed {
                 match &t.kind {
+                    Tok::AndBullet | Tok::OrBullet if saw_case_operand => {
+                        // A junction bullet after an absorbed CASE would slice the
+                        // CASE (guards can contain `/\`); reject → v1 fallback.
+                        return Err(
+                            "CASE operand would be sliced by a junction bullet → v1".to_string(),
+                        );
+                    }
                     // body-extending logical structure v2 owns
                     Tok::Implies
                     | Tok::Iff
@@ -1649,6 +1684,14 @@ impl<'a> Parser<'a> {
                     | Tok::Comma
                     | Tok::EqEq => break,
                     _ => {}
+                }
+            }
+            // Note whether this token is a depth-0 CASE keyword (operand form).
+            if depth == 0 {
+                if let Tok::Ident(w) = &t.kind {
+                    if w == "CASE" {
+                        saw_case_operand = true;
+                    }
                 }
             }
             // Track bracket depth (so `f[a => b]`—rare—or `Op(x => y)` keep the
