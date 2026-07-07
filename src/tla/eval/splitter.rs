@@ -389,6 +389,28 @@ pub(super) fn split_top_level(expr: &str, delim: &str, keyword: bool) -> Vec<Str
     result
 }
 
+/// True if `clause` ends with a binary/binding operator that still expects a
+/// following operand or body: `=>` / `<=>` (implication / biconditional whose
+/// right side follows) or a LET/quantifier `IN` (whose body follows). Used by
+/// `split_indented_top_level_boolean` to avoid mis-splitting a following
+/// `/\`/`\/` bullet — the operator's missing right operand — into a spurious
+/// sibling junction item once upstream indentation has been flattened.
+///
+/// Only matches a *trailing* operator (the clause is left dangling), so it
+/// never affects a well-formed junction item like `a => b` on one line.
+fn ends_with_dangling_binder(clause: &str) -> bool {
+    let c = clause.trim_end();
+    if c.ends_with("=>") || c.ends_with("<=>") {
+        return true;
+    }
+    // A trailing `IN` keyword (word-boundary) — the LET/quantifier body follows.
+    if let Some(prefix) = c.strip_suffix("IN") {
+        // Must be a standalone `IN` token: preceded by whitespace (or nothing).
+        return prefix.is_empty() || prefix.ends_with(|ch: char| ch.is_whitespace());
+    }
+    false
+}
+
 pub(super) fn split_indented_top_level_boolean(expr: &str, delim: &str) -> Option<Vec<String>> {
     if !expr.contains('\n') {
         return None;
@@ -410,7 +432,35 @@ pub(super) fn split_indented_top_level_boolean(expr: &str, delim: &str) -> Optio
         let indent = line.len().saturating_sub(trimmed.len());
         if trimmed.starts_with(delim) {
             let top_level_indent = *base_indent.get_or_insert(indent);
-            if indent == top_level_indent {
+            // A `delim` bullet at the top-level indent is normally a NEW sibling
+            // junction item. But if the clause accumulated so far ends with a
+            // *dangling* binary operator that still expects a right operand
+            // (`=>`, `<=>`) or opens a scope whose body follows (`IN`), then this
+            // bullet IS that missing operand / body — NOT a sibling. Keep it
+            // attached to `current`.
+            //
+            // This shape arises once upstream indentation has been flattened by
+            // nested LET/quantifier body extraction (each level `.trim()`s its
+            // sub-expressions). NanoBlockchain's `CryptographicInvariant`:
+            //
+            //     /\ signedBlock /= NoBlock =>
+            //         LET publicKey == PublicKeyOf(ledger, hash) IN
+            //         /\ ValidateSignature(...)
+            //
+            // flattens to (all at column 0)
+            //
+            //     signedBlock /= NoBlock => LET publicKey == ... IN
+            //     /\ ValidateSignature(...)
+            //
+            // so the `/\ ValidateSignature` (the `=>`-consequent's LET body)
+            // would wrongly become a sibling conjunct of the antecedent — its
+            // record access (`signedBlock.signature`) is then evaluated
+            // UNCONDITIONALLY, past the `=>` short-circuit, producing a spurious
+            // `record access on non-record value NoBlockVal` violation on the
+            // initial state where every `signedBlock = NoBlock`. Deferring the
+            // bullet keeps the whole `... => LET ... IN /\ ...` as one clause so
+            // the implication's `=>` correctly gates the consequent.
+            if indent == top_level_indent && !ends_with_dangling_binder(current.trim_end()) {
                 if !current.trim().is_empty() {
                     clauses.push(current.trim().to_string());
                     current.clear();
@@ -1908,6 +1958,50 @@ mod tests {
         // Same rule for `<=>`: a quantifier body consumes it too.
         let expr = r"P /\ \A y \in S : Q(y) <=> R(y)";
         assert_eq!(split_top_level_symbol(expr, "<=>"), vec![expr]);
+    }
+
+    #[test]
+    fn indented_bool_keeps_implies_consequent_let_body_attached() {
+        // NanoBlockchain `CryptographicInvariant` missed-soundness regression.
+        // After nested LET/quantifier body extraction flattens indentation, the
+        // `=>`-consequent's LET body (`/\ ValidateSignature(...)`) sits at the
+        // same column as the antecedent's leading `/\`. The indented-boolean
+        // splitter must NOT treat the consequent bullet as a *sibling* conjunct
+        // — that would evaluate `signedBlock.signature` unconditionally, past the
+        // `=>` short-circuit, and false-violate the initial state (every
+        // `signedBlock = NoBlock`). The whole `... => LET ... IN /\ ...` stays
+        // one clause so `=>` gates the consequent.
+        let flat = "/\\ signedBlock /= NoBlock => LET publicKey == PublicKeyOf(ledger, hash) IN\n/\\ ValidateSignature(signedBlock.signature, publicKey, hash)";
+        // Single top-level clause (the implication) — no sibling split.
+        assert_eq!(split_indented_top_level_boolean(flat, "/\\"), None);
+
+        // dangling-binder detector: trailing `=>`, `<=>`, `IN` expect an operand.
+        assert!(ends_with_dangling_binder("a /= b =>"));
+        assert!(ends_with_dangling_binder("LET x == y IN"));
+        assert!(ends_with_dangling_binder("p <=>"));
+        // A well-formed one-line item is NOT dangling.
+        assert!(!ends_with_dangling_binder("a => b"));
+        assert!(!ends_with_dangling_binder("x = 1"));
+        // Identifier ending in "IN" must not be mistaken for the keyword.
+        assert!(!ends_with_dangling_binder("MAIN"));
+    }
+
+    #[test]
+    fn indented_bool_still_splits_genuine_siblings_after_this_fix() {
+        // Guard: the dangling-binder gate must NOT suppress normal sibling
+        // splits. A conjunct that does NOT end in `=>`/`<=>`/`IN` still splits.
+        let siblings = "/\\ x = 1\n/\\ y = 2";
+        assert_eq!(
+            split_indented_top_level_boolean(siblings, "/\\"),
+            Some(vec!["x = 1".to_string(), "y = 2".to_string()])
+        );
+        // A one-line `a => b` conjunct followed by a sibling still splits (the
+        // first clause does not END with a dangling `=>`).
+        let impl_then_sib = "/\\ a => b\n/\\ c = 2";
+        assert_eq!(
+            split_indented_top_level_boolean(impl_then_sib, "/\\"),
+            Some(vec!["a => b".to_string(), "c = 2".to_string()])
+        );
     }
 
     #[test]
