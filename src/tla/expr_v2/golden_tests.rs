@@ -161,3 +161,139 @@ fn paren_junction() {
     let s = shape("(/\\ A\n /\\ B)");
     assert_eq!(s, "(AND[Atom(\"A\"), Atom(\"B\")])");
 }
+
+// ===================== Fix #1: entry-stop =====================
+
+use super::parse_ast;
+
+// `/\ A =>\n/\ B\n/\ C`: the `=>` consequent must STOP at the second `/\`
+// (same fence column). Item 1 (`A =>`) then has an EMPTY consequent → v2
+// rejects (→ v1 fallback), it does NOT swallow B and C into the consequent.
+#[test]
+fn entry_stop_empty_consequent_rejects() {
+    let src = "/\\ A =>\n/\\ B\n/\\ C";
+    let r = parse_ast(src);
+    assert!(
+        r.is_err(),
+        "empty `=>` consequent at the fence must reject (→ v1 fallback), got: {:?}",
+        r.map(|e| e.shape())
+    );
+}
+
+// An empty junction item `/\ \n /\ B` must NOT collapse to B — it rejects.
+#[test]
+fn entry_stop_empty_item_rejects() {
+    let r = parse_ast("/\\\n/\\ B");
+    assert!(
+        r.is_err(),
+        "empty junction item must reject, got: {:?}",
+        r.map(|e| e.shape())
+    );
+}
+
+// `/\ P => /\ Q\n         /\ R` where the `=>` consequent `/\ Q` is DEEPER
+// (col > 0) attaches to the `=>`; a `/\ R` sibling at the OUTER column would
+// NOT. Here both Q and R are deep, so both attach to the consequent junction.
+#[test]
+fn entry_stop_deeper_consequent_attaches() {
+    // P => (deep /\ Q /\ R), all inside item 1's `=>`.
+    let src = "\
+/\\ P => /\\ Q
+         /\\ R";
+    let s = shape(src);
+    // Single top-level item `P => AND[Q,R]` collapses (1-item junction).
+    assert_eq!(s, "Implies(Atom(\"P\"), AND[Atom(\"Q\"), Atom(\"R\")])");
+}
+
+// The sibling-vs-consequent split: `/\ P => /\ Q  (deep)` then `/\ R` at the
+// OUTER column 0 is a SIBLING, not part of the `=>` consequent.
+#[test]
+fn entry_stop_outer_sibling_not_swallowed() {
+    let src = "\
+/\\ P => /\\ Q
+/\\ R";
+    let s = shape(src);
+    // AND[ Implies(P, Q) , R ]  — R is a sibling at col 0.
+    assert_eq!(
+        s,
+        "AND[Implies(Atom(\"P\"), Atom(\"Q\")), Atom(\"R\")]",
+        "outer sibling R wrongly attached: {s}"
+    );
+}
+
+// ===================== Fix #2: IF keeps caller fence =====================
+
+// An IF inside a junction: a sibling bullet after the ELSE branch must NOT be
+// swallowed into the else-branch.
+#[test]
+fn if_in_junction_sibling_not_swallowed() {
+    let src = "\
+/\\ IF c THEN t ELSE e
+/\\ Sib";
+    let s = shape(src);
+    assert_eq!(
+        s,
+        "AND[If(Atom(\"c\"), Atom(\"t\"), Atom(\"e\")), Atom(\"Sib\")]",
+        "sibling after IF/ELSE wrongly swallowed: {s}"
+    );
+}
+
+// ===================== Fix #3: parameterized/function LET =====================
+
+// A parameterized operator LET must reject (→ v1 fallback), never lower to a
+// binding that drops the params.
+#[test]
+fn param_let_rejects() {
+    let r = parse_ast("LET Op(x) == x + 1 IN Op(2)");
+    assert!(
+        r.is_err(),
+        "parameterized LET must reject (→ v1 fallback), got: {:?}",
+        r.map(|e| e.shape())
+    );
+}
+
+// A function-def LET must reject too.
+#[test]
+fn func_let_rejects() {
+    let r = parse_ast("LET f[x] == x + 1 IN f[2]");
+    assert!(
+        r.is_err(),
+        "function-def LET must reject (→ v1 fallback), got: {:?}",
+        r.map(|e| e.shape())
+    );
+}
+
+// A plain (non-parameterized) LET still parses structurally.
+#[test]
+fn plain_let_still_parses() {
+    let s = shape("LET x == 1 IN x + 1");
+    assert_eq!(s, "Let([x==Atom(\"1\")] IN Atom(\"x + 1\"))");
+}
+
+// ===================== Fix #4: comment stripping in atoms =====================
+
+// A comment inside an atom run must NOT reach v1 in the Atom text.
+#[test]
+fn atom_strips_inline_block_comment() {
+    let s = shape("x (* c *) + y");
+    assert_eq!(s, "Atom(\"x  + y\")", "comment leaked into atom text: {s}");
+}
+
+#[test]
+fn atom_strips_line_comment() {
+    // `a + b \* trailing` — the line comment is dropped from the atom text.
+    let s = shape("a + b \\* trailing");
+    assert_eq!(s, "Atom(\"a + b\")", "line comment leaked: {s}");
+}
+
+// ===================== Fix #5: unterminated block comment =====================
+
+#[test]
+fn unterminated_block_comment_rejects() {
+    let r = parse_ast("A (* unterminated");
+    assert!(
+        r.is_err(),
+        "unterminated block comment must reject (→ v1 fallback), got: {:?}",
+        r.map(|e| e.shape())
+    );
+}

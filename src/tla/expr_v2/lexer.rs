@@ -88,6 +88,11 @@ pub enum Tok {
     /// run can be reconstructed verbatim from the source span).
     Other(String),
 
+    /// A lexing error (e.g. an unterminated `(* ... *)` block comment). Emitted
+    /// in place of further tokens so any parse consuming it fails → v1 fallback,
+    /// rather than silently truncating the input. Carries a diagnostic message.
+    LexError(String),
+
     Eof,
 }
 
@@ -108,6 +113,9 @@ pub struct Lexer<'a> {
     col: u32,
     /// Whether a newline has been seen since the last emitted token.
     pending_newline: bool,
+    /// Set when trivia-skipping hits an unrecoverable error (unterminated block
+    /// comment). Surfaced as a `Tok::LexError` token at the next `next_token`.
+    lex_error: Option<String>,
 }
 
 /// The full set of multi-char structural operators, longest first, mapped to a
@@ -133,6 +141,7 @@ impl<'a> Lexer<'a> {
             line: 1,
             col: 0,
             pending_newline: false,
+            lex_error: None,
         }
     }
 
@@ -148,7 +157,20 @@ impl<'a> Lexer<'a> {
         self.src[self.pos..].starts_with(s.as_bytes())
     }
 
-    /// Advance one byte, maintaining line/col. Newlines set `pending_newline`.
+    /// Width of a hard tab in columns for layout purposes. TLA+ specs SHOULD use
+    /// spaces; if a tab appears we advance to the next multiple of this so the
+    /// bullet column stays consistent rather than counting the tab as 1 byte.
+    const TAB_WIDTH: u32 = 8;
+
+    /// Advance one byte, maintaining line/col. Newlines reset the column and set
+    /// `pending_newline`.
+    ///
+    /// Fix #6: column tracking is now CHAR- and tab-aware, not raw-byte:
+    ///  - A UTF-8 continuation byte (`0b10xx_xxxx`) does NOT advance the column,
+    ///    so a multi-byte char in a preceding comment/string can't shift a later
+    ///    bullet's `start_col` (which the junction fence relies on).
+    ///  - A hard tab advances to the next `TAB_WIDTH` tab-stop instead of +1, so
+    ///    a tab-indented bullet lands on a stable column.
     fn bump(&mut self) {
         if let Some(b) = self.peek_byte() {
             self.pos += 1;
@@ -156,6 +178,11 @@ impl<'a> Lexer<'a> {
                 self.line += 1;
                 self.col = 0;
                 self.pending_newline = true;
+            } else if b == b'\t' {
+                self.col = (self.col / Self::TAB_WIDTH + 1) * Self::TAB_WIDTH;
+            } else if (b & 0xC0) == 0x80 {
+                // UTF-8 continuation byte: part of the previous char — no column
+                // advance (the leading byte already counted the char once).
             } else {
                 self.col += 1;
             }
@@ -190,7 +217,15 @@ impl<'a> Lexer<'a> {
                     let mut depth = 1usize;
                     while depth > 0 {
                         match self.peek_byte() {
-                            None => break,
+                            None => {
+                                // Fix #5: unterminated block comment. Record a lex
+                                // error instead of silently breaking (which would
+                                // truncate the input and let v2 lower a prefix).
+                                self.lex_error = Some(
+                                    "unterminated block comment (missing `*)`)".to_string(),
+                                );
+                                break;
+                            }
                             Some(b'(') if self.byte_at(1) == Some(b'*') => {
                                 self.bump_n(2);
                                 depth += 1;
@@ -328,6 +363,14 @@ impl<'a> Lexer<'a> {
         let start = self.pos;
         let sl = self.line;
         let sc = self.col;
+
+        // Fix #5: surface a trivia-scanning error (unterminated block comment) as
+        // a distinct token so the parser fails and falls back to v1.
+        if let Some(msg) = self.lex_error.take() {
+            let mut tok = self.mk(Tok::LexError(msg), start, sl, sc);
+            tok.had_newline_before = had_newline;
+            return tok;
+        }
 
         let mut tok = match self.peek_byte() {
             None => self.mk(Tok::Eof, start, sl, sc),

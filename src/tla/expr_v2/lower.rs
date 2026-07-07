@@ -114,28 +114,21 @@ fn lower_domain(domain: &Expr) -> CompiledExpr {
 }
 
 fn lower_let(defs: &[LetDef], body: &Expr) -> CompiledExpr {
-    let mut bindings = Vec::with_capacity(defs.len());
-    for d in defs {
-        // Reconstruct the binding value text for parameterized / function defs so
-        // the existing compiler builds the right Lambda / function form. For a
-        // plain `id == value`, lower the value structurally; for `Op(a,b) == v`
-        // or `f[x] == v`, we hand the WHOLE definition text to `compile_expr`
-        // via a synthesized LET so the existing machinery handles the binder.
-        if d.params.is_empty() && d.func_args.is_empty() {
-            bindings.push((d.name.clone(), lower(&d.value)));
-        } else {
-            // Build a Lambda-ish value via the old compiler using the reassembled
-            // definition. We wrap as `LAMBDA a, b : <value>` semantics by asking
-            // compile_expr on a synthesized operator-value. The old parser stores
-            // parameterized LET bindings as Lambda; reuse it by compiling the
-            // value text with the params captured. Since CompiledExpr::Let only
-            // holds (name, value) and resolves params at call sites via the
-            // operator machinery elsewhere, we approximate by lowering the value
-            // and letting downstream OpCall resolution bind params — matching the
-            // old behavior where the value text is compiled directly.
-            bindings.push((d.name.clone(), lower(&d.value)));
-        }
-    }
+    // Fix #3: parameterized operator defs (`Op(a,b) == ..`) and function defs
+    // (`f[x] == ..`) are REJECTED at parse time (see `parser::parse_let`), so
+    // every def reaching here is a plain `name == value` that `CompiledExpr::Let`
+    // (whose bindings are just `(name, value)`) can represent faithfully. Lower
+    // each value structurally.
+    let bindings = defs
+        .iter()
+        .map(|d| {
+            debug_assert!(
+                d.params.is_empty() && d.func_args.is_empty(),
+                "parameterized/function LET should have been rejected in the parser"
+            );
+            (d.name.clone(), lower(&d.value))
+        })
+        .collect();
     CompiledExpr::Let {
         bindings,
         body: Box::new(lower(body)),

@@ -141,7 +141,23 @@ impl<'a> Parser<'a> {
     }
 
     /// Pratt entry: lowest-precedence binding starts here.
+    ///
+    /// Fix #1 (entry-stop): before descending into `parse_bin`/`parse_prefix` we
+    /// must honor the active fence. If the very next token already satisfies the
+    /// caller's `Stop` (a hard terminator, the barrier, OR a new-line bullet at or
+    /// shallower than the fence column), then this sub-expression is EMPTY — the
+    /// bullet/terminator belongs to an ENCLOSING construct. Descending anyway
+    /// would (a) swallow a sibling/enclosing bullet as a fresh junction, or (b)
+    /// collapse an empty junction item to its neighbor. Both are wrong parses, so
+    /// we return an error which triggers the v2→v1 fallback rather than producing
+    /// a silently-wrong `CompiledExpr`.
     fn parse_expr(&mut self, stop: &Stop) -> PResult<Expr> {
+        if self.should_stop(stop) {
+            return Err(format!(
+                "empty sub-expression at fence (token {:?})",
+                self.peek_kind()
+            ));
+        }
         self.parse_bin(stop, 0)
     }
 
@@ -233,6 +249,23 @@ impl<'a> Parser<'a> {
                 break;
             };
             self.advance(); // operator
+            // Fix #1 (entry-stop): a body-extending operator (`=>`/`<=>`) whose
+            // consequent would be EMPTY — i.e. the next token already satisfies
+            // the caller's fence (a sibling/enclosing bullet at or shallower than
+            // the fence column, or a hard terminator) — is a WRONG parse. E.g.
+            //   /\ A =>
+            //   /\ B
+            //   /\ C
+            // the `=>` consequent must stop at the second `/\` (same fence
+            // column); parsing an RHS here would swallow B and C. Reject → v1
+            // fallback rather than silently mis-attach.
+            if self.should_stop(stop) {
+                return Err(format!(
+                    "empty consequent for {:?} at fence (token {:?})",
+                    op,
+                    self.peek_kind()
+                ));
+            }
             // Body-extending operators (=> / <=>) parse RHS with the CALLER's
             // stop so they extend maximally down/right (this is what pulls a
             // following LET-with-junction into the consequent).
@@ -524,6 +557,24 @@ impl<'a> Parser<'a> {
             let value = self.parse_expr(&value_stop)?;
             self.barrier = saved;
 
+            // Fix #3: v2 has NO faithful lowering for a parameterized operator
+            // def `Op(a,b) == ...` or a function def `f[x] == ...` — the target
+            // `CompiledExpr::Let` only stores `(name, value)` with no binders, so
+            // structurally lowering such a def would DROP the parameters and emit
+            // a silently-WRONG CompiledExpr (`LET Op(x) == x+1 IN Op(2)` would
+            // mis-resolve `Op`). The old string compiler deliberately returns
+            // `Unparsed(whole LET)` for these and lets the interpreter bind
+            // params at call sites. So we REJECT here → v2 falls back to v1,
+            // which produces that correct Unparsed form. A safe fallback beats a
+            // wrong lowering.
+            if !params.is_empty() || !func_args.is_empty() {
+                return Err(format!(
+                    "parameterized/function LET binding '{}' not supported by v2 \
+                     (falling back to v1)",
+                    name
+                ));
+            }
+
             defs.push(LetDef {
                 name,
                 params,
@@ -628,20 +679,27 @@ impl<'a> Parser<'a> {
     }
 
     /// `IF cond THEN a ELSE b`. Bodies extend with the caller's stop.
+    ///
+    /// Fix #2: thread the caller's `outer` Stop through every branch so the
+    /// enclosing bullet fence is preserved. Using `Stop::top()` here would LOSE
+    /// the fence, letting a sibling bullet that follows THEN/ELSE be swallowed
+    /// into the branch. We only ADD the branch-delimiter hard terminators
+    /// (`THEN`/`ELSE`) on top of `outer`; the else-branch keeps `outer` as-is.
     fn parse_if(&mut self, outer: &Stop) -> PResult<Expr> {
         let head = self.advance(); // IF
-        let cond_stop = Stop::top().with_hard(&[Tok::Then]);
+        let cond_stop = outer.with_hard(&[Tok::Then]);
         let cond = self.parse_expr(&cond_stop)?;
         if !matches!(self.peek_kind(), Tok::Then) {
             return Err("expected THEN in IF".to_string());
         }
         self.advance();
-        let then_stop = Stop::top().with_hard(&[Tok::Else]);
+        let then_stop = outer.with_hard(&[Tok::Else]);
         let then_ = self.parse_expr(&then_stop)?;
         if !matches!(self.peek_kind(), Tok::Else) {
             return Err("expected ELSE in IF".to_string());
         }
         self.advance();
+        // else-branch extends with the caller's fence intact (Fix #2).
         let else_ = self.parse_expr(outer)?;
         let span = head.span.merge(else_.span());
         Ok(Expr::If {
@@ -745,7 +803,12 @@ impl<'a> Parser<'a> {
                 self.peek_kind()
             ));
         }
-        let text = self.text(start, end);
+        // Fix #4: the atom text is reconstructed from the ORIGINAL byte slice, so
+        // any `\*`/`(* *)` comment the lexer already stripped would otherwise be
+        // reintroduced (e.g. `x (* c *) + y` would reach v1 WITH the comment).
+        // Strip comments from the materialized slice (replacing each with a single
+        // space to preserve token separation) so v1 lowers clean text.
+        let text = strip_comments(&self.text(start, end));
         Ok(Expr::Atom {
             text,
             span: start_tok.span.merge(self.toks[self.pos.saturating_sub(1)].span),
@@ -753,9 +816,84 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// Strip TLA+ comments from an atom text slice: `\* ...` to end-of-line and
+/// nested `(* ... *)`. Each comment is replaced by a single space so adjacent
+/// tokens don't fuse (e.g. `a(* c *)b` -> `a b`). Comment markers inside a
+/// double-quoted string literal are left untouched. Mirrors the lexer's trivia
+/// rules so the text handed to `compile_expr_v1` matches what v2 tokenized.
+fn strip_comments(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        // String literal: copy verbatim (with `\"` escapes) — no comment scan.
+        if b[i] == b'"' {
+            out.push(b'"');
+            i += 1;
+            while i < b.len() {
+                if b[i] == b'\\' && i + 1 < b.len() {
+                    out.push(b[i]);
+                    out.push(b[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                out.push(b[i]);
+                let done = b[i] == b'"';
+                i += 1;
+                if done {
+                    break;
+                }
+            }
+            continue;
+        }
+        // Line comment `\* ... ` to end of line (keep the newline).
+        if b[i] == b'\\' && i + 1 < b.len() && b[i + 1] == b'*' {
+            i += 2;
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            out.push(b' ');
+            continue;
+        }
+        // Nested block comment `(* ... *)`.
+        if b[i] == b'(' && i + 1 < b.len() && b[i + 1] == b'*' {
+            i += 2;
+            let mut depth = 1usize;
+            while i < b.len() && depth > 0 {
+                if b[i] == b'(' && i + 1 < b.len() && b[i + 1] == b'*' {
+                    depth += 1;
+                    i += 2;
+                } else if b[i] == b'*' && i + 1 < b.len() && b[i + 1] == b')' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            out.push(b' ');
+            continue;
+        }
+        // Regular byte: copy verbatim (preserves multi-byte UTF-8 unchanged; we
+        // only special-case ASCII comment/string markers above).
+        out.push(b[i]);
+        i += 1;
+    }
+    // `out` is `s` with whole ASCII-delimited comment regions removed, so it
+    // remains valid UTF-8.
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+}
+
 /// Parse a source string into an [`Expr`] AST.
 pub fn parse(src: &str) -> PResult<Expr> {
     let toks = super::lexer::tokenize(src);
+    // Fix #5: a lex error (e.g. unterminated block comment) invalidates the whole
+    // token stream — bail so the caller falls back to v1 rather than parsing a
+    // truncated prefix.
+    if let Some(t) = toks.iter().find(|t| matches!(t.kind, Tok::LexError(_))) {
+        if let Tok::LexError(msg) = &t.kind {
+            return Err(format!("lex error: {msg}"));
+        }
+    }
     let mut p = Parser::new(src, toks);
     p.parse_expr_top()
 }
