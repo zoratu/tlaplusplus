@@ -335,37 +335,64 @@ impl<'a> Parser<'a> {
                 self.peek_kind()
             ));
         }
-        match self.peek_kind() {
-            Tok::AndBullet => self.parse_junction(JunctionOp::And, stop),
-            Tok::OrBullet => self.parse_junction(JunctionOp::Or, stop),
-            Tok::Forall => self.parse_quant(QuantKind::Forall, stop),
-            Tok::Exists => self.parse_quant(QuantKind::Exists, stop),
-            Tok::Let => self.parse_let(stop),
-            Tok::If => self.parse_if(stop),
-            Tok::LParen => self.parse_paren(stop),
-            // ---- Phase 1 containers ----
-            // Each is attempted STRUCTURALLY only when the container is a
-            // "standalone" prefix — i.e. after its balanced span the next token
-            // is a v2 boundary (a stop bullet / hard terminator / EOF, or a
-            // v2-owned `=>`/`<=>`). If instead a LEAF operator follows (e.g.
-            // `{1,2} \union {3}`, `<<a>>[1]`, `r.field`), v2 does NOT own that
-            // operator, so a structural container prefix would strand it → a
-            // trailing-token error. In that case we fall through to `parse_atom`,
-            // which absorbs the WHOLE expression (container + trailing leaf ops)
-            // as one Atom for v1 to lower — identical to v1's own parse.
-            Tok::LBrace if self.container_is_standalone(stop, Tok::LBrace, Tok::RBrace) => {
+        // Classify the leading token into an owned category first (avoids
+        // binding a reference out of the scrutinee into arms that need `&mut
+        // self`), then dispatch. The Phase-1 container arms are attempted
+        // STRUCTURALLY only when the container is a "standalone" prefix — i.e.
+        // after its balanced span the next token is a v2 boundary (a stop bullet
+        // / hard terminator / EOF, or a v2-owned `=>`/`<=>`). If instead a LEAF
+        // operator follows (e.g. `{1,2} \union {3}`, `<<a>>[1]`, `r.field`), v2
+        // does NOT own that operator, so a structural container prefix would
+        // strand it → a trailing-token error. In that case we fall through to
+        // `parse_atom`, which absorbs the WHOLE expression (container + trailing
+        // leaf ops) as one Atom for v1 to lower — identical to v1's own parse.
+        enum Lead {
+            AndB,
+            OrB,
+            Forall,
+            Exists,
+            Let,
+            If,
+            LParen,
+            LBrace,
+            LBracket,
+            AngleOpen,
+            Choose,
+            Case,
+            Atom,
+        }
+        let lead = match self.peek_kind() {
+            Tok::AndBullet => Lead::AndB,
+            Tok::OrBullet => Lead::OrB,
+            Tok::Forall => Lead::Forall,
+            Tok::Exists => Lead::Exists,
+            Tok::Let => Lead::Let,
+            Tok::If => Lead::If,
+            Tok::LParen => Lead::LParen,
+            Tok::LBrace => Lead::LBrace,
+            Tok::LBracket => Lead::LBracket,
+            Tok::Choose => Lead::Choose,
+            Tok::Other(s) if s == "<<" => Lead::AngleOpen,
+            Tok::Ident(w) if w == "CASE" => Lead::Case,
+            _ => Lead::Atom,
+        };
+        match lead {
+            Lead::AndB => self.parse_junction(JunctionOp::And, stop),
+            Lead::OrB => self.parse_junction(JunctionOp::Or, stop),
+            Lead::Forall => self.parse_quant(QuantKind::Forall, stop),
+            Lead::Exists => self.parse_quant(QuantKind::Exists, stop),
+            Lead::Let => self.parse_let(stop),
+            Lead::If => self.parse_if(stop),
+            Lead::LParen => self.parse_paren(stop),
+            Lead::LBrace if self.container_is_standalone(stop, Tok::LBrace, Tok::RBrace) => {
                 self.parse_set(stop)
             }
-            Tok::Other(s) if s == "<<" && self.tuple_is_standalone(stop) => {
-                self.parse_tuple(stop)
-            }
-            Tok::LBracket if self.container_is_standalone(stop, Tok::LBracket, Tok::RBracket) => {
+            Lead::AngleOpen if self.tuple_is_standalone(stop) => self.parse_tuple(stop),
+            Lead::LBracket if self.container_is_standalone(stop, Tok::LBracket, Tok::RBracket) => {
                 self.parse_bracket(stop)
             }
-            Tok::Choose => self.parse_choose(stop),
-            Tok::Ident(w) if w == "CASE" && self.case_is_standalone(stop) => {
-                self.parse_case(stop)
-            }
+            Lead::Choose => self.parse_choose(stop),
+            Lead::Case if self.case_is_standalone(stop) => self.parse_case(stop),
             _ => self.parse_atom(stop),
         }
     }
@@ -445,6 +472,15 @@ impl<'a> Parser<'a> {
     /// OTHER trailing token (a leaf operator, `.field`, `[`, function-apply,
     /// etc.) means the container is an OPERAND and must be absorbed as an atom.
     fn is_v2_boundary_at(&self, idx: usize, stop: &Stop) -> bool {
+        // A token at/after the active barrier is a boundary: the enclosing
+        // caller (a container element, a LET value) fenced the parse there, so a
+        // container ending exactly at the barrier is standalone and can be
+        // recursed structurally (e.g. a nested comprehension inside a set
+        // element). Without this a nested container inside an element would be
+        // absorbed as an atom instead of getting v2 fencing.
+        if idx >= self.barrier {
+            return true;
+        }
         let t = &self.toks[idx.min(self.toks.len() - 1)];
         match &t.kind {
             Tok::Eof | Tok::Implies | Tok::Iff => true,
