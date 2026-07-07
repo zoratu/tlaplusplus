@@ -614,6 +614,121 @@ fn case_arm_junction_fenced() {
     assert!(s.contains("-> AND["), "case arm junction not fenced: {s}");
 }
 
+// ===================== Phase 1.5: CASE wrong-parse fixes =====================
+
+// Bug #1: a CASE arm's RESULT is a full expression; a depth-0 `=>` inside the
+// result belongs to the ARM, not the CASE boundary. `CASE p -> a => b [] OTHER
+// -> c` parses as `Case[p -> (a => b) [] OTHER -> c]`, NOT `(CASE p -> a) => ...`.
+#[test]
+fn case_arm_result_implication_stays_in_arm() {
+    let s = shape("CASE p -> a => b [] OTHER -> c");
+    // Top-level is a Case (not an Implies), and the arm result is `a => b`.
+    assert!(s.starts_with("Case["), "CASE sliced at =>: {s}");
+    assert!(
+        s.contains("Implies(Atom(\"a\"), Atom(\"b\"))"),
+        "arm result implication lost: {s}"
+    );
+    // And it lowers EXACTLY as v1 does (v1 matches TLC).
+    assert_lower_matches_v1("CASE p -> a => b [] OTHER -> c");
+}
+
+// Bug #1 (guard variant): a depth-0 `=>` inside a GUARD belongs to the arm.
+#[test]
+fn case_arm_guard_implication_stays_in_arm() {
+    let s = shape("CASE p => q -> a [] OTHER -> c");
+    assert!(s.starts_with("Case["), "CASE sliced at => in guard: {s}");
+    assert!(
+        s.contains("Implies(Atom(\"p\"), Atom(\"q\"))"),
+        "arm guard implication lost: {s}"
+    );
+    assert_lower_matches_v1("CASE p => q -> a [] OTHER -> c");
+}
+
+// Bug #1 (<=> variant): `<=>` inside an arm result stays in the arm.
+#[test]
+fn case_arm_result_iff_stays_in_arm() {
+    let s = shape("CASE p -> a <=> b [] OTHER -> c");
+    assert!(s.starts_with("Case["), "CASE sliced at <=>: {s}");
+    assert_lower_matches_v1("CASE p -> a <=> b [] OTHER -> c");
+}
+
+// Bug #2: a CASE that is a LEAF OPERAND of a leaf `=` must NOT be sliced at the
+// `=>` inside its arm. `x = CASE p -> a => b [] OTHER -> c` falls back to v1
+// (which parses the whole `x = CASE ...` correctly) rather than emitting a
+// partial Atom + outer Implies.
+#[test]
+fn case_operand_sliced_by_implies_falls_back() {
+    assert_v2_rejects("x = CASE p -> a => b [] OTHER -> c");
+}
+
+// Bug #2 (<=> variant).
+#[test]
+fn case_operand_sliced_by_iff_falls_back() {
+    assert_v2_rejects("x = CASE p -> a <=> b [] OTHER -> c");
+}
+
+// Bug #3a: an UNPARENTHESIZED nested CASE (whose inner `[]` would be stolen by
+// the outer CASE's separator scan) falls back to v1.
+#[test]
+fn case_nested_unparenthesized_falls_back() {
+    assert_v2_rejects("CASE p -> CASE q -> a [] r -> b [] OTHER -> c");
+}
+
+// Bug #3a (control): a PARENTHESIZED nested CASE is at depth>0 (absorbed as an
+// atom sub-parse) and stays fine — it lowers identically to v1.
+#[test]
+fn case_nested_parenthesized_ok() {
+    assert_lower_matches_v1("CASE p -> (CASE q -> a [] OTHER -> b) [] OTHER -> c");
+}
+
+// Bug #3b: a CASE with a DUPLICATE OTHER falls back (TLC: OTHER unique).
+#[test]
+fn case_duplicate_other_falls_back() {
+    assert_v2_rejects("CASE p -> a [] OTHER -> b [] OTHER -> c");
+}
+
+// Bug #3b: a CASE with a NON-FINAL OTHER falls back (TLC: OTHER must be last).
+#[test]
+fn case_non_final_other_falls_back() {
+    assert_v2_rejects("CASE OTHER -> a [] p -> b");
+}
+
+// Bug #4: a bracket interior containing a top-level CASE must NOT be classified
+// as a function set `[D -> R]` (the `->` are arm arrows). Falls back to v1.
+#[test]
+fn bracket_with_case_falls_back() {
+    assert_v2_rejects("[CASE p -> a]");
+}
+
+// ===== TLC-verified goldens: =>/<=> grouping + CASE-arm implication =====
+// These pin v2's lowering against v1 (which matches TLC v2.19) for the exact
+// operator-precedence shapes flagged in review.
+
+// `=>` binds TIGHTER than `<=>`: `a => b <=> c` == `(a => b) <=> c`.
+#[test]
+fn implies_tighter_than_iff_left() {
+    assert_lower_matches_v1("a => b <=> c");
+}
+
+// `a <=> b => c` == `a <=> (b => c)`.
+#[test]
+fn iff_looser_than_implies_right() {
+    assert_lower_matches_v1("a <=> b => c");
+}
+
+// `=>` is right-associative: `a => b => c` == `a => (b => c)`. (Lowering-match
+// counterpart to `implies_right_assoc`, which checks the shape.)
+#[test]
+fn implies_right_assoc_lowers_like_v1() {
+    assert_lower_matches_v1("a => b => c");
+}
+
+// Full CASE with an arm-result implication + OTHER, lowered exactly as v1.
+#[test]
+fn case_arm_implication_full_matches_v1() {
+    assert_lower_matches_v1("CASE p -> a => b [] q -> c [] OTHER -> d");
+}
+
 // ===================== Phase 1: CHOOSE =====================
 
 #[test]

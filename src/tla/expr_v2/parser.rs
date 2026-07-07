@@ -560,6 +560,34 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Like [`Self::is_v2_boundary_at`] but for the CASE extent scan: a depth-0
+    /// `=>`/`<=>` is NOT a CASE boundary — it belongs to the current arm's guard
+    /// or result (`CASE p -> a => b [] ...` has result `a => b`; `CASE p => q ->
+    /// a [] ...` has guard `p => q`). The overall CASE extent is bounded by the
+    /// CALLER's Stop (hard terms / fence bullets / EOF / an unbalanced closer),
+    /// exactly like other body-extending forms — NOT by `=>`/`<=>`. Everything
+    /// else matches `is_v2_boundary_at`.
+    fn case_boundary_at(&self, idx: usize, stop: &Stop) -> bool {
+        if idx >= self.barrier {
+            return true;
+        }
+        let t = &self.toks[idx.min(self.toks.len() - 1)];
+        match &t.kind {
+            // NB: `Tok::Implies | Tok::Iff` deliberately NOT boundaries here —
+            // they belong to a CASE arm's guard/result, not the CASE terminator.
+            Tok::Eof => true,
+            k if stop.hard_terms.iter().any(|h| h == k) => true,
+            Tok::AndBullet | Tok::OrBullet => {
+                if let Some(col) = stop.bullet_fence_col {
+                    t.had_newline_before && t.span.start_col <= col
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
     fn container_is_standalone(&self, stop: &Stop, open: Tok, close: Tok) -> bool {
         match self.matching_close_index(open, close) {
             Some(after) => self.is_v2_boundary_at(after, stop),
@@ -619,7 +647,10 @@ impl<'a> Parser<'a> {
                 Tok::Other(s) if s == "<<" => depth += 1,
                 Tok::Other(s) if s == ">>" => depth -= 1,
                 Tok::Other(s) if s == "->" && depth == 0 => saw_arrow = true,
-                _ if depth == 0 && self.is_v2_boundary_at(i, stop) => break,
+                // CASE arms own their `=>`/`<=>`; use the CASE-specific boundary
+                // (which does NOT stop at `=>`/`<=>`) so the extent covers whole
+                // arms. See `case_boundary_at`.
+                _ if depth == 0 && self.case_boundary_at(i, stop) => break,
                 _ => {}
             }
             i += 1;
@@ -1372,6 +1403,22 @@ impl<'a> Parser<'a> {
             }
         }
 
+        // Fix #4: a top-level `CASE` inside the bracket interior means the `->`
+        // tokens are CASE arm arrows, NOT a function-set `[D -> R]` arrow. A
+        // single-arm CASE `[CASE p -> a]` would otherwise be mis-classified as a
+        // function set (domain `CASE p`, range `a`). Reject any bracket interior
+        // containing a top-level CASE → v1 fallback (v1 lowers the whole bracket
+        // correctly).
+        {
+            let cases = self.top_level_positions(closer, |k| match k {
+                Tok::Ident(s) => s == "CASE",
+                _ => false,
+            });
+            if !cases.is_empty() {
+                return Err("bracket interior contains a top-level CASE → v1".to_string());
+            }
+        }
+
         // `|->` present at top level → record literal OR function construct.
         let mapsto = self.top_level_positions(closer, |k| matches!(k, Tok::MapsTo));
         if !mapsto.is_empty() {
@@ -1581,8 +1628,11 @@ impl<'a> Parser<'a> {
     /// results recurse. Lowers to `CompiledExpr::Case { arms, other }`.
     fn parse_case(&mut self, outer: &Stop) -> PResult<Expr> {
         let head = self.advance(); // CASE (an Ident)
-        // Determine the CASE extent: from here to the enclosing v2 boundary at
-        // depth 0.
+        // Fix #1: the CASE extent runs from here to the enclosing v2 boundary at
+        // depth 0. Use `case_boundary_at` (NOT `is_v2_boundary_at`) so a depth-0
+        // `=>`/`<=>` is NOT treated as the CASE terminator — it belongs to the
+        // current arm's guard/result. E.g. in `CASE p -> a => b [] OTHER -> c`
+        // the arm result is `a => b`, and the CASE extends over the whole thing.
         let end_excl = {
             let mut i = self.pos;
             let mut depth: i32 = 0;
@@ -1602,12 +1652,38 @@ impl<'a> Parser<'a> {
                     }
                     Tok::Other(s) if s == "<<" => depth += 1,
                     Tok::Other(s) if s == ">>" => depth -= 1,
-                    _ if depth == 0 && self.is_v2_boundary_at(i, outer) => break i,
+                    _ if depth == 0 && self.case_boundary_at(i, outer) => break i,
                     _ => {}
                 }
                 i += 1;
             }
         };
+
+        // Fix #3a: an UNPARENTHESIZED nested CASE would have its inner `[]` arm
+        // separators (and `->` arrows) stolen by this outer CASE's depth-0 scan,
+        // mangling both. The `[]`/`->` split has no CASE-nesting depth, so the
+        // only safe option is to REJECT a nested CASE keyword at depth 0 within
+        // this extent → v1 fallback (v1 parses nested CASE correctly). A CASE
+        // inside `(...)` is at depth>0 and is fine (it becomes an atom sub-parse).
+        {
+            let mut i = self.pos;
+            let mut depth: i32 = 0;
+            while i < end_excl {
+                match &self.toks[i].kind {
+                    Tok::LParen | Tok::LBracket | Tok::LBrace => depth += 1,
+                    Tok::RParen | Tok::RBracket | Tok::RBrace => depth -= 1,
+                    Tok::Other(s) if s == "<<" => depth += 1,
+                    Tok::Other(s) if s == ">>" => depth -= 1,
+                    Tok::Ident(w) if depth == 0 && w == "CASE" => {
+                        return Err(
+                            "unparenthesized nested CASE not modeled by v2 → v1".to_string(),
+                        );
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+        }
 
         // Arm separators `[]` at depth 0 within [self.pos, end_excl).
         let seps = self.top_level_positions(end_excl, |k| match k {
@@ -1621,11 +1697,16 @@ impl<'a> Parser<'a> {
         }
         let mut seg_ends: Vec<usize> = seps.clone();
         seg_ends.push(end_excl);
+        let n_segs = seg_ends.len();
 
         let mut arms: Vec<(Expr, Expr)> = Vec::new();
         let mut other: Option<Box<Expr>> = None;
 
-        for (seg_start, seg_end) in seg_starts.into_iter().zip(seg_ends.into_iter()) {
+        for (seg_idx, (seg_start, seg_end)) in seg_starts
+            .into_iter()
+            .zip(seg_ends.into_iter())
+            .enumerate()
+        {
             self.pos = seg_start;
             // An arm is `guard -> result`; find the depth-0 `->` in this segment.
             let arrows: Vec<usize> = self
@@ -1641,6 +1722,16 @@ impl<'a> Parser<'a> {
             let is_other = seg_start + 1 == a
                 && matches!(&self.toks[seg_start].kind, Tok::Ident(s) if s == "OTHER");
             if is_other {
+                // Fix #3b: OTHER must be UNIQUE and the LAST arm (TLC semantics).
+                // A duplicate or non-final OTHER would silently overwrite `other`
+                // (losing arms / order) when lowered. Reject → v1 fallback, which
+                // matches TLC's handling.
+                if other.is_some() {
+                    return Err("CASE with duplicate OTHER → v1".to_string());
+                }
+                if seg_idx + 1 != n_segs {
+                    return Err("CASE with non-final OTHER → v1".to_string());
+                }
                 self.pos = a + 1;
                 let res = self.parse_subexpr_until(seg_end)?;
                 other = Some(Box::new(res));
@@ -1717,6 +1808,18 @@ impl<'a> Parser<'a> {
                         // CASE (guards can contain `/\`); reject → v1 fallback.
                         return Err(
                             "CASE operand would be sliced by a junction bullet → v1".to_string(),
+                        );
+                    }
+                    // Fix #2: `=>`/`<=>` after an absorbed depth-0 CASE would ALSO
+                    // slice the CASE — the operator belongs INSIDE an arm
+                    // (`x = CASE p -> a => b [] OTHER -> c`, arm result `a => b`),
+                    // not to an outer implication. Absorbing only `x = CASE p ->
+                    // a` and emitting `Implies(that, ...)` is a WRONG parse. The
+                    // atom reader cannot know where the CASE ends, so reject the
+                    // whole atom → v1 fallback (v1 parses `x = CASE ...` correctly).
+                    Tok::Implies | Tok::Iff if saw_case_operand => {
+                        return Err(
+                            "CASE operand would be sliced by =>/<=> → v1".to_string(),
                         );
                     }
                     // body-extending logical structure v2 owns
