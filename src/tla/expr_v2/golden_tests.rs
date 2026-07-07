@@ -116,8 +116,10 @@ fn nano_blockchain_shape() {
     assert!(s.contains("Let("), "missing inner let: {s}");
     // The inner `=> LET pk == g(h) IN ...` must attach the inner LET as the
     // consequent (structural body extension), not split it off.
+    // Leaf comparison `sb # NoBlock` stays inside a single Atom (v1 lowers it);
+    // v2 owns only the `=>` structure, attaching the inner LET as the consequent.
     assert!(
-        s.contains("Implies(Neq(Atom(\"sb\"), Atom(\"NoBlock\")), Let("),
+        s.contains("Implies(Atom(\"sb # NoBlock\"), Let("),
         "consequent not the inner LET: {s}"
     );
 }

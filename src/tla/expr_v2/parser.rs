@@ -156,44 +156,23 @@ impl<'a> Parser<'a> {
     fn bin_op_at(&self, level: u32) -> Option<(BinOp, bool /*right assoc*/)> {
         let k = self.peek_kind();
         match level {
+            // v2 owns ONLY the top-level body-extending logical operators.
+            // Comparisons / arithmetic / set operators are LEFT INSIDE the atom
+            // and lowered by v1 (so their precedence — incl. `..` vs `+` — is
+            // exactly the old parser's). See the atom-reader comment for why.
             0 => match k {
                 Tok::Iff => Some((BinOp::Iff, true)),
                 Tok::Implies => Some((BinOp::Implies, true)),
-                _ => None,
-            },
-            3 => match k {
-                Tok::Eq => Some((BinOp::Eq, false)),
-                Tok::Neq => Some((BinOp::Neq, false)),
-                Tok::Lt => Some((BinOp::Lt, false)),
-                Tok::Gt => Some((BinOp::Gt, false)),
-                Tok::Le => Some((BinOp::Le, false)),
-                Tok::Ge => Some((BinOp::Ge, false)),
-                Tok::ElemOf => Some((BinOp::In, false)),
-                Tok::NotIn => Some((BinOp::NotIn, false)),
-                _ => None,
-            },
-            4 => match k {
-                Tok::Plus => Some((BinOp::Add, false)),
-                Tok::Minus => Some((BinOp::Sub, false)),
-                Tok::Union => Some((BinOp::Union, false)),
-                Tok::Intersect => Some((BinOp::Intersect, false)),
-                Tok::Backslash => Some((BinOp::SetMinus, false)),
-                Tok::Concat => Some((BinOp::Concat, false)),
-                _ => None,
-            },
-            5 => match k {
-                Tok::Star => Some((BinOp::Mul, false)),
-                Tok::Div => Some((BinOp::Div, false)),
-                Tok::Slash => Some((BinOp::Div, false)),
-                Tok::Mod => Some((BinOp::Mod, false)),
-                Tok::Caret => Some((BinOp::Pow, false)),
                 _ => None,
             },
             _ => None,
         }
     }
 
-    const MAX_BIN_LEVEL: u32 = 5;
+    // Levels: 0 = <=>/=>, 1 = \/, 2 = /\ (junction levels), 3+ = leaf operators
+    // handled inside atoms by v1. We still descend through 3..=MAX so the
+    // recursion bottoms out at parse_unary.
+    const MAX_BIN_LEVEL: u32 = 2;
 
     fn parse_bin(&mut self, stop: &Stop, level: u32) -> PResult<Expr> {
         if level > Self::MAX_BIN_LEVEL {
@@ -713,31 +692,20 @@ impl<'a> Parser<'a> {
             if depth == 0 && self.should_stop(stop) {
                 break;
             }
-            // At depth 0, structural tokens that outer layers own end the atom.
+            // At depth 0, ONLY the structural tokens v2 truly owns end an atom.
+            // Deliberately NOT included: comparison / arithmetic / set / membership
+            // operators (= # < > <= >= \in \notin + - * \div % ^ \union \intersect
+            // \ \o) and the range `..`. Those are LEAF operators — v1's compiler
+            // already gets their precedence right (e.g. `..` binds tighter than
+            // `+` in `0..MaxSegmentId+1`), whereas re-deriving it in v2 introduced
+            // precedence bugs. Keeping them inside the atom means v1 lowers them,
+            // so leaf semantics stay byte-for-byte identical. v2 owns only
+            // junctions, `=>`/`<=>`, and the quantifier/LET/IF keyword structure.
             if depth == 0 && consumed {
                 match &t.kind {
-                    // operators owned by the Pratt binary layers
+                    // body-extending logical structure v2 owns
                     Tok::Implies
                     | Tok::Iff
-                    | Tok::Eq
-                    | Tok::Neq
-                    | Tok::Lt
-                    | Tok::Gt
-                    | Tok::Le
-                    | Tok::Ge
-                    | Tok::ElemOf
-                    | Tok::NotIn
-                    | Tok::Plus
-                    | Tok::Minus
-                    | Tok::Star
-                    | Tok::Slash
-                    | Tok::Div
-                    | Tok::Mod
-                    | Tok::Caret
-                    | Tok::Union
-                    | Tok::Intersect
-                    | Tok::Backslash
-                    | Tok::Concat
                     // structural keywords / bullets
                     | Tok::AndBullet
                     | Tok::OrBullet
