@@ -939,7 +939,26 @@ fn dedent_common(expr: &str) -> String {
         .join("\n")
 }
 
+/// Public expression compiler.
+///
+/// By default this is the original string-based compiler (`compile_expr_v1`).
+/// When the `TLAPLUS_EXPR_PARSER=v2` env flag is set, we route through the new
+/// layout-aware `expr_v2` parser and fall back to v1 on ANY v2 parse error, so
+/// enabling the flag can never make an expression fail to compile that used to.
+/// DEFAULT OFF — no behavioral change unless the flag is explicitly set.
 pub fn compile_expr(expr: &str) -> CompiledExpr {
+    if crate::tla::expr_v2::v2_enabled() {
+        if let Ok(compiled) = crate::tla::expr_v2::parse_and_lower(expr) {
+            return compiled;
+        }
+        // fall through to v1 on any v2 parse error
+    }
+    compile_expr_v1(expr)
+}
+
+/// The original string-based expression compiler. `expr_v2`'s `Atom` leaves
+/// lower via this function, so leaf semantics are byte-for-byte unchanged.
+pub fn compile_expr_v1(expr: &str) -> CompiledExpr {
     // Re-base the expression while PRESERVING relative indentation: strip the
     // common leading whitespace shared by all non-empty lines instead of
     // `trim()`-ing line 1 to column 0. A bare `trim()` de-indents the first
