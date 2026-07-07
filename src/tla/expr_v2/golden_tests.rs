@@ -15,7 +15,9 @@ fn shape(src: &str) -> String {
 //    junction), NOT `And([Implies(P, LET..Q), R])`.
 #[test]
 fn implies_let_junction_consequent() {
-    let s = shape("P => LET X == v IN /\\ Q\n              /\\ R");
+    // `/\ Q` bullet is at column 19 (after "P => LET X == v IN "); the
+    // continuation `/\ R` must align to the SAME column (TLA+ layout rule).
+    let s = shape("P => LET X == v IN /\\ Q\n                   /\\ R");
     // Implies(P, Let([X==v] IN AND[Q, R]))
     assert!(
         s.starts_with("Implies(Atom(\"P\"), Let("),
@@ -53,9 +55,11 @@ fn junction_item_implies_let_then_sibling() {
 // 4a. Nested Paxos-Phase2a-like: `/\ \A i,j : \/ A \/ B  /\ C`.
 #[test]
 fn paxos_like_nested() {
+    // `\/ A` bullet is at column 25 (after "/\ \A i \in I, j \in J : "); the
+    // continuation `\/ B` aligns to column 25; the sibling `/\ C` is at col 0.
     let src = "\
 /\\ \\A i \\in I, j \\in J : \\/ A
-                             \\/ B
+                         \\/ B
 /\\ C";
     let s = shape(src);
     // AST: AND[ Forall(i\in I; j\in J : OR[A, B]), C ]
