@@ -97,7 +97,19 @@ pub(crate) fn split_action_body_clauses(expr: &str) -> Vec<String> {
             || (starts_quant && (part.ends_with(':') || part.ends_with("IN")))
             || (part.starts_with("LET") && part.ends_with("IN"));
         if open_quant_or_let {
-            let mut combined = part;
+            // Re-glue the trailing conjuncts of an open quantifier/LET body with
+            // ` /\ `. A conjunct whose value is `LHS = LET ... IN <body>` (or a
+            // bare trailing `LET ... IN <body>`) is hazardous here: a LET body has
+            // no closing token, so once flattened onto one line the next ` /\ `
+            // glue is swallowed *into* that body — e.g.
+            //   received' = LET sb == ... IN [n \in Node |-> ...]
+            //   /\ UNCHANGED distributedLedger
+            // becomes `received' = LET ... IN ([func] /\ UNCHANGED ...)`, and the
+            // primed assignment's RHS evaluates to a Function used as a Boolean
+            // (NanoBlockchain's Create{Send,Receive,ChangeRep}Block). Bound the
+            // LET body with explicit parentheses so the glue conjoins at the
+            // intended (outer) level.
+            let mut combined = bound_trailing_let_in_body(&part);
             for rest in expanded.iter().skip(idx + 1) {
                 let rest = normalize_multiline_action_indentation(rest.trim())
                     .trim()
@@ -106,7 +118,7 @@ pub(crate) fn split_action_body_clauses(expr: &str) -> Vec<String> {
                     continue;
                 }
                 combined.push_str(" /\\ ");
-                combined.push_str(&rest);
+                combined.push_str(&bound_trailing_let_in_body(&rest));
             }
             merged.push(combined);
             break;
@@ -249,6 +261,34 @@ pub fn split_action_body_disjuncts(expr: &str) -> Vec<String> {
     let conjunctive_clauses = split_action_body_clauses(trimmed);
     if conjunctive_clauses.len() > 1 {
         return vec![trimmed.to_string()];
+    }
+
+    // SOUNDNESS: the body reduces to a *single* conjunctive clause that is a
+    // quantified action (`[/\] \E x \in S : <body-with-nested-\/>`). The `\/`
+    // then lives *inside* the quantifier body, so its bound variable spans
+    // every disjunct. This is the conjunctive analogue of the nested-quantifier
+    // guard on the `parse_action_exists` branch above. A `\E`-led conjunct such
+    // as
+    //   /\ \E block \in received[node] :
+    //          /\ \/ A(block) \/ B(block)
+    //          /\ post(block)
+    // parses to one `\E block : ...` clause, but the `split_top_level(trimmed,
+    // "\\/")` fall-through below is blind to the quantifier body and to the
+    // inner `/\` nesting — it would shred the disjunction into `\/`-branches
+    // with `block` unbound (each resolving to `ModelValue("block")`), silently
+    // dropping every successor (NanoBlockchain's `ProcessBlock`, whose
+    // multi-line body loses its relative indentation during action-body
+    // normalization so the nested `\/` land at the top level). Keep the whole
+    // quantified clause as one disjunct and let `eval_exists_action_multi`
+    // expand the inner `\/` with the binder in scope.
+    if let [clause] = conjunctive_clauses.as_slice() {
+        let head = clause.trim_start();
+        let is_quantified = ["\\E ", "\\A ", "\\E\n", "\\A\n", "\\E(", "\\A("]
+            .iter()
+            .any(|prefix| head.starts_with(prefix));
+        if is_quantified {
+            return vec![trimmed.to_string()];
+        }
     }
 
     split_top_level(trimmed, "\\/")
@@ -644,6 +684,153 @@ fn normalize_multiline_action_indentation(expr: &str) -> String {
         normalized.push_str(trimmed);
     }
     normalized
+}
+
+/// A LET body has no closing token, so when a conjunct of the form
+/// `<lhs> = LET <defs> IN <body>` (or a bare trailing `LET <defs> IN <body>`)
+/// is flattened onto a single line and re-glued with a following ` /\ <next>`,
+/// the `<next>` is parsed *inside* `<body>` rather than as a sibling conjunct.
+/// This wraps the trailing `LET ... IN <body>` in explicit parentheses so the
+/// following glue conjoins at the intended outer level. Only fires when the
+/// LET has a genuine (non-empty) IN body — a dangling `... IN` head (the open
+/// quantifier/LET prefix that the merge loop stitches onto) is left untouched.
+///
+/// Note: `find_action_keyword` skips `LET`/`IN` when scanning for a plain
+/// keyword, so we locate the LET boundaries via `matches_keyword_at` directly.
+fn bound_trailing_let_in_body(part: &str) -> String {
+    let chars: Vec<char> = part.chars().collect();
+    let mut i = 0usize;
+    let mut paren = 0usize;
+    let mut bracket = 0usize;
+    let mut brace = 0usize;
+    let mut angle = 0usize;
+    let mut let_start: Option<usize> = None; // char index of outermost top-level LET
+    let mut let_depth = 0usize;
+    let mut in_end: Option<usize> = None; // char index just past the matching top-level IN
+
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        match c {
+            '(' => paren += 1,
+            ')' => paren = paren.saturating_sub(1),
+            '[' => bracket += 1,
+            ']' => bracket = bracket.saturating_sub(1),
+            '{' => brace += 1,
+            '}' => brace = brace.saturating_sub(1),
+            '<' if next == Some('<') => {
+                angle += 1;
+                i += 2;
+                continue;
+            }
+            '>' if next == Some('>') => {
+                angle = angle.saturating_sub(1);
+                i += 2;
+                continue;
+            }
+            _ => {}
+        }
+        let at_top = paren == 0 && bracket == 0 && brace == 0 && angle == 0;
+        if at_top && matches_keyword_at(&chars, i, "LET") {
+            if let_depth == 0 {
+                let_start = Some(i);
+                in_end = None;
+            }
+            let_depth += 1;
+            i += 3;
+            continue;
+        }
+        if at_top && let_depth > 0 && matches_keyword_at(&chars, i, "IN") {
+            let_depth -= 1;
+            if let_depth == 0 {
+                in_end = Some(i + 2);
+            }
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+
+    // The LET body starts just past the matching top-level `IN`. Bound it at the
+    // first top-level `/\`/`\/` that follows (the LET body is that single leading
+    // expression; anything after the operator is a sibling conjunct/disjunct that
+    // must stay *outside* the parentheses). If the IN body is empty the `... IN`
+    // is a dangling head (the open quantifier/LET prefix) — leave it untouched.
+    if let (Some(ls), Some(ie)) = (let_start, in_end) {
+        let body_tail: String = chars[ie..].iter().collect();
+        let body_trimmed = body_tail.trim_start();
+        if body_trimmed.is_empty() {
+            return part.to_string(); // dangling `... IN` head — nothing to bound
+        }
+        // If the IN body *itself* is a bulleted `/\`/`\/` block, the LET body is
+        // that whole boolean block (an action-LET like `LET b == v IN /\ A /\ B`),
+        // not a value expression followed by a sibling conjunct. Wrapping here
+        // would either enclose the entire action or (if we stopped at the first
+        // `/\`) leave an empty LET body. Leave such LETs to the action evaluator.
+        if body_trimmed.starts_with("/\\") || body_trimmed.starts_with("\\/") {
+            return part.to_string();
+        }
+        // Scan from the IN body for the first top-level boolean connective.
+        let (mut p, mut b, mut br, mut a, mut ld) = (0usize, 0usize, 0usize, 0usize, 0usize);
+        let mut body_end = chars.len();
+        let mut j = ie;
+        while j < chars.len() {
+            let c = chars[j];
+            let next = chars.get(j + 1).copied();
+            match c {
+                '(' => p += 1,
+                ')' => p = p.saturating_sub(1),
+                '[' => b += 1,
+                ']' => b = b.saturating_sub(1),
+                '{' => br += 1,
+                '}' => br = br.saturating_sub(1),
+                '<' if next == Some('<') => {
+                    a += 1;
+                    j += 2;
+                    continue;
+                }
+                '>' if next == Some('>') => {
+                    a = a.saturating_sub(1);
+                    j += 2;
+                    continue;
+                }
+                _ => {}
+            }
+            let at_top = p == 0 && b == 0 && br == 0 && a == 0;
+            // Track nested LET inside the body so an inner `\/`/`/\` there does
+            // not prematurely close the outer body.
+            if at_top && matches_keyword_at(&chars, j, "LET") {
+                ld += 1;
+                j += 3;
+                continue;
+            }
+            if at_top && ld > 0 && matches_keyword_at(&chars, j, "IN") {
+                ld -= 1;
+                j += 2;
+                continue;
+            }
+            // `/\` is `'/'` then `'\\'`; `\/` is `'\\'` then `'/'`.
+            let is_conjunct = c == '/' && next == Some('\\');
+            let is_disjunct = c == '\\' && next == Some('/');
+            if at_top && ld == 0 && (is_conjunct || is_disjunct) && j > ie {
+                body_end = j;
+                break;
+            }
+            j += 1;
+        }
+
+        let before: String = chars[..ls].iter().collect();
+        let let_expr: String = chars[ls..body_end].iter().collect();
+        let after: String = chars[body_end..].iter().collect();
+        let let_expr = let_expr.trim_end();
+        let after = after.trim_start();
+        if after.is_empty() {
+            return format!("{before}({let_expr})");
+        }
+        return format!("{before}({let_expr}) {after}");
+    }
+
+    part.to_string()
 }
 
 pub(crate) fn parse_action_if(expr: &str) -> Option<(&str, &str, &str)> {
@@ -1676,6 +1863,80 @@ mod tests {
                 "every branch must carry the shared post-condition: {exprs:?}"
             );
         }
+    }
+
+    #[test]
+    fn split_action_body_disjuncts_keeps_quantified_conjunctive_body_intact() {
+        // Regression for NanoBlockchain `ProcessBlock`. The body is a single
+        // conjunct that is a `\E`-quantified action whose body is itself a
+        // conjunction with a *nested* disjunction:
+        //   /\ \E block \in received[node] :
+        //          /\ \/ ProcessOpenBlock(node, block)
+        //             \/ ProcessSendBlock(node, block)
+        //          /\ received' = [received EXCEPT ![node] = @ \ {block}]
+        // The `\/` lives inside the `\E block` scope; splitting on it orphans the
+        // `block` binder (it resolves to `ModelValue("block")` → record access on a
+        // non-record → the whole ProcessBlock branch is silently dropped). The
+        // whole quantified clause must stay ONE disjunct so the per-branch exists
+        // expansion binds `block` before evaluating the inner disjunction.
+        let body = r#"
+            /\ \E block \in received[node] :
+                /\  \/ ProcessOpenBlock(node, block)
+                    \/ ProcessSendBlock(node, block)
+                    \/ ProcessReceiveBlock(node, block)
+                    \/ ProcessChangeRepBlock(node, block)
+                /\ received' = [received EXCEPT ![node] = @ \ {block}]
+        "#;
+        let disjuncts = split_action_body_disjuncts(body);
+        assert_eq!(
+            disjuncts.len(),
+            1,
+            "quantified conjunctive body must stay one disjunct, got {}: {disjuncts:#?}",
+            disjuncts.len()
+        );
+        assert!(
+            disjuncts[0].contains("\\E block \\in received[node]"),
+            "the quantifier binder must be preserved: {}",
+            disjuncts[0]
+        );
+        assert!(
+            disjuncts[0].contains("received' = [received EXCEPT ![node] = @ \\ {block}]"),
+            "the shared post-condition must be preserved: {}",
+            disjuncts[0]
+        );
+    }
+
+    #[test]
+    fn bound_trailing_let_in_body_wraps_assignment_rhs_let() {
+        // A primed-assignment RHS that is `LET ... IN <value>` followed by a
+        // sibling conjunct must have its LET body parenthesized so the sibling
+        // `/\` is not swallowed into the (closing-token-less) LET body.
+        let part =
+            "received' = LET sb == [block |-> b] IN [n \\in Node |-> received[n] \\cup {sb}] \
+             /\\ UNCHANGED distributedLedger";
+        let bounded = bound_trailing_let_in_body(part);
+        assert_eq!(
+            bounded,
+            "received' = (LET sb == [block |-> b] IN [n \\in Node |-> received[n] \\cup {sb}]) \
+             /\\ UNCHANGED distributedLedger"
+        );
+    }
+
+    #[test]
+    fn bound_trailing_let_in_body_leaves_action_let_untouched() {
+        // A `LET x == v IN /\ A /\ B` is an action-LET whose IN body is the whole
+        // bulleted block — it must NOT be parenthesized (doing so would either
+        // enclose the whole action or leave an empty LET body).
+        let part = "LET nb == [previous |-> p] IN /\\ ValidateSendBlock(l, nb) /\\ received' = nb";
+        assert_eq!(bound_trailing_let_in_body(part), part);
+    }
+
+    #[test]
+    fn bound_trailing_let_in_body_leaves_dangling_in_head_untouched() {
+        // The open quantifier/LET prefix the merge loop stitches onto ends with a
+        // bare `... IN` (no body yet) — nothing to bound.
+        let part = "\\E x \\in S : LET nb == [a |-> 1] IN";
+        assert_eq!(bound_trailing_let_in_body(part), part);
     }
 
     #[test]

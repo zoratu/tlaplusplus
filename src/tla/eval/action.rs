@@ -739,12 +739,53 @@ fn expand_action_call_multi(
         )));
     }
 
-    // See the `alias!op` branch: a defined operator called with a primed
-    // argument acts as an action even when its own body has no prime. Perform
-    // textual arg substitution so the primed assignment surfaces.
-    if !looks_action && has_primed_arg {
-        let substituted = substitute_params_text(&def.body, &def.params, &arg_exprs);
-        return Some(eval_action_body_text_multi(&substituted, ctx, branch));
+    // A primed argument (e.g. `lastHash'`) names a *next-state variable*, not a
+    // value: it has no defined value until the action assigns it. So a body
+    // clause referencing that parameter (`newLastHash = hash`) is meant to
+    // become a primed *assignment* (`lastHash' = hash`), which only a textual
+    // substitution of `param -> arg` can express. Value-binding a primed arg
+    // instead evaluates `lastHash'` (unassigned) and turns the clause into a
+    // guard against a bogus value, silently dropping the successor.
+    //
+    // Substitute the *primed* args textually so their assignments surface, then
+    // value-bind the remaining non-primed args (each is a genuine value and
+    // safe/cheaper to bind). This subsumes the earlier `!looks_action` case: a
+    // CONSTANT-operator override invoked with a primed arg — e.g. Nano's
+    // `CalculateHash(genesisBlock, lastHash, lastHash') <- CalculateHashImpl` —
+    // is transitively an action (`looks_action == true`) yet still needs its
+    // `lastHash'` arg threaded textually so `newLastHash = hash` becomes the
+    // primed assignment `lastHash' = hash`.
+    if has_primed_arg {
+        let mut substituted = def.body.clone();
+        let mut value_params: Vec<&String> = Vec::new();
+        let mut value_args: Vec<&String> = Vec::new();
+        for (param, arg_expr) in def.params.iter().zip(arg_exprs.iter()) {
+            if arg_is_primed_expr(arg_expr) {
+                substituted = substitute_params_text(
+                    &substituted,
+                    std::slice::from_ref(param),
+                    std::slice::from_ref(arg_expr),
+                );
+            } else {
+                value_params.push(param);
+                value_args.push(arg_expr);
+            }
+        }
+
+        let mut child_ctx = ctx.clone();
+        {
+            let locals_mut = std::rc::Rc::make_mut(&mut child_ctx.locals);
+            for (param, arg_expr) in value_params.iter().zip(value_args.iter()) {
+                let value = match eval_expr(arg_expr, ctx) {
+                    Ok(value) => value,
+                    Err(err) => return Some(Err(err)),
+                };
+                if let Err(err) = bind_param_value(locals_mut, param, value) {
+                    return Some(Err(err));
+                }
+            }
+        }
+        return Some(eval_action_body_text_multi(&substituted, &child_ctx, branch));
     }
 
     let mut child_ctx = ctx.clone();
@@ -1514,6 +1555,35 @@ mod tests {
         let memint = branches[0].0.get("memInt").expect("memInt' staged");
         let expected = eval_expr("<<7, 9>>", &ctx).expect("tuple evaluates");
         assert_eq!(memint, &expected);
+    }
+
+    #[test]
+    fn action_operator_called_with_primed_argument_substitutes_it_textually() {
+        // Regression (NanoBlockchain `CalculateHash <- CalculateHashImpl`). An
+        // operator whose body *is* an action (assigns a prime) but which is ALSO
+        // called with a primed argument must still substitute that primed arg
+        // textually — value-binding it evaluates the (unassigned) next-state
+        // variable and turns the intended primed assignment `newV = w` into a
+        // guard against a bogus value, dropping the successor.
+        //   Set(v, nv) == /\ hits' = hits + 1 /\ nv = v
+        //   Set(5, cursor')  ==>  cursor' = 5  /\  hits' = hits + 1
+        let state = tla_state([("hits", TlaValue::Int(0)), ("cursor", TlaValue::Int(0))]);
+        let mut definitions = BTreeMap::new();
+        definitions.insert(
+            "Set".to_string(),
+            TlaDefinition {
+                name: "Set".to_string(),
+                params: vec!["v".to_string(), "nv".to_string()],
+                body: "/\\ hits' = hits + 1 /\\ nv = v".to_string(),
+                is_recursive: false,
+            },
+        );
+        let ctx = EvalContext::with_definitions(&state, &definitions);
+        let branches = eval_action_body_multi("Set(5, cursor')", &ctx, &BTreeMap::new())
+            .expect("action operator with a primed arg should still fire");
+        assert_eq!(branches.len(), 1, "{branches:?}");
+        assert_eq!(branches[0].0.get("cursor"), Some(&TlaValue::Int(5)));
+        assert_eq!(branches[0].0.get("hits"), Some(&TlaValue::Int(1)));
     }
 
     #[test]
