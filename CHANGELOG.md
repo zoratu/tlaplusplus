@@ -1,5 +1,27 @@
 # Changelog
 
+## v1.2.27 (2026-07-07)
+
+An init false-violation fix from the corpus re-baseline: `NanoBlockchain/MCNanoSmall` (and Medium/Large) halted at the initial state reporting a violation (`record access on non-record value NoBlockVal`) where TLC finds none.
+
+### PR #146 — keep a `=>`-consequent `LET` body attached in the indented boolean split
+
+`CryptographicInvariant` guards a record access with a multi-line implication:
+
+```
+/\ signedBlock /= NoBlock =>
+    LET publicKey == PublicKeyOf(ledger, hash) IN
+    /\ ValidateSignature(signedBlock.signature, ...)
+```
+
+On the initial state every `signedBlock = NoBlock` (a model value `NoBlockVal`), so the antecedent is false and the consequent must not be evaluated. The invariant resolves through the interpreted instance-member path, and in `split_indented_top_level_boolean` (`src/tla/eval/splitter.rs`) the nested `LET`/quantifier body extraction flattens indentation, leaving the `=>`-consequent's `/\ ValidateSignature` at the same column as the antecedent's `/\`. It was made a *sibling* conjunct — `And([Implies(signedBlock /= NoBlock, LET publicKey == … IN), ValidateSignature(…)])` — so `signedBlock.signature` ran unconditionally, past the `=>` short-circuit, and errored on the non-record `NoBlockVal`.
+
+A `/\`/`\/` bullet at the top-level indent is no longer treated as a new sibling when the accumulated clause ends with a **dangling right-operand-expecting operator** (`=>`, `<=>`, or a `LET`/quantifier `IN`) — that bullet is the missing operand/body and stays attached. A new word-boundary-safe `ends_with_dangling_binder` helper drives the check (so an identifier ending in `IN`, like `MAIN`, is not mistaken for the keyword).
+
+`MCNanoSmall` no longer false-violates. A 226-spec corpus scan in both directions changed exactly three specs — NanoBlockchain Small/Medium/Large (all VIOL→OK, matching TLC's OK/timeout) — with zero new false violations, zero newly-missed, and no `=>`-using spec regressed. Gauntlet green: `cargo test --release` 1283 passed / 0 failed (+2 splitter regression tests), `scripts/diff_tlc.sh` 13/13, compiled-vs-interpreted proptest 17/17, state-graph snapshots 12/12.
+
+Known follow-up (separate, pre-existing, not a regression): with the false violation removed, NanoBlockchain still explores only the initial state because `Next` evaluation surfaces a distinct limitation — `record access on non-record value ModelValue("block")` in block-type dispatch over the `CHOOSE`-defined constants `KeyPair`/`Ownership`. Reaching TLC's full 3003/530587 distinct states is deferred to that fix.
+
 ## v1.2.26 (2026-07-07)
 
 A false-liveness-violation fix from the v1.2.25 corpus re-baseline: `Liveness/MCLiveInternalMemory` explored 4408 distinct states (matching TLC) but reported `violation=true` where TLC reports no error. The under-exploration that previously masked it was fixed in v1.2.24 (#139), which exposed this pre-existing fairness bug.
