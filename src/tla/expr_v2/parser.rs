@@ -308,6 +308,33 @@ impl<'a> Parser<'a> {
     // -- prefix / primary ----------------------------------------------------
 
     fn parse_prefix(&mut self, stop: &Stop) -> PResult<Expr> {
+        // Fix #1 (entry-stop, ROBUST single-point guard): `parse_prefix` is the
+        // ONLY place a leading `/\`/`\/` bullet becomes a fresh junction
+        // (`parse_junction`). Every operand-parsing entry — `parse_expr`,
+        // `parse_unary`'s operand (after `~`), and the infix-bullet RHS in
+        // `parse_bin` — reaches here to obtain its leading prefix/atom. So a
+        // single `should_stop` check on a leading bullet here makes it
+        // STRUCTURALLY IMPOSSIBLE to consume a STOP bullet (one on a new line at
+        // or shallower than the active fence column, or past the barrier/a hard
+        // terminator) as a junction-start, regardless of the calling path.
+        //
+        // Without this, `~` (parse_unary) and the infix `/\`/`\/` RHS would call
+        // parse_prefix on a stop bullet and `parse_junction` would swallow it:
+        //   /\ A => ~        the `/\ B` after `~` becomes `~`'s operand
+        //   /\ B
+        //   /\ C
+        //   /\ A /\          the trailing infix `/\` RHS eats the sibling `/\ B`
+        //   /\ B
+        //   /\ C
+        // Rejecting → v2→v1 fallback (correct) rather than a silently-wrong parse.
+        if matches!(self.peek_kind(), Tok::AndBullet | Tok::OrBullet)
+            && self.should_stop(stop)
+        {
+            return Err(format!(
+                "stop bullet at fence cannot start a junction (token {:?})",
+                self.peek_kind()
+            ));
+        }
         match self.peek_kind() {
             Tok::AndBullet => self.parse_junction(JunctionOp::And, stop),
             Tok::OrBullet => self.parse_junction(JunctionOp::Or, stop),
@@ -473,8 +500,19 @@ impl<'a> Parser<'a> {
             };
             let mut params = Vec::new();
             let mut func_args = Vec::new();
+            // Fix #2: track SYNTACTIC PRESENCE of a param/func-arg list, not just
+            // whether we collected any names. `Op() == ..` and `f[] == ..` open a
+            // list but collect ZERO names, yet are STILL parameterized defs that
+            // v2 cannot faithfully lower (the binder would be dropped). Keying the
+            // reject off `params/func_args` emptiness lets those leak to
+            // `lower_let` (a release build only `debug_assert`s). So we set a flag
+            // the instant a `(`/`[` list is OPENED after the def name, and reject
+            // on the flag — regardless of name count.
+            let mut saw_param_list = false;
+            let mut saw_func_arg_list = false;
             // Operator params `Op(a,b)`
             if matches!(self.peek_kind(), Tok::LParen) {
+                saw_param_list = true;
                 self.advance();
                 loop {
                     match self.peek_kind() {
@@ -507,6 +545,7 @@ impl<'a> Parser<'a> {
             }
             // Function args `f[x]`
             if matches!(self.peek_kind(), Tok::LBracket) {
+                saw_func_arg_list = true;
                 self.advance();
                 loop {
                     match self.peek_kind() {
@@ -557,7 +596,7 @@ impl<'a> Parser<'a> {
             let value = self.parse_expr(&value_stop)?;
             self.barrier = saved;
 
-            // Fix #3: v2 has NO faithful lowering for a parameterized operator
+            // Fix #2/#3: v2 has NO faithful lowering for a parameterized operator
             // def `Op(a,b) == ...` or a function def `f[x] == ...` — the target
             // `CompiledExpr::Let` only stores `(name, value)` with no binders, so
             // structurally lowering such a def would DROP the parameters and emit
@@ -567,7 +606,13 @@ impl<'a> Parser<'a> {
             // params at call sites. So we REJECT here → v2 falls back to v1,
             // which produces that correct Unparsed form. A safe fallback beats a
             // wrong lowering.
-            if !params.is_empty() || !func_args.is_empty() {
+            //
+            // Fix #2: reject on the SYNTACTIC-PRESENCE flags, not on collected
+            // name counts. `Op() == 1` / `f[] == 1` open a list but collect zero
+            // names — keying off `params/func_args` emptiness would leak the
+            // binder past this reject into `lower_let` (which only `debug_assert`s
+            // in release). The flags fire the instant a `(`/`[` list is opened.
+            if saw_param_list || saw_func_arg_list || !params.is_empty() || !func_args.is_empty() {
                 return Err(format!(
                     "parameterized/function LET binding '{}' not supported by v2 \
                      (falling back to v1)",
@@ -859,6 +904,15 @@ fn strip_comments(s: &str) -> String {
         if b[i] == b'(' && i + 1 < b.len() && b[i + 1] == b'*' {
             i += 2;
             let mut depth = 1usize;
+            // Fix #3: a block comment may span newlines. Collapsing it to a single
+            // space would DESTROY line structure — the Atom text handed to v1
+            // would have fewer lines than the source the lexer saw, so v1's own
+            // layout-sensitive parsing could interpret the (now single-line)
+            // remainder differently. Preserve the newline COUNT: emit that many
+            // `\n` (plus a separating space) so line/column structure in the
+            // delegated Atom mirrors the source. String-literal contents are left
+            // untouched (handled above; the comment scan never enters strings).
+            let mut newlines = 0usize;
             while i < b.len() && depth > 0 {
                 if b[i] == b'(' && i + 1 < b.len() && b[i + 1] == b'*' {
                     depth += 1;
@@ -867,8 +921,14 @@ fn strip_comments(s: &str) -> String {
                     depth -= 1;
                     i += 2;
                 } else {
+                    if b[i] == b'\n' {
+                        newlines += 1;
+                    }
                     i += 1;
                 }
+            }
+            for _ in 0..newlines {
+                out.push(b'\n');
             }
             out.push(b' ');
             continue;

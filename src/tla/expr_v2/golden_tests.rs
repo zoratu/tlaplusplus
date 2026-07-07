@@ -219,6 +219,51 @@ fn entry_stop_outer_sibling_not_swallowed() {
     );
 }
 
+// --- Phase 0.6 Fix 1: entry-stop bypass via `~` and infix-bullet RHS ---
+
+// `/\ A => ~\n/\ B\n/\ C`: after the `~`, the operand parse reaches a STOP
+// bullet (`/\ B` on a new line at the fence column). The Phase-0.5 fix only
+// guarded `parse_expr`; the `~` operand path bypassed it and `~` swallowed
+// `/\ B` as its operand. The single-point `parse_prefix` guard now rejects the
+// stop bullet on ALL paths → v1 fallback (NOT `~` swallowing B/C).
+#[test]
+fn entry_stop_not_operand_swallow() {
+    let src = "/\\ A => ~\n/\\ B\n/\\ C";
+    let r = parse_ast(src);
+    assert!(
+        r.is_err(),
+        "`~` must NOT swallow the sibling `/\\ B` at the fence (→ v1 fallback), got: {:?}",
+        r.map(|e| e.shape())
+    );
+}
+
+// `/\ A /\\n/\ B\n/\ C`: the trailing INFIX `/\` (same line, after A) has its
+// RHS parsed via `parse_bin`, which reaches `parse_prefix` on the next token —
+// `/\ B` on a new line at the fence column, a STOP bullet. The infix RHS must
+// NOT consume that sibling bullet as a fresh junction-start. Rejects → v1
+// fallback.
+#[test]
+fn entry_stop_not_infix_rhs_swallow() {
+    let src = "/\\ A /\\\n/\\ B\n/\\ C";
+    let r = parse_ast(src);
+    assert!(
+        r.is_err(),
+        "infix `/\\` RHS must NOT swallow the sibling `/\\ B` at the fence \
+         (→ v1 fallback), got: {:?}",
+        r.map(|e| e.shape())
+    );
+}
+
+// Companion: an inline-`/\` whose bullets are all on ONE line (a genuine infix
+// conjunction, no following STOP sibling) still parses — the guard rejects only
+// a stop bullet on a NEW line at/shallower-than the fence, not legitimate infix
+// continuations. This confirms the Fix-1 guard is not over-rejecting.
+#[test]
+fn entry_stop_inline_infix_still_parses() {
+    let s = shape("/\\ A /\\ B /\\ C");
+    assert_eq!(s, "AND[Atom(\"A\"), Atom(\"B\"), Atom(\"C\")]");
+}
+
 // ===================== Fix #2: IF keeps caller fence =====================
 
 // An IF inside a junction: a sibling bullet after the ELSE branch must NOT be
@@ -268,6 +313,34 @@ fn plain_let_still_parses() {
     assert_eq!(s, "Let([x==Atom(\"1\")] IN Atom(\"x + 1\"))");
 }
 
+// --- Phase 0.6 Fix 2: EMPTY param / func-arg lists must still reject ---
+
+// `LET Op() == 1 IN Op()`: an EMPTY param list `()` collects zero names but is
+// still a syntactically parameterized def. Keying the reject off collected-name
+// counts would leak the binder past the reject into `lower_let` (a release-mode
+// only `debug_assert`). The `saw_param_list` flag catches it → v1 fallback.
+#[test]
+fn empty_param_let_rejects() {
+    let r = parse_ast("LET Op() == 1 IN Op()");
+    assert!(
+        r.is_err(),
+        "empty-param-list LET `Op()` must reject (→ v1 fallback), got: {:?}",
+        r.map(|e| e.shape())
+    );
+}
+
+// `LET f[] == 1 IN f[0]`: an EMPTY func-arg list `[]` — same leak risk, caught
+// by `saw_func_arg_list`.
+#[test]
+fn empty_func_arg_let_rejects() {
+    let r = parse_ast("LET f[] == 1 IN f[0]");
+    assert!(
+        r.is_err(),
+        "empty-func-arg-list LET `f[]` must reject (→ v1 fallback), got: {:?}",
+        r.map(|e| e.shape())
+    );
+}
+
 // ===================== Fix #4: comment stripping in atoms =====================
 
 // A comment inside an atom run must NOT reach v1 in the Atom text.
@@ -279,6 +352,26 @@ fn atom_strips_inline_block_comment() {
     assert!(!s.contains("(*") && !s.contains("*)") && !s.contains('c'),
         "comment leaked into atom text: {s}");
     assert!(s.starts_with("Atom(\"x") && s.contains("+ y"), "atom malformed: {s}");
+}
+
+// Phase 0.6 Fix 3: a block comment that spans NEWLINES must preserve the
+// newline count in the stripped atom text (so line/column structure handed to
+// v1 mirrors the source the lexer saw), not collapse to a single space.
+#[test]
+fn atom_preserves_newlines_across_block_comment() {
+    let s = shape("a (* multi\nline\ncomment *) + b");
+    // Comment body gone.
+    assert!(
+        !s.contains("multi") && !s.contains("comment") && !s.contains("(*"),
+        "block comment leaked: {s}"
+    );
+    // The two interior newlines are preserved (rendered as `\n` in the AST
+    // shape's Atom debug). Leaf tokens `a`, `+`, `b` remain.
+    assert!(s.contains("a") && s.contains("+ b"), "atom malformed: {s}");
+    assert!(
+        s.matches("\\n").count() >= 2,
+        "block-comment newlines not preserved (expected >=2 `\\n`): {s}"
+    );
 }
 
 #[test]
