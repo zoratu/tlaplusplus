@@ -428,17 +428,33 @@ fn unterminated_block_comment_rejects() {
 #[test]
 fn atom_block_comment_preserves_trailing_column() {
     use super::parser;
-    // `A (* c *) => B` — after stripping, the `=>` (owned by v2) still splits;
-    // the atom `A` text keeps `A` at column 0. Confirm the `(* c *)` region is
-    // replaced by spaces (width 7), not a single space, by checking the atom
-    // text length is preserved to the `=>`.
     let s = shape("A (* cc *) => B");
     assert!(s.starts_with("Implies(Atom(\"A\")"), "got: {s}");
-    // Directly exercise strip: the stripped text has no comment body and the
-    // column of the next non-space char after the comment is unchanged.
-    let stripped = parser::strip_comments_for_test("xx(* comment *)yy");
-    // "xx" + 13 spaces (width of "(* comment *)") + "yy"
-    assert_eq!(stripped, "xx             yy", "got {stripped:?}");
+    // A single-line comment is replaced by whitespace of EXACTLY its own width,
+    // so the following token keeps its column. `(* comment *)` is 13 chars.
+    let comment = "(* comment *)";
+    let stripped = parser::strip_comments_for_test(&format!("xx{comment}yy"));
+    let expected = format!("xx{}yy", " ".repeat(comment.chars().count()));
+    assert_eq!(stripped, expected, "single-line width not preserved");
+    // The next token's column is unchanged from the original.
+    let orig = format!("xx{comment}yy");
+    assert_eq!(
+        stripped.find("yy").unwrap(),
+        orig.find("yy").unwrap(),
+        "column of trailing token shifted"
+    );
+    // Multi-line: interior newlines preserved AND the final line padded to the
+    // width after the last newline so a token after `*)` keeps its column.
+    let ml = parser::strip_comments_for_test("a (* c\nd *) + b");
+    assert_eq!(ml.matches('\n').count(), 1, "interior newline not preserved");
+    let last_line = ml.rsplit('\n').next().unwrap();
+    // Original final comment-line is "d *)" (4 cols) then " + b"; the `+` must
+    // sit at the same column as in the source line "d *) + b".
+    assert_eq!(
+        last_line.find('+'),
+        "d *) + b".find('+'),
+        "final-line column not preserved: {last_line:?}"
+    );
 }
 
 // ===================== Phase 1: SETS =====================
@@ -559,11 +575,16 @@ fn except_rejects_to_v1() {
     assert_v2_rejects("[f EXCEPT !.field = w]");
 }
 
-// Action / stuttering box `[A]_v` is not modeled by v2 → fallback.
+// Action / stuttering box `[A]_v` is not modeled STRUCTURALLY by v2: the `]_`
+// subscript makes the bracket non-standalone, so v2 absorbs the WHOLE thing as
+// one Atom that v1 lowers (never a structural record/function-set mis-parse).
 #[test]
-fn action_box_rejects_to_v1() {
-    assert_v2_rejects("[Next]_vars");
-    assert_v2_rejects("[A]_v");
+fn action_box_stays_atom_for_v1() {
+    // Whole-atom absorption → lowering matches v1 exactly (v1 owns temporal).
+    assert_eq!(shape("[Next]_vars"), "Atom(\"[Next]_vars\")");
+    assert_eq!(shape("[A]_v"), "Atom(\"[A]_v\")");
+    assert_lower_matches_v1("[Next]_vars");
+    assert_lower_matches_v1("[A]_v");
 }
 
 // A bracket that is an operand of a leaf op stays an atom.

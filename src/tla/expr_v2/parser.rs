@@ -1738,22 +1738,6 @@ fn strip_comments(s: &str) -> String {
         }
         // Nested block comment `(* ... *)`.
         if b[i] == b'(' && i + 1 < b.len() && b[i + 1] == b'*' {
-            // Column at which this comment's `(*` opens, measured (in CHARACTERS,
-            // skipping UTF-8 continuation bytes) from the last emitted newline in
-            // `out`. Needed so a SINGLE-LINE comment is replaced by whitespace of
-            // the SAME width, keeping the column of the next token on that line.
-            let start_col = {
-                let mut c = 0usize;
-                for &ob in out.iter().rev() {
-                    if ob == b'\n' {
-                        break;
-                    }
-                    if (ob & 0xC0) != 0x80 {
-                        c += 1;
-                    }
-                }
-                c
-            };
             i += 2;
             let mut depth = 1usize;
             // Fix #3 + Codex carry-over: a block comment may span newlines.
@@ -1764,16 +1748,17 @@ fn strip_comments(s: &str) -> String {
             // line to a single space would shift the COLUMN of the next token on
             // that line, which is equally layout-breaking. So we replace the
             // comment with whitespace that preserves BOTH: emit the interior
-            // newlines, then pad the final-line portion with spaces to the exact
-            // column width the comment occupied on its LAST line (from the `(*`
-            // opener — or column 0 after an interior newline — through the `*)`
-            // closer, inclusive). Every token AFTER the comment then keeps its
-            // original column. String-literal contents are left untouched
-            // (handled above; the comment scan never enters strings).
+            // newlines, then pad the final-line portion with as many spaces as
+            // the comment occupied on its LAST line (its own char WIDTH from the
+            // `(*` opener — or from column 0 after an interior newline — through
+            // the `*)` closer, inclusive). Because the text BEFORE the comment is
+            // copied verbatim, emitting the comment's own width keeps every token
+            // AFTER the comment at its original column. String-literal contents
+            // are left untouched (handled above; the scan never enters strings).
             let mut newlines = 0usize;
-            // Columns consumed on the comment's FINAL line. Seeded with the start
-            // column + the 2-col `(*` opener; reset to 0 at each interior newline.
-            let mut final_line_cols = start_col + 2;
+            // Char-width the comment occupies on its FINAL line. Seeded with the
+            // 2-col `(*` opener; reset to 0 at each interior newline.
+            let mut final_line_cols = 2usize;
             while i < b.len() && depth > 0 {
                 if b[i] == b'(' && i + 1 < b.len() && b[i + 1] == b'*' {
                     depth += 1;
