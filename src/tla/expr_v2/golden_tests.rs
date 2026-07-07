@@ -58,9 +58,30 @@ fn paxos_like_nested() {
                              \\/ B
 /\\ C";
     let s = shape(src);
-    // AND[ Forall(i : Forall(j : OR[A, B])), C ]
-    assert!(s.starts_with("AND[Forall(i\\in Atom(\"I\") : Forall(j\\in Atom(\"J\") : OR[Atom(\"A\"), Atom(\"B\")])"), "got: {s}");
+    // AST: AND[ Forall(i\in I; j\in J : OR[A, B]), C ]
+    // (multi-bound is a single Quant node in the AST; lowering nests it.)
+    assert!(
+        s.starts_with(
+            "AND[Forall(i\\in Atom(\"I\"); j\\in Atom(\"J\") : OR[Atom(\"A\"), Atom(\"B\")])"
+        ),
+        "got: {s}"
+    );
     assert!(s.ends_with(", Atom(\"C\")]"), "sibling C not separate: {s}");
+}
+
+// Lowering the multi-bound quantifier must nest single-var Foralls.
+#[test]
+fn multibound_quant_lowers_nested() {
+    use super::parse_and_lower;
+    use crate::tla::compiled_expr::CompiledExpr;
+    let c = parse_and_lower("\\A i \\in I, j \\in J : P").unwrap();
+    match c {
+        CompiledExpr::Forall { var, body, .. } => {
+            assert_eq!(var, "i");
+            assert!(matches!(*body, CompiledExpr::Forall { .. }), "not nested");
+        }
+        other => panic!("expected Forall, got {other:?}"),
+    }
 }
 
 // 4b. 3-level checkpoint-coordination-like: `P => /\ (R => /\ X /\ Y)`.
