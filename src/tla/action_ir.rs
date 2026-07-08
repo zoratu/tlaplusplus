@@ -84,10 +84,25 @@ pub struct ActionIr {
 fn split_action_conjuncts_v2(expr: &str) -> Option<Vec<String>> {
     use crate::tla::expr_v2::{self, ast};
 
-    // Uniform dedent (NOT line-flattening): preserves relative columns so the
-    // layout parser sees a consistent coordinate system for the whole body.
-    let normalized = normalize_multiline_action_indentation(expr.trim());
-    let src = normalized.trim();
+    // FIX D1 — parse a GENUINELY layout-preserved (uniform-dedent) source.
+    //
+    // `normalize_multiline_action_indentation` is NOT a true uniform dedent: it
+    // leaves line 1 UNCHANGED and dedents only the continuation lines by *their
+    // own* min-indent. That does NOT preserve the relative column between line 1
+    // and later lines. For a shape like
+    //     /\ A /\ \E x \in S :
+    //            /\ P(x)
+    //            /\ Q(x)
+    // (no later line is an outer sibling) the continuation bullets `P`/`Q` get
+    // collapsed toward line-1's column, so expr_v2 sees a top-level `And` where
+    // `P(x)`/`Q(x)` were actually INSIDE the `\E` body → wrong conjunct grouping
+    // → wrong successors. A TRUE uniform dedent — subtract the SAME min-indent
+    // (computed across ALL non-blank lines, INCLUDING line 1) from EVERY line —
+    // preserves every relative column and puts the shallowest line at column 0,
+    // so expr_v2's junction fences match the original layout. We slice item
+    // spans out of exactly this `src`, so the byte offsets stay valid.
+    let dedented = uniform_dedent(expr);
+    let src = dedented.trim();
     if src.is_empty() {
         return None;
     }
@@ -95,24 +110,73 @@ fn split_action_conjuncts_v2(expr: &str) -> Option<Vec<String>> {
     // tokens, so `Ok` == full consumption. `.ok()?` → fallback on parse/lex error.
     let tree = expr_v2::parse_ast(src).ok()?;
 
-    let items = match &tree {
-        // ROOT `And`-junction only. `>= 2` items (a lone `/\ X` lowers to its
-        // single item in the parser, never a Junction; guard anyway).
-        ast::Expr::Junction { op: ast::JunctionOp::And, items, .. } if items.len() >= 2 => items,
-        // Any other root (Or-junction, Quant, Let, If, Binary, Not, containers,
-        // Atom, …) → fallback. This preserves the `\E`/`\A`/`IF`/`\/` whole-body
-        // special-cases and the disjunct path.
-        _ => return None,
+    // Root gate: only take the v2 path when the ROOT is an `And`-junction. Any
+    // other root (Or-junction, Quant, Let, If, Binary, Not, containers, Atom, …)
+    // → fallback, preserving the `\E`/`\A`/`IF`/`\/` whole-body special-cases and
+    // the disjunct path.
+    let ast::Expr::Junction { op: ast::JunctionOp::And, col: root_col, .. } = &tree else {
+        return None;
     };
 
-    // Slice each child's exact source extent from `src`. Item spans start AFTER
-    // the leading `/\` bullet (the parser `advance()`s past the bullet before
-    // parsing the item — see `parse_junction`), so the slice does not include
-    // the bullet. We therefore do NOT strip a leading `/\`; we trim and apply
-    // the SAME per-clause normalization the fallback applies to each conjunct.
-    let mut out = Vec::with_capacity(items.len());
-    for it in items {
-        let sp = it.span();
+    // LAYOUT-CONSISTENCY GUARD (D1 companion). A uniform dedent preserves every
+    // relative column, but it does NOT repair a body whose top-level bullets sit
+    // at INCONSISTENT columns — e.g. a raw-string / mid-definition extraction
+    // where line 1's bullet is at col 0 but its top-level SIBLINGS are all
+    // indented (col 12), with a nested `IF`/quantifier body even deeper. There
+    // the parser fences the root junction on the DEEPER sibling column and a
+    // trailing sibling gets swallowed into an `IF`-ELSE / quantifier body
+    // (`split_action_body_clauses_keeps_parser_shaped_if_then_else_together`:
+    // `/\ UNCHANGED tmState` absorbed into the ELSE branch). We detect this by
+    // comparing line-1's LEADING bullet column against the root junction's fence
+    // column `root_col`: when line 1 begins with a `/\` bullet, that bullet MUST
+    // be the root fence. If it is SHALLOWER than `root_col`, the layout is
+    // inconsistent for v2's fence model → return None and let the string
+    // fallback own it (verified: the fallback groups every such shape — including
+    // Codex's `/\ A /\ \E x : <bulleted body>` D1 case — correctly).
+    //
+    // The guard applies only to MULTI-LINE bodies: a single-line inline junction
+    // (`/\ a' = 1 /\ b' = 2`) has no cross-line layout to be inconsistent, and
+    // its root `col` is the SECOND (mid-line) bullet's column — never line-1's
+    // leading-bullet column — so comparing them would spuriously reject every
+    // legitimate inline conjunction.
+    if src.contains('\n') {
+        let first_line = src.lines().next().unwrap_or("");
+        let first_trim = first_line.trim_start();
+        if first_trim.starts_with("/\\") {
+            let first_bullet_col = (first_line.len() - first_trim.len()) as u32;
+            if first_bullet_col != *root_col {
+                return None;
+            }
+        }
+    }
+
+    // FIX D2 — AST-based flattening instead of the string inline-splitter.
+    //
+    // The old v2 path ran the string `split_inline_action_conjuncts` on each AST
+    // item, re-introducing string-level `/\` splitting INSIDE AST-bounded items.
+    // That breaks binder/branch scope for shapes like
+    //     /\ b' = \E x \in S : P(x) /\ Q(x)   (the /\ is the \E body's)
+    //     /\ b' = IF c THEN P /\ Q ELSE R     (the /\ is the IF branch's)
+    // — string-splitting that inner `/\` loses/invents successors.
+    //
+    // Instead we recursively flatten `Junction{And}` nodes: a conjunct is a
+    // MAXIMAL subtree whose root is NOT `Junction{And}`. We unwrap nested
+    // And-junctions into their children and STOP at any non-And node
+    // (`Binary`/`Quant`/`Let`/`If`/`Atom`/containers/`Or`-junction/…), emitting
+    // THAT node's source slice as one conjunct. This correctly splits inline
+    // `guard /\ x'=e` (both are And-junction children) WITHOUT splitting the
+    // `/\` inside a `\E`/`LET`/`IF` body (that `/\` lives under a Quant/Let/If
+    // node, never unwrapped).
+    let mut leaves: Vec<&ast::Expr> = Vec::new();
+    flatten_and_leaves(&tree, &mut leaves);
+    // A single flattened leaf → not really a >=2-conjunct action → fallback.
+    if leaves.len() < 2 {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(leaves.len());
+    for leaf in leaves {
+        let sp = leaf.span();
         // Span-safety guard (mirrors `classify_boolean_v2`): bail to fallback
         // rather than panic-slicing on an inverted / OOB / non-boundary span.
         if sp.start > sp.end
@@ -122,14 +186,10 @@ fn split_action_conjuncts_v2(expr: &str) -> Option<Vec<String>> {
         {
             return None;
         }
-        // Item spans start AFTER the leading `/\` bullet: `parse_junction`
-        // `advance()`s past the bullet before parsing the item, so the slice
-        // never includes the outer bullet. We therefore do NOT strip a leading
-        // `/\` — doing so would corrupt a conjunct that is *itself* a nested
-        // bulleted `/\`-list (`/\ /\ A /\ B`), whose item slice legitimately
-        // begins with `/\`. (Verified empirically by the
-        // `v2_leading_bullet_stripped_no_double_bullet` test: no conjunct
-        // retains a bullet.)
+        // Leaf spans start AFTER any leading `/\` bullet (`parse_junction`
+        // `advance()`s past the bullet before parsing the item), so the slice
+        // never includes an outer bullet. Apply the SAME per-clause
+        // normalization the fallback applies to each conjunct.
         let raw = &src[sp.start..sp.end];
         let clause = normalize_multiline_action_indentation(raw.trim())
             .trim()
@@ -137,32 +197,85 @@ fn split_action_conjuncts_v2(expr: &str) -> Option<Vec<String>> {
         if clause.is_empty() {
             return None;
         }
-        // A v2 top-level junction item may still contain INLINE `/\` conjuncts on
-        // one line, e.g. `unsat[c] = {} /\ alloc[c] = {}` or the hazardous mixed
-        // shape `S # {} /\ unsat' = [...]` (a guard AND a primed assignment on the
-        // same line). `classify_clause` must see each atomic conjunct SEPARATELY —
-        // otherwise a mixed guard+primed clause is misread as a single primed
-        // assignment `unsat' = (S # {} /\ [...])`, which type-errors and silently
-        // drops every successor (SimpleAllocator / all allocator specs: 1 distinct
-        // vs the correct 400). The fallback pipeline splits each `part` with
-        // `split_inline_action_conjuncts` for exactly this reason; do the same to
-        // v2's items so the two paths produce identical atomic conjuncts. This is
-        // NOT the re-glue/`bound_trailing_let_in_body` compensation logic (which
-        // v2 correctly never needs) — it is the same leaf-level inline split the
-        // v1 path always applies after its top-level split. `\E`/`\A`/`LET`/`IF`/
-        // `\/`-led items are returned whole by `split_inline_action_conjuncts`, so
-        // their bodies (already correctly bounded by v2) are never shredded.
-        for atom in split_inline_action_conjuncts(&clause) {
-            let atom = atom.trim().to_string();
-            if !atom.is_empty() {
-                out.push(atom);
-            }
-        }
+        out.push(clause);
     }
     if out.is_empty() {
         return None;
     }
     Some(out)
+}
+
+/// FIX D2 — recursively collect the conjunct LEAVES of an action-body AST.
+///
+/// A conjunct is a maximal subtree whose root is NOT `Junction{And}`. This walk
+/// unwraps nested `Junction{And}` nodes into their children and STOPS at every
+/// other node kind — `Binary`, `Quant`, `Let`, `If`, `Atom`, `Paren`,
+/// containers, and crucially a `Junction{Or}` (a disjunctive sub-action stays
+/// ONE conjunct). The `/\` inside a `\E`/`\A`/`LET`/`IF` body is never unwrapped
+/// because it lives under a `Quant`/`Let`/`If` node, which is a leaf here.
+fn flatten_and_leaves<'a>(
+    expr: &'a crate::tla::expr_v2::ast::Expr,
+    out: &mut Vec<&'a crate::tla::expr_v2::ast::Expr>,
+) {
+    use crate::tla::expr_v2::ast;
+    match expr {
+        ast::Expr::Junction { op: ast::JunctionOp::And, items, .. } => {
+            for it in items {
+                flatten_and_leaves(it, out);
+            }
+        }
+        // Any non-And node is a conjunct leaf, kept whole.
+        other => out.push(other),
+    }
+}
+
+/// FIX D1 — a TRUE uniform dedent: compute the minimum leading indentation
+/// across ALL non-blank lines (INCLUDING the first) and strip that SAME amount
+/// from EVERY line. This PRESERVES the relative column of every line, so the
+/// layout-aware expr_v2 parser sees a coordinate system that matches the
+/// original source exactly.
+///
+/// Unlike `normalize_multiline_action_indentation` (which leaves line 1
+/// untouched and dedents continuations by *their own* min-indent — collapsing a
+/// nested `\E`/`IF` body toward line-1's column when line 1 is the shallowest
+/// line and all continuations are that body), a uniform dedent never changes
+/// any line's column RELATIVE to any other. When line 1 is already the
+/// shallowest line at column 0 this is a no-op; when line 1 is itself indented
+/// it rebases the whole block so the shallowest line lands at column 0 while
+/// keeping every relative offset intact.
+fn uniform_dedent(expr: &str) -> String {
+    let min_indent = expr
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(line.len() - trimmed.len())
+            }
+        })
+        .min()
+        .unwrap_or(0);
+
+    if min_indent == 0 {
+        return expr.to_string();
+    }
+
+    let mut out = String::with_capacity(expr.len());
+    for (i, line) in expr.lines().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        if line.trim_start().is_empty() {
+            // Blank / whitespace-only line: keep empty (no column to preserve).
+            continue;
+        }
+        // Every non-blank line has indent >= min_indent by construction, so this
+        // slice is always in bounds and on a char boundary (leading spaces/tabs
+        // are single-byte ASCII).
+        out.push_str(&line[min_indent..]);
+    }
+    out
 }
 
 pub(crate) fn split_action_body_clauses(expr: &str) -> Vec<String> {
@@ -2401,5 +2514,129 @@ mod tests {
             split_action_conjuncts_v2(body).is_none(),
             "lex/parse error must fall back to None"
         );
+    }
+
+    // ---- Phase 4.1: D1 (uniform dedent) + D2 (AST And-flatten) ----
+
+    #[test]
+    fn v2_d1_single_bulleted_quantified_body_stays_inside_exists() {
+        // FIX D1 — Codex's motivating shape. Line 1 (`/\ A /\ \E x \in S :`) is
+        // at col 0 while the `\E` body bullets `P`/`Q` sit at col 7 (no top-level
+        // sibling follows them). This is a layout where line-1's leading bullet
+        // (col 0) is SHALLOWER than the root junction fence the parser installs,
+        // so the LAYOUT-CONSISTENCY GUARD routes it to the string fallback — which
+        // groups it correctly. The Codex requirement (P/Q NOT hoisted out of the
+        // `\E`) is asserted end-to-end via `split_action_body_clauses`: EXACTLY
+        // two conjuncts, `A` and the whole `\E x \in S : /\ P(x) /\ Q(x)`.
+        let body = "/\\ A /\\ \\E x \\in S :\n\
+                    \x20      /\\ P(x)\n\
+                    \x20      /\\ Q(x)";
+        let clauses = split_action_body_clauses(body);
+        assert_eq!(clauses.len(), 2, "P/Q must NOT be hoisted to top level: {clauses:#?}");
+        assert_eq!(clauses[0], "A");
+        assert!(
+            clauses[1].starts_with("\\E x \\in S")
+                && clauses[1].contains("P(x)")
+                && clauses[1].contains("Q(x)"),
+            "the \\E body must keep P/Q: {}",
+            clauses[1]
+        );
+    }
+
+    #[test]
+    fn v2_d1_indented_line1_uniform_dedent_preserves_layout() {
+        // FIX D1 — line 1 is itself INDENTED (mid-definition extraction / raw
+        // string literal). `uniform_dedent` rebases the whole block by the shared
+        // min-indent (8) so the shallowest line lands at col 0 while every
+        // relative offset is preserved — the layout the parser needs. As in the
+        // col-0 variant, line-1's leading bullet is shallower than the root fence,
+        // so the consistency guard defers to the (correct) string fallback.
+        // Assert end-to-end: two conjuncts with P/Q inside the `\E`.
+        let body = "        /\\ A /\\ \\E x \\in S :\n\
+                    \x20              /\\ P(x)\n\
+                    \x20              /\\ Q(x)";
+        let clauses = split_action_body_clauses(body);
+        assert_eq!(clauses.len(), 2, "{clauses:#?}");
+        assert_eq!(clauses[0], "A");
+        assert!(
+            clauses[1].starts_with("\\E x \\in S") && clauses[1].contains("Q(x)"),
+            "{}",
+            clauses[1]
+        );
+    }
+
+    #[test]
+    fn v2_d2_assignment_rhs_exists_inline_and_not_split() {
+        // FIX D2 — `/\ b' = \E x \in S : P(x) /\ Q(x)` newline `/\ y' = y + 1`.
+        // The inline `/\` after `P(x)` belongs to the `\E` body. v2 does NOT own
+        // this shape: the greedy `\E`-body extent reaches to end-of-input, so
+        // `parse_ast` fails its full-consumption check ("trailing tokens after
+        // expr near Exists") → `split_action_conjuncts_v2` returns None → the
+        // STRING FALLBACK owns it. The end-to-end contract (asserted via
+        // `split_action_body_clauses`) is exactly what Codex requires: EXACTLY
+        // two conjuncts, the `b' = \E ...` intact with its inline `/\` NOT split.
+        let body = "/\\ b' = \\E x \\in S : P(x) /\\ Q(x)\n\
+                    /\\ y' = y + 1";
+        assert!(
+            split_action_conjuncts_v2(body).is_none(),
+            "v2 must not own the greedy-\\E-body RHS shape; fall back to string path"
+        );
+        let clauses = split_action_body_clauses(body);
+        assert_eq!(clauses.len(), 2, "inline \\E-body /\\ must NOT split: {clauses:#?}");
+        assert_eq!(clauses[0], "b' = \\E x \\in S : P(x) /\\ Q(x)");
+        assert_eq!(clauses[1], "y' = y + 1");
+    }
+
+    #[test]
+    fn v2_d2_assignment_rhs_if_inline_and_not_split() {
+        // FIX D2 — `/\ b' = IF c THEN P /\ Q ELSE R` newline `/\ y' = 2`. The
+        // `/\` in the THEN branch belongs to the `IF` body. Like the `\E` case,
+        // v2's greedy IF-body extent fails full consumption ("trailing tokens
+        // after expr near If") → None → the string fallback owns it. End-to-end
+        // (via `split_action_body_clauses`) the two conjuncts are correct and the
+        // IF-branch inline `/\` stays intact.
+        let body = "/\\ b' = IF c THEN P /\\ Q ELSE R\n\
+                    /\\ y' = 2";
+        assert!(
+            split_action_conjuncts_v2(body).is_none(),
+            "v2 must not own the greedy-IF-body RHS shape; fall back to string path"
+        );
+        let clauses = split_action_body_clauses(body);
+        assert_eq!(clauses.len(), 2, "IF-branch /\\ must NOT split: {clauses:#?}");
+        assert_eq!(clauses[0], "b' = IF c THEN P /\\ Q ELSE R");
+        assert_eq!(clauses[1], "y' = 2");
+    }
+
+    #[test]
+    fn v2_d2_inline_guard_and_assignment_still_split() {
+        // FIX D2 (the MOTIVATING split that MUST still happen) — a guard AND a
+        // primed assignment on the SAME line: `/\ S # {} /\ unsat' = [...]`.
+        // Both `S # {}` and `unsat' = [...]` are And-junction children (the top
+        // `/\` is a real conjunction, not a sub-expression body), so AST
+        // flattening splits them into TWO conjuncts. (If they were NOT split,
+        // `unsat'` would be misread as `unsat' = (S # {} /\ [...])`, type-error,
+        // and every successor would be silently dropped — SimpleAllocator 1 vs
+        // the correct 400.)
+        let body = "/\\ S # {} /\\ unsat' = [x \\in S |-> 0]";
+        let parts = split_action_conjuncts_v2(body).expect("root should be an And junction");
+        assert_eq!(parts.len(), 2, "guard and assignment must be SEPARATE conjuncts: {parts:#?}");
+        assert_eq!(parts[0], "S # {}");
+        assert_eq!(parts[1], "unsat' = [x \\in S |-> 0]");
+    }
+
+    #[test]
+    fn v2_uniform_dedent_is_noop_when_first_line_at_col0() {
+        // A def body whose line 1 is already at col 0 with indented
+        // continuations dedents by 0 — the shared min-indent is 0.
+        let body = "/\\ a' = 1\n       /\\ b' = 2";
+        assert_eq!(uniform_dedent(body), body);
+    }
+
+    #[test]
+    fn v2_uniform_dedent_rebases_by_shared_min_indent() {
+        // Every line indented by >= 4; uniform_dedent strips exactly 4 from all,
+        // preserving the relative offset of the deeper continuation.
+        let input = "    /\\ A\n        /\\ B";
+        assert_eq!(uniform_dedent(input), "/\\ A\n    /\\ B");
     }
 }
