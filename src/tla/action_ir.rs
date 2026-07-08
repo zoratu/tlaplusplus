@@ -364,34 +364,31 @@ fn classify_action_disjunct_v2(expr: &str) -> DisjunctSplitV2 {
         {
             return DisjunctSplitV2::Fallback;
         }
-        // Leaf spans start AFTER any leading `\/` bullet (`parse_junction`
-        // advances past the bullet before parsing the item), so the slice never
-        // includes an outer bullet. Apply the SAME per-clause normalization the
-        // fallback applies to each disjunct.
-        let raw = &src[sp.start..sp.end];
-        let mut clause = normalize_multiline_action_indentation(raw.trim())
+        // Leaf spans start AFTER the enclosing `\/` bullet (`parse_junction`
+        // advances past the bullet before parsing the item). But when a disjunct
+        // branch is written `\/ /\ <conjuncts>`, the leaf's OWN leading `/\`
+        // bullet can also be excluded from the span:
+        //   - an `And`-junction leaf's span starts at its FIRST item when that
+        //     item is inline right after the `\/` (Peterson's `a3`, 2PC guards);
+        //   - a SINGLE-conjunct branch (`\/ /\ \E S : ...`) collapses in
+        //     `parse_junction` (`items.len()==1` → the item), so the leaf is the
+        //     `\E`/`Atom` and the `/\` is likewise dropped (byzpaxos `leader`).
+        // Dropping that `/\` (and re-normalizing the now-unwrapped body) shreds a
+        // conjunction's guard (Peterson: false mutual-exclusion violation) or
+        // changes a quantifier body's extent (byzpaxos: state-space blow-up) —
+        // successors invented or lost. The trusted string splitter KEEPS the
+        // `/\`. So EXTEND the slice backward to recapture a leading `/\` bullet
+        // that sits between the `\/` bullet and this leaf (skipping only
+        // whitespace/newlines, and never crossing the `\/` bullet). This makes
+        // every disjunct's source text match the string path exactly, for every
+        // leaf kind.
+        let start = recapture_leading_and_bullet(src, sp.start);
+        let raw = &src[start..sp.end];
+        let clause = normalize_multiline_action_indentation(raw.trim())
             .trim()
             .to_string();
         if clause.is_empty() {
             return DisjunctSplitV2::Fallback;
-        }
-        // SOUNDNESS (Peterson / 2PC guard-branch bug): an `And`-junction leaf's
-        // span can start AFTER its own leading `/\` bullet — `parse_junction`
-        // sets the junction span from its *first item* when that item is inline
-        // right after the enclosing `\/` bullet (the outer bullet's advance eats
-        // the line up to the first conjunct). The slice then reads
-        // `tmState="commit" /\ rmState2=1` with the leading `/\` DROPPED, so the
-        // downstream conjunct splitter mis-groups the first conjunct's guard
-        // (dropping it → crossed guard/effect → phantom successors, e.g.
-        // Peterson's spurious `a0 -> cs` transition and a false mutual-exclusion
-        // violation). A disjunct that is a conjunction MUST present as a bulleted
-        // `/\ ...` clause. Re-prepend the bullet when the normalized slice lost
-        // it. Non-And leaves (Atom/Quant/Let/If/Binary/Paren) are single clauses
-        // and never need a `/\` prefix.
-        let leaf_is_and =
-            matches!(leaf, ast::Expr::Junction { op: ast::JunctionOp::And, .. });
-        if leaf_is_and && !clause.starts_with("/\\") {
-            clause = format!("/\\ {clause}");
         }
         out.push(clause);
     }
@@ -399,6 +396,40 @@ fn classify_action_disjunct_v2(expr: &str) -> DisjunctSplitV2 {
         return DisjunctSplitV2::Fallback;
     }
     DisjunctSplitV2::Split(out)
+}
+
+/// Phase 5 — extend a disjunct-leaf slice start backward to recapture a leading
+/// `/\` bullet that the parser dropped.
+///
+/// Given `src` and the leaf's span start, scan backward over ASCII whitespace
+/// (spaces / tabs / newlines) only. If the two bytes immediately before that run
+/// are a `/\` AndBullet, return the index of that `/\` (so the slice includes
+/// it). Otherwise return `leaf_start` unchanged. The scan never crosses a `\/`
+/// OrBullet: we stop looking as soon as the preceding non-whitespace is anything
+/// other than the `\` of a `/\`. This is intentionally minimal — it recovers the
+/// single `/\` a `\/ /\ <body>` branch dropped, and does nothing for a genuine
+/// non-bulleted leaf (Atom / bare `\E` with no preceding `/\`).
+fn recapture_leading_and_bullet(src: &str, leaf_start: usize) -> usize {
+    let bytes = src.as_bytes();
+    // Walk back over whitespace.
+    let mut i = leaf_start;
+    while i > 0 && (bytes[i - 1] == b' ' || bytes[i - 1] == b'\t' || bytes[i - 1] == b'\n' || bytes[i - 1] == b'\r') {
+        i -= 1;
+    }
+    // Need at least two bytes `/\` immediately before the whitespace run.
+    if i >= 2 && bytes[i - 2] == b'/' && bytes[i - 1] == b'\\' {
+        let bullet_start = i - 2;
+        // Guard: the `/\` must itself be a bullet — i.e. preceded by start-of-
+        // input, whitespace, or a `\/` OrBullet (`\/ /\ ...`). If the byte before
+        // the `/\` is a non-space, non-`/` token char, this `/\` is part of some
+        // larger token/expression and must NOT be absorbed.
+        let ok_before = bullet_start == 0
+            || matches!(bytes[bullet_start - 1], b' ' | b'\t' | b'\n' | b'\r' | b'/');
+        if ok_before && src.is_char_boundary(bullet_start) {
+            return bullet_start;
+        }
+    }
+    leaf_start
 }
 
 /// Phase 5 — recursively collect the DISJUNCT leaves of an action-body AST.
