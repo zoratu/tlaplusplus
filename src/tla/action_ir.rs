@@ -277,6 +277,63 @@ enum DisjunctSplitV2 {
 /// coordinate system matches the source, `parse_ast` (full-consume == `Ok`),
 /// then an Or-fence layout guard + `flatten_or_leaves` slice extraction with the
 /// same span-safety and per-clause normalization.
+/// Phase 5.1 (FIX B/C) — return the first LOGICAL line of `src`, skipping leading
+/// blank lines, `\*` line comments, and `(* ... *)` block comments (single- or
+/// multi-line). The returned slice is `trim_start`ed. Returns `""` if the whole
+/// input is blank/comments.
+///
+/// Block-comment scanning is a simple depth counter over `(*`/`*)` pairs (TLA+
+/// block comments nest). Once we are outside any block comment and land on a
+/// non-blank, non-`\*` character on a line, we return that line trimmed. If a
+/// block comment ends mid-line, the remainder of that line after `*)` is the
+/// first logical text.
+fn first_logical_line_skipping_comments(src: &str) -> &str {
+    let bytes = src.as_bytes();
+    let n = bytes.len();
+    let mut i = 0usize;
+    let mut depth: usize = 0; // block-comment nesting depth
+
+    while i < n {
+        if depth > 0 {
+            // Inside a block comment: look for `*)` (may nest with `(*`).
+            if i + 1 < n && bytes[i] == b'(' && bytes[i + 1] == b'*' {
+                depth += 1;
+                i += 2;
+            } else if i + 1 < n && bytes[i] == b'*' && bytes[i + 1] == b')' {
+                depth -= 1;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        match bytes[i] {
+            b' ' | b'\t' | b'\r' | b'\n' => {
+                i += 1;
+            }
+            b'(' if i + 1 < n && bytes[i + 1] == b'*' => {
+                depth += 1;
+                i += 2;
+            }
+            b'\\' if i + 1 < n && bytes[i + 1] == b'*' => {
+                // `\*` line comment: skip to end of line.
+                while i < n && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            _ => {
+                // First logical (non-comment, non-blank) char. Return from HERE
+                // to end of line. Starting at `i` (not the raw line start) means
+                // an inline trailing block comment before real code — `(* c *)
+                // /\ A` — still yields `/\ A`, so the mis-fence `/\` check fires.
+                let line_end = src[i..].find('\n').map(|p| i + p).unwrap_or(n);
+                return src[i..line_end].trim_start();
+            }
+        }
+    }
+    ""
+}
+
 fn classify_action_disjunct_v2(expr: &str) -> DisjunctSplitV2 {
     use crate::tla::expr_v2::{self, ast};
 
@@ -314,11 +371,13 @@ fn classify_action_disjunct_v2(expr: &str) -> DisjunctSplitV2 {
     // this v2 root-`Or` is a mis-fence: return `RootOrLayoutMismatch` and let the
     // string path's conjunction guard keep the whole body as one action.
     {
-        let first_logical = src
-            .lines()
-            .map(str::trim_start)
-            .find(|l| !l.is_empty() && !l.starts_with("\\*"))
-            .unwrap_or("");
+        // FIX B (Phase 5.1): locate the first LOGICAL line, skipping not only
+        // blank lines and `\*` line comments but also leading `(* ... *)` block
+        // comments (single- OR multi-line). A leading block comment before a
+        // `/\`-led body would otherwise bypass this guard and recreate the
+        // Peterson mis-fence (a `/\`-led conjunction shredded into disjuncts →
+        // false mutual-exclusion violation).
+        let first_logical = first_logical_line_skipping_comments(src);
         if first_logical.starts_with("/\\") {
             return DisjunctSplitV2::RootOrLayoutMismatch;
         }
@@ -409,14 +468,82 @@ fn classify_action_disjunct_v2(expr: &str) -> DisjunctSplitV2 {
 /// other than the `\` of a `/\`. This is intentionally minimal — it recovers the
 /// single `/\` a `\/ /\ <body>` branch dropped, and does nothing for a genuine
 /// non-bulleted leaf (Atom / bare `\E` with no preceding `/\`).
-fn recapture_leading_and_bullet(src: &str, leaf_start: usize) -> usize {
-    let bytes = src.as_bytes();
-    // Walk back over whitespace.
-    let mut i = leaf_start;
-    while i > 0 && (bytes[i - 1] == b' ' || bytes[i - 1] == b'\t' || bytes[i - 1] == b'\n' || bytes[i - 1] == b'\r') {
+/// Phase 5.1 (FIX C) — take ONE backward step over a run of whitespace, a `\*`
+/// line comment, or a `(* ... *)` block comment ending immediately before `end`.
+/// Returns the index of the byte just before the skipped run, or `end` unchanged
+/// if the byte before `end` is neither whitespace nor the close of a comment.
+/// Called in a loop until it stops making progress.
+fn skip_whitespace_and_comments_backward(bytes: &[u8], end: usize) -> usize {
+    let mut i = end;
+    // 1. Whitespace run.
+    while i > 0 && matches!(bytes[i - 1], b' ' | b'\t' | b'\n' | b'\r') {
         i -= 1;
     }
-    // Need at least two bytes `/\` immediately before the whitespace run.
+    if i < end {
+        return i;
+    }
+    // 2. Block comment `(* ... *)` closing at `i` (i.e. bytes[i-2..i] == "*)").
+    if i >= 2 && bytes[i - 2] == b'*' && bytes[i - 1] == b')' {
+        // Scan back to the matching `(*`, honoring nesting.
+        let mut depth = 1usize;
+        let mut j = i - 2;
+        while j >= 2 {
+            if bytes[j - 2] == b'*' && bytes[j - 1] == b')' {
+                depth += 1;
+                j -= 2;
+            } else if bytes[j - 2] == b'(' && bytes[j - 1] == b'*' {
+                depth -= 1;
+                j -= 2;
+                if depth == 0 {
+                    return j;
+                }
+            } else {
+                j -= 1;
+            }
+        }
+        // Unbalanced (no matching `(*`): don't skip past — leave unchanged so the
+        // recapture conservatively fails rather than over-absorbing.
+        return end;
+    }
+    // 3. `\*` line comment: it runs to end-of-line. A trailing line comment sits
+    // BEFORE a newline, so after the whitespace step above we'd be at the `\n`
+    // that precedes the comment's line only if there was one; a same-line `\*`
+    // comment ending at `i` means bytes[..i] ends inside the comment text. Walk
+    // back to the `\*` opener on this line if present (bounded by line start).
+    let line_start = {
+        let mut k = i;
+        while k > 0 && bytes[k - 1] != b'\n' {
+            k -= 1;
+        }
+        k
+    };
+    let mut k = i;
+    while k >= line_start + 2 {
+        if bytes[k - 2] == b'\\' && bytes[k - 1] == b'*' {
+            return k - 2;
+        }
+        k -= 1;
+    }
+    end
+}
+
+fn recapture_leading_and_bullet(src: &str, leaf_start: usize) -> usize {
+    let bytes = src.as_bytes();
+    // Walk back over whitespace AND comments. FIX C (Phase 5.1): a `\*` line
+    // comment or `(* ... *)` block comment can sit between the `/\` bullet and
+    // the leaf (`\/ /\ (* c *) guard`); without skipping it the backward scan
+    // stops at the comment's closing byte, fails to find the `/\`, and DROPS the
+    // conjunction bullet — shredding the disjunct's guard. Skip such comments so
+    // the `/\` is still recaptured.
+    let mut i = leaf_start;
+    loop {
+        let before = skip_whitespace_and_comments_backward(bytes, i);
+        if before == i {
+            break;
+        }
+        i = before;
+    }
+    // Need at least two bytes `/\` immediately before the whitespace/comment run.
     if i >= 2 && bytes[i - 2] == b'/' && bytes[i - 1] == b'\\' {
         let bullet_start = i - 2;
         // Guard: the `/\` must itself be a bullet — i.e. preceded by start-of-
@@ -815,35 +942,58 @@ pub fn split_action_body_disjuncts(expr: &str) -> Vec<String> {
     // Phase 5 — IMMEDIATELY before the blind `split_top_level(_, "\\/")`: if v2
     // fully parsed the body and its root is NOT a splittable top-level `Or`
     // (`ParsedNonRootOr`), OR the root was an `Or` whose layout guard failed
-    // (`RootOrLayoutMismatch`), do NOT blind-split — return the WHOLE body as one
-    // disjunct. This protects root `LET d == e IN A \/ B`, `IF c THEN A \/ B ELSE
-    // D`, `\A x : A(x) \/ B(x)`, `\E`-scoped and `Paren`-non-Or bodies whose
-    // inner `\/` the string guards above do not cover; the inner disjunction is
-    // expanded downstream with its binder/branch scope intact. Only a `Fallback`
-    // (genuine v2 parse failure) reaches the blind split with pre-Phase-5
-    // behavior. `Split` already returned at the top of the function.
+    // (`RootOrLayoutMismatch`), do NOT blind-split. For a body with NO leading
+    // `\/`, return the WHOLE body as one disjunct — this protects root `LET d ==
+    // e IN A \/ B`, `IF c THEN A \/ B ELSE D`, `\A x : A(x) \/ B(x)`, `\E`-scoped
+    // and `Paren`-non-Or bodies whose inner `\/` the string guards above do not
+    // cover. For a body WITH a single leading `\/` bullet (a collapsed
+    // single-disjunct `\/ <scoped item>`), strip that one bullet and return the
+    // remainder whole (FIX A below) — same protection, minus the F3 self-loop.
+    // Either way the inner disjunction is expanded downstream with its
+    // binder/branch scope intact. Only a `Fallback` (genuine v2 parse failure)
+    // reaches the blind split with pre-Phase-5 behavior. `Split` already
+    // returned at the top of the function.
     //
-    // EXCEPTION (fixpoint-recursion guard): never take the whole-body return for
-    // a body that itself STARTS with a `\/` bullet. A single-disjunct `\/ X`
-    // collapses in `parse_junction` (`items.len()==1` → the item), so v2 reports
-    // its root as the item node (Atom/Quant/…) → `ParsedNonRootOr`. Returning
-    // `vec!["\/ X"]` here would preserve the leading `\/`, and every recursive
-    // caller that re-feeds a returned disjunct
-    // (`collect_action_param_samples_from_expr`,
-    // `split_nested_action_disjuncts`, …) branches on `trimmed.starts_with("\\/")`
-    // → it recurses on `\/ X` == its own input → unbounded self-recursion / stack
-    // overflow (probe `parsed_braf_...` on `\/ Write1(symbol)`). The pre-Phase-5
-    // string path strips that `\/` (`split_top_level` yields `["X"]`), breaking
-    // the loop. So a `\/`-led body must always fall through to the string split.
-    if !trimmed.starts_with("\\/")
-        && matches!(
-            disjunct_v2,
-            DisjunctSplitV2::ParsedNonRootOr | DisjunctSplitV2::RootOrLayoutMismatch
-        )
-    {
+    // FIX A (Phase 5.1 BLOCKER): a `\/`-led body that v2 fully parsed to a
+    // non-root-Or / layout-mismatch shape (e.g. `\/ \E x \in S : A(x) \/ B(x)`,
+    // `\/ LET d == e IN A \/ B`) MUST NOT reach the blind `split_top_level(_,
+    // "\\/")` below. A single-disjunct `\/ X` collapses in `parse_junction`
+    // (`items.len()==1` → the item), so v2 reports the root as that scoped item
+    // node (`Quant`/`Let`/`Atom`/…) → `ParsedNonRootOr` (or a layout mismatch).
+    // The blind split would re-split the inner scoped `\/` of `X`, leaking the
+    // binder / LET scope (Codex blocker). Instead, strip EXACTLY the ONE leading
+    // `\/` bullet and return the remainder as ONE disjunct — the downstream `\E`
+    // / LET expansion then handles the inner `\/` with `x` / `d` in scope.
+    //
+    // Why strip the `\/` (rather than keep it as pre-Phase-5): keeping the
+    // leading `\/` re-triggers the F3 fixpoint self-loop — every recursive caller
+    // that re-feeds a returned disjunct
+    // (`collect_action_param_samples_from_expr`, `split_nested_action_disjuncts`,
+    // …) branches on `trimmed.starts_with("\\/")` and recurses on its own input
+    // → unbounded self-recursion. Stripping the one bullet breaks the loop while
+    // preserving the scoped inner `\/` unsplit. A genuine multi-branch `\/ A \/ B
+    // \/ C` is a root `Or` → already returned as `Split` at the top of the
+    // function, so it never reaches here.
+    if matches!(
+        disjunct_v2,
+        DisjunctSplitV2::ParsedNonRootOr | DisjunctSplitV2::RootOrLayoutMismatch
+    ) {
+        if let Some(stripped) = trimmed.strip_prefix("\\/") {
+            // Strip exactly the ONE leading `\/` bullet; keep the remainder whole
+            // (do NOT blind-split — the inner `\/` is scoped by the item node).
+            let stripped = stripped.trim_start();
+            if !stripped.is_empty() {
+                return vec![stripped.to_string()];
+            }
+        }
+        // Non-`\/`-led scoped body (root `LET`/`IF`/`\A`/`\E`/`Paren`-non-Or):
+        // keep the whole body as one disjunct.
         return vec![trimmed.to_string()];
     }
 
+    // Only a `Fallback` (genuine v2 parse failure, or v2 disabled) reaches the
+    // blind string split below with pre-Phase-5 behavior. No parsed scoped body
+    // — `\/`-led or otherwise — can reach it anymore.
     split_top_level(trimmed, "\\/")
         .into_iter()
         .filter_map(|part| {
@@ -3193,5 +3343,156 @@ mod tests {
             classify_action_disjunct_v2(body),
             DisjunctSplitV2::Fallback
         ));
+    }
+
+    // ---- Phase 5.1 (Codex NO-GO fixes A/B/C) ----
+
+    #[test]
+    fn v2_disj_fix_a_leading_or_scoped_exists_returns_one_disjunct_binder_in_scope() {
+        // FIX A (BLOCKER): a `\/`-led body whose scoped item is a quantifier
+        // (`\/ \E x \in S : A(x) \/ B(x)`) collapses to a `Quant` root
+        // (`ParsedNonRootOr`). The inner `\/` lives INSIDE the `\E x` scope, so it
+        // must NOT be split. Strip exactly the one leading `\/` and return the
+        // remainder as ONE disjunct; the `\E` prefix stays intact.
+        let out = split_action_body_disjuncts("\\/ \\E x \\in S : A(x) \\/ B(x)");
+        assert_eq!(out.len(), 1, "inner \\/ must NOT be split: {out:#?}");
+        assert!(out[0].starts_with("\\E x \\in S :"), "\\E prefix intact: {out:#?}");
+        assert!(out[0].contains("A(x)"), "{out:#?}");
+        assert!(out[0].contains("B(x)"), "{out:#?}");
+        assert!(!out[0].starts_with("\\/"), "leading \\/ stripped: {out:#?}");
+    }
+
+    #[test]
+    fn v2_disj_fix_a_leading_or_scoped_let_returns_one_disjunct() {
+        // FIX A: `\/ LET d == e IN A \/ B` — the `\/` is inside the LET body
+        // scope. One disjunct, LET-bound `d` in scope for both A and B.
+        let out = split_action_body_disjuncts("\\/ LET d == e IN A \\/ B");
+        assert_eq!(out.len(), 1, "LET body \\/ must NOT be split: {out:#?}");
+        assert!(out[0].starts_with("LET d == e IN"), "{out:#?}");
+        assert!(out[0].contains("A \\/ B"), "{out:#?}");
+        assert!(!out[0].starts_with("\\/"), "leading \\/ stripped: {out:#?}");
+    }
+
+    #[test]
+    fn v2_disj_fix_b_block_comment_before_conjunction_stays_one_action() {
+        // FIX B: a leading `(* ... *)` block comment before a `/\`-led body must
+        // NOT be shredded into `\/` branches (Peterson false mutual-exclusion
+        // violation). The body is a conjunction (one action). The `first_logical`
+        // scan must skip the block comment so the `/\`-conjunction guard fires;
+        // whether the protection is reported as `RootOrLayoutMismatch` (parser
+        // mis-fences to root-Or) or `ParsedNonRootOr` (parser fences the `/\` as
+        // a root-And), the END-TO-END guarantee is the same: the body stays ONE
+        // disjunct.
+        let body = "(* hdr *)\n/\\ A \\/ B\n/\\ C";
+        assert!(
+            matches!(
+                classify_action_disjunct_v2(body),
+                DisjunctSplitV2::RootOrLayoutMismatch | DisjunctSplitV2::ParsedNonRootOr
+            ),
+            "block-comment-prefixed /\\ body must be kept whole, not root-Or-split"
+        );
+        let out = split_action_body_disjuncts(body);
+        assert_eq!(out.len(), 1, "conjunction stays one disjunct: {out:#?}");
+    }
+
+    #[test]
+    fn v2_disj_fix_b_multiline_block_comment_before_conjunction_stays_one_action() {
+        // FIX B: multi-line block comment variant — same one-action guarantee.
+        let body = "(* line one\n   line two *)\n/\\ A \\/ B\n/\\ C";
+        assert!(
+            matches!(
+                classify_action_disjunct_v2(body),
+                DisjunctSplitV2::RootOrLayoutMismatch | DisjunctSplitV2::ParsedNonRootOr
+            ),
+            "multi-line block-comment /\\ body must be kept whole"
+        );
+        let out = split_action_body_disjuncts(body);
+        assert_eq!(out.len(), 1, "conjunction stays one disjunct: {out:#?}");
+    }
+
+    #[test]
+    fn v2_disj_fix_b_misfenced_root_or_block_comment_is_layout_mismatch() {
+        // FIX B (direct guard exercise): construct a body where the parser DOES
+        // mis-fence a `/\`-led conjunction to a root `Or` (inline `\/` at/left of
+        // the `/\` bullet column), then prepend a block comment. Without the
+        // comment-skipping in the `first_logical` scan the guard would be bypassed
+        // and the guard-crossing shred would happen. With FIX B it stays
+        // `RootOrLayoutMismatch` (kept whole).
+        let no_comment = "/\\ A\n\\/ B\n/\\ C";
+        let with_comment = "(* c *)\n/\\ A\n\\/ B\n/\\ C";
+        // Both must classify identically (the comment must not change the verdict).
+        let a = classify_action_disjunct_v2(no_comment);
+        let b = classify_action_disjunct_v2(with_comment);
+        assert_eq!(
+            std::mem::discriminant(&a),
+            std::mem::discriminant(&b),
+            "leading block comment must not change the mis-fence classification"
+        );
+        // And neither is shredded.
+        assert_eq!(split_action_body_disjuncts(with_comment).len(), 1);
+    }
+
+    #[test]
+    fn first_logical_line_skips_block_and_line_comments() {
+        assert_eq!(first_logical_line_skipping_comments("(* c *)\n/\\ A"), "/\\ A");
+        assert_eq!(
+            first_logical_line_skipping_comments("\\* line\n(* blk *)\n\\/ X"),
+            "\\/ X"
+        );
+        assert_eq!(first_logical_line_skipping_comments("(* c *) /\\ A"), "/\\ A");
+        assert_eq!(first_logical_line_skipping_comments("  \n  /\\ A"), "/\\ A");
+        assert_eq!(
+            first_logical_line_skipping_comments("(* line one\n line two *)\n/\\ A"),
+            "/\\ A"
+        );
+    }
+
+    #[test]
+    fn v2_disj_fix_c_commented_branch_recaptures_and_bullet() {
+        // FIX C: a commented `\/` branch (`\/ (* c *) /\ guard /\ post`) must keep
+        // its `/\` conjunction INSIDE the disjunct — the comment in the recapture
+        // gap must not cause the `/\` to be dropped.
+        let out = split_action_body_disjuncts(
+            "\\/ (* c *) /\\ guard\n           /\\ post\n\\/ D",
+        );
+        assert_eq!(out.len(), 2, "{out:#?}");
+        // The first disjunct retains its `/\` conjunction (guard AND post).
+        assert!(out[0].contains("guard"), "{out:#?}");
+        assert!(out[0].contains("post"), "{out:#?}");
+        assert!(out[0].contains("/\\"), "the /\\ conjunction must be kept: {out:#?}");
+        assert_eq!(out[1].trim(), "D", "{out:#?}");
+    }
+
+    #[test]
+    fn skip_whitespace_and_comments_backward_handles_block_comment() {
+        // `/\ (* c *) guard` — the backward whitespace+comment skip from the leaf
+        // must step back PAST the `(* c *)` block comment (and its surrounding
+        // whitespace) so that `recapture_leading_and_bullet` can then see the `/\`
+        // bullet. The skip helper stops just after the `/\` (leaving the two
+        // bullet bytes for recapture's own `bytes[i-2..i]` check), so the
+        // end-to-end contract is: recapture returns the index of the `/\`.
+        let s = "/\\ (* c *) guard";
+        let leaf = s.find("guard").unwrap();
+        // The skip must make progress across the comment (not stall at `)`).
+        let after_skip = {
+            let bytes = s.as_bytes();
+            let mut i = leaf;
+            loop {
+                let b = skip_whitespace_and_comments_backward(bytes, i);
+                if b == i {
+                    break;
+                }
+                i = b;
+            }
+            i
+        };
+        assert!(
+            after_skip <= 2,
+            "skip must cross the block comment back to the /\\ region, got {after_skip}"
+        );
+        // The real contract: recapture recovers the `/\` bullet at index 0.
+        let recaptured = recapture_leading_and_bullet(s, leaf);
+        assert_eq!(recaptured, 0, "recapture must land on the /\\ bullet");
+        assert_eq!(&s[recaptured..recaptured + 2], "/\\");
     }
 }
