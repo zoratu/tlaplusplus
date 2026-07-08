@@ -118,6 +118,28 @@ fn split_action_conjuncts_v2(expr: &str) -> Option<Vec<String>> {
         return None;
     };
 
+    // DISJUNCTION-BODY GUARD (soundness — EWD998PCal `node`, PlusCal
+    // `Op(self) == \/ ... \/ ...`). A body whose FIRST logical line begins with a
+    // `\/` bullet is semantically a DISJUNCTION, never a top-level conjunction.
+    // But when that leading `\/` sits at a SHALLOWER column than its sibling `\/`
+    // bullets — the classic `node(self) == \/ /\ A` shape, where line 1's `\/`
+    // trails the `== ` at col 0 while the continuation `\/`s are indented — the
+    // uniform-dedented source has inconsistent `\/` columns. v2 then fences the
+    // shallow leading `\/` as a single (collapsing) disjunct and lets the LAST
+    // quantifier/junction body greedily swallow the deeper sibling `\/` disjuncts,
+    // so `parse_ast` returns a ROOT `And` (`/\ guard /\ \E x : <swallowed rest>`).
+    // Conjunct-splitting THAT And shreds the whole multi-disjunct action into two
+    // leaves whose second leaf is a `\E` body that absorbed every other disjunct
+    // → the action loses all but a few successors (EWD998PCal N=3: 321,370 → ~11k
+    // distinct, a false-safe under-exploration). The trusted string splitter
+    // groups this shape correctly, so when the first logical line is `\/`-led we
+    // return None and fall back. (A genuine `/\`-led body with an INLINE `\/`
+    // inside a conjunct does not trip this: its first logical line starts with
+    // `/\`, handled by the layout guard below.)
+    if first_logical_line_skipping_comments(src).starts_with("\\/") {
+        return None;
+    }
+
     // LAYOUT-CONSISTENCY GUARD (D1 companion). A uniform dedent preserves every
     // relative column, but it does NOT repair a body whose top-level bullets sit
     // at INCONSISTENT columns — e.g. a raw-string / mid-definition extraction
@@ -2961,6 +2983,32 @@ mod tests {
         assert!(
             split_action_conjuncts_v2(body).is_none(),
             "lex/parse error must fall back to None"
+        );
+    }
+
+    #[test]
+    fn v2_or_led_shallow_leading_bullet_body_falls_back() {
+        // SOUNDNESS REGRESSION (EWD998PCal `node`, PlusCal `Op(self) == \/ ...`).
+        // A `\/`-led disjunction whose leading `\/` sits SHALLOWER than its sibling
+        // `\/` bullets (the `node(self) == \/ /\ A` shape: line-1 `\/` trails the
+        // stripped `== ` at col 0, continuation `\/`s indented) makes v2 mis-fence
+        // — the shallow leading `\/` collapses and the last `\E` body swallows the
+        // deeper sibling disjuncts, so `parse_ast` returns a ROOT `And`. Conjunct-
+        // splitting THAT And shreds the multi-disjunct action (EWD998PCal N=3
+        // under-explored 321,370 → ~11k distinct, a false-safe). The disjunction-
+        // body guard must return None so the string splitter (correct) owns it.
+        let body = "\\/ /\\ active[self]\n   /\\ \\E to \\in Node \\ {self}:\n        network' = f(to)\n   /\\ counter' = g\n              \\/ /\\ \\E msg \\in P:\n                 /\\ network' = h(msg)\n              \\/ /\\ active' = FALSE\n                 /\\ UNCHANGED net";
+        assert!(
+            split_action_conjuncts_v2(body).is_none(),
+            "\\/-led body must fall back to the string splitter, not be conjunct-split"
+        );
+        // And end-to-end: the disjunct splitter must recover >=3 disjuncts (the
+        // action's real successors), not collapse into a swallowed \E body.
+        let disj = split_action_body_disjuncts(body);
+        assert!(
+            disj.len() >= 3,
+            "\\/-led body must split into its real disjuncts, got {}: {disj:#?}",
+            disj.len()
         );
     }
 

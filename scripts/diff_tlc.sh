@@ -10,6 +10,11 @@
 #      because both checkers stop early on first violation and that is non-deterministic)
 #   3. Deadlock detection (we always pass `-deadlock` to TLC and `--allow-deadlock` to
 #      tlaplusplus so the two agree on the absence-of-deadlock contract)
+#   4. Count-drop guard: FAIL when tlaplusplus reports NO violation but explores
+#      materially fewer distinct states than TLC (< COUNT_DROP_RATIO, default 0.90).
+#      A large under-count with a "safe" verdict is a false-safe — the checker
+#      never visited the states where a violation would live. This catches the
+#      under-exploration class that verdict-only comparison misses.
 #
 # Exit codes:
 #   0 — every spec ran on both checkers and all comparisons matched
@@ -41,6 +46,10 @@ DIFF_LIST="${DIFF_LIST:-${ROOT_DIR}/corpus/diff_test/list.tsv}"
 DIFF_ALLOWLIST="${DIFF_ALLOWLIST:-${ROOT_DIR}/corpus/diff_test/allowlist.tsv}"
 DIFF_TIMEOUT_SECS="${DIFF_TIMEOUT_SECS:-60}"
 DIFF_OUTPUT_DIR="${DIFF_OUTPUT_DIR:-${ROOT_DIR}/.diff-tlc-out}"
+# Count-drop guard: FAIL when tlaplusplus reports no violation yet explores fewer
+# than COUNT_DROP_RATIO * TLC's distinct states (a false-safe / under-exploration
+# red flag). Set to 0 to disable. See the COUNT-DROP GUARD block below.
+COUNT_DROP_RATIO="${COUNT_DROP_RATIO:-0.90}"
 
 if [[ -z "${TLAPLUSPLUS_BIN:-}" ]]; then
   if [[ -x "${ROOT_DIR}/target/release/tlaplusplus" ]]; then
@@ -325,6 +334,31 @@ while IFS=$'\t' read -r spec_id module_path config_path expect_violation notes; 
   if [[ "${tlc_violation}" == "no" && "${tlapp_violation}" == "no" ]]; then
     if [[ -n "${tlc_distinct}" && -n "${tlapp_distinct}" && "${tlc_distinct}" != "${tlapp_distinct}" ]]; then
       spec_failures+=("distinct state count mismatch: TLC=${tlc_distinct} tlaplusplus=${tlapp_distinct}")
+    fi
+  fi
+
+  # COUNT-DROP GUARD (false-safe / under-exploration detector).
+  #
+  # The exact-match check above catches count divergence only when BOTH sides
+  # report "no violation". But a whole class of soundness bugs hides even when
+  # the verdict matches: if tlaplusplus explores DRAMATICALLY fewer states than
+  # TLC yet still reports "no violation", that "safe" verdict is a FALSE-SAFE —
+  # the checker simply never visited the states where a violation would live.
+  # (This is exactly how the EWD998PCal v2-parser under-exploration escaped the
+  # gate: 321,370 distinct in TLC vs ~11k under the v2 default, verdict
+  # "noviolation" in both — a silent false-safe.) The verdict-only corpus scans
+  # missed the whole class because they never compared counts.
+  #
+  # So: whenever tlaplusplus reports NO violation but its distinct count is
+  # materially below TLC's (< COUNT_DROP_RATIO, default 0.90), FAIL — regardless
+  # of what TLC's own verdict is. A large under-count with "noviolation" is a
+  # red flag that must be investigated, not silently passed. Set
+  # COUNT_DROP_RATIO=0 to disable (not recommended for the gate).
+  if [[ "${COUNT_DROP_RATIO}" != "0" && "${tlapp_violation}" == "no" \
+        && -n "${tlc_distinct}" && -n "${tlapp_distinct}" \
+        && "${tlc_distinct}" -gt 0 && "${tlapp_distinct}" != "${tlc_distinct}" ]]; then
+    if awk "BEGIN{exit !(${tlapp_distinct} < ${COUNT_DROP_RATIO} * ${tlc_distinct})}"; then
+      spec_failures+=("COUNT-DROP false-safe: tlaplusplus explored ${tlapp_distinct} distinct vs TLC ${tlc_distinct} (< ${COUNT_DROP_RATIO}x) while reporting no violation — likely under-exploration/missed states")
     fi
   fi
 
