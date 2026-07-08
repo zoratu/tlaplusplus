@@ -3170,6 +3170,21 @@ mod tests {
     }
 
     #[test]
+    fn v2_disj_single_bulleted_disjunct_strips_bullet_no_self_loop() {
+        // REGRESSION GUARD (probe `parsed_braf_write_at_most_...` stack overflow):
+        // a single-disjunct `\/ X` collapses in parse_junction to the item, so v2
+        // classifies its root as the item (`ParsedNonRootOr`). The Phase-5
+        // whole-body guard must NOT return `["\/ X"]` (keeping the bullet) — that
+        // makes recursive re-feeders (`collect_action_param_samples_from_expr`,
+        // `split_nested_action_disjuncts`) loop on `\/ X == input`. A `\/`-led
+        // body must fall through to the string split, which STRIPS the `\/`.
+        let out = split_action_body_disjuncts("\\/ Write1(symbol)");
+        assert_eq!(out.len(), 1, "{out:#?}");
+        assert!(!out[0].starts_with("\\/"), "leading \\/ must be stripped: {}", out[0]);
+        assert_eq!(out[0], "Write1(symbol)");
+    }
+
+    #[test]
     fn v2_disj_falls_back_on_parse_error() {
         // Unterminated block comment → lex error → Fallback → the string path
         // (blind split reachable). Just assert the classification is Fallback.
