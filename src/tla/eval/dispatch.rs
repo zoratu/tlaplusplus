@@ -664,13 +664,12 @@ mod phase3_boolean_tests {
         //     /\ C
         // (1) The whole expr must classify as IndentedAnd with 2 parts: the
         //     inner `\/ A ... \/ B` disjunction source and `C`.
-        // (2) Recursively re-classifying part[0] must yield the A-or-B
-        //     disjunction — either directly via v2 (IndentedOr/Or) or via the
-        //     v1 fallback (OrPrefixSingle etc.). Whichever path, the EVALUATION
-        //     must be the disjunction of A and B, never a mis-grouped single
-        //     atom. If the child slice shifts continuation-bullet columns so v2
-        //     would mis-group, the code returns None → v1 fallback, which still
-        //     evaluates correctly.
+        // (2) Recursively re-classifying part[0] must re-classify via v2 as
+        //     IndentedOr[A, B] — no fallback needed. A Phase-3.1 box probe
+        //     observed `child_op=IndentedOr`; this test asserts that exact
+        //     shape (exactly 2 parts trimming to "A" and "B") rather than a
+        //     permissive substring check, both satisfying Codex and *proving*
+        //     the "no fallback needed" claim.
         let e = "/\\ \\/ A\n   \\/ B\n/\\ C";
         let op = classify_op(e);
         assert!(
@@ -689,29 +688,25 @@ mod phase3_boolean_tests {
             "part[0] should be the A/B disjunction source; got {:?}",
             inner
         );
-        // Recursively classify the child slice: it must resolve to an OR of the
-        // two branches (directly via v2 IndentedOr/Or, or via the v1
-        // OrPrefixSingle fallback), NOT a mis-grouped IndentedAnd/Implies/Iff.
+        // Recursively classify the child slice: it must re-classify via v2 as
+        // IndentedOr with exactly two parts trimming to "A" and "B" — no v1
+        // fallback needed (confirmed by a Phase-3.1 box probe).
         let child_op = classify_op(inner);
-        let child_parts: Vec<String> = match &child_op {
-            Op::IndentedOr(p) | Op::Or(p) => p.clone(),
-            // OrPrefixSingle: the dispatcher strips the leading `\/` and
-            // re-evaluates the remainder — still an OR-shaped, correct
-            // evaluation (safe fallback), so accept it.
-            Op::OrPrefixSingle => vec![inner.to_string()],
+        let child_parts = match &child_op {
+            Op::IndentedOr(p) => p,
             other => panic!(
-                "part[0] must re-classify as an OR of A and B (v2 or fallback); \
-                 got a mis-grouping that is not OR-shaped: {}",
+                "part[0] must re-classify via v2 as IndentedOr[A, B]; \
+                 got {}",
                 variant_name(other)
             ),
         };
-        // Both branches must survive the re-parse (or, in the single-strip
-        // fallback, both bullets remain in the residual source to be evaluated).
-        let joined = child_parts.join(" ");
-        assert!(
-            joined.contains('A') && joined.contains('B'),
-            "child re-classify must retain both A and B branches; got {:?}",
+        assert_eq!(
+            child_parts.len(),
+            2,
+            "IndentedOr must have exactly 2 branches; got {:?}",
             child_parts
         );
+        assert_eq!(child_parts[0].trim(), "A", "first branch must be A");
+        assert_eq!(child_parts[1].trim(), "B", "second branch must be B");
     }
 }
