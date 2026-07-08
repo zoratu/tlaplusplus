@@ -181,9 +181,15 @@ fn classify_boolean_v2(expr: &str) -> Option<Op> {
             sp.end,
             expr.len()
         );
-        // Defensive (release): if the span is somehow out of bounds or not a
-        // char boundary, bail to the fallback rather than panic-slicing.
-        if sp.end > expr.len() || !expr.is_char_boundary(sp.start) || !expr.is_char_boundary(sp.end)
+        // Defensive (release): if the span is inverted, somehow out of bounds,
+        // or not a char boundary, bail to the fallback rather than panic-slicing.
+        // The `sp.start > sp.end` check mirrors the debug_assert above so an
+        // inverted span (even with both endpoints on char boundaries) bails to
+        // `None`→fallback instead of panicking on `expr[sp.start..sp.end]`.
+        if sp.start > sp.end
+            || sp.end > expr.len()
+            || !expr.is_char_boundary(sp.start)
+            || !expr.is_char_boundary(sp.end)
         {
             return None;
         }
@@ -640,21 +646,72 @@ mod phase3_boolean_tests {
         }
     }
 
+    // NOTE: the v1 escape-hatch behavior of `classify_boolean_v2` (returning
+    // `None` when `TLAPLUS_EXPR_PARSER=v1`) is deliberately NOT tested here by
+    // mutating the process-global env var: `std::env::set_var` is `unsafe` and
+    // parallel-racy under the default (multi-threaded) test harness, and can
+    // poison other tests that read the var concurrently. The pure config
+    // decision underneath the env layer is unit-tested directly in
+    // `crate::tla::expr_v2::config_tests` (via `v2_enabled_for`), and the
+    // end-to-end escape hatch is covered at integration level by
+    // `TLAPLUS_EXPR_PARSER=v1 scripts/diff_tlc.sh`.
+
     #[test]
-    fn respects_v1_escape_hatch() {
-        // With the v1 escape hatch set, classify_boolean_v2 must return None so
-        // the splitter cascade runs on both paths.
-        // SAFETY: single-threaded test; restore afterwards.
-        let prev = std::env::var("TLAPLUS_EXPR_PARSER").ok();
-        unsafe {
-            std::env::set_var("TLAPLUS_EXPR_PARSER", "v1");
-        }
-        assert!(classify_boolean_v2("/\\ a\n/\\ b").is_none());
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("TLAPLUS_EXPR_PARSER", v),
-                None => std::env::remove_var("TLAPLUS_EXPR_PARSER"),
-            }
-        }
+    fn nested_child_junction_slice_reclassifies_or_falls_back_safely() {
+        // Codex-requested nested-layout slice test. Shape:
+        //     /\ \/ A
+        //        \/ B
+        //     /\ C
+        // (1) The whole expr must classify as IndentedAnd with 2 parts: the
+        //     inner `\/ A ... \/ B` disjunction source and `C`.
+        // (2) Recursively re-classifying part[0] must yield the A-or-B
+        //     disjunction — either directly via v2 (IndentedOr/Or) or via the
+        //     v1 fallback (OrPrefixSingle etc.). Whichever path, the EVALUATION
+        //     must be the disjunction of A and B, never a mis-grouped single
+        //     atom. If the child slice shifts continuation-bullet columns so v2
+        //     would mis-group, the code returns None → v1 fallback, which still
+        //     evaluates correctly.
+        let e = "/\\ \\/ A\n   \\/ B\n/\\ C";
+        let op = classify_op(e);
+        assert!(
+            matches!(op, Op::IndentedAnd(_)),
+            "whole expr must be IndentedAnd; got {}",
+            variant_name(&op)
+        );
+        let parts = parts_of(&op);
+        assert_eq!(parts.len(), 2, "expected 2 conjuncts, got {:?}", parts);
+        // part[1] is the trailing `C` conjunct.
+        assert_eq!(parts[1].trim(), "C");
+        // part[0] is the inner disjunction source; it must contain both bullets.
+        let inner = parts[0].as_str();
+        assert!(
+            inner.contains("\\/ A") && inner.contains("\\/ B"),
+            "part[0] should be the A/B disjunction source; got {:?}",
+            inner
+        );
+        // Recursively classify the child slice: it must resolve to an OR of the
+        // two branches (directly via v2 IndentedOr/Or, or via the v1
+        // OrPrefixSingle fallback), NOT a mis-grouped IndentedAnd/Implies/Iff.
+        let child_op = classify_op(inner);
+        let child_parts: Vec<String> = match &child_op {
+            Op::IndentedOr(p) | Op::Or(p) => p.clone(),
+            // OrPrefixSingle: the dispatcher strips the leading `\/` and
+            // re-evaluates the remainder — still an OR-shaped, correct
+            // evaluation (safe fallback), so accept it.
+            Op::OrPrefixSingle => vec![inner.to_string()],
+            other => panic!(
+                "part[0] must re-classify as an OR of A and B (v2 or fallback); \
+                 got a mis-grouping that is not OR-shaped: {}",
+                variant_name(other)
+            ),
+        };
+        // Both branches must survive the re-parse (or, in the single-strip
+        // fallback, both bullets remain in the residual source to be evaluated).
+        let joined = child_parts.join(" ");
+        assert!(
+            joined.contains('A') && joined.contains('B'),
+            "child re-classify must retain both A and B branches; got {:?}",
+            child_parts
+        );
     }
 }
