@@ -91,7 +91,18 @@ scan_one() {
   read -r c2 v2 <<<"$(_run v2)"
   read -r c1 v1 <<<"$(_run v1)"
   flag=ok
-  if [ "${v2}" != timeout ] && [ "${v1}" != timeout ] && [ "${v2}" != err ] && [ "${v1}" != err ] \
+  # MISSED-VIOLATION: v1 (trusted oracle) found a violation the v2 default did not.
+  # That is an unambiguous soundness regression, independent of state counts, so
+  # flag it whenever both runs actually completed a verdict.
+  if [ "${v1}" = viol ] && [ "${v2}" = noviol ]; then
+    flag=MISSED_VIOLATION
+  # COUNT-DROP false-safe: v2 explored materially fewer states than v1 while still
+  # reporting NO violation. A low count paired with a violation is NOT a false
+  # positive — violation runs legitimately stop early — so only flag when v2 is
+  # a completed `noviol`. v1 must likewise have completed a verdict (not
+  # timeout/err) to be a trustworthy oracle.
+  elif [ "${v2}" = noviol ] \
+     && [ "${v1}" != timeout ] && [ "${v1}" != err ] \
      && [ "${c1}" -gt 0 ] 2>/dev/null && [ "${c2}" -ge 0 ] 2>/dev/null; then
     awk "BEGIN{exit !(${c2} < ${SU_RATIO} * ${c1})}" && flag=UNDEREXPLORE
   fi
@@ -105,14 +116,23 @@ xargs -P "${PAR}" -I{} bash -c 'scan_one "$1"' _ {} < "${CFGS}"
 
 ALL="${OUTDIR}/all.tsv"
 cat "${OUTDIR}"/*.res 2>/dev/null | sort > "${ALL}"
-FLAGGED=$(grep -c 'UNDEREXPLORE' "${ALL}" 2>/dev/null || echo 0)
+UNDER=$(grep -c 'UNDEREXPLORE' "${ALL}" 2>/dev/null); UNDER=${UNDER:-0}
+MISSED=$(grep -c 'MISSED_VIOLATION' "${ALL}" 2>/dev/null); MISSED=${MISSED:-0}
+FLAGGED=$(( UNDER + MISSED ))
 echo "============================================================"
 echo "scan_underexploration summary: $(wc -l < "${ALL}") spec(s) scanned"
-echo "  under-exploration flagged: ${FLAGGED}"
+echo "  under-exploration flagged: ${UNDER}"
+echo "  missed-violation flagged:  ${MISSED}"
 echo "============================================================"
 if [ "${FLAGGED}" -gt 0 ]; then
-  echo "UNDER-EXPLORATION (v2 default explored < ${RATIO}x the v1 distinct count):"
-  grep 'UNDEREXPLORE' "${ALL}"
+  if [ "${MISSED}" -gt 0 ]; then
+    echo "MISSED VIOLATION (v1 found a violation the v2 default did not):"
+    grep 'MISSED_VIOLATION' "${ALL}"
+  fi
+  if [ "${UNDER}" -gt 0 ]; then
+    echo "UNDER-EXPLORATION (v2 default explored < ${RATIO}x the v1 distinct count, verdict noviolation):"
+    grep 'UNDEREXPLORE' "${ALL}"
+  fi
   rm -rf "${WORK}"
   exit 1
 fi

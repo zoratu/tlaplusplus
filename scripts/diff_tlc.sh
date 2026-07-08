@@ -354,7 +354,16 @@ while IFS=$'\t' read -r spec_id module_path config_path expect_violation notes; 
   # of what TLC's own verdict is. A large under-count with "noviolation" is a
   # red flag that must be investigated, not silently passed. Set
   # COUNT_DROP_RATIO=0 to disable (not recommended for the gate).
-  if [[ "${COUNT_DROP_RATIO}" != "0" && "${tlapp_violation}" == "no" \
+  #
+  # TLC-SUCCESS GATE: the count-drop comparison is only meaningful against a
+  # COMPLETE TLC baseline. If TLC timed out or errored (rc != 0), its printed
+  # distinct count is PARTIAL — comparing tlaplusplus against a truncated
+  # baseline would produce noise (false FAILs when TLC stopped early, or missed
+  # detections when TLC's partial count happens to sit above ours). TLC exits 0
+  # only when it explores the full state space with no violation, so gate the
+  # check on ${tlc_rc} == 0 and skip it otherwise (a partial baseline can't
+  # ground a false-safe claim).
+  if [[ "${COUNT_DROP_RATIO}" != "0" && "${tlc_rc}" -eq 0 && "${tlapp_violation}" == "no" \
         && -n "${tlc_distinct}" && -n "${tlapp_distinct}" \
         && "${tlc_distinct}" -gt 0 && "${tlapp_distinct}" != "${tlc_distinct}" ]]; then
     if awk "BEGIN{exit !(${tlapp_distinct} < ${COUNT_DROP_RATIO} * ${tlc_distinct})}"; then

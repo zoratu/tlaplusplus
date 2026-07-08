@@ -3002,13 +3002,40 @@ mod tests {
             split_action_conjuncts_v2(body).is_none(),
             "\\/-led body must fall back to the string splitter, not be conjunct-split"
         );
-        // And end-to-end: the disjunct splitter must recover >=3 disjuncts (the
-        // action's real successors), not collapse into a swallowed \E body.
+        // And end-to-end: the disjunct splitter must recover EXACTLY the three
+        // top-level `\/` branches — the action's real successors — not collapse
+        // into a swallowed \E body (under-split) and not shred an inner grouped
+        // clause into extra siblings (over-split). Assert the exact count AND the
+        // distinguishing leading text of each branch so a wrong boundary fails.
         let disj = split_action_body_disjuncts(body);
-        assert!(
-            disj.len() >= 3,
-            "\\/-led body must split into its real disjuncts, got {}: {disj:#?}",
+        assert_eq!(
+            disj.len(),
+            3,
+            "\\/-led body must split into its 3 real disjuncts, got {}: {disj:#?}",
             disj.len()
+        );
+        // The leading `\/` bullet is stripped; each branch's body opens with `/\`.
+        // Match on the first distinguishing token of each branch.
+        assert!(
+            disj[0].contains("active[self]") && disj[0].contains("network' = f(to)"),
+            "branch 0 must be the active-node send branch: {}",
+            disj[0]
+        );
+        assert!(
+            disj[1].contains("\\E msg \\in P") && disj[1].contains("network' = h(msg)"),
+            "branch 1 must be the receive branch: {}",
+            disj[1]
+        );
+        assert!(
+            disj[2].contains("active' = FALSE") && disj[2].contains("UNCHANGED net"),
+            "branch 2 must be the deactivate branch: {}",
+            disj[2]
+        );
+        // No branch may leak content from a sibling (over-split / mis-fence guard).
+        assert!(
+            !disj[0].contains("network' = h(msg)") && !disj[0].contains("active' = FALSE"),
+            "branch 0 swallowed a sibling disjunct: {}",
+            disj[0]
         );
     }
 
