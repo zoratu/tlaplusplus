@@ -822,10 +822,25 @@ pub fn split_action_body_disjuncts(expr: &str) -> Vec<String> {
     // expanded downstream with its binder/branch scope intact. Only a `Fallback`
     // (genuine v2 parse failure) reaches the blind split with pre-Phase-5
     // behavior. `Split` already returned at the top of the function.
-    if matches!(
-        disjunct_v2,
-        DisjunctSplitV2::ParsedNonRootOr | DisjunctSplitV2::RootOrLayoutMismatch
-    ) {
+    //
+    // EXCEPTION (fixpoint-recursion guard): never take the whole-body return for
+    // a body that itself STARTS with a `\/` bullet. A single-disjunct `\/ X`
+    // collapses in `parse_junction` (`items.len()==1` → the item), so v2 reports
+    // its root as the item node (Atom/Quant/…) → `ParsedNonRootOr`. Returning
+    // `vec!["\/ X"]` here would preserve the leading `\/`, and every recursive
+    // caller that re-feeds a returned disjunct
+    // (`collect_action_param_samples_from_expr`,
+    // `split_nested_action_disjuncts`, …) branches on `trimmed.starts_with("\\/")`
+    // → it recurses on `\/ X` == its own input → unbounded self-recursion / stack
+    // overflow (probe `parsed_braf_...` on `\/ Write1(symbol)`). The pre-Phase-5
+    // string path strips that `\/` (`split_top_level` yields `["X"]`), breaking
+    // the loop. So a `\/`-led body must always fall through to the string split.
+    if !trimmed.starts_with("\\/")
+        && matches!(
+            disjunct_v2,
+            DisjunctSplitV2::ParsedNonRootOr | DisjunctSplitV2::RootOrLayoutMismatch
+        )
+    {
         return vec![trimmed.to_string()];
     }
 
