@@ -119,6 +119,106 @@ pub(super) enum Op {
     Atom,
 }
 
+/// Phase 3: layout-aware boolean/junction grouping via the `expr_v2` AST.
+///
+/// This is the interpreted-path twin of Phase 2's compiled-path routing. It
+/// replaces ONLY the top-level boolean grouping decision (`/\`/`\/`/`=>`/`<=>`)
+/// that the string splitter cascade in `classify_op` performs — the same
+/// string-splitting disease Phase 2 fixed for the compiled path. Everything
+/// else (comparison, arithmetic, set ops, ...) still runs through the existing
+/// cascade unchanged.
+///
+/// Returns:
+/// - `None` if v2 is disabled (`TLAPLUS_EXPR_PARSER=v1|off`) or the v2 parse
+///   errors → the existing splitter cascade runs, unchanged (always safe).
+/// - `None` if the TOP node is anything other than an And/Or junction with
+///   `>= 2` items or a top-level `=>`/`<=>` binary → fall through to the
+///   existing cascade (which handles comparison/arith/set/quant/etc., or the
+///   prefix-single fallbacks for degenerate 1-item junctions).
+/// - `Some(Op)` for the boolean shapes we take over.
+///
+/// # Semantic-mapping evidence (read `eval_expr.rs` arms ~130-197)
+/// - `Op::IndentedAnd(parts)` and `Op::And(parts)` evaluate IDENTICALLY: both
+///   fold `&&` over the parts, short-circuiting on the first `false`. Likewise
+///   `Op::IndentedOr` and `Op::Or` both fold `||`, short-circuiting on `true`.
+///   So mapping every And-junction → `IndentedAnd` and Or-junction →
+///   `IndentedOr` is behaviour-preserving; we pick the `Indented*` variants
+///   because a v2 `Junction` is precisely the layout-grouped bulleted list.
+/// - `Op::Implies(vec![lhs, rhs])`: `eval_implies_parts` on a 2-element slice
+///   evaluates lhs; if false returns true, else evaluates rhs — exactly
+///   `lhs => rhs`. For a right-assoc chain `A => B => C`, v2 gives
+///   `Implies(A, Implies(B, C))`, so `rhs = "B => C"` and the recursive
+///   re-classify re-parses it correctly. We do NOT flatten.
+/// - `Op::Iff(vec![lhs, rhs])`: the arm folds pairwise `==`; on 2 parts that is
+///   `lhs == rhs`, i.e. the biconditional.
+///
+/// # Span-offset invariant
+/// v2 spans are byte offsets 0-based into the exact `&str` passed to
+/// `expr_v2::parse_ast` (the lexer starts `pos = 0` on `expr.as_bytes()`; see
+/// `expr_v2::lexer::Lexer::new`). So `expr[child.span.start .. child.span.end]`
+/// is the original source substring for that child. A debug assertion below
+/// guards the bounds.
+///
+/// # Cache soundness
+/// This is a pure function of `expr` (`v2_enabled()` is process-constant), so
+/// the thread-local `classify_op` cache keyed on the trimmed `expr` stays sound.
+fn classify_boolean_v2(expr: &str) -> Option<Op> {
+    use crate::tla::expr_v2::{self, ast};
+
+    if !expr_v2::v2_enabled() {
+        return None;
+    }
+    let tree = expr_v2::parse_ast(expr).ok()?;
+
+    // Take the original source substring for a child expr. Spans are 0-based
+    // byte offsets into `expr` (see the doc-comment invariant above).
+    let slice = |child: &ast::Expr| -> Option<String> {
+        let sp = child.span();
+        debug_assert!(
+            sp.start <= sp.end && sp.end <= expr.len(),
+            "expr_v2 span out of bounds for classify_boolean_v2: start={}, end={}, len={}",
+            sp.start,
+            sp.end,
+            expr.len()
+        );
+        // Defensive (release): if the span is somehow out of bounds or not a
+        // char boundary, bail to the fallback rather than panic-slicing.
+        if sp.end > expr.len() || !expr.is_char_boundary(sp.start) || !expr.is_char_boundary(sp.end)
+        {
+            return None;
+        }
+        Some(expr[sp.start..sp.end].trim().to_string())
+    };
+
+    match &tree {
+        ast::Expr::Junction { op, items, .. } => {
+            // Degenerate 1-item (or empty) junctions: fall through to the
+            // existing `*PrefixSingle` fallback, which matches the historical
+            // semantics exactly. Only take over `>= 2`-item lists.
+            if items.len() < 2 {
+                return None;
+            }
+            let mut parts = Vec::with_capacity(items.len());
+            for it in items {
+                parts.push(slice(it)?);
+            }
+            match op {
+                ast::JunctionOp::And => Some(Op::IndentedAnd(parts)),
+                ast::JunctionOp::Or => Some(Op::IndentedOr(parts)),
+            }
+        }
+        ast::Expr::Binary { op: ast::BinOp::Implies, lhs, rhs, .. } => {
+            Some(Op::Implies(vec![slice(lhs)?, slice(rhs)?]))
+        }
+        ast::Expr::Binary { op: ast::BinOp::Iff, lhs, rhs, .. } => {
+            Some(Op::Iff(vec![slice(lhs)?, slice(rhs)?]))
+        }
+        // Any other top node (comparison, arithmetic, set-op, Quant, Let, If,
+        // Not, Paren, containers, Atom) → fall through to the existing cascade.
+        _ => None,
+    }
+}
+
 /// Run the cascade once and return the chosen `Op`. Mirrors the order and
 /// predicates of the old inline cascade in `eval_expr_inner` exactly.
 ///
@@ -148,7 +248,20 @@ pub(super) fn classify_op(expr: &str) -> Op {
         }
     }
 
-    // ---- indented boolean: /\ / \/ ----
+    // ---- Phase 3: layout-aware boolean grouping via expr_v2 ----
+    //
+    // Take over ONLY the top-level boolean grouping decision (And/Or junctions,
+    // `=>`, `<=>`) using the layout-aware v2 AST. This fixes the interpreted-
+    // path twin of the Phase-2.1 MCPaxos bug where the string splitter let an
+    // indented `/\` swallow a lower-precedence `=>`. Returns `None` (→ the
+    // splitter cascade below runs unchanged) whenever v2 is disabled, the parse
+    // errors, or the top node is not a boolean shape we own. See
+    // `classify_boolean_v2` for the full mapping + semantic evidence.
+    if let Some(op) = classify_boolean_v2(expr) {
+        return op;
+    }
+
+    // ---- indented boolean: /\ / \/ (fallback: v2 disabled / parse err / non-boolean top) ----
     if expr.starts_with("/\\")
         && let Some(parts) = split_indented_top_level_boolean(expr, "/\\")
         && parts.len() > 1
@@ -406,4 +519,142 @@ pub(super) fn is_low_op(op: &Op) -> bool {
             | Op::Multiplicative { .. }
             | Op::Exp { .. }
     )
+}
+
+#[cfg(test)]
+mod phase3_boolean_tests {
+    use super::*;
+
+    // Helper: assert classify_boolean_v2 returns the expected part-slices for a
+    // given boolean top shape. Also implicitly exercises the span-offset
+    // invariant (a wrong offset would yield wrong / out-of-bounds slices, and
+    // the debug_assert in `slice` would fire under `cargo test`).
+    fn parts_of(op: &Op) -> Vec<String> {
+        match op {
+            Op::IndentedAnd(p) | Op::IndentedOr(p) | Op::Implies(p) | Op::Iff(p) => p.clone(),
+            other => panic!("unexpected op variant: {:?}", variant_name(other)),
+        }
+    }
+    fn variant_name(op: &Op) -> &'static str {
+        match op {
+            Op::IndentedAnd(_) => "IndentedAnd",
+            Op::IndentedOr(_) => "IndentedOr",
+            Op::Implies(_) => "Implies",
+            Op::Iff(_) => "Iff",
+            _ => "other",
+        }
+    }
+
+    #[test]
+    fn and_junction_maps_to_indented_and() {
+        let e = "/\\ a > 0\n/\\ b > 1";
+        let op = classify_boolean_v2(e).expect("should classify as boolean");
+        assert!(matches!(op, Op::IndentedAnd(_)));
+        assert_eq!(parts_of(&op), vec!["a > 0", "b > 1"]);
+    }
+
+    #[test]
+    fn or_junction_maps_to_indented_or() {
+        let e = "\\/ a > 0\n\\/ b > 1";
+        let op = classify_boolean_v2(e).expect("should classify as boolean");
+        assert!(matches!(op, Op::IndentedOr(_)));
+        assert_eq!(parts_of(&op), vec!["a > 0", "b > 1"]);
+    }
+
+    #[test]
+    fn implies_maps_to_two_element_implies() {
+        let e = "a > 0 => b > 1";
+        let op = classify_boolean_v2(e).expect("should classify as implies");
+        assert!(matches!(op, Op::Implies(_)));
+        assert_eq!(parts_of(&op), vec!["a > 0", "b > 1"]);
+    }
+
+    #[test]
+    fn implies_chain_is_right_assoc_two_element() {
+        // A => B => C  =>  Implies(A, "B => C") — recursion re-parses the rhs.
+        let e = "a => b => c";
+        let op = classify_boolean_v2(e).expect("should classify as implies");
+        let p = parts_of(&op);
+        assert_eq!(p.len(), 2);
+        assert_eq!(p[0], "a");
+        assert_eq!(p[1], "b => c");
+    }
+
+    #[test]
+    fn iff_maps_to_two_element_iff() {
+        let e = "a > 0 <=> b > 1";
+        let op = classify_boolean_v2(e).expect("should classify as iff");
+        assert!(matches!(op, Op::Iff(_)));
+        assert_eq!(parts_of(&op), vec!["a > 0", "b > 1"]);
+    }
+
+    #[test]
+    fn implies_looser_than_indented_and() {
+        // The interpreted-path twin of the MCPaxos bug: a bulleted /\ under a
+        // quantifier body followed by => must group as Implies(And[...], rhs),
+        // NOT let the /\ swallow the =>. v2 gives Implies at top.
+        let e = "/\\ p\n/\\ q\n=> r";
+        // Depending on layout this parses as either Implies at top or None;
+        // the key assertion is we NEVER return an IndentedAnd that swallows =>.
+        if let Some(op) = classify_boolean_v2(e) {
+            assert!(
+                matches!(op, Op::Implies(_)),
+                "must not let /\\ swallow => ; got {}",
+                variant_name(&op)
+            );
+        }
+    }
+
+    #[test]
+    fn single_item_junction_falls_through() {
+        // `\/ X` single-bullet → None so the OrPrefixSingle fallback handles it,
+        // preserving historical semantics.
+        let e = "\\/ a > 0";
+        assert!(classify_boolean_v2(e).is_none());
+    }
+
+    #[test]
+    fn non_boolean_top_falls_through() {
+        // Comparison / arithmetic / quantifier / set tops → None (existing
+        // cascade handles them).
+        assert!(classify_boolean_v2("a > 0").is_none());
+        assert!(classify_boolean_v2("a + b").is_none());
+        assert!(classify_boolean_v2("\\A x \\in S : P(x)").is_none());
+        assert!(classify_boolean_v2("{1, 2, 3}").is_none());
+        assert!(classify_boolean_v2("f[x]").is_none());
+    }
+
+    #[test]
+    fn slices_are_valid_substrings_of_input() {
+        // Span-offset invariant: every returned part is a trimmed substring of
+        // the original input (guards against off-by-one span bugs).
+        let e = "/\\ foo = bar\n/\\ baz \\in Nat";
+        let op = classify_boolean_v2(e).unwrap();
+        for part in parts_of(&op) {
+            assert!(
+                e.contains(part.trim()),
+                "part {:?} is not a substring of input {:?}",
+                part,
+                e
+            );
+        }
+    }
+
+    #[test]
+    fn respects_v1_escape_hatch() {
+        // With the v1 escape hatch set, classify_boolean_v2 must return None so
+        // the splitter cascade runs on both paths.
+        // SAFETY: single-threaded test; restore afterwards.
+        let prev = std::env::var("TLAPLUS_EXPR_PARSER").ok();
+        unsafe {
+            std::env::set_var("TLAPLUS_EXPR_PARSER", "v1");
+        }
+        assert!(classify_boolean_v2("/\\ a\n/\\ b").is_none());
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("TLAPLUS_EXPR_PARSER", v),
+                None => std::env::remove_var("TLAPLUS_EXPR_PARSER"),
+            }
+        }
+    }
 }
