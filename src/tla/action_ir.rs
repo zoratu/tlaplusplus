@@ -224,7 +224,174 @@ fn flatten_and_leaves<'a>(
                 flatten_and_leaves(it, out);
             }
         }
+        // Same-connective Paren unwrap: `(A /\ B)` is a parenthesized conjunction
+        // whose leaves are conjuncts, so descend into it. We unwrap ONLY when the
+        // inner node is itself an `And`-junction — a `Paren` wrapping a `Quant`,
+        // `Let`, `If`, `Or`-junction, `Binary`, etc. is a single conjunct leaf and
+        // must stay whole (its inner `/\`, if any, is scoped by that node). This
+        // closes the conservative `Paren(And)` case: previously `(A /\ B)` stayed
+        // one leaf; now it flattens to `A`, `B`.
+        ast::Expr::Paren { inner, .. }
+            if matches!(
+                inner.as_ref(),
+                ast::Expr::Junction { op: ast::JunctionOp::And, .. }
+            ) =>
+        {
+            flatten_and_leaves(inner, out);
+        }
         // Any non-And node is a conjunct leaf, kept whole.
+        other => out.push(other),
+    }
+}
+
+/// The 4-state result of classifying an action body for DISJUNCT splitting via
+/// expr_v2. A plain `Option<Vec<String>>` is insufficient here: a body whose
+/// root is a SCOPED node (`Let`/`If`/`\A`/`Paren`-non-Or/`Quant`) may contain an
+/// inner `\/` whose binder/branch scope spans both sides. Returning `None`
+/// (fallback) for such a body would let the blind `split_top_level(_, "\\/")`
+/// wrongly split that inner disjunction and orphan a binder or drop a guard. The
+/// 4 states let the caller distinguish "root Or → split" from "fully parsed,
+/// root is NOT a splittable Or → keep the body whole" from "genuine parse
+/// failure → let the string logic decide".
+enum DisjunctSplitV2 {
+    /// Root is an `Or`-junction and the Or layout guard passed → these are the
+    /// top-level disjuncts.
+    Split(Vec<String>),
+    /// Full parse succeeded but the root is NOT an `Or`-junction (`Quant`/`Let`/
+    /// `If`/`And`/`Binary`/`Paren`-non-Or/`Atom`/containers/…). Do NOT blind-split
+    /// on `\/`: any inner `\/` is scoped by the root node.
+    ParsedNonRootOr,
+    /// Root IS an `Or`-junction but the Or layout guard failed (inconsistent
+    /// bullet columns for a raw/mid-definition extraction). Do NOT blind-split;
+    /// keep the body whole conservatively.
+    RootOrLayoutMismatch,
+    /// Parse failed or did not fully consume the input → let the existing string
+    /// logic own the body (pre-Phase-5 behavior).
+    Fallback,
+}
+
+/// Phase 5 — classify an action body for top-level DISJUNCT splitting via the
+/// layout-aware expr_v2 AST. See `DisjunctSplitV2` for the 4-state contract.
+///
+/// Mirrors `split_action_conjuncts_v2` (Phase 4): uniform-dedent so the parser's
+/// coordinate system matches the source, `parse_ast` (full-consume == `Ok`),
+/// then an Or-fence layout guard + `flatten_or_leaves` slice extraction with the
+/// same span-safety and per-clause normalization.
+fn classify_action_disjunct_v2(expr: &str) -> DisjunctSplitV2 {
+    use crate::tla::expr_v2::{self, ast};
+
+    // TRUE uniform dedent (preserves every relative column; see `uniform_dedent`).
+    // We slice leaf spans out of exactly this `src`, so byte offsets stay valid.
+    let dedented = uniform_dedent(expr);
+    let src = dedented.trim();
+    if src.is_empty() {
+        return DisjunctSplitV2::Fallback;
+    }
+
+    // `Ok` == full consumption (trailing tokens error). Parse/lex error → fallback.
+    let Ok(tree) = expr_v2::parse_ast(src) else {
+        return DisjunctSplitV2::Fallback;
+    };
+
+    // Root gate. Any non-`Or` root is a fully-parsed scoped/leaf node: return
+    // `ParsedNonRootOr` so the caller keeps the body whole (protecting root
+    // `Let`/`If`/`\A`/`\E`/`And`/`Paren`-non-Or bodies with an inner `\/`).
+    let ast::Expr::Junction { op: ast::JunctionOp::Or, col: root_col, .. } = &tree else {
+        return DisjunctSplitV2::ParsedNonRootOr;
+    };
+
+    // OR LAYOUT-CONSISTENCY GUARD (mirrors the Phase-4 And guard). A uniform
+    // dedent preserves relative columns but cannot repair a body whose top-level
+    // bullets sit at inconsistent columns (raw / mid-definition extraction). For
+    // a MULTI-LINE body whose first logical line begins with a `\/` bullet, that
+    // bullet MUST be the root Or fence column. If it is shallower, v2's fence
+    // model does not match the layout → `RootOrLayoutMismatch` (keep whole).
+    // Single-line inline `\/` bodies have no cross-line layout: `root_col` is a
+    // mid-line bullet column, never line-1's leading-bullet column, so comparing
+    // them would spuriously reject every legitimate inline disjunction.
+    if src.contains('\n') {
+        let first_line = src.lines().next().unwrap_or("");
+        let first_trim = first_line.trim_start();
+        if first_trim.starts_with("\\/") {
+            let first_bullet_col = (first_line.len() - first_trim.len()) as u32;
+            if first_bullet_col != *root_col {
+                return DisjunctSplitV2::RootOrLayoutMismatch;
+            }
+        }
+    }
+
+    // Flatten the root `Or` into its maximal non-Or leaves.
+    let mut leaves: Vec<&ast::Expr> = Vec::new();
+    flatten_or_leaves(&tree, &mut leaves);
+    // Fewer than 2 leaves → not really a >=2-disjunct body → fallback.
+    if leaves.len() < 2 {
+        return DisjunctSplitV2::Fallback;
+    }
+
+    let mut out = Vec::with_capacity(leaves.len());
+    for leaf in leaves {
+        let sp = leaf.span();
+        // Span-safety guard: bail to fallback rather than panic-slice on an
+        // inverted / OOB / non-char-boundary span.
+        if sp.start > sp.end
+            || sp.end > src.len()
+            || !src.is_char_boundary(sp.start)
+            || !src.is_char_boundary(sp.end)
+        {
+            return DisjunctSplitV2::Fallback;
+        }
+        // Leaf spans start AFTER any leading `\/` bullet (`parse_junction`
+        // advances past the bullet before parsing the item), so the slice never
+        // includes an outer bullet. Apply the SAME per-clause normalization the
+        // fallback applies to each disjunct.
+        let raw = &src[sp.start..sp.end];
+        let clause = normalize_multiline_action_indentation(raw.trim())
+            .trim()
+            .to_string();
+        if clause.is_empty() {
+            return DisjunctSplitV2::Fallback;
+        }
+        out.push(clause);
+    }
+    if out.is_empty() {
+        return DisjunctSplitV2::Fallback;
+    }
+    DisjunctSplitV2::Split(out)
+}
+
+/// Phase 5 — recursively collect the DISJUNCT leaves of an action-body AST.
+///
+/// A disjunct is a maximal subtree whose root is NOT `Junction{Or}`. This walk
+/// unwraps nested `Junction{Or}` nodes into their children and STOPS at every
+/// other node kind — `Junction{And}` (a `\/ /\ guard /\ post` branch is ONE
+/// disjunct that CONTAINS a conjunction), `Quant`, `Let`, `If`, `Binary`,
+/// `Atom`, containers. It NEVER enters a quantifier / LET / IF / And node, so a
+/// `\/` scoped inside any of those (e.g. `\E x : A(x) \/ B(x)` — root `Quant`)
+/// is never split here.
+fn flatten_or_leaves<'a>(
+    expr: &'a crate::tla::expr_v2::ast::Expr,
+    out: &mut Vec<&'a crate::tla::expr_v2::ast::Expr>,
+) {
+    use crate::tla::expr_v2::ast;
+    match expr {
+        ast::Expr::Junction { op: ast::JunctionOp::Or, items, .. } => {
+            for it in items {
+                flatten_or_leaves(it, out);
+            }
+        }
+        // Same-connective Paren unwrap: `(A \/ B)` is a parenthesized disjunction
+        // whose leaves are disjuncts, so descend. Unwrap ONLY when the inner node
+        // is itself an `Or`-junction — a `Paren` wrapping an `And`/`Quant`/`Let`/
+        // `If`/`Binary` is a single disjunct leaf and stays whole.
+        ast::Expr::Paren { inner, .. }
+            if matches!(
+                inner.as_ref(),
+                ast::Expr::Junction { op: ast::JunctionOp::Or, .. }
+            ) =>
+        {
+            flatten_or_leaves(inner, out);
+        }
+        // Any non-Or node is a disjunct leaf, kept whole.
         other => out.push(other),
     }
 }
@@ -436,6 +603,32 @@ pub fn split_action_body_disjuncts(expr: &str) -> Vec<String> {
         return Vec::new();
     }
 
+    // ---- Phase 5: layout-aware action-DISJUNCT splitting via expr_v2 ----
+    // Compute the 4-state v2 classification ONCE up front (gated on v2_enabled).
+    //   - `Split(v)`             → return the v2 disjuncts immediately.
+    //   - `ParsedNonRootOr`      → full parse, root is a scoped/leaf node
+    //                              (`Let`/`If`/`\A`/`\E`/`And`/`Binary`/…): the
+    //                              existing string guards below give the right
+    //                              answer for the shapes they cover, and the
+    //                              blind `split_top_level(_, "\\/")` fall-through
+    //                              is REPLACED with "return the whole body as one
+    //                              disjunct" (see the guard just before it). This
+    //                              protects root `LET`/`IF`/`\A`/`Paren`-non-Or
+    //                              bodies with an inner `\/` that the string
+    //                              guards don't cover.
+    //   - `RootOrLayoutMismatch` → same conservative protection (whole body).
+    //   - `Fallback`             → parse genuinely failed: pre-Phase-5 behavior,
+    //                              the string logic (incl. the final blind split)
+    //                              owns the body unchanged.
+    let disjunct_v2 = if crate::tla::expr_v2::v2_enabled() {
+        classify_action_disjunct_v2(trimmed)
+    } else {
+        DisjunctSplitV2::Fallback
+    };
+    if let DisjunctSplitV2::Split(clauses) = &disjunct_v2 {
+        return clauses.clone();
+    }
+
     if split_outer_let(trimmed).is_some() {
         if let Some(disjuncts) = split_outer_let_body_disjuncts(trimmed) {
             return disjuncts;
@@ -544,6 +737,23 @@ pub fn split_action_body_disjuncts(expr: &str) -> Vec<String> {
         if is_quantified {
             return vec![trimmed.to_string()];
         }
+    }
+
+    // Phase 5 — IMMEDIATELY before the blind `split_top_level(_, "\\/")`: if v2
+    // fully parsed the body and its root is NOT a splittable top-level `Or`
+    // (`ParsedNonRootOr`), OR the root was an `Or` whose layout guard failed
+    // (`RootOrLayoutMismatch`), do NOT blind-split — return the WHOLE body as one
+    // disjunct. This protects root `LET d == e IN A \/ B`, `IF c THEN A \/ B ELSE
+    // D`, `\A x : A(x) \/ B(x)`, `\E`-scoped and `Paren`-non-Or bodies whose
+    // inner `\/` the string guards above do not cover; the inner disjunction is
+    // expanded downstream with its binder/branch scope intact. Only a `Fallback`
+    // (genuine v2 parse failure) reaches the blind split with pre-Phase-5
+    // behavior. `Split` already returned at the top of the function.
+    if matches!(
+        disjunct_v2,
+        DisjunctSplitV2::ParsedNonRootOr | DisjunctSplitV2::RootOrLayoutMismatch
+    ) {
+        return vec![trimmed.to_string()];
     }
 
     split_top_level(trimmed, "\\/")
@@ -2638,5 +2848,200 @@ mod tests {
         // preserving the relative offset of the deeper continuation.
         let input = "    /\\ A\n        /\\ B";
         assert_eq!(uniform_dedent(input), "/\\ A\n    /\\ B");
+    }
+
+    // ---- Phase 5: classify_action_disjunct_v2 (expr_v2 action-DISJUNCT split) ----
+
+    // Small matchers to keep the 4-state assertions terse.
+    fn disj_v2_is_parsed_non_root_or(expr: &str) -> bool {
+        matches!(classify_action_disjunct_v2(expr), DisjunctSplitV2::ParsedNonRootOr)
+    }
+    fn disj_v2_split(expr: &str) -> Option<Vec<String>> {
+        match classify_action_disjunct_v2(expr) {
+            DisjunctSplitV2::Split(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn v2_disj_bare_root_or_splits_three() {
+        // `\/ A \/ B \/ C` → root Or → 3 disjuncts via v2.
+        let body = "\\/ A\n\\/ B\n\\/ C";
+        let parts = disj_v2_split(body).expect("root should be an Or junction");
+        assert_eq!(parts, vec!["A".to_string(), "B".to_string(), "C".to_string()]);
+        // End-to-end through the wired entry.
+        assert_eq!(split_action_body_disjuncts(body), vec!["A", "B", "C"]);
+    }
+
+    #[test]
+    fn v2_disj_inline_root_or_splits() {
+        // Single-line inline `A \/ B \/ C` → root Or, no layout guard reject.
+        let body = "A \\/ B \\/ C";
+        let parts = disj_v2_split(body).expect("root should be an Or junction");
+        assert_eq!(parts, vec!["A".to_string(), "B".to_string(), "C".to_string()]);
+    }
+
+    #[test]
+    fn v2_disj_nested_exists_is_parsed_non_root_or() {
+        // Lamport-mutex nested exists: root is `Quant` → ParsedNonRootOr → NOT
+        // split by v2. The existing `\E` path keeps the inner `q` in scope.
+        let body = "\\E p \\in P : \\E q \\in Q : A(p, q) \\/ B(p, q)";
+        assert!(disj_v2_is_parsed_non_root_or(body));
+        // End-to-end: nested-quantifier guard keeps it whole (binder not orphaned).
+        let out = split_action_body_disjuncts(body);
+        assert_eq!(out.len(), 1, "nested \\E must stay one disjunct: {out:#?}");
+        assert!(out[0].starts_with("\\E p \\in P"));
+    }
+
+    #[test]
+    fn v2_disj_bare_exists_is_parsed_non_root_or() {
+        // `\E x \in S : A(x) \/ B(x)` → root Quant → ParsedNonRootOr. The
+        // existing `\E`-prefix-repeat path gives 2 branches each with `x`.
+        let body = "\\E x \\in S : A(x) \\/ B(x)";
+        assert!(disj_v2_is_parsed_non_root_or(body));
+        let out = split_action_body_disjuncts(body);
+        assert_eq!(out.len(), 2, "expected 2 \\E-prefixed branches: {out:#?}");
+        assert!(out[0].starts_with("\\E x \\in S") && out[0].contains("A(x)"));
+        assert!(out[1].starts_with("\\E x \\in S") && out[1].contains("B(x)"));
+    }
+
+    #[test]
+    fn v2_disj_conjunction_root_stays_whole() {
+        // `/\ guard /\ \/ A \/ B /\ post` → root And → ParsedNonRootOr → guard #3
+        // (`/\`-conjunction) keeps it ONE action (the inner `\/` is one conjunct).
+        let body = "/\\ guard\n/\\ \\/ A\n   \\/ B\n/\\ post";
+        assert!(disj_v2_is_parsed_non_root_or(body));
+        let out = split_action_body_disjuncts(body);
+        assert_eq!(out.len(), 1, "conjunction must stay one action: {out:#?}");
+    }
+
+    #[test]
+    fn v2_disj_root_let_with_inner_or_stays_whole() {
+        // root `LET d == e IN A \/ B` → root Let → ParsedNonRootOr → whole. The
+        // `A \/ B` is the LET IN-body and must NOT be blind-split (the string
+        // guards do NOT cover this; the ParsedNonRootOr protection is what saves
+        // it — pre-Phase-5, `split_top_level` would split on the inner `\/`).
+        let body = "LET d == e IN A \\/ B";
+        assert!(disj_v2_is_parsed_non_root_or(body));
+        let out = split_action_body_disjuncts(body);
+        assert_eq!(out.len(), 1, "root LET must stay one disjunct: {out:#?}");
+        assert!(out[0].starts_with("LET d == e IN"));
+        assert!(out[0].contains("A \\/ B"));
+    }
+
+    #[test]
+    fn v2_disj_root_if_with_inner_or_stays_whole() {
+        // root `IF c THEN A \/ B ELSE D` → root If → ParsedNonRootOr → whole.
+        let body = "IF c THEN A \\/ B ELSE D";
+        assert!(disj_v2_is_parsed_non_root_or(body));
+        let out = split_action_body_disjuncts(body);
+        assert_eq!(out.len(), 1, "root IF must stay one disjunct: {out:#?}");
+        assert!(out[0].starts_with("IF c THEN"));
+    }
+
+    #[test]
+    fn v2_disj_root_forall_with_inner_or_stays_whole() {
+        // `\A x \in S : A(x) \/ B(x)` → root Quant(\A) → ParsedNonRootOr → whole.
+        let body = "\\A x \\in S : A(x) \\/ B(x)";
+        assert!(disj_v2_is_parsed_non_root_or(body));
+        let out = split_action_body_disjuncts(body);
+        assert_eq!(out.len(), 1, "root \\A must stay one disjunct: {out:#?}");
+        assert!(out[0].starts_with("\\A x \\in S"));
+    }
+
+    #[test]
+    fn v2_disj_paren_or_unwraps() {
+        // `(A \/ B)` → root Paren(Or) → v2 unwraps → 2 disjuncts.
+        let body = "(A \\/ B)";
+        let parts = disj_v2_split(body).expect("Paren(Or) should unwrap to an Or root");
+        assert_eq!(parts, vec!["A".to_string(), "B".to_string()]);
+    }
+
+    #[test]
+    fn v2_disj_paren_and_stays_one_disjunct() {
+        // `(A /\ B)` → root Paren(And) → ParsedNonRootOr (Paren-non-Or) → the
+        // flatten_or Paren unwrap is same-connective ONLY, so this stays whole.
+        let body = "(A /\\ B)";
+        assert!(disj_v2_is_parsed_non_root_or(body));
+    }
+
+    #[test]
+    fn v2_flatten_and_paren_and_unwraps_conjuncts() {
+        // Phase-4 improvement: `(A /\ B)` as a conjunct-flatten root now unwraps
+        // to two conjuncts. `flatten_and_leaves` unwraps Paren ONLY when inner is
+        // an And-junction.
+        use crate::tla::expr_v2;
+        let tree = expr_v2::parse_ast("(A /\\ B)").expect("parse");
+        let mut leaves = Vec::new();
+        flatten_and_leaves(&tree, &mut leaves);
+        assert_eq!(leaves.len(), 2, "Paren(And) must flatten to two conjunct leaves");
+    }
+
+    #[test]
+    fn v2_flatten_or_paren_or_unwraps_disjuncts() {
+        use crate::tla::expr_v2;
+        let tree = expr_v2::parse_ast("(A \\/ B)").expect("parse");
+        let mut leaves = Vec::new();
+        flatten_or_leaves(&tree, &mut leaves);
+        assert_eq!(leaves.len(), 2, "Paren(Or) must flatten to two disjunct leaves");
+    }
+
+    #[test]
+    fn v2_flatten_or_paren_and_stays_one_leaf() {
+        // A Paren(And) inside an Or-flatten is NOT same-connective → one leaf.
+        use crate::tla::expr_v2;
+        let tree = expr_v2::parse_ast("(A /\\ B) \\/ C").expect("parse");
+        let mut leaves = Vec::new();
+        flatten_or_leaves(&tree, &mut leaves);
+        assert_eq!(leaves.len(), 2, "expected [(A /\\ B), C]: {}", leaves.len());
+    }
+
+    #[test]
+    fn v2_disj_branch_with_conjunction_stays_one_disjunct() {
+        // `\/ /\ guard /\ x' = 1  \/ /\ ~guard /\ x' = 2` — each `\/` branch is a
+        // conjunction (root And under the Or), so flatten_or STOPS at each And →
+        // 2 disjuncts, each containing its full conjunction (guard NOT dropped).
+        let body = "\\/ /\\ guard\n   /\\ x' = 1\n\\/ /\\ ~guard\n   /\\ x' = 2";
+        let parts = disj_v2_split(body).expect("root should be an Or junction");
+        assert_eq!(parts.len(), 2, "expected 2 conjunctive disjuncts: {parts:#?}");
+        assert!(parts[0].contains("guard") && parts[0].contains("x' = 1"));
+        assert!(parts[1].contains("~guard") && parts[1].contains("x' = 2"));
+    }
+
+    #[test]
+    fn v2_disj_nanoblockchain_process_block_stays_whole() {
+        // `/\ \E block \in S : /\ \/ A(block) \/ B(block) /\ post` → root And →
+        // ParsedNonRootOr → the `/\`-conjunction / single-\E-conjunct guards keep
+        // it ONE disjunct (binder `block` in scope over the inner `\/`).
+        let body = "/\\ \\E block \\in S :\n\
+                    \x20      /\\ \\/ A(block)\n\
+                    \x20         \\/ B(block)\n\
+                    \x20      /\\ post(block)";
+        assert!(disj_v2_is_parsed_non_root_or(body));
+        let out = split_action_body_disjuncts(body);
+        assert_eq!(out.len(), 1, "ProcessBlock shape must stay one disjunct: {out:#?}");
+    }
+
+    #[test]
+    fn v2_disj_conjunction_led_disjunction_prefix_still_works() {
+        // `/\ \/ A \/ B` (a `/\`-led body whose sole conjunct is a disjunction)
+        // routes via the `strip_prefix("/\\")` branch. root here (after strip) is
+        // an Or; ensure the v2 classification of the FULL `/\ \/`-body is a
+        // consistent And root → ParsedNonRootOr (kept whole is wrong here, but the
+        // dedicated `/\ \/` strip branch runs BEFORE the whole-body protection).
+        let body = "/\\ \\/ A\n   \\/ B";
+        let out = split_action_body_disjuncts(body);
+        assert_eq!(out.len(), 2, "leading /\\ over a bare \\/ splits into 2: {out:#?}");
+    }
+
+    #[test]
+    fn v2_disj_falls_back_on_parse_error() {
+        // Unterminated block comment → lex error → Fallback → the string path
+        // (blind split reachable). Just assert the classification is Fallback.
+        let body = "\\/ A (* unterminated \\/ B";
+        assert!(matches!(
+            classify_action_disjunct_v2(body),
+            DisjunctSplitV2::Fallback
+        ));
     }
 }
