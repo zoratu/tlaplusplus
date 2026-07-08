@@ -42,9 +42,39 @@ pub fn parse_ast(expr: &str) -> Result<Expr, String> {
 /// once per call; cheap enough for the compile path (compilation is not on the
 /// hot eval loop).
 pub fn v2_enabled() -> bool {
-    match std::env::var("TLAPLUS_EXPR_PARSER") {
-        Ok(v) if v.eq_ignore_ascii_case("v1") || v.eq_ignore_ascii_case("off") => false,
+    v2_enabled_for(std::env::var("TLAPLUS_EXPR_PARSER").ok().as_deref())
+}
+
+/// Pure config decision underneath the env layer: maps the raw
+/// `TLAPLUS_EXPR_PARSER` value (`None` when unset) to the enabled bool. v2 is
+/// disabled only for an explicit `v1`/`off` (case-insensitive); every other
+/// value — including `None` and `v2` — enables it. Factored out so the decision
+/// can be unit-tested without mutating the process-global env (which is
+/// `unsafe` and parallel-racy under the default test harness).
+pub fn v2_enabled_for(value: Option<&str>) -> bool {
+    match value {
+        Some(v) if v.eq_ignore_ascii_case("v1") || v.eq_ignore_ascii_case("off") => false,
         _ => true,
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::v2_enabled_for;
+
+    #[test]
+    fn v1_and_off_disable_case_insensitively() {
+        for v in ["v1", "V1", "off", "OFF", "Off"] {
+            assert!(!v2_enabled_for(Some(v)), "{v} should disable v2");
+        }
+    }
+
+    #[test]
+    fn unset_and_other_values_enable() {
+        assert!(v2_enabled_for(None));
+        assert!(v2_enabled_for(Some("v2")));
+        assert!(v2_enabled_for(Some("")));
+        assert!(v2_enabled_for(Some("anything")));
     }
 }
 
