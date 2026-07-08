@@ -163,6 +163,38 @@ fn three_siblings_split() {
     assert_eq!(s, "AND[Atom(\"A\"), Atom(\"B\"), Atom(\"C\")]");
 }
 
+// --- Regression (Bug 1, MCPaxosTiny `Inv`): a bulleted junction that is the
+// ANTECEDENT of a new-line `=>` at the bullet column groups the WHOLE junction
+// as the antecedent, matching TLA+ precedence (`=>` looser than `/\`). The
+// Paxos inductive invariant contains `\A mm : /\ P /\ Q => R`; mis-grouping it
+// as `/\ P /\ (Q => R)` flips the invariant and yields a false-positive
+// violation. See `should_stop`. ---
+#[test]
+fn junction_antecedent_of_newline_implies() {
+    // `/\ A /\ B` then a `=>` on its own line at the bullet column (col 0):
+    // the antecedent is `A /\ B`, NOT just `B`.
+    let s = shape("/\\ A\n/\\ B\n=> C");
+    assert_eq!(s, "Implies(AND[Atom(\"A\"), Atom(\"B\")], Atom(\"C\"))");
+}
+
+// The exact Paxos `Inv` sub-shape: `\A mm \in S : /\ P\n /\ Q\n => R`.
+// Must lower to `Forall(mm : Implies(And[P, Q], R))`, matching TLC.
+#[test]
+fn paxos_inv_forall_junction_antecedent() {
+    let src = "\
+\\A mm \\in msgs : /\\ mm.type = \"2a\"
+                 /\\ mm.bal = m.bal
+                 => mm.val = m.val";
+    let s = shape(src);
+    // The `=>` at the bullet column has the whole `/\` junction as antecedent.
+    // Correct grouping starts `Forall(... : Implies(AND[...`.
+    // The mis-grouped shape would instead start `Forall(... : AND[...`.
+    assert!(
+        s.starts_with("Forall(mm\\in Atom(\"msgs\") : Implies(AND["),
+        "expected junction as antecedent, got: {s}"
+    );
+}
+
 // --- Regression: => is right-associative ---
 #[test]
 fn implies_right_assoc() {

@@ -75,6 +75,12 @@ pub struct Parser<'a> {
     /// beyond this index while it is set. Used to bound a LET binding value to
     /// the start of the next binding without heuristics. `usize::MAX` = none.
     barrier: usize,
+    /// Current recursive-descent nesting depth (incremented on every
+    /// `parse_expr` entry). Bounds recursion so a pathologically deep input
+    /// (e.g. 280-level nested `IF`/parens) returns an Err → v1 fallback rather
+    /// than overflowing the thread stack. v1 then applies its own
+    /// `MAX_DEPTH` guard and reports a graceful depth error.
+    depth: usize,
 }
 
 type PResult<T> = Result<T, String>;
@@ -86,6 +92,7 @@ impl<'a> Parser<'a> {
             toks,
             pos: 0,
             barrier: usize::MAX,
+            depth: 0,
         }
     }
 
@@ -135,6 +142,28 @@ impl<'a> Parser<'a> {
             {
                 return true;
             }
+            // A new-line => / <=> at or to the LEFT of the junction's bullet
+            // column is the LOOSER logical operator whose antecedent is the
+            // WHOLE junction (in TLA+, => and <=> bind looser than /\ and \/).
+            // It must terminate the current junction ITEM so the item does not
+            // swallow it, letting the enclosing expression consume the
+            // operator with the finished junction as its antecedent. Without
+            // this, a layout like
+            //     /\ A
+            //     /\ B
+            //     => C
+            // (the Paxos Inv `\A mm : /\ P /\ Q => R` shape) is mis-grouped
+            // as And[A, Implies(B, C)] instead of Implies(And[A, B], C), which
+            // flips the invariant's truth value (MCPaxosTiny false-positive).
+            // An INLINE => (same line as the item head, e.g. `/\ P => X`) has
+            // had_newline_before == false and is NOT fenced here: it
+            // legitimately belongs to the item.
+            if matches!(t.kind, Tok::Implies | Tok::Iff)
+                && t.had_newline_before
+                && t.span.start_col <= col
+            {
+                return true;
+            }
         }
         false
     }
@@ -163,7 +192,26 @@ impl<'a> Parser<'a> {
     /// collapse an empty junction item to its neighbor. Both are wrong parses, so
     /// we return an error which triggers the v2→v1 fallback rather than producing
     /// a silently-wrong `CompiledExpr`.
+    /// Recursion-depth ceiling for the v2 recursive-descent parser. Kept
+    /// comfortably below v1's `MAX_DEPTH` (256) AND below the point at which
+    /// the default 2 MiB thread stack overflows, so deeply nested input
+    /// (e.g. `compiler_helper_coverage_t207g`'s 280-level nested `IF` chains)
+    /// yields an Err → v1 fallback, where v1's own guard reports a graceful
+    /// recursion-depth error instead of aborting on a stack overflow.
+    const MAX_DEPTH: usize = 200;
+
     fn parse_expr(&mut self, stop: &Stop) -> PResult<Expr> {
+        self.depth += 1;
+        if self.depth > Self::MAX_DEPTH {
+            self.depth -= 1;
+            return Err("v2 recursion depth exceeded → v1".to_string());
+        }
+        let r = self.parse_expr_inner(stop);
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_expr_inner(&mut self, stop: &Stop) -> PResult<Expr> {
         if self.should_stop(stop) {
             return Err(format!(
                 "empty sub-expression at fence (token {:?})",
@@ -2086,6 +2134,14 @@ mod hard_terms_invariant_tests {
     /// CASE arm results at `=>`/`<=>`, mangling nested implications. This test
     /// asserts the `with_hard` guard rejects those tokens (fails in debug via the
     /// `debug_assert!`), and that legitimate delimiters are accepted.
+    // NOTE: these two tests assert the `debug_assert!` in `with_hard` fires.
+    // `debug_assert!` is compiled out in release builds, so the panic never
+    // happens under `cargo test --release` and a `#[should_panic]` test would
+    // FAIL there. Gate them on `debug_assertions` so they only run in debug
+    // builds where the assert is live. The invariant itself stays guarded by
+    // the `debug_assert!` (and by `top_hard_terms_are_delimiter_only` +
+    // `with_hard_accepts_delimiters`, which run in every profile).
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "delimiter-only")]
     fn with_hard_rejects_implies() {
@@ -2093,6 +2149,7 @@ mod hard_terms_invariant_tests {
         let _ = Stop::top().with_hard(&[Tok::Implies]);
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "delimiter-only")]
     fn with_hard_rejects_iff() {
