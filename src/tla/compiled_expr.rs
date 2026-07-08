@@ -941,11 +941,11 @@ fn dedent_common(expr: &str) -> String {
 
 /// Public expression compiler.
 ///
-/// By default this is the original string-based compiler (`compile_expr_v1`).
-/// When the `TLAPLUS_EXPR_PARSER=v2` env flag is set, we route through the new
-/// layout-aware `expr_v2` parser and fall back to v1 on ANY v2 parse error, so
-/// enabling the flag can never make an expression fail to compile that used to.
-/// DEFAULT OFF — no behavioral change unless the flag is explicitly set.
+/// As of Phase 2 the DEFAULT path routes through the layout-aware `expr_v2`
+/// parser, falling back to the original string-based compiler (`compile_expr_v1`)
+/// on ANY v2 parse error, so v2 can never make an expression fail to compile
+/// that used to. The v2 path is disabled only when `TLAPLUS_EXPR_PARSER=v1`
+/// (or `=off`) is explicitly set — the rollback escape hatch.
 pub fn compile_expr(expr: &str) -> CompiledExpr {
     if crate::tla::expr_v2::v2_enabled() {
         if let Ok(compiled) = crate::tla::expr_v2::parse_and_lower(expr) {

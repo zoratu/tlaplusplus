@@ -35,6 +35,18 @@ impl Stop {
     }
 
     fn with_hard(&self, extra: &[Tok]) -> Self {
+        // INVARIANT (Codex residual): `hard_terms` must stay delimiter-only.
+        // `Tok::Implies`/`Tok::Iff` must NEVER become hard terminators — if they
+        // did, `case_boundary_at` (which slices CASE arm results at hard terms)
+        // would wrongly cut arm bodies at `=>`/`<=>`, mangling nested implications.
+        // These operators are handled structurally by the Pratt parser, never as
+        // stops. This guard makes any future violation fail loudly in debug/test.
+        debug_assert!(
+            !extra.iter().any(|t| matches!(t, Tok::Implies | Tok::Iff)),
+            "Stop.hard_terms must be delimiter-only: refusing to add \
+             Tok::Implies/Tok::Iff as a hard terminator (would break \
+             case_boundary_at CASE-arm slicing)"
+        );
         let mut hard = self.hard_terms.clone();
         for e in extra {
             if !hard.contains(e) {
@@ -2063,4 +2075,57 @@ pub fn parse(src: &str) -> PResult<Expr> {
     }
     let mut p = Parser::new(src, toks);
     p.parse_expr_top()
+}
+
+#[cfg(test)]
+mod hard_terms_invariant_tests {
+    use super::*;
+
+    /// The `Stop.hard_terms` set must stay delimiter-only: adding `Tok::Implies`
+    /// or `Tok::Iff` as a hard terminator would make `case_boundary_at` slice
+    /// CASE arm results at `=>`/`<=>`, mangling nested implications. This test
+    /// asserts the `with_hard` guard rejects those tokens (fails in debug via the
+    /// `debug_assert!`), and that legitimate delimiters are accepted.
+    #[test]
+    #[should_panic(expected = "delimiter-only")]
+    fn with_hard_rejects_implies() {
+        // Should trip the debug_assert in `with_hard`.
+        let _ = Stop::top().with_hard(&[Tok::Implies]);
+    }
+
+    #[test]
+    #[should_panic(expected = "delimiter-only")]
+    fn with_hard_rejects_iff() {
+        let _ = Stop::top().with_hard(&[Tok::Iff]);
+    }
+
+    #[test]
+    fn with_hard_accepts_delimiters() {
+        // Sanity: real delimiters used across the parser are all fine.
+        let s = Stop::top().with_hard(&[
+            Tok::Then,
+            Tok::Else,
+            Tok::In,
+            Tok::Colon,
+            Tok::Comma,
+            Tok::RParen,
+        ]);
+        assert!(s.hard_terms.contains(&Tok::Then));
+        assert!(s.hard_terms.contains(&Tok::In));
+        // And the invariant holds: no Implies/Iff ever present.
+        assert!(!s
+            .hard_terms
+            .iter()
+            .any(|t| matches!(t, Tok::Implies | Tok::Iff)));
+    }
+
+    /// Static guard: no `Stop` built from `top()` starts with a forbidden term.
+    #[test]
+    fn top_hard_terms_are_delimiter_only() {
+        let s = Stop::top();
+        assert!(!s
+            .hard_terms
+            .iter()
+            .any(|t| matches!(t, Tok::Implies | Tok::Iff)));
+    }
 }

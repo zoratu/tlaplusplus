@@ -4,10 +4,10 @@
 //! hand-written recursive-descent + Pratt parser owning a layout-fence stack →
 //! ExprAst (with spans + explicit Junction nodes) → lower to CompiledExpr`.
 //!
-//! Phase 0 is ADDITIVE and FLAG-GATED. The new parser only runs when
-//! `TLAPLUS_EXPR_PARSER=v2` is set (falling back to the old parser on any parse
-//! error), or in tests / the shadow-compare harness. It changes NO default
-//! behavior.
+//! As of Phase 2 the v2 parser is the DEFAULT parsing path. It runs unless
+//! `TLAPLUS_EXPR_PARSER=v1` (or `=off`) is explicitly set, and it always falls
+//! back to the old parser on any parse error, so it can never make an
+//! expression fail to compile that used to. The env var is the rollback lever.
 //!
 //! What v2 owns STRUCTURALLY: `/\`/`\/` bulleted junctions, `=>`/`<=>`,
 //! `\A`/`\E`, `LET .. IN ..`, `IF .. THEN .. ELSE ..`, and the Pratt binary /
@@ -35,12 +35,17 @@ pub fn parse_ast(expr: &str) -> Result<Expr, String> {
     parser::parse(expr)
 }
 
-/// True iff the `TLAPLUS_EXPR_PARSER=v2` env flag is set. Read once per call;
-/// cheap enough for the compile path (compilation is not on the hot eval loop).
+/// True iff the layout-aware v2 parser should run. As of Phase 2 this is the
+/// DEFAULT (returns `true`); v2 is disabled only when `TLAPLUS_EXPR_PARSER` is
+/// explicitly set to `v1` or `off` (case-insensitive), which is the rollback
+/// escape hatch. Any other value (including unset or `v2`) enables v2. Read
+/// once per call; cheap enough for the compile path (compilation is not on the
+/// hot eval loop).
 pub fn v2_enabled() -> bool {
-    std::env::var("TLAPLUS_EXPR_PARSER")
-        .map(|v| v.eq_ignore_ascii_case("v2"))
-        .unwrap_or(false)
+    match std::env::var("TLAPLUS_EXPR_PARSER") {
+        Ok(v) if v.eq_ignore_ascii_case("v1") || v.eq_ignore_ascii_case("off") => false,
+        _ => true,
+    }
 }
 
 #[cfg(test)]
