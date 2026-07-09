@@ -190,18 +190,37 @@ fn classify_boolean_v2(expr: &str) -> Option<Op> {
     // bullet, return None and fall back to the v1 cascade. Always sound: a body
     // whose first logical token is `\/` is never a top-level `/\` (and vice
     // versa). Mirrors the `action_ir.rs` disjunction-body guard.
+    //
+    // NARROWED (2026-07, MCBakery under-exploration): the guard must fire ONLY
+    // for the actual mis-parse it targets — a v2 top that is a junction of the
+    // OPPOSITE polarity to the leading bullet (`\/`-led body parsed as top-`AND`,
+    // or vice versa). It must NOT fire when the v2 top is a looser binary
+    // (`=>`/`<=>`). In TLA+ `=>`/`<=>` bind LOOSER than `/\`/`\/`, so a body like
+    //     /\ /\ (pc[i] = "w2")
+    //        /\ \/ ...
+    //        => max[nxt[i]] >= num[i]
+    // legitimately LEADS with `/\` but its top operator is `=>`; the leading `/\`
+    // block is the antecedent. The old guard rejected this (v2 top = Implies !=
+    // matching junction) and fell back to v1's string cascade, which shreds the
+    // `=>` and drops the antecedent — MCBakery under-explored ~110x (5,388 vs TLC
+    // 655,200) by rejecting the vacuously-true implication on all-`ncs` states.
+    // v2's layout-aware `Implies(And[...], rhs)` is the CORRECT grouping, so we
+    // keep it. We still reject an opposite-polarity JUNCTION top (SingleLaneBridge).
     {
         let lead = expr.trim_start();
         let leads_with_or = lead.starts_with("\\/");
         let leads_with_and = lead.starts_with("/\\");
         if leads_with_or || leads_with_and {
-            let v2_top_matches = matches!(
+            // Only an opposite-polarity *junction* top is the SingleLaneBridge
+            // mis-parse. A top-level `=>`/`<=>` (or matching-polarity junction) is
+            // a legitimate looser/aligned grouping — keep it.
+            let v2_top_opposite_junction = matches!(
                 &tree,
                 ast::Expr::Junction { op, .. }
-                    if (leads_with_or && *op == ast::JunctionOp::Or)
-                        || (leads_with_and && *op == ast::JunctionOp::And)
+                    if (leads_with_or && *op == ast::JunctionOp::And)
+                        || (leads_with_and && *op == ast::JunctionOp::Or)
             );
-            if !v2_top_matches {
+            if v2_top_opposite_junction {
                 return None;
             }
         }
@@ -782,6 +801,43 @@ mod phase3_boolean_tests {
         assert!(
             matches!(&op, Op::IndentedOr(_) | Op::Or(_)),
             "aligned \\/-junction wrongly classified as {}",
+            variant_name(&op)
+        );
+    }
+
+    // ===== Regression (MCBakery `IInv` conjunct 7, `=>` looser than `/\`) =====
+    // A body that LEADS with `/\` but whose top operator is `=>` (the leading
+    // `/\` block is the antecedent) must classify as `Op::Implies`, NOT be
+    // rejected by the leading-bullet guard back to the v1 string cascade (which
+    // shreds the `=>` and drops the antecedent). This is the MCBakery ~110x
+    // under-exploration: on an all-`ncs` state the antecedent is false so the
+    // implication is vacuously TRUE, but the shredded form REJECTED the state.
+    #[test]
+    fn leading_and_block_with_implies_classifies_as_implies() {
+        // The exact conjunct-7 shape (leading `/\ /\ ...` antecedent, `=>` at the
+        // inner bullet column, consequent on the same line).
+        let body = "/\\ /\\ (pc[i] = \"w2\")\n   /\\ \\/ (pc[nxt[i]] = \"e2\") /\\ (i \\notin unchecked[nxt[i]])\n      \\/ pc[nxt[i]] = \"e3\"\n   => max[nxt[i]] >= num[i]";
+        let op = classify_op(body);
+        assert!(
+            matches!(&op, Op::Implies(_)),
+            "leading-/\\ block with top-level => must be Op::Implies, got {}",
+            variant_name(&op)
+        );
+        if let Op::Implies(p) = &op {
+            assert_eq!(p.len(), 2, "implies must have antecedent + consequent");
+            // Antecedent is the whole leading /\ block; consequent is the >= term.
+            assert!(p[0].contains("pc[i]"), "antecedent lost: {p:?}");
+            assert!(p[1].contains("max[nxt[i]]"), "consequent lost: {p:?}");
+        }
+    }
+
+    // Minimal single-line form of the same precedence rule.
+    #[test]
+    fn inline_and_block_implies_is_implies() {
+        let op = classify_op("/\\ A /\\ B => C");
+        assert!(
+            matches!(&op, Op::Implies(_)),
+            "`/\\ A /\\ B => C` must be Op::Implies((A/\\B), C), got {}",
             variant_name(&op)
         );
     }

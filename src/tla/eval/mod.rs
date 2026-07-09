@@ -580,6 +580,45 @@ mod tests {
         );
     }
 
+    /// Regression (MCBakery `IInv` conjunct 7): a `\A`-body implication whose
+    /// antecedent is a leading `/\` block — `\A i : /\ /\ A /\ B => C` — must be
+    /// grouped as `Implies((A /\ B), C)`, so a FALSE antecedent makes it
+    /// vacuously TRUE (NOT reject the state). Before the guard narrowing, the
+    /// leading-`/\` guard rejected v2's correct `Implies` grouping and fell back
+    /// to the v1 string cascade, which shredded the `=>` and treated the leading
+    /// `/\` conjuncts as REQUIRED — under-exploring MCBakery ~110x by rejecting
+    /// vacuously-true implications on all-`ncs` states.
+    #[test]
+    fn forall_body_implication_with_false_and_antecedent_is_vacuously_true() {
+        let state = tla_state([]);
+        let ctx = EvalContext::new(&state);
+        // Antecedent `FALSE /\ TRUE` is false → implication vacuously TRUE.
+        let vacuous = "\\A i \\in {1} : /\\ /\\ FALSE\n                     /\\ TRUE\n                     => FALSE";
+        assert_eq!(
+            eval_expr(vacuous, &ctx).expect("vacuous implication should eval"),
+            TlaValue::Bool(true),
+            "false-antecedent implication under \\A must be vacuously TRUE"
+        );
+        // Single-line form of the same shape.
+        assert_eq!(
+            eval_expr("\\A i \\in {1} : /\\ FALSE /\\ TRUE => FALSE", &ctx).unwrap(),
+            TlaValue::Bool(true)
+        );
+        // Sanity: with a TRUE antecedent, the consequent is REQUIRED (so a false
+        // consequent makes the whole thing false — the antecedent is not dropped).
+        assert_eq!(
+            eval_expr("\\A i \\in {1} : /\\ TRUE /\\ TRUE => FALSE", &ctx).unwrap(),
+            TlaValue::Bool(false),
+            "true-antecedent implication must still require the consequent"
+        );
+        // And a genuine (non-implication) conjunction still requires both.
+        assert_eq!(
+            eval_expr("\\A i \\in {1} : /\\ TRUE /\\ FALSE", &ctx).unwrap(),
+            TlaValue::Bool(false),
+            "plain /\\ conjunction must require every conjunct"
+        );
+    }
+
     #[test]
     fn normalizes_binder_and_higher_order_param_names() {
         assert_eq!(normalize_param_name("leader \\in Node"), "leader");
