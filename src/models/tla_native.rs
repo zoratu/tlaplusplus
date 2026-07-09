@@ -1934,27 +1934,29 @@ fn expand_state_predicate_clauses(
 }
 
 /// Returns `true` iff the state-predicate expander must NOT split `clause` on
-/// top-level `/\` — because expr_v2 CONFIDENTLY reports that the `/\` tokens are
-/// NOT a genuine top-level conjunction but live inside a LOOSER / non-`And`
-/// construct.
+/// top-level `/\` — because expr_v2 CONFIDENTLY reports that `clause` is rooted
+/// in a top-level `=>`/`<=>` whose `/\` tokens live inside the ANTECEDENT,
+/// not a genuine top-level conjunction.
 ///
-/// The naive `split_top_level(_, "/\\")` ignores operator precedence and
-/// structure. Two shapes it mis-splits, both fixed here:
+/// The naive `split_top_level(_, "/\\")` ignores operator precedence. The one
+/// shape this guard fixes:
 ///   - `/\ A /\ B => C` — root `=>`/`<=>` (LOOSER than `/\`), so the `/\` bullets
 ///     are inside the implication ANTECEDENT `(A /\ B)`. Splitting turns the
-///     leading `/\ A` into a spurious REQUIRED conjunct.
-///   - `\A i \in S : /\ A /\ B` — root quantifier, so the `/\` bullets are the
-///     quantifier BODY. Splitting strands the `\A i \in S :` head from its body
-///     conjuncts and makes each body conjunct a top-level requirement.
-/// Both are the MCBakery `IInv` under-exploration (TLC 655,200 vs ours 5,388).
+///     leading `/\ A` into a spurious REQUIRED conjunct, so an inductive-
+///     invariant-as-Init predicate rejects nearly all valid initial states.
 ///
-/// Rule: split ONLY when v2 confidently parses the clause AND its ROOT is a
-/// `Junction{And}` (a genuine top-level conjunction). Any OTHER confidently
-/// parsed root — `Binary{Implies|Iff}`, `Quant`, `Junction{Or}`, `Let`, `If`,
-/// … — means the `/\` is not a top-level conjunction, so keep the clause whole
-/// (it is then evaluated via `eval_expr` → `classify_boolean_v2`, which groups
-/// it correctly). This function returns `true` in exactly those keep-whole
-/// cases.
+/// Rule: keep the clause WHOLE only when v2 confidently parses it AND its ROOT
+/// is `Binary{Implies|Iff}` AND the antecedent has no top-level membership
+/// (`x \in S`) the enumerator would otherwise harvest. EVERY other root —
+/// `Junction{And}` (genuine top-level conjunction), `Junction{Or}`, `Quant`
+/// (quantifier, e.g. `\A i \in S : /\ A /\ B`), `Let`, `If`, a bare leaf, a
+/// container — falls through to the CURRENT split behavior UNCHANGED. This
+/// function returns `true` in exactly the keep-whole implication case above.
+///
+/// NOTE: this guard does NOT fix quantifier-rooted (`\A .../ \E ...`) predicates
+/// — those explicitly fall through to the existing split. In particular it does
+/// NOT resolve the MCBakery `IInv` under-exploration, whose root cause is a
+/// separate, deeper eval-level bug in implication-under-`\A`.
 ///
 /// Deliberately conservative on UNCERTAINTY — returns `false` (→ current split
 /// behavior, unchanged) whenever v2 is disabled (`TLAPLUS_EXPR_PARSER=v1`/`off`)
@@ -2043,18 +2045,18 @@ fn append_expanded_state_predicate_clause(
     // the leading `/\ A` into a SEPARATE REQUIRED conjunct. But `=>`/`<=>` are
     // LOOSER than `/\`, so the true parse is `((A /\ B) => C)` — one implication,
     // NOT two conjuncts. Shredding the antecedent makes an inductive-invariant-
-    // as-Init predicate reject nearly all valid initial states (MCBakery: TLC
-    // 655,200 vs ours 5,388, ~110x under-exploration).
+    // as-Init predicate reject nearly all valid initial states.
     //
     // Fix: consult expr_v2 BEFORE splitting. When v2 is enabled, `parse_ast`
     // fully consumes `trimmed`, and its ROOT is `Binary{Implies|Iff}` (a looser
-    // top operator), the `/\` lives INSIDE the antecedent — do NOT split; append
-    // `trimmed` as ONE clause (evaluated whole via `eval_expr` → v2, which groups
-    // it correctly). ONLY when v2 confidently reports an implication/iff root do
-    // we prevent the split; a genuine top-level `/\` (root `Junction{And}`), a
-    // bare leaf, a parse failure, or v2 being disabled all fall through to the
-    // CURRENT behavior unchanged. This narrowly targets the shredded-antecedent
-    // bug and cannot alter a genuine conjunction's enumeration.
+    // top operator) with no top-level membership in the antecedent, the `/\`
+    // lives INSIDE the antecedent — do NOT split; append `trimmed` as ONE clause
+    // (evaluated whole via `eval_expr` → v2, which groups it correctly). This is
+    // the ONLY shape kept whole: a genuine top-level `/\` (root `Junction{And}`),
+    // a `Junction{Or}`, a quantifier root (`\A`/`\E`), `Let`/`If`, a bare leaf, a
+    // parse failure, or v2 being disabled ALL fall through to the CURRENT split
+    // behavior unchanged. This narrowly targets the shredded-antecedent bug and
+    // cannot alter a genuine conjunction's (or quantifier's) enumeration.
     if !state_predicate_root_is_looser_than_and(trimmed) {
         let parts = split_top_level(trimmed, "/\\");
         if parts.len() > 1 || trimmed.starts_with("/\\") {
