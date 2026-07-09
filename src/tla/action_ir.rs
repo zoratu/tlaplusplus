@@ -632,7 +632,7 @@ fn flatten_or_leaves<'a>(
 /// shallowest line at column 0 this is a no-op; when line 1 is itself indented
 /// it rebases the whole block so the shallowest line lands at column 0 while
 /// keeping every relative offset intact.
-fn uniform_dedent(expr: &str) -> String {
+pub(crate) fn uniform_dedent(expr: &str) -> String {
     let min_indent = expr
         .lines()
         .filter_map(|line| {
