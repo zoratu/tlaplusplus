@@ -1933,23 +1933,35 @@ fn expand_state_predicate_clauses(
     out
 }
 
-/// Returns `true` iff expr_v2 CONFIDENTLY reports that `clause`'s fully-parsed
-/// root operator is looser than `/\` — i.e. a top-level implication (`=>`) or
-/// iff (`<=>`). In that case the top-level `/\` bullets are INSIDE the
-/// implication's antecedent, so the state-predicate expander must NOT split on
-/// `/\` (doing so shreds the antecedent into spurious required conjuncts).
+/// Returns `true` iff the state-predicate expander must NOT split `clause` on
+/// top-level `/\` — because expr_v2 CONFIDENTLY reports that the `/\` tokens are
+/// NOT a genuine top-level conjunction but live inside a LOOSER / non-`And`
+/// construct.
 ///
-/// Deliberately conservative — returns `false` (→ current split behavior) for
-/// EVERY uncertain case:
-///   - v2 disabled (`TLAPLUS_EXPR_PARSER=v1`/`off`),
-///   - parse/lex failure or a v2 mis-fence (`parse_ast` returns `Err`),
-///   - any root that is not `Binary{Implies|Iff}` (a genuine `Junction{And}`,
-///     a bare leaf/`Atom`, a `Junction{Or}`, quantifier, `LET`, `IF`, …).
+/// The naive `split_top_level(_, "/\\")` ignores operator precedence and
+/// structure. Two shapes it mis-splits, both fixed here:
+///   - `/\ A /\ B => C` — root `=>`/`<=>` (LOOSER than `/\`), so the `/\` bullets
+///     are inside the implication ANTECEDENT `(A /\ B)`. Splitting turns the
+///     leading `/\ A` into a spurious REQUIRED conjunct.
+///   - `\A i \in S : /\ A /\ B` — root quantifier, so the `/\` bullets are the
+///     quantifier BODY. Splitting strands the `\A i \in S :` head from its body
+///     conjuncts and makes each body conjunct a top-level requirement.
+/// Both are the MCBakery `IInv` under-exploration (TLC 655,200 vs ours 5,388).
 ///
-/// So a genuine top-level `/\` conjunction still splits exactly as before; only
-/// a confidently-implication/iff-rooted predicate is kept whole. Mirrors the
-/// root-check + fallback pattern in `split_action_conjuncts_v2` (`action_ir`)
-/// and `classify_boolean_v2` (`dispatch`).
+/// Rule: split ONLY when v2 confidently parses the clause AND its ROOT is a
+/// `Junction{And}` (a genuine top-level conjunction). Any OTHER confidently
+/// parsed root — `Binary{Implies|Iff}`, `Quant`, `Junction{Or}`, `Let`, `If`,
+/// … — means the `/\` is not a top-level conjunction, so keep the clause whole
+/// (it is then evaluated via `eval_expr` → `classify_boolean_v2`, which groups
+/// it correctly). This function returns `true` in exactly those keep-whole
+/// cases.
+///
+/// Deliberately conservative on UNCERTAINTY — returns `false` (→ current split
+/// behavior, unchanged) whenever v2 is disabled (`TLAPLUS_EXPR_PARSER=v1`/`off`)
+/// or the parse errors / mis-fences. So a genuine top-level `/\` conjunction
+/// still splits exactly as before, and no spec regresses on a v2 parse failure.
+/// Mirrors the root-check + fallback pattern in `split_action_conjuncts_v2`
+/// (`action_ir`) and `classify_boolean_v2` (`dispatch`).
 fn state_predicate_root_is_looser_than_and(clause: &str) -> bool {
     use crate::tla::expr_v2::{self, ast};
 
@@ -1966,10 +1978,48 @@ fn state_predicate_root_is_looser_than_and(clause: &str) -> bool {
         return false;
     }
     match expr_v2::parse_ast(src) {
+        // A top-level implication/iff whose antecedent is a `/\` block — the
+        // `/\` bullets are the ANTECEDENT, not top-level conjuncts. Splitting on
+        // `/\` would shred the leading antecedent bullet into a spurious REQUIRED
+        // conjunct (`/\ A /\ B => C` -> `[A, "B => C"]`). Keep the clause whole
+        // ONLY when the antecedent has no top-level state-predicate membership
+        // (`x \in S`) that the enumerator would otherwise harvest — otherwise
+        // keeping it whole would strand a needed variable assignment inside the
+        // antecedent (an "Init does not assign" failure). See
+        // `implies_antecedent_has_top_level_membership`.
         Ok(ast::Expr::Binary {
             op: ast::BinOp::Implies | ast::BinOp::Iff,
+            lhs,
             ..
-        }) => true,
+        }) => !implies_antecedent_has_top_level_membership(&lhs),
+        // Everything else — a genuine `Junction{And}`, a `Junction{Or}` (whose
+        // downstream `\/`-branch merge logic depends on the current split), a
+        // quantifier, a bare leaf, a container, `Let`/`If`, … — keeps the CURRENT
+        // behavior. Parse/lex errors and mis-fences likewise fall back. This is
+        // the conservative choice: only the proven-shredded implication shape
+        // above changes, and only when it strands no membership assignment.
+        _ => false,
+    }
+}
+
+/// True iff `ante` (the antecedent of a top-level `=>`/`<=>`) is a `/\` junction
+/// whose items include a top-level `x \in S` membership. Such a membership is a
+/// candidate variable assignment the Init enumerator harvests during the `/\`
+/// split; keeping the whole implication as one clause would strand it (the
+/// enumerator would never bind that variable → "Init does not assign"). When the
+/// antecedent has no such membership (the shredded-guard case: `/\ A /\ B => C`
+/// where `A`,`B` are pure predicates), it is safe — and correct — to keep the
+/// implication whole.
+fn implies_antecedent_has_top_level_membership(ante: &crate::tla::expr_v2::ast::Expr) -> bool {
+    use crate::tla::expr_v2::ast;
+    match ante {
+        ast::Expr::Junction { op: ast::JunctionOp::And, items, .. } => items.iter().any(|it| {
+            matches!(it, ast::Expr::Binary { op: ast::BinOp::In, .. })
+                || matches!(it, ast::Expr::Atom { text, .. } if text.contains("\\in"))
+        }),
+        // A bare `x \in S` antecedent (no `/\`) is also a membership.
+        ast::Expr::Binary { op: ast::BinOp::In, .. } => true,
+        ast::Expr::Atom { text, .. } => text.contains("\\in"),
         _ => false,
     }
 }
@@ -4138,6 +4188,31 @@ mod tests {
             out.len(),
             2,
             "genuine top-level /\\ must split into 2 conjuncts, got {out:?}"
+        );
+    }
+
+    // Safety: an implication whose ANTECEDENT contains a top-level membership
+    // (`x \in S`) must NOT be kept whole — the enumerator harvests that `\in` as
+    // a variable assignment, and stranding it inside the antecedent would leave
+    // the variable unassigned ("Init does not assign"). Such a clause must still
+    // reach the split path (the guard returns false).
+    #[test]
+    fn implies_with_membership_in_antecedent_is_not_kept_whole() {
+        assert!(
+            !state_predicate_root_is_looser_than_and(
+                "/\\ x \\in 0..2 /\\ y \\in 0..2 => (x + y = 2)"
+            ),
+            "an implication whose antecedent has a top-level membership must not be kept whole"
+        );
+        // A bare `x \in S => C` (single-membership antecedent) is likewise unsafe.
+        assert!(
+            !state_predicate_root_is_looser_than_and("x \\in S => P"),
+            "a bare-membership antecedent must not be kept whole"
+        );
+        // But a pure-predicate antecedent (no membership) IS kept whole.
+        assert!(
+            state_predicate_root_is_looser_than_and("/\\ (a = 1) /\\ (b = 2) => (c = 3)"),
+            "a pure-predicate implication antecedent must be kept whole"
         );
     }
 
