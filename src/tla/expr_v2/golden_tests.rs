@@ -1050,3 +1050,45 @@ fn if_else_body_extends_over_newline_implies() {
     );
     assert!(s.ends_with(", Atom(\"D\")]"), "sibling D not separate: {s}");
 }
+
+// Chained set-minus in a quantifier DOMAIN that opens with a parenthesised
+// operand: `\A j \in (S \ u) \ {i} : P`. A leading `(` must be parsed as a
+// structural `Paren` ONLY when the container is standalone; here a trailing
+// leaf `\ {i}` follows, so the whole `(S \ u) \ {i}` domain must be absorbed as
+// ONE Atom (v1 lowers set-minus). Before the `Lead::LParen` standalone guard,
+// `parse_paren` consumed only `(S \ u)` and stranded `\ {i}`, so `parse_quant`
+// hit `expected ':' ... found Backslash` → the WHOLE clause errored → v1
+// fallback. On MCBakery `IInv` this made conjunct-5 fail to parse and the
+// surrounding `\A i : /\ ...` mis-filter a non-invariant (both-in-CS) state,
+// admitting a false MutualExclusion violation.
+#[test]
+fn quant_domain_chained_setminus_with_leading_paren() {
+    // Must parse (not Err) and keep the domain as one atom; body `P`. The
+    // `.shape()` debug rendering escapes each `\` as `\\`, so the domain atom
+    // reads `(S \\ u) \\ {i}` in the shape string.
+    let s = shape("\\A j \\in (S \\ u) \\ {i} : P");
+    assert!(
+        s.starts_with("Forall(")
+            && s.contains("(S \\\\ u) \\\\ {i}")
+            && s.ends_with(": Atom(\"P\"))"),
+        "chained set-minus domain must parse with the whole domain as one atom: {s}"
+    );
+    // The sibling `/\` conjunct after such a quantifier must NOT be swallowed.
+    let s2 = shape(
+        "/\\ A => \\A j \\in (S \\ u) \\ {i} : P\n/\\ B => \\A j \\in T \\ {i} : Q",
+    );
+    assert!(
+        s2.starts_with("AND[Implies(") && s2.contains("), Implies("),
+        "two implication conjuncts must stay separate (no swallow): {s2}"
+    );
+}
+
+// The `(paren) leaf-op` absorb-as-atom rule generalises beyond quantifier
+// domains: `(A \cup B) \ C` (paren followed by a set-minus leaf) must be one
+// Atom, matching v1's lowering, not a bare `Paren` that strands `\ C`.
+#[test]
+fn paren_then_leaf_op_absorbs_as_atom() {
+    let s = shape("(A \\cup B) \\ C");
+    // `.shape()` escapes each `\` as `\\` in the rendered atom text.
+    assert_eq!(s, "Atom(\"(A \\\\cup B) \\\\ C\")", "paren+leaf must be one atom: {s}");
+}

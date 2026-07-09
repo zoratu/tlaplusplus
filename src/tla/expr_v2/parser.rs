@@ -504,7 +504,21 @@ impl<'a> Parser<'a> {
             Lead::Exists => self.parse_quant(QuantKind::Exists, stop),
             Lead::Let => self.parse_let(stop),
             Lead::If => self.parse_if(stop),
-            Lead::LParen => self.parse_paren(stop),
+            // A leading `(` is parsed as a structural `Paren` ONLY when the
+            // container is standalone — i.e. after its balanced `)` the next token
+            // is a v2 boundary. When a LEAF operator follows (e.g. the trailing
+            // set-minus in a quantifier domain `\A j \in (S \ u) \ {i} : P` or
+            // `(A \cup B) \ C`, or `(f)[x]`, `(r).field`), v2 does NOT own that
+            // operator, so a structural `Paren` prefix would STRAND it and error
+            // (`expected ':' ... found Backslash`). Mirror the `{`/`[`/`<<`
+            // container arms below: fall through to `parse_atom`, which absorbs
+            // the whole `(...) <leaf-ops>` run as one Atom for v1 to lower —
+            // identical to v1's own parse. Fixes the MCBakery `IInv` chained
+            // set-minus-in-quantifier-domain parse failure that made the whole
+            // `\A i : ...` fall back and mis-filter a non-invariant state.
+            Lead::LParen if self.container_is_standalone(stop, Tok::LParen, Tok::RParen) => {
+                self.parse_paren(stop)
+            }
             Lead::LBrace if self.container_is_standalone(stop, Tok::LBrace, Tok::RBrace) => {
                 self.parse_set(stop)
             }
