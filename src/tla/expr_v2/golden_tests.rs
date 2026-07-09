@@ -829,3 +829,224 @@ fn choose_unbounded_rejects() {
 fn choose_tuple_binder_rejects() {
     assert_v2_rejects("CHOOSE <<a, b>> \\in S : a > b");
 }
+
+// ===================== Phase 2.1: `=>` COLUMN coverage (Codex carry-over) =====
+//
+// These goldens pin the newline-`=>`-fence rule from Phase 2.1 across the three
+// column relationships to a junction bullet, nested junction levels, `=>`/`<=>`
+// chains, and the body-extending forms (`\A`/`LET`/`IF`). They are ADDITIVE
+// coverage documenting/locking the precedence rule; each asserts the lowered
+// AST/`CompiledExpr` shape.
+//
+// The rule (parser.rs `should_stop`): a NEW-LINE `=>`/`<=>` whose `start_col`
+// is `<=` the active junction's bullet-fence column is the LOOSER operator whose
+// antecedent is the WHOLE junction, so it TERMINATES the current item (the
+// enclosing expr then consumes `=>` with the finished junction as antecedent).
+// A more-indented (`start_col > col`) newline `=>`, or an INLINE `=>` (no
+// newline before), stays INSIDE the item body.
+
+// --- (A) `=>` at a column EQUAL to the junction bullet ---
+// `/\ A\n/\ B\n=> C` — the `=>` at col 0 EQUALS the bullet fence (col 0), so it
+// terminates the junction: antecedent is the whole `A /\ B`.
+// (Companion to `junction_antecedent_of_newline_implies`, made explicit for the
+// EQUAL-column case with the shape spelled out.)
+#[test]
+fn implies_col_equal_to_bullet_takes_whole_junction() {
+    let s = shape("/\\ A\n/\\ B\n=> C");
+    assert_eq!(
+        s,
+        "Implies(AND[Atom(\"A\"), Atom(\"B\")], Atom(\"C\"))",
+        "=> at bullet column must take the whole junction as antecedent: {s}"
+    );
+}
+
+// --- (B) `=>` at a column to the LEFT of the junction bullet ---
+// Bullets indented at col 3; the `=>` at col 0 is LEFT of the fence → still
+// terminates the junction (`start_col <= col`), whole junction is antecedent.
+#[test]
+fn implies_col_left_of_bullet_takes_whole_junction() {
+    let src = "\
+   /\\ A
+   /\\ B
+=> C";
+    let s = shape(src);
+    assert_eq!(
+        s,
+        "Implies(AND[Atom(\"A\"), Atom(\"B\")], Atom(\"C\"))",
+        "=> left of the bullet column must take the whole junction: {s}"
+    );
+}
+
+// --- (C) `=>` at a column to the RIGHT of the junction bullet ---
+// A newline `=>` MORE-indented than the bullet stays INSIDE the current item.
+// Here only the LAST item `/\ B` owns the deeper `=> C`, so the shape is
+// `AND[A, Implies(B, C)]` — NOT `Implies(AND[A,B], C)`.
+#[test]
+fn implies_col_right_of_bullet_stays_in_last_item() {
+    let src = "\
+/\\ A
+/\\ B
+   => C";
+    let s = shape(src);
+    assert_eq!(
+        s,
+        "AND[Atom(\"A\"), Implies(Atom(\"B\"), Atom(\"C\"))]",
+        "=> right of the bullet must bind to the last item only: {s}"
+    );
+}
+
+// --- INLINE `=>` (no newline) always stays in the item, regardless of column ---
+// `/\ A\n/\ B => C`: the `=>` is inline on item 2's line (had_newline_before ==
+// false), so it belongs to item 2 → `AND[A, Implies(B, C)]`.
+#[test]
+fn implies_inline_stays_in_item() {
+    let s = shape("/\\ A\n/\\ B => C");
+    assert_eq!(
+        s,
+        "AND[Atom(\"A\"), Implies(Atom(\"B\"), Atom(\"C\"))]",
+        "inline => must belong to its item: {s}"
+    );
+}
+
+// --- Nested junction columns: a newline `=>` binds to the CORRECT level ---
+// Outer `/\` at col 0; item 1 is an inner `\/`-junction at col 5. A newline `=>`
+// at col 5 fences the INNER junction (`\/ P \/ Q` is its antecedent), while the
+// outer `/\ R` sibling at col 0 stays separate.
+#[test]
+fn nested_junction_newline_implies_binds_inner_level() {
+    let src = "\
+/\\ \\/ P
+   \\/ Q
+   => S
+/\\ R";
+    let s = shape(src);
+    // AND[ Implies(OR[P, Q], S) , R ]
+    assert_eq!(
+        s,
+        "AND[Implies(OR[Atom(\"P\"), Atom(\"Q\")], Atom(\"S\")), Atom(\"R\")]",
+        "newline => must bind to the inner \\/ level: {s}"
+    );
+}
+
+// A newline `=>` at the OUTER column (col 0) instead fences the OUTER junction:
+// its antecedent is the whole outer `/\` (whose first item is the inner `\/`).
+#[test]
+fn nested_junction_newline_implies_binds_outer_level() {
+    let src = "\
+/\\ \\/ P
+   \\/ Q
+/\\ R
+=> S";
+    let s = shape(src);
+    // Implies( AND[ OR[P,Q], R ], S )
+    assert_eq!(
+        s,
+        "Implies(AND[OR[Atom(\"P\"), Atom(\"Q\")], Atom(\"R\")], Atom(\"S\"))",
+        "newline => at outer column must fence the outer junction: {s}"
+    );
+}
+
+// --- `=>` / `<=>` chains (precedence + associativity), lowered as v1 (== TLC) ---
+
+// `A => B => C` right-assoc (shape counterpart already exists; here the mixed
+// and equal-column chain forms).
+#[test]
+fn implies_chain_three_right_assoc_shape() {
+    let s = shape("A => B => C => D");
+    assert_eq!(
+        s,
+        "Implies(Atom(\"A\"), Implies(Atom(\"B\"), Implies(Atom(\"C\"), Atom(\"D\"))))"
+    );
+}
+
+// `A <=> B => C` — `<=>` is LOOSER than `=>`, so this is `A <=> (B => C)`.
+#[test]
+fn iff_looser_than_implies_chain_shape() {
+    let s = shape("A <=> B => C");
+    assert_eq!(
+        s,
+        "Iff(Atom(\"A\"), Implies(Atom(\"B\"), Atom(\"C\")))",
+        "<=> must be looser than =>: {s}"
+    );
+    assert_lower_matches_v1("A <=> B => C");
+}
+
+// `A => B <=> C` — `=>` tighter, so `(A => B) <=> C`.
+#[test]
+fn implies_tighter_than_iff_chain_shape() {
+    let s = shape("A => B <=> C");
+    assert_eq!(
+        s,
+        "Iff(Implies(Atom(\"A\"), Atom(\"B\")), Atom(\"C\"))",
+        "=> must be tighter than <=>: {s}"
+    );
+    assert_lower_matches_v1("A => B <=> C");
+}
+
+// `<=>` is right-associative and body-extending: `A <=> B <=> C` == `A <=> (B <=> C)`.
+#[test]
+fn iff_chain_right_assoc_shape() {
+    let s = shape("A <=> B <=> C");
+    assert_eq!(
+        s,
+        "Iff(Atom(\"A\"), Iff(Atom(\"B\"), Atom(\"C\")))"
+    );
+}
+
+// --- Body-extending forms containing a more-indented newline `=>` ---
+
+// `\A x \in S : <body>` — a newline `=>` MORE-indented than the `\A` bullet
+// extends the quantifier body. Here the `\A` is item 1 of an outer `/\`; the
+// deeper `=> C` stays in the `\A` body, while `/\ D` at col 0 is a sibling.
+#[test]
+fn forall_body_extends_over_more_indented_implies() {
+    let src = "\
+/\\ \\A x \\in S : /\\ A
+                 /\\ B
+                 => C
+/\\ D";
+    let s = shape(src);
+    // AND[ Forall(x : Implies(AND[A,B], C)) , D ]
+    assert!(
+        s.starts_with("AND[Forall(x\\in Atom(\"S\") : Implies(AND[Atom(\"A\"), Atom(\"B\")], Atom(\"C\")))"),
+        "\\A body must extend over the deeper => (junction antecedent): {s}"
+    );
+    assert!(s.ends_with(", Atom(\"D\")]"), "sibling D not separate: {s}");
+}
+
+// `LET x == v IN <body>` — a newline `=>` inside the IN-body extends the LET
+// body. The `=>` at the body's junction column takes the junction as antecedent.
+#[test]
+fn let_body_extends_over_newline_implies() {
+    let src = "\
+LET x == v IN /\\ A
+              /\\ B
+              => C";
+    let s = shape(src);
+    // Let([x==v] IN Implies(AND[A,B], C))
+    assert_eq!(
+        s,
+        "Let([x==Atom(\"v\")] IN Implies(AND[Atom(\"A\"), Atom(\"B\")], Atom(\"C\")))",
+        "LET body must extend over the newline => : {s}"
+    );
+}
+
+// `IF c THEN t ELSE <else-body>` — a newline `=>` inside the ELSE branch, more-
+// indented than the IF, extends the else-branch expression (the whole `IF` is
+// item 1 of an outer `/\`, `/\ D` is a sibling).
+#[test]
+fn if_else_body_extends_over_newline_implies() {
+    let src = "\
+/\\ IF c THEN t
+   ELSE /\\ A
+        /\\ B
+        => C
+/\\ D";
+    let s = shape(src);
+    // AND[ If(c, t, Implies(AND[A,B], C)) , D ]
+    assert!(
+        s.starts_with("AND[If(Atom(\"c\"), Atom(\"t\"), Implies(AND[Atom(\"A\"), Atom(\"B\")], Atom(\"C\")))"),
+        "IF else-branch must extend over the deeper => : {s}"
+    );
+    assert!(s.ends_with(", Atom(\"D\")]"), "sibling D not separate: {s}");
+}

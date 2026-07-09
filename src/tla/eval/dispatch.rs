@@ -170,6 +170,43 @@ fn classify_boolean_v2(expr: &str) -> Option<Op> {
     }
     let tree = expr_v2::parse_ast(expr).ok()?;
 
+    // SOUNDNESS GUARD (SingleLaneBridge `HaveSameDirection`, misaligned bullets).
+    // When a body's FIRST logical token is a disjunction/conjunction bullet, the
+    // body is semantically that junction, so its top operator must be that same
+    // junction op. But v2's strict column fence mis-parses a junction whose
+    // leading bullet sits at a SHALLOWER column than its continuation bullets:
+    // the leading bullet collapses to a single item and a body-extending
+    // `\A`/`\E`/`LET`/`IF` inside it swallows the deeper sibling bullet, flipping
+    // the top operator. For example (leading `\/` at col 0, continuation `\/` at
+    // col 4):
+    //     \/ a /\ \A c : P
+    //         \/ b /\ \A c : Q
+    // parses as `AND[a, Forall(c : OR[P, AND[b, Forall(c:Q)]])]` — an `AND` with
+    // the second disjunct swallowed — instead of `OR[AND[a,..], AND[b,..]]`. This
+    // flips the boolean result and (in SingleLaneBridge) dropped 74 reachable
+    // states (a false-safe under-exploration). v1's alignment-tolerant
+    // `split_indented_top_level_boolean` / `split_top_level_symbol` groups it
+    // correctly. So when the v2 top node's junction op DISAGREES with the leading
+    // bullet, return None and fall back to the v1 cascade. Always sound: a body
+    // whose first logical token is `\/` is never a top-level `/\` (and vice
+    // versa). Mirrors the `action_ir.rs` disjunction-body guard.
+    {
+        let lead = expr.trim_start();
+        let leads_with_or = lead.starts_with("\\/");
+        let leads_with_and = lead.starts_with("/\\");
+        if leads_with_or || leads_with_and {
+            let v2_top_matches = matches!(
+                &tree,
+                ast::Expr::Junction { op, .. }
+                    if (leads_with_or && *op == ast::JunctionOp::Or)
+                        || (leads_with_and && *op == ast::JunctionOp::And)
+            );
+            if !v2_top_matches {
+                return None;
+            }
+        }
+    }
+
     // Take the original source substring for a child expr. Spans are 0-based
     // byte offsets into `expr` (see the doc-comment invariant above).
     let slice = |child: &ast::Expr| -> Option<String> {
@@ -709,4 +746,44 @@ mod phase3_boolean_tests {
         assert_eq!(child_parts[0].trim(), "A", "first branch must be A");
         assert_eq!(child_parts[1].trim(), "B", "second branch must be B");
     }
+
+    // ===== Regression (SingleLaneBridge `HaveSameDirection`, misaligned bullets) =====
+    // A `\/`-junction whose LEADING bullet is at a shallower column than its
+    // continuation bullet must NOT be mis-classified by v2 as an `IndentedAnd`
+    // (the mis-fence that swallowed the second disjunct into a `\A` body and
+    // dropped 74 reachable SingleLaneBridge states — a false-safe). The guard in
+    // `classify_boolean_v2` returns None for this shape so the alignment-tolerant
+    // v1 cascade classifies it as the disjunction it actually is.
+    #[test]
+    fn misaligned_leading_or_bullet_not_reclassified_as_and() {
+        // Leading `\/` at col 0, continuation `\/` at col 4 (as `HaveSameDirection`
+        // reaches the classifier after trimming its leading indentation).
+        let body = "\\/ car \\in CarsRight /\\ \\A c \\in CarsInBridge : c \\in CarsRight\n    \\/ car \\in CarsLeft /\\ \\A c \\in CarsInBridge : c \\in CarsLeft";
+        let op = classify_op(body);
+        // Must be a disjunction (IndentedOr or Or), NEVER an And/IndentedAnd.
+        assert!(
+            matches!(&op, Op::IndentedOr(_) | Op::Or(_)),
+            "misaligned-bullet \\/-junction wrongly classified as {} (mis-fence)",
+            variant_name(&op)
+        );
+        // And the disjuncts must be the two real branches (not one swallowed).
+        if let Op::IndentedOr(p) | Op::Or(p) = &op {
+            assert_eq!(p.len(), 2, "expected 2 disjuncts, got {}: {p:?}", p.len());
+            assert!(p[1].contains("CarsLeft"), "second disjunct lost: {p:?}");
+        }
+    }
+
+    // Companion: the ALIGNED form (both `\/` at col 0) is already correct under v2
+    // and must stay a disjunction (guard must not over-reject it).
+    #[test]
+    fn aligned_or_bullets_stay_disjunction() {
+        let body = "\\/ car \\in CarsRight /\\ \\A c \\in CarsInBridge : c \\in CarsRight\n\\/ car \\in CarsLeft /\\ \\A c \\in CarsInBridge : c \\in CarsLeft";
+        let op = classify_op(body);
+        assert!(
+            matches!(&op, Op::IndentedOr(_) | Op::Or(_)),
+            "aligned \\/-junction wrongly classified as {}",
+            variant_name(&op)
+        );
+    }
+
 }
