@@ -1933,6 +1933,47 @@ fn expand_state_predicate_clauses(
     out
 }
 
+/// Returns `true` iff expr_v2 CONFIDENTLY reports that `clause`'s fully-parsed
+/// root operator is looser than `/\` — i.e. a top-level implication (`=>`) or
+/// iff (`<=>`). In that case the top-level `/\` bullets are INSIDE the
+/// implication's antecedent, so the state-predicate expander must NOT split on
+/// `/\` (doing so shreds the antecedent into spurious required conjuncts).
+///
+/// Deliberately conservative — returns `false` (→ current split behavior) for
+/// EVERY uncertain case:
+///   - v2 disabled (`TLAPLUS_EXPR_PARSER=v1`/`off`),
+///   - parse/lex failure or a v2 mis-fence (`parse_ast` returns `Err`),
+///   - any root that is not `Binary{Implies|Iff}` (a genuine `Junction{And}`,
+///     a bare leaf/`Atom`, a `Junction{Or}`, quantifier, `LET`, `IF`, …).
+///
+/// So a genuine top-level `/\` conjunction still splits exactly as before; only
+/// a confidently-implication/iff-rooted predicate is kept whole. Mirrors the
+/// root-check + fallback pattern in `split_action_conjuncts_v2` (`action_ir`)
+/// and `classify_boolean_v2` (`dispatch`).
+fn state_predicate_root_is_looser_than_and(clause: &str) -> bool {
+    use crate::tla::expr_v2::{self, ast};
+
+    if !expr_v2::v2_enabled() {
+        return false;
+    }
+    // Uniform-dedent so the parser's column coordinate system matches the source
+    // layout (a state-predicate clause pulled from a definition body may carry
+    // continuation indentation). `parse_ast` errors on trailing tokens, so `Ok`
+    // == full consumption; any error → fallback (current split behavior).
+    let dedented = crate::tla::action_ir::uniform_dedent(clause);
+    let src = dedented.trim();
+    if src.is_empty() {
+        return false;
+    }
+    match expr_v2::parse_ast(src) {
+        Ok(ast::Expr::Binary {
+            op: ast::BinOp::Implies | ast::BinOp::Iff,
+            ..
+        }) => true,
+        _ => false,
+    }
+}
+
 fn append_expanded_state_predicate_clause(
     clause: &str,
     definitions: &BTreeMap<String, TlaDefinition>,
@@ -1946,19 +1987,39 @@ fn append_expanded_state_predicate_clause(
         return;
     }
 
-    let parts = split_top_level(trimmed, "/\\");
-    if parts.len() > 1 || trimmed.starts_with("/\\") {
-        for part in parts {
-            append_expanded_state_predicate_clause(
-                &part,
-                definitions,
-                instances,
-                active_instance,
-                visiting,
-                out,
-            );
+    // SOUNDNESS GUARD (expr_v2-root-aware — the Phase-4 pattern). The naive
+    // `split_top_level(_, "/\\")` below ignores `=>`/`<=>` precedence: for a
+    // state predicate like `/\ A /\ B => C` it yields `["A", "B => C"]`, turning
+    // the leading `/\ A` into a SEPARATE REQUIRED conjunct. But `=>`/`<=>` are
+    // LOOSER than `/\`, so the true parse is `((A /\ B) => C)` — one implication,
+    // NOT two conjuncts. Shredding the antecedent makes an inductive-invariant-
+    // as-Init predicate reject nearly all valid initial states (MCBakery: TLC
+    // 655,200 vs ours 5,388, ~110x under-exploration).
+    //
+    // Fix: consult expr_v2 BEFORE splitting. When v2 is enabled, `parse_ast`
+    // fully consumes `trimmed`, and its ROOT is `Binary{Implies|Iff}` (a looser
+    // top operator), the `/\` lives INSIDE the antecedent — do NOT split; append
+    // `trimmed` as ONE clause (evaluated whole via `eval_expr` → v2, which groups
+    // it correctly). ONLY when v2 confidently reports an implication/iff root do
+    // we prevent the split; a genuine top-level `/\` (root `Junction{And}`), a
+    // bare leaf, a parse failure, or v2 being disabled all fall through to the
+    // CURRENT behavior unchanged. This narrowly targets the shredded-antecedent
+    // bug and cannot alter a genuine conjunction's enumeration.
+    if !state_predicate_root_is_looser_than_and(trimmed) {
+        let parts = split_top_level(trimmed, "/\\");
+        if parts.len() > 1 || trimmed.starts_with("/\\") {
+            for part in parts {
+                append_expanded_state_predicate_clause(
+                    &part,
+                    definitions,
+                    instances,
+                    active_instance,
+                    visiting,
+                    out,
+                );
+            }
+            return;
         }
-        return;
     }
 
     // Handle TLC sub-expression references: Name!N refers to the N-th conjunct
@@ -4031,6 +4092,54 @@ fn warm_up_action_cache(
 mod tests {
     use super::*;
     use std::fs;
+
+    // Regression: a state predicate whose top operator is a `=>` (looser than
+    // `/\`) whose ANTECEDENT is a `/\` block must be kept as ONE clause, NOT
+    // shredded into a leading required conjunct + a `B => C` conjunct. This is
+    // the MCBakery inductive-invariant-as-Init under-exploration (~110x).
+    #[test]
+    fn implies_rooted_state_predicate_is_not_shredded_on_and() {
+        let defs: BTreeMap<String, TlaDefinition> = BTreeMap::new();
+        let instances: BTreeMap<String, TlaModuleInstance> = BTreeMap::new();
+
+        // `(A /\ B) => C` written with a leading `/\` in the antecedent.
+        let clause = "/\\ (x = 1) /\\ (y = 2) => (z = 3)";
+        let out = expand_state_predicate_clauses(clause, &defs, &instances);
+        assert_eq!(
+            out.len(),
+            1,
+            "implies-rooted predicate must stay one clause, got {out:?}"
+        );
+        assert!(
+            out[0].contains("=>"),
+            "the whole implication must be preserved, got {out:?}"
+        );
+
+        // Iff (`<=>`) root is likewise looser than `/\`.
+        let iff = "/\\ (x = 1) /\\ (y = 2) <=> (z = 3)";
+        let out_iff = expand_state_predicate_clauses(iff, &defs, &instances);
+        assert_eq!(
+            out_iff.len(),
+            1,
+            "iff-rooted predicate must stay one clause, got {out_iff:?}"
+        );
+    }
+
+    // A genuine top-level conjunction must STILL split into its conjuncts —
+    // the guard only fires for implication/iff roots.
+    #[test]
+    fn genuine_top_level_and_still_splits() {
+        let defs: BTreeMap<String, TlaDefinition> = BTreeMap::new();
+        let instances: BTreeMap<String, TlaModuleInstance> = BTreeMap::new();
+
+        let clause = "/\\ (x = 1) /\\ (y = 2)";
+        let out = expand_state_predicate_clauses(clause, &defs, &instances);
+        assert_eq!(
+            out.len(),
+            2,
+            "genuine top-level /\\ must split into 2 conjuncts, got {out:?}"
+        );
+    }
 
     #[test]
     fn builds_and_steps_simple_tla_model() {
