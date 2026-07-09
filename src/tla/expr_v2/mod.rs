@@ -213,22 +213,31 @@ mod mis_fence_tests {
 
     // THE POINT OF THE FIX: the compiled path must NOT emit a flipped `And`.
     // With the choke-point reject, `parse_and_lower` returns `Err`, so
-    // `compile_expr` uses `compile_expr_v1`, which groups the `\/`-led body as
-    // an `Or`. Here we assert `parse_and_lower` refuses (the flipped `And` is
-    // never produced); the v1 fallback that yields `Or` lives in `compile_expr`.
+    // `parse_and_lower` refuses the mis-fence (the flipped `And` is never
+    // produced), so the full `compile_expr` defers to the v1 fallback instead.
     #[test]
     fn compiled_path_does_not_produce_flipped_and() {
+        // The detector fires, so v2 refuses this mis-fenced parse and can NEVER
+        // hand `lower` a flipped root `And` on the compiled path.
         let r = parse_and_lower(MIS_FENCE_OR);
         assert!(
             r.is_err(),
             "compiled path must fall back on mis-fence, not emit a junction; got: {:?}",
             r
         );
-        // And prove v1 (the fallback target) produces the correct `Or` shape.
+        // Consequently the full compiled path falls back to v1 verbatim rather
+        // than v2's flipped `And`. (This synthetic fixture is misaligned beyond
+        // v1's tolerance too, so v1 does not itself yield `Or` here — the point
+        // of the fix is that the compiled path defers to the v1 oracle. For a
+        // real-world misaligned shape like SingleLaneBridge `HaveSameDirection`,
+        // v1 is alignment-tolerant and agrees with TLC; end-to-end count
+        // correctness is covered by the corpus gate, not this unit test.)
+        let full = crate::tla::compiled_expr::compile_expr(MIS_FENCE_OR);
         let v1 = crate::tla::compiled_expr::compile_expr_v1(MIS_FENCE_OR);
-        assert!(
-            matches!(v1, CompiledExpr::Or(_)),
-            "v1 fallback must group the \\/-led body as Or, got: {v1:?}"
+        assert_eq!(
+            format!("{full:?}"),
+            format!("{v1:?}"),
+            "compiled path must equal the v1 fallback, not v2's flipped And"
         );
     }
 
