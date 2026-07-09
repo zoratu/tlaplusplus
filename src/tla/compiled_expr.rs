@@ -3344,16 +3344,33 @@ fn try_parse_exists(expr: &str) -> Option<CompiledExpr> {
 
     let colon_idx = find_top_level_colon(rest)?;
     let binding = rest[..colon_idx].trim();
-    // Body uses `.trim()` (NOT `dedent_common`). The body is re-`compile_expr`'d,
-    // which re-bases it with `dedent_common` anyway, so within-body conjunction
-    // bullets still split correctly via the entry dedent + symbol fallback. We
-    // deliberately do NOT realign the body here: re-indenting a quantifier body
-    // before it reaches the action-IR layer flips the IR's guard-vs-action-
-    // existential classification of an inner `\E ... : <pure guard>` (it starts
-    // enumerating witnesses as successors). Keeping the de-indenting `.trim()`
-    // preserves the shape the action IR expects. Regression: Paxos `Phase2a`
-    // generated 2 (duplicate) successors instead of 1.
-    let body = rest[colon_idx + 1..].trim();
+    // Body extraction: `dedent_common` (NOT a bare `.trim()`), matching
+    // `try_parse_forall`. A bare `.trim()` de-indents ONLY the body's first
+    // line, so a uniformly-indented bulleted body like
+    //     \E i \in Procs :
+    //                /\ (pc[i] = "w2") => (nxt[i] # i)   <- col 11
+    //                /\ (pc[i] = "e2") => flag[i]         <- col 11
+    // becomes "first bullet at col 0, siblings at col 11"; the compiled
+    // indented-boolean splitter then folds every deeper sibling `/\` INTO the
+    // first conjunct and the `=>` fallback right-nests the lot, flipping an
+    // `\E`-quantified predicate's truth value (the `\E`/CHOOSE twin of the
+    // MCBakery `\A` bug fixed for `try_parse_forall`). `dedent_common` keeps
+    // every bullet at the same column so the real top-level conjunction
+    // survives. It is a no-op when the first line already holds the minimum
+    // indent (the common case), so it matches the old `.trim()` there.
+    //
+    // NOTE on the action-IR: the ACTION-existential path does NOT reach here —
+    // `compile_action_ir` routes `\E`-conjuncts through
+    // `action_ir::parse_action_exists` -> `CompiledActionClause::Exists`, whose
+    // body is split by the action-aware `split_action_body_clauses`
+    // (uniform-dedent based). `try_parse_exists` is the PREDICATE path
+    // (invariants, guards, value context). `dedent_common` is itself a uniform
+    // dedent, so any inner guard `\E`/`\A` that DID reach a nested
+    // `compile_expr` here keeps its relative column layout intact — the
+    // guard-vs-action classification the action IR performs upstream is
+    // unaffected. Paxos `Phase2a` still generates exactly 1 successor.
+    let body_owned = dedent_common(&rest[colon_idx + 1..]);
+    let body = body_owned.as_str();
 
     if contains_tuple_binder(binding) {
         return Some(CompiledExpr::Unparsed(expr.to_string()));
@@ -3485,7 +3502,12 @@ fn try_parse_choose(expr: &str) -> Option<CompiledExpr> {
 
     let colon_idx = find_top_level_colon(rest)?;
     let binding = rest[..colon_idx].trim();
-    let body = rest[colon_idx + 1..].trim();
+    // Body extraction: `dedent_common` (NOT a bare `.trim()`), matching
+    // `try_parse_forall`/`try_parse_exists`. A uniformly-indented bulleted
+    // CHOOSE predicate body must keep its top-level conjunction rather than
+    // fold into the first conjunct + right-nest via the `=>` fallback.
+    let body_owned = dedent_common(&rest[colon_idx + 1..]);
+    let body = body_owned.as_str();
 
     if contains_tuple_binder(binding) {
         return Some(CompiledExpr::Unparsed(expr.to_string()));
@@ -3994,6 +4016,7 @@ mod tests {
             CompiledExpr::Not(a) => format!("Not({})", shape(a)),
             CompiledExpr::Forall { body, .. } => format!("Forall({})", shape(body)),
             CompiledExpr::Exists { body, .. } => format!("Exists({})", shape(body)),
+            CompiledExpr::Choose { body, .. } => format!("Choose({})", shape(body)),
             CompiledExpr::Let { body, .. } => format!("Let({})", shape(body)),
             CompiledExpr::Unparsed(s) if s.trim().is_empty() => "EMPTY".to_string(),
             _ => "_".to_string(),
@@ -4026,6 +4049,45 @@ mod tests {
             shape(&e),
             "Forall(And[Implies(_,_),Implies(_,_),Implies(_,_)])",
             "uniformly-indented `/\\ P => Q` conjuncts under a `\\A` head must be a \
+             top-level conjunction of implications, not a nested `=>` chain"
+        );
+    }
+
+    /// `\E`/CHOOSE twin of `forall_head_col0_uniformly_indented_...`. A `\E`
+    /// head at column 0 whose `P => Q` conjunct bullets are UNIFORMLY indented
+    /// below it must compile to `Exists(And[Implies, Implies])`, NOT a
+    /// right-nested `=>` chain. Before the fix `try_parse_exists` extracted the
+    /// body with a bare `.trim()` (de-indents only line 1), so the compiled
+    /// indented-boolean splitter folded the deeper siblings into conjunct 0 and
+    /// the `=>` fallback right-nested the lot — flipping the predicate's truth
+    /// value (a MISSED invariant violation on the compiled path used by
+    /// `check_invariants`). `dedent_common` keeps every bullet at the same
+    /// column. The ACTION-existential path is unaffected: it routes through
+    /// `parse_action_exists` -> `CompiledActionClause::Exists`, not here.
+    #[test]
+    fn exists_head_col0_uniformly_indented_implies_conjuncts_stay_a_conjunction() {
+        let e = compile_expr(
+            "\\E i \\in Procs :\n           /\\ (pc[i] = \"w2\") => (nxt[i] # i)\n           /\\ (pc[i] = \"e2\") => flag[i]",
+        );
+        assert_eq!(
+            shape(&e),
+            "Exists(And[Implies(_,_),Implies(_,_)])",
+            "uniformly-indented `/\\ P => Q` conjuncts under a `\\E` head must be a \
+             top-level conjunction of implications, not a nested `=>` chain"
+        );
+    }
+
+    /// CHOOSE twin — same uniformly-indented `P => Q` bulleted predicate body
+    /// must survive as a top-level conjunction inside the `Choose`.
+    #[test]
+    fn choose_head_col0_uniformly_indented_implies_conjuncts_stay_a_conjunction() {
+        let c = compile_expr(
+            "CHOOSE i \\in Procs :\n           /\\ (pc[i] = \"w2\") => (nxt[i] # i)\n           /\\ (pc[i] = \"e2\") => flag[i]",
+        );
+        assert_eq!(
+            shape(&c),
+            "Choose(And[Implies(_,_),Implies(_,_)])",
+            "uniformly-indented `/\\ P => Q` conjuncts under a `CHOOSE` head must be a \
              top-level conjunction of implications, not a nested `=>` chain"
         );
     }
