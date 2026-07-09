@@ -3409,10 +3409,28 @@ fn try_parse_forall(expr: &str) -> Option<CompiledExpr> {
 
     let colon_idx = find_top_level_colon(rest)?;
     let binding = rest[..colon_idx].trim();
-    // Body uses `.trim()` (NOT `dedent_common`); see try_parse_exists for why
-    // realigning a quantifier body here breaks action-IR existential
-    // classification (Paxos `Phase2a` duplicate-successor regression).
-    let body = rest[colon_idx + 1..].trim();
+    // Body extraction: `dedent_common` (NOT a bare `.trim()`). A bare `.trim()`
+    // de-indents ONLY the body's first line, so a uniformly-indented bulleted
+    // body like
+    //     \A i \in Procs :
+    //                /\ (pc[i] = "w2") => (nxt[i] # i)   <- col 11
+    //                /\ ...                              <- col 11
+    // becomes "first bullet at col 0, all siblings at col 11". The compiled
+    // indented-boolean splitter then takes the FIRST bullet's shallower column
+    // as `base_indent`, so every sibling `/\` at the deeper column is folded
+    // INTO the first conjunct instead of being a top-level sibling. The `=>`
+    // fallback then right-nests the whole thing as `P0 => ((Q0 /\ P1) => ...)`,
+    // flipping the invariant's truth value (MCBakery `IInv` compiled `Inv=TRUE`
+    // on a state where the interpreter — which normalizes indentation — and TLC
+    // both say `Inv=FALSE`). `dedent_common` de-indents ALL lines by their
+    // shared minimum, keeping every bullet at the same column so the splitter
+    // sees the real top-level conjunction. It is a no-op whenever the first line
+    // already holds the minimum indent (the overwhelmingly common case), so it
+    // matches the old `.trim()` exactly there; it differs only in the
+    // misaligned-first-bullet case this fixes. (Applied to `\A` only; the
+    // action-IR `Phase2a` concern lives in `try_parse_exists`, left untouched.)
+    let body_owned = dedent_common(&rest[colon_idx + 1..]);
+    let body = body_owned.as_str();
 
     if contains_tuple_binder(binding) {
         return Some(CompiledExpr::Unparsed(expr.to_string()));
@@ -3980,6 +3998,36 @@ mod tests {
             CompiledExpr::Unparsed(s) if s.trim().is_empty() => "EMPTY".to_string(),
             _ => "_".to_string(),
         }
+    }
+
+    /// Regression (MCBakery `Inv`/`IInv` compiled-vs-interpreted divergence):
+    /// a `\A i \in S :` head at column 0 whose conjunct bullets are UNIFORMLY
+    /// indented below it (each conjunct an inline `P => Q`) must compile to
+    /// `Forall(And[Implies, Implies, ...])`, NOT a right-nested `=>` chain.
+    ///
+    /// `try_parse_forall` extracts the body after the colon. A bare `.trim()`
+    /// there de-indents ONLY the first bullet, leaving "first bullet at col 0,
+    /// every sibling at col 11". `split_indented_top_level_boolean` then takes
+    /// the shallow first bullet's column as `base_indent`, folds all deeper
+    /// sibling `/\` into the first conjunct, and the `=>` fallback right-nests
+    /// the lot as `P0 => ((Q0 /\ P1) => ...)` — flipping the predicate's truth
+    /// value (compiled returned TRUE where the interpreter and TLC return
+    /// FALSE). `dedent_common` keeps every bullet at the same column so the
+    /// real top-level conjunction survives. This is the compiled twin of the
+    /// interpreted-path normalization already done by
+    /// `eval::normalize_multiline_boolean_indentation`.
+    #[test]
+    fn forall_head_col0_uniformly_indented_implies_conjuncts_stay_a_conjunction() {
+        // `\A` head at column 0, three `P => Q` conjunct bullets at column 11.
+        let e = compile_expr(
+            "\\A i \\in Procs :\n           /\\ (pc[i] = \"w2\") => (nxt[i] # i)\n           /\\ (pc[i] = \"e2\") => flag[i]\n           /\\ (pc[i] = \"cs\") => ok[i]",
+        );
+        assert_eq!(
+            shape(&e),
+            "Forall(And[Implies(_,_),Implies(_,_),Implies(_,_)])",
+            "uniformly-indented `/\\ P => Q` conjuncts under a `\\A` head must be a \
+             top-level conjunction of implications, not a nested `=>` chain"
+        );
     }
 
     /// 3-level nested implication where the innermost `\A` head is MORE indented
