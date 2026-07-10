@@ -14,15 +14,30 @@ name: ci
 #   JDK to run TLC. Also runs the compiled-vs-interpreted proptest equivalence
 #   gate (T2) at PROPTEST_CASES=128.
 #
-# Hybrid CI model: heavy gates (chaos smoke, --features failpoints,
-# --features symbolic-init, Verus proofs) run via an external spot-CI driver,
-# not here. See CLAUDE.md for the chaos-smoke / Verus gate descriptions.
+# - `symbolic-init`: compiles + runs the suite under `--features symbolic-init`
+#   (Z3-backed enumeration). This feature is NOT built by the default `tests`
+#   job, so type drift in its feature-gated test code goes undetected there —
+#   which is exactly how PR #168's `BTreeMap`->`TlaState` bit-rot reached main.
+#
+# - `failpoints`: compiles + runs the suite under `--features failpoints`
+#   (chaos fault-injection). Same rationale: a feature the default job never
+#   builds needs its own compile+run gate.
+#
+# Heavier gates that don't fit hosted runners — the chaos smoke/soak and the
+# Verus proofs (build-from-source) — run on a self-hosted spot runner via the
+# manual-dispatch `.github/workflows/heavy-gates.yml` workflow, not here.
 
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+
+# Cancel superseded runs on the same ref (e.g. a new push to a PR) so the
+# slow serial failpoints job doesn't pile up.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: never
@@ -142,3 +157,71 @@ jobs:
           path: .diff-tlc-out/
           if-no-files-found: ignore
           retention-days: 7
+
+  symbolic-init:
+    name: cargo test --features symbolic-init
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install z3 + clang (z3-sys bindgen deps)
+        # libz3-dev puts z3.h at /usr/include/z3.h (no subdir), so z3-sys 0.8.1
+        # finds it without Z3_SYS_Z3_HEADER overrides.
+        run: sudo apt-get update && sudo apt-get install -y libz3-dev clang libclang-dev
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-symbolic-init-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-symbolic-init-${{ runner.os }}-
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run symbolic-init test suite
+        run: cargo test --release --features symbolic-init
+
+  failpoints:
+    name: cargo test --features failpoints
+    runs-on: ubuntu-latest
+    # Serial (--test-threads=1, see below) is slower than the parallel default
+    # job, so allow extra headroom over the 30-min used elsewhere.
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-failpoints-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-failpoints-${{ runner.os }}-
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run failpoints test suite
+        # Single-threaded: the `fail` crate's failpoint registry is
+        # process-global, so a test that sets e.g. `queue_spill_fail=return`
+        # (in the #[cfg(feature="failpoints")] modules) contaminates any other
+        # test exercising that instrumented path concurrently. That deadlocks
+        # e.g. spillable_work_stealing::test_compression_ring_overflow_falls_
+        # through_to_disk (its background spill coordinator retries the
+        # globally-failing spill forever). Serial execution scopes each
+        # failpoint to its own test. Slower but correct; the suite is
+        # unit-test-dominated so it stays well under the timeout.
+        run: cargo test --release --features failpoints -- --test-threads=1
