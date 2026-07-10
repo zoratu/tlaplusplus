@@ -67,39 +67,128 @@ use tlaplusplus::tla::{
 ///   IsPos(n) == n > 0
 ///
 /// Names are intentionally short so the generator can spell them as identifiers.
-fn build_state() -> TlaState {
+///
+/// Helper: assemble a state from the tunable free-variable values. All states
+/// share the SAME variable names AND types (Int / Bool / Set-of-Int /
+/// Seq-of-Int / Record{a,b} / Function Int->Int) so every generated
+/// expression stays well-typed no matter which state we evaluate it against.
+fn make_state(
+    x: i64,
+    y: i64,
+    b: bool,
+    s_elems: &[i64],
+    t_elems: &[i64],
+    sq_elems: &[i64],
+    ra: i64,
+    rb: i64,
+    func_pairs: &[(i64, i64)],
+) -> TlaState {
     use std::collections::{BTreeMap, BTreeSet};
 
-    let mut s = BTreeSet::new();
-    s.insert(TlaValue::Int(1));
-    s.insert(TlaValue::Int(2));
-    s.insert(TlaValue::Int(3));
-
-    let mut t = BTreeSet::new();
-    t.insert(TlaValue::Int(2));
-    t.insert(TlaValue::Int(3));
-    t.insert(TlaValue::Int(4));
-
-    let sq = vec![TlaValue::Int(10), TlaValue::Int(20), TlaValue::Int(30)];
+    let s: BTreeSet<TlaValue> = s_elems.iter().map(|&n| TlaValue::Int(n)).collect();
+    let t: BTreeSet<TlaValue> = t_elems.iter().map(|&n| TlaValue::Int(n)).collect();
+    let sq: Vec<TlaValue> = sq_elems.iter().map(|&n| TlaValue::Int(n)).collect();
 
     let mut rec = BTreeMap::new();
-    rec.insert("a".to_string(), TlaValue::Int(1));
-    rec.insert("b".to_string(), TlaValue::Int(2));
+    rec.insert("a".to_string(), TlaValue::Int(ra));
+    rec.insert("b".to_string(), TlaValue::Int(rb));
 
     let mut func = BTreeMap::new();
-    func.insert(TlaValue::Int(1), TlaValue::Int(100));
-    func.insert(TlaValue::Int(2), TlaValue::Int(200));
+    for &(k, v) in func_pairs {
+        func.insert(TlaValue::Int(k), TlaValue::Int(v));
+    }
 
     tla_state([
-        ("x", TlaValue::Int(3)),
-        ("y", TlaValue::Int(7)),
-        ("b", TlaValue::Bool(true)),
+        ("x", TlaValue::Int(x)),
+        ("y", TlaValue::Int(y)),
+        ("b", TlaValue::Bool(b)),
         ("S", TlaValue::Set(HashedArc::new(s))),
         ("T", TlaValue::Set(HashedArc::new(t))),
         ("sq", TlaValue::Seq(HashedArc::new(sq))),
         ("r", TlaValue::Record(HashedArc::new(rec))),
         ("f", TlaValue::Function(HashedArc::new(func))),
     ])
+}
+
+/// The canonical (historical) fixed state — used by the deterministic sanity
+/// `#[test]`s so their asserted values stay stable.
+fn build_state() -> TlaState {
+    make_state(
+        3,
+        7,
+        true,
+        &[1, 2, 3],
+        &[2, 3, 4],
+        &[10, 20, 30],
+        1,
+        2,
+        &[(1, 100), (2, 200)],
+    )
+}
+
+/// A panel of distinct states over the SAME schema. The property harness
+/// evaluates every generated expression against ALL of these, so a predicate
+/// and its sub-predicates are exercised in states where they are both true
+/// and false — the equivalence `eval_expr == eval_compiled` must hold at each.
+///
+/// The values are chosen to flip common sub-predicate outcomes: x vs y
+/// ordering, b true/false, disjoint/overlapping/empty S,T (so `\in`,
+/// `\subseteq`, `\union`, `\` change verdict), empty and longer sequences,
+/// records with equal/zero/negative fields, and functions with a different
+/// (and empty) domain (so `f[1]`/`f[2]` sometimes error on BOTH paths).
+fn build_states() -> Vec<TlaState> {
+    vec![
+        // (0) canonical baseline.
+        build_state(),
+        // (1) x > y, b = FALSE, S and T disjoint, empty function domain.
+        make_state(
+            9,
+            2,
+            false,
+            &[1, 2],
+            &[5, 6],
+            &[7],
+            0,
+            0,
+            &[],
+        ),
+        // (2) x == y, empty S, T == full, empty sequence, negative record fields.
+        make_state(
+            4,
+            4,
+            true,
+            &[],
+            &[1, 2, 3, 4],
+            &[],
+            -3,
+            -8,
+            &[(1, 1)],
+        ),
+        // (3) negatives, S superset of T, longer sequence, different func range.
+        make_state(
+            -2,
+            5,
+            false,
+            &[1, 2, 3, 4, 5],
+            &[2, 4],
+            &[0, 0, 5, 100],
+            2,
+            2,
+            &[(1, 2), (2, 1), (3, 3)],
+        ),
+        // (4) zeros / boundaries, S == T, singleton sequence.
+        make_state(
+            0,
+            0,
+            true,
+            &[2, 3],
+            &[2, 3],
+            &[42],
+            5,
+            5,
+            &[(1, 100), (2, 100)],
+        ),
+    ]
 }
 
 fn build_definitions() -> BTreeMap<String, TlaDefinition> {
@@ -965,29 +1054,43 @@ fn compare(
     }
 }
 
-fn check_equivalence(expr: &str) -> Result<(), String> {
+/// Check `eval_expr(expr, s) == eval_compiled(compile_expr(expr), s)` on a
+/// SINGLE state. Both-Ok-equal / both-error / both-panic are all "equal".
+fn check_equivalence_in_state(expr: &str, state: &TlaState, state_idx: usize) -> Result<(), String> {
     // Catch panics — either evaluator panicking is itself a divergence we
     // want to surface (and not bring down the whole proptest run with).
-    let state = build_state();
     let defs = build_definitions();
-    let ctx = EvalContext::with_definitions(&state, &defs);
+    let ctx = EvalContext::with_definitions(state, &defs);
 
     let interp = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| eval_expr(expr, &ctx)));
+    // The compiler is state-independent, but we recompile per state so a
+    // panic in either stage is attributed to the right (expr, state) pair.
     let compi = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let compiled = compile_expr(expr);
         eval_compiled(&compiled, &ctx)
     }));
 
+    let tag = |m: String| format!("[state #{state_idx}] {m}");
     match (interp, compi) {
-        (Ok(i), Ok(c)) => compare(expr, i, c),
+        (Ok(i), Ok(c)) => compare(expr, i, c).map_err(tag),
         (Err(_), Err(_)) => Ok(()), // both panicked - symmetric
-        (Ok(_), Err(_)) => Err(format!(
+        (Ok(_), Err(_)) => Err(tag(format!(
             "DIVERGENCE on `{expr}`: compiler panicked, interpreter did not"
-        )),
-        (Err(_), Ok(_)) => Err(format!(
+        ))),
+        (Err(_), Ok(_)) => Err(tag(format!(
             "DIVERGENCE on `{expr}`: interpreter panicked, compiler did not"
-        )),
+        ))),
     }
+}
+
+/// Check the equivalence across the WHOLE panel of states (`build_states`).
+/// A divergence in any single state fails the whole check, so a predicate is
+/// exercised in states where its sub-predicates are both true and false.
+fn check_equivalence(expr: &str) -> Result<(), String> {
+    for (idx, state) in build_states().iter().enumerate() {
+        check_equivalence_in_state(expr, state, idx)?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

@@ -16,6 +16,13 @@ failpoints = ["fail/failpoints"]
 # Enable Z3-backed symbolic Init enumeration (T5).
 # Requires libz3-dev / clang to build the z3-sys bindgen step.
 symbolic-init = ["dep:z3"]
+# Dual-evaluator unification Phase 0: when a model hot-path predicate is
+# evaluated via the interpreted `eval_expr`, also evaluate it via
+# `eval_compiled(compile_expr(..))` and log any divergence. OFF by default —
+# zero cost on the production path (the check helper compiles to a no-op).
+# Enable + set TLAPP_EVAL_CONSISTENCY=1 to surface real-spec divergences on a
+# corpus run. See docs/eval-unify-phase0-audit.md.
+eval-consistency-check = []
 # Enable Verus annotations on shipping FingerprintShard (T13.4 Phase 2).
 # Activates the Verus path-deps below; only needed for `cargo verus check`,
 # not for regular `cargo build` / `cargo test`. The Verus deps are optional
