@@ -446,6 +446,29 @@ fn arb_bool(depth: u32) -> BoxedStrategy<Typed> {
             body.text()
         ))
     });
+    // Phase-2 port: tuple-binder quantifiers `\E <<a,b>> \in S : P` /
+    // `\A <<a,b>> \in S : P`. The domain is a set of pairs so destructuring
+    // is exercised; the predicate references both components.
+    let tuple_exists = arb_bool(depth - 1).prop_map(|body| {
+        Typed::Bool(format!(
+            "(\\E <<__a, __b>> \\in {{<<1,2>>, <<3,4>>}} : (({}) \\/ (__a < __b)))",
+            body.text()
+        ))
+    });
+    let tuple_forall = arb_bool(depth - 1).prop_map(|body| {
+        Typed::Bool(format!(
+            "(\\A <<__a, __b>> \\in {{<<1,2>>, <<3,4>>}} : (({}) \\/ (__a < __b)))",
+            body.text()
+        ))
+    });
+    // Phase-2 port: type-set membership `f \in [D -> R]` and record-set
+    // membership `r \in [a: S, b: T]`. Uses a small concrete function/record
+    // so the compiled structural membership check is exercised true and false.
+    let func_set_in = Just(Typed::Bool(
+        "([__i \\in 1..2 |-> __i] \\in [1..2 -> 1..3])".to_string(),
+    ));
+    let rec_set_in =
+        Just(Typed::Bool("([a |-> 1, b |-> 2] \\in [a: 1..2, b: 1..3])".to_string()));
     let if_bool = (
         arb_bool(depth - 1),
         arb_bool(depth - 1),
@@ -470,6 +493,10 @@ fn arb_bool(depth: u32) -> BoxedStrategy<Typed> {
         1 => subseteq,
         1 => exists,
         1 => forall,
+        1 => tuple_exists,
+        1 => tuple_forall,
+        1 => func_set_in,
+        1 => rec_set_in,
         1 => if_bool,
         1 => opcall,
     ]
@@ -498,6 +525,30 @@ fn arb_set_int(depth: u32) -> BoxedStrategy<Typed> {
         // {__e + 1 : __e \in 1..3}
         Typed::SetInt(format!("{{({}) + __e : __e \\in 1..3}}", e.text()))
     });
+    // Phase-2 port: multi-binder MAP comprehension `{ e : x \in S, y \in T }`.
+    let multi_map = arb_int(depth - 1).prop_map(|e| {
+        Typed::SetInt(format!(
+            "{{(({}) + __x) * __y : __x \\in 1..3, __y \\in 1..2}}",
+            e.text()
+        ))
+    });
+    // Phase-2 port: multi-binder FILTER comprehension
+    // `{ x \in S, y \in T : P }`. Elements are pairs; we project the sum via a
+    // wrapping map so the result stays a set of Int (keeps the Typed::SetInt
+    // contract; the inner filter comprehension itself is the ported node).
+    let multi_filter = arb_bool(depth - 1).prop_map(|p| {
+        Typed::SetInt(format!(
+            "{{ __t[1] + __t[2] : __t \\in {{ __x \\in 1..3, __y \\in 1..3 : ({}) \\/ (__x <= __y) }} }}",
+            p.text()
+        ))
+    });
+    // Phase-2 port: tuple-binder FILTER comprehension `{ <<x,y>> \in S : P }`.
+    let tuple_filter = arb_bool(depth - 1).prop_map(|p| {
+        Typed::SetInt(format!(
+            "{{ __t[1] * __t[2] : __t \\in {{ <<__x, __y>> \\in {{<<1,2>>, <<3,4>>, <<5,6>>}} : ({}) \\/ (__x < __y) }} }}",
+            p.text()
+        ))
+    });
 
     prop_oneof![
         4 => leaf,
@@ -507,6 +558,9 @@ fn arb_set_int(depth: u32) -> BoxedStrategy<Typed> {
         2 => lit,
         1 => filter,
         1 => map,
+        1 => multi_map,
+        1 => multi_filter,
+        1 => tuple_filter,
     ]
     .boxed()
 }
@@ -1186,6 +1240,64 @@ fn sanity_quantifier() {
 #[test]
 fn sanity_record_access() {
     check_equivalence("r.a + r.b").unwrap();
+}
+
+// Phase-2 port sanity tests: each construct the ports moved off the
+// `Unparsed` interpreter fallback onto a real `CompiledExpr` node. The
+// equivalence check proves the compiled node matches the interpreter.
+
+#[test]
+fn sanity_tuple_binder_exists() {
+    check_equivalence("\\E <<a, b>> \\in {<<1, 2>>, <<3, 1>>} : a > b").unwrap();
+    check_equivalence("\\E <<a, b>> \\in {<<1, 2>>, <<3, 4>>} : a > b").unwrap();
+}
+
+#[test]
+fn sanity_tuple_binder_forall() {
+    check_equivalence("\\A <<a, b>> \\in {<<1, 2>>, <<3, 4>>} : a < b").unwrap();
+    check_equivalence("\\A <<a, b>> \\in {<<1, 2>>, <<4, 3>>} : a < b").unwrap();
+}
+
+#[test]
+fn sanity_tuple_binder_choose() {
+    check_equivalence("CHOOSE <<a, b>> \\in {<<1, 2>>, <<3, 4>>} : a + b = 7").unwrap();
+    // No witness -> both error.
+    check_equivalence("CHOOSE <<a, b>> \\in {<<1, 2>>} : a > b").unwrap();
+}
+
+#[test]
+fn sanity_tuple_binder_arity_mismatch_both_error() {
+    // Domain element is a triple; a 2-var tuple binder mismatches -> both err.
+    check_equivalence("\\E <<a, b>> \\in {<<1, 2, 3>>} : a > 0").unwrap();
+}
+
+#[test]
+fn sanity_multi_binder_map_comprehension() {
+    check_equivalence("{ x + y : x \\in 1..3, y \\in 1..2 }").unwrap();
+    check_equivalence("{ <<k, v>> : k \\in {1, 2}, v \\in {7, 8} }").unwrap();
+}
+
+#[test]
+fn sanity_multi_binder_filter_comprehension() {
+    check_equivalence("{ x \\in 1..3, y \\in 1..3 : x < y }").unwrap();
+}
+
+#[test]
+fn sanity_tuple_binder_filter_comprehension() {
+    check_equivalence("{ <<x, y>> \\in {<<1, 2>>, <<3, 1>>} : x < y }").unwrap();
+}
+
+#[test]
+fn sanity_type_set_membership_function() {
+    check_equivalence("[i \\in 1..2 |-> i] \\in [1..2 -> 1..3]").unwrap();
+    // Wrong range -> not a member.
+    check_equivalence("[i \\in 1..2 |-> 9] \\in [1..2 -> 1..3]").unwrap();
+}
+
+#[test]
+fn sanity_type_set_membership_record() {
+    check_equivalence("[a |-> 1, b |-> 2] \\in [a: 1..2, b: 1..3]").unwrap();
+    check_equivalence("[a |-> 5, b |-> 2] \\in [a: 1..2, b: 1..3]").unwrap();
 }
 
 #[test]

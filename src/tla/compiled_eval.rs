@@ -4,7 +4,7 @@
 //! the overhead of string parsing on every evaluation.
 
 use crate::tla::compiled_expr::{
-    CompiledExpr, compile_expr, find_top_level_colon, resolve_state_vars,
+    CompiledExpr, TupleQuantifierKind, compile_expr, find_top_level_colon, resolve_state_vars,
     resolve_state_vars_with_binders,
 };
 use crate::tla::hashed_arc::HashedArc;
@@ -1085,6 +1085,49 @@ fn eval_compiled_inner(
             Err(anyhow!("CHOOSE: no element satisfies predicate"))
         }
 
+        // Tuple-binder quantifier / CHOOSE: `\E <<x,y>> \in S : P`, etc.
+        // Each domain element must be a sequence of exactly `vars.len()`
+        // components; component i binds to vars[i]. Mirrors the interpreter's
+        // `assign_binder_value` (arity mismatch / non-seq → error).
+        CompiledExpr::TupleQuantifier {
+            kind,
+            vars,
+            domain,
+            body,
+        } => {
+            let domain_val = eval_compiled_inner(domain, ctx, depth)?;
+            let domain_set = domain_val.as_set()?;
+            for elem in domain_set.iter() {
+                let new_ctx = bind_tuple_element(ctx, vars, elem)?;
+                let holds = eval_compiled_inner(body, &new_ctx, depth)?.as_bool()?;
+                match kind {
+                    TupleQuantifierKind::Exists => {
+                        if holds {
+                            return Ok(TlaValue::Bool(true));
+                        }
+                    }
+                    TupleQuantifierKind::Forall => {
+                        if !holds {
+                            return Ok(TlaValue::Bool(false));
+                        }
+                    }
+                    TupleQuantifierKind::Choose => {
+                        if holds {
+                            return Ok(elem.clone());
+                        }
+                    }
+                }
+            }
+            match kind {
+                TupleQuantifierKind::Exists => Ok(TlaValue::Bool(false)),
+                TupleQuantifierKind::Forall => Ok(TlaValue::Bool(true)),
+                TupleQuantifierKind::Choose => {
+                    Err(anyhow!("CHOOSE: no element satisfies predicate"))
+                }
+            }
+        }
+
+
         // Set comprehension
         CompiledExpr::SetComprehension {
             var,
@@ -1107,6 +1150,31 @@ fn eval_compiled_inner(
                 let val = eval_compiled_inner(body, &new_ctx, depth)?;
                 result.insert(val);
             }
+            Ok(TlaValue::Set(HashedArc::new(result)))
+        }
+
+        // Multi-binder set comprehension: `{ e : x \in S, y \in T }` (map)
+        // or `{ x \in S, y \in T : P }` / `{ <<x,y>> \in S : P }` (filter).
+        // Nested cartesian iteration over the binders in order, then apply the
+        // optional filter and collect the mapped body. Mirrors the
+        // interpreter's `collect_binder_map_set` / `collect_binder_filter_set`.
+        CompiledExpr::MultiSetComprehension {
+            binders,
+            body,
+            filter,
+        } => {
+            let mut result = BTreeSet::new();
+            multi_comprehension_iter(binders, 0, ctx, depth, &mut |scoped| {
+                ctx.check_budget(1)?;
+                if let Some(filter_expr) = filter {
+                    if !eval_compiled_inner(filter_expr, scoped, depth)?.as_bool()? {
+                        return Ok(());
+                    }
+                }
+                let val = eval_compiled_inner(body, scoped, depth)?;
+                result.insert(val);
+                Ok(())
+            })?;
             Ok(TlaValue::Set(HashedArc::new(result)))
         }
 
@@ -1241,6 +1309,66 @@ fn eval_compiled_inner(
         // Fallback: use string-based evaluation
         CompiledExpr::Unparsed(s) => eval_expr(s, ctx),
     }
+}
+
+/// Bind a domain element to a tuple binder `<<v0, v1, ...>>`, producing a
+/// child context. A single-name binder binds the whole element. A multi-name
+/// binder requires `elem` to be a sequence of exactly the same arity and binds
+/// each component positionally. Mirrors the interpreter's `assign_binder_value`
+/// (`src/tla/eval/quantifier.rs`): non-sequence or arity mismatch is an error.
+fn bind_tuple_element<'a>(
+    ctx: &EvalContext<'a>,
+    vars: &[String],
+    elem: &TlaValue,
+) -> Result<EvalContext<'a>> {
+    if vars.len() == 1 {
+        return Ok(ctx.with_local_value(vars[0].clone(), elem.clone()));
+    }
+    let parts = match elem {
+        TlaValue::Seq(parts) if parts.len() == vars.len() => parts,
+        TlaValue::Seq(parts) => {
+            return Err(anyhow!(
+                "tuple binder arity mismatch: expected {}, got {}",
+                vars.len(),
+                parts.len()
+            ));
+        }
+        other => {
+            return Err(anyhow!(
+                "tuple binder expects a sequence value, got {:?}",
+                other
+            ));
+        }
+    };
+    let mut child = ctx.clone();
+    for (name, part) in vars.iter().zip(parts.iter()) {
+        child = child.with_local_value(name.clone(), part.clone());
+    }
+    Ok(child)
+}
+
+/// Recursively iterate a multi-binder cartesian product, invoking `f` with the
+/// scoped context for each combination. Binder `i`'s domain is evaluated in the
+/// context of binders `0..i` (so later domains may depend on earlier binders,
+/// matching the interpreter's left-to-right binder evaluation).
+fn multi_comprehension_iter<'a>(
+    binders: &[(Vec<String>, CompiledExpr)],
+    idx: usize,
+    ctx: &EvalContext<'a>,
+    depth: usize,
+    f: &mut dyn FnMut(&EvalContext<'a>) -> Result<()>,
+) -> Result<()> {
+    if idx == binders.len() {
+        return f(ctx);
+    }
+    let (vars, domain) = &binders[idx];
+    let domain_val = eval_compiled_inner(domain, ctx, depth)?;
+    let domain_set = domain_val.as_set()?;
+    for elem in domain_set.iter() {
+        let scoped = bind_tuple_element(ctx, vars, elem)?;
+        multi_comprehension_iter(binders, idx + 1, &scoped, depth, f)?;
+    }
+    Ok(())
 }
 
 fn compiled_membership_contains(

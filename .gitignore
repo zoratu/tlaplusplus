@@ -23,3 +23,5 @@ tests/*.proptest-regressions
 scripts/REDACTED
 notes/
 .ci/last-analysis.txt
+
+/.diff-tlc-out
