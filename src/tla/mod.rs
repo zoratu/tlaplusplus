@@ -29,6 +29,7 @@ pub use action_ir::{
 pub use cfg::{ConfigValue, TlaConfig, normalize_operator_ref_name, parse_tla_config};
 pub use compiled_eval::{
     apply_compiled_action_ir, apply_compiled_action_ir_multi, eval_compiled, eval_compiled_guard,
+    eval_predicate,
 };
 pub use compiled_expr::{CompiledActionClause, CompiledActionIr, CompiledExpr, compile_expr};
 pub use eval::{

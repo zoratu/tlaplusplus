@@ -2601,6 +2601,45 @@ fn try_parse_func_construct(inner: &str) -> Option<CompiledExpr> {
         let body_owned = dedent_common(&inner[arrow_idx + 3..]);
         let body = body_owned.as_str();
 
+        // Multi-binder function constructor: `[x, y \in D |-> e]` /
+        // `[x \in A, y \in B |-> e]` — a function over the cartesian product,
+        // keyed by `<<x, y>>` tuples. The compiler has no multi-binder
+        // `FuncConstruct` node, and `parse_in_binding` would happily accept the
+        // FIRST `var \in dom` slice (`x`), silently dropping the second binder
+        // and producing a WRONG single-binder function; or, when the var side
+        // is a comma list (`x, y`), it falls through to the record-literal
+        // branch and mis-reads `[src, dst \in Node |-> TRUE]` as the record
+        // `{"dst \in Node": TRUE}`. Either way the result is a silently wrong
+        // value (not an error — so the compiled-error fallback in
+        // `eval_predicate` can't catch it), which false-violated a
+        // `NetworkPath \in [Node \X Node -> BOOLEAN]` TypeInvariant on
+        // MCCheckpointCoordination's initial state. So detect the multi-binder
+        // shape BEFORE `parse_in_binding` and punt the whole bracket to
+        // `Unparsed`, whose leaf is the interpreter — it builds the
+        // cartesian-product function correctly. (Portable to a real multi-binder
+        // `FuncConstruct` node in Phase 2 — Table 2.)
+        if binding.contains("\\in") {
+            let first_in = binding.find("\\in").unwrap();
+            let var_side = binding[..first_in].trim();
+            // Shared-domain form: `x, y \in D` — the var side (before the single
+            // `\in`) is itself a top-level comma list of 2+ identifiers.
+            let shared_domain_multi = split_top_level(var_side, ",")
+                .iter()
+                .filter(|p| !p.trim().is_empty())
+                .count()
+                >= 2;
+            // Per-binder-domain form: `x \in A, y \in B` — the binding splits on
+            // top-level commas into 2+ pieces that each carry their own `\in`.
+            let per_binder_multi = split_top_level(binding, ",")
+                .iter()
+                .filter(|p| p.contains("\\in"))
+                .count()
+                >= 2;
+            if shared_domain_multi || per_binder_multi {
+                return Some(CompiledExpr::Unparsed(format!("[{inner}]")));
+            }
+        }
+
         if let Some((var, domain)) = parse_in_binding(binding) {
             return Some(CompiledExpr::FuncConstruct {
                 var: var.to_string(),
@@ -6159,6 +6198,48 @@ fn test_negated_bulleted_conjunction_compiles_to_not_of_and() {
         CompiledExpr::And(parts) => assert_eq!(parts.len(), 2),
         other => panic!("`~A /\\ B` must be And([~A, B]), got: {:?}", other),
     }
+}
+
+#[test]
+fn test_multi_binder_function_constructor_punts_to_unparsed() {
+    // Regression (eval-unify Phase 1): a MULTI-binder function constructor
+    // `[x, y \in D |-> e]` (a function over `D \X D`, keyed by `<<x, y>>`)
+    // must NOT be mis-compiled to a `RecordLiteral`. `parse_in_binding`
+    // rejects the `x, y` var side, and there is no multi-binder `FuncConstruct`
+    // node, so before the fix the caller fell through to the record-literal
+    // branch and read `[src, dst \in Node |-> TRUE]` as the record
+    // `{"dst \in Node": TRUE}` — a silently WRONG value that false-violated
+    // `NetworkPath \in [Node \X Node -> BOOLEAN]` on MCCheckpointCoordination's
+    // initial state. The compiler must instead emit `Unparsed`, whose leaf is
+    // the interpreter (which builds the cartesian-product function correctly).
+    for src in [
+        "[src, dst \\in Node |-> TRUE]",           // shared domain
+        "[x, y \\in 1..3 |-> x + y]",              // shared domain, arith body
+        "[i \\in A, j \\in B |-> i]",              // per-binder domains
+    ] {
+        match compile_expr(src) {
+            CompiledExpr::Unparsed(s) => assert_eq!(
+                s.trim(),
+                src,
+                "multi-binder func-construct should punt the whole bracket"
+            ),
+            other => panic!(
+                "multi-binder function constructor `{src}` must compile to \
+                 Unparsed, got: {other:?}"
+            ),
+        }
+    }
+
+    // Guardrails: single-binder function constructors and record literals are
+    // UNCHANGED.
+    assert!(
+        matches!(compile_expr("[n \\in Node |-> TRUE]"), CompiledExpr::FuncConstruct { .. }),
+        "single-binder func-construct must stay FuncConstruct"
+    );
+    assert!(
+        matches!(compile_expr("[a |-> 1, b |-> 2]"), CompiledExpr::RecordLiteral(_)),
+        "record literal must stay RecordLiteral"
+    );
 }
 
 /// T206: detect expressions with 3+ top-level binary `-` (or `+`) occurrences,

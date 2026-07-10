@@ -6,7 +6,7 @@ use crate::tla::module::TlaModuleInstance;
 use crate::tla::value::get_resolution_schema;
 use crate::tla::{
     ActionClause, ActionIr, CompiledActionIr, EvalContext, TlaDefinition, TlaState, TlaValue,
-    apply_compiled_action_ir_multi, compile_action_ir, eval_expr, normalize_param_name,
+    apply_compiled_action_ir_multi, compile_action_ir, eval_predicate, normalize_param_name,
     split_action_body_disjuncts, split_top_level,
 };
 use anyhow::{Result, anyhow};
@@ -556,7 +556,7 @@ fn execute_branch(
 
             let mut args = Vec::with_capacity(arg_exprs.len());
             for arg_expr in arg_exprs {
-                args.push(eval_expr(&arg_expr, &outer_ctx)?);
+                args.push(eval_predicate(&arg_expr, &outer_ctx)?);
             }
 
             let mut bound_locals = locals.clone();
@@ -608,7 +608,7 @@ fn execute_branch(
 
         let mut args = Vec::with_capacity(arg_exprs.len());
         for arg_expr in arg_exprs {
-            args.push(eval_expr(&arg_expr, &ctx)?);
+            args.push(eval_predicate(&arg_expr, &ctx)?);
         }
 
         let mut bound_locals = locals.clone();
@@ -805,7 +805,7 @@ fn parse_binders(
             }
         }
 
-        let domain = eval_expr(domain_text.trim(), &ctx)?;
+        let domain = eval_predicate(domain_text.trim(), &ctx)?;
         let values = domain.as_set()?.iter().cloned().collect::<Vec<_>>();
 
         for var in split_top_level(vars_text, ",") {
@@ -1160,7 +1160,7 @@ fn seed_instance_constant_bindings(
             defs_mut.insert(constant.clone(), def);
             continue;
         }
-        if let Ok(value) = eval_expr(constant, parent_ctx) {
+        if let Ok(value) = eval_predicate(constant, parent_ctx) {
             locals_mut.insert(constant.clone(), value);
         }
     }
@@ -1173,7 +1173,7 @@ fn bind_instance_substitutions(
 ) -> Result<()> {
     for (param, value_expr) in &instance.substitutions {
         let trimmed = value_expr.trim();
-        let value = eval_expr(trimmed, parent_ctx)?;
+        let value = eval_predicate(trimmed, parent_ctx)?;
         locals_mut.insert(param.clone(), value);
 
         if let Some(primed_value) = resolved_instance_primed_substitution_value(trimmed, parent_ctx)
@@ -1190,7 +1190,7 @@ fn resolved_instance_primed_substitution_value(
     parent_ctx: &EvalContext<'_>,
 ) -> Option<TlaValue> {
     let primed_expr = format!("{trimmed}'");
-    let primed_value = eval_expr(&primed_expr, parent_ctx).ok()?;
+    let primed_value = eval_predicate(&primed_expr, parent_ctx).ok()?;
     match &primed_value {
         TlaValue::ModelValue(name) if name == &primed_expr => None,
         _ => Some(primed_value),

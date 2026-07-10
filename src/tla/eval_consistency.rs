@@ -23,19 +23,20 @@
 #[cfg(feature = "eval-consistency-check")]
 use crate::tla::EvalContext;
 
-/// Compare the interpreted result for `expr` against the compiled result and
-/// report any divergence. `interp` is the value the caller already obtained
-/// from `eval_expr(expr, ctx)` — passing it in avoids re-evaluating the
-/// interpreted path.
+/// Compare the interpreted (`eval_expr`) and compiled (`eval_compiled`) results
+/// for `expr` in `ctx` and report any divergence.
+///
+/// Post-Phase-1 the model hot path evaluates via the *compiled* path
+/// (`eval_predicate` → `eval_compiled`), so this check computes BOTH sides
+/// itself rather than trusting a caller-provided `interp` value (which would
+/// now be the compiled result, making the comparison vacuous). The whole
+/// function is compiled out in default builds, so re-running the interpreter
+/// here costs nothing on the production path.
 ///
 /// No-op unless built with `--features eval-consistency-check` AND
 /// `TLAPP_EVAL_CONSISTENCY` is set.
 #[cfg(feature = "eval-consistency-check")]
-pub fn check_predicate_consistency(
-    expr: &str,
-    ctx: &EvalContext<'_>,
-    interp: &anyhow::Result<crate::tla::TlaValue>,
-) {
+pub fn check_predicate_consistency(expr: &str, ctx: &EvalContext<'_>) {
     use std::sync::OnceLock;
     static MODE: OnceLock<Mode> = OnceLock::new();
     #[derive(Clone, Copy, PartialEq)]
@@ -53,10 +54,12 @@ pub fn check_predicate_consistency(
         return;
     }
 
+    let interp = crate::tla::eval_expr(expr, ctx);
+
     let compiled = crate::tla::compile_expr(expr);
     let compi = crate::tla::eval_compiled(&compiled, ctx);
 
-    let divergent = match (interp, &compi) {
+    let divergent = match (&interp, &compi) {
         (Ok(a), Ok(b)) => a != b,
         (Err(_), Err(_)) => false, // both-error is agreement
         _ => true,                 // one Ok, one Err
@@ -80,9 +83,4 @@ pub fn check_predicate_consistency(
 /// No-op stub for default builds (feature off). Monomorphised away entirely.
 #[cfg(not(feature = "eval-consistency-check"))]
 #[inline(always)]
-pub fn check_predicate_consistency(
-    _expr: &str,
-    _ctx: &crate::tla::EvalContext<'_>,
-    _interp: &anyhow::Result<crate::tla::TlaValue>,
-) {
-}
+pub fn check_predicate_consistency(_expr: &str, _ctx: &crate::tla::EvalContext<'_>) {}
