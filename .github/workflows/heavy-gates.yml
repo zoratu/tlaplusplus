@@ -1,0 +1,82 @@
+name: heavy-gates
+
+# Manually-dispatched heavy verification gates that don't fit GitHub-hosted
+# runners:
+#   - chaos-smoke: 5-min failpoint soak (scripts/chaos_smoke.sh)
+#   - verus:       the four Verus proof files (verification/verus/run_proof.sh),
+#                  which require a multi-hundred-MB Verus toolchain built from
+#                  source.
+#
+# These run on a SELF-HOSTED, EPHEMERAL runner on spot. The runner is launched
+# and registered out-of-band by the spot orchestrator (kept in infrastructure,
+# NOT in this repo); it advertises the generic labels [self-hosted, linux, spot]
+# and self-terminates after the job. Nothing in this file references any
+# credential, AWS resource, region, AMI, IP, or instance id — only the generic
+# runner label. All secrets (the runner registration token, cloud credentials)
+# live in the out-of-band orchestrator.
+#
+# Flow:
+#   1. out-of-band: launch a spot box and register a `--ephemeral` Actions
+#      runner on it with the `spot` label (+ Rust toolchain; for `verus`, Verus
+#      on PATH via scripts/verus_bootstrap.sh).
+#   2. here: click "Run workflow" (or the orchestrator dispatches via the API).
+#   3. the selected job lands on that runner, runs, and the box tears down.
+#
+# Manual dispatch (not per-push) is deliberate: with no runner online a
+# per-push trigger would queue jobs that hang. Dispatch only when a runner has
+# been provisioned — e.g. pre-release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      gate:
+        description: Which heavy gate(s) to run
+        type: choice
+        default: both
+        options:
+          - both
+          - chaos-smoke
+          - verus
+
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: short
+
+jobs:
+  chaos-smoke:
+    if: ${{ inputs.gate == 'both' || inputs.gate == 'chaos-smoke' }}
+    name: chaos smoke (5-min failpoint soak)
+    runs-on: [self-hosted, linux, spot]
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build (failpoints)
+        run: cargo build --release --features failpoints
+
+      - name: Chaos smoke
+        # Delegates to chaos_soak.sh with smoke params (5-min, swarm auto);
+        # fails unless >= 6 of the 12 catalog failpoints fire.
+        run: scripts/chaos_smoke.sh
+
+  verus:
+    if: ${{ inputs.gate == 'both' || inputs.gate == 'verus' }}
+    name: verus proofs (tier-B, tier-A, shard-methods, liveness)
+    runs-on: [self-hosted, linux, spot]
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Verus proof files
+        # Assumes `verus` is on PATH on the runner (provisioned out-of-band via
+        # scripts/verus_bootstrap.sh); run_proof.sh auto-discovers it. Each
+        # invocation exits non-zero on any verification failure, so `set -e`
+        # makes the job fail if any of the four proofs regresses.
+        run: |
+          set -e
+          verification/verus/run_proof.sh tier-b
+          verification/verus/run_proof.sh tier-a
+          verification/verus/run_proof.sh shard-methods
+          verification/verus/run_proof.sh liveness-v2
