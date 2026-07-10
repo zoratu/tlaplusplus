@@ -1253,3 +1253,209 @@ fn t16_swarm_mode_env_default_is_on() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Layout-fuzzing property (regression net for the compiled `.trim()`-body
+// class of soundness bugs).
+//
+// The bug class: several `try_parse_*` functions in `compiled_expr.rs` used
+// to extract a multi-line body/branch/arm-value with a bare `.trim()` (which
+// de-indents only the FIRST line). For a uniformly-indented bulleted body
+// like
+//     /\ P0 => Q0    <- col 8
+//     /\ P1 => Q1    <- col 8
+// under a shallower construct head, `.trim()` leaves "first bullet at col 0,
+// siblings at col 8". The compiled indented-boolean splitter then takes the
+// shallow first bullet's column as base_indent, folds the deeper siblings
+// into conjunct 0, and the `=>` fallback right-nests the whole thing —
+// FLIPPING the predicate's truth value (a MISSED violation on the compiled
+// `check_invariants` path).
+//
+// The original `compiled_vs_interpreted` proptest missed this whole class
+// because it renders every expression in exactly ONE canonical layout. This
+// property varies LAYOUT: it renders the SAME boolean predicate under a
+// construct in three layouts —
+//   (A) aligned   (head and first body bullet share a column)
+//   (B) shallow-head (head at col 0, body bullets uniformly indented — the
+//       exact shape that triggered the bug)
+//   (C) deep-head (head MORE indented than its body)
+// and asserts:
+//   1. For each layout, the interpreter and compiler agree (both Ok-equal or
+//      both error) — via `check_equivalence`.
+//   2. The COMPILED value is invariant across all three layouts (compiling
+//      is layout-independent for a well-formed predicate).
+// Either failure catches a future `.trim()`-body regression.
+// ---------------------------------------------------------------------------
+
+/// A single atomic `P => Q` implication over the fixed test state. Both sides
+/// are chosen from a small pool that evaluates without error on `build_state`.
+#[derive(Clone, Debug)]
+struct Impl {
+    p: &'static str,
+    q: &'static str,
+}
+
+fn arb_impl() -> impl Strategy<Value = Impl> {
+    // Predicates over the fixed state (x=3, y=7, b=TRUE, S={1,2,3}, T={2,3,4}).
+    let ps = prop::sample::select(vec![
+        "(x = 3)",
+        "(y > 5)",
+        "(x \\in S)",
+        "(2 \\in T)",
+        "(x < y)",
+        "b",
+    ]);
+    let qs = prop::sample::select(vec![
+        "(y = 7)",
+        "(x + 1 = 4)",
+        "(x \\in T)",
+        "(1 \\in S)",
+        "(y > x)",
+        "TRUE",
+    ]);
+    (ps, qs).prop_map(|(p, q)| Impl { p, q })
+}
+
+/// Render a conjunction of `P => Q` implications as a bulleted body, one
+/// bullet per line, every bullet at `indent` spaces.
+fn render_body(impls: &[Impl], indent: usize) -> String {
+    let pad = " ".repeat(indent);
+    impls
+        .iter()
+        .map(|im| format!("{pad}/\\ {} => {}", im.p, im.q))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Which wrapping construct to test the body inside.
+///
+/// NOTE: an unapplied `LAMBDA` is deliberately NOT included here. Its value is
+/// a closure whose `TlaValue::Lambda` equality compares the *stored body text* —
+/// and the whole point of the `try_parse_lambda` fix is that the compiler now
+/// dedents that text while the interpreter keeps the raw indentation, so the
+/// two closures compare unequal even though they are semantically identical
+/// (the lambda is never applied here). The LAMBDA-body layout-invariance is
+/// instead locked by the `lambda_body_col0_uniformly_indented_...` unit test in
+/// `compiled_expr.rs`, which asserts on the compiled *shape*. Every wrapper we
+/// DO include yields a directly value-comparable Bool/Int result.
+#[derive(Clone, Copy, Debug)]
+enum Wrap {
+    Forall,
+    Exists,
+    Choose,
+    IfThen,
+    Let,
+    Case,
+    Bare, // no wrapper — the body compiled directly (top-level conjunction)
+}
+
+fn arb_wrap() -> impl Strategy<Value = Wrap> {
+    prop::sample::select(vec![
+        Wrap::Forall,
+        Wrap::Exists,
+        Wrap::Choose,
+        Wrap::IfThen,
+        Wrap::Let,
+        Wrap::Case,
+        Wrap::Bare,
+    ])
+}
+
+/// Render `wrap(body)` in one of three layouts.
+///   layout 0 = aligned (head and first bullet share a column)
+///   layout 1 = shallow-head (head col 0, body bullets uniformly indented)
+///   layout 2 = deep-head (head more indented than its body)
+///
+/// Returns None for wrapper/layout combos that don't make a well-formed
+/// header (kept minimal — every combo we return must parse).
+fn render_wrapped(wrap: Wrap, impls: &[Impl], layout: u8) -> String {
+    // Body indentation per layout. For all layouts the *body bullets* are
+    // uniformly indented among themselves (that is the whole point — the
+    // bug is about the FIRST bullet vs siblings). We vary the head column and
+    // the body column relative to it.
+    let (head_indent, body_indent) = match layout {
+        0 => (4usize, 4usize),  // aligned: head col 4, body col 4
+        1 => (0usize, 11usize), // shallow head col 0, body col 11 (bug shape)
+        _ => (6usize, 2usize),  // deep head col 6, body col 2
+    };
+    let hpad = " ".repeat(head_indent);
+    let body = render_body(impls, body_indent);
+    match wrap {
+        Wrap::Bare => body,
+        Wrap::Forall => format!("{hpad}\\A i \\in S :\n{body}"),
+        Wrap::Exists => format!("{hpad}\\E i \\in S :\n{body}"),
+        Wrap::Choose => format!("{hpad}CHOOSE i \\in S :\n{body}"),
+        Wrap::IfThen => format!("{hpad}IF x = 3 THEN\n{body}\n{hpad}ELSE FALSE"),
+        Wrap::Let => format!("{hpad}LET z == 1 IN\n{body}"),
+        Wrap::Case => format!("{hpad}CASE x = 3 ->\n{body}\n{hpad}  [] OTHER -> FALSE"),
+    }
+}
+
+/// Evaluate a rendered expression with the compiler, returning the Ok value
+/// or None on error/panic (so we can compare Ok-values across layouts).
+fn compiled_value(expr: &str) -> Option<TlaValue> {
+    let state = build_state();
+    let defs = build_definitions();
+    let ctx = EvalContext::with_definitions(&state, &defs);
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        eval_compiled(&compile_expr(expr), &ctx).ok()
+    }))
+    .ok()
+    .flatten()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        // Bounded for CI: the interesting variation is layout × wrapper, not
+        // huge predicates, so a modest case count fully covers the space.
+        cases: std::env::var("PROPTEST_CASES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(|n: u32| n.min(256))
+            .unwrap_or(128),
+        max_shrink_iters: 2048,
+        .. ProptestConfig::default()
+    })]
+
+    /// Layout-invariance property. For a uniformly-bulleted `/\ P => Q`
+    /// conjunction wrapped in a construct, the compiler must (1) agree with
+    /// the interpreter for EVERY layout, and (2) produce the SAME value
+    /// regardless of layout. This locks the `.trim()`-body soundness class
+    /// closed (forall/exists/choose/if/let/case/lambda/bare bodies).
+    #[test]
+    fn compiled_predicate_is_invariant_to_layout(
+        wrap in arb_wrap(),
+        impls in prop::collection::vec(arb_impl(), 2..=4),
+    ) {
+        // (A) aligned, (B) shallow-head/uniformly-indented body (bug shape),
+        // (C) deep-head. Reference = aligned layout's interpreted value.
+        let mut compiled_vals = Vec::new();
+        for layout in 0u8..3 {
+            let text = render_wrapped(wrap, &impls, layout);
+            prop_assume!(!text.trim().is_empty());
+
+            // (1) interpreter and compiler must agree on this exact layout.
+            if let Err(msg) = check_equivalence(&text) {
+                return Err(TestCaseError::fail(format!(
+                    "layout {layout} ({wrap:?}) interp/compiler divergence:\n{msg}"
+                )));
+            }
+            compiled_vals.push(compiled_value(&text));
+        }
+
+        // (2) the compiled value must be identical across all three layouts.
+        // (CHOOSE over a possibly-empty predicate can legitimately error, so
+        // we only require equality among the produced Ok/None triple — which
+        // check (1) has already tied to the interpreter per layout.)
+        prop_assert_eq!(
+            &compiled_vals[0], &compiled_vals[1],
+            "compiled value differs between aligned and shallow-head layouts for {:?}",
+            wrap
+        );
+        prop_assert_eq!(
+            &compiled_vals[0], &compiled_vals[2],
+            "compiled value differs between aligned and deep-head layouts for {:?}",
+            wrap
+        );
+    }
+}
