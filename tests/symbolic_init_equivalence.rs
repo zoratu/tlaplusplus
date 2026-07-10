@@ -123,7 +123,7 @@ proptest! {
         pred in arb_predicate(2),
     ) {
         let (field_specs, var_name) = spec;
-        let state = BTreeMap::new();
+        let state = tlaplusplus::tla::value::TlaState::new();
         let defs = BTreeMap::new();
         let instances = BTreeMap::new();
         let ctx = make_ctx(&state, &defs, &instances);
@@ -226,7 +226,7 @@ proptest! {
         range_max in 2i64..=4,
         pred in arb_seq_predicate(3),
     ) {
-        let state = BTreeMap::new();
+        let state = tlaplusplus::tla::value::TlaState::new();
         let defs = BTreeMap::new();
         let instances = BTreeMap::new();
         let ctx = make_ctx(&state, &defs, &instances);
@@ -248,7 +248,7 @@ proptest! {
 
 #[test]
 fn empty_intersection_predicate_returns_empty_set() {
-    let state = BTreeMap::new();
+    let state = tlaplusplus::tla::value::TlaState::new();
     let defs = BTreeMap::new();
     let instances = BTreeMap::new();
     let ctx = make_ctx(&state, &defs, &instances);

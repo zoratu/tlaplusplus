@@ -2586,7 +2586,7 @@ mod tests {
 
     #[test]
     fn empty_field_specs_returns_none() {
-        let state = BTreeMap::new();
+        let state = crate::tla::value::TlaState::new();
         let defs = BTreeMap::new();
         let instances = BTreeMap::new();
         let ctx = make_ctx(&state, &defs, &instances);
@@ -2596,7 +2596,7 @@ mod tests {
 
     #[test]
     fn single_int_field_with_true_predicate_enumerates_full_domain() {
-        let state = BTreeMap::new();
+        let state = crate::tla::value::TlaState::new();
         let defs = BTreeMap::new();
         let instances = BTreeMap::new();
         let ctx = make_ctx(&state, &defs, &instances);
@@ -2611,7 +2611,7 @@ mod tests {
 
     #[test]
     fn two_int_fields_with_sum_constraint_matches_brute_force() {
-        let state = BTreeMap::new();
+        let state = crate::tla::value::TlaState::new();
         let defs = BTreeMap::new();
         let instances = BTreeMap::new();
         let ctx = make_ctx(&state, &defs, &instances);
@@ -2641,7 +2641,7 @@ mod tests {
     #[test]
     fn distinctness_constraint_three_fields() {
         // Mini-Einstein: 3 fields, each in 1..3, all distinct.
-        let state = BTreeMap::new();
+        let state = crate::tla::value::TlaState::new();
         let defs = BTreeMap::new();
         let instances = BTreeMap::new();
         let ctx = make_ctx(&state, &defs, &instances);
@@ -2659,7 +2659,7 @@ mod tests {
 
     #[test]
     fn enum_domain_with_equality() {
-        let state = BTreeMap::new();
+        let state = crate::tla::value::TlaState::new();
         let defs = BTreeMap::new();
         let instances = BTreeMap::new();
         let ctx = make_ctx(&state, &defs, &instances);
@@ -2686,7 +2686,7 @@ mod tests {
 
     #[test]
     fn unsupported_predicate_returns_none() {
-        let state = BTreeMap::new();
+        let state = crate::tla::value::TlaState::new();
         let defs = BTreeMap::new();
         let instances = BTreeMap::new();
         let ctx = make_ctx(&state, &defs, &instances);
@@ -2708,7 +2708,7 @@ mod tests {
     fn function_set_int_range_with_position_filter() {
         // Sequence p of length 3 over {1,2,3,4} where p[2] = 2.
         // Expected: 4 * 1 * 4 = 16 sequences.
-        let state = BTreeMap::new();
+        let state = crate::tla::value::TlaState::new();
         let defs = BTreeMap::new();
         let instances = BTreeMap::new();
         let ctx = make_ctx(&state, &defs, &instances);
@@ -2728,7 +2728,7 @@ mod tests {
         // Mini-Einstein: sequence of length 3 over {RED, GREEN, BLUE},
         // distinctness constraint via chained set differences. Should
         // yield 3! = 6 permutations.
-        let state = BTreeMap::new();
+        let state = crate::tla::value::TlaState::new();
         let defs = BTreeMap::new();
         let instances = BTreeMap::new();
         let ctx = make_ctx(&state, &defs, &instances);
@@ -2754,7 +2754,7 @@ mod tests {
     #[test]
     fn function_set_with_constant_filter() {
         // Permutation of {1,2,3} with p[1] = 2 should give 2 results.
-        let state = BTreeMap::new();
+        let state = crate::tla::value::TlaState::new();
         let defs = BTreeMap::new();
         let instances = BTreeMap::new();
         let ctx = make_ctx(&state, &defs, &instances);
@@ -2774,7 +2774,7 @@ mod tests {
     #[test]
     fn function_set_permutation_string_range_matches_brute_force() {
         // Brute-force-comparable size: 4! = 24 permutations of a string set.
-        let state = BTreeMap::new();
+        let state = crate::tla::value::TlaState::new();
         let defs = BTreeMap::new();
         let instances = BTreeMap::new();
         let ctx = make_ctx(&state, &defs, &instances);
@@ -2805,7 +2805,7 @@ mod tests {
 
     #[test]
     fn function_set_zero_length_returns_none() {
-        let state = BTreeMap::new();
+        let state = crate::tla::value::TlaState::new();
         let defs = BTreeMap::new();
         let instances = BTreeMap::new();
         let ctx = make_ctx(&state, &defs, &instances);
@@ -2816,7 +2816,7 @@ mod tests {
 
     #[test]
     fn function_set_empty_range_returns_zero_seqs() {
-        let state = BTreeMap::new();
+        let state = crate::tla::value::TlaState::new();
         let defs = BTreeMap::new();
         let instances = BTreeMap::new();
         let ctx = make_ctx(&state, &defs, &instances);
@@ -2828,7 +2828,7 @@ mod tests {
     #[test]
     fn function_set_unsupported_pred_returns_none() {
         // Sequence projection inside Cardinality is not part of the subset.
-        let state = BTreeMap::new();
+        let state = crate::tla::value::TlaState::new();
         let defs = BTreeMap::new();
         let instances = BTreeMap::new();
         let ctx = make_ctx(&state, &defs, &instances);
@@ -2843,7 +2843,7 @@ mod tests {
         // Permutation expressed via pairwise # operators (no set-difference
         // shortcut). Should still produce 6 results — the translator
         // handles `p[i] # p[j]` directly via translate_eq + not.
-        let state = BTreeMap::new();
+        let state = crate::tla::value::TlaState::new();
         let defs = BTreeMap::new();
         let instances = BTreeMap::new();
         let ctx = make_ctx(&state, &defs, &instances);
@@ -2858,7 +2858,7 @@ mod tests {
     fn function_set_correctness_gate_brute_force_agrees() {
         // Correctness gate: enumerate small sequence-set with a complex
         // predicate via SMT and via brute force, assert sets agree.
-        let state = BTreeMap::new();
+        let state = crate::tla::value::TlaState::new();
         let defs = BTreeMap::new();
         let instances = BTreeMap::new();
         let ctx = make_ctx(&state, &defs, &instances);
@@ -2899,7 +2899,7 @@ mod tests {
 
     #[test]
     fn joint_solve_no_invariants_returns_no_violation() {
-        let state = BTreeMap::new();
+        let state = crate::tla::value::TlaState::new();
         let defs = BTreeMap::new();
         let instances = BTreeMap::new();
         let ctx = make_ctx(&state, &defs, &instances);
@@ -2922,7 +2922,7 @@ mod tests {
         // With seq_len 3 and range {1,2,3}, the cross-product is 27*27=729
         // total state pairs; many violate. Witness should satisfy the
         // negated invariant.
-        let state = BTreeMap::new();
+        let state = crate::tla::value::TlaState::new();
         let defs = BTreeMap::new();
         let instances = BTreeMap::new();
         let ctx = make_ctx(&state, &defs, &instances);
@@ -2968,7 +2968,7 @@ mod tests {
         // `\A i \in 1..3 : a[i] = b[i]` (every position matches). This holds
         // for every initial state (only one exists: a=b=[1,2,3]). The
         // joint solver should return NoViolation.
-        let state = BTreeMap::new();
+        let state = crate::tla::value::TlaState::new();
         let defs = BTreeMap::new();
         let instances = BTreeMap::new();
         let ctx = make_ctx(&state, &defs, &instances);
@@ -3001,7 +3001,7 @@ mod tests {
 
     #[test]
     fn joint_solve_returns_none_for_zero_var_specs() {
-        let state = BTreeMap::new();
+        let state = crate::tla::value::TlaState::new();
         let defs = BTreeMap::new();
         let instances = BTreeMap::new();
         let ctx = make_ctx(&state, &defs, &instances);
@@ -3013,7 +3013,7 @@ mod tests {
     fn joint_solve_empty_range_proves_safe() {
         // Empty range with non-empty seq → no initial state exists at all.
         // Vacuously safe (no violation possible).
-        let state = BTreeMap::new();
+        let state = crate::tla::value::TlaState::new();
         let defs = BTreeMap::new();
         let instances = BTreeMap::new();
         let ctx = make_ctx(&state, &defs, &instances);
@@ -3037,7 +3037,7 @@ mod tests {
         // With both free permutations there exist witnesses where position
         // of 1 in a doesn't co-occur with position of 30 in b. So
         // `~invariant` is SAT → solver returns Violation witness.
-        let state = BTreeMap::new();
+        let state = crate::tla::value::TlaState::new();
         let defs = BTreeMap::new();
         let instances = BTreeMap::new();
         let ctx = make_ctx(&state, &defs, &instances);
