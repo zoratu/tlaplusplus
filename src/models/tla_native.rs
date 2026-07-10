@@ -3552,7 +3552,15 @@ fn evaluate_init_states(
 
         let mut all_guards_pass = true;
         for guard in &pure_guards {
-            match eval_expr(guard, &ctx) {
+            let guard_result = eval_expr(guard, &ctx);
+            // Phase-0 opt-in dual-evaluator consistency check (no-op unless
+            // built with --features eval-consistency-check + env flag).
+            crate::tla::eval_consistency::check_predicate_consistency(
+                guard,
+                &ctx,
+                &guard_result,
+            );
+            match guard_result {
                 Ok(val) => {
                     if !val.as_bool().unwrap_or(false) {
                         all_guards_pass = false;

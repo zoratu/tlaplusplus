@@ -4,6 +4,7 @@ pub mod cfg;
 pub mod compiled_eval;
 pub mod compiled_expr;
 pub mod eval;
+pub mod eval_consistency;
 pub mod expr_v2;
 pub mod formula;
 pub mod hashed_arc;
