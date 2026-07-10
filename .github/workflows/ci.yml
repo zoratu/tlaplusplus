@@ -186,7 +186,9 @@ jobs:
   failpoints:
     name: cargo test --features failpoints
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Serial (--test-threads=1, see below) is slower than the parallel default
+    # job, so allow extra headroom over the 30-min used elsewhere.
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
@@ -207,4 +209,13 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Run failpoints test suite
-        run: cargo test --release --features failpoints
+        # Single-threaded: the `fail` crate's failpoint registry is
+        # process-global, so a test that sets e.g. `queue_spill_fail=return`
+        # (in the #[cfg(feature="failpoints")] modules) contaminates any other
+        # test exercising that instrumented path concurrently. That deadlocks
+        # e.g. spillable_work_stealing::test_compression_ring_overflow_falls_
+        # through_to_disk (its background spill coordinator retries the
+        # globally-failing spill forever). Serial execution scopes each
+        # failpoint to its own test. Slower but correct; the suite is
+        # unit-test-dominated so it stays well under the timeout.
+        run: cargo test --release --features failpoints -- --test-threads=1
