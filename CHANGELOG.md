@@ -1,5 +1,31 @@
 # Changelog
 
+## v1.2.29 (2026-07-10)
+
+The layout-aware `expr_v2` parser becomes the default across every parsing path, replacing the string-indentation-heuristic grouping that caused the recurring `=>`/`/\` precedence ripple-regressions (MCCheckpointCoordination, NanoBlockchain, MCPaxos). Along the way, the exhaustive corpus validation surfaced and closed a cluster of soundness bugs — most notably an entire class of compiled-path *missed violations*. Every phase was gated by an independent per-phase review plus a full 226-spec corpus diff-vs-TLC in both directions.
+
+### Parser re-architecture — `expr_v2` becomes the default (#150–#153)
+
+A hand-written layout-aware lexer + Pratt parser (`src/tla/expr_v2/`) parses the source once into a structural AST carrying real column/span information, then lowers to the existing `CompiledExpr`. Grouping decisions (junctions, `=>`/`<=>`, quantifier/`LET`/`IF`/`CASE` bodies) are made from the tree, never re-derived from a `.trim()`-flattened string; every leaf operator stays in an `Atom` lowered by the previous compiler. The old string splitters are retained as an automatic fallback and behind the `TLAPLUS_EXPR_PARSER=v1` escape hatch (fully reversible).
+
+- **#150 — compiled path.** `compile_expr` routes through `expr_v2` by default. Fixed a false-positive `Inv` violation on `MCPaxosTiny` (a newline `=>` at a junction bullet column was swallowing the junction as its consequent instead of its antecedent).
+- **#151 — interpreted path.** `classify_op`'s boolean/junction grouping routes through `expr_v2` too (`classify_boolean_v2`), unifying both expression paths.
+- **#152 — action conjuncts.** `split_action_body_clauses` routes conjunct splitting through the `expr_v2` `Junction{And}` tree (`split_action_conjuncts_v2` + `uniform_dedent` + AST `And`-flattening), retiring the fragile `open_quant_or_let` re-glue heuristics.
+- **#153 — action disjuncts.** Root-`Or` disjunct splitting through `expr_v2`, with a 4-state result that keeps binder-scoped (`\E x : A \/ B`) and `LET`/`IF`-headed bodies whole so they can never reach the blind string splitter.
+
+Result across the four PRs: `scripts/diff_tlc.sh` 13/13 under both parsers, full-corpus zero verdict regressions, and `expr_v2` measurably *fixes* several latent v1 bugs (a `TeachingConcurrency/Simple` false violation, three eval-errors, and specs v1 timed out on).
+
+### Soundness fixes surfaced during validation (#154–#159)
+
+- **#154 — EWD998PCal false-safe under-exploration.** `split_action_conjuncts_v2` mis-fenced a `\/`-led body (inconsistent bullet columns) as a root `And`, collapsing exploration from TLC's 321,370 to 8 distinct while still reporting no violation. Fixed with a disjunction-body guard; also added a **count-drop gate** to `diff_tlc.sh` (fail when we explore < 0.9× TLC's distinct count while reporting no violation) plus `scripts/scan_underexploration.sh`, so a large under-count with an unchanged verdict is no longer dismissed.
+- **#155 — systemic mis-fence choke point.** The misaligned-leading-bullet mis-fence (which can flip a junction's top operator `Or`↔`And`) was guarded per-call-site on the interpreted and action paths but left the *compiled* path exposed; the guard now lives at the shared `parse_ast` choke point so every consumer falls back to v1 on a mis-fence. Also fixed the `SingleLaneBridge` interpreted-path instance and added `=>`-column golden coverage.
+- **#156 — Init `=>`-antecedent shredding.** The Init state-predicate enumerator split `(A /\ B) => C` on `/\` with no precedence awareness, turning the antecedent's leading bullet into a spurious required conjunct; now keeps `Implies`/`Iff`-rooted clauses whole.
+- **#157–#159 — compiled-path `.trim()`-body missed-violation class.** Several `try_parse_*` functions extracted a multi-line body/branch with a bare `.trim()` (de-indenting only the first line), so a uniformly-indented `/\ P => Q` body mis-grouped into a right-nested implication chain and evaluated vacuously true — a *missed violation* on the compiled `check_invariants` path (reachable whenever `expr_v2` falls back to the string compiler for a complex predicate). Fixed by extracting bodies with the uniform-dedent helper `dedent_common` across `\A` (#157), `\E`/CHOOSE (#158), and `IF`/`LET`/CASE/LAMBDA/function-construct/EXCEPT (#159). #159 also adds a layout-fuzzing proptest (`compiled_predicate_is_invariant_to_layout`) that renders predicates under seven wrappers in aligned / shallow-head / deep-head layouts and asserts the interpreter and compiler agree and the compiled value is layout-invariant — a regression net for the whole class.
+
+Validation for the cluster: `cargo test --release` clean (1462 tests), `diff_tlc.sh` 13/13 under both parsers, and full-corpus diffs with zero verdict regressions on each PR (`MCPaxosTiny` stays 3,921; the count-drop gate and under-exploration scan both clean).
+
+Known follow-ups (documented, not regressions): `MCBakery`'s inductive-invariant-as-Init model is still under-explored at Init (verdict-correct, count-under — a separate interpreted-path issue), and the deeper direction of collapsing our two evaluation paths (interpreted `eval_expr` + compiled `eval_compiled`) onto a single evaluator, matching TLC's single-AST/single-evaluator design.
+
 ## v1.2.28 (2026-07-07)
 
 Follow-up to v1.2.27: with NanoBlockchain's init false-violation removed, its `Next` evaluation errored (`record access on non-record value ModelValue("block")`) and generated no successors, so ours halted at the single init state while TLC explores 3003. This fixes three cascading action-parse bugs that each silently dropped a `Next` branch's successors.
