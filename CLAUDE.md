@@ -46,10 +46,11 @@ cargo test --release --test state_graph_snapshots
 # Chaos soak (T11) — 1-hour release ritual, opt-in via --features failpoints
 scripts/chaos_soak.sh --duration 3600 --swarm-mode auto
 
-# Chaos smoke (T11.3) — 5-min CI-gate variant of the soak; runs on every
-# PR + push to main via .github/workflows/chaos-smoke.yml. Same harness,
-# shorter duration, fails CI on any divergence/hang or if < 6 of the 12
-# failpoints fire.
+# Chaos smoke (T11.3) — 5-min variant of the soak (same harness, shorter
+# duration; fails on any divergence/hang or if < 6 of the 12 failpoints
+# fire). NOTE (2026-07-10): NOT currently auto-gated — there is no
+# chaos-smoke.yml workflow and no external driver runs it per push. Run it
+# manually on spot; wiring it into spot-CI is pending.
 scripts/chaos_smoke.sh
 
 # Run fuzzing (requires nightly)
@@ -285,9 +286,11 @@ regressions on per-PR commits. `scripts/chaos_smoke.sh` is a thin
 wrapper that delegates to `chaos_soak.sh` with smoke parameters
 (5-minute duration, 30-second per-iter timeout, swarm-mode auto,
 2 workers) and adds a coverage gate: it parses
-`.chaos-smoke/iterations.tsv` and fails CI unless `>= 6` of the 12
-catalog failpoints actually fire. Wired into
-`scripts/REDACTED` (run on a fresh EC2 spot per push) to run on every PR + push to main.
+`.chaos-smoke/iterations.tsv` and fails unless `>= 6` of the 12
+catalog failpoints actually fire. NOTE (2026-07-10): this harness is NOT
+currently wired into any automated CI — there is no `chaos-smoke.yml`
+workflow and no external driver runs it per push. Run it manually on spot;
+automating it via spot-CI is pending.
 
 ```bash
 cargo build --release --features failpoints
@@ -433,10 +436,10 @@ Periodic checkpoints (`--checkpoint-interval-secs`) persist state for crash reco
 **Working (TLC feature parity + 1.0.0 additions)**:
 
 Test suite & gates:
-- **1,232 default tests**, 0 failures, 10 ignored (`cargo test --release`)
-- **1,254 tests with `--features failpoints`**, 0 failures
-- **1,259 tests with `--features symbolic-init`**, 0 failures
-- **13/13 differential-vs-TLC specs** pass via `scripts/diff_tlc.sh` (state counts agree exactly with TLC v2.19); CI gate via `scripts/REDACTED` (run on a fresh EC2 spot per push) runs on a `[ubuntu-latest, ubuntu-24.04-arm]` cross-arch matrix
+- **1,471 default tests**, 0 failures, 10 ignored (`cargo test --release`)
+- **1,494 tests with `--features failpoints`**, 0 failures
+- **1,498 tests with `--features symbolic-init`**, 0 failures, 10 ignored (counts as of 2026-07-10)
+- **13/13 differential-vs-TLC specs** pass via `scripts/diff_tlc.sh` (state counts agree exactly with TLC v2.19); gated in GitHub Actions (`.github/workflows/ci.yml`, `diff-tlc` job) on a `[ubuntu-latest, ubuntu-24.04-arm]` cross-arch matrix. The same workflow also gates `--features symbolic-init` and `--features failpoints` (both added 2026-07-10 after PR #168 — the default `tests` job builds neither feature, so their gated test code had gone uncompiled by CI, which is how #168's `BTreeMap`->`TlaState` bit-rot reached main).
 - **T2 proptest equivalence**: compiled-vs-interpreted on Int/Bool/Set/Seq/Record/Str expressions, clean across 9 seeds at `PROPTEST_CASES=2048`; CI runs at 128
 - **T16a swarm proptest**: random subset of 17 shape categories per case (Regehr-style); kept alongside the uniform regression
 - **State-graph snapshot tests**: 12 active snapshots for 7 small TLA+ specs, validated against TLC v2.19
@@ -475,7 +478,7 @@ Verification:
 - Verus tier-A extension (T13.1-T13.3). 31 lemmas verified over a `Seq<u64>` linear-probe model with spec-level CAS soundness and bounded reader-retry termination. Lives at `verification/verus/seqlock_resize_tier_a.rs`; run via `verification/verus/run_proof.sh tier-a`.
 - Verus tier-A.5 production-shape shadow (T13.4 partial). 17 verified items modeling `FingerprintShard`'s hot-path methods with real Verus tracked permissions (`PAtomicU64` + `Tracked<&PermissionU64>`). Lives at `verification/verus/shard_methods.rs`; run via `verification/verus/run_proof.sh shard-methods`.
 - Verus reader-liveness (T13.3 + T13.5). Unbounded-fairness liveness theorem `theorem_no_starvation` over a temporal trace model; both safety and liveness sides fully proved with 0 axioms. The constructive proof (`verification/verus/reader_liveness_v2.rs`, 17 verified, 0 errors via `./run_proof.sh reader-liveness-v2`) replaces the three previous protocol-shape axioms with explicit short-`seq!` witnesses (2- and 3-element extensions). The original `verification/verus/reader_liveness.rs` (14 verified plus 3 documented `external_body` axioms) is preserved as the bounded-form temporal-trace fallback and reference for the eventual `state_machines!` port.
-- CI gate (T13.6). `scripts/REDACTED` (run on a fresh EC2 spot per push) builds Verus from source on `ubuntu-latest`, caches the build keyed on the pinned upstream ref, and runs all four proof files (tier-B, tier-A, shard-methods, liveness) on push to main + PR. Aarch64 runs as a manual `workflow_dispatch` job (informational, not a gate) due to upstream Z3 packaging issues on hosted aarch64 runners.
+- CI gate (T13.6) — NOT CURRENTLY AUTOMATED (corrected 2026-07-10). The four proof files (tier-B, tier-A, shard-methods, liveness) are run manually via `verification/verus/run_proof.sh`; there is no Verus CI workflow and no external driver builds Verus per push. Building Verus from source is heavy, so this is a spot-CI candidate rather than a hosted-runner one; automating it is pending.
 
 Chaos & swarm:
 - 1-hour chaos soak (`scripts/chaos_soak.sh`) covers all 12 failpoints in `src/chaos.rs`; 0 divergences, 0 hangs in the v1.0.0 release run.
@@ -484,7 +487,7 @@ Chaos & swarm:
 Deferred to v1.1.0:
 - T5.5: Joint Init+Solution symbolic encoding (Einstein-class workloads). T5.4 (streaming Init enumeration) landed in v1.1.0.
 Landed in v1.1.0:
-- T11.3: per-PR chaos smoke (`scripts/chaos_smoke.sh`, `scripts/REDACTED` (run on a fresh EC2 spot per push)).
+- T11.3: chaos smoke harness (`scripts/chaos_smoke.sh`). NOTE: the harness landed but is NOT auto-gated (no workflow/driver runs it per push — corrected 2026-07-10); run manually on spot.
 - T11.4: `route_spill_batch` Err-branch inflight leak fix; permanent disk failures
   (real or `queue_spill_fail=return` failpoint) now release `inflight_spilled`
   and account dropped items in `QueueStats::spill_lost_permanently`.
