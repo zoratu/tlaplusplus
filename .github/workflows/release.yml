@@ -1,0 +1,64 @@
+name: release
+
+# Auto-tag + publish a GitHub release whenever the crate version on `main`
+# advances to a version that isn't tagged yet. This makes the tag + release a
+# side effect of merging a version-bump PR, so they can never lapse (which is
+# how v1.2.20–v1.2.29 shipped without releases). The release notes are the
+# matching `## vX.Y.Z` section of CHANGELOG.md.
+#
+# Manual side of the chore: `scripts/release.sh X.Y.Z` bumps Cargo.toml/lock
+# (and checks the CHANGELOG entry exists); open a PR with that + the CHANGELOG
+# entry; merging it triggers this workflow.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Cargo.toml
+      - CHANGELOG.md
+
+permissions:
+  contents: write
+
+concurrency: release
+
+jobs:
+  tag-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read crate version
+        id: ver
+        run: |
+          VER=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "([0-9.]+)".*/\1/')
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "Crate version: $VER"
+
+      - name: Publish release if untagged
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VER: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          TAG="v${VER}"
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null || \
+             gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "${TAG} already tagged/released — nothing to do."
+            exit 0
+          fi
+          # Notes = the matching CHANGELOG section (fail loudly if missing).
+          awk -v v="${VER}" '$0 ~ "^## v" v " \\(" {f=1;print;next} f && /^## v[0-9]/ {exit} f{print}' CHANGELOG.md > /tmp/notes.md
+          if [ ! -s /tmp/notes.md ]; then
+            echo "::error::No '## v${VER} (...)' section in CHANGELOG.md — add release notes before bumping the version."
+            exit 1
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "Release ${TAG}"
+          git push origin "${TAG}"
+          # --latest is auto-computed by gh (highest semver); notes from CHANGELOG.
+          gh release create "${TAG}" --title "${TAG}" --notes-file /tmp/notes.md --verify-tag
+          echo "Published ${TAG}."
