@@ -2,8 +2,9 @@
 
 A Rust implementation of TLA+ model checking with TLC feature parity, achieving **10.7x faster** state exploration than Java TLC on many-core systems. 182/182 (100%) of the [tlaplus/Examples](https://github.com/tlaplus/Examples) corpus passes analysis; **174/182 (95.6%)** also pass full model checking at 60s.
 
-**v1.2.12 (2026-06-17)** ships with:
-- 1,236 default tests + 1,258 with failpoints + 1,263 with symbolic-init, 0 failures
+**v1.2.30 (2026-07-10)** ships with:
+- 1,471 default tests + 1,494 with failpoints + 1,498 with symbolic-init, 0 failures
+- Unified evaluator: Init, Next, guards, and invariants all run through one compiled evaluator (`eval_predicate`), structurally eliminating the interpreted-vs-compiled divergence class that hid missed violations
 - Memory-bounded queue spilling: opt-in byte budget (`--queue-max-inmem-bytes`) and RSS ceiling (`--queue-memory-ceiling-pct`) keep big specs from OOM-killing
 - Differential CI gate vs TLC (13/13 specs match exactly)
 - Compiled-vs-interpreted proptest equivalence (clean across 9 seeds at 2048 cases)
@@ -175,10 +176,10 @@ cargo build --release
 ## Testing
 
 ```bash
-# Run all tests (756 tests)
+# Run all tests (1,471 tests)
 cargo test --release
 
-# Run with chaos/failpoint testing (776 tests)
+# Run with chaos/failpoint testing (1,494 tests)
 cargo test --release --features failpoints
 
 # Run with Z3-backed symbolic Init enumeration (T5)
@@ -199,9 +200,9 @@ cargo +nightly fuzz run fuzz_tla_module
 ```
 
 The test suite includes:
-- **756 unit/integration tests** covering runtime, storage, TLA+ evaluation, and model checking correctness
-- **776 tests with `--features failpoints`** (adds chaos/fault-injection coverage)
-- **774 tests with `--features symbolic-init`** (adds Z3-backed enumeration coverage)
+- **1,471 unit/integration tests** covering runtime, storage, TLA+ evaluation, and model checking correctness
+- **1,494 tests with `--features failpoints`** (adds chaos/fault-injection coverage)
+- **1,498 tests with `--features symbolic-init`** (adds Z3-backed enumeration coverage)
 - **17 proptest cases** in the compiled-vs-interpreted equivalence harness (uniform + Regehr-style swarm mask), plus 19 set-algebra/serialization property tests
 - **23 chaos/failpoint tests** for single-fault-path correctness
 - **8 fuzz targets** for parser robustness
@@ -314,7 +315,7 @@ coverage matrix and a top concurrent-pair matrix (for swarm-mode runs).
 ### Core Components
 
 - **Runtime Engine** (`src/runtime.rs`) — Parallel state exploration with NUMA-aware work-stealing, checkpoint coordination, liveness checking
-- **TLA+ Frontend** (`src/tla/`) — Native parser, expression evaluator (text + compiled paths), action IR compiler
+- **TLA+ Frontend** (`src/tla/`) — Native parser, unified compiled expression evaluator (Init/Next/guards/invariants share one evaluation path), action IR compiler
 - **Fingerprint Store** (`src/storage/page_aligned_fingerprint_store.rs`) — Lock-free CAS, page-aligned, dynamic resize at 85% load
 - **Work-Stealing Queues** (`src/storage/work_stealing_queues.rs`) — Per-worker deques, NUMA-aware stealing, disk spilling
 - **Simulation** (`src/simulation.rs`) — Random behavior sampling with xoshiro256** PRNG
