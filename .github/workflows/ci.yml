@@ -23,15 +23,21 @@ name: ci
 #   (chaos fault-injection). Same rationale: a feature the default job never
 #   builds needs its own compile+run gate.
 #
-# Heavier gates that don't fit hosted runners — the full chaos soak/smoke and
-# the Verus proofs (build-from-source) — are NOT yet automated here; they are
-# run manually on spot. See CLAUDE.md "Chaos Smoke" / "Verus" for status.
+# Heavier gates that don't fit hosted runners — the chaos smoke/soak and the
+# Verus proofs (build-from-source) — run on a self-hosted spot runner via the
+# manual-dispatch `.github/workflows/heavy-gates.yml` workflow, not here.
 
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+
+# Cancel superseded runs on the same ref (e.g. a new push to a PR) so the
+# slow serial failpoints job doesn't pile up.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: never

@@ -48,9 +48,9 @@ scripts/chaos_soak.sh --duration 3600 --swarm-mode auto
 
 # Chaos smoke (T11.3) — 5-min variant of the soak (same harness, shorter
 # duration; fails on any divergence/hang or if < 6 of the 12 failpoints
-# fire). NOTE (2026-07-10): NOT currently auto-gated — there is no
-# chaos-smoke.yml workflow and no external driver runs it per push. Run it
-# manually on spot; wiring it into spot-CI is pending.
+# fire). Not per-push. Run it manually on spot, or via the manual-dispatch
+# `.github/workflows/heavy-gates.yml` workflow (gate=chaos-smoke), which runs
+# it on a self-hosted spot runner provisioned out-of-band.
 scripts/chaos_smoke.sh
 
 # Run fuzzing (requires nightly)
@@ -287,10 +287,10 @@ wrapper that delegates to `chaos_soak.sh` with smoke parameters
 (5-minute duration, 30-second per-iter timeout, swarm-mode auto,
 2 workers) and adds a coverage gate: it parses
 `.chaos-smoke/iterations.tsv` and fails unless `>= 6` of the 12
-catalog failpoints actually fire. NOTE (2026-07-10): this harness is NOT
-currently wired into any automated CI — there is no `chaos-smoke.yml`
-workflow and no external driver runs it per push. Run it manually on spot;
-automating it via spot-CI is pending.
+catalog failpoints actually fire. It is not run per-push; run it manually on
+spot, or via the manual-dispatch `.github/workflows/heavy-gates.yml` workflow
+(gate=chaos-smoke), which runs it on a self-hosted spot runner provisioned
+out-of-band by the spot orchestrator (validated end-to-end 2026-07-10).
 
 ```bash
 cargo build --release --features failpoints
@@ -478,7 +478,7 @@ Verification:
 - Verus tier-A extension (T13.1-T13.3). 31 lemmas verified over a `Seq<u64>` linear-probe model with spec-level CAS soundness and bounded reader-retry termination. Lives at `verification/verus/seqlock_resize_tier_a.rs`; run via `verification/verus/run_proof.sh tier-a`.
 - Verus tier-A.5 production-shape shadow (T13.4 partial). 17 verified items modeling `FingerprintShard`'s hot-path methods with real Verus tracked permissions (`PAtomicU64` + `Tracked<&PermissionU64>`). Lives at `verification/verus/shard_methods.rs`; run via `verification/verus/run_proof.sh shard-methods`.
 - Verus reader-liveness (T13.3 + T13.5). Unbounded-fairness liveness theorem `theorem_no_starvation` over a temporal trace model; both safety and liveness sides fully proved with 0 axioms. The constructive proof (`verification/verus/reader_liveness_v2.rs`, 17 verified, 0 errors via `./run_proof.sh reader-liveness-v2`) replaces the three previous protocol-shape axioms with explicit short-`seq!` witnesses (2- and 3-element extensions). The original `verification/verus/reader_liveness.rs` (14 verified plus 3 documented `external_body` axioms) is preserved as the bounded-form temporal-trace fallback and reference for the eventual `state_machines!` port.
-- CI gate (T13.6) — NOT CURRENTLY AUTOMATED (corrected 2026-07-10). The four proof files (tier-B, tier-A, shard-methods, liveness) are run manually via `verification/verus/run_proof.sh`; there is no Verus CI workflow and no external driver builds Verus per push. Building Verus from source is heavy, so this is a spot-CI candidate rather than a hosted-runner one; automating it is pending.
+- CI gate (T13.6) — not per-push (corrected 2026-07-10). The four proof files (tier-B, tier-A, shard-methods, liveness) run via `verification/verus/run_proof.sh`, either manually or via the manual-dispatch `.github/workflows/heavy-gates.yml` workflow (gate=verus) on a self-hosted spot runner. Building Verus from source is heavy, so it stays on spot (runner + Verus toolchain provisioned out-of-band) rather than a hosted runner, and manual-dispatch rather than per-push.
 
 Chaos & swarm:
 - 1-hour chaos soak (`scripts/chaos_soak.sh`) covers all 12 failpoints in `src/chaos.rs`; 0 divergences, 0 hangs in the v1.0.0 release run.
