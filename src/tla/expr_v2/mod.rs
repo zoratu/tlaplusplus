@@ -85,7 +85,7 @@ fn root_junction_mis_fences(ast: &Expr, expr: &str) -> bool {
     let Expr::Junction { op, .. } = ast else {
         return false;
     };
-    let lead = first_logical_line_skipping_comments(expr);
+    let lead = crate::tla::text_util::first_logical_line_skipping_comments(expr);
     let leads_with_or = lead.starts_with("\\/");
     let leads_with_and = lead.starts_with("/\\");
     match op {
@@ -94,56 +94,6 @@ fn root_junction_mis_fences(ast: &Expr, expr: &str) -> bool {
         // Root is a disjunction but the body is led by a `/\` bullet → mis-fence.
         JunctionOp::Or => leads_with_and,
     }
-}
-
-/// Return the first LOGICAL line of `src`, skipping leading blank lines, `\*`
-/// line comments, and `(* ... *)` block comments (single- or multi-line; TLA+
-/// block comments nest). The returned slice is `trim_start`ed. Returns `""` if
-/// the whole input is blank/comments.
-///
-/// Shared by the mis-fence detector; the same routine (originally in
-/// `action_ir.rs`) is corpus-proven for the leading-bullet probe.
-fn first_logical_line_skipping_comments(src: &str) -> &str {
-    let bytes = src.as_bytes();
-    let n = bytes.len();
-    let mut i = 0usize;
-    let mut depth: usize = 0; // block-comment nesting depth
-
-    while i < n {
-        if depth > 0 {
-            // Inside a block comment: look for `*)` (may nest with `(*`).
-            if i + 1 < n && bytes[i] == b'(' && bytes[i + 1] == b'*' {
-                depth += 1;
-                i += 2;
-            } else if i + 1 < n && bytes[i] == b'*' && bytes[i + 1] == b')' {
-                depth -= 1;
-                i += 2;
-            } else {
-                i += 1;
-            }
-            continue;
-        }
-        match bytes[i] {
-            b' ' | b'\t' | b'\r' | b'\n' => {
-                i += 1;
-            }
-            b'(' if i + 1 < n && bytes[i + 1] == b'*' => {
-                depth += 1;
-                i += 2;
-            }
-            b'\\' if i + 1 < n && bytes[i + 1] == b'*' => {
-                // `\*` line comment: skip to end of line.
-                while i < n && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            _ => {
-                let line_end = src[i..].find('\n').map(|p| i + p).unwrap_or(n);
-                return src[i..line_end].trim_start();
-            }
-        }
-    }
-    ""
 }
 
 /// True iff the layout-aware v2 parser should run. As of Phase 2 this is the
@@ -278,15 +228,6 @@ mod mis_fence_tests {
             parse_ast(&src).is_err(),
             "comment-prefixed mis-fence must still reject"
         );
-    }
-
-    #[test]
-    fn first_logical_line_skips_comments() {
-        use super::first_logical_line_skipping_comments as f;
-        assert_eq!(f("(* c *)\n/\\ A"), "/\\ A");
-        assert_eq!(f("\\* line\n(* blk *)\n\\/ X"), "\\/ X");
-        assert_eq!(f("(* c *) /\\ A"), "/\\ A");
-        assert_eq!(f("  \n  /\\ A"), "/\\ A");
     }
 }
 

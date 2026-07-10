@@ -136,7 +136,7 @@ fn split_action_conjuncts_v2(expr: &str) -> Option<Vec<String>> {
     // return None and fall back. (A genuine `/\`-led body with an INLINE `\/`
     // inside a conjunct does not trip this: its first logical line starts with
     // `/\`, handled by the layout guard below.)
-    if first_logical_line_skipping_comments(src).starts_with("\\/") {
+    if crate::tla::text_util::first_logical_line_skipping_comments(src).starts_with("\\/") {
         return None;
     }
 
@@ -299,63 +299,6 @@ enum DisjunctSplitV2 {
 /// coordinate system matches the source, `parse_ast` (full-consume == `Ok`),
 /// then an Or-fence layout guard + `flatten_or_leaves` slice extraction with the
 /// same span-safety and per-clause normalization.
-/// Phase 5.1 (FIX B/C) — return the first LOGICAL line of `src`, skipping leading
-/// blank lines, `\*` line comments, and `(* ... *)` block comments (single- or
-/// multi-line). The returned slice is `trim_start`ed. Returns `""` if the whole
-/// input is blank/comments.
-///
-/// Block-comment scanning is a simple depth counter over `(*`/`*)` pairs (TLA+
-/// block comments nest). Once we are outside any block comment and land on a
-/// non-blank, non-`\*` character on a line, we return that line trimmed. If a
-/// block comment ends mid-line, the remainder of that line after `*)` is the
-/// first logical text.
-fn first_logical_line_skipping_comments(src: &str) -> &str {
-    let bytes = src.as_bytes();
-    let n = bytes.len();
-    let mut i = 0usize;
-    let mut depth: usize = 0; // block-comment nesting depth
-
-    while i < n {
-        if depth > 0 {
-            // Inside a block comment: look for `*)` (may nest with `(*`).
-            if i + 1 < n && bytes[i] == b'(' && bytes[i + 1] == b'*' {
-                depth += 1;
-                i += 2;
-            } else if i + 1 < n && bytes[i] == b'*' && bytes[i + 1] == b')' {
-                depth -= 1;
-                i += 2;
-            } else {
-                i += 1;
-            }
-            continue;
-        }
-        match bytes[i] {
-            b' ' | b'\t' | b'\r' | b'\n' => {
-                i += 1;
-            }
-            b'(' if i + 1 < n && bytes[i + 1] == b'*' => {
-                depth += 1;
-                i += 2;
-            }
-            b'\\' if i + 1 < n && bytes[i + 1] == b'*' => {
-                // `\*` line comment: skip to end of line.
-                while i < n && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            _ => {
-                // First logical (non-comment, non-blank) char. Return from HERE
-                // to end of line. Starting at `i` (not the raw line start) means
-                // an inline trailing block comment before real code — `(* c *)
-                // /\ A` — still yields `/\ A`, so the mis-fence `/\` check fires.
-                let line_end = src[i..].find('\n').map(|p| i + p).unwrap_or(n);
-                return src[i..line_end].trim_start();
-            }
-        }
-    }
-    ""
-}
-
 fn classify_action_disjunct_v2(expr: &str) -> DisjunctSplitV2 {
     use crate::tla::expr_v2::{self, ast};
 
@@ -399,7 +342,7 @@ fn classify_action_disjunct_v2(expr: &str) -> DisjunctSplitV2 {
         // `/\`-led body would otherwise bypass this guard and recreate the
         // Peterson mis-fence (a `/\`-led conjunction shredded into disjuncts →
         // false mutual-exclusion violation).
-        let first_logical = first_logical_line_skipping_comments(src);
+        let first_logical = crate::tla::text_util::first_logical_line_skipping_comments(src);
         if first_logical.starts_with("/\\") {
             return DisjunctSplitV2::RootOrLayoutMismatch;
         }
@@ -3505,21 +3448,6 @@ mod tests {
         );
         // And neither is shredded.
         assert_eq!(split_action_body_disjuncts(with_comment).len(), 1);
-    }
-
-    #[test]
-    fn first_logical_line_skips_block_and_line_comments() {
-        assert_eq!(first_logical_line_skipping_comments("(* c *)\n/\\ A"), "/\\ A");
-        assert_eq!(
-            first_logical_line_skipping_comments("\\* line\n(* blk *)\n\\/ X"),
-            "\\/ X"
-        );
-        assert_eq!(first_logical_line_skipping_comments("(* c *) /\\ A"), "/\\ A");
-        assert_eq!(first_logical_line_skipping_comments("  \n  /\\ A"), "/\\ A");
-        assert_eq!(
-            first_logical_line_skipping_comments("(* line one\n line two *)\n/\\ A"),
-            "/\\ A"
-        );
     }
 
     #[test]
