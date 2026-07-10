@@ -1,5 +1,29 @@
 # Changelog
 
+## v1.2.30 (2026-07-10)
+
+Dual-evaluator unification. `tlaplusplus` had **two** expression evaluators — interpreted (`eval_expr` → `classify_op`) and compiled (`compile_expr` → `CompiledExpr` → `eval_compiled`) — and the model's hot path (Init / guards) used the interpreted one while `check_invariants` used the compiled one. Same predicate text, two mechanisms that could disagree — the root cause behind MCBakery and the v1.2.29 `.trim()`-body missed-violation class. This routes the model onto the single compiled evaluator, matching TLC's single-AST/single-evaluator design.
+
+### Phase 0 — safety net + audit (#161)
+
+Strengthened the compiled-vs-interpreted equivalence proptest (`eval_expr(P,s) == eval_compiled(compile_expr(P),s)`) across a 5-state panel × a wide typed grammar × three layouts; an audit doc (`docs/eval-unify-phase0-audit.md`) categorizing every direct `eval_expr` caller and mapping the `Unparsed` surface; and an opt-in, zero-cost `eval-consistency-check` feature that logs any real-spec divergence during exploration. No behavior change.
+
+### Phase 1 — route the model hot path through the compiled evaluator (#162)
+
+The 30 hot-path `eval_expr` call sites (Init / Next / guards / domains, in `tla_native.rs` and `action_exec.rs`) now go through a cached `eval_predicate` (compile once per unique predicate string, then `eval_compiled`). So Init, Next, and invariants share one evaluator — the interpreted-vs-compiled divergence class is structurally eliminated. The interpreter remains the fallback only for a compiled *error* (never `Ok`-vs-`Ok`), so no coverage is lost while the compiled path's correctness improvements are preserved.
+
+`MCBakery` (an inductive-invariant-as-Init model) goes from **5,388 → 655,200 distinct, completing clean — matching TLC**: a ~122× under-exploration resolved, because its Init now picks up the v1.2.29 `\A`-body precedence fixes. Performance is neutral-to-better (the compiled path avoids per-call re-parsing — `Combined.tla` +6.2% states/min; `run-counter-grid` byte-identical). Routing Init through the compiled path also surfaced a latent multi-binder function-constructor mis-compile (false-violated `MCCheckpointCoordination`), fixed via the superset contract. Full corpus in both directions: zero verdict regressions.
+
+### Phase 2 — shrink the `Unparsed` surface (#163)
+
+Ported the portable constructs the compiler previously punted to the interpreter into real `CompiledExpr` nodes — tuple binders for `\E`/`\A`/`CHOOSE`, multi-binder set comprehensions, and type-set membership — each proven behavior-preserving by extending the equivalence proptest to generate it (compiled == interpreter). The genuinely-hard long-tail (user-defined infix, inline `INSTANCE`, recursive `LET`, unbounded `CHOOSE`) stays on the fallback by design.
+
+### Release automation (#164)
+
+`.github/workflows/release.yml` now auto-creates the git tag and GitHub release on push to `main` when the crate version is untagged (notes from the matching CHANGELOG section), with a `scripts/release.sh` bump helper — so releases can't lapse (as v1.2.20–v1.2.29 did; now backfilled).
+
+Validation: `cargo test --release` clean (incl. the equivalence proptest), `scripts/diff_tlc.sh` 13/13 under both parsers, full-corpus diff both directions with zero verdict regressions on each PR.
+
 ## v1.2.29 (2026-07-10)
 
 The layout-aware `expr_v2` parser becomes the default across every parsing path, replacing the string-indentation-heuristic grouping that caused the recurring `=>`/`/\` precedence ripple-regressions (MCCheckpointCoordination, NanoBlockchain, MCPaxos). Along the way, the exhaustive corpus validation surfaced and closed a cluster of soundness bugs — most notably an entire class of compiled-path *missed violations*. Every phase was gated by an independent per-phase review plus a full 226-spec corpus diff-vs-TLC in both directions.
