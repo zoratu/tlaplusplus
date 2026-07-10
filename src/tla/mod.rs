@@ -13,6 +13,7 @@ pub mod por;
 pub mod scan;
 pub mod symbolic_init;
 pub mod temporal;
+pub(crate) mod text_util;
 pub mod value;
 pub mod var_table;
 
