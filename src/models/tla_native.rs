@@ -10,7 +10,8 @@ use crate::tla::{
     ClauseKind, CompiledActionIr, CompiledExpr, ConfigValue, EvalContext, PorAnalysis,
     TemporalFormula, TlaConfig, TlaDefinition, TlaModule, TlaState, TlaValue, classify_clause,
     compile_action_ir, compile_expr, count_next_disjuncts, eval_action_body_multi,
-    eval_action_constraint, eval_compiled, eval_expr, evaluate_next_states_labeled_with_instances,
+    eval_action_constraint, eval_compiled, eval_predicate,
+    evaluate_next_states_labeled_with_instances,
     evaluate_next_states_per_disjunct, evaluate_next_states_swarm,
     evaluate_next_states_with_instances, insert_compiled_action,
     looks_like_action, normalize_operator_ref_name, parse_tla_config, parse_tla_module_file,
@@ -949,7 +950,7 @@ impl TlaModel {
                 &self.module.definitions,
                 &self.module.instances,
             );
-            eval_expr(view_expr, &ctx).map_err(|e| format!("view evaluation failed: {}", e))
+            eval_predicate(view_expr, &ctx).map_err(|e| format!("view evaluation failed: {}", e))
         } else {
             // No view defined - return full state as a value
             // Convert state to TlaValue::Record
@@ -1012,7 +1013,7 @@ impl TlaModel {
             &self.module.definitions,
             &self.module.instances,
         );
-        match eval_expr(pred_text, &ctx) {
+        match eval_predicate(pred_text, &ctx) {
             Ok(TlaValue::Bool(b)) => Some(b),
             _ => None,
         }
@@ -2649,7 +2650,7 @@ fn evaluate_init_states(
                     &module.instances,
                 );
 
-                if let Ok(domain_val) = eval_expr(domain_expr, &ctx) {
+                if let Ok(domain_val) = eval_predicate(domain_expr, &ctx) {
                     if let Ok(domain_set) = domain_val.as_set() {
                         let mut all_states = Vec::new();
                         for binding_val in domain_set.iter() {
@@ -2742,7 +2743,7 @@ fn evaluate_init_states(
                 &definition_scope,
                 &module.instances,
             );
-            match eval_expr(&ref_name, &ctx) {
+            match eval_predicate(&ref_name, &ctx) {
                 Ok(value) => {
                     base_state.insert(Arc::from(name.as_str()), value);
                     progress = true;
@@ -2751,7 +2752,7 @@ fn evaluate_init_states(
                     // Try resolving as a zero-arg definition from definition_scope
                     if let Some(def) = definition_scope.get(&ref_name) {
                         if def.params.is_empty() {
-                            if let Ok(value) = eval_expr(&def.body, &ctx) {
+                            if let Ok(value) = eval_predicate(&def.body, &ctx) {
                                 base_state.insert(Arc::from(name.as_str()), value);
                                 progress = true;
                                 continue;
@@ -2882,7 +2883,7 @@ fn evaluate_init_states(
             );
             // Try evaluating the whole disjunction — if it produces a
             // definite value, we can skip it (TRUE guard) or reject (FALSE)
-            if let Ok(TlaValue::Bool(_)) = eval_expr(clause_trimmed, &ctx) {
+            if let Ok(TlaValue::Bool(_)) = eval_predicate(clause_trimmed, &ctx) {
                 guards.push(clause);
                 continue;
             }
@@ -2916,7 +2917,7 @@ fn evaluate_init_states(
                             }
                             _ => {
                                 // Guard — check if it's satisfied
-                                if let Ok(TlaValue::Bool(false)) = eval_expr(sc, &ctx) {
+                                if let Ok(TlaValue::Bool(false)) = eval_predicate(sc, &ctx) {
                                     branch_ok = false;
                                     break;
                                 }
@@ -2988,7 +2989,7 @@ fn evaluate_init_states(
                 &definition_scope,
                 &module.instances,
             );
-            match eval_expr(&expr, &ctx) {
+            match eval_predicate(&expr, &ctx) {
                 Ok(value) => {
                     base_state.insert(Arc::from(var.as_str()), value);
                     progress = true;
@@ -3009,7 +3010,7 @@ fn evaluate_init_states(
                         &definition_scope,
                         &module.instances,
                     );
-                    if let Ok(val) = eval_expr(&def.body, &ctx) {
+                    if let Ok(val) = eval_predicate(&def.body, &ctx) {
                         augmented_state.insert(Arc::from(name.as_str()), val);
                     }
                 }
@@ -3023,7 +3024,7 @@ fn evaluate_init_states(
                     &definition_scope,
                     &module.instances,
                 );
-                match eval_expr(&expr, &ctx) {
+                match eval_predicate(&expr, &ctx) {
                     Ok(value) => {
                         base_state.insert(Arc::from(var.as_str()), value);
                         progress = true;
@@ -3072,7 +3073,7 @@ fn evaluate_init_states(
                 &definition_scope,
                 &module.instances,
             );
-            match eval_expr(&set_expr, &ctx) {
+            match eval_predicate(&set_expr, &ctx) {
                 Ok(set_val) => {
                     // Accept both Set and Seq as membership domains.
                     // Constraint-propagated record sets return Seq for O(n)
@@ -3114,7 +3115,7 @@ fn evaluate_init_states(
                         &definition_scope,
                         &module.instances,
                     );
-                    if let Ok(val) = eval_expr(&def.body, &ctx) {
+                    if let Ok(val) = eval_predicate(&def.body, &ctx) {
                         augmented.insert(Arc::from(name.as_str()), val);
                     }
                 }
@@ -3127,7 +3128,7 @@ fn evaluate_init_states(
                     &definition_scope,
                     &module.instances,
                 );
-                match eval_expr(&set_expr, &ctx) {
+                match eval_predicate(&set_expr, &ctx) {
                     Ok(set_val) => {
                         if let Ok(set) = set_val.as_set() {
                             if !set.is_empty() {
@@ -3287,7 +3288,7 @@ fn evaluate_init_states(
                 &definition_scope,
                 &module.instances,
             );
-            if let Ok(set_val) = eval_expr(set_expr, &ctx) {
+            if let Ok(set_val) = eval_predicate(set_expr, &ctx) {
                 if let Ok(set) = set_val.as_set() {
                     for value in set.iter() {
                         let mut new_state = state.clone();
@@ -3380,7 +3381,7 @@ fn evaluate_init_states(
                         &definition_scope,
                         &module.instances,
                     );
-                    if let Ok(value) = eval_expr(expr, &ctx) {
+                    if let Ok(value) = eval_predicate(expr, &ctx) {
                         state.insert(Arc::from(var.as_str()), value);
                     }
                 }
@@ -3397,7 +3398,7 @@ fn evaluate_init_states(
                 &definition_scope,
                 &module.instances,
             );
-            if let Ok(set_val) = eval_expr(set_expr, &ctx) {
+            if let Ok(set_val) = eval_predicate(set_expr, &ctx) {
                 if let Ok(set) = set_val.as_set() {
                     for value in set.iter() {
                         let mut new_state = state.clone();
@@ -3439,7 +3440,7 @@ fn evaluate_init_states(
                     );
 
                     // Evaluate domain
-                    let domain_set = match eval_expr(domain_expr, &ctx) {
+                    let domain_set = match eval_predicate(domain_expr, &ctx) {
                         Ok(v) => match v.as_set() {
                             Ok(s) => s.clone(),
                             Err(_) => continue,
@@ -3472,7 +3473,7 @@ fn evaluate_init_states(
                                             &definition_scope,
                                             &module.instances,
                                         );
-                                        if let Ok(val) = eval_expr(&expr, &ctx2) {
+                                        if let Ok(val) = eval_predicate(&expr, &ctx2) {
                                             trial_state.insert(Arc::from(var.as_str()), val);
                                         } else {
                                             all_ok = false;
@@ -3486,7 +3487,7 @@ fn evaluate_init_states(
                                         &definition_scope,
                                         &module.instances,
                                     );
-                                    match eval_expr(bc, &ctx2) {
+                                    match eval_predicate(bc, &ctx2) {
                                         Ok(TlaValue::Bool(false)) => {
                                             all_ok = false;
                                         }
@@ -3552,14 +3553,12 @@ fn evaluate_init_states(
 
         let mut all_guards_pass = true;
         for guard in &pure_guards {
-            let guard_result = eval_expr(guard, &ctx);
-            // Phase-0 opt-in dual-evaluator consistency check (no-op unless
-            // built with --features eval-consistency-check + env flag).
-            crate::tla::eval_consistency::check_predicate_consistency(
-                guard,
-                &ctx,
-                &guard_result,
-            );
+            // Phase-1: hot-path guard eval routes through the compiled path.
+            let guard_result = eval_predicate(guard, &ctx);
+            // Opt-in dual-evaluator consistency check (no-op unless built with
+            // --features eval-consistency-check + env flag). Computes both
+            // interpreted and compiled results internally and compares.
+            crate::tla::eval_consistency::check_predicate_consistency(guard, &ctx);
             match guard_result {
                 Ok(val) => {
                     if !val.as_bool().unwrap_or(false) {
@@ -3611,7 +3610,7 @@ fn evaluate_init_states(
                             } = classify_clause(&clause)
                             {
                                 if v == var {
-                                    if let Ok(val) = eval_expr(
+                                    if let Ok(val) = eval_predicate(
                                         expr,
                                         &EvalContext::with_definitions_and_instances(
                                             &state,
@@ -3643,7 +3642,7 @@ fn evaluate_init_states(
                                             {
                                                 if v == var {
                                                     if let Ok(val) =
-                                                        eval_expr(
+                                                        eval_predicate(
                                                             expr, &EvalContext::with_definitions_and_instances(&state, &definition_scope, &module.instances),
                                                         )
                                                     {
@@ -3699,7 +3698,7 @@ fn evaluate_init_states(
                     &definition_scope,
                     &module.instances,
                 );
-                if let Ok(TlaValue::Bool(true)) = eval_expr(&init_def.body, &ctx) {
+                if let Ok(TlaValue::Bool(true)) = eval_predicate(&init_def.body, &ctx) {
                     // Init evaluated to TRUE with current state — check if
                     // variables got bound through side effects in the context
                 }
@@ -3747,7 +3746,7 @@ fn evaluate_init_states(
                             &definition_scope,
                             &module.instances,
                         );
-                        if let Ok(value) = eval_expr(rhs, &ctx) {
+                        if let Ok(value) = eval_predicate(rhs, &ctx) {
                             recovery_state.insert(Arc::from(var.as_str()), value);
                             recovered = true;
                         }
@@ -3761,7 +3760,7 @@ fn evaluate_init_states(
                             &definition_scope,
                             &module.instances,
                         );
-                        if let Ok(set_val) = eval_expr(rhs, &ctx) {
+                        if let Ok(set_val) = eval_predicate(rhs, &ctx) {
                             if let Ok(set) = set_val.as_set() {
                                 if let Some(first) = set.iter().next() {
                                     recovery_state.insert(Arc::from(var.as_str()), first.clone());

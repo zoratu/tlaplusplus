@@ -4,7 +4,8 @@
 //! the overhead of string parsing on every evaluation.
 
 use crate::tla::compiled_expr::{
-    CompiledExpr, compile_expr, find_top_level_colon, resolve_state_vars_with_binders,
+    CompiledExpr, compile_expr, find_top_level_colon, resolve_state_vars,
+    resolve_state_vars_with_binders,
 };
 use crate::tla::hashed_arc::HashedArc;
 use crate::tla::eval::{
@@ -117,6 +118,101 @@ fn get_or_compile_operator(name: &str, body: &str, params: &[String]) -> Arc<Com
         );
         compiled
     })
+}
+
+// Thread-local cache for compiled *predicate/expression strings* evaluated on
+// the model hot path (Init clauses, guards, domain sets, definition bodies).
+//
+// Phase 1 of the dual-evaluator unification routes the model hot path
+// (`src/models/tla_native.rs`, `src/tla/action_exec.rs`) off the interpreted
+// `eval_expr(text, ctx)` and onto `eval_compiled(compile_expr(text), ctx)`, so
+// Init/Next/guards/invariants all share ONE evaluator. The hot path evaluates
+// the same predicate strings millions of times, so re-compiling on every call
+// would tank throughput; this cache compiles each unique string exactly once.
+//
+// This mirrors `THREAD_LOCAL_OPERATOR_CACHE` and `dispatch::classify_op_cached`:
+// thread-local (zero cross-thread contention), `ahash` (non-adversarial keys),
+// `Arc<CompiledExpr>` values (a hit is a refcount bump, not a re-compile), and
+// bounded with clear-on-overflow so a run over pathologically many distinct
+// predicate strings can't grow the map without bound.
+//
+// The cached expression is schema-resolved (`resolve_state_vars`) exactly like
+// the precompiled invariants and `get_or_compile_operator`, so free module-var
+// references become `StateVar { slot }` fast-path lookups. Slot resolution is
+// always safe: `eval_compiled` verifies `schema_name_at(slot) == name` (and
+// that the name isn't a local binder) before using the slot, and otherwise
+// falls back to name-based lookup — so an extra binder entry in the state (the
+// `[x \in D |-> ...]` / `\E x \in D` Init sites that insert the binder into the
+// trial state) can never be mis-resolved.
+const PREDICATE_CACHE_CAP: usize = 4096;
+
+thread_local! {
+    static THREAD_LOCAL_PREDICATE_CACHE: RefCell<AHashMap<String, Arc<CompiledExpr>>> =
+        RefCell::new(AHashMap::with_capacity(256));
+}
+
+/// Compile `text` (schema-resolved) once and cache it thread-locally.
+fn compile_predicate_cached(text: &str) -> Arc<CompiledExpr> {
+    THREAD_LOCAL_PREDICATE_CACHE.with(|cache| {
+        if let Some(cached) = cache.borrow().get(text) {
+            return Arc::clone(cached);
+        }
+        let mut compiled = compile_expr(text);
+        if let Some(schema) = get_resolution_schema() {
+            resolve_state_vars(&mut compiled, schema.as_ref());
+        }
+        let compiled = Arc::new(compiled);
+        let mut map = cache.borrow_mut();
+        if map.len() >= PREDICATE_CACHE_CAP {
+            map.clear();
+        }
+        map.insert(text.to_string(), Arc::clone(&compiled));
+        compiled
+    })
+}
+
+/// Model hot-path expression evaluator: the Phase-1 replacement for the
+/// interpreted `eval_expr(text, ctx)` at the Init/Next/guard/domain call sites.
+///
+/// Compiles `text` (cached) and evaluates it through `eval_compiled`, so the
+/// model exploration path and `check_invariants` share the single compiled
+/// evaluator. Semantically equivalent to `eval_expr` on the Phase-0-covered
+/// space (the equivalence proptest guards this); the compiled path is a
+/// superset — any construct it can't model lowers to `Unparsed(text)` whose
+/// leaf is `eval_expr` itself.
+///
+/// **Interpreter fallback on compiled error.** The compiled path is meant to
+/// be a strict superset of the interpreter, but a handful of constructs
+/// compile to a *structured* node (rather than `Unparsed`) that `eval_compiled`
+/// then fails on where `eval_expr` succeeds — the known case is the *unbounded*
+/// `CHOOSE h : P(h)` (no `\in` domain): the interpreter mints a fresh model
+/// value, while the compiled `Choose` node resolves the binder to a model value
+/// and then mis-applies `as_bool` to the body, erroring
+/// ("expected BOOLEAN, got ModelValue"). To guarantee Phase-1 can *never*
+/// regress a spec relative to the reference interpreter, on a compiled `Err`
+/// we re-evaluate through `eval_expr` and return that result. This costs the
+/// interpreter only on the (rare) compiled-error path; the common success path
+/// stays purely compiled. Shrinking the set of constructs that need this
+/// fallback (so more lowers to `Unparsed` or a correct node) is Phase-2 work
+/// (Table 2 — e.g. an unbounded-`CHOOSE` node). `Ok`-vs-`Ok` divergences (where
+/// the compiled path is the *more*-correct one, e.g. MCBakery) are preserved:
+/// this fallback only fires when the compiled path outright errors.
+pub fn eval_predicate(text: &str, ctx: &EvalContext<'_>) -> Result<TlaValue> {
+    let compiled = compile_predicate_cached(text);
+    match eval_compiled(&compiled, ctx) {
+        Ok(value) => Ok(value),
+        Err(compiled_err) => {
+            // Compiled path failed — fall back to the reference interpreter so
+            // a construct the compiler mis-modeled (rather than punting to
+            // `Unparsed`) can't lose coverage the interpreter had. If the
+            // interpreter also errors, surface the compiled error (its message
+            // is the more informative for the compiled node that failed).
+            match eval_expr(text, ctx) {
+                Ok(value) => Ok(value),
+                Err(_) => Err(compiled_err),
+            }
+        }
+    }
 }
 
 /// Convert a TlaValue to its string representation (for ToString operator)
