@@ -13,6 +13,14 @@ use std::sync::Arc;
 use crate::tla::hashed_arc::HashedArc;
 use crate::tla::value::StateSchema;
 
+/// Which tuple-binder quantifier / CHOOSE semantics a `TupleQuantifier` uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TupleQuantifierKind {
+    Exists,
+    Forall,
+    Choose,
+}
+
 /// Compiled TLA+ expression - parsed once, evaluated many times
 #[derive(Debug, Clone)]
 pub enum CompiledExpr {
@@ -137,10 +145,36 @@ pub enum CompiledExpr {
         body: Box<CompiledExpr>,
     },
 
+    /// Tuple-binder quantifier / CHOOSE: `\E <<x, y>> \in S : body`,
+    /// `\A <<x, y>> \in S : body`, `CHOOSE <<x, y>> \in S : body`.
+    /// Each domain element must be a sequence of exactly `vars.len()`
+    /// components; component `i` is bound to `vars[i]` (mirrors the
+    /// interpreter's `assign_binder_value`). `kind` selects the semantics.
+    TupleQuantifier {
+        kind: TupleQuantifierKind,
+        vars: Vec<String>,
+        domain: Box<CompiledExpr>,
+        body: Box<CompiledExpr>,
+    },
+
     // Set comprehension: {expr : x \in S}
     SetComprehension {
         var: String,
         domain: Box<CompiledExpr>,
+        body: Box<CompiledExpr>,
+        filter: Option<Box<CompiledExpr>>,
+    },
+
+    /// Multi-binder set comprehension:
+    ///   map form   `{ e : x \in S, y \in T, ... }`  (filter = None)
+    ///   filter form `{ <<x, y>> \in S : P }` and `{ x \in S, y \in T : P }`
+    /// The binders are evaluated as a nested cartesian iteration in order;
+    /// `body` is the mapped element (map form) or the bound identity/tuple
+    /// (filter form), `filter` gates inclusion. Each binder is a tuple of
+    /// one-or-more names over a shared domain (tuple binders destructure a
+    /// sequence element the same way `TupleQuantifier` does).
+    MultiSetComprehension {
+        binders: Vec<(Vec<String>, CompiledExpr)>,
         body: Box<CompiledExpr>,
         filter: Option<Box<CompiledExpr>>,
     },
@@ -234,6 +268,7 @@ impl CompiledExpr {
             CompiledExpr::Exists { domain, body, .. }
             | CompiledExpr::Forall { domain, body, .. }
             | CompiledExpr::Choose { domain, body, .. }
+            | CompiledExpr::TupleQuantifier { domain, body, .. }
             | CompiledExpr::FuncConstruct { domain, body, .. } => {
                 domain.is_fully_compiled() && body.is_fully_compiled()
             }
@@ -244,6 +279,15 @@ impl CompiledExpr {
                 ..
             } => {
                 domain.is_fully_compiled()
+                    && body.is_fully_compiled()
+                    && filter.as_ref().map_or(true, |f| f.is_fully_compiled())
+            }
+            CompiledExpr::MultiSetComprehension {
+                binders,
+                body,
+                filter,
+            } => {
+                binders.iter().all(|(_, d)| d.is_fully_compiled())
                     && body.is_fully_compiled()
                     && filter.as_ref().map_or(true, |f| f.is_fully_compiled())
             }
@@ -496,6 +540,15 @@ fn collect_expr_binders(expr: &CompiledExpr, binders: &mut BTreeSet<String>) {
             collect_expr_binders(domain, binders);
             collect_expr_binders(body, binders);
         }
+        CompiledExpr::TupleQuantifier {
+            vars, domain, body, ..
+        } => {
+            for v in vars {
+                insert_binder_name(binders, v);
+            }
+            collect_expr_binders(domain, binders);
+            collect_expr_binders(body, binders);
+        }
         CompiledExpr::SetComprehension {
             var,
             domain,
@@ -504,6 +557,22 @@ fn collect_expr_binders(expr: &CompiledExpr, binders: &mut BTreeSet<String>) {
         } => {
             insert_binder_name(binders, var);
             collect_expr_binders(domain, binders);
+            collect_expr_binders(body, binders);
+            if let Some(filter) = filter {
+                collect_expr_binders(filter, binders);
+            }
+        }
+        CompiledExpr::MultiSetComprehension {
+            binders: bs,
+            body,
+            filter,
+        } => {
+            for (vars, domain) in bs {
+                for v in vars {
+                    insert_binder_name(binders, v);
+                }
+                collect_expr_binders(domain, binders);
+            }
             collect_expr_binders(body, binders);
             if let Some(filter) = filter {
                 collect_expr_binders(filter, binders);
@@ -661,6 +730,7 @@ fn resolve_expr_slots(expr: &mut CompiledExpr, schema: &StateSchema, binders: &B
         CompiledExpr::Exists { domain, body, .. }
         | CompiledExpr::Forall { domain, body, .. }
         | CompiledExpr::Choose { domain, body, .. }
+        | CompiledExpr::TupleQuantifier { domain, body, .. }
         | CompiledExpr::FuncConstruct { domain, body, .. } => {
             resolve_expr_slots(domain, schema, binders);
             resolve_expr_slots(body, schema, binders);
@@ -672,6 +742,19 @@ fn resolve_expr_slots(expr: &mut CompiledExpr, schema: &StateSchema, binders: &B
             ..
         } => {
             resolve_expr_slots(domain, schema, binders);
+            resolve_expr_slots(body, schema, binders);
+            if let Some(filter) = filter {
+                resolve_expr_slots(filter, schema, binders);
+            }
+        }
+        CompiledExpr::MultiSetComprehension {
+            binders: bs,
+            body,
+            filter,
+        } => {
+            for (_, domain) in bs {
+                resolve_expr_slots(domain, schema, binders);
+            }
             resolve_expr_slots(body, schema, binders);
             if let Some(filter) = filter {
                 resolve_expr_slots(filter, schema, binders);
@@ -1284,10 +1367,12 @@ pub fn compile_expr_v1(expr: &str) -> CompiledExpr {
 
     // Comparison operators
     if let Some((left, op, right)) = split_comparison(expr) {
-        if matches!(op, "\\in" | "\\notin") && is_bracket_type_expr(right) {
-            return CompiledExpr::Unparsed(expr.to_string());
-        }
-
+        // NOTE: `x \in [D -> R]` / `x \in [f: S]` (bracket type-set membership)
+        // used to be punted to the interpreter here. `compiled_membership_contains`
+        // now handles `FunctionSet` and `RecordSet` membership structurally
+        // (checking the value's domain/range/fields without materializing the
+        // type set), so we let the `In`/`NotIn` node compile directly — the RHS
+        // `compile_expr("[D -> R]")` lowers to `FunctionSet`/`RecordSet`.
         let left_expr = Box::new(compile_expr(left));
         let right_expr = Box::new(compile_expr(right));
         return match op {
@@ -2504,6 +2589,9 @@ fn parse_func_apply(expr: &str) -> Option<(&str, Vec<String>)> {
     None
 }
 
+// Retained for reference / potential reuse; `x \in [D -> R]` membership now
+// compiles directly (handled structurally in `compiled_membership_contains`).
+#[allow(dead_code)]
 fn is_bracket_type_expr(expr: &str) -> bool {
     let trimmed = expr.trim();
     if !trimmed.starts_with('[') || !trimmed.ends_with(']') {
@@ -2541,51 +2629,99 @@ fn try_parse_set_comprehension(inner: &str) -> Option<CompiledExpr> {
         let left = inner[..colon_idx].trim();
         let right = inner[colon_idx + 1..].trim();
 
-        // Check if right side is "x \in S" pattern
+        // MAP FORM: `{ expr : x \in S }` or `{ expr : x \in S, y \in T, ... }`.
+        // The binders are on the RIGHT of the colon; the mapped element is
+        // `left`. The single-binder identifier case keeps its dedicated
+        // `SetComprehension` node (unchanged fast path). Multi-binder and
+        // tuple-binder forms lower to `MultiSetComprehension`.
         if let Some((var, domain)) = parse_in_binding(right) {
-            // MULTI-BINDER MAP FORM: `{ expr : x \in S, y \in T, ... }`.
-            // The compiled `SetComprehension` node models only ONE binder.
-            // `parse_in_binding(right)` above matched the FIRST `\in` greedily
-            // and folded the remaining binders into the domain expression
-            // (`domain = "S, y \in T"`), which would then compile to a broken
-            // `Membership(compile("S, y"), T)` and fail at eval with
-            // "unexpected trailing tokens in expr: S, y" — reported as a false
-            // invariant violation on the initial state (btree/kvstore `TypeOK`,
-            // `args \in {<<k,v>>: k \in Keys, v \in Vals}`). The interpreter's
-            // `eval_set_expression` handles arbitrary multi-binder map
-            // comprehensions correctly (via `parse_binders` +
-            // `collect_binder_map_set`), so defer the whole set expression to it.
-            if parse_multiple_bindings(right).map(|b| b.len()).unwrap_or(1) > 1 {
-                return Some(CompiledExpr::Unparsed(format!("{{{inner}}}")));
+            if parse_multiple_bindings(right).map(|b| b.len()).unwrap_or(1) <= 1 {
+                // {expr : x \in S}
+                return Some(CompiledExpr::SetComprehension {
+                    var: var.to_string(),
+                    domain: Box::new(compile_expr(domain)),
+                    body: Box::new(compile_expr(left)),
+                    filter: None,
+                });
             }
-            // {expr : x \in S}
-            return Some(CompiledExpr::SetComprehension {
-                var: var.to_string(),
-                domain: Box::new(compile_expr(domain)),
-                body: Box::new(compile_expr(left)),
-                filter: None,
-            });
+        }
+        // Multi-binder / tuple-binder map form. Note `parse_in_binding`
+        // matched a single identifier; a tuple-binder map `{ e : <<k,v>> \in S }`
+        // is NOT matched by `parse_in_binding` (var not an identifier) but IS
+        // handled here via `parse_all_binders`.
+        if find_keyword(right, "\\in").is_some()
+            && let Some(bindings) = parse_all_binders(right)
+            && (bindings.len() > 1 || bindings.iter().any(|(vars, _)| vars.len() > 1))
+        {
+            return Some(build_multi_comprehension(&bindings, compile_expr(left), None));
         }
 
-        // Check if left side is "x \in S" pattern
+        // FILTER FORM: `{ x \in S : P }`, `{ <<x,y>> \in S : P }`, or
+        // `{ x \in S, y \in T : P }`. The binders are on the LEFT; `right` is
+        // the predicate. Single identifier binder keeps the `SetComprehension`
+        // node; tuple/multi binders lower to `MultiSetComprehension` whose body
+        // reconstructs the interpreter's `binder_key` element (single value, or
+        // a `<<...>>` tuple across all bound vars in order).
         if let Some((var, domain)) = parse_in_binding(left) {
-            // Same guard for the filter form `{x \in S : P}`: if the binder
-            // side actually carries multiple bindings (`{<<x,y>> \in S : P}`
-            // is a tuple binder, but `{x \in S, y \in T : P}` is multi-binder),
-            // defer to the interpreter rather than dropping binders.
-            if parse_multiple_bindings(left).map(|b| b.len()).unwrap_or(1) > 1 {
-                return Some(CompiledExpr::Unparsed(format!("{{{inner}}}")));
+            if parse_multiple_bindings(left).map(|b| b.len()).unwrap_or(1) <= 1 {
+                // {x \in S : filter}
+                return Some(CompiledExpr::SetComprehension {
+                    var: var.to_string(),
+                    domain: Box::new(compile_expr(domain)),
+                    body: Box::new(CompiledExpr::Var(var.to_string())),
+                    filter: Some(Box::new(compile_expr(right))),
+                });
             }
-            // {x \in S : filter}
-            return Some(CompiledExpr::SetComprehension {
-                var: var.to_string(),
-                domain: Box::new(compile_expr(domain)),
-                body: Box::new(CompiledExpr::Var(var.to_string())),
-                filter: Some(Box::new(compile_expr(right))),
-            });
+        }
+        if find_keyword(left, "\\in").is_some()
+            && let Some(bindings) = parse_all_binders(left)
+            && (bindings.len() > 1 || bindings.iter().any(|(vars, _)| vars.len() > 1))
+        {
+            let key_body = binder_key_element(&bindings);
+            return Some(build_multi_comprehension(
+                &bindings,
+                key_body,
+                Some(compile_expr(right)),
+            ));
         }
     }
     None
+}
+
+/// Build the element expression for a multi-binder FILTER comprehension,
+/// mirroring the interpreter's `binder_key`: if exactly one variable is bound
+/// across all binders the element is that variable; otherwise it is a tuple
+/// `<<v0, v1, ...>>` of all bound variables in binder order.
+fn binder_key_element(bindings: &[(Vec<String>, String)]) -> CompiledExpr {
+    let all_vars: Vec<&String> = bindings.iter().flat_map(|(vars, _)| vars.iter()).collect();
+    if all_vars.len() == 1 {
+        CompiledExpr::Var(all_vars[0].clone())
+    } else {
+        CompiledExpr::SeqLiteral(
+            all_vars
+                .into_iter()
+                .map(|v| CompiledExpr::Var(v.clone()))
+                .collect(),
+        )
+    }
+}
+
+/// Assemble a `MultiSetComprehension` node from parsed binders (each binder's
+/// domain text compiled here).
+fn build_multi_comprehension(
+    bindings: &[(Vec<String>, String)],
+    body: CompiledExpr,
+    filter: Option<CompiledExpr>,
+) -> CompiledExpr {
+    let binders = bindings
+        .iter()
+        .map(|(vars, domain)| (vars.clone(), compile_expr(domain)))
+        .collect();
+    CompiledExpr::MultiSetComprehension {
+        binders,
+        body: Box::new(body),
+        filter: filter.map(Box::new),
+    }
 }
 
 fn try_parse_func_construct(inner: &str) -> Option<CompiledExpr> {
@@ -2942,6 +3078,35 @@ fn parse_except_path(s: &str) -> Option<Vec<CompiledExpr>> {
     if path.is_empty() { None } else { Some(path) }
 }
 
+/// Find a top-level occurrence of `target` (a single char) at or after byte
+/// offset `from`, ignoring occurrences inside brackets/parens/braces or `<<>>`.
+fn find_top_level_char_from(s: &str, target: char, from: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let (byte, c) = chars[i];
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            '<' if i + 1 < chars.len() && chars[i + 1].1 == '<' => {
+                depth += 1;
+                i += 2;
+                continue;
+            }
+            '>' if i + 1 < chars.len() && chars[i + 1].1 == '>' => {
+                depth -= 1;
+                i += 2;
+                continue;
+            }
+            _ if c == target && depth == 0 && byte >= from => return Some(byte),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Find = sign at top level (not inside brackets/parens)
 fn find_top_level_eq(s: &str) -> Option<usize> {
     let mut depth = 0;
@@ -3026,6 +3191,82 @@ fn parse_multiple_bindings(s: &str) -> Option<Vec<(String, String)>> {
 
 fn contains_tuple_binder(binding: &str) -> bool {
     binding.contains("<<") && binding.contains(">>")
+}
+
+/// Parse a single binder variable pattern into its component names.
+/// `<<x, y>>` -> `["x", "y"]`; a bare identifier `x` -> `["x"]`.
+/// Returns None if the pattern is neither a well-formed tuple of identifiers
+/// nor a single identifier (so the caller can fall back to `Unparsed`).
+fn parse_binder_pattern_vars(pattern: &str) -> Option<Vec<String>> {
+    let trimmed = pattern.trim();
+    if let Some(inner) = trimmed.strip_prefix("<<").and_then(|s| s.strip_suffix(">>")) {
+        let vars: Vec<String> = split_top_level(inner, ",")
+            .into_iter()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .collect();
+        if vars.is_empty() || !vars.iter().all(|v| is_identifier(v)) {
+            return None;
+        }
+        return Some(vars);
+    }
+    if is_identifier(trimmed) {
+        return Some(vec![trimmed.to_string()]);
+    }
+    None
+}
+
+/// Parse a full binder segment list (one or more comma-separated binders, each
+/// possibly a tuple pattern) into `[(vars, domain_text), ...]`. Handles
+/// `<<x,y>> \in S`, `x \in S, y \in T`, `i, j \in S`, and mixtures.
+/// Returns None if any segment is malformed (caller falls back to `Unparsed`).
+///
+/// Mirrors the interpreter's `parse_binders`: a comma inside a domain is only a
+/// binder separator if the text after it contains a top-level `\in`.
+fn parse_all_binders(binding: &str) -> Option<Vec<(Vec<String>, String)>> {
+    let mut result = Vec::new();
+    let mut rest = binding.trim();
+
+    while !rest.is_empty() {
+        let in_idx = find_keyword(rest, "\\in")?;
+        let vars_text = rest[..in_idx].trim();
+        let after_in = rest[in_idx + "\\in".len()..].trim_start();
+
+        // Find the comma (if any) that separates this domain from the next
+        // binder: a top-level comma whose tail still contains a top-level
+        // `\in`. Commas inside the domain expression (e.g. `{1, 2}`) are
+        // already nested, and a trailing tuple-var comma has no following
+        // `\in` so it won't be picked either.
+        let mut split_idx: Option<usize> = None;
+        let mut search_from = 0usize;
+        while let Some(rel) = find_top_level_char_from(after_in, ',', search_from) {
+            let tail = after_in[rel + 1..].trim_start();
+            if find_keyword(tail, "\\in").is_some() {
+                split_idx = Some(rel);
+                break;
+            }
+            search_from = rel + 1;
+        }
+
+        let (domain_text, next_rest) = match split_idx {
+            Some(idx) => (after_in[..idx].trim(), after_in[idx + 1..].trim_start()),
+            None => (after_in.trim(), ""),
+        };
+
+        // The vars side may itself be comma-separated patterns sharing this
+        // domain: `i, j \in S` or `<<x,y>>, z \in S`.
+        for pattern in split_top_level(vars_text, ",") {
+            let pattern = pattern.trim();
+            if pattern.is_empty() {
+                continue;
+            }
+            result.push((parse_binder_pattern_vars(pattern)?, domain_text.to_string()));
+        }
+
+        rest = next_rest;
+    }
+
+    if result.is_empty() { None } else { Some(result) }
 }
 
 /// Split quantifier bindings by comma, respecting nesting
@@ -3463,7 +3704,23 @@ fn try_parse_exists(expr: &str) -> Option<CompiledExpr> {
     let body_owned = dedent_common(&rest[colon_idx + 1..]);
     let body = body_owned.as_str();
 
+    // Tuple binder(s): `\E <<x,y>> \in S : P` (and multi-binder mixtures).
+    // Model as nested TupleQuantifier/Exists nodes (each binder over its own
+    // domain, innermost binder closest to the body). A single-name binder
+    // uses `Exists`; a multi-name (tuple) binder uses `TupleQuantifier`.
     if contains_tuple_binder(binding) {
+        if let Some(bindings) = parse_all_binders(binding) {
+            let mut result = compile_expr(body);
+            for (vars, domain) in bindings.into_iter().rev() {
+                result = build_quantifier_node(
+                    TupleQuantifierKind::Exists,
+                    vars,
+                    compile_expr(&domain),
+                    result,
+                );
+            }
+            return Some(result);
+        }
         return Some(CompiledExpr::Unparsed(expr.to_string()));
     }
 
@@ -3540,7 +3797,20 @@ fn try_parse_forall(expr: &str) -> Option<CompiledExpr> {
     let body_owned = dedent_common(&rest[colon_idx + 1..]);
     let body = body_owned.as_str();
 
+    // Tuple binder(s): `\A <<x,y>> \in S : P` (and multi-binder mixtures).
     if contains_tuple_binder(binding) {
+        if let Some(bindings) = parse_all_binders(binding) {
+            let mut result = compile_expr(body);
+            for (vars, domain) in bindings.into_iter().rev() {
+                result = build_quantifier_node(
+                    TupleQuantifierKind::Forall,
+                    vars,
+                    compile_expr(&domain),
+                    result,
+                );
+            }
+            return Some(result);
+        }
         return Some(CompiledExpr::Unparsed(expr.to_string()));
     }
 
@@ -3600,7 +3870,21 @@ fn try_parse_choose(expr: &str) -> Option<CompiledExpr> {
     let body_owned = dedent_common(&rest[colon_idx + 1..]);
     let body = body_owned.as_str();
 
+    // Tuple binder: `CHOOSE <<x,y>> \in S : P`. CHOOSE returns the witnessing
+    // element, so only the single-binder form nests cleanly; a multi-binder
+    // CHOOSE is left to the interpreter.
     if contains_tuple_binder(binding) {
+        if let Some(bindings) = parse_all_binders(binding)
+            && bindings.len() == 1
+        {
+            let (vars, domain) = bindings.into_iter().next().unwrap();
+            return Some(build_quantifier_node(
+                TupleQuantifierKind::Choose,
+                vars,
+                compile_expr(&domain),
+                compile_expr(body),
+            ));
+        }
         return Some(CompiledExpr::Unparsed(expr.to_string()));
     }
 
@@ -3611,6 +3895,43 @@ fn try_parse_choose(expr: &str) -> Option<CompiledExpr> {
         domain: Box::new(compile_expr(domain)),
         body: Box::new(compile_expr(body)),
     })
+}
+
+/// Build a quantifier / CHOOSE node from a (possibly single-name) binder. A
+/// single-name binder lowers to the ordinary single-binder node; a multi-name
+/// (tuple) binder lowers to `TupleQuantifier` with positional destructuring.
+fn build_quantifier_node(
+    kind: TupleQuantifierKind,
+    vars: Vec<String>,
+    domain: CompiledExpr,
+    body: CompiledExpr,
+) -> CompiledExpr {
+    if vars.len() == 1 {
+        let var = vars.into_iter().next().unwrap();
+        return match kind {
+            TupleQuantifierKind::Exists => CompiledExpr::Exists {
+                var,
+                domain: Box::new(domain),
+                body: Box::new(body),
+            },
+            TupleQuantifierKind::Forall => CompiledExpr::Forall {
+                var,
+                domain: Box::new(domain),
+                body: Box::new(body),
+            },
+            TupleQuantifierKind::Choose => CompiledExpr::Choose {
+                var,
+                domain: Box::new(domain),
+                body: Box::new(body),
+            },
+        };
+    }
+    CompiledExpr::TupleQuantifier {
+        kind,
+        vars,
+        domain: Box::new(domain),
+        body: Box::new(body),
+    }
 }
 
 fn find_keyword(expr: &str, keyword: &str) -> Option<usize> {
@@ -4578,13 +4899,19 @@ IN
     }
 
     #[test]
-    fn test_tuple_pattern_quantifier_falls_back_to_unparsed() {
+    fn test_tuple_pattern_quantifier_compiles_to_tuple_node() {
+        // Phase-2 port: a tuple-binder quantifier now lowers to a real
+        // `TupleQuantifier` node (positional sequence destructuring) instead
+        // of the interpreter `Unparsed` fallback. The equivalence proptest
+        // (`compiled_vs_interpreted`) proves this matches the interpreter.
         let expr = compile_expr(r#"\A <<p, pnl>> \in settlementPayments : pnl >= 0"#);
-        assert!(
-            matches!(expr, CompiledExpr::Unparsed(_)),
-            "tuple-pattern quantifier should preserve the original expression for interpreted fallback: {:?}",
-            expr
-        );
+        match expr {
+            CompiledExpr::TupleQuantifier { kind, vars, .. } => {
+                assert_eq!(kind, TupleQuantifierKind::Forall);
+                assert_eq!(vars, vec!["p".to_string(), "pnl".to_string()]);
+            }
+            other => panic!("expected TupleQuantifier, got {other:?}"),
+        }
     }
 
     #[test]
