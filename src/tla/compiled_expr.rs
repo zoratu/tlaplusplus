@@ -2592,7 +2592,14 @@ fn try_parse_func_construct(inner: &str) -> Option<CompiledExpr> {
     // Pattern: x \in S |-> expr
     if let Some(arrow_idx) = inner.find("|->") {
         let binding = inner[..arrow_idx].trim();
-        let body = inner[arrow_idx + 3..].trim();
+        // Body extraction: `dedent_common` (NOT a bare `.trim()`), matching the
+        // quantifier/IF/LET/CASE/LAMBDA fixes. A function-construction body
+        // `x \in S |-> body` can be a uniformly-indented bulleted boolean value;
+        // a bare `.trim()` would fold deeper siblings into conjunct 0 and
+        // right-nest through the `=>` fallback, flipping the value. `dedent_common`
+        // keeps every bullet at the same column; no-op in the aligned case.
+        let body_owned = dedent_common(&inner[arrow_idx + 3..]);
+        let body = body_owned.as_str();
 
         if let Some((var, domain)) = parse_in_binding(binding) {
             return Some(CompiledExpr::FuncConstruct {
@@ -2813,7 +2820,13 @@ fn parse_except_updates(s: &str) -> Option<Vec<(Vec<CompiledExpr>, CompiledExpr)
         // Note: eq_pos is relative to part[1..], so we add 1 to get the position in part
         let eq_pos = find_top_level_eq(&part[1..])?;
         let path_str = part[1..1 + eq_pos].trim();
-        let value_str = part[1 + eq_pos + 1..].trim();
+        // Value extraction: `dedent_common` (NOT a bare `.trim()`), matching the
+        // quantifier/IF/LET/CASE/LAMBDA fixes. An EXCEPT update value can be a
+        // uniformly-indented bulleted boolean value; `dedent_common` keeps every
+        // bullet at the same column so the indented-boolean splitter does not
+        // fold siblings into conjunct 0. No-op in the aligned case.
+        let value_owned = dedent_common(&part[1 + eq_pos + 1..]);
+        let value_str = value_owned.as_str();
 
         // Parse the path: [k1][k2][k3]...
         let path = parse_except_path(path_str)?;
@@ -3080,7 +3093,15 @@ fn try_compile_case(expr: &str) -> Option<CompiledExpr> {
         // Find the first top-level "->" to split condition from value.
         let arrow_idx = find_top_level_arrow(arm)?;
         let cond = arm[..arrow_idx].trim();
-        let value = arm[arrow_idx + 2..].trim();
+        // Arm-value extraction: `dedent_common` (NOT a bare `.trim()`), matching
+        // the quantifier/IF/LET fixes. A CASE arm value can be a uniformly-
+        // indented bulleted `/\`/`\/` conjunction; a bare `.trim()` de-indents
+        // only its first line, so the compiled indented-boolean splitter folds
+        // the deeper siblings into conjunct 0 and the `=>` fallback right-nests
+        // the lot, flipping the arm's truth value. `dedent_common` keeps every
+        // bullet at the same column; it is a no-op in the common (aligned) case.
+        let value_owned = dedent_common(&arm[arrow_idx + 2..]);
+        let value = value_owned.as_str();
 
         if cond == "OTHER" {
             other = Some(Box::new(compile_expr(value)));
@@ -3176,13 +3197,28 @@ fn try_parse_if(expr: &str) -> Option<CompiledExpr> {
     let rest = rest[then_idx + 4..].trim();
 
     let else_idx = find_keyword(rest, "ELSE")?;
-    let then_expr = rest[..else_idx].trim();
-    let else_expr = rest[else_idx + 4..].trim();
+    // Branch extraction: `dedent_common` (NOT a bare `.trim()`), matching
+    // `try_parse_forall`/`try_parse_exists`/`try_parse_choose`. A bare `.trim()`
+    // de-indents ONLY the branch's first line, so a uniformly-indented bulleted
+    // THEN/ELSE branch like
+    //     IF cond THEN
+    //         /\ P0 => Q0    <- col 8
+    //         /\ P1 => Q1    <- col 8
+    //     ELSE ...
+    // becomes "first bullet at col 0, siblings at col 8"; the compiled
+    // indented-boolean splitter then folds every deeper sibling `/\` INTO the
+    // first conjunct and the `=>` fallback right-nests the lot, flipping the
+    // branch's truth value (the IF twin of the MCBakery `\A` bug). `dedent_common`
+    // keeps every bullet at the same column so the real top-level conjunction
+    // survives; it is a no-op when the first branch line already holds the
+    // minimum indent (the common case), matching the old `.trim()` there.
+    let then_owned = dedent_common(&rest[..else_idx]);
+    let else_owned = dedent_common(&rest[else_idx + 4..]);
 
     Some(CompiledExpr::If {
         cond: Box::new(compile_expr(cond)),
-        then_branch: Box::new(compile_expr(then_expr)),
-        else_branch: Box::new(compile_expr(else_expr)),
+        then_branch: Box::new(compile_expr(then_owned.as_str())),
+        else_branch: Box::new(compile_expr(else_owned.as_str())),
     })
 }
 
@@ -3271,9 +3307,18 @@ fn try_parse_let(expr: &str) -> Option<CompiledExpr> {
         return Some(CompiledExpr::Unparsed(expr.to_string()));
     }
 
+    // Body extraction: `dedent_common` (NOT a bare `.trim()`), matching the
+    // quantifier/IF fixes. A LET IN-body can be a uniformly-indented bulleted
+    // `/\`/`\/` conjunction; a bare `.trim()` (which `body_str` already applied)
+    // de-indents only its first line, so the compiled indented-boolean splitter
+    // folds the deeper siblings into conjunct 0 and the `=>` fallback right-nests
+    // the lot, flipping the body's truth value. `dedent_common` keeps every
+    // bullet at the same column; it is a no-op when the body's first line already
+    // holds the minimum indent, so it matches `body_str` in the common case.
+    let body_owned = dedent_common(body_str);
     Some(CompiledExpr::Let {
         bindings,
-        body: Box::new(compile_expr(body_str)),
+        body: Box::new(compile_expr(body_owned.as_str())),
     })
 }
 
@@ -3312,7 +3357,14 @@ fn try_parse_lambda(expr: &str) -> Option<CompiledExpr> {
 
     let colon_idx = find_top_level_colon(rest)?;
     let params_str = rest[..colon_idx].trim();
-    let body_str = rest[colon_idx + 1..].trim();
+    // Body extraction: `dedent_common` (NOT a bare `.trim()`), matching the
+    // quantifier/IF/LET/CASE fixes. A LAMBDA body can be a uniformly-indented
+    // bulleted `/\`/`\/` conjunction; a bare `.trim()` would fold the deeper
+    // siblings into conjunct 0 via the indented-boolean splitter and right-nest
+    // through the `=>` fallback, flipping the body's truth value. `dedent_common`
+    // keeps every bullet at the same column; it is a no-op in the aligned case.
+    let body_str = dedent_common(&rest[colon_idx + 1..]);
+    let body_str = body_str.as_str();
 
     // Parse parameter names (comma-separated identifiers)
     let params: Vec<String> = params_str
@@ -4088,6 +4140,94 @@ mod tests {
             shape(&c),
             "Choose(And[Implies(_,_),Implies(_,_)])",
             "uniformly-indented `/\\ P => Q` conjuncts under a `CHOOSE` head must be a \
+             top-level conjunction of implications, not a nested `=>` chain"
+        );
+    }
+
+    /// IF twin of `forall_head_col0_uniformly_indented_...`. An `IF cond THEN`
+    /// branch whose `P => Q` conjunct bullets are UNIFORMLY indented below a
+    /// column-0 head must compile so the THEN branch stays a top-level
+    /// conjunction of implications, NOT a right-nested `=>` chain. Before the fix
+    /// `try_parse_if` extracted the branch with a bare `.trim()` (de-indents only
+    /// line 1), so the compiled indented-boolean splitter folded the deeper
+    /// siblings into conjunct 0 and the `=>` fallback right-nested the lot —
+    /// flipping the branch's truth value on the compiled `check_invariants` path.
+    #[test]
+    fn if_then_col0_uniformly_indented_implies_conjuncts_stay_a_conjunction() {
+        // THEN keyword at col 0, two `P => Q` bullets uniformly indented at col 11.
+        let e = compile_expr(
+            "IF cond THEN\n           /\\ (pc = \"w2\") => (nxt # i)\n           /\\ (pc = \"e2\") => flag\n       ELSE done",
+        );
+        assert_eq!(
+            shape(&e),
+            "_",
+            "sanity: parses as If (leaf shape `_` since If is not a boolean shape node)"
+        );
+        // Assert on the THEN branch's structure directly.
+        let CompiledExpr::If { then_branch, .. } = &e else {
+            panic!("expected If, got {e:?}");
+        };
+        assert_eq!(
+            shape(then_branch),
+            "And[Implies(_,_),Implies(_,_)]",
+            "uniformly-indented `/\\ P => Q` conjuncts in an IF THEN branch must be \
+             a top-level conjunction of implications, not a nested `=>` chain"
+        );
+    }
+
+    /// LET-body twin. A `LET x == e IN` body that is a uniformly-indented
+    /// `/\ P => Q` conjunction below a column-0 head must compile to
+    /// `Let(And[Implies, Implies])`, NOT a right-nested `=>` chain. Before the
+    /// fix `try_parse_let`'s final `compile_expr(body_str)` used a bare-`.trim()`
+    /// `body_str`, folding the deeper siblings into conjunct 0.
+    #[test]
+    fn let_body_col0_uniformly_indented_implies_conjuncts_stay_a_conjunction() {
+        let e = compile_expr(
+            "LET x == 1 IN\n           /\\ (pc = \"w2\") => (nxt # x)\n           /\\ (pc = \"e2\") => flag",
+        );
+        assert_eq!(
+            shape(&e),
+            "Let(And[Implies(_,_),Implies(_,_)])",
+            "uniformly-indented `/\\ P => Q` conjuncts in a LET IN-body must be a \
+             top-level conjunction of implications, not a nested `=>` chain"
+        );
+    }
+
+    /// CASE-arm-value twin. A CASE arm whose value is a uniformly-indented
+    /// `/\ P => Q` conjunction below the `->` must keep that value as a top-level
+    /// conjunction of implications, NOT a right-nested `=>` chain. Before the fix
+    /// the arm value was extracted with a bare `.trim()`.
+    #[test]
+    fn case_arm_col0_uniformly_indented_implies_conjuncts_stay_a_conjunction() {
+        let e = compile_expr(
+            "CASE g ->\n           /\\ (pc = \"w2\") => (nxt # i)\n           /\\ (pc = \"e2\") => flag\n         [] OTHER -> done",
+        );
+        let CompiledExpr::Case { arms, .. } = &e else {
+            panic!("expected Case, got {e:?}");
+        };
+        assert_eq!(
+            shape(&arms[0].1),
+            "And[Implies(_,_),Implies(_,_)]",
+            "uniformly-indented `/\\ P => Q` conjuncts in a CASE arm value must be a \
+             top-level conjunction of implications, not a nested `=>` chain"
+        );
+    }
+
+    /// LAMBDA-body twin. A `LAMBDA x :` body that is a uniformly-indented
+    /// `/\ P => Q` conjunction below the colon must stay a top-level conjunction
+    /// of implications, NOT a right-nested `=>` chain.
+    #[test]
+    fn lambda_body_col0_uniformly_indented_implies_conjuncts_stay_a_conjunction() {
+        let e = compile_expr(
+            "LAMBDA x :\n           /\\ (pc = \"w2\") => (nxt # x)\n           /\\ (pc = \"e2\") => flag",
+        );
+        let CompiledExpr::Lambda { body, .. } = &e else {
+            panic!("expected Lambda, got {e:?}");
+        };
+        assert_eq!(
+            shape(body),
+            "And[Implies(_,_),Implies(_,_)]",
+            "uniformly-indented `/\\ P => Q` conjuncts in a LAMBDA body must be a \
              top-level conjunction of implications, not a nested `=>` chain"
         );
     }
