@@ -90,7 +90,10 @@ Test-only call sites (`#[cfg(test)]`) are excluded — notably
 | `src/tla/action_exec.rs:1176` | Successor: RHS value eval |
 | `src/tla/action_exec.rs:1193` | Successor: primed-assignment value eval |
 
-**Count: 26 in `tla_native.rs`, 6 in `action_exec.rs` — the Phase 1 set.**
+**Count: 25 in `tla_native.rs`, 6 in `action_exec.rs` — the Phase 1 set.**
+(The guard site at L3555 now also carries the opt-in Phase-0 consistency check
+call — see Task 3 — but still evaluates via `eval_expr`; behavior is
+unchanged.)
 
 ### (b) CLI / analysis — lower priority
 
