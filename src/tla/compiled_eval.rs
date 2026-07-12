@@ -620,11 +620,18 @@ fn eval_compiled_inner(
             Ok(TlaValue::Set(HashedArc::new(product)))
         }
         CompiledExpr::Subset(a, b) => {
+            // A \subseteq B == \A x \in A : x \in B. Check each element of the
+            // (finite) left set via structural membership so B is never
+            // enumerated -- B may be a record/function set over an infinite
+            // domain like `[content: Messages, age: Int]`. Matches TLC.
             let left = eval_compiled_inner(a, ctx, depth)?;
-            let right = eval_compiled_inner(b, ctx, depth)?;
             let left_set = left.as_set()?;
-            let right_set = right.as_set()?;
-            Ok(TlaValue::Bool(left_set.is_subset(&right_set)))
+            for elem in left_set.iter() {
+                if !compiled_membership_contains(elem, b, ctx, depth)? {
+                    return Ok(TlaValue::Bool(false));
+                }
+            }
+            Ok(TlaValue::Bool(true))
         }
         CompiledExpr::Cardinality(e) => {
             let set = eval_compiled_inner(e, ctx, depth)?;
