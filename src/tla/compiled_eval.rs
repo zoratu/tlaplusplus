@@ -1556,6 +1556,27 @@ fn compiled_membership_contains(
                     }
                     Ok(true)
                 }
+                // A sequence `<<e1,...,en>>` is the function `[1..n -> R]`, so it
+                // is a member of `[D -> R]` when `D = 1..n` and every element is
+                // in `R`. Ours stores sequences as a distinct `Seq` value (not a
+                // `Function`), so without this a spec typing a buffer as
+                // `[elems: [1..len -> T]]` but building it with sequence values
+                // (BufferedRandomAccessFile's `buff`) fails its type invariant.
+                TlaValue::Seq(seq) => {
+                    let domain_val = eval_compiled_inner(domain, ctx, depth)?;
+                    let domain_set = domain_val.as_set()?;
+                    let seq_domain: std::collections::BTreeSet<TlaValue> =
+                        (1..=seq.len() as i64).map(TlaValue::Int).collect();
+                    if seq_domain != *domain_set {
+                        return Ok(false);
+                    }
+                    for val in seq.iter() {
+                        if !compiled_membership_contains(val, range, ctx, depth)? {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                }
                 _ => Ok(false),
             }
         }
@@ -1571,6 +1592,37 @@ fn compiled_membership_contains(
                     return compiled_membership_contains(value, &compiled_body, ctx, depth);
                 }
                 return membership_matches_text(value, &def.body, ctx, depth);
+            }
+            let set_val = eval_compiled_inner(set_expr, ctx, depth)?;
+            set_val.contains(value)
+        }
+        CompiledExpr::OpCall { name, args } => {
+            // A parameterized defined operator whose body denotes a set -- e.g.
+            // `ArrayOfAnyLength(T) == [elems: Seq(T)]`. Bind the arguments and
+            // test membership structurally against the body, so an infinite
+            // codomain like `Seq(T)` is never materialized (which would fail
+            // "unknown operator/function 'Seq'"). Mirrors eval_compiled_opcall's
+            // param binding but recurses through compiled_membership_contains
+            // instead of evaluating the body to a concrete set. Built-in ops
+            // (no user definition) fall through to the materialize-and-test path.
+            if let Some(def) = lookup_definition(name, ctx)
+                && !def.params.is_empty()
+                && def.params.len() == args.len()
+            {
+                let arg_values: Vec<TlaValue> = args
+                    .iter()
+                    .map(|a| eval_compiled_inner(a, ctx, depth))
+                    .collect::<Result<_>>()?;
+                let compiled_body = get_or_compile_operator(name, &def.body, &def.params);
+                let mut new_ctx = if ctx.local_definitions.contains_key(name) {
+                    ctx.clone()
+                } else {
+                    ctx.enter_module_operator_scope()
+                };
+                for (param, value) in def.params.iter().zip(arg_values.into_iter()) {
+                    new_ctx = new_ctx.with_local_value(normalize_param_name(param), value);
+                }
+                return compiled_membership_contains(value, &compiled_body, &new_ctx, depth);
             }
             let set_val = eval_compiled_inner(set_expr, ctx, depth)?;
             set_val.contains(value)

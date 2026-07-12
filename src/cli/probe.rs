@@ -7373,8 +7373,14 @@ INVARIANTS TypeInvariant
             pending_mem = next_pending_mem;
         }
 
+        // `file_content \in ArrayOfAnyLength(SymbolOrArbitrary)` (with
+        // `ArrayOfAnyLength(T) == [elems: Seq(T)]`) is now membership-evaluable
+        // (it was not before parameterized-op / Seq(T) membership landed), so
+        // the type constraint reports satisfied for the empty-sequence Init
+        // value and the refine-satisfied heuristic swaps in a richer non-empty
+        // representative -- one refinement of `file_content`.
         let seeded = seed_probe_state_from_type_invariants(&mut probe_state, &module, None);
-        assert_eq!(seeded, 0);
+        assert_eq!(seeded, 1);
         assert_eq!(probe_state.get("dirty"), Some(&TlaValue::Bool(false)));
         assert!(matches!(probe_state.get("buff"), Some(TlaValue::Record(_))));
         assert!(matches!(
