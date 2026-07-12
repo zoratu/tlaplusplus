@@ -1279,10 +1279,15 @@ fn eval_compiled_inner(
 
         // Built-in sets
         CompiledExpr::NatSet => {
-            // Can't enumerate Nat, but can use it in membership checks
-            Err(anyhow!(
-                "cannot enumerate Nat - use it only in membership checks"
-            ))
+            // Honor a `Nat <- Override` config override: if Nat is bound to a
+            // concrete (finite) set, enumerate that; otherwise Nat is infinite.
+            if let Some(ov) = ctx.runtime_value("Nat") {
+                Ok(ov)
+            } else {
+                Err(anyhow!(
+                    "cannot enumerate Nat - use it only in membership checks"
+                ))
+            }
         }
         CompiledExpr::IntSet => Err(anyhow!(
             "cannot enumerate Int - use it only in membership checks"
@@ -1379,10 +1384,25 @@ fn compiled_membership_contains(
 ) -> Result<bool> {
     // Single increment site (depth-tracking consolidation).
     let depth = depth + 1;
-    match set_expr {
-        CompiledExpr::NatSet => Ok(matches!(value.as_int(), Ok(n) if n >= 0)),
+        match set_expr {
+        CompiledExpr::NatSet => {
+            if let Some(ov) = ctx.runtime_value("Nat") {
+                ov.contains(value)
+            } else {
+                Ok(matches!(value.as_int(), Ok(n) if n >= 0))
+            }
+        }
         CompiledExpr::IntSet => Ok(value.as_int().is_ok()),
         CompiledExpr::BooleanSet => Ok(matches!(value, TlaValue::Bool(_))),
+        // Set operations: membership checked structurally so a non-enumerable
+        // operand (e.g. Nat in `Nat \\ {0}`) is used only in a membership test,
+        // never enumerated. Matches TLC, which never enumerates the codomain.
+        CompiledExpr::SetMinus(a, b) => Ok(compiled_membership_contains(value, a, ctx, depth)?
+            && !compiled_membership_contains(value, b, ctx, depth)?),
+        CompiledExpr::Union(a, b) => Ok(compiled_membership_contains(value, a, ctx, depth)?
+            || compiled_membership_contains(value, b, ctx, depth)?),
+        CompiledExpr::Intersect(a, b) => Ok(compiled_membership_contains(value, a, ctx, depth)?
+            && compiled_membership_contains(value, b, ctx, depth)?),
         // Fast path: x \in a..b → a <= x && x <= b (avoids set construction)
         CompiledExpr::SetRange(lo, hi) => {
             let x = value.as_int()?;
@@ -1531,6 +1551,22 @@ fn compiled_membership_contains(
                 }
                 _ => Ok(false),
             }
+        }
+        // Nullary user operator (e.g. `Clock == Nat \\ {0}`) as a set: resolve
+        // its body and check membership structurally, like the Var arm, instead
+        // of evaluating (which would enumerate a non-enumerable operand).
+        CompiledExpr::OpCall { name, args } if args.is_empty() => {
+            if let Some(def) = ctx.definition(name)
+                && def.params.is_empty()
+            {
+                let compiled_body = get_or_compile_operator(name, &def.body, &def.params);
+                if !matches!(&*compiled_body, CompiledExpr::Unparsed(_)) {
+                    return compiled_membership_contains(value, &compiled_body, ctx, depth);
+                }
+                return membership_matches_text(value, &def.body, ctx, depth);
+            }
+            let set_val = eval_compiled_inner(set_expr, ctx, depth)?;
+            set_val.contains(value)
         }
         _ => {
             let set_val = eval_compiled_inner(set_expr, ctx, depth)?;
