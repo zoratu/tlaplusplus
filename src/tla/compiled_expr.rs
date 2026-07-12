@@ -2606,7 +2606,7 @@ fn is_bracket_type_expr(expr: &str) -> bool {
     inner.contains("->") || inner.contains(':')
 }
 
-fn parse_op_call(expr: &str) -> Option<(&str, Vec<String>)> {
+pub(crate) fn parse_op_call(expr: &str) -> Option<(&str, Vec<String>)> {
     // Find name followed by (args)
     if let Some(paren_idx) = expr.find('(') {
         let name = &expr[..paren_idx];

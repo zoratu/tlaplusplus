@@ -3898,6 +3898,77 @@ Buffer == INSTANCE RingBuffer
         assert_eq!(empty_lhs, TlaValue::Bool(true));
     }
 
+    // A sequence `<<e1,...,en>>` is the function `[1..n -> R]`, so `seq \in
+    // [D -> R]` must be true when `D = 1..n` and every element is in `R`. Ours
+    // stores sequences as a distinct `Seq` value; without a Seq case in the
+    // function-set membership arm, BufferedRandomAccessFile's `buff \in
+    // Array(T, BuffSz)` (with `Array(T, n) == [elems: [1..n -> T]]`, built from
+    // sequence values) failed its type invariant. Checked on both evaluators.
+    #[test]
+    fn seq_is_member_of_function_set() {
+        use crate::tla::{compile_expr, eval_compiled};
+        let state = TlaState::new();
+        let defs = BTreeMap::new();
+        let ctx = EvalContext::with_definitions(&state, &defs);
+        let cases = [
+            ("<<1, 2>> \\in [1..2 -> {1, 2, 3}]", true),
+            ("<<1, 3>> \\in [1..2 -> {1, 2, 3}]", true),
+            ("<<1, 5>> \\in [1..2 -> {1, 2, 3}]", false), // element out of range
+            ("<<1, 2, 3>> \\in [1..2 -> {1, 2, 3}]", false), // wrong domain length
+            ("<<>> \\in [1..0 -> {1, 2, 3}]", true),      // empty seq, empty domain
+        ];
+        for (expr, want) in cases {
+            assert_eq!(
+                eval_expr(expr, &ctx).unwrap(),
+                TlaValue::Bool(want),
+                "interpreted: {expr}"
+            );
+            assert_eq!(
+                eval_compiled(&compile_expr(expr), &ctx).unwrap(),
+                TlaValue::Bool(want),
+                "compiled: {expr}"
+            );
+        }
+    }
+
+    // `x \in Op(args)` where `Op` is a user-defined operator whose body denotes
+    // an (infinite) set must expand the operator and test membership
+    // structurally, not evaluate the infinite body. Regression:
+    // BufferedRandomAccessFile's `file_content \in ArrayOfAnyLength(Sym)` with
+    // `ArrayOfAnyLength(T) == [elems: Seq(T)]` failed "unknown operator 'Seq'".
+    #[test]
+    fn membership_in_parameterized_operator_over_infinite_set() {
+        use crate::tla::{compile_expr, eval_compiled};
+        let defs = BTreeMap::from([(
+            "ArrayOfAnyLength".to_string(),
+            TlaDefinition {
+                name: "ArrayOfAnyLength".to_string(),
+                params: vec!["T".to_string()],
+                body: "[elems: Seq(T)]".to_string(),
+                is_recursive: false,
+            },
+        )]);
+        let state = TlaState::new();
+        let ctx = EvalContext::with_definitions(&state, &defs);
+        let cases = [
+            ("[elems |-> <<1, 2>>] \\in ArrayOfAnyLength({1, 2, 3})", true),
+            ("[elems |-> <<1, 5>>] \\in ArrayOfAnyLength({1, 2, 3})", false), // 5 not in T
+            ("[elems |-> <<>>] \\in ArrayOfAnyLength({1, 2, 3})", true),      // empty seq
+        ];
+        for (expr, want) in cases {
+            assert_eq!(
+                eval_expr(expr, &ctx).unwrap(),
+                TlaValue::Bool(want),
+                "interpreted: {expr}"
+            );
+            assert_eq!(
+                eval_compiled(&compile_expr(expr), &ctx).unwrap(),
+                TlaValue::Bool(want),
+                "compiled: {expr}"
+            );
+        }
+    }
+
     #[test]
     fn t2_3_dotdot_binds_tighter_than_union() {
         let state = TlaState::new();

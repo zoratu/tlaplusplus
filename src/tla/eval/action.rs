@@ -1164,6 +1164,24 @@ pub(super) fn matches_membership_expr(
                 return matches_membership_expr(value, &def.body, ctx, depth + 1);
             }
 
+            // A parameterized defined operator whose body denotes a set --
+            // e.g. `ArrayOfAnyLength(T) == [elems: Seq(T)]`. Substitute the
+            // argument text into the body and test membership structurally, so
+            // an infinite codomain like `Seq(T)` is never materialized (which
+            // would fail with "unknown operator/function 'Seq'"). Mirrors the
+            // nullary case above. Built-ins like `Seq(S)`/`SUBSET` are handled
+            // by their own arms below, since they have no user definition.
+            if let Some((op_name, arg_texts)) =
+                crate::tla::compiled_expr::parse_op_call(rhs_trimmed)
+                && let Some(def) = ctx.definition(op_name)
+                && !def.params.is_empty()
+                && def.params.len() == arg_texts.len()
+            {
+                let substituted =
+                    substitute_params_text(&def.body, &def.params, &arg_texts);
+                return matches_membership_expr(value, &substituted, ctx, depth + 1);
+            }
+
             // `value \in UNION SS`  <=>  `\E S \in SS : value \in S`. When the
             // outer set `SS` is an explicit set literal `{ E1, E2, ... }` we can
             // test membership structurally against each element without
@@ -1352,6 +1370,29 @@ pub(super) fn matches_membership_expr(
                                 return Ok(false);
                             }
                             for item in func.values() {
+                                if !matches_membership_expr(item, codomain_expr, ctx, depth + 1)? {
+                                    return Ok(false);
+                                }
+                            }
+                            Ok(true)
+                        }
+                        // A sequence `<<e1,...,en>>` is the function `[1..n -> R]`;
+                        // it is a member of `[D -> R]` when `D = 1..n` and every
+                        // element is in `R`. Sequences are stored as a distinct
+                        // `Seq` value, so accept them here too (mirrors the
+                        // compiled FunctionSet arm).
+                        TlaValue::Seq(seq) => {
+                            let domain_val = eval_expr_inner(domain_expr, ctx, depth + 1)?;
+                            let domain_set = match domain_val.as_set() {
+                                Ok(set) => set,
+                                Err(_) => return Ok(false),
+                            };
+                            let seq_domain: BTreeSet<TlaValue> =
+                                (1..=seq.len() as i64).map(TlaValue::Int).collect();
+                            if seq_domain != *domain_set {
+                                return Ok(false);
+                            }
+                            for item in seq.iter() {
                                 if !matches_membership_expr(item, codomain_expr, ctx, depth + 1)? {
                                     return Ok(false);
                                 }
