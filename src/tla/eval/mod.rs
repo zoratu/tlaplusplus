@@ -4004,6 +4004,36 @@ Buffer == INSTANCE RingBuffer
         assert!(eval_compiled(&compile_expr("Assert(1 = 2, \"boom\")"), &ctx).is_err());
     }
 
+    // A non-integer value (ModelValue) is simply not a member of an integer
+    // range: `x \in a..b` must be false, never an error. Regression (Chameneos):
+    // `meetingPlace \in ChameneosID \cup {MeetingPlaceEmpty}` splits structurally
+    // into `MeetingPlaceEmpty \in 0..N`; the compiled SetRange arm used to
+    // propagate an "expected Int" error, spuriously failing TypeOK at the
+    // initial state.
+    #[test]
+    fn model_value_not_in_int_range_is_false_not_error() {
+        use crate::tla::{compile_expr, eval_compiled};
+        let state = tla_state([("mv", TlaValue::ModelValue("Empty".to_string()))]);
+        let defs = BTreeMap::new();
+        let ctx = EvalContext::with_definitions(&state, &defs);
+        for expr in ["mv \\in 0..3", "mv \\in 1..4"] {
+            assert_eq!(eval_expr(expr, &ctx).unwrap(), TlaValue::Bool(false), "interp: {expr}");
+            assert_eq!(
+                eval_compiled(&compile_expr(expr), &ctx).unwrap(),
+                TlaValue::Bool(false),
+                "compiled: {expr}"
+            );
+        }
+        // The full union form (the TypeOK shape) is true on both paths.
+        let u = "mv \\in (0..3 \\cup {mv})";
+        assert_eq!(eval_expr(u, &ctx).unwrap(), TlaValue::Bool(true), "interp union");
+        assert_eq!(
+            eval_compiled(&compile_expr(u), &ctx).unwrap(),
+            TlaValue::Bool(true),
+            "compiled union"
+        );
+    }
+
     #[test]
     fn t2_3_dotdot_binds_tighter_than_union() {
         let state = TlaState::new();

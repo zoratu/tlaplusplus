@@ -1412,7 +1412,14 @@ fn compiled_membership_contains(
             && compiled_membership_contains(value, b, ctx, depth)?),
         // Fast path: x \in a..b → a <= x && x <= b (avoids set construction)
         CompiledExpr::SetRange(lo, hi) => {
-            let x = value.as_int()?;
+            // A non-integer value (e.g. a ModelValue) is simply not a member of
+            // an integer range -- return false rather than propagating the
+            // `as_int` error, which matters when this arm is reached
+            // structurally, e.g. `x \in (0..N \cup {ModelValue})` splits into
+            // `x \in 0..N` for a model-value `x` (Chameneos TypeOK).
+            let Ok(x) = value.as_int() else {
+                return Ok(false);
+            };
             let a = eval_compiled_inner(lo, ctx, depth)?.as_int()?;
             let b = eval_compiled_inner(hi, ctx, depth)?.as_int()?;
             Ok(a <= x && x <= b)
