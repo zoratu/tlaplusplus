@@ -107,6 +107,14 @@ pub fn canonicalize_tla_state(state: &TlaState, symmetry: &SymmetrySpec) -> TlaS
         Some(g) if !g.is_empty() => g,
         _ => return state.clone(),
     };
+    // Symmetric model values are also present as constant self-bindings in the
+    // state (`r1 |-> r1`); those entries must be held fixed during permutation
+    // (see apply_permutation_to_state) so symmetric states canonicalize alike.
+    static EMPTY_FIXED: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
+    let fixed_keys = symmetry
+        .symmetric_values
+        .as_ref()
+        .unwrap_or_else(|| EMPTY_FIXED.get_or_init(HashSet::new));
 
     // Safety valve: enumerating N! permutations gets expensive fast.
     // 5! = 120 is tolerable; 6! = 720 starts to bite; 7! = 5040 is too
@@ -171,7 +179,7 @@ pub fn canonicalize_tla_state(state: &TlaState, symmetry: &SymmetrySpec) -> TlaS
         let candidate_norm = if perm_map.iter().all(|(k, v)| k == v) {
             state_norm.clone()
         } else {
-            apply_permutation_to_state(state_norm, &perm_map)
+            apply_permutation_to_state(state_norm, &perm_map, fixed_keys)
         };
 
         if best_norm.as_ref().map_or(true, |b| &candidate_norm < b) {
@@ -196,7 +204,7 @@ pub fn canonicalize_tla_state(state: &TlaState, symmetry: &SymmetrySpec) -> TlaS
 
     match best_perm {
         Some(perm_map) if !perm_map.iter().all(|(k, v)| k == v) => {
-            apply_permutation_to_state(state, &perm_map)
+            apply_permutation_to_state(state, &perm_map, fixed_keys)
         }
         _ => state.clone(),
     }
@@ -274,12 +282,33 @@ fn collect_model_values_in_value(
 }
 
 /// Apply a permutation to all ModelValue instances in a state
-fn apply_permutation_to_state(state: &TlaState, permutation: &HashMap<String, String>) -> TlaState {
+fn apply_permutation_to_state(
+    state: &TlaState,
+    permutation: &HashMap<String, String>,
+    fixed_keys: &HashSet<String>,
+) -> TlaState {
     // A permutation renames symmetric ModelValues *inside* the values; the
     // variable names (schema) are unchanged. Map values while preserving the
     // schema Arc so we don't re-derive a schema or double-clone keys/values on
     // every canonicalization (the symmetry hot path).
-    state.map_values(|v| apply_permutation_to_value(v, permutation))
+    //
+    // `fixed_keys` names entries that must be left untouched: the symmetric model
+    // values themselves are present in the state as constant self-bindings
+    // (`r1 |-> ModelValue("r1")`, ...). These are identical in every reachable
+    // state, but permuting them (`r1 |-> ModelValue("r2")`) makes two symmetric
+    // states pick *different* canonical forms — defeating the whole reduction.
+    // They are constants, so keep them fixed; only the mutable state that
+    // *references* the symmetric values gets permuted.
+    if fixed_keys.is_empty() {
+        return state.map_values(|v| apply_permutation_to_value(v, permutation));
+    }
+    state.map_values_keyed(|name, v| {
+        if fixed_keys.contains(name) {
+            v.clone()
+        } else {
+            apply_permutation_to_value(v, permutation)
+        }
+    })
 }
 
 fn apply_permutation_to_value(value: &TlaValue, permutation: &HashMap<String, String>) -> TlaValue {
@@ -475,6 +504,51 @@ mod tests {
         // The lex-min representative is the one with x=n1, y=n2
         // (because x sorts before y; n1 < n2).
         assert_eq!(canon_a, state_a);
+    }
+
+    /// Regression (Paxos SimplifiedFastPaxos): ours stores CONSTANTS in the
+    /// state, so the symmetric model values appear as constant self-bindings
+    /// (`n1 |-> n1`). Permuting those made two symmetric states pick *different*
+    /// canonical forms, defeating symmetry reduction entirely (Paxos explored
+    /// 48514 states instead of TLC's 1207). The self-bindings are constants and
+    /// must be held fixed; only the mutable state that references them permutes.
+    #[test]
+    fn canonicalize_holds_symmetric_value_constant_self_bindings_fixed() {
+        use std::sync::Arc;
+        let mut spec = SymmetrySpec::new("NodeSym".to_string());
+        spec.initialize_with_groups(vec![
+            ["n1", "n2"].iter().map(|s| s.to_string()).collect(),
+        ]);
+
+        // Constant self-bindings n1|->n1, n2|->n2 plus a variable `v` that
+        // references a symmetric value; state_a and state_b are the same orbit.
+        let mk = |vval: &str| -> TlaState {
+            [
+                (Arc::<str>::from("n1"), TlaValue::ModelValue("n1".to_string())),
+                (Arc::<str>::from("n2"), TlaValue::ModelValue("n2".to_string())),
+                (Arc::<str>::from("v"), TlaValue::ModelValue(vval.to_string())),
+            ]
+            .into_iter()
+            .collect()
+        };
+        let state_a = mk("n1");
+        let state_b = mk("n2");
+
+        let canon_a = canonicalize_tla_state(&state_a, &spec);
+        let canon_b = canonicalize_tla_state(&state_b, &spec);
+        assert_eq!(
+            canon_a, canon_b,
+            "symmetric states must collapse despite the constant self-bindings"
+        );
+        // The self-bindings stay fixed in the canonical form.
+        assert_eq!(
+            canon_a.get("n1"),
+            Some(&TlaValue::ModelValue("n1".to_string()))
+        );
+        assert_eq!(
+            canon_a.get("n2"),
+            Some(&TlaValue::ModelValue("n2".to_string()))
+        );
     }
 
     /// 3-element symmetry group (matches MCCheckpointCoord's Node = {n1,n2,n3}).
