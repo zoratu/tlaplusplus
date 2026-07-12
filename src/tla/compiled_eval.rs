@@ -2909,6 +2909,45 @@ fn eval_compiled_clause_to_branch<'a>(
 /// clause — but the correct semantics is to expand each disjunct as a
 /// successor-producing branch. Returns true when the text needs the
 /// interpreted action-body evaluator instead of the boolean guard evaluator.
+/// A `Guard` clause may actually be an ACTION-operator call whose body assigns
+/// through one of its parameters, e.g. `LoseMsg == Lose(msgQ)` with
+/// `Lose(q) == ... q' = [...]`. Such a parameter aliases the argument VARIABLE,
+/// so `q'` must resolve to `msgQ'`. Evaluating it as a boolean guard (or
+/// value-binding `q`) leaks `q` as a phantom state variable and deforms the
+/// state space (AlternatingBit: 1476 states vs TLC's 240). When `text` is such a
+/// call, return the operator body with the argument text substituted for each
+/// parameter (so `q'` becomes `msgQ'`), ready to evaluate as an action body.
+fn expand_primed_param_action_call(text: &str, ctx: &EvalContext<'_>) -> Option<String> {
+    let (name, args) = crate::tla::compiled_expr::parse_op_call(text.trim())?;
+    let def = ctx.definition(name)?;
+    if def.params.is_empty() || def.params.len() != args.len() {
+        return None;
+    }
+    let primes_a_param = def.params.iter().any(|p| {
+        let pb = p.as_bytes();
+        let bytes = def.body.as_bytes();
+        let plen = pb.len();
+        plen > 0
+            && (0..bytes.len().saturating_sub(plen)).any(|i| {
+                &bytes[i..i + plen] == pb
+                    && (i == 0 || !is_word_byte(bytes[i - 1]))
+                    && bytes.get(i + plen) == Some(&b'\'')
+            })
+    });
+    if !primes_a_param {
+        return None;
+    }
+    Some(crate::tla::eval::substitute_params_text(
+        &def.body,
+        &def.params,
+        &args,
+    ))
+}
+
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
 fn guard_text_is_action_body(text: &str) -> bool {
     let trimmed = text.trim_start();
     // An action body reaches this function as a `Guard` clause whenever
@@ -3168,6 +3207,33 @@ fn try_eval_compiled_guard_as_action<'a>(
     }
 
     let outer_ctx = branch.ctx.clone();
+
+    // A parameter assigned through its prime in the body (`Lose(q) == ... q' = ...`)
+    // aliases the ARGUMENT VARIABLE, so `q'` must become `msgQ'`. The compiled
+    // path below value-binds the parameter and compiles the raw body, turning
+    // `q' = ...` into a primed assignment to a phantom state variable `q`
+    // (AlternatingBit's `LoseMsg == Lose(msgQ)`: 1476 states vs TLC's 240).
+    // Substitute the argument text into the body first, so the prime lands on the
+    // real variable, then evaluate the substituted body as an action.
+    if let Some(substituted) = expand_primed_param_action_call(text, &branch.ctx) {
+        let interpreted_branches =
+            crate::tla::eval::eval_action_body_multi(&substituted, &branch.ctx, &branch.staged)?;
+        let mut out = Vec::with_capacity(interpreted_branches.len());
+        for (staged, unchanged_vars) in interpreted_branches {
+            let mut merged = branch.unchanged_vars.clone();
+            for v in unchanged_vars {
+                if !merged.contains(&v) {
+                    merged.push(v);
+                }
+            }
+            out.push(CompiledActionBranch {
+                ctx: outer_ctx.clone(),
+                staged,
+                unchanged_vars: merged,
+            });
+        }
+        return Ok(Some(out));
+    }
 
     // Soundness fix (wrapper-alias + nested disjunction): evaluate the resolved
     // action through the *compiled* clause evaluator rather than the interpreted
