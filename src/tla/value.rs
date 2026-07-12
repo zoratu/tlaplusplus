@@ -331,6 +331,24 @@ impl TlaState {
             values: self.values.iter().map(f).collect(),
         }
     }
+
+    /// Like [`map_values`], but the closure also receives each variable's name,
+    /// so callers can leave selected entries untouched. Used by symmetry
+    /// canonicalization, which must NOT permute the constant self-bindings of
+    /// symmetric model values (`r1 |-> r1`), only the mutable state that
+    /// references them. Preserves the schema `Arc` and slot order.
+    pub fn map_values_keyed(&self, f: impl Fn(&str, &TlaValue) -> TlaValue) -> TlaState {
+        TlaState {
+            schema: Arc::clone(&self.schema),
+            values: self
+                .schema
+                .names
+                .iter()
+                .zip(self.values.iter())
+                .map(|(name, v)| f(name, v))
+                .collect(),
+        }
+    }
 }
 
 impl<'a> TlaStateEntry<'a> {
