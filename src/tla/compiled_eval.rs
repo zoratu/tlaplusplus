@@ -2034,6 +2034,34 @@ fn eval_compiled_opcall(
             }
             return Ok(TlaValue::Bool(true));
         }
+        // TLC!Assert(val, out) == IF val THEN TRUE ELSE Print(out, FALSE).
+        // As an action conjunct on a reachable state the guard is normally
+        // true, so it must evaluate transparently to TRUE; without a handler it
+        // fell through to "unknown operator", and a failed action eval is
+        // silently treated as a disabled branch -- so any action arm guarded by
+        // an Assert (e.g. Echo's `n1` first-message receive) never fired,
+        // collapsing state exploration. A false assertion surfaces as an error.
+        "Assert" if arg_values.len() == 2 && !user_defined_shadow => {
+            return match &arg_values[0] {
+                TlaValue::Bool(true) => Ok(TlaValue::Bool(true)),
+                TlaValue::Bool(false) => Err(anyhow!(
+                    "assertion failed: {:?}",
+                    arg_values[1]
+                )),
+                other => Err(anyhow!(
+                    "Assert expects a boolean first argument, got {:?}",
+                    other
+                )),
+            };
+        }
+        // TLC!Print(out, val) == val ; TLC!PrintT(out) == TRUE. Side-effecting
+        // debug output is a no-op here; both must be value-transparent.
+        "Print" if arg_values.len() == 2 && !user_defined_shadow => {
+            return Ok(arg_values[1].clone());
+        }
+        "PrintT" if arg_values.len() == 1 && !user_defined_shadow => {
+            return Ok(TlaValue::Bool(true));
+        }
         "Len" => {
             if arg_values.len() != 1 {
                 return Err(anyhow!("Len expects 1 argument"));
