@@ -490,6 +490,17 @@ pub(crate) fn dump_state_graph(model: &TlaModel, path: &std::path::Path, format:
         model.next_states(&state, &mut successors);
 
         for succ in &successors {
+            // Apply the same state/action constraints the runtime worker uses
+            // (worker.rs `successors.retain(...)`), so the dumped graph matches
+            // the checked state space. This also makes the dump TERMINATE for a
+            // spec whose reachable space is only finite under a `CONSTRAINT`
+            // (e.g. AlternatingBit's `Len(msgQ) <= msgQLen`): without it this
+            // BFS re-explores the unbounded space and never writes a file.
+            if model.check_state_constraints(succ).is_err()
+                || model.check_action_constraints(&state, succ).is_err()
+            {
+                continue;
+            }
             let to_fp = model_fingerprint(succ);
             transitions.push((from_fp, to_fp));
             if visited.insert(to_fp) {
