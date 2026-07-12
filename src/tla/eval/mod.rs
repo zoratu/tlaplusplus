@@ -4034,6 +4034,51 @@ Buffer == INSTANCE RingBuffer
         );
     }
 
+    // Audit guard for the "structural membership must return false, never error,
+    // on a type mismatch" invariant (the SetRange footgun, #177). A ModelValue is
+    // not a member of any of these numeric/collection set shapes; every arm must
+    // yield Bool(false) on BOTH evaluators without raising an error. A regression
+    // here (an arm that `?`-propagates a coercion error) would panic on unwrap.
+    #[test]
+    fn structural_membership_never_errors_on_type_mismatch() {
+        use crate::tla::{compile_expr, eval_compiled};
+        let state = tla_state([("mv", TlaValue::ModelValue("Empty".to_string()))]);
+        let defs = BTreeMap::new();
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        let false_cases = [
+            "mv \\in Int",
+            "mv \\in Nat",
+            "mv \\in 0..3",                    // SetRange (the #177 fix)
+            "mv \\in BOOLEAN",
+            "mv \\in SUBSET {1, 2}",           // mv is not a set
+            "mv \\in [{1, 2} -> {3, 4}]",      // mv is not a function
+            "mv \\in [a: {1, 2}]",             // mv is not a record
+            "mv \\in Seq({1, 2})",             // mv is not a sequence
+            "mv \\in ({1, 2} \\cup {3})",
+            "mv \\in (0..3 \\cup Int)",        // union of two numeric shapes
+            "mv \\in (0..3 \\intersect Nat)",
+        ];
+        for expr in false_cases {
+            assert_eq!(eval_expr(expr, &ctx).unwrap(), TlaValue::Bool(false), "interp: {expr}");
+            assert_eq!(
+                eval_compiled(&compile_expr(expr), &ctx).unwrap(),
+                TlaValue::Bool(false),
+                "compiled: {expr}"
+            );
+        }
+
+        // Positive controls: the model value IS a member here.
+        for expr in ["mv \\in {mv}", "mv \\in ({1, 2} \\cup {mv})"] {
+            assert_eq!(eval_expr(expr, &ctx).unwrap(), TlaValue::Bool(true), "interp: {expr}");
+            assert_eq!(
+                eval_compiled(&compile_expr(expr), &ctx).unwrap(),
+                TlaValue::Bool(true),
+                "compiled: {expr}"
+            );
+        }
+    }
+
     #[test]
     fn t2_3_dotdot_binds_tighter_than_union() {
         let state = TlaState::new();
