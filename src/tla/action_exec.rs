@@ -251,6 +251,33 @@ fn body_has_instance_action_call(body: &str) -> bool {
     false
 }
 
+/// The compiled `CompiledLetWithPrimes` path can silently drop successors when a
+/// `LET ... IN` body stages a primed variable (e.g. Paxos's
+/// `PaxosAccept == ... \E ... : LET M == ... IN ... /\ messages' = ...`), returning
+/// `Ok(empty)` for an action that is in fact enabled. Detect a body worth
+/// cross-checking against the interpreted evaluator: it contains a `LET` keyword.
+/// We do NOT require a visible prime, because the primed assignment is frequently
+/// hidden behind a helper operator (Paxos's `SendMessage(m) == messages' = ...`),
+/// so the prime never appears in the action body's own text. This is only
+/// consulted on an *empty* compiled result, so a false positive merely re-runs the
+/// interpreted evaluator (which returns the same empty) — it cannot mask a
+/// correct-empty; the cost is a redundant interpreted pass over a disabled
+/// LET-bodied action.
+fn body_has_let_with_primes(body: &str) -> bool {
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        if &bytes[i..i + 3] == b"LET"
+            && (i == 0 || !is_ident_byte(bytes[i - 1]))
+            && bytes.get(i + 3).map_or(true, |&n| !is_ident_byte(n))
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
@@ -629,24 +656,28 @@ fn execute_branch(
         // (meaning compilation couldn't handle the expression at all).
         let compiled_ir = get_or_compile_action(def);
         return match apply_compiled_action_ir_multi(&compiled_ir, state, &ctx) {
-            // The compiled action IR can silently drop successors when the
-            // operator body routes a primed variable through a *module-instance
-            // action call* inside a LET, e.g. Disruptor's
-            //   BeginWrite(w) == LET index == Buffer!IndexOf(next) IN
-            //                      ... /\ Buffer!Write(index, w, next) /\ ...
-            // where the compiled `CompiledLetWithPrimes` path fails to stage
-            // `ringbuffer'` and returns `Ok(empty)` even though the action is
-            // enabled. Empty is normally trusted (guards legitimately blocking
-            // the transition), but when the body reaches an instance-action
-            // call `Alias!Op(...)` we cross-check with the interpreted
-            // evaluator (the inline-action path below already does the same
-            // empty→interpreted fallback). Non-empty compiled results are
-            // always trusted; the fallback only fires on an *empty* compiled
-            // result for a body that contains a `!`-qualified action call, so
-            // it cannot mask a correct-empty and adds no cost to the common
-            // path.
+            // The compiled action IR can silently drop successors when a
+            // `LET ... IN` body stages a primed variable, because the compiled
+            // `CompiledLetWithPrimes` path fails to stage the prime and returns
+            // `Ok(empty)` even though the action is enabled. Two shapes hit this:
+            //   - a module-instance action call inside a LET, e.g. Disruptor's
+            //       BeginWrite(w) == LET index == Buffer!IndexOf(next) IN
+            //                          ... /\ Buffer!Write(index, w, next) /\ ...
+            //     (fails to stage `ringbuffer'`); and
+            //   - a plain primed assignment inside a LET, e.g. Paxos's
+            //       PaxosAccept == ... \E ... : LET M == ... IN ... /\ messages' = ...
+            //     (fails to stage `messages'`, collapsing 48514 states to 289).
+            // Empty is normally trusted (guards legitimately blocking the
+            // transition), so we only cross-check with the interpreted evaluator
+            // when the body reaches an instance-action call or contains a
+            // LET-with-primes. Non-empty compiled results are always trusted; on
+            // an *empty* result a false positive merely re-runs the interpreted
+            // evaluator (which returns the same empty), so it cannot mask a
+            // correct-empty.
             Ok(successors)
-                if successors.is_empty() && body_has_instance_action_call(&def.body) =>
+                if successors.is_empty()
+                    && (body_has_instance_action_call(&def.body)
+                        || body_has_let_with_primes(&def.body)) =>
             {
                 let interpreted_ir = compile_action_ir(def);
                 match apply_action_ir_with_context_multi(&interpreted_ir, state, &ctx) {
@@ -3185,6 +3216,50 @@ SPECIFICATION
             next.get("y"),
             Some(&TlaValue::Int(2)),
             "y' from Step2 must read the intermediate x' = 2 (composition order)"
+        );
+    }
+
+    #[test]
+    fn let_in_action_with_helper_hidden_prime_generates_successors() {
+        // Regression (Paxos SimplifiedFastPaxos): an action operator whose body
+        // is `\E ... : LET x == ... IN Helper(...)`, where `Helper` hides the
+        // primed assignment (`Send(m) == msgs' = msgs \union {m}`), was silently
+        // dropped by the compiled `CompiledLetWithPrimes` path (returned
+        // Ok(empty)). Because the prime is not visible in the operator body, the
+        // instance-action-call fallback did not fire, collapsing exploration
+        // (Paxos: 48514 reachable states -> 289). Next calls the operator, so
+        // this exercises the operator-call empty->interpreted fallback.
+        let defs = BTreeMap::from([
+            (
+                "Send".to_string(),
+                TlaDefinition {
+                    name: "Send".to_string(),
+                    params: vec!["m".to_string()],
+                    body: "msgs' = msgs \\union {m}".to_string(),
+                    is_recursive: false,
+                },
+            ),
+            (
+                "Act".to_string(),
+                TlaDefinition {
+                    name: "Act".to_string(),
+                    params: vec![],
+                    body: "\\E n \\in {1, 2, 3} : LET x == n IN Send(x)".to_string(),
+                    is_recursive: false,
+                },
+            ),
+        ]);
+        let state = tla_state([(
+            "msgs",
+            TlaValue::Set(HashedArc::new(std::collections::BTreeSet::new())),
+        )]);
+        let result = evaluate_next_states("Act", &defs, &state)
+            .expect("LET-in-action with a helper-hidden prime must generate successors");
+        assert_eq!(
+            result.len(),
+            3,
+            "expected 3 successors (one per n), got {}: {result:#?}",
+            result.len()
         );
     }
 
