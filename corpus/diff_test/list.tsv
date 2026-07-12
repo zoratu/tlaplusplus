@@ -44,3 +44,4 @@ work_queue	corpus/internals/WorkQueue.tla	corpus/internals/WorkQueue.cfg	no	regr
 # (WorkQueue.tla was promoted to the active list above on 2026-04-26 after
 # the T1.3 wrapper-Next fairness fix; it now reports no fairness violation
 # matching TLC.)
+nat_override_membership	corpus/language/NatOverrideMembership.tla	corpus/language/NatOverrideMembership.cfg	no	regression: x \in (Nat \ {0}) under Nat <- Override must not enumerate infinite Nat (fixes MCLamportMutex/TLCSailfish false-violations)
