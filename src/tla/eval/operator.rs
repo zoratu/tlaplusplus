@@ -77,6 +77,30 @@ pub(crate) fn eval_operator_call(
             }
             return Ok(TlaValue::Bool(true));
         }
+        // TLC!Assert(val, out) == IF val THEN TRUE ELSE Print(out, FALSE).
+        // Must evaluate transparently to TRUE when the guard holds (the common
+        // case on reachable states); a false assertion surfaces as an error.
+        // See the compiled-path handler for why the missing case silently
+        // collapsed state exploration (Echo `n1`).
+        "Assert" if args.len() == 2 && !user_defined_shadow => {
+            return match &args[0] {
+                TlaValue::Bool(true) => Ok(TlaValue::Bool(true)),
+                TlaValue::Bool(false) => {
+                    Err(anyhow!("assertion failed: {}", tla_to_string(&args[1])))
+                }
+                other => Err(anyhow!(
+                    "Assert expects a boolean first argument, got {:?}",
+                    other
+                )),
+            };
+        }
+        // TLC!Print(out, val) == val ; TLC!PrintT(out) == TRUE.
+        "Print" if args.len() == 2 && !user_defined_shadow => {
+            return Ok(args[1].clone());
+        }
+        "PrintT" if args.len() == 1 && !user_defined_shadow => {
+            return Ok(TlaValue::Bool(true));
+        }
         "ToString" => {
             if args.len() != 1 {
                 return Err(anyhow!("ToString expects 1 argument"));

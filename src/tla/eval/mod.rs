@@ -3969,6 +3969,41 @@ Buffer == INSTANCE RingBuffer
         }
     }
 
+    // TLC!Assert/Print/PrintT must be value-transparent so an action conjunct
+    // guarded by `Assert(cond, msg)` fires when `cond` holds. Without handlers
+    // these fell through to "unknown operator", and a failed action eval is
+    // silently a disabled branch -- which collapsed Echo's state exploration
+    // (ours found 8 of TLC's 75 distinct states).
+    #[test]
+    fn tlc_assert_print_are_value_transparent() {
+        use crate::tla::{compile_expr, eval_compiled};
+        let state = TlaState::new();
+        let defs = BTreeMap::new();
+        let ctx = EvalContext::with_definitions(&state, &defs);
+        let true_cases = [
+            "Assert(2 = 2, \"nope\")",
+            "PrintT(\"hello\")",
+            "Assert(TRUE, \"nope\") /\\ (1 < 2)",
+        ];
+        for expr in true_cases {
+            assert_eq!(eval_expr(expr, &ctx).unwrap(), TlaValue::Bool(true), "interp: {expr}");
+            assert_eq!(
+                eval_compiled(&compile_expr(expr), &ctx).unwrap(),
+                TlaValue::Bool(true),
+                "compiled: {expr}"
+            );
+        }
+        // Print(out, val) == val
+        assert_eq!(eval_expr("Print(\"out\", 5)", &ctx).unwrap(), TlaValue::Int(5));
+        assert_eq!(
+            eval_compiled(&compile_expr("Print(\"out\", 5)"), &ctx).unwrap(),
+            TlaValue::Int(5)
+        );
+        // A false assertion is an error, not silently true.
+        assert!(eval_expr("Assert(1 = 2, \"boom\")", &ctx).is_err());
+        assert!(eval_compiled(&compile_expr("Assert(1 = 2, \"boom\")"), &ctx).is_err());
+    }
+
     #[test]
     fn t2_3_dotdot_binds_tighter_than_union() {
         let state = TlaState::new();
