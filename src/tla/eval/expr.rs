@@ -247,10 +247,21 @@ pub(super) fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usiz
                     depth + 1,
                 )?)),
                 "\\subseteq" => {
-                    let right = eval_expr_inner(rhs, ctx, depth + 1)?;
+                    // A \subseteq B == \A x \in A : x \in B. Check each element of
+                    // the (finite) left set via structural membership so B need not
+                    // be enumerated -- B may be a record/function set over an
+                    // infinite domain like `[content: Messages, age: Int]`. Matches
+                    // TLC, which never enumerates the right operand of \subseteq.
                     let lhs_set = left.as_set()?;
-                    let rhs_set = right.as_set()?;
-                    Ok(TlaValue::Bool(lhs_set.iter().all(|v| rhs_set.contains(v))))
+                    let rhs_trimmed = rhs.trim();
+                    let mut all = true;
+                    for v in lhs_set.iter() {
+                        if !matches_membership_expr(v, rhs_trimmed, ctx, depth + 1)? {
+                            all = false;
+                            break;
+                        }
+                    }
+                    Ok(TlaValue::Bool(all))
                 }
                 _ => Err(anyhow!("unsupported comparison operator {op}")),
             };

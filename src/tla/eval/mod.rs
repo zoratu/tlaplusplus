@@ -3867,6 +3867,37 @@ Buffer == INSTANCE RingBuffer
         assert_eq!(true_case, TlaValue::Bool(true));
     }
 
+    // `A \subseteq B` must check each element of A for membership in B
+    // structurally, never enumerating B. When B is a record set over an
+    // infinite field domain (`[content: {...}, age: Int]`, as in
+    // EnvironmentController's `inTransit \subseteq Boxes`), enumerating B was
+    // impossible and produced a spurious "record set field value is not a set:
+    // Int" invariant failure. Structural membership matches TLC.
+    #[test]
+    fn subseteq_over_record_set_with_infinite_field_domain() {
+        let state = TlaState::new();
+        let defs = BTreeMap::new();
+        let ctx = EvalContext::with_definitions(&state, &defs);
+
+        let member = eval_expr(
+            "{[content |-> \"m\", age |-> 0]} \\subseteq [content: {\"m\"}, age: Int]",
+            &ctx,
+        )
+        .expect("subseteq of record set with Int field must evaluate, not error on Int");
+        assert_eq!(member, TlaValue::Bool(true));
+
+        let not_member = eval_expr(
+            "{[content |-> \"m\", age |-> 0]} \\subseteq [content: {\"x\"}, age: Int]",
+            &ctx,
+        )
+        .expect("subseteq of record set with Int field must evaluate");
+        assert_eq!(not_member, TlaValue::Bool(false));
+
+        let empty_lhs = eval_expr("{} \\subseteq [content: {\"m\"}, age: Int]", &ctx)
+            .expect("empty set is a subset of anything without enumerating the rhs");
+        assert_eq!(empty_lhs, TlaValue::Bool(true));
+    }
+
     #[test]
     fn t2_3_dotdot_binds_tighter_than_union() {
         let state = TlaState::new();
