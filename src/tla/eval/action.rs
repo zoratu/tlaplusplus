@@ -574,7 +574,7 @@ fn arg_is_primed_expr(arg: &str) -> bool {
 /// preserving word boundaries. Used when a call passes a primed argument so the
 /// substituted body (e.g. `memInt' = <<p,req>>`) surfaces the primed assignment
 /// that value-binding a next-state variable cannot express.
-fn substitute_params_text(body: &str, params: &[String], args: &[String]) -> String {
+pub(crate) fn substitute_params_text(body: &str, params: &[String], args: &[String]) -> String {
     let mut result = body.to_string();
     for (param, arg) in params.iter().zip(args.iter()) {
         let arg = arg.trim();

@@ -2,6 +2,7 @@ use crate::fairness::{ActionLabel, LabeledTransition};
 use crate::tla::compiled_expr::resolve_state_vars_in_action_ir;
 use crate::tla::hashed_arc::HashedArc;
 use crate::tla::eval::apply_action_ir_with_context_multi;
+use crate::tla::eval::substitute_params_text;
 use crate::tla::module::TlaModuleInstance;
 use crate::tla::value::get_resolution_schema;
 use crate::tla::{
@@ -263,6 +264,31 @@ fn body_has_instance_action_call(body: &str) -> bool {
 /// interpreted evaluator (which returns the same empty) — it cannot mask a
 /// correct-empty; the cost is a redundant interpreted pass over a disabled
 /// LET-bodied action.
+/// True when `ident` appears primed (`ident'`) as a whole word in `body`. Used to
+/// detect an operator parameter that is assigned through its prime -- e.g.
+/// `Lose(q) == ... q' = ...` -- which means the parameter aliases the state
+/// variable passed as the argument, so it must be substituted textually rather
+/// than value-bound (otherwise `q'` primes a phantom variable `q`).
+fn body_primes_identifier(body: &str, ident: &str) -> bool {
+    let bytes = body.as_bytes();
+    let id = ident.as_bytes();
+    if id.is_empty() {
+        return false;
+    }
+    let ilen = id.len();
+    let mut i = 0;
+    while i + ilen < bytes.len() {
+        if &bytes[i..i + ilen] == id
+            && (i == 0 || !is_ident_byte(bytes[i - 1]))
+            && bytes[i + ilen] == b'\''
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 fn body_has_let_with_primes(body: &str) -> bool {
     let bytes = body.as_bytes();
     let mut i = 0;
@@ -619,6 +645,23 @@ fn execute_branch(
                 def.params.len(),
                 arg_exprs.len()
             ));
+        }
+
+        // If the operator body primes any of its parameters (e.g.
+        // `Lose(q) == ... q' = ...`), the parameter is an alias for the ARGUMENT
+        // VARIABLE, so `q'` must resolve to `arg'`. Value-binding the parameter
+        // (below) loses that aliasing -- the compiled/interpreted IR then treats
+        // `q'` as priming a phantom state variable `q`, deforming the state space
+        // (AlternatingBit's `LoseMsg == Lose(msgQ)` leaked a `q` variable: ours
+        // explored 1476 states vs TLC's 240). Substitute the argument text into
+        // the body so `q'` -> `msgQ'`, then execute the substituted body directly.
+        if def
+            .params
+            .iter()
+            .any(|p| body_primes_identifier(&def.body, p))
+        {
+            let substituted = substitute_params_text(&def.body, &def.params, &arg_exprs);
+            return execute_branch(&substituted, locals, definitions, instances, state);
         }
 
         let mut ctx = if let Some(inst) = instances {
@@ -3217,6 +3260,53 @@ SPECIFICATION
             Some(&TlaValue::Int(2)),
             "y' from Step2 must read the intermediate x' = 2 (composition order)"
         );
+    }
+
+    #[test]
+    fn action_operator_priming_its_parameter_targets_the_argument_variable() {
+        // Regression (AlternatingBit's `LoseMsg == Lose(msgQ)` with
+        // `Lose(q) == ... q' = ...`): an action operator that assigns through its
+        // parameter aliases the ARGUMENT variable, so `q'` must prime `x`, not
+        // leak `q` as a phantom state variable. Before the fix ours value-bound
+        // `q` and compiled `q' = ...` as a primed assignment to a phantom `q`,
+        // deforming the state space (1476 states vs TLC's 240).
+        let defs = BTreeMap::from([(
+            "Shift".to_string(),
+            TlaDefinition {
+                name: "Shift".to_string(),
+                params: vec!["q".to_string()],
+                body: "q' = Tail(q)".to_string(),
+                is_recursive: false,
+            },
+        )]);
+        let state = tla_state([
+            (
+                "x",
+                TlaValue::Seq(HashedArc::new(vec![
+                    TlaValue::Int(1),
+                    TlaValue::Int(2),
+                    TlaValue::Int(3),
+                ])),
+            ),
+            ("y", TlaValue::Int(7)),
+        ]);
+        let result = evaluate_next_states("Shift(x) /\\ UNCHANGED y", &defs, &state)
+            .expect("action operator priming its parameter must produce a successor");
+        assert_eq!(result.len(), 1, "expected 1 successor, got {}", result.len());
+        let next = &result[0];
+        assert!(
+            next.get("q").is_none(),
+            "no phantom `q` variable should be in the state: {next:?}"
+        );
+        assert_eq!(
+            next.get("x"),
+            Some(&TlaValue::Seq(HashedArc::new(vec![
+                TlaValue::Int(2),
+                TlaValue::Int(3)
+            ]))),
+            "x' must be Tail(x)"
+        );
+        assert_eq!(next.get("y"), Some(&TlaValue::Int(7)), "y unchanged");
     }
 
     #[test]
