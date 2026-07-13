@@ -2949,7 +2949,11 @@ fn is_word_byte(b: u8) -> bool {
 }
 
 fn guard_text_is_action_body(text: &str) -> bool {
-    let trimmed = text.trim_start();
+    // Strip a redundant outer paren wrapper so a *parenthesized* disjunction of
+    // actions -- `( \/ b1 \/ b2 )` -- is recognised (its `\/` is otherwise hidden
+    // inside the parens and read as non-top-level). Mirrors the interpreted
+    // `eval_disjunctive_action_body_multi`.
+    let trimmed = strip_outer_parens_str(text).trim_start();
     // An action body reaches this function as a `Guard` clause whenever
     // `compile_action_ir` failed to recognise a top-level disjunction as an
     // action (it splits on conjunction, not disjunction). That happens for BOTH
