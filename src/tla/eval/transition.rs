@@ -1,19 +1,17 @@
 //! Transition-context evaluation: action-constraint checking that
 //! reads both pre-state and post-state variables (`x` vs `x'`).
 //!
-//! `eval_action_constraint` is the public entry point. It builds a
-//! `TransitionContext` (declared in the parent module) and dispatches
-//! to `eval_transition_expr`, which today only handles identifiers and
-//! simple binary comparisons — full primed-variable evaluation goes
-//! through the main interpreter via
-//! `eval_action_clause_text_multi`.
+//! `eval_action_constraint` is the public entry point. It stages the
+//! post-state (`next`) variables into an `EvalContext` as primes
+//! (`var'`) alongside the pre-state (`current`) and dispatches to the
+//! full expression interpreter (`eval_expr`), so any constraint shape —
+//! `\in` over a range, set/record expressions, definition calls — is
+//! evaluated the same way successor generation evaluates guards.
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use std::collections::BTreeMap;
 
-use crate::tla::{TlaDefinition, TlaState, TlaValue};
-
-use super::{MAX_EVAL_DEPTH, TransitionContext};
+use crate::tla::{TlaDefinition, TlaState};
 
 /// Evaluate an action constraint over a state transition
 ///
@@ -25,63 +23,26 @@ pub fn eval_action_constraint(
     next: &TlaState,
     definitions: Option<&BTreeMap<String, TlaDefinition>>,
 ) -> Result<bool> {
-    let ctx = if let Some(defs) = definitions {
-        TransitionContext::with_definitions(current, next, defs)
-    } else {
-        TransitionContext::new(current, next)
+    // Evaluate through the FULL expression evaluator with `next`'s values staged
+    // as primes (`var'`), so an action constraint like `step' \in step..(step+1)`
+    // -- `\in` over a range, unprimed `step` from `current`, primed `step'` from
+    // `next` -- is handled correctly. The bespoke `eval_transition_expr` below
+    // only supported simple comparisons and mis-evaluated such constraints to
+    // false, pruning every successor (LanguageFeatureMatrix: 1 state vs TLC's 21).
+    let mut ctx = match definitions {
+        Some(defs) => super::EvalContext::with_definitions(current, defs),
+        None => super::EvalContext::new(current),
     };
-
-    eval_transition_expr(expr, &ctx, 0)?.as_bool()
-}
-
-/// Evaluate an expression in a transition context (supporting primed variables)
-fn eval_transition_expr(expr: &str, ctx: &TransitionContext<'_>, depth: usize) -> Result<TlaValue> {
-    if depth > MAX_EVAL_DEPTH {
-        return Err(anyhow!("eval depth limit exceeded at {}", MAX_EVAL_DEPTH));
-    }
-
-    let expr = expr.trim();
-
-    // Handle primed and unprimed identifiers
-    if is_identifier(expr) {
-        if let Some(val) = ctx.resolve_variable(expr) {
-            return Ok(val);
+    {
+        let locals = std::rc::Rc::make_mut(&mut ctx.locals);
+        for (name, value) in next.iter() {
+            let mut key = String::with_capacity(name.len() + 1);
+            key.push_str(name);
+            key.push('\'');
+            locals.insert(key, value.clone());
         }
-
-        // Try to resolve as definition
-        if let Some(def) = ctx.definition(expr) {
-            if def.params.is_empty() {
-                // For now, we can't fully evaluate definitions in transition context
-                // This would require a full transition-aware evaluator
-                // Just return a model value
-                return Ok(TlaValue::ModelValue(expr.to_string()));
-            }
-        }
-
-        return Ok(TlaValue::ModelValue(expr.to_string()));
     }
-
-    // For now, only support simple comparisons
-    // Full implementation would need to recursively handle all expressions
-    // with primed variable support throughout
-
-    // Try simple comparison: x' >= x
-    if let Some((left, op, right)) = parse_simple_comparison(expr) {
-        let left_val = eval_transition_expr(left.trim(), ctx, depth + 1)?;
-        let right_val = eval_transition_expr(right.trim(), ctx, depth + 1)?;
-
-        return Ok(TlaValue::Bool(apply_comparison(&left_val, op, &right_val)?));
-    }
-
-    // Deferred: full primed-variable expression evaluation is not needed for
-    // action constraint checking — the main evaluator in eval_action_clause_text_multi
-    // handles primed variables via staged assignments and classify_clause().
-    // This fallback only fires for eval_action_constraint() which is used for
-    // post-hoc constraint validation, not successor generation.
-    Err(anyhow!(
-        "complex action constraints not yet fully supported: {}",
-        expr
-    ))
+    super::eval_expr(expr, &ctx)?.as_bool()
 }
 
 pub(super) fn is_identifier(s: &str) -> bool {
@@ -110,46 +71,10 @@ pub(super) fn is_identifier(s: &str) -> bool {
     saw_identifier_marker
 }
 
-fn parse_simple_comparison(expr: &str) -> Option<(&str, &str, &str)> {
-    for op in [">=", "<=", "=", ">", "<", "/="] {
-        if let Some(idx) = expr.find(op) {
-            let left = &expr[..idx];
-            let right = &expr[idx + op.len()..];
-            return Some((left, op, right));
-        }
-    }
-    None
-}
-
-fn apply_comparison(left: &TlaValue, op: &str, right: &TlaValue) -> Result<bool> {
-    match (left, right) {
-        (TlaValue::Int(a), TlaValue::Int(b)) => Ok(match op {
-            ">=" => a >= b,
-            "<=" => a <= b,
-            "=" => a == b,
-            ">" => a > b,
-            "<" => a < b,
-            "/=" => a != b,
-            _ => return Err(anyhow!("unknown operator: {}", op)),
-        }),
-        (TlaValue::Bool(a), TlaValue::Bool(b)) => Ok(match op {
-            "=" => a == b,
-            "/=" => a != b,
-            _ => return Err(anyhow!("invalid operator for bool: {}", op)),
-        }),
-        _ => Err(anyhow!(
-            "comparison not supported for types: {:?} {} {:?}",
-            left,
-            op,
-            right
-        )),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tla::tla_state;
+    use crate::tla::{TlaValue, tla_state};
 
     #[test]
     fn t4_apply_comparison_kills_int_match_arm_deletion() {
@@ -197,6 +122,41 @@ mod tests {
             !eval_action_constraint("z' > z", &current, &next, None)
                 .expect("primed > must evaluate for equal ints"),
             "z' > z must be false when both are 7"
+        );
+    }
+
+    #[test]
+    fn action_constraint_membership_over_range() {
+        // Regression for LanguageFeatureMatrix (ours=1 vs TLC=21): the action
+        // constraint `step' \in step..(step+1)` is ALWAYS satisfiable (a step
+        // that advances by one lands in the range), but the old bespoke
+        // `eval_transition_expr` only understood simple binary comparisons and
+        // errored/returned false on the `\in`-over-range shape, pruning every
+        // successor. The full-interpreter path must evaluate it correctly.
+        let current = tla_state([("step", TlaValue::Int(3))]);
+
+        // step' = step + 1  -> 4 \in 3..4  -> true
+        let next = tla_state([("step", TlaValue::Int(4))]);
+        assert!(
+            eval_action_constraint("step' \\in step..(step+1)", &current, &next, None)
+                .expect("membership-over-range constraint must evaluate"),
+            "4 \\in 3..4 must satisfy the action constraint"
+        );
+
+        // step' = step  -> 3 \in 3..4  -> true (in range)
+        let next_same = tla_state([("step", TlaValue::Int(3))]);
+        assert!(
+            eval_action_constraint("step' \\in step..(step+1)", &current, &next_same, None)
+                .expect("membership-over-range constraint must evaluate"),
+            "3 \\in 3..4 must satisfy the action constraint"
+        );
+
+        // step' = step + 5  -> 8 \in 3..4  -> false (out of range: constraint prunes)
+        let next_far = tla_state([("step", TlaValue::Int(8))]);
+        assert!(
+            !eval_action_constraint("step' \\in step..(step+1)", &current, &next_far, None)
+                .expect("membership-over-range constraint must evaluate"),
+            "8 \\in 3..4 must NOT satisfy the action constraint"
         );
     }
 
