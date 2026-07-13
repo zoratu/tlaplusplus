@@ -296,23 +296,36 @@ pub(super) fn eval_expr_inner(raw_expr: &str, ctx: &EvalContext<'_>, depth: usiz
             return Ok(out);
         }
         Op::Cartesian(parts) => {
-            let mut result = eval_expr_inner(&parts[0], ctx, depth + 1)?;
-            for part in &parts[1..] {
-                let rhs = eval_expr_inner(part, ctx, depth + 1)?;
-                let lhs_set = result.as_set()?;
-                let rhs_set = rhs.as_set()?;
-                ctx.check_budget(lhs_set.len() * rhs_set.len())?;
-                let mut product = BTreeSet::new();
-                for lhs_val in lhs_set {
-                    for rhs_val in rhs_set {
-                        let tuple =
-                            TlaValue::Seq(HashedArc::new(vec![lhs_val.clone(), rhs_val.clone()]));
-                        product.insert(tuple);
+            // `A \X B \X C` is the set of FLAT n-tuples `<<a, b, c>>`, not the
+            // nested pairs `<<<<a,b>>, c>>` a naive left-fold produces: TLA+/TLC
+            // treat a chained Cartesian product as n-tuples. So `tup[3]` and
+            // `sumList(tup)` (glowingRaccoon's `anneal`) work only if the tuple
+            // is flat. Build the product by extending each partial tuple with one
+            // element per part.
+            let mut sets = Vec::with_capacity(parts.len());
+            for part in parts {
+                let v = eval_expr_inner(part, ctx, depth + 1)?;
+                sets.push(v.as_set()?.iter().cloned().collect::<Vec<TlaValue>>());
+            }
+            let total = sets.iter().fold(1usize, |acc, s| acc.saturating_mul(s.len()));
+            ctx.check_budget(total)?;
+            let mut tuples: Vec<Vec<TlaValue>> = vec![Vec::with_capacity(sets.len())];
+            for set in &sets {
+                let mut next = Vec::with_capacity(tuples.len().saturating_mul(set.len()));
+                for t in &tuples {
+                    for v in set {
+                        let mut nt = t.clone();
+                        nt.push(v.clone());
+                        next.push(nt);
                     }
                 }
-                result = TlaValue::Set(HashedArc::new(product));
+                tuples = next;
             }
-            return Ok(result);
+            let product: BTreeSet<TlaValue> = tuples
+                .into_iter()
+                .map(|t| TlaValue::Seq(HashedArc::new(t)))
+                .collect();
+            return Ok(TlaValue::Set(HashedArc::new(product)));
         }
         Op::FuncOverride(parts) => {
             let mut out = eval_expr_inner(&parts[0], ctx, depth + 1)?;

@@ -610,11 +610,25 @@ fn eval_compiled_inner(
             let left_set = left.as_set()?;
             let right_set = right.as_set()?;
             ctx.check_budget(left_set.len() * right_set.len())?;
+            // `A \X B \X C` is the set of FLAT n-tuples `<<a, b, c>>`, not nested
+            // pairs -- TLA+/TLC treat a chained Cartesian product as n-tuples, so
+            // `tup[3]` and `sumList(tup)` (glowingRaccoon's `anneal`) need a flat
+            // tuple. A chained `\X` nests as either `(A \X B) \X C` or
+            // `A \X (B \X C)`, so when an operand is itself a Cartesian product its
+            // value is already a tuple and must be spliced in rather than nested.
+            let left_is_prod = matches!(a.as_ref(), CompiledExpr::CartesianProduct(_, _));
+            let right_is_prod = matches!(b.as_ref(), CompiledExpr::CartesianProduct(_, _));
+            let splice = |v: &TlaValue, is_prod: bool, out: &mut Vec<TlaValue>| match v {
+                TlaValue::Seq(s) if is_prod => out.extend(s.iter().cloned()),
+                other => out.push(other.clone()),
+            };
             let mut product = BTreeSet::new();
             for lhs_val in left_set {
                 for rhs_val in right_set {
-                    let tuple = TlaValue::Seq(HashedArc::new(vec![lhs_val.clone(), rhs_val.clone()]));
-                    product.insert(tuple);
+                    let mut elems = Vec::new();
+                    splice(lhs_val, left_is_prod, &mut elems);
+                    splice(rhs_val, right_is_prod, &mut elems);
+                    product.insert(TlaValue::Seq(HashedArc::new(elems)));
                 }
             }
             Ok(TlaValue::Set(HashedArc::new(product)))
