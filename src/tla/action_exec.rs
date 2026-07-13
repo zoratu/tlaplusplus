@@ -778,11 +778,33 @@ fn execute_branch(
         }
     }
 
-    // Use compiled action IR for inline actions too
+    // Use compiled action IR for inline actions too. Mirror the careful
+    // compiled→interpreted fallback of the operator-call path above:
+    //  - a NON-empty compiled result is always trusted;
+    //  - an *empty* compiled result is trusted (the guards legitimately blocked
+    //    the transition) UNLESS the body reaches an instance-action call or a
+    //    LET-with-primes, the shapes where the compiled path can spuriously
+    //    return empty for an enabled action -- only then cross-check;
+    //  - the interpreted cross-check's *errors are swallowed*: a disabled action
+    //    whose trailing post-state constraint (`... /\ \A i : failed'[i] = ...`)
+    //    reads a prime that was never staged errors there, but that is a correct
+    //    0-successor result, not a crash. The old code fell back UNCONDITIONALLY
+    //    and PROPAGATED that error, turning a disabled `ProcTick` into a
+    //    next-state panic (`function application unsupported for
+    //    ModelValue("failed'")`) that stalled EnvironmentController at 1 state.
     let compiled_ir = get_or_compile_action(&inline_def);
     match apply_compiled_action_ir_multi(&compiled_ir, state, &ctx) {
         Ok(successors) if !successors.is_empty() => Ok(successors),
-        _ => apply_action_ir_with_context_multi(&compile_action_ir(&inline_def), state, &ctx),
+        Ok(empty)
+            if body_has_instance_action_call(trimmed) || body_has_let_with_primes(trimmed) =>
+        {
+            match apply_action_ir_with_context_multi(&compile_action_ir(&inline_def), state, &ctx) {
+                Ok(interp) => Ok(interp),
+                Err(_) => Ok(empty),
+            }
+        }
+        Ok(empty) => Ok(empty),
+        Err(_) => apply_action_ir_with_context_multi(&compile_action_ir(&inline_def), state, &ctx),
     }
 }
 
