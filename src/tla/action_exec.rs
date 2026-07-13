@@ -3263,6 +3263,28 @@ SPECIFICATION
     }
 
     #[test]
+    fn parenthesized_disjunction_reading_staged_prime_produces_successors() {
+        // Regression (nbacc_ray97's `UponSent`): an inner *parenthesized*
+        // disjunction whose branches read a prime staged by an earlier conjunct
+        // -- `(a' = 0 \/ a' = 1) /\ ( \/ (/\ a'=1 /\ b'=10) \/ (/\ a'=0 /\ b'=20) )`
+        // -- must expand. The `\/` was hidden inside the parens, so the clause was
+        // read as a boolean and dropped every successor (ours reached 1444 of
+        // TLC's 3016 states; COMMIT/ABORT were unreachable).
+        let defs = BTreeMap::new();
+        let state = tla_state([("a", TlaValue::Int(9)), ("b", TlaValue::Int(9))]);
+        // `b' = 1` stages the prime; the parenthesized disjunction reads it: only
+        // the first branch's `b' = 1` guard holds, so exactly one successor
+        // (a=10, b=1). Before the fix the `\/` was hidden by the parens, the
+        // clause was a boolean, and zero successors were produced.
+        let body = "b' = 1 /\\ ( \\/ (/\\ b' > 0 /\\ a' = 10) \\/ (/\\ b' < 0 /\\ a' = 20) )";
+        let result = evaluate_next_states(body, &defs, &state)
+            .expect("parenthesized disjunction reading a staged prime must produce successors");
+        assert_eq!(result.len(), 1, "expected 1 successor, got {}", result.len());
+        assert_eq!(result[0].get("a"), Some(&TlaValue::Int(10)));
+        assert_eq!(result[0].get("b"), Some(&TlaValue::Int(1)));
+    }
+
+    #[test]
     fn action_operator_priming_its_parameter_targets_the_argument_variable() {
         // Regression (AlternatingBit's `LoseMsg == Lose(msgQ)` with
         // `Lose(q) == ... q' = ...`): an action operator that assigns through its

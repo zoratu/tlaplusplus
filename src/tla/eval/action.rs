@@ -273,7 +273,17 @@ fn eval_disjunctive_action_body_multi(
     ctx: &EvalContext<'_>,
     branch: ActionEvalBranch,
 ) -> Option<Result<Vec<ActionEvalBranch>>> {
-    let trimmed = expr.trim();
+    // Strip a redundant outer paren wrapper so a *parenthesized* disjunction of
+    // actions -- `( \/ b1 \/ b2 )`, as in nbacc_ray97's `UponSent`:
+    //   /\ pc[self] = "SENT"
+    //   /\ ( \/ (/\ fd'[self] = TRUE  /\ pc' = ... )
+    //        \/ (/\ fd'[self] = FALSE /\ ... /\ pc' = ...) )
+    //   /\ sent' = sent
+    // -- is split into its branches. Without this the `\/` is hidden inside the
+    // parens, `split_action_body_disjuncts` returns a single disjunct, and the
+    // clause falls through to boolean evaluation, dropping every successor (so
+    // `UponSent` never fired and COMMIT/ABORT were unreachable).
+    let trimmed = crate::tla::eval::splitter::strip_outer_parens(expr.trim());
     let disjuncts = split_action_body_disjuncts(trimmed);
     if disjuncts.len() <= 1 {
         return None;
@@ -283,7 +293,12 @@ fn eval_disjunctive_action_body_multi(
     let mut first_err = None;
     let mut saw_clean_empty = false;
     for disjunct in disjuncts {
-        match eval_action_body_text_multi(&disjunct, ctx, branch.clone()) {
+        // Each split disjunct keeps its own paren wrapper -- `( /\ g /\ x' = ... )`
+        // -- which must be stripped so its inner `/\` conjuncts split (otherwise
+        // the whole disjunct is read as one boolean clause and drops its primed
+        // assignment).
+        let disjunct = crate::tla::eval::splitter::strip_outer_parens(disjunct.trim());
+        match eval_action_body_text_multi(disjunct, ctx, branch.clone()) {
             Ok(mut branches) => {
                 if branches.is_empty() {
                     saw_clean_empty = true;
