@@ -2,6 +2,7 @@ use crate::fairness::{ActionLabel, LabeledTransition};
 use crate::tla::compiled_expr::resolve_state_vars_in_action_ir;
 use crate::tla::hashed_arc::HashedArc;
 use crate::tla::eval::apply_action_ir_with_context_multi;
+use crate::tla::eval::arg_is_primed_expr;
 use crate::tla::eval::substitute_params_text;
 use crate::tla::module::TlaModuleInstance;
 use crate::tla::value::get_resolution_schema;
@@ -647,18 +648,34 @@ fn execute_branch(
             ));
         }
 
-        // If the operator body primes any of its parameters (e.g.
-        // `Lose(q) == ... q' = ...`), the parameter is an alias for the ARGUMENT
-        // VARIABLE, so `q'` must resolve to `arg'`. Value-binding the parameter
-        // (below) loses that aliasing -- the compiled/interpreted IR then treats
-        // `q'` as priming a phantom state variable `q`, deforming the state space
-        // (AlternatingBit's `LoseMsg == Lose(msgQ)` leaked a `q` variable: ours
-        // explored 1476 states vs TLC's 240). Substitute the argument text into
-        // the body so `q'` -> `msgQ'`, then execute the substituted body directly.
-        if def
-            .params
-            .iter()
-            .any(|p| body_primes_identifier(&def.body, p))
+        // The operator call must be expanded by TEXTUAL argument substitution
+        // (macro semantics), not parameter value-binding, in two aliasing cases:
+        //
+        //  1. The body primes one of its parameters (`Lose(q) == ... q' = ...`):
+        //     the parameter aliases the ARGUMENT VARIABLE, so `q'` must resolve to
+        //     `arg'`. Value-binding turns `q'` into a phantom state variable `q`
+        //     (AlternatingBit's `LoseMsg == Lose(msgQ)`: 1476 states vs TLC's 240).
+        //
+        //  2. An ARGUMENT is primed (`CalculateHash(block, lastHash, lastHash')`):
+        //     the parameter it binds (`newLastHash`) aliases the next-state
+        //     variable `lastHash'`, so a body clause `newLastHash = h` is really
+        //     the primed assignment `lastHash' = h`. Value-binding evaluates the
+        //     unstaged `lastHash'` and turns the clause into a boolean guard,
+        //     staging only the body's *direct* primes (`hashFunction'`) and never
+        //     `lastHash'`. A later conjunct that reads it -- Nano's ProcessSendBlock
+        //     `distributedLedger' = [.. EXCEPT ![node][lastHash'] = ..]` -- then
+        //     indexes with a bogus `lastHash'` and the action never fires
+        //     (MCNanoSmall 1563 vs TLC 3003; this `execute_branch` path is taken
+        //     because Nano is instantiated via `N == INSTANCE Nano` and reached
+        //     through `Next == IF .. THEN N!Next ELSE ..`). This mirrors the
+        //     interpreted `eval_action_body_multi` and compiled
+        //     `try_eval_compiled_guard_as_action` primed-argument handling.
+        let has_primed_arg = arg_exprs.iter().any(|a| arg_is_primed_expr(a));
+        if has_primed_arg
+            || def
+                .params
+                .iter()
+                .any(|p| body_primes_identifier(&def.body, p))
         {
             let substituted = substitute_params_text(&def.body, &def.params, &arg_exprs);
             return execute_branch(&substituted, locals, definitions, instances, state);

@@ -548,7 +548,7 @@ fn extract_body_call_idents(body: &str) -> Vec<String> {
 /// the body `newMemInt = <<p,d>>` is really the primed assignment
 /// `memInt' = <<p,req>>`. `looks_like_action` inspects only the body text, so
 /// it misses this; the "actionness" comes from the call site.
-fn arg_is_primed_expr(arg: &str) -> bool {
+pub(crate) fn arg_is_primed_expr(arg: &str) -> bool {
     let bytes = arg.as_bytes();
     let mut in_string = false;
     let mut escaped = false;
