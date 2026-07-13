@@ -669,8 +669,15 @@ impl TlaValue {
     /// in sorted order and all `Int` keys sort numerically within the `Int`
     /// variant, so positional comparison is sound.
     fn is_one_to_n_domain(map: &BTreeMap<TlaValue, TlaValue>) -> bool {
+        // An empty function IS the empty sequence `<<>>` in TLA+ (`[x \in {} |-> e]`
+        // = `<<>>`), so it normalizes to the empty `Seq`. Returning false here left
+        // an empty function built as `[j \in 1..0 |-> ...]` (e.g. AlternatingBit's
+        // `Lose` emptying a length-1 queue) un-normalized, so it fingerprinted
+        // distinctly from a `<<>>` reached via `Tail`/`Init` -- inflating the state
+        // count. Consistent with `func_is_sequence_shaped`, which treats empty as
+        // sequence-shaped.
         if map.is_empty() {
-            return false;
+            return true;
         }
         for (i, k) in map.keys().enumerate() {
             match k {
@@ -1010,6 +1017,18 @@ mod proptests {
     #[allow(dead_code)]
     fn arb_tla_seq() -> impl Strategy<Value = TlaValue> {
         prop::collection::vec(arb_tla_value(), 0..10).prop_map(|v| TlaValue::Seq(HashedArc::new(v)))
+    }
+
+    #[test]
+    fn empty_function_normalizes_and_compares_equal_to_empty_seq() {
+        // An empty function IS the empty sequence `<<>>` in TLA+, so it must
+        // normalize to `Seq([])` for fingerprinting -- a queue emptied via
+        // `[j \in 1..0 |-> ...]` (AlternatingBit's `Lose`) has to dedup with one
+        // emptied via `Tail`/`Init`. It also compares semantically equal.
+        let empty_func = TlaValue::Function(HashedArc::new(std::collections::BTreeMap::new()));
+        let empty_seq = TlaValue::Seq(HashedArc::new(Vec::new()));
+        assert_eq!(empty_func.normalize_seq_changed(), Some(empty_seq.clone()));
+        assert!(empty_func.semantic_eq(&empty_seq));
     }
 
     proptest! {
