@@ -30,6 +30,7 @@ queue_segment_sync_fixed	corpus/internals/QueueSegmentSync.tla	corpus/internals/
 queue_segment_sync_buggy	corpus/internals/QueueSegmentSync.tla	corpus/internals/QueueSegmentSync_Buggy.cfg	yes	regression for T1.1 soundness fix; expected SegmentsRecoverable violation must be caught
 view_test	corpus/language/ViewTest.tla	corpus/language/ViewTest.cfg	no	regression for T1.5 splitter soundness fix; 106 distinct under VIEW <<x, y>>; pre-fix counted 121 due to spurious successor that dropped `timestamp' = timestamp + 1`
 work_queue	corpus/internals/WorkQueue.tla	corpus/internals/WorkQueue.cfg	no	regression for T1.3 wrapper-Next fairness fix; 15003 distinct; pre-fix tlaplusplus reported a false-positive Buchi-style fairness violation on the single-state self-loop SCC at the terminated state
+primed_arg_action_staging	corpus/examples/PrimedArgActionStaging.tla	corpus/examples/PrimedArgActionStaging.cfg	yes	regression: an action operator called with a primed argument (Bump(x, x')) must stage x' via param-aliasing (x' = x+1) so a later `seen' = seen \cup {x'}` reads it; pre-fix the compiled/execute_branch action paths value-bound the unstaged prime, x' never staged, Step never fired, exploration froze at 1 state (found investigating MCNanoSmall)
 
 # --------------------------------------------------------------------
 # KNOWN DIVERGENT SPECS (not gated; tracked for fix in follow-up work)

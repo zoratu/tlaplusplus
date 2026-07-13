@@ -3194,28 +3194,45 @@ fn try_eval_compiled_guard_as_action<'a>(
     // at the initial states (a false-safe soundness bug). Route the call text
     // through the interpreted action evaluator, which substitutes the primed
     // argument into the body so `nm = <<p,d>>` surfaces as `memInt' = <<p,d>>`.
+    // A primed *argument* (e.g. `lastHash'`) aliases a next-state variable, so the
+    // parameter it binds must be threaded TEXTUALLY into the body: a body clause
+    // `newLastHash = hash` is meant to become the primed assignment
+    // `lastHash' = hash`. The compiled value-binding path below evaluates the
+    // (unstaged) prime and turns the clause into a boolean guard, silently
+    // dropping the successor. The interpreted evaluator's `has_primed_arg` path
+    // (eval/action.rs) performs the substitution correctly, so route there
+    // whenever an argument is primed. This must fire EVEN when the body is *also*
+    // transitively an action via a direct prime: Nano's
+    // `CalculateHashImpl(block, oldLastHash, newLastHash) == LET h == ... IN
+    // newLastHash = h /\ hashFunction' = ...` stages BOTH `lastHash'` (via its
+    // `newLastHash` param) AND `hashFunction'` directly. Because `hashFunction'`
+    // makes it transitively an action, the old gate below skipped the substitution
+    // and staged only `hashFunction'`; `lastHash'` stayed unstaged, so the later
+    // `distributedLedger' = [.. EXCEPT ![node][lastHash'] = ..]` in
+    // ProcessSendBlock read a bogus `lastHash'` and the action never fired
+    // (MCNanoSmall 1563 vs TLC 3003).
     let has_primed_arg = call_args.iter().any(|a| arg_expr_is_primed(a));
-    if !def_call_is_transitively_action(&name, &branch.ctx, 0) {
-        if has_primed_arg && def.body.trim() != text.trim() {
-            let interpreted_branches =
-                crate::tla::eval::eval_action_body_multi(text, &branch.ctx, &branch.staged)?;
-            let outer_ctx = branch.ctx.clone();
-            let mut out = Vec::with_capacity(interpreted_branches.len());
-            for (staged, unchanged_vars) in interpreted_branches {
-                let mut merged_unchanged = branch.unchanged_vars.clone();
-                for var in unchanged_vars {
-                    if !merged_unchanged.contains(&var) {
-                        merged_unchanged.push(var);
-                    }
+    if has_primed_arg && def.body.trim() != text.trim() {
+        let interpreted_branches =
+            crate::tla::eval::eval_action_body_multi(text, &branch.ctx, &branch.staged)?;
+        let outer_ctx = branch.ctx.clone();
+        let mut out = Vec::with_capacity(interpreted_branches.len());
+        for (staged, unchanged_vars) in interpreted_branches {
+            let mut merged_unchanged = branch.unchanged_vars.clone();
+            for var in unchanged_vars {
+                if !merged_unchanged.contains(&var) {
+                    merged_unchanged.push(var);
                 }
-                out.push(CompiledActionBranch {
-                    ctx: outer_ctx.clone(),
-                    staged,
-                    unchanged_vars: merged_unchanged,
-                });
             }
-            return Ok(Some(out));
+            out.push(CompiledActionBranch {
+                ctx: outer_ctx.clone(),
+                staged,
+                unchanged_vars: merged_unchanged,
+            });
         }
+        return Ok(Some(out));
+    }
+    if !def_call_is_transitively_action(&name, &branch.ctx, 0) {
         return Ok(None);
     }
     // Avoid infinite recursion when the body is the call itself (already
