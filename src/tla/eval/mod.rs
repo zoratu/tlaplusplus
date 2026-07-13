@@ -4080,6 +4080,31 @@ Buffer == INSTANCE RingBuffer
         }
     }
 
+    // `A \X B \X C` is the set of FLAT 3-tuples `<<a,b,c>>`, not nested pairs
+    // `<<<<a,b>>,c>>`. Regression (glowingRaccoon's `anneal`):
+    // `\E tup \in (r1 \X r2 \X r3) : sumList(tup) = k /\ ... tup[3] ...` -- with
+    // nested pairs `tup[3]` and `sumList(tup)` fail, so the action was disabled
+    // (ours explored 3 of TLC's 305 states).
+    #[test]
+    fn chained_cartesian_product_yields_flat_ntuples() {
+        use crate::tla::{compile_expr, eval_compiled};
+        let state = TlaState::new();
+        let defs = BTreeMap::new();
+        let ctx = EvalContext::with_definitions(&state, &defs);
+        for expr in [
+            "(CHOOSE t \\in ((1..2) \\X {3} \\X {4}) : t[1] = 2)[3] = 4",
+            "\\A t \\in ((1..2) \\X {3} \\X {4}) : Len(t) = 3",
+            "<<2, 3, 4>> \\in ((1..2) \\X {3} \\X {4})",
+        ] {
+            assert_eq!(eval_expr(expr, &ctx).unwrap(), TlaValue::Bool(true), "interp: {expr}");
+            assert_eq!(
+                eval_compiled(&compile_expr(expr), &ctx).unwrap(),
+                TlaValue::Bool(true),
+                "compiled: {expr}"
+            );
+        }
+    }
+
     #[test]
     fn t2_3_dotdot_binds_tighter_than_union() {
         let state = TlaState::new();
