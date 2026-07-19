@@ -2862,13 +2862,19 @@ fn eval_compiled_clause_to_branch<'a>(
         }
         CompiledActionClause::Unchanged { vars } => {
             let mut branch = branch;
+            // Resolve a defined variable-tuple operand (`UNCHANGED envVars`,
+            // `envVars == << procPause, moved, failed, F >>`) to its component
+            // variables so each component prime is staged and a later prime read
+            // resolves — see `eval::action::expand_unchanged_var`.
             for var in vars {
-                branch.unchanged_vars.push(var.clone());
-                if let Some(value) = branch.ctx.state.get(var.as_str()) {
-                    branch
-                        .staged
-                        .entry(var.clone())
-                        .or_insert_with(|| value.clone());
+                for rv in crate::tla::eval::expand_unchanged_var(var, &branch.ctx, 0) {
+                    if let Some(value) = branch.ctx.state.get(rv.as_str()) {
+                        branch
+                            .staged
+                            .entry(rv.clone())
+                            .or_insert_with(|| value.clone());
+                    }
+                    branch.unchanged_vars.push(rv);
                 }
             }
             Ok(vec![branch])
