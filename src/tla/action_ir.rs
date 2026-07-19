@@ -762,6 +762,48 @@ fn split_inline_action_conjuncts(part: &str) -> Vec<String> {
     }
 }
 
+/// True when the body's ONLY top-level `/\` conjunct is the leading one — i.e.
+/// `/\ <disjunction>` with no sibling `/\` conjunct outside the disjunction.
+/// Used to decide whether a `/\ \/ ...`-led body may strip its leading `/\` and
+/// split the disjunction: it may only when the disjunction spans the whole body
+/// (2PC `RS`: `/\ \/ b1 \/ b2 \/ b3`, 3 disjuncts), NOT when the disjunction is
+/// only the FIRST of several conjuncts (EnvironmentController `Receive`:
+/// `/\ (\/ a \/ b) /\ LocallyTick /\ UNCHANGED ...`), where stripping would
+/// absorb the shared trailing conjuncts into the last `\/` branch and drop them
+/// from the others. `split_action_body_clauses` over-counts a lone
+/// disjunction-conjunct (it flattens the branches' inner `/\`), so this reads the
+/// layout directly: the disjunction's `\/` branch bullets sit at one indent; a
+/// TOP-LEVEL `/\` conjunct sits SHALLOWER than that, a branch-body `/\` sits
+/// DEEPER. Count `/\` lines shallower than the shallowest `\/` bullet; more than
+/// one means there are sibling conjuncts outside the disjunction. (`expr.trim()`
+/// dedents the first line, so an absolute per-line column won't line up — hence
+/// the comparison is relative to the `\/` bullets.) A body with no `\/` bullet
+/// line (single-line, or no disjunction) is treated as sole — the pre-existing
+/// behavior.
+fn leading_conjunct_is_sole(body: &str) -> bool {
+    let mut min_or_indent = usize::MAX;
+    for line in body.lines() {
+        let t = line.trim_start();
+        if t.starts_with("\\/") {
+            min_or_indent = min_or_indent.min(line.len() - t.len());
+        }
+    }
+    if min_or_indent == usize::MAX {
+        return true;
+    }
+    let mut count = 0usize;
+    for line in body.lines() {
+        let t = line.trim_start();
+        if t.starts_with("/\\") && line.len() - t.len() < min_or_indent {
+            count += 1;
+            if count > 1 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 pub fn split_action_body_disjuncts(expr: &str) -> Vec<String> {
     let trimmed = expr.trim();
     if trimmed.is_empty() {
@@ -805,8 +847,25 @@ pub fn split_action_body_disjuncts(expr: &str) -> Vec<String> {
         return vec![trimmed.to_string()];
     }
 
+    // A body that is `/\ \/ b1 \/ b2` — a single conjunct that IS a disjunction —
+    // strips its leading `/\` and splits the disjunction. But this must NOT fire
+    // when the disjunction is only the FIRST of several conjuncts
+    // (`/\ (\/ a \/ b) /\ shared1 /\ shared2`, e.g. EnvironmentController's
+    // EPFailureDetector `Receive`: a leading guard-disjunction followed by
+    // `LocallyTick(i)` and more). Stripping the `/\` there makes the whole
+    // remainder look like a top-level disjunction, so the trailing shared
+    // conjuncts get absorbed into the LAST `\/` branch and dropped from the
+    // others — the guard-disjunct's first branch then fires WITHOUT the shared
+    // `LocallyTick`/primed conjuncts, so `localClock` never advances and the
+    // detector's whole message machinery stays disabled (36 states vs TLC's
+    // ~130k). Only strip-and-recurse when the body is a *single* conjunctive
+    // clause (the pure `/\ <disjunction>` shape); a multi-clause conjunction
+    // falls through to the conjunction guard below, which keeps it whole and
+    // lets the clause evaluator expand the inner `\/` with the shared conjuncts
+    // in scope.
     if let Some(rest) = trimmed.strip_prefix("/\\").map(str::trim_start)
         && rest.starts_with("\\/")
+        && leading_conjunct_is_sole(trimmed)
     {
         return split_action_body_disjuncts(rest);
     }
@@ -2327,6 +2386,31 @@ mod tests {
         assert!(disjuncts[0].contains("\\E q \\in Proc \\ {p}"));
         assert!(disjuncts[0].contains("Recv(p, q)"));
         assert!(disjuncts[0].contains("Recv(q, p)"));
+    }
+
+    #[test]
+    fn split_action_body_disjuncts_keeps_leading_guard_disjunction_with_shared_conjuncts() {
+        // Regression (EnvironmentController EPFailureDetector `Receive`): a body
+        // whose FIRST conjunct is a multi-line guard-disjunction, followed by
+        // shared conjuncts (`LocallyTick(i)`, `UNCHANGED ...`). The top-level
+        // connective is `/\`, so this is ONE disjunct — the inner `\/` must not
+        // be split off. A prior bug stripped the leading `/\` and split at the
+        // guard's `\/`, producing `[/\ %P=0 /\ %S=0, /\ %P#0 /\ %S#0 /\
+        // LocallyTick /\ UNCHANGED]`: the shared `LocallyTick`/`UNCHANGED`
+        // conjuncts were absorbed into only the LAST branch, so the first
+        // guard-disjunct fired WITHOUT advancing the clock — freezing localClock
+        // at 0 and collapsing exploration (36 states vs TLC's ~130k).
+        let body = "  /\\ \\/ /\\ localClock[i] % PredictPoint = 0\n        /\\ localClock[i] % SendPoint = 0\n     \\/ /\\ localClock[i] % PredictPoint # 0\n        /\\ localClock[i] % SendPoint # 0\n  /\\ LocallyTick(i)\n  /\\ UNCHANGED outgoingMessages";
+        let disj = split_action_body_disjuncts(body);
+        assert_eq!(
+            disj.len(),
+            1,
+            "leading guard-disjunction with shared trailing conjuncts must stay ONE disjunct, got {}: {disj:#?}",
+            disj.len()
+        );
+        // And the shared conjuncts must be present (not dropped).
+        assert!(disj[0].contains("LocallyTick(i)"), "shared LocallyTick lost: {:?}", disj[0]);
+        assert!(disj[0].contains("UNCHANGED outgoingMessages"), "shared UNCHANGED lost: {:?}", disj[0]);
     }
 
     #[test]

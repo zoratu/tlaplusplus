@@ -773,13 +773,23 @@ fn expand_action_call_multi(
         instance_ctx.definitions = Some(&module.definitions);
         instance_ctx.instances = effective_instance_scope(&module.instances, ctx.instances);
         seed_implicit_instance_constant_bindings(instance, module, ctx, &mut instance_ctx);
+        // Evaluate call arguments in the caller's *staged* context so an argument
+        // that READS a next-state variable resolves — e.g. EnvironmentController's
+        // `Detector!Receive(i, inDelivery')`, whose `inDelivery'` was staged by the
+        // preceding `CommChan!Deliver(i)`. Against the bare `ctx` the primed read
+        // is an unbound ModelValue, so Receive's `\E m \in incomingMessages` (with
+        // `incomingMessages` bound to that ModelValue) errors and Receive produces
+        // no successor — the RECEIVE branch never fires, `LocallyTick` never runs,
+        // and localClock stays frozen at 0. A staged context only ADDS `var'`
+        // keys, so unprimed arguments evaluate identically.
+        let arg_ctx = ctx_with_staged_primes(ctx, &branch.staged);
         {
             let locals_mut = std::rc::Rc::make_mut(&mut instance_ctx.locals);
             if let Err(err) = bind_instance_substitutions(instance, ctx, locals_mut) {
                 return Some(Err(err));
             }
             for (param, arg_expr) in def.params.iter().zip(arg_exprs.iter()) {
-                let value = match eval_expr(arg_expr, ctx) {
+                let value = match eval_expr(arg_expr, &arg_ctx) {
                     Ok(value) => value,
                     Err(err) => return Some(Err(err)),
                 };
