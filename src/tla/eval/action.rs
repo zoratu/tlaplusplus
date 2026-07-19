@@ -164,6 +164,69 @@ pub fn apply_action_ir_with_context(
         .next())
 }
 
+/// Expand one `UNCHANGED` operand to the concrete state variables it names.
+///
+/// A bare state variable expands to itself. A defined nullary operator whose
+/// body is a variable tuple — `envVars == << procPause, moved, failed, F >>`, the
+/// standard TLA+ idiom — expands to its component variables, recursively (a
+/// component may itself be such a tuple operator). This lets `UNCHANGED envVars`
+/// stage each component prime (`procPause'`, `moved'`, `failed'`, `F'`) so a
+/// later conjunct or trailing constraint that READS one of those primes resolves
+/// it. Without the expansion the operand is treated as one phantom name
+/// (`envVars`), no component prime is staged, and a subsequent `failed'` read
+/// resolves to an unbound `ModelValue("failed'")` — the successor state itself is
+/// still correct (unchanged vars survive the clone), so the gap is invisible
+/// until an action reads its own unchanged prime, as EnvironmentController's
+/// `DELTAConstraint`/`PHIConstraint` do after the `Crash`/`ProcTick` crashed
+/// branch's `UNCHANGED envVars`.
+pub(crate) fn expand_unchanged_var(
+    var: &str,
+    ctx: &EvalContext<'_>,
+    depth: usize,
+) -> Vec<String> {
+    if depth > 16 || ctx.state.get(var).is_some() {
+        return vec![var.to_string()];
+    }
+    if let Some(def) = ctx.definition(var)
+        && def.params.is_empty()
+    {
+        let body = def.body.trim();
+        if let Some(inner) = body
+            .strip_prefix("<<")
+            .and_then(|s| s.strip_suffix(">>"))
+        {
+            let parts = split_top_level_symbol(inner, ",");
+            if !parts.is_empty() {
+                return parts
+                    .into_iter()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .flat_map(|name| expand_unchanged_var(&name, ctx, depth + 1))
+                    .collect();
+            }
+        }
+    }
+    vec![var.to_string()]
+}
+
+/// Stage an `UNCHANGED` operand list onto `branch`, resolving each operand to its
+/// concrete state variables via [`expand_unchanged_var`]. Shared by the
+/// interpreted `ActionClause`/`ClauseKind` unchanged handlers.
+fn stage_unchanged_vars(
+    branch: &mut ActionEvalBranch,
+    vars: &[String],
+    ctx: &EvalContext<'_>,
+) {
+    for var in vars {
+        for rv in expand_unchanged_var(var, ctx, 0) {
+            if let Some(value) = ctx.state.get(rv.as_str()) {
+                branch.staged.entry(rv.clone()).or_insert_with(|| value.clone());
+            }
+            branch.unchanged_vars.push(rv);
+        }
+    }
+}
+
 fn eval_action_clauses_multi(
     clauses: &[ActionClause],
     ctx: &EvalContext<'_>,
@@ -224,15 +287,7 @@ fn eval_action_clause_to_branch(
         }
         ActionClause::Unchanged { vars } => {
             let mut branch = branch;
-            for var in vars {
-                branch.unchanged_vars.push(var.clone());
-                if let Some(value) = ctx.state.get(var.as_str()) {
-                    branch
-                        .staged
-                        .entry(var.clone())
-                        .or_insert_with(|| value.clone());
-                }
-            }
+            stage_unchanged_vars(&mut branch, vars, ctx);
             Ok(vec![branch])
         }
         ActionClause::Exists { binders, body } => {
@@ -967,12 +1022,7 @@ fn eval_action_clause_text_multi(
         }
         ClauseKind::Unchanged { vars } => {
             let mut branch = branch;
-            for var in vars {
-                branch.unchanged_vars.push(var.clone());
-                if let Some(value) = ctx.state.get(var.as_str()) {
-                    branch.staged.entry(var).or_insert_with(|| value.clone());
-                }
-            }
+            stage_unchanged_vars(&mut branch, &vars, ctx);
             Ok(vec![branch])
         }
         ClauseKind::UnprimedEquality { .. }

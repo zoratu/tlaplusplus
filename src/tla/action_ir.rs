@@ -843,6 +843,32 @@ pub fn split_action_body_disjuncts(expr: &str) -> Vec<String> {
             // inner bound variable.
             return vec![trimmed.to_string()];
         }
+        // SOUNDNESS: if the quantifier body is a top-level *conjunction* whose
+        // final conjunct is a nested disjunction —
+        //   \E i \in Proc :
+        //      /\ moved[i] = "NO"
+        //      /\ procPause' = [procPause EXCEPT ![i] = 0]
+        //      /\ \/ /\ moved' = [moved EXCEPT ![i] = "PREDICT"] /\ ...
+        //         \/ /\ moved' = [moved EXCEPT ![i] = "RECEIVE"] /\ ...
+        // — the `\/` lives *inside* the last `/\` conjunct, NOT at the body's
+        // top level. `split_top_level(body, "\\/")` below is blind to the `/\`
+        // structure and would shred the disjunction into independent `\E i : ...`
+        // branches, dropping the surrounding guards (`moved[i] = "NO"`) and the
+        // shared primed conjuncts (`procPause'`, `UNCHANGED`). Those orphaned
+        // branches then fire from states where the guard is false and later read
+        // an unstaged prime — a spurious-partial-branch bug that both
+        // over-generates successors and, when a trailing constraint reads the
+        // dropped prime, panics (EnvironmentController's `ProcTick`; ACP's
+        // `parProgNB`). The conjunction guard at the end of this function catches
+        // the non-quantified analogue, but it inspects `trimmed`, which starts
+        // with `\E` here and so `split_action_body_clauses` returns a single
+        // clause — the check must run on the *body*. Keep the whole
+        // `\E <binders> : <conjunction>` as one disjunct; downstream IR
+        // compilation / `eval_exists_action_multi` expands the inner `\/` with
+        // the guards and binder in scope.
+        if split_action_body_clauses(body).len() > 1 {
+            return vec![trimmed.to_string()];
+        }
         let body_disjuncts = split_top_level(body, "\\/");
         if body_disjuncts.len() > 1 || body.trim_start().starts_with("\\/") {
             return body_disjuncts
@@ -2301,6 +2327,41 @@ mod tests {
         assert!(disjuncts[0].contains("\\E q \\in Proc \\ {p}"));
         assert!(disjuncts[0].contains("Recv(p, q)"));
         assert!(disjuncts[0].contains("Recv(q, p)"));
+    }
+
+    #[test]
+    fn split_action_body_disjuncts_keeps_exists_conjunction_with_trailing_nested_disjunction() {
+        // Regression (EnvironmentController `ProcTick`, ACP `parProgNB`): a
+        // `\E`-quantified body that is a top-level CONJUNCTION whose final
+        // conjunct is a nested disjunction. The `\/` lives inside the last `/\`
+        // conjunct, so the whole `\E i : /\ ... /\ (\/ A \/ B)` is ONE disjunct.
+        // A prior bug split it into `\E i : /\ guards...`, `\E i : A`, `\E i : B`
+        // — dropping the surrounding guards + shared primed conjuncts, so the
+        // orphaned A/B branches fired from every state (even when the guard was
+        // false) and later read an unstaged prime, panicking.
+        let disjuncts = split_action_body_disjuncts(
+            r#"\E i \in Proc :
+                  /\ failed[i] = FALSE
+                  /\ moved[i] = "NO"
+                  /\ procPause' = [procPause EXCEPT ![i] = 0]
+                  /\ UNCHANGED << failed >>
+                  /\ \/ /\ moved' = [moved EXCEPT ![i] = "PREDICT"]
+                        /\ UNCHANGED << inTransit, inDelivery >>
+                     \/ /\ moved' = [moved EXCEPT ![i] = "RECEIVE"]
+                        /\ CommChan!Deliver(i)"#,
+        );
+        assert_eq!(
+            disjuncts.len(),
+            1,
+            "exists body that is a conjunction with a nested trailing disjunction must stay one disjunct, got {}: {disjuncts:#?}",
+            disjuncts.len()
+        );
+        assert!(disjuncts[0].contains("moved[i] = \"NO\""), "guard preserved: {}", disjuncts[0]);
+        assert!(
+            disjuncts[0].contains("procPause' = [procPause EXCEPT ![i] = 0]"),
+            "shared primed conjunct preserved: {}",
+            disjuncts[0]
+        );
     }
 
     #[test]

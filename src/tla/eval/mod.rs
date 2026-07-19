@@ -82,8 +82,8 @@ pub use action::{
     apply_action_ir, apply_action_ir_with_context, eval_action_body_multi, eval_let_action_multi,
 };
 pub(crate) use action::{
-    apply_action_ir_with_context_multi, arg_is_primed_expr, parse_action_binder_specs,
-    parse_action_call_expr, substitute_params_text,
+    apply_action_ir_with_context_multi, arg_is_primed_expr, expand_unchanged_var,
+    parse_action_binder_specs, parse_action_call_expr, substitute_params_text,
 };
 // `eval_let_action` is the legacy single-successor wrapper; kept
 // `pub(crate)` for parity with the pre-split surface but currently
