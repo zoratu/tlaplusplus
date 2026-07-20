@@ -3319,7 +3319,15 @@ fn try_eval_compiled_guard_as_action<'a>(
             }
         }
         if bind_ok {
-            let compiled = CompiledActionIr::from_ir(&crate::tla::compile_action_ir(&def));
+            // Reuse the thread-local/prewarmed compiled-IR cache rather than
+            // recompiling `def` on every guard evaluation. This action-call
+            // guard is on the hot path (each `\E`-quantified disjunct of a
+            // Next disjunction resolves through here), and recompiling —
+            // `compile_action_ir` + `from_ir` + `compile_expr`/`lower` per call
+            // — dominated trace reconstruction for fairness specs (ACP's
+            // `reconstruct_trace_limited` spun for minutes re-compiling parProg/
+            // decideOnForward/abortOnTimeout on every re-explored state).
+            let compiled = crate::tla::action_exec::get_or_compile_action(&def);
             let seed = CompiledActionBranch {
                 ctx: child_ctx,
                 staged: branch.staged.clone(),
