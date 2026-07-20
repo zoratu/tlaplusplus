@@ -610,7 +610,34 @@ pub(crate) fn uniform_dedent(expr: &str) -> String {
     out
 }
 
+// Thread-local memoization of the action-body text splitters. These are pure
+// functions of their input text (the v2 layout-aware parse is deterministic and
+// `v2_enabled()` is fixed for the process), but they are re-invoked on the SAME
+// action/clause text on every `next_states` call — during full-space
+// exploration and, especially, trace reconstruction which re-explores the whole
+// graph. Re-running the Pratt parse + string scans per visit dominated the hot
+// path for fairness/reconstruction specs after #189 cached the compiled IR
+// (gdb: `split_action_body_clauses`/`split_top_level`/`matches_keyword_at`).
+// Caching by the input string returns the cached split (a cheap Vec<String>
+// clone) instead of re-parsing. Thread-local, so no cross-worker contention.
 pub(crate) fn split_action_body_clauses(expr: &str) -> Vec<String> {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+    thread_local! {
+        static CACHE: RefCell<HashMap<String, Rc<Vec<String>>>> = RefCell::new(HashMap::new());
+    }
+    if let Some(v) = CACHE.with(|c| c.borrow().get(expr).cloned()) {
+        return (*v).clone();
+    }
+    let v = split_action_body_clauses_uncached(expr);
+    CACHE.with(|c| {
+        c.borrow_mut().insert(expr.to_string(), Rc::new(v.clone()));
+    });
+    v
+}
+
+fn split_action_body_clauses_uncached(expr: &str) -> Vec<String> {
     // ---- Phase 4: layout-aware action-conjunct splitting via expr_v2 ----
     // Route the top-level conjunct split through the v2 AST when the body's ROOT
     // is an `And` junction. Returns `None` (→ the entire string-based body below
@@ -805,6 +832,23 @@ fn leading_conjunct_is_sole(body: &str) -> bool {
 }
 
 pub fn split_action_body_disjuncts(expr: &str) -> Vec<String> {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+    thread_local! {
+        static CACHE: RefCell<HashMap<String, Rc<Vec<String>>>> = RefCell::new(HashMap::new());
+    }
+    if let Some(v) = CACHE.with(|c| c.borrow().get(expr).cloned()) {
+        return (*v).clone();
+    }
+    let v = split_action_body_disjuncts_uncached(expr);
+    CACHE.with(|c| {
+        c.borrow_mut().insert(expr.to_string(), Rc::new(v.clone()));
+    });
+    v
+}
+
+fn split_action_body_disjuncts_uncached(expr: &str) -> Vec<String> {
     let trimmed = expr.trim();
     if trimmed.is_empty() {
         return Vec::new();
