@@ -50,7 +50,7 @@ fn action_cache_key(def: &TlaDefinition) -> String {
 }
 
 /// Get or compile an action IR with compiled expressions (thread-local, zero contention)
-fn get_or_compile_action(def: &TlaDefinition) -> Arc<CompiledActionIr> {
+pub(crate) fn get_or_compile_action(def: &TlaDefinition) -> Arc<CompiledActionIr> {
     let cache_key = if def.params.is_empty() {
         None
     } else {
