@@ -2867,6 +2867,68 @@ fn evaluate_init_states(
         i += 1;
     }
 
+    // A conjunctive Init with a disjunctive conjunct — `/\ A /\ (\/ B1 \/ B2)
+    // /\ C` — must be DISTRIBUTED into `(A /\ B1 /\ C) \/ (A /\ B2 /\ C)` and
+    // each alternative recursed as its own Init, so the disjunct branches'
+    // membership/equality alternatives are enumerated. Without this the loop
+    // below evaluates the `\/` clause as a boolean guard; with unbound state
+    // variables that reads FALSE (`light \in {"off","on"}` with `light` unbound
+    // is `ModelValue("light") \in {..}` = false), so the branch is silently
+    // dropped and the initial-state count collapses — Prisoner{Solo,}LightUnknown
+    // lost the `Light_Unknown /\ light \in {"off","on"}` alternative → 1 init
+    // state instead of 2. We distribute over `merged_clauses` (NOT a raw
+    // `split_top_level(_, "/\\")`, which shreds a disjunct's inner `/\` guards);
+    // `merged_clauses` has already rejoined each disjunction into one clause. A
+    // disjunct with a false constant guard (`~Light_Unknown` when `Light_Unknown
+    // = TRUE`) yields zero states via the guard check, so the union is exact.
+    // Recursion terminates (each level removes one disjunctive conjunct).
+    if merged_clauses.len() > 1 {
+        let disj_pos = merged_clauses.iter().position(|c| {
+            let t = c.trim();
+            t.starts_with("\\/") && split_top_level(t, "\\/").len() > 1
+        });
+        if let Some(pos) = disj_pos {
+            let disjuncts = split_top_level(merged_clauses[pos].trim(), "\\/");
+            if disjuncts.len() > 1 {
+                let others: Vec<&String> = merged_clauses
+                    .iter()
+                    .enumerate()
+                    .filter(|(k, _)| *k != pos)
+                    .map(|(_, c)| c)
+                    .collect();
+                let mut all_states = Vec::new();
+                for d in &disjuncts {
+                    let d = d.trim();
+                    if d.is_empty() {
+                        continue;
+                    }
+                    let mut new_body = format!("/\\ {d}");
+                    for o in &others {
+                        new_body.push_str("\n/\\ ");
+                        new_body.push_str(o);
+                    }
+                    let synth_name = format!("__SyntheticInitDistrib_{init_name}__");
+                    let mut module_clone = module.clone();
+                    module_clone.definitions.insert(
+                        synth_name.clone(),
+                        TlaDefinition {
+                            name: synth_name.clone(),
+                            params: vec![],
+                            body: new_body,
+                            is_recursive: false,
+                        },
+                    );
+                    if let Ok(states) = evaluate_init_states(&module_clone, cfg, &synth_name) {
+                        all_states.extend(states);
+                    }
+                }
+                if !all_states.is_empty() {
+                    return Ok(all_states);
+                }
+            }
+        }
+    }
+
     for clause in merged_clauses {
         // For disjunctive clauses (\/ branches), try to resolve them
         // using already-known constants. This handles patterns like:
