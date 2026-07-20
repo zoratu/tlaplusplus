@@ -4143,7 +4143,21 @@ fn compile_action_clause_text(expr: &str) -> CompiledActionClause {
         ClauseKind::UnprimedEquality { .. }
         | ClauseKind::UnprimedMembership { .. }
         | ClauseKind::Other => {
-            if trimmed.starts_with("LET") && trimmed.contains('\'') {
+            // A `LET ... IN <body>` action clause routes through
+            // `compile_let_with_primes` so its body conjuncts are compiled and
+            // evaluated as ACTION clauses (each may stage a prime). The gate used
+            // to also require a literal `'` in the LET text, but that missed a
+            // prime HIDDEN behind a helper call — `LET M == ... IN SendMessage(m)`
+            // where `SendMessage(m) == messages' = ...` (Paxos/SimplifiedFastPaxos
+            // `PaxosAccept`). Without a visible `'`, the clause fell to a boolean
+            // `Guard`, which evaluates the helper in value context and drops its
+            // primed assignment → the action produced 0 successors (worked around
+            // in #175 via an interpreted fallback on the empty compiled result;
+            // this makes the compiled path correct directly). `compile_let_with_primes`
+            // still returns None (→ interpreted `LetWithPrimes`) for shapes it
+            // can't compile (e.g. a `CASE`-of-actions body). A pure value LET is
+            // handled identically: its body compiles to boolean `Guard` clauses.
+            if trimmed.starts_with("LET") {
                 match compile_let_with_primes(trimmed) {
                     Some(compiled) => compiled,
                     None => CompiledActionClause::LetWithPrimes {
