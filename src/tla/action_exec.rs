@@ -2760,8 +2760,14 @@ SPECIFICATION
         )
         .expect("cfg should be written");
 
-        let parsed_module = parse_tla_module_file(&mc).expect("parsed module should load");
+        let mut parsed_module = parse_tla_module_file(&mc).expect("parsed module should load");
         let model = TlaModel::from_files(&mc, Some(&cfg), None, None).expect("model");
+        // Constants are no longer carried in the model state (they belong to the
+        // fixed model context — see TlaModel::from_files). Probe against the
+        // model's INJECTED module, whose constant definitions resolve the
+        // constant references that used to be read from the state. This mirrors
+        // production `analyze-tla`, which injects constants before probing.
+        parsed_module = model.module.clone();
         let probe_state = model
             .initial_states_vec
             .first()
@@ -2940,8 +2946,14 @@ SPECIFICATION
         )
         .expect("cfg should be written");
 
-        let parsed_module = parse_tla_module_file(&mc).expect("parsed module should load");
+        let mut parsed_module = parse_tla_module_file(&mc).expect("parsed module should load");
         let model = TlaModel::from_files(&mc, Some(&cfg), None, None).expect("model");
+        // Constants are no longer carried in the model state (they belong to the
+        // fixed model context — see TlaModel::from_files). Probe against the
+        // model's INJECTED module, whose constant definitions resolve the
+        // constant references that used to be read from the state. This mirrors
+        // production `analyze-tla`, which injects constants before probing.
+        parsed_module = model.module.clone();
         let probe_state = model
             .initial_states_vec
             .first()

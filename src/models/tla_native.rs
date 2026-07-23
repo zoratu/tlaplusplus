@@ -141,6 +141,37 @@ impl TlaModel {
             Some(states) => states,
             None => evaluate_init_states(&module, &config, &init_name)?,
         };
+        // Constants belong to the fixed model context, not the mutable state:
+        // in TLA+/TLC a state is a valuation of the declared VARIABLES only.
+        // Init evaluation seeds constants into each state so Init predicates can
+        // read them (e.g. `x \in Node`), but we must NOT carry them in the
+        // fingerprinted state. They are identical across every reachable state
+        // (so removing them cannot change any distinct-state count) yet they
+        // bloat every fingerprint (bincode-serialized + hashed per state) and
+        // every stored state. Strip them here — centrally, on the already-
+        // materialized initial states — so this one filter covers the
+        // brute-force, joint-symbolic (T5.5) and streaming Init paths at once
+        // (evaluate_init_states itself has several early-return paths that each
+        // seed constants). Constants stay resolvable during action/invariant
+        // eval via their injected definitions (non-model-value constants) or via
+        // the `ModelValue(name)` identifier fallback (model values, whose self-
+        // referential def is intentionally NOT injected — see
+        // inject_constants_into_module_tree). Because the active schema below is
+        // derived from these (now variable-only) states, constant references
+        // compile to name-based `Var` rather than per-state `StateVar { slot }`.
+        {
+            let var_set: std::collections::HashSet<&str> =
+                module.variables.iter().map(|s| s.as_str()).collect();
+            initial_states_vec = initial_states_vec
+                .into_iter()
+                .map(|state| {
+                    state
+                        .into_iter()
+                        .filter(|(k, _)| var_set.contains(k.as_ref()))
+                        .collect()
+                })
+                .collect();
+        }
         if let Some(first_state) = initial_states_vec.first() {
             let names: Vec<Arc<str>> = first_state.keys().cloned().collect();
             crate::tla::value::set_active_schema(names);
@@ -4075,6 +4106,29 @@ fn inject_constants_into_module_tree(
             && !module.definitions.contains_key(name)
         {
             continue;
+        }
+
+        // A SELF-REFERENTIAL model-value constant (`NULL = NULL`, where the
+        // constant name equals the model value) must NOT be injected as the
+        // definition `NULL == NULL`. Now that constants are no longer carried in
+        // the state (see `TlaModel::from_files`), resolving the name through that
+        // definition would recurse to MAX_DEPTH; the `ModelValue(name)` identifier
+        // fallback (present in both evaluators — compiled `eval_var_by_name` and
+        // interpreted `resolve_identifier`) resolves it correctly instead.
+        // Skipping only the self-referential case is deliberately narrow: an
+        // ALIASED model value (`NoBlock = NoBlockVal`, name != value) injects the
+        // NON-self-referential def `NoBlock == NoBlockVal`, which must be KEPT —
+        // otherwise `NoBlock` would fall back to `ModelValue("NoBlock")` instead
+        // of resolving to the intended `NoBlockVal`. (Model-value SETS such as
+        // `Node = {n1, n2}` are `ConfigValue::Set`, not `ModelValue`, and inject
+        // normally; their elements resolve via the same fallback.) This is also
+        // safer than a body-equals-name guard in the evaluators, which would
+        // silently reinterpret a user-written recursive `X == X` as a model value
+        // instead of surfacing the recursion.
+        if let ConfigValue::ModelValue(mv) = value {
+            if mv == name {
+                continue;
+            }
         }
 
         let (params, body) = match value {

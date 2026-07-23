@@ -4743,10 +4743,13 @@ INVARIANTS TypeInvariant
             .first()
             .cloned()
             .expect("initial state should exist");
-        assert_eq!(
-            probe_state.get("NoBlock"),
-            Some(&TlaValue::ModelValue("NoBlockVal".to_string()))
-        );
+        // Constants are no longer carried in the state (they belong to the fixed
+        // model context — see TlaModel::from_files): `NoBlock` is NOT a state
+        // entry, only the declared variable `hashFunction` is. That `NoBlock`
+        // still resolves to the model value NoBlockVal is verified below via
+        // `eval_expr("N!NoBlock", ...)` against the model's injected definitions.
+        assert!(probe_state.get("NoBlock").is_none(), "{probe_state:?}");
+        assert!(probe_state.get("hashFunction").is_some(), "{probe_state:?}");
 
         let def = model
             .module
