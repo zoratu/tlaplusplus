@@ -107,9 +107,14 @@ pub fn canonicalize_tla_state(state: &TlaState, symmetry: &SymmetrySpec) -> TlaS
         Some(g) if !g.is_empty() => g,
         _ => return state.clone(),
     };
-    // Symmetric model values are also present as constant self-bindings in the
-    // state (`r1 |-> r1`); those entries must be held fixed during permutation
-    // (see apply_permutation_to_state) so symmetric states canonicalize alike.
+    // `fixed_keys` names state entries that must be held fixed during permutation.
+    // Historically constants were carried in the state as self-bindings
+    // (`r1 |-> r1`) and had to be protected here; constants are no longer part of
+    // the state (see `TlaModel::from_files`), so in normal model checking
+    // `fixed_keys` matches nothing and this is a harmless no-op. It is retained
+    // because the unit tests below still exercise canonicalization on states
+    // built with explicit self-bindings, and because `apply_permutation_to_state`
+    // relies on it whenever such entries are present.
     static EMPTY_FIXED: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
     let fixed_keys = symmetry
         .symmetric_values
@@ -292,13 +297,15 @@ fn apply_permutation_to_state(
     // schema Arc so we don't re-derive a schema or double-clone keys/values on
     // every canonicalization (the symmetry hot path).
     //
-    // `fixed_keys` names entries that must be left untouched: the symmetric model
-    // values themselves are present in the state as constant self-bindings
-    // (`r1 |-> ModelValue("r1")`, ...). These are identical in every reachable
-    // state, but permuting them (`r1 |-> ModelValue("r2")`) makes two symmetric
-    // states pick *different* canonical forms — defeating the whole reduction.
-    // They are constants, so keep them fixed; only the mutable state that
-    // *references* the symmetric values gets permuted.
+    // `fixed_keys` names entries that must be left untouched. When symmetric model
+    // values appear in the state as constant self-bindings (`r1 |-> ModelValue("r1")`),
+    // permuting them (`r1 |-> ModelValue("r2")`) would make two symmetric states
+    // pick *different* canonical forms — defeating the reduction — so they are kept
+    // fixed; only the mutable state that *references* the symmetric values gets
+    // permuted. In normal model checking constants are no longer carried in the
+    // state (see `TlaModel::from_files`), so `fixed_keys` is empty/non-matching and
+    // the fast path below applies; this keying path still guards states built with
+    // explicit self-bindings (e.g. the unit tests).
     if fixed_keys.is_empty() {
         return state.map_values(|v| apply_permutation_to_value(v, permutation));
     }
