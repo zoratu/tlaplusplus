@@ -86,7 +86,16 @@ pub(crate) fn eval_operator_call(
             return match &args[0] {
                 TlaValue::Bool(true) => Ok(TlaValue::Bool(true)),
                 TlaValue::Bool(false) => {
-                    Err(anyhow!("assertion failed: {}", tla_to_string(&args[1])))
+                    // A definitively-failed assertion reached during committed
+                    // next-state generation is a safety violation; record it on
+                    // the side channel (the Err is otherwise swallowed as a
+                    // disabled branch). See crate::model reached-assertion side
+                    // channel and the compiled-path handler.
+                    let message = format!("assertion failed: {}", tla_to_string(&args[1]));
+                    if crate::model::in_committed_next_state() {
+                        crate::model::record_pending_assertion_violation(message.clone());
+                    }
+                    Err(anyhow!("{message}"))
                 }
                 other => Err(anyhow!(
                     "Assert expects a boolean first argument, got {:?}",

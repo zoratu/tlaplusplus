@@ -2065,10 +2065,20 @@ fn eval_compiled_opcall(
         "Assert" if arg_values.len() == 2 && !user_defined_shadow => {
             return match &arg_values[0] {
                 TlaValue::Bool(true) => Ok(TlaValue::Bool(true)),
-                TlaValue::Bool(false) => Err(anyhow!(
-                    "assertion failed: {:?}",
-                    arg_values[1]
-                )),
+                TlaValue::Bool(false) => {
+                    // A definitively-failed assertion reached during committed
+                    // next-state generation is a safety violation (TLC halts on
+                    // it). Record it on the side channel so the worker can report
+                    // it — the returned Err would otherwise be swallowed as a
+                    // disabled branch. Only Bool(false) records; a non-boolean
+                    // argument (below) is a benign/ambiguous eval error, not a
+                    // violation. See crate::model reached-assertion side channel.
+                    let message = format!("assertion failed: {:?}", arg_values[1]);
+                    if crate::model::in_committed_next_state() {
+                        crate::model::record_pending_assertion_violation(message.clone());
+                    }
+                    Err(anyhow!("{message}"))
+                }
                 other => Err(anyhow!(
                     "Assert expects a boolean first argument, got {:?}",
                     other
