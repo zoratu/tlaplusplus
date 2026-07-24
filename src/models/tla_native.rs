@@ -499,6 +499,12 @@ impl Model for TlaModel {
     }
 
     fn next_states(&self, state: &Self::State, out: &mut Vec<Self::State>) {
+        // Mark committed next-state generation: a reached `Assert(FALSE)` in the
+        // action is a safety violation and is recorded on the reached-assertion
+        // side channel (drained by the worker), rather than being masked as a
+        // disabled branch. See crate::model.
+        let _committed = crate::model::enter_committed_next_state();
+
         // Optimization: if Next is trivially UNCHANGED vars, skip evaluation.
         // Every initial state is a fixed point — no transitions to explore.
         if self.trivial_next {
@@ -536,6 +542,13 @@ impl Model for TlaModel {
                 // this will be detected by the runtime when out remains empty.
             }
             Err(err) => {
+                // A reached Assert(FALSE) recorded a pending violation on the
+                // side channel (see crate::model). Return with no successors so
+                // the worker drains and reports it as a safety violation — do NOT
+                // panic, and do so regardless of `allow_deadlock`.
+                if crate::model::has_pending_assertion_violation() {
+                    return;
+                }
                 if self.allow_deadlock {
                     // Treat evaluation errors as deadlocked states (no successors).
                     // This handles cases like: guards that fail type evaluation
@@ -714,6 +727,10 @@ impl Model for TlaModel {
         if !self.has_fairness_constraints() && !self.needs_graph_liveness_check() {
             return None;
         }
+
+        // Committed next-state generation (see next_states): a reached
+        // Assert(FALSE) here is recorded on the reached-assertion side channel.
+        let _committed = crate::model::enter_committed_next_state();
 
         let next_def = self.module.definitions.get(&self.next_name)?;
 

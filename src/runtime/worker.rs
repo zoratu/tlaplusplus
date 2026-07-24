@@ -482,6 +482,11 @@ pub(super) fn run_worker<M: Model>(
 
         successors.clear();
 
+        // Clear any stale reached-assertion record before generating successors,
+        // so the drain below attributes an assertion to THIS state's action
+        // (a prior iteration's trace reconstruction can also run next_states).
+        crate::model::take_pending_assertion_violation();
+
         // Use labeled transitions if fairness constraints exist
         if let Some(ref transitions_map) = worker_labeled_transitions {
             if let Some(labeled_transitions_vec) = worker_model.next_states_labeled(&state)
@@ -511,6 +516,53 @@ pub(super) fn run_worker<M: Model>(
         } else {
             // No fairness constraints - use regular next_states
             worker_model.next_states(&state, &mut successors);
+        }
+
+        // A reached Assert(FALSE) during the next-state evaluation above is a
+        // safety violation (TLC halts on it). `next_states` returns `()` and
+        // cannot surface it, so the evaluator recorded it on the reached-
+        // assertion side channel; drain and report it here exactly like an
+        // invariant violation (same trace reconstruction + channel + stop).
+        if let Some(assert_message) = crate::model::take_pending_assertion_violation() {
+            let trace = if let Some(ref pm) = worker_parent_map {
+                let sm = worker_state_map
+                    .as_ref()
+                    .expect("state_map missing but parent_map present");
+                let mut chain = vec![state.clone()];
+                let mut fp = worker_model.fingerprint(&state);
+                while let Some(parent_fp_entry) = pm.get(&fp) {
+                    let parent_fp = *parent_fp_entry;
+                    if let Some(parent_state) = sm.get(&parent_fp) {
+                        chain.push(parent_state.clone());
+                        fp = parent_fp;
+                    } else {
+                        break;
+                    }
+                }
+                chain.reverse();
+                chain
+            } else {
+                reconstruct_trace_limited(worker_model.as_ref(), &state, 100)
+                    .unwrap_or_else(|| vec![state.clone()])
+            };
+            let _ = worker_violation_tx.try_send(Violation {
+                message: assert_message,
+                state: state.clone(),
+                property_type: PropertyType::Safety,
+                trace,
+            });
+            let prev_count = worker_violation_count.fetch_add(1, Ordering::AcqRel);
+            let should_stop =
+                worker_stop_on_violation && (prev_count + 1) >= worker_max_violations;
+            if should_stop {
+                worker_stop.store(true, Ordering::Release);
+                worker_queue.finish();
+            }
+            worker_queue.worker_idle(worker_state.id());
+            if should_stop {
+                break;
+            }
+            continue;
         }
 
         #[allow(unused_variables)]

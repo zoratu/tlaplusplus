@@ -29,6 +29,84 @@ pub(crate) fn fingerprint_hasher() -> ahash::AHasher {
     .build_hasher()
 }
 
+// ---------------------------------------------------------------------------
+// Reached-assertion side channel
+//
+// A reached `Assert(FALSE)` in a next-state action is a safety violation (TLC
+// halts on it with the assertion message). But `Model::next_states` returns
+// `()` — it has no error/violation channel — and an eval error there is
+// otherwise silently treated as a disabled branch, so such a violation would
+// be masked as under-exploration. To surface it without a trait-signature
+// change, the evaluator records the failed assertion in this per-thread slot,
+// and the worker drains it immediately after each `next_states` call and
+// reports it exactly like an invariant violation.
+//
+// Two guards keep this sound (no false violations):
+//   1. Only an assertion whose argument evaluated to `Bool(false)` is recorded
+//      — a benign guard-eval failure (e.g. a record access on a `ModelValue`
+//      when a sibling guard is false) errors on a *different* expression and is
+//      not recorded. Conjunction short-circuit means a reached assertion had
+//      all preceding guards pass.
+//   2. It is recorded only while a *committed* next-state generation is in
+//      progress (see `CommittedNextStateGuard`), so speculative evaluations
+//      (`ENABLED`, invariant/state-constraint checks, action probing) that hit
+//      an assertion do not record a spurious pending violation.
+use std::cell::{Cell, RefCell};
+
+thread_local! {
+    static COMMITTED_NEXT_STATE_DEPTH: Cell<u32> = const { Cell::new(0) };
+    static PENDING_ASSERTION_VIOLATION: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// RAII marker: while alive, evaluation is part of committed next-state
+/// generation, so a reached `Assert(FALSE)` should be recorded as a pending
+/// violation. Nesting is tracked with a depth counter so a re-entrant
+/// `next_states` (e.g. POR) restores the enclosing state on drop.
+pub struct CommittedNextStateGuard(());
+
+/// Enter committed next-state generation. Hold the returned guard for the
+/// duration of the `next_states`/`next_states_labeled` evaluation.
+#[must_use]
+pub fn enter_committed_next_state() -> CommittedNextStateGuard {
+    COMMITTED_NEXT_STATE_DEPTH.with(|d| d.set(d.get() + 1));
+    CommittedNextStateGuard(())
+}
+
+impl Drop for CommittedNextStateGuard {
+    fn drop(&mut self) {
+        COMMITTED_NEXT_STATE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// True when evaluation is inside a committed next-state generation.
+pub fn in_committed_next_state() -> bool {
+    COMMITTED_NEXT_STATE_DEPTH.with(|d| d.get() > 0)
+}
+
+/// Record a reached `Assert(FALSE)` encountered during committed next-state
+/// generation. Keeps the first message recorded until it is drained (the first
+/// assertion reached is the one TLC would halt on).
+pub fn record_pending_assertion_violation(message: String) {
+    PENDING_ASSERTION_VIOLATION.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(message);
+        }
+    });
+}
+
+/// Take (and clear) any pending reached-assertion violation for this thread.
+pub fn take_pending_assertion_violation() -> Option<String> {
+    PENDING_ASSERTION_VIOLATION.with(|slot| slot.borrow_mut().take())
+}
+
+/// Peek whether a reached-assertion violation is pending (without clearing).
+/// Used by `Model::next_states` to return cleanly (rather than panic) when a
+/// reached `Assert(FALSE)` produced the eval error, so the worker can report it.
+pub fn has_pending_assertion_violation() -> bool {
+    PENDING_ASSERTION_VIOLATION.with(|slot| slot.borrow().is_some())
+}
+
 /// Action label for tracking which actions are taken in transitions
 /// This is optional and only used by models that support fairness checking
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
