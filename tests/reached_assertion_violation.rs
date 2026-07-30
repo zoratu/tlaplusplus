@@ -17,7 +17,24 @@ use serial_test::serial;
 use std::fs;
 use tempfile::TempDir;
 use tlaplusplus::models::tla_native::TlaModel;
-use tlaplusplus::{EngineConfig, Model, PropertyType, RunOutcome, run_model};
+use tlaplusplus::{
+    EngineConfig, Model, PropertyType, RunOutcome, SimulationConfig, run_model, run_simulation,
+};
+
+/// Build a `TlaModel` from inline sources (with `allow_deadlock = true`, the
+/// mode in which the swallow bug used to manifest). The `TempDir` is returned so
+/// the caller keeps the spec files alive for the model's lifetime.
+fn build_model(name: &str, module_src: &str, cfg_src: &str) -> (TlaModel, TempDir) {
+    let dir = TempDir::new().expect("tempdir");
+    let module_path = dir.path().join(format!("{name}.tla"));
+    let cfg_path = dir.path().join(format!("{name}.cfg"));
+    fs::write(&module_path, module_src).expect("write module");
+    fs::write(&cfg_path, cfg_src).expect("write cfg");
+    let mut model =
+        TlaModel::from_files(&module_path, Some(&cfg_path), None, None).expect("model loads");
+    model.allow_deadlock = true;
+    (model, dir)
+}
 
 fn run_spec(name: &str, module_src: &str, cfg_src: &str) -> RunOutcome<<TlaModel as Model>::State> {
     let dir = TempDir::new().expect("tempdir");
@@ -102,5 +119,80 @@ Next == \/ (x < 3 /\ x' = x + 1)
         outcome.stats.states_distinct, 4,
         "expected 4 distinct states (x = 0..3), got {}",
         outcome.stats.states_distinct
+    );
+}
+
+// Simulation mode (`--simulate`) uses a separate next-state path and does not go
+// through the exhaustive BFS worker; these guard that a reached Assert(FALSE) is
+// still reported there — both for the plain path (`next_states`) and the swarm
+// path (`next_states_swarm`).
+
+#[test]
+#[serial]
+fn simulation_reports_reached_assert_false() {
+    // Deterministic single-successor walk 0 -> 1 -> 2; the action from x=2 takes
+    // x'=3 and Assert(x' < 3) fails. Random-walk simulation must report it.
+    let module_src = r#"---- MODULE AssertSimInline ----
+EXTENDS Integers, TLC
+VARIABLE x
+Init == x = 0
+Next == /\ x < 3
+        /\ x' = x + 1
+        /\ Assert(x' < 3, "x' reached 3")
+====
+"#;
+    let (model, _dir) = build_model("AssertSimInline", module_src, "INIT Init\nNEXT Next\n");
+    let config = SimulationConfig {
+        depth: 10,
+        num_traces: 5,
+        seed: 1,
+        swarm: false,
+    };
+    let outcome = run_simulation(&model, &config, 1);
+
+    let v = outcome
+        .violations
+        .first()
+        .expect("simulation must report the reached Assert(FALSE)");
+    assert_eq!(v.property_type, PropertyType::Safety, "{}", v.message);
+    assert!(
+        v.message.contains("assertion failed"),
+        "unexpected message: {}",
+        v.message
+    );
+}
+
+#[test]
+#[serial]
+fn swarm_simulation_reports_reached_assert_false() {
+    // Two Next disjuncts so swarm mode engages (`next_states_swarm`). The first
+    // disjunct both advances and asserts (Assert(x' < 3) fails at x=2); the x=3
+    // self-loop keeps it a two-disjunct action. With a fixed seed over many
+    // traces, traces that keep the first disjunct reach x=2 and assert.
+    let module_src = r#"---- MODULE AssertSwarmInline ----
+EXTENDS Integers, TLC
+VARIABLE x
+Init == x = 0
+Next == \/ (x < 3 /\ x' = x + 1 /\ Assert(x' < 3, "x' reached 3"))
+        \/ (x = 3 /\ x' = x)
+====
+"#;
+    let (model, _dir) = build_model("AssertSwarmInline", module_src, "INIT Init\nNEXT Next\n");
+    let config = SimulationConfig {
+        depth: 10,
+        num_traces: 300,
+        seed: 12345,
+        swarm: true,
+    };
+    let outcome = run_simulation(&model, &config, 1);
+
+    assert!(
+        !outcome.violations.is_empty(),
+        "swarm simulation must report the reached Assert(FALSE)"
+    );
+    assert!(
+        outcome.violations[0].message.contains("assertion failed"),
+        "unexpected message: {}",
+        outcome.violations[0].message
     );
 }
