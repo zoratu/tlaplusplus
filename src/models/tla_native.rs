@@ -954,6 +954,11 @@ impl Model for TlaModel {
         enabled_mask: &[usize],
         out: &mut Vec<Self::State>,
     ) {
+        // Committed next-state generation (see next_states): a reached
+        // Assert(FALSE) here is recorded on the reached-assertion side channel so
+        // the caller (e.g. the simulation loop) can report it as a violation.
+        let _committed = crate::model::enter_committed_next_state();
+
         let next_def = self
             .module
             .definitions
@@ -977,6 +982,11 @@ impl Model for TlaModel {
                 out.extend(states);
             }
             Err(err) => {
+                // A reached Assert(FALSE) recorded a pending violation; return
+                // cleanly so the caller can report it (see next_states).
+                if crate::model::has_pending_assertion_violation() {
+                    return;
+                }
                 if self.allow_deadlock {
                     return;
                 }

@@ -236,6 +236,23 @@ where
             }
             total_states += 1;
 
+            // A reached Assert(FALSE) during the next-state generation above is a
+            // safety violation (TLC halts on it). The failing action produced no
+            // successors, so `successors` is empty here; drain the reached-
+            // assertion side channel and record it, exactly as the exhaustive BFS
+            // worker does. See crate::model.
+            if let Some(message) = crate::model::take_pending_assertion_violation() {
+                violations.push(Violation {
+                    message,
+                    state: current.clone(),
+                    property_type: PropertyType::Safety,
+                    trace: trace.clone(),
+                });
+                if violations.len() >= max_violations {
+                    break;
+                }
+            }
+
             if successors.is_empty() {
                 // Deadlocked state - end this trace
                 if step + 1 > max_depth_reached {
