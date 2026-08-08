@@ -196,3 +196,33 @@ Next == \/ (x < 3 /\ x' = x + 1 /\ Assert(x' < 3, "x' reached 3"))
         outcome.violations[0].message
     );
 }
+
+// An Assert(FALSE) inside an INVARIANT is already surfaced via check_invariants
+// (an eval error there is reported as a violation). Lock that in so the item-3
+// side-channel work can't regress it.
+#[test]
+#[serial]
+fn assert_false_in_invariant_is_reported_as_violation() {
+    // Inv = Assert(x < 3): holds for x = 0,1,2; at x = 3 the assertion fails, so
+    // check_invariants errors and the run reports a Safety violation.
+    let module_src = r#"---- MODULE AssertInvInline ----
+EXTENDS Integers, TLC
+VARIABLE x
+Init == x = 0
+Next == x < 5 /\ x' = x + 1
+Inv == Assert(x < 3, "x must stay below 3")
+====
+"#;
+    let cfg_src = "INIT Init\nNEXT Next\nINVARIANT Inv\n";
+    let outcome = run_spec("AssertInvInline", module_src, cfg_src);
+
+    let v = outcome
+        .violation
+        .expect("Assert(FALSE) in an invariant must be reported as a violation");
+    assert_eq!(v.property_type, PropertyType::Safety, "{}", v.message);
+    assert!(
+        v.message.contains("assertion failed"),
+        "unexpected message: {}",
+        v.message
+    );
+}
