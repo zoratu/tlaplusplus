@@ -315,7 +315,21 @@ pub(crate) fn evaluate_assumes(model: &TlaModel) -> anyhow::Result<()> {
     );
 
     for body in &model.module.assumes {
-        match eval_expr(body, &ctx) {
+        // Evaluate each ASSUME in a committed (non-speculative) scope so that a
+        // reached `Assert(FALSE)` inside it is recorded on the reached-assertion
+        // side channel (see crate::model). TLC halts on such an assertion, so we
+        // must surface it as a hard failure — but only the definitive
+        // `Assert(FALSE)` case: a plain evaluation error (an ASSUME shape our
+        // evaluator can't handle yet, e.g. one referencing state) must stay a
+        // warning, per the `Err` arm below.
+        let result = {
+            let _committed = crate::model::enter_committed_next_state();
+            eval_expr(body, &ctx)
+        };
+        if let Some(assert_msg) = crate::model::take_pending_assertion_violation() {
+            return Err(anyhow::anyhow!("ASSUME failed ({assert_msg}): {body}"));
+        }
+        match result {
             Ok(TlaValue::Bool(true)) => {
                 // ASSUME satisfied
             }
@@ -578,4 +592,59 @@ pub(crate) fn dump_state_graph(model: &TlaModel, path: &std::path::Path, format:
         path.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod assume_assert_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn model_with(name: &str, module_src: &str, cfg_src: &str) -> TlaModel {
+        let dir = TempDir::new().expect("tempdir");
+        let m = dir.path().join(format!("{name}.tla"));
+        let c = dir.path().join(format!("{name}.cfg"));
+        fs::write(&m, module_src).expect("write module");
+        fs::write(&c, cfg_src).expect("write cfg");
+        // from_files reads eagerly, so the TempDir may drop after this returns.
+        TlaModel::from_files(&m, Some(&c), None, None).expect("model loads")
+    }
+
+    // A reached Assert(FALSE) inside an ASSUME is a hard failure (TLC halts on
+    // it). Previously evaluate_assumes downgraded every eval error — including a
+    // failed assertion — to a warning, silently continuing.
+    #[test]
+    fn assume_reached_assert_false_is_hard_error() {
+        let module_src = r#"---- MODULE AssumeAssertFalse ----
+EXTENDS Integers, TLC
+VARIABLE x
+ASSUME Assert(1 = 2, "assume must hold")
+Init == x = 0
+Next == x' = x
+====
+"#;
+        let model = model_with("AssumeAssertFalse", module_src, "INIT Init\nNEXT Next\n");
+        let err = evaluate_assumes(&model)
+            .expect_err("a reached Assert(FALSE) in an ASSUME must be a hard error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ASSUME failed") && msg.contains("assertion failed"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    // A satisfied assertion in an ASSUME must NOT fail.
+    #[test]
+    fn assume_assert_true_is_ok() {
+        let module_src = r#"---- MODULE AssumeAssertTrue ----
+EXTENDS Integers, TLC
+VARIABLE x
+ASSUME Assert(1 = 1, "holds")
+Init == x = 0
+Next == x' = x
+====
+"#;
+        let model = model_with("AssumeAssertTrue", module_src, "INIT Init\nNEXT Next\n");
+        evaluate_assumes(&model).expect("a satisfied ASSUME assertion must be Ok");
+    }
 }
