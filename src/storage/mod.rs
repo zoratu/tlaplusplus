@@ -21,6 +21,10 @@ pub mod page_aligned_color_map;
 // Compiled only by cargo verus check --features verus.
 #[cfg(feature = "verus")]
 pub mod verified_fingerprint_shard;
+// T13.4 full lift Phase A.2 — equivalence tests for VerifiedShard vs FingerprintShard.
+// Tests that both implementations produce identical results for the same fingerprint stream.
+#[cfg(test)]
+pub mod verified_fingerprint_shard_equivalence;
 #[cfg_attr(feature = "verus", verifier::external)]
 pub mod page_aligned_fingerprint_store;
 #[cfg_attr(feature = "verus", verifier::external)]

@@ -450,3 +450,83 @@ pub fn verified_shard_rehash_batch(
 }
 
 } // verus!
+
+// Non-verus implementations for regular builds
+// These provide the same API but without Verus annotations
+#[cfg(not(feature = "verus"))]
+impl VerifiedShard {
+    /// Create a new VerifiedShard with the given capacity
+    pub fn new(capacity: usize) -> Self {
+        let actual_cap = capacity.next_power_of_two();
+        let slots: Vec<AtomicU64> = (0..actual_cap).map(|_| AtomicU64::new(0)).collect();
+        VerifiedShard {
+            slots,
+            perms: Tracked(Map::empty()),
+            count: AtomicU64::new(0),
+            capacity: actual_cap,
+            seq: AtomicU64::new(0),
+        }
+    }
+
+    /// Get capacity
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Get count
+    pub fn len(&self) -> u64 {
+        self.count.load(Ordering::Acquire)
+    }
+
+    /// Check if fingerprint exists
+    pub fn contains(&self, fp: u64) -> bool {
+        let fp = if fp == 0 { 1 } else { fp };
+        let idx = (fp as usize) % self.capacity;
+        let mut probes: u64 = 0;
+        while probes < self.capacity as u64 {
+            let idx_wrapped = (idx + (probes as usize)) % self.capacity;
+            let stored = self.slots[idx_wrapped].load(Ordering::Acquire);
+            if stored == fp {
+                return true;
+            }
+            if stored == 0 {
+                break;
+            }
+            probes += 1;
+        }
+        false
+    }
+
+    /// Insert fingerprint, returns true if already present
+    pub fn contains_or_insert(&mut self, fp: u64) -> bool {
+        let fp = if fp == 0 { 1 } else { fp };
+        let idx = (fp as usize) % self.capacity;
+        let mut probes: u64 = 0;
+        while probes < self.capacity as u64 {
+            let idx_wrapped = (idx + (probes as usize)) % self.capacity;
+            let stored = self.slots[idx_wrapped].load(Ordering::Acquire);
+            if stored == fp {
+                return true;
+            }
+            if stored == 0 {
+                match self.slots[idx_wrapped].compare_exchange(0, fp, Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => {
+                        self.count.fetch_add(1, Ordering::AcqRel);
+                        return false;
+                    }
+                    Err(actual) if actual == fp => return true,
+                    Err(_) => {} // Lost race, continue probing
+                }
+            }
+            probes += 1;
+        }
+        false
+    }
+
+    /// Load factor
+    pub fn load_factor(&self) -> f64 {
+        let count = self.len() as f64;
+        let capacity = self.capacity as f64;
+        count / capacity
+    }
+}

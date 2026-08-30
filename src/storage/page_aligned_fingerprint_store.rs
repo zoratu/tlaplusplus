@@ -567,6 +567,13 @@ impl FingerprintShard {
         self.capacity.load(Ordering::Acquire)
     }
 
+    /// Get current capacity (thread-safe, public for testing)
+    #[inline]
+    #[cfg(test)]
+    pub fn capacity(&self) -> usize {
+        self.capacity.load(Ordering::Acquire)
+    }
+
     /// Get current table pointer (thread-safe)
     #[inline]
     fn get_table(&self) -> *mut HashTableEntry {
@@ -1316,9 +1323,21 @@ impl FingerprintShard {
         self.count.load(Ordering::Relaxed)
     }
 
+    /// Get current count of fingerprints (public for testing)
+    #[cfg(test)]
+    pub fn shard_len(&self) -> u64 {
+        self.count.load(Ordering::Relaxed)
+    }
+
     /// Get load factor (0.0 to 1.0)
     fn load_factor(&self) -> f64 {
         self.len() as f64 / self.get_capacity() as f64
+    }
+
+    /// Get load factor (0.0 to 1.0, public for testing)
+    #[cfg(test)]
+    pub fn shard_load_factor(&self) -> f64 {
+        self.shard_len() as f64 / self.capacity() as f64
     }
 
     fn has_file_backed_mapping(&self) -> bool {
@@ -1860,6 +1879,13 @@ impl PageAlignedFingerprintStore {
     /// Get the number of shards
     pub fn shard_count(&self) -> usize {
         self.shards.len()
+    }
+
+    /// Get the total capacity (for testing).
+    /// This is the sum of all shard capacities.
+    #[cfg(test)]
+    pub fn capacity(&self) -> usize {
+        self.shards.iter().map(|s| s.get_capacity()).sum()
     }
 
     /// Advise the kernel that all shard memory is cold and can be paged out
