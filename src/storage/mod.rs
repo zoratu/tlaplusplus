@@ -16,6 +16,11 @@ pub mod hybrid_fingerprint_store;
 pub mod numa;
 #[cfg_attr(feature = "verus", verifier::external)]
 pub mod page_aligned_color_map;
+// T13.4 full lift Phase A.1 — verified parallel shard struct.
+// Contains verus!{} blocks for full method-level annotation.
+// Compiled only by cargo verus check --features verus.
+#[cfg(feature = "verus")]
+pub mod verified_fingerprint_shard;
 #[cfg_attr(feature = "verus", verifier::external)]
 pub mod page_aligned_fingerprint_store;
 #[cfg_attr(feature = "verus", verifier::external)]
