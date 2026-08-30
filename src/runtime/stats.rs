@@ -15,6 +15,10 @@ pub(super) struct AtomicRunStats {
     pub(super) duplicates: AtomicU64,
     pub(super) enqueued: AtomicU64,
     pub(super) checkpoints: AtomicU64,
+    /// Swallowed eval errors during committed next-state generation.
+    /// These are eval errors (1/0, f[k] OOB, etc.) that were treated as
+    /// disabled branches. This is a diagnostic counter, NOT a violation.
+    pub(super) swallowed_eval_errors: AtomicU64,
 }
 
 impl AtomicRunStats {
@@ -26,6 +30,7 @@ impl AtomicRunStats {
         duplicates: u64,
         enqueued: u64,
         checkpoints: u64,
+        swallowed_eval_errors: u64,
     ) -> Self {
         Self {
             states_generated: AtomicU64::new(states_generated),
@@ -34,10 +39,11 @@ impl AtomicRunStats {
             duplicates: AtomicU64::new(duplicates),
             enqueued: AtomicU64::new(enqueued),
             checkpoints: AtomicU64::new(checkpoints),
+            swallowed_eval_errors: AtomicU64::new(swallowed_eval_errors),
         }
     }
 
-    pub(super) fn snapshot(&self) -> (u64, u64, u64, u64, u64, u64) {
+    pub(super) fn snapshot(&self) -> (u64, u64, u64, u64, u64, u64, u64) {
         (
             self.states_generated.load(Ordering::Relaxed),
             self.states_processed.load(Ordering::Relaxed),
@@ -45,6 +51,7 @@ impl AtomicRunStats {
             self.duplicates.load(Ordering::Relaxed),
             self.enqueued.load(Ordering::Relaxed),
             self.checkpoints.load(Ordering::Relaxed),
+            self.swallowed_eval_errors.load(Ordering::Relaxed),
         )
     }
 }
@@ -57,34 +64,36 @@ mod tests {
     #[test]
     fn default_is_all_zeroes() {
         let s = AtomicRunStats::default();
-        assert_eq!(s.snapshot(), (0, 0, 0, 0, 0, 0));
+        assert_eq!(s.snapshot(), (0, 0, 0, 0, 0, 0, 0));
     }
 
     #[test]
-    fn from_checkpoint_preserves_all_six_counters() {
+    fn from_checkpoint_preserves_all_seven_counters() {
         // Distinct values catch field-order swap mutations (e.g. processed
         // and distinct accidentally aliased).
-        let s = AtomicRunStats::from_checkpoint(11, 22, 33, 44, 55, 66);
-        assert_eq!(s.snapshot(), (11, 22, 33, 44, 55, 66));
+        let s = AtomicRunStats::from_checkpoint(11, 22, 33, 44, 55, 66, 77);
+        assert_eq!(s.snapshot(), (11, 22, 33, 44, 55, 66, 77));
     }
 
     #[test]
     fn snapshot_is_field_aligned() {
         // Bump each counter in isolation; snapshot must surface in the
-        // documented (gen, proc, dist, dup, enq, ckpt) order.
+        // documented (gen, proc, dist, dup, enq, ckpt, swallowed) order.
         let s = AtomicRunStats::default();
         s.states_generated.fetch_add(1, Ordering::Relaxed);
-        assert_eq!(s.snapshot(), (1, 0, 0, 0, 0, 0));
+        assert_eq!(s.snapshot(), (1, 0, 0, 0, 0, 0, 0));
         s.states_processed.fetch_add(2, Ordering::Relaxed);
-        assert_eq!(s.snapshot(), (1, 2, 0, 0, 0, 0));
+        assert_eq!(s.snapshot(), (1, 2, 0, 0, 0, 0, 0));
         s.states_distinct.fetch_add(4, Ordering::Relaxed);
-        assert_eq!(s.snapshot(), (1, 2, 4, 0, 0, 0));
+        assert_eq!(s.snapshot(), (1, 2, 4, 0, 0, 0, 0));
         s.duplicates.fetch_add(8, Ordering::Relaxed);
-        assert_eq!(s.snapshot(), (1, 2, 4, 8, 0, 0));
+        assert_eq!(s.snapshot(), (1, 2, 4, 8, 0, 0, 0));
         s.enqueued.fetch_add(16, Ordering::Relaxed);
-        assert_eq!(s.snapshot(), (1, 2, 4, 8, 16, 0));
+        assert_eq!(s.snapshot(), (1, 2, 4, 8, 16, 0, 0));
         s.checkpoints.fetch_add(32, Ordering::Relaxed);
-        assert_eq!(s.snapshot(), (1, 2, 4, 8, 16, 32));
+        assert_eq!(s.snapshot(), (1, 2, 4, 8, 16, 32, 0));
+        s.swallowed_eval_errors.fetch_add(64, Ordering::Relaxed);
+        assert_eq!(s.snapshot(), (1, 2, 4, 8, 16, 32, 64));
     }
 
     #[test]
@@ -107,12 +116,13 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
-        let (gen_count, proc_count, dist, dup, enq, ckpt) = s.snapshot();
+        let (gen_count, proc_count, dist, dup, enq, ckpt, swallowed) = s.snapshot();
         assert_eq!(gen_count, THREADS * PER_THREAD);
         assert_eq!(dup, THREADS * PER_THREAD);
         assert_eq!(proc_count, 0);
         assert_eq!(dist, 0);
         assert_eq!(enq, 0);
         assert_eq!(ckpt, 0);
+        assert_eq!(swallowed, 0);
     }
 }

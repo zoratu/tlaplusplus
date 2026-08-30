@@ -387,7 +387,7 @@ mod tests {
             !final_flag,
             "Drop guard must clear init_producing even on empty Init"
         );
-        let (gen_count, _, dist, dup, enq, _) = stats.snapshot();
+        let (gen_count, _, dist, dup, enq, _, _) = stats.snapshot();
         assert_eq!(gen_count, 0);
         assert_eq!(dist, 0);
         assert_eq!(dup, 0);
@@ -411,7 +411,7 @@ mod tests {
         assert!(!final_flag);
         let distinct_returned = result.expect("producer ok");
         assert_eq!(distinct_returned, 3, "3 unique states");
-        let (gen_count, _, dist, dup, enq, _) = stats.snapshot();
+        let (gen_count, _, dist, dup, enq, _, _) = stats.snapshot();
         assert_eq!(gen_count, 5, "states_generated counts every yielded state");
         assert_eq!(dist, 3, "states_distinct counts only unique");
         assert_eq!(dup, 2, "duplicates counts the two repeats");

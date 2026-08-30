@@ -15,7 +15,7 @@ use crate::tla::{
     evaluate_next_states_per_disjunct, evaluate_next_states_swarm,
     evaluate_next_states_with_instances, insert_compiled_action,
     looks_like_action, normalize_operator_ref_name, parse_tla_config, parse_tla_module_file,
-    split_top_level,
+    split_action_body_disjuncts, split_top_level,
 };
 use anyhow::{Context, Result, anyhow};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -549,14 +549,31 @@ impl Model for TlaModel {
                 if crate::model::has_pending_assertion_violation() {
                     return;
                 }
+
+                // Distinguish between single-branch and multi-disjunct actions:
+                // - Single-branch: errors propagate (TLC halts on the specific error)
+                // - Multi-disjunct: errors in individual disjuncts are swallowed
+                //   (branch is disabled)
+                let is_multi_disjunct =
+                    split_action_body_disjuncts(&next_def.body).len() > 1;
+
                 if self.allow_deadlock {
-                    // Treat evaluation errors as deadlocked states (no successors).
-                    // This handles cases like: guards that fail type evaluation
-                    // (e.g., record access on ModelValue) when all action branches
-                    // are disabled for this state.
-                    return;
+                    // Record the swallowed error for diagnostics.
+                    if crate::model::in_committed_next_state() {
+                        crate::model::record_swallowed_eval_error();
+                    }
+                    if is_multi_disjunct {
+                        // Multi-disjunct: swallow the error (branch would have been disabled)
+                        return;
+                    } else {
+                        // Single-branch: with allow_deadlock, treat as deadlocked state
+                        // (no successors) - the error stops exploration at this state
+                        return;
+                    }
+                } else {
+                    // allow_deadlock is false: panic on errors (TLC halts)
+                    panic!("native next-state evaluation failed: {err}");
                 }
-                panic!("native next-state evaluation failed: {err}");
             }
         }
     }
@@ -987,10 +1004,31 @@ impl Model for TlaModel {
                 if crate::model::has_pending_assertion_violation() {
                     return;
                 }
+
+                // Distinguish between single-branch and multi-disjunct actions:
+                // - Single-branch: errors propagate (TLC halts on the specific error)
+                // - Multi-disjunct: errors in individual disjuncts are swallowed
+                //   (branch is disabled)
+                let is_multi_disjunct =
+                    split_action_body_disjuncts(&next_def.body).len() > 1;
+
                 if self.allow_deadlock {
-                    return;
+                    // Record the swallowed error for diagnostics.
+                    if crate::model::in_committed_next_state() {
+                        crate::model::record_swallowed_eval_error();
+                    }
+                    if is_multi_disjunct {
+                        // Multi-disjunct: swallow the error (branch would have been disabled)
+                        return;
+                    } else {
+                        // Single-branch: with allow_deadlock, treat as deadlocked state
+                        // (no successors) - the error stops exploration at this state
+                        return;
+                    }
+                } else {
+                    // allow_deadlock is false: panic on errors (TLC halts)
+                    panic!("swarm next-state evaluation failed: {err}");
                 }
-                panic!("swarm next-state evaluation failed: {err}");
             }
         }
     }

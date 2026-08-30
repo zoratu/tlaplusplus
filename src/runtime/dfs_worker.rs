@@ -1025,7 +1025,7 @@ mod tests {
         let ctx =
             make_dfs_ctx(Arc::clone(&model), Arc::clone(&stats), stop, vtx, etx, Arc::clone(&verdict_done));
         run_dfs_worker(ctx);
-        let (_g, _p, distinct, _d, _e, _c) = stats.snapshot();
+        let (_g, _p, distinct, _d, _e, _c, _sw) = stats.snapshot();
         assert_eq!(distinct, 5, "expected to visit 5 chain states (v=0..=4)");
         assert!(verdict_done.load(Ordering::Acquire), "verdict-done flag must be set on completion");
     }
@@ -1064,7 +1064,7 @@ mod tests {
         let ctx =
             make_dfs_ctx(Arc::clone(&model), Arc::clone(&stats), stop, vtx, etx, verdict_done);
         run_dfs_worker(ctx);
-        let (_g, _p, distinct, _d, _e, _c) = stats.snapshot();
+        let (_g, _p, distinct, _d, _e, _c, _sw) = stats.snapshot();
         assert_eq!(distinct, 2, "expected exactly 2 distinct states (0, 1)");
     }
 

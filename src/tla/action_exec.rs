@@ -212,6 +212,12 @@ pub fn evaluate_next_states_with_instances(
                 // would have been false). Only fail if ALL branches error out
                 // and none produced successors.
                 last_error = Some(err);
+                // Record errors that occurred during committed mode for diagnostics.
+                // Both single-branch (error propagated) and multi-disjunct (error
+                // swallowed as disabled branch) branches that fail should be counted.
+                if crate::model::in_committed_next_state() {
+                    crate::model::record_swallowed_eval_error();
+                }
             }
         }
     }
@@ -344,6 +350,12 @@ pub fn evaluate_next_states_swarm(
             Ok(successors) => out.extend(successors),
             Err(err) => {
                 last_error = Some(err);
+                // Record errors that were swallowed during committed mode.
+                // For multi-index enabled specs, individual branch errors are swallowed
+                // as "disabled branch" - count them for diagnostics.
+                if crate::model::in_committed_next_state() && enabled_indices.len() > 1 {
+                    crate::model::record_swallowed_eval_error();
+                }
             }
         }
     }
@@ -380,7 +392,17 @@ pub fn evaluate_next_states_per_disjunct(
     for disj in &disjuncts {
         match execute_branch(disj.trim(), &BTreeMap::new(), definitions, instances, state) {
             Ok(successors) => out.push(successors),
-            Err(_) => out.push(Vec::new()),
+            Err(err) => {
+                // Record eval errors that were swallowed during committed
+                // next-state generation. These are errors like 1/0, f[k] OOB,
+                // x.field on non-record, CHOOSE {} etc. that would cause TLC
+                // to halt but are silently treated as disabled branches.
+                // See model.rs record_swallowed_eval_error.
+                if crate::model::in_committed_next_state() {
+                    crate::model::record_swallowed_eval_error();
+                }
+                out.push(Vec::new());
+            }
         }
     }
     out
@@ -411,8 +433,31 @@ pub fn evaluate_next_states_labeled_with_instances(
     let mut out = Vec::new();
 
     for (disjunct_idx, disj) in disjuncts.iter().enumerate() {
-        let successors =
-            execute_branch(disj.trim(), &BTreeMap::new(), definitions, instances, state)?;
+        let successors = match execute_branch(
+            disj.trim(),
+            &BTreeMap::new(),
+            definitions,
+            instances,
+            state,
+        ) {
+            Ok(successors) => successors,
+            Err(err) => {
+                // For multi-disjunct actions, swallow errors in individual disjuncts
+                // (the branch is disabled). For single-branch, propagate the error.
+                // For diagnostics, count errors for both cases (during committed mode)
+                // since both represent branches that didn't produce successors.
+                if crate::model::in_committed_next_state() {
+                    crate::model::record_swallowed_eval_error();
+                }
+                if disjuncts.len() > 1 {
+                    // Multi-disjunct: skip this disabled disjunct
+                    continue;
+                } else {
+                    // Single-branch: propagate the error (TLC halts)
+                    return Err(err);
+                }
+            }
+        };
 
         // Extract action name from disjunct (e.g., "SendMsg(m)" -> "SendMsg")
         let action_name = extract_action_name(disj.trim()).unwrap_or_else(|| next_name.to_string());
@@ -742,7 +787,15 @@ fn execute_branch(
                 let interpreted_ir = compile_action_ir(def);
                 match apply_action_ir_with_context_multi(&interpreted_ir, state, &ctx) {
                     Ok(interp) => Ok(interp),
-                    Err(_) => Ok(successors),
+                    Err(_) => {
+                        // Interpreted fallback also failed. This error is swallowed
+                        // as a disabled branch (the compiled path returned empty
+                        // which is trusted for this shape). Record for diagnostics.
+                        if crate::model::in_committed_next_state() {
+                            crate::model::record_swallowed_eval_error();
+                        }
+                        Ok(successors)
+                    }
                 }
             }
             Ok(successors) => Ok(successors),
@@ -750,8 +803,29 @@ fn execute_branch(
                 let interpreted_ir = compile_action_ir(def);
                 match apply_action_ir_with_context_multi(&interpreted_ir, state, &ctx) {
                     Ok(successors) => Ok(successors),
-                    Err(_) => {
-                        execute_branch(&def.body, &bound_locals, definitions, instances, state)
+                    Err(interp_err) => {
+                        // Interpreted fallback also failed. We need to distinguish:
+                        // 1. Single-branch actions: errors should propagate (TLC halts)
+                        // 2. Multi-disjunct actions: errors are swallowed (branch disabled)
+                        //
+                        // We determine this by checking if the action body is a single
+                        // conjunct (single-branch) or a disjunction of conjuncts.
+                        //
+                        // For diagnostics, we count errors for both cases (during
+                        // committed mode) since both represent branches that didn't
+                        // produce successors.
+                        let is_multi_disjunct = split_action_body_disjuncts(&def.body).len() > 1;
+                        if crate::model::in_committed_next_state() {
+                            crate::model::record_swallowed_eval_error();
+                        }
+
+                        if is_multi_disjunct {
+                            // Multi-disjunct: swallow the error (branch would have been disabled)
+                            Ok(Vec::new())
+                        } else {
+                            // Single-branch: propagate the error (TLC halts)
+                            Err(interp_err)
+                        }
                     }
                 }
             }
@@ -800,11 +874,41 @@ fn execute_branch(
         {
             match apply_action_ir_with_context_multi(&compile_action_ir(&inline_def), state, &ctx) {
                 Ok(interp) => Ok(interp),
-                Err(_) => Ok(empty),
+                Err(_) => {
+                    // Interpreted fallback also failed. Record swallowed error.
+                    if crate::model::in_committed_next_state() {
+                        crate::model::record_swallowed_eval_error();
+                    }
+                    Ok(empty)
+                }
             }
         }
         Ok(empty) => Ok(empty),
-        Err(_) => apply_action_ir_with_context_multi(&compile_action_ir(&inline_def), state, &ctx),
+        Err(_) => {
+            // Compiled failed, try interpreted. If interpreted also fails,
+            // we need to distinguish single-branch vs multi-disjunct:
+            // - Single-branch: propagate error (TLC halts)
+            // - Multi-disjunct: swallow error (branch disabled)
+            //
+            // For diagnostics, we count errors for both cases (during committed
+            // mode) since both represent branches that didn't produce successors.
+            let is_multi_disjunct = split_action_body_disjuncts(trimmed).len() > 1;
+            if crate::model::in_committed_next_state() {
+                crate::model::record_swallowed_eval_error();
+            }
+            match apply_action_ir_with_context_multi(&compile_action_ir(&inline_def), state, &ctx) {
+                Ok(successors) => Ok(successors),
+                Err(interp_err) => {
+                    if is_multi_disjunct {
+                        // Multi-disjunct: swallow the error (branch would have been disabled)
+                        Ok(Vec::new())
+                    } else {
+                        // Single-branch: propagate the error (TLC halts)
+                        Err(interp_err)
+                    }
+                }
+            }
+        }
     }
 }
 

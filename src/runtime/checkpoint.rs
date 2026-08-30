@@ -32,6 +32,8 @@ pub(super) struct CheckpointManifest {
     pub(super) duplicates: u64,
     pub(super) enqueued: u64,
     pub(super) checkpoints: u64,
+    /// Swallowed eval errors during committed next-state generation (diagnostic)
+    pub(super) swallowed_eval_errors: u64,
     pub(super) configured_workers: usize,
     pub(super) actual_workers: usize,
     pub(super) allowed_cpu_count: usize,
@@ -266,7 +268,7 @@ where
         fail_point!("checkpoint_fp_flush_fail");
         let _ = ctx.fp_store.flush()?;
 
-        let (states_generated, states_processed, states_distinct, duplicates, enqueued, _) =
+        let (states_generated, states_processed, states_distinct, duplicates, enqueued, _, swallowed) =
             ctx.run_stats.snapshot();
         let checkpoints = ctx.run_stats.checkpoints.load(Ordering::Relaxed);
         let now = SystemTime::now()
@@ -284,6 +286,7 @@ where
             duplicates,
             enqueued,
             checkpoints,
+            swallowed_eval_errors: swallowed,
             configured_workers: ctx.config.workers,
             actual_workers: ctx.worker_plan.worker_count,
             allowed_cpu_count: ctx.worker_plan.allowed_cpus.len(),
@@ -332,6 +335,7 @@ mod tests {
             duplicates: 5,
             enqueued: 10,
             checkpoints: 1,
+            swallowed_eval_errors: 0,
             configured_workers: 8,
             actual_workers: 8,
             allowed_cpu_count: 16,

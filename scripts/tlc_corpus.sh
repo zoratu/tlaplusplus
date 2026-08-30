@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -uo pipefail
 
 # Run TLC on all corpus specs (auto-discovered from directory structure)
 
@@ -11,9 +11,6 @@ SUMMARY_PATH="${OUT_ROOT}/summary.tsv"
 mkdir -p "${OUT_ROOT}"
 
 printf "id\tstatus\texit_code\tduration_sec\tstates_generated\tstates_distinct\tdepth\tmodule\tcfg\tlog\n" > "${SUMMARY_PATH}"
-
-total=0
-failures=0
 
 # Find all .cfg files and run the corresponding .tla
 find "${CORPUS_DIR}" -name "*.cfg" -type f | sort | while read -r cfg_path; do
@@ -65,7 +62,8 @@ find "${CORPUS_DIR}" -name "*.cfg" -type f | sort | while read -r cfg_path; do
 
   start_epoch="$(date +%s)"
   set +e
-  "${ROOT_DIR}/scripts/tlc_check.sh" "${module_path}" "${cfg_path}" "${run_dir}" >"${log_path}" 2>&1
+  # Run TLC with a 180-second timeout for large specs
+  timeout 180 "${ROOT_DIR}/scripts/tlc_check.sh" "${module_path}" "${cfg_path}" "${run_dir}" >"${log_path}" 2>&1
   exit_code=$?
   set -e
   end_epoch="$(date +%s)"
@@ -78,6 +76,7 @@ find "${CORPUS_DIR}" -name "*.cfg" -type f | sort | while read -r cfg_path; do
   else
     echo "  OK (${duration_sec}s)"
   fi
+  true
 
   states_generated="$(sed -n 's/^\([0-9][0-9]*\) states generated, .*$/\1/p' "${log_path}" | tail -n 1)"
   states_distinct="$(sed -n 's/^[0-9][0-9]* states generated, \([0-9][0-9]*\) distinct states found, .*$/\1/p' "${log_path}" | tail -n 1)"

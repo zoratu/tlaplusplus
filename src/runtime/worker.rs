@@ -189,6 +189,8 @@ pub(super) fn run_worker<M: Model>(
     let mut local_duplicates = 0u64;
     let mut local_states_distinct = 0u64;
     let mut local_enqueued = 0u64;
+    // Swallowed eval errors during committed next-state generation
+    let mut local_swallowed_eval_errors = 0u64;
     // Adaptive flush: every 512 states OR every ~1 second (whichever comes first)
     // This balances atomic contention reduction vs stats freshness
     const STATS_FLUSH_INTERVAL: u64 = 512;
@@ -199,6 +201,7 @@ pub(super) fn run_worker<M: Model>(
                              duplicates: &mut u64,
                              distinct: &mut u64,
                              enqueued: &mut u64,
+                             swallowed_errors: &mut u64,
                              stats: &AtomicRunStats| {
         if *processed > 0 {
             stats
@@ -225,6 +228,12 @@ pub(super) fn run_worker<M: Model>(
         if *enqueued > 0 {
             stats.enqueued.fetch_add(*enqueued, Ordering::Relaxed);
             *enqueued = 0;
+        }
+        if *swallowed_errors > 0 {
+            stats
+                .swallowed_eval_errors
+                .fetch_add(*swallowed_errors, Ordering::Relaxed);
+            *swallowed_errors = 0;
         }
     };
 
@@ -374,6 +383,10 @@ pub(super) fn run_worker<M: Model>(
             stealer.set_locally_idle(false);
         }
 
+        // Check for swallowed eval errors (from committed next-state generation)
+        // and add to local counter for aggregation.
+        local_swallowed_eval_errors += crate::model::take_swallowed_eval_errors();
+
         // Periodically flush local stats to reduce atomic contention
         // Flush either by count OR by time (every ~1 second) for accurate reporting
         let should_flush = local_states_processed % STATS_FLUSH_INTERVAL == 0
@@ -385,6 +398,7 @@ pub(super) fn run_worker<M: Model>(
                 &mut local_duplicates,
                 &mut local_states_distinct,
                 &mut local_enqueued,
+                &mut local_swallowed_eval_errors,
                 &worker_stats,
             );
             last_stats_flush = Instant::now();
@@ -517,6 +531,13 @@ pub(super) fn run_worker<M: Model>(
             // No fairness constraints - use regular next_states
             worker_model.next_states(&state, &mut successors);
         }
+
+        // Read any swallowed eval errors (from committed next-state generation).
+        // We need to read AFTER next_states because errors are recorded inside it.
+        // The earlier read at the top of the loop handles multi-state models;
+        // this handles single-state models where the error occurs and there's
+        // no next iteration to read it.
+        local_swallowed_eval_errors += crate::model::take_swallowed_eval_errors();
 
         // A reached Assert(FALSE) during the next-state evaluation above is a
         // safety violation (TLC halts on it). `next_states` returns `()` and
@@ -769,6 +790,7 @@ pub(super) fn run_worker<M: Model>(
         &mut local_duplicates,
         &mut local_states_distinct,
         &mut local_enqueued,
+        &mut local_swallowed_eval_errors,
         &worker_stats,
     );
 

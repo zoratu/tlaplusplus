@@ -1458,7 +1458,7 @@ mod tests {
             cluster: None,
         };
         run_dfs_pool(ctx);
-        let (_g, _p, distinct, _d, _e, _c) = stats.snapshot();
+        let (_g, _p, distinct, _d, _e, _c, _sw) = stats.snapshot();
         distinct
     }
 

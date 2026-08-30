@@ -319,6 +319,8 @@ pub struct RunStats {
     pub resumed_from_checkpoint: bool,
     pub queue: QueueStats,
     pub fingerprints: FingerprintStats,
+    /// Swallowed eval errors during committed next-state generation (diagnostic)
+    pub swallowed_eval_errors: u64,
 }
 
 mod dfs_cluster_bridge;
@@ -420,7 +422,7 @@ pub mod dfs_cluster_test_api {
 
         run_dfs_pool(ctx);
 
-        let (_g, _p, distinct, _d, _e, _c) = stats.snapshot();
+        let (_g, _p, distinct, _d, _e, _c, _sw) = stats.snapshot();
         let mut violations: Vec<Violation<M::State>> = Vec::new();
         while let Ok(v) = vrx.try_recv() {
             violations.push(v);
@@ -970,6 +972,7 @@ where
                     manifest.duplicates,
                     manifest.enqueued,
                     manifest.checkpoints,
+                    manifest.swallowed_eval_errors,
                 ))
             }
             Ok(None) => {
@@ -1218,6 +1221,7 @@ where
                     duplicates,
                     enqueued,
                     checkpoints,
+                    swallowed_eval_errors,
                 ) = ckpt_run_stats.snapshot();
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -1234,6 +1238,7 @@ where
                     duplicates,
                     enqueued,
                     checkpoints,
+                    swallowed_eval_errors,
                     configured_workers: ckpt_configured_workers,
                     actual_workers: ckpt_worker_count,
                     allowed_cpu_count: ckpt_allowed_cpus,

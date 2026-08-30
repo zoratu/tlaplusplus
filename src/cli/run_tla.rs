@@ -491,6 +491,16 @@ pub(crate) fn handle(
         queue_pending
     );
 
+    // T204.2: report swallowed eval errors from committed next-state generation.
+    // These are eval errors that would have caused TLC to halt but were treated
+    // as disabled branches (multi-disjunct action pattern).
+    if outcome.stats.swallowed_eval_errors > 0 {
+        println!(
+            "swallowed eval errors: {}",
+            format_with_commas(outcome.stats.swallowed_eval_errors)
+        );
+    }
+
     let duration_secs = outcome.stats.duration.as_secs();
     let duration_str = if duration_secs < 60 {
         format!("{:02}s", duration_secs)

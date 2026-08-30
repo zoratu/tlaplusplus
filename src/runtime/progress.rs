@@ -271,7 +271,7 @@ where
                     } else {
                         eprintln!("Emergency checkpoint: fingerprint store flushed successfully");
                     }
-                    let (generated, _, distinct, _, _, _) = progress_run_stats.snapshot();
+                    let (generated, _, distinct, _, _, _, _) = progress_run_stats.snapshot();
                     eprintln!(
                         "Emergency checkpoint: {} states generated, {} distinct at time of failure",
                         generated, distinct
@@ -284,7 +284,7 @@ where
                 break;
             }
 
-            let (states_generated, _states_processed, states_distinct, _, _, _) =
+            let (states_generated, _states_processed, states_distinct, _, _, _, _) =
                 progress_run_stats.snapshot();
             // Use total_pending_count to include spilled items on disk
             let queue_pending = progress_queue.total_pending_count();

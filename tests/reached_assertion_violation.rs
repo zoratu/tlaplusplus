@@ -226,3 +226,180 @@ Inv == Assert(x < 3, "x must stay below 3")
         v.message
     );
 }
+
+// Test that for multi-disjunct Next, errors in individual disjuncts are
+// swallowed as "disabled branch" (not propagated as violations).
+// This is correct behavior because each disjunct is evaluated independently.
+#[test]
+#[serial]
+fn swallowed_eval_errors_are_counted() {
+    // Next has two disjuncts: one that produces x=1, and one that has 1/0.
+    // For multi-disjunct specs, errors in individual disjuncts are swallowed
+    // as "disabled branch" and the diagnostic counter records it.
+    let module_src = r#"---- MODULE SwallowedErrorInline ----
+EXTENDS Integers
+VARIABLE x
+Init == x = 0
+Next == \/ /\ x = 0
+            /\ x' = 1
+        \/ /\ x = 0
+            /\ x' = 1 / 0
+====
+"#;
+    let cfg_src = "INIT Init\nNEXT Next\n";
+    let outcome = run_spec("SwallowedErrorInline", module_src, cfg_src);
+
+    // The run should complete without a violation (not a safety violation)
+    // because the 1/0 branch is one of multiple disjuncts, so the error
+    // is swallowed as "disabled branch".
+    assert!(
+        outcome.violation.is_none(),
+        "swallowed eval errors in multi-disjunct Next must not cause violations, got: {:?}",
+        outcome.violation
+    );
+
+    // The diagnostic counter should have recorded the swallowed error.
+    assert!(
+        outcome.stats.swallowed_eval_errors >= 1,
+        "expected at least 1 swallowed eval error, got {}",
+        outcome.stats.swallowed_eval_errors
+    );
+
+    // The state count should be 2 (init x=0, and one transition to x=1).
+    // The 1/0 branch produces no successors (error swallowed).
+    assert_eq!(
+        outcome.stats.states_distinct, 2,
+        "expected 2 distinct states (x=0 and x=1), got {}",
+        outcome.stats.states_distinct
+    );
+}
+
+// Test that for single-branch Next, eval errors are propagated (TLC halts).
+#[test]
+#[serial]
+fn single_branch_eval_error_is_propagated() {
+    // Single-branch Next with 1/0 should result in the error being propagated.
+    // TLC halts on eval errors in Next; we should match this behavior.
+    // The error is NOT a violation (no Assert), but it stops exploration.
+    let module_src = r#"---- MODULE SingleBranchDivByZero ----
+EXTENDS Integers
+VARIABLE x
+Init == x = 0
+Next == /\ x = 0
+        /\ x' = 1 / 0
+====
+"#;
+    let cfg_src = "INIT Init\nNEXT Next\n";
+    let outcome = run_spec("SingleBranchDivByZero", module_src, cfg_src);
+
+    // For single-branch Next, the div by zero error should propagate.
+    // The run should complete (no panic) with the error counted as a swallowed
+    // eval error (for diagnostic purposes), even though we don't expect a
+    // violation (no Assert(FALSE)). The error stops exploration at this state.
+    assert!(
+        outcome.violation.is_none(),
+        "single-branch eval errors should not cause violations (no Assert), got: {:?}",
+        outcome.violation
+    );
+    // The error should be counted as swallowed for diagnostics
+    assert!(
+        outcome.stats.swallowed_eval_errors >= 1,
+        "expected at least 1 swallowed eval error, got {}",
+        outcome.stats.swallowed_eval_errors
+    );
+}
+
+// Test that for multi-disjunct Next, eval errors in individual disjuncts are swallowed.
+#[test]
+#[serial]
+fn multi_disjunct_div_by_zero_is_swallowed() {
+    // Multi-disjunct Next where one disjunct has 1/0.
+    // The error should be swallowed (not propagated as a violation).
+    let module_src = r#"---- MODULE MultiDisjDivByZero ----
+EXTENDS Integers
+VARIABLE x
+Init == x = 0
+Next == \/ /\ x = 0
+            /\ x' = 1
+        \/ /\ x = 0
+            /\ x' = 1 / 0
+        \/ /\ x = 0
+            /\ x' = 2
+====
+"#;
+    let cfg_src = "INIT Init\nNEXT Next\n";
+    let outcome = run_spec("MultiDisjDivByZero", module_src, cfg_src);
+
+    // The run should complete without a violation
+    assert!(
+        outcome.violation.is_none(),
+        "multi-disjunct eval errors should not cause violations, got: {:?}",
+        outcome.violation
+    );
+
+    // The error should be counted as swallowed
+    assert!(
+        outcome.stats.swallowed_eval_errors >= 1,
+        "expected at least 1 swallowed eval error, got {}",
+        outcome.stats.swallowed_eval_errors
+    );
+
+    // States: x=0 (init), x=1, x=2 (the 1/0 branch produces no successors)
+    assert_eq!(
+        outcome.stats.states_distinct, 3,
+        "expected 3 distinct states (x=0, x=1, x=2), got {}",
+        outcome.stats.states_distinct
+    );
+}
+
+// Test array index out of bounds (OOB) is handled correctly
+#[test]
+#[serial]
+fn array_index_oob_is_swallowed_in_multi_disjunct() {
+    // Test that f[k] OOB errors are handled correctly in multi-disjunct Next
+    let module_src = r#"---- MODULE ArrayIndexOOB ----
+EXTENDS Integers
+VARIABLE f
+Init == f = [i \in 1..3 |-> i * 10]  \* f = [1 -> 10, 2 -> 20, 3 -> 30]
+Next == \/ /\ f[1] > 5
+            /\ f' = [f EXCEPT ![1] = 100]
+        \/ /\ f[5] > 5  \* OOB - f only has keys 1,2,3
+            /\ f' = [f EXCEPT ![1] = 200]
+====
+"#;
+    let cfg_src = "INIT Init\nNEXT Next\n";
+    let outcome = run_spec("ArrayIndexOOB", module_src, cfg_src);
+
+    // The run should complete without a violation
+    assert!(
+        outcome.violation.is_none(),
+        "array index OOB errors should not cause violations, got: {:?}",
+        outcome.violation
+    );
+}
+
+// Test record access on non-record is handled correctly
+#[test]
+#[serial]
+fn record_access_non_record_is_swallowed_in_multi_disjunct() {
+    // Test that x.field on non-record errors are handled correctly
+    let module_src = r#"---- MODULE RecordAccessNonRecord ----
+EXTENDS Integers
+VARIABLE x
+Init == x = 5  \* x is an Int, not a record
+Next == \/ /\ x > 0
+            /\ x' = x + 1
+        \/ /\ x.ghost > 0  \* accessing .ghost on Int - should error
+            /\ x' = x + 2
+====
+"#;
+    let cfg_src = "INIT Init\nNEXT Next\n";
+    let outcome = run_spec("RecordAccessNonRecord", module_src, cfg_src);
+
+    // The run should complete without a violation
+    assert!(
+        outcome.violation.is_none(),
+        "record access on non-record errors should not cause violations, got: {:?}",
+        outcome.violation
+    );
+}

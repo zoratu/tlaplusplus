@@ -220,6 +220,7 @@ impl<'a, M: Model> ShutdownContext<'a, M> {
                 duplicates,
                 enqueued,
                 checkpoints,
+                swallowed_eval_errors,
             ) = self.run_stats.snapshot();
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -236,6 +237,7 @@ impl<'a, M: Model> ShutdownContext<'a, M> {
                 duplicates,
                 enqueued,
                 checkpoints,
+                swallowed_eval_errors,
                 configured_workers: self.config.workers,
                 actual_workers: self.worker_plan.worker_count,
                 allowed_cpu_count: self.worker_plan.allowed_cpus.len(),
@@ -351,6 +353,7 @@ impl<'a, M: Model> ShutdownContext<'a, M> {
             duplicates,
             enqueued,
             checkpoints,
+            swallowed_eval_errors,
         ) = self.run_stats.snapshot();
 
         Ok(RunOutcome {
@@ -370,6 +373,7 @@ impl<'a, M: Model> ShutdownContext<'a, M> {
                 numa_nodes_used: self.worker_plan.numa_nodes_used,
                 effective_memory_max_bytes: self.effective_memory_max,
                 resumed_from_checkpoint: self.resumed_from_checkpoint,
+                swallowed_eval_errors,
                 queue: {
                     let ws_stats = self.queue.stats();
                     QueueStats {

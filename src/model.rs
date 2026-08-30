@@ -56,6 +56,11 @@ use std::cell::{Cell, RefCell};
 thread_local! {
     static COMMITTED_NEXT_STATE_DEPTH: Cell<u32> = const { Cell::new(0) };
     static PENDING_ASSERTION_VIOLATION: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// Counter for eval errors that were swallowed during committed next-state
+    /// generation. These are errors like 1/0, f[k] OOB, x.field on non-record,
+    /// CHOOSE {} etc. that would cause TLC to halt but are silently treated as
+    /// disabled branches by us. This is default-off diagnostic (not a violation).
+    static SWALLOWED_EVAL_ERRORS: Cell<u64> = const { Cell::new(0) };
 }
 
 /// RAII marker: while alive, evaluation is part of committed next-state
@@ -105,6 +110,25 @@ pub fn take_pending_assertion_violation() -> Option<String> {
 /// reached `Assert(FALSE)` produced the eval error, so the worker can report it.
 pub fn has_pending_assertion_violation() -> bool {
     PENDING_ASSERTION_VIOLATION.with(|slot| slot.borrow().is_some())
+}
+
+/// Increment the swallowed eval errors counter during committed next-state
+/// generation. This is a diagnostic counter, NOT a violation.
+/// Errors during committed mode are typically from branches that are
+/// legitimately disabled (eval error on a sub-expr TLC would short-circuit),
+/// so we just count them for diagnostic purposes.
+pub fn record_swallowed_eval_error() {
+    SWALLOWED_EVAL_ERRORS.with(|counter| counter.set(counter.get() + 1));
+}
+
+/// Take (and clear) the swallowed eval errors count for this thread.
+/// Used by the runtime to report diagnostic stats at the end of a run.
+pub fn take_swallowed_eval_errors() -> u64 {
+    SWALLOWED_EVAL_ERRORS.with(|counter| {
+        let val = counter.get();
+        counter.set(0);
+        val
+    })
 }
 
 /// Action label for tracking which actions are taken in transitions
