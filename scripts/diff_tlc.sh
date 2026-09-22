@@ -175,10 +175,13 @@ parse_tlaplusplus_output() {
   if grep -qE "^violation=true" "${file}"; then
     violation="yes"
   fi
-  # tlaplusplus reports deadlock as a violation when --allow-deadlock is not set;
-  # we pass --allow-deadlock so deadlock-only stops shouldn't be reported.
-  # We still scan for the literal "deadlock" mention as a defense.
-  if grep -qiE "deadlock detected|deadlocked" "${file}"; then
+  # tlaplusplus reports a deadlock (a reachable state with no successors) as a
+  # violation when --allow-deadlock is not set, matching TLC's default check
+  # (see runtime worker's terminal-deadlock detection). This harness passes
+  # --allow-deadlock (and TLC's -deadlock), so both sides suppress the check and
+  # deadlock stays "no"; we still scan for the literal report as a defense so a
+  # regression that flips the flag handling is caught here.
+  if grep -qiE "Deadlock reached|deadlock detected|deadlocked" "${file}"; then
     deadlock="yes"
   fi
   printf -v "${out_var_states}" '%s' "${states}"

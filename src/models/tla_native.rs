@@ -676,6 +676,15 @@ impl Model for TlaModel {
         Ok(())
     }
 
+    /// TLA+ models report deadlock (a reachable state with no enabled action)
+    /// unless the user disabled the check. `allow_deadlock` is set from the
+    /// `--allow-deadlock` CLI flag and from `CHECK_DEADLOCK FALSE` in the cfg
+    /// (see `TlaModel::from_module_and_config` and `cli::run_tla`), matching
+    /// TLC's `-deadlock`.
+    fn deadlock_check_enabled(&self) -> bool {
+        !self.allow_deadlock
+    }
+
     fn canonicalize(&self, state: Self::State) -> Self::State {
         if let Some(ref symmetry) = self.symmetry {
             canonicalize_tla_state(&state, symmetry)
