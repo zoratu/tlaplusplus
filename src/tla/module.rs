@@ -647,10 +647,22 @@ fn load_module_instances(module: &mut TlaModule, base_path: &Path) -> Result<()>
         } else {
             let module_dir = base_path.parent().unwrap_or_else(|| Path::new("."));
             let instance_path = module_dir.join(format!("{}.tla", instance.module_name));
+            // An unnamed `INSTANCE M` flattens M's operators directly into this
+            // module's namespace. If M cannot be resolved we skip the merge, so
+            // every operator M would have re-exported (including any it itself
+            // re-exports transitively from a further unnamed instance) is now
+            // absent — which surfaces downstream as a confusing "unknown
+            // operator" at action-compile / eval time rather than here. Name
+            // that consequence so the failure is self-diagnosing.
             eprintln!(
-                "Warning: Unnamed instance module '{}' not found at {}",
+                "Warning: unnamed instance module '{}' not found at {} — its \
+                 re-exported operators will be UNRESOLVED and any spec using \
+                 them will later fail with an 'unknown operator' error. Check \
+                 the module name spelling/case and that '{}.tla' is on the \
+                 module search path.",
                 instance.module_name,
-                instance_path.display()
+                instance_path.display(),
+                instance.module_name,
             );
         }
     }
@@ -3485,6 +3497,139 @@ Next == x' = BaseHelper(x)
         );
 
         // Clean up
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // Regression: a base operator re-exported through a CHAIN of unnamed
+    // instances must be present in the top module's flat `definitions` map.
+    //
+    //   Rest    : defines InitRest
+    //   Shared  : `INSTANCE Rest`,   InitShared == InitRest   (re-export lvl 1)
+    //   TopChain: `INSTANCE Shared`, uses InitShared          (re-export lvl 2)
+    //
+    // The previously-untested gap: `merge_instance_definitions` copies
+    // `source.definitions` but not `source.unnamed_instances`. That is only
+    // sound because the source module is fully parsed (its own unnamed
+    // instances already flattened into `source.definitions`) before the merge.
+    // This test pins that invariant so a future refactor of the parse/merge
+    // order cannot silently drop transitively re-exported operators — the
+    // failure class behind the reported "unnamed-INSTANCE operator re-export
+    // (InitRest inside InitShared) unresolved" build error.
+    #[test]
+    fn unnamed_instance_transitive_reexport_is_merged() {
+        use std::fs;
+
+        let tmp = std::env::temp_dir().join("tlapp-unnamed-transitive-reexport-test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should be created");
+
+        fs::write(
+            tmp.join("Rest.tla"),
+            r#"
+---- MODULE Rest ----
+EXTENDS Naturals
+VARIABLES x
+InitRest == x = 0
+====
+"#,
+        )
+        .expect("Rest should be written");
+
+        fs::write(
+            tmp.join("Shared.tla"),
+            r#"
+---- MODULE Shared ----
+EXTENDS Naturals
+VARIABLES x
+INSTANCE Rest
+InitShared == InitRest
+NextShared == x < 2 /\ x' = x + 1
+====
+"#,
+        )
+        .expect("Shared should be written");
+
+        let top = tmp.join("TopChain.tla");
+        fs::write(
+            &top,
+            r#"
+---- MODULE TopChain ----
+EXTENDS Naturals
+VARIABLES x
+INSTANCE Shared
+Init == InitShared
+Next == NextShared
+====
+"#,
+        )
+        .expect("TopChain should be written");
+
+        let module = parse_tla_module_file(&top).expect("TopChain should parse");
+
+        // Level-1 re-export: the intermediate's operator.
+        assert!(
+            module.definitions.contains_key("InitShared"),
+            "InitShared (re-exported by Shared) must be in TopChain's definitions"
+        );
+        // Level-2 (transitive) re-export: the base operator that InitShared
+        // depends on. This is the exact operator whose absence produced the
+        // reported build failure.
+        assert!(
+            module.definitions.contains_key("InitRest"),
+            "InitRest (re-exported transitively from Rest via Shared) must be in \
+             TopChain's definitions"
+        );
+        assert!(
+            module.definitions.contains_key("NextShared"),
+            "NextShared (re-exported by Shared) must be in TopChain's definitions"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // Regression: three levels of unnamed nesting (Rest <- Mid <- Shared <- Top).
+    // Confirms the flatten-before-merge invariant holds at arbitrary depth.
+    #[test]
+    fn unnamed_instance_three_level_nesting_is_merged() {
+        use std::fs;
+
+        let tmp = std::env::temp_dir().join("tlapp-unnamed-three-level-test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir should be created");
+
+        fs::write(
+            tmp.join("Rest.tla"),
+            "---- MODULE Rest ----\nVARIABLES x\nInitRest == x = 0\n====\n",
+        )
+        .expect("Rest should be written");
+        fs::write(
+            tmp.join("Mid.tla"),
+            "---- MODULE Mid ----\nVARIABLES x\nINSTANCE Rest\nInitMid == InitRest\n====\n",
+        )
+        .expect("Mid should be written");
+        fs::write(
+            tmp.join("Shared.tla"),
+            "---- MODULE Shared ----\nVARIABLES x\nINSTANCE Mid\nInitShared == InitMid\n====\n",
+        )
+        .expect("Shared should be written");
+
+        let top = tmp.join("TopDeep.tla");
+        fs::write(
+            &top,
+            "---- MODULE TopDeep ----\nVARIABLES x\nINSTANCE Shared\nInit == InitShared\nNext == x' = x\n====\n",
+        )
+        .expect("TopDeep should be written");
+
+        let module = parse_tla_module_file(&top).expect("TopDeep should parse");
+
+        for op in ["InitShared", "InitMid", "InitRest"] {
+            assert!(
+                module.definitions.contains_key(op),
+                "{op} must be flattened into TopDeep's definitions through the \
+                 Rest <- Mid <- Shared <- TopDeep chain"
+            );
+        }
+
         let _ = fs::remove_dir_all(&tmp);
     }
 
