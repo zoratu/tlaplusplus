@@ -339,3 +339,214 @@ Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Bare top-level `<>[]P` (EventuallyAlways) graph-liveness detection.
+//
+// Regression guard for a false-NEGATIVE soundness bug: a `PROPERTY` of the
+// bare shape `<>[]P` (eventually-always) was left ENTIRELY unchecked, because
+// `graph_liveness_shape` matched only `[](P => <>[]Q)`. tlaplusplus explored
+// the full state space and reported `violation=false` on specs where TLC finds
+// a genuine `<>[]P` violation (a fair recurrent cycle, or a quiescent terminal
+// state, where P is infinitely-often false). Fix: desugar `<>[]Q` to
+// `[](TRUE => <>[]Q)` and route it through `graph_liveness_violation`, plus
+// treat quiescent terminal states as fair stutter cycles.
+//
+// Each test declares `WF_vars(Next)` so the wrapper-Next path deems any in-SCC
+// edge fair — this isolates the graph-liveness detection from action-label
+// routing.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn eventually_always_fair_cycle_violates() {
+    // x toggles 0<->1 forever. `<>[](x = 1)` is VIOLATED: x = 0 recurs
+    // infinitely, so `x = 1` can never become always-true. TLC reports this;
+    // before the fix we returned violation=false.
+    let module_src = r#"---- MODULE EAFairCycle ----
+EXTENDS Naturals
+
+VARIABLES x
+
+vars == <<x>>
+
+Init == x = 0
+
+Next == \/ (x = 0 /\ x' = 1)
+        \/ (x = 1 /\ x' = 0)
+
+Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
+
+P == x = 1
+Progress == <>[]P
+====
+"#;
+    let cfg_src = "SPECIFICATION Spec\nPROPERTY Progress\n";
+    let outcome = run_spec("EAFairCycle", module_src, cfg_src);
+
+    assert_eq!(outcome.stats.states_distinct, 2, "x toggles in {{0, 1}}");
+    let v = outcome
+        .violation
+        .as_ref()
+        .expect("expected a liveness violation: <>[](x = 1) fails on the 0<->1 cycle");
+    assert_eq!(v.property_type, PropertyType::Liveness);
+}
+
+#[test]
+#[serial]
+fn eventually_always_absorbing_cycle_violates() {
+    // 0 -> 1 -> 2 <-> 3: the behaviour enters an absorbing NON-terminal
+    // 2-cycle {2, 3} where `x <= 1` is always false. `<>[](x <= 1)` is
+    // VIOLATED. Distinguishes an SCC/cycle-search gap from a terminal-stutter
+    // gap.
+    let module_src = r#"---- MODULE EAAbsorbCycle ----
+EXTENDS Naturals
+
+VARIABLES x
+
+vars == <<x>>
+
+Init == x = 0
+
+Next == \/ (x = 0 /\ x' = 1)
+        \/ (x = 1 /\ x' = 2)
+        \/ (x = 2 /\ x' = 3)
+        \/ (x = 3 /\ x' = 2)
+
+Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
+
+P == x <= 1
+Progress == <>[]P
+====
+"#;
+    let cfg_src = "SPECIFICATION Spec\nPROPERTY Progress\n";
+    let outcome = run_spec("EAAbsorbCycle", module_src, cfg_src);
+
+    assert_eq!(outcome.stats.states_distinct, 4, "x ranges over {{0,1,2,3}}");
+    let v = outcome
+        .violation
+        .as_ref()
+        .expect("expected a liveness violation: <>[](x <= 1) fails in the {2,3} cycle");
+    assert_eq!(v.property_type, PropertyType::Liveness);
+}
+
+#[test]
+#[serial]
+fn eventually_always_self_loop_quiescent_violates() {
+    // A quiescent cell modelled with an explicit stutter action (the common
+    // way to represent a stable/"Fix" state without a deadlock): x climbs to 2
+    // then self-loops via `Stay`. `<>[](x = 1)` is VIOLATED — the behaviour is
+    // eventually-always x = 2, never eventually-always x = 1. The {2} self-loop
+    // is a fair non-trivial SCC with ¬P, so the SCC scan catches it.
+    let module_src = r#"---- MODULE EASelfLoopQuiescent ----
+EXTENDS Naturals
+
+VARIABLES x
+
+vars == <<x>>
+
+Init == x = 0
+
+Step == /\ x < 2 /\ x' = x + 1
+Stay == /\ x = 2 /\ UNCHANGED vars
+
+Next == Step \/ Stay
+
+Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
+
+P == x = 1
+Progress == <>[]P
+====
+"#;
+    let cfg_src = "SPECIFICATION Spec\nPROPERTY Progress\n";
+    let outcome = run_spec("EASelfLoopQuiescent", module_src, cfg_src);
+
+    assert_eq!(outcome.stats.states_distinct, 3, "x ranges over {{0,1,2}}");
+    let v = outcome
+        .violation
+        .as_ref()
+        .expect("expected a liveness violation: <>[](x = 1) fails at the x = 2 self-loop");
+    assert_eq!(v.property_type, PropertyType::Liveness);
+}
+
+#[test]
+#[serial]
+fn eventually_always_quiescent_terminal_violates() {
+    // A genuine quiescent TERMINAL state (no successor) with deadlock-checking
+    // OFF (`run_spec` sets `allow_deadlock = true`). x climbs 0 -> 1 -> 2 and
+    // x = 2 has no enabled action. Under `[][Next]_vars` the behaviour stutters
+    // forever at x = 2; since Next is disabled there, `WF_vars(Next)` is
+    // vacuously satisfied, so the stutter-suffix is FAIR. `<>[](x = 1)` is
+    // therefore VIOLATED. This exercises the terminal-stutter branch of the
+    // fix (the non-trivial-SCC scan never sees a terminal state).
+    let module_src = r#"---- MODULE EAQuiescentTerminal ----
+EXTENDS Naturals
+
+VARIABLES x
+
+vars == <<x>>
+
+Init == x = 0
+
+Step == /\ x < 2 /\ x' = x + 1
+
+Next == Step
+
+Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
+
+P == x = 1
+Progress == <>[]P
+====
+"#;
+    let cfg_src = "SPECIFICATION Spec\nPROPERTY Progress\n";
+    let outcome = run_spec("EAQuiescentTerminal", module_src, cfg_src);
+
+    assert_eq!(outcome.stats.states_distinct, 3, "x ranges over {{0,1,2}}");
+    let v = outcome
+        .violation
+        .as_ref()
+        .expect("expected a liveness violation: <>[](x = 1) fails at the quiescent x = 2 terminal");
+    assert_eq!(v.property_type, PropertyType::Liveness);
+}
+
+#[test]
+#[serial]
+fn eventually_always_control_holds_no_false_violation() {
+    // CONTROL: the SAME quiescent-terminal shape, but `<>[](x = 2)` genuinely
+    // HOLDS — the only fair behaviour is 0 -> 1 -> 2 -> 2 -> ..., which is
+    // eventually-always x = 2. Both engines must report NO violation. Proves
+    // the fix is not blindly flagging every `<>[]P` property.
+    let module_src = r#"---- MODULE EAControlHolds ----
+EXTENDS Naturals
+
+VARIABLES x
+
+vars == <<x>>
+
+Init == x = 0
+
+Step == /\ x < 2 /\ x' = x + 1
+
+Next == Step
+
+Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
+
+P == x = 2
+Progress == <>[]P
+====
+"#;
+    let cfg_src = "SPECIFICATION Spec\nPROPERTY Progress\n";
+    let outcome = run_spec("EAControlHolds", module_src, cfg_src);
+
+    assert_eq!(outcome.stats.states_distinct, 3, "x ranges over {{0,1,2}}");
+    if let Some(v) = &outcome.violation {
+        if v.property_type == PropertyType::Liveness {
+            panic!(
+                "false-positive regression: <>[](x = 2) HOLDS (behaviour is \
+                 eventually-always x = 2); must not report a liveness violation, \
+                 got: {}",
+                v.message
+            );
+        }
+    }
+}
