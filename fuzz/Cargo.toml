@@ -44,6 +44,14 @@ test = false
 doc = false
 bench = false
 
+# Action-body disjunct splitter (regression surface for PR #187 panic)
+[[bin]]
+name = "fuzz_action_splitter"
+path = "fuzz_targets/fuzz_action_splitter.rs"
+test = false
+doc = false
+bench = false
+
 # Storage layer fuzz targets (PRs #6, #7, #8)
 [[bin]]
 name = "fuzz_queue_serialization"

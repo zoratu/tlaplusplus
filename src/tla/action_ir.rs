@@ -2556,6 +2556,24 @@ mod tests {
     }
 
     #[test]
+    fn split_action_body_disjuncts_terminates_on_unterminated_let_func_arg_bracket() {
+        // Regression (found by fuzz_action_splitter): the v2 LET parser's
+        // func-arg `[..]` loop had no EOF guard, so a LET binding name followed
+        // by an unclosed `[` and no `==`/`IN` (`LET f[`) spun forever —
+        // `advance()` clamps at the Eof token, and the loop's catch-all arm
+        // re-advanced without progress. These must return (a hang fails the
+        // test by timeout) and, since the shape is not a real splittable
+        // disjunction, yield the whole body as a single piece.
+        assert_eq!(split_action_body_disjuncts("LET RRR[").len(), 1);
+        // The original minimized fuzz artifact (LET, blank lines, name, `[`,
+        // then stray bytes) exercises the same non-terminating path.
+        assert_eq!(
+            split_action_body_disjuncts("LET\n\n\nRRR[\u{0}\u{0}\u{0}\u{e}RRRRR").len(),
+            1
+        );
+    }
+
+    #[test]
     fn split_action_body_disjuncts_ignores_comment_only_prefix_lines() {
         let disjuncts = split_action_body_disjuncts(
             r#"
