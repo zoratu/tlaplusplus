@@ -280,6 +280,10 @@ pub enum PropertyType {
     Safety,
     /// Liveness property - something good eventually happens
     Liveness,
+    /// Deadlock - a reachable state has no successors (no action enabled).
+    /// Reported like a safety violation but distinguished for clarity; matches
+    /// TLC's default deadlock check (suppressed by `-deadlock`/`--allow-deadlock`).
+    Deadlock,
 }
 
 #[derive(Debug)]

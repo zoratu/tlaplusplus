@@ -339,6 +339,20 @@ pub trait Model: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Whether the runtime should report a reachable state with no successors
+    /// as a deadlock (matching TLC's default deadlock check).
+    ///
+    /// A state is a deadlock when no action is enabled in it, i.e. `next_states`
+    /// yields no successors. TLC reports this as a violation unless deadlock
+    /// checking is disabled (`-deadlock` / `CHECK_DEADLOCK FALSE`).
+    ///
+    /// Default is `false`: synthetic/stress models legitimately reach terminal
+    /// states (e.g. a grid boundary) and must not be flagged. Only TLA+ models
+    /// opt in — see `TlaModel`, which returns `!self.allow_deadlock`.
+    fn deadlock_check_enabled(&self) -> bool {
+        false
+    }
+
     /// Canonicalize a state under symmetry reduction.
     ///
     /// When a SYMMETRY set is configured, two states that differ only by a
