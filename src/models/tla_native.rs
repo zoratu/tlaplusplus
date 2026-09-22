@@ -906,6 +906,29 @@ impl Model for TlaModel {
                         }
                     }
                 }
+                // Quiescent terminal states also stutter forever. A terminal
+                // state (no outgoing graph edge) has `Next` disabled, so every
+                // `WF_`/`SF_` constraint is vacuously satisfied there — the
+                // stutter-suffix behaviour is FAIR. TLC treats a deadlock's
+                // stutter the same way (when deadlock-checking is off, the
+                // usual mode for a spec with intended quiescent states). So a
+                // terminal `¬Q` state fails `<>[]Q` and is a bad cycle. Without
+                // this, a bare `<>[]Q` (or `[](P => <>[]Q)`) violation that
+                // only manifests at a quiescent terminal state was missed under
+                // fairness (the non-trivial-SCC scan never sees a terminal, and
+                // the no-fairness stutter branch below is skipped when fairness
+                // is present).
+                for (&fp, st) in state_by_fp.iter() {
+                    let is_terminal = adjacency_fp
+                        .get(&fp)
+                        .map(|succs| succs.is_empty())
+                        .unwrap_or(true);
+                    if is_terminal
+                        && self.eval_state_pred_on_state(q_text, st) == Some(false)
+                    {
+                        bad_cycle_fps.insert(fp);
+                    }
+                }
             } else {
                 // No fairness: every reachable ¬Q state can be stuttered on
                 // forever → each is a bad cycle. BUT this stutter-reachability
@@ -1456,35 +1479,59 @@ fn formula_has_non_fairness_liveness(formula: &TemporalFormula) -> bool {
     }
 }
 
-/// Recognise the graph-structured liveness shape `[](P => <>[]Q)` where `P`
-/// and `Q` are pure state predicates. Returns `Some((P_text, Q_text))` for
-/// the exactly-supported shape, `None` otherwise.
+/// Recognise a graph-structured liveness shape and reduce it to `(P_text,
+/// Q_text)`, the antecedent and the eventually-always consequent, both pure
+/// state predicates. Returns `None` for anything else (a missed violation is
+/// safer than a false one). Two shapes map here:
 ///
-/// This is the ONLY graph-level shape the post-processing check handles. It is
-/// deliberately narrow: both operands must be pure, prime-free, non-temporal
-/// state predicates so they can be evaluated per state. Anything else (nested
-/// temporal, action formulas, `<>P` consequents without the `[]`) returns
-/// `None` and is left unchecked (a missed violation is safer than a false one).
+///   * `[](P => <>[]Q)` — the original conditional shape (RealTime et al.).
+///   * `<>[]Q` — a bare top-level eventually-always property. It is exactly
+///     `[](TRUE => <>[]Q)`, so we desugar it with an always-true antecedent
+///     and route it through the same `graph_liveness_violation` machinery.
+///     Without this, a bare `<>[]Q` property returned `None` here and was left
+///     entirely unchecked — a false-negative soundness bug (a fair recurrent
+///     cycle, or a quiescent terminal state, where `Q` is infinitely-often
+///     false was never reported as a violation).
+///
+/// In both cases the operand(s) must be pure, prime-free, non-temporal state
+/// predicates so they can be evaluated per state.
 fn graph_liveness_shape(formula: &TemporalFormula) -> Option<(&str, &str)> {
-    let TemporalFormula::Always(inner) = formula else {
-        return None;
-    };
-    let TemporalFormula::Implies(ante, cons) = inner.as_ref() else {
-        return None;
-    };
-    let TemporalFormula::StatePredicate(p) = ante.as_ref() else {
-        return None;
-    };
-    let TemporalFormula::EventuallyAlways(q_inner) = cons.as_ref() else {
-        return None;
-    };
-    let TemporalFormula::StatePredicate(q) = q_inner.as_ref() else {
-        return None;
-    };
-    if is_pure_state_predicate_text(p) && is_pure_state_predicate_text(q) {
-        Some((p.trim(), q.trim()))
-    } else {
-        None
+    match formula {
+        // `[](P => <>[]Q)`
+        TemporalFormula::Always(inner) => {
+            let TemporalFormula::Implies(ante, cons) = inner.as_ref() else {
+                return None;
+            };
+            let TemporalFormula::StatePredicate(p) = ante.as_ref() else {
+                return None;
+            };
+            let TemporalFormula::EventuallyAlways(q_inner) = cons.as_ref() else {
+                return None;
+            };
+            let TemporalFormula::StatePredicate(q) = q_inner.as_ref() else {
+                return None;
+            };
+            if is_pure_state_predicate_text(p) && is_pure_state_predicate_text(q) {
+                Some((p.trim(), q.trim()))
+            } else {
+                None
+            }
+        }
+        // Bare `<>[]Q` ≡ `[](TRUE => <>[]Q)`. The `"TRUE"` antecedent is a
+        // `&'static str` (evaluates to `Bool(true)` on every state), so any
+        // reachable state that reaches a bad `¬Q` cycle witnesses the
+        // violation.
+        TemporalFormula::EventuallyAlways(q_inner) => {
+            let TemporalFormula::StatePredicate(q) = q_inner.as_ref() else {
+                return None;
+            };
+            if is_pure_state_predicate_text(q) {
+                Some(("TRUE", q.trim()))
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 
