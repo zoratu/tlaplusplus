@@ -180,8 +180,10 @@ parse_tlaplusplus_output() {
   # (see runtime worker's terminal-deadlock detection). This harness passes
   # --allow-deadlock (and TLC's -deadlock), so both sides suppress the check and
   # deadlock stays "no"; we still scan for the literal report as a defense so a
-  # regression that flips the flag handling is caught here.
-  if grep -qiE "Deadlock reached|deadlock detected|deadlocked" "${file}"; then
+  # regression that flips the flag handling is caught here. Match the exact
+  # worker message ("Deadlock reached: ...") so a benign "--allow-deadlock" echo
+  # cannot false-trip the deadlock comparison below.
+  if grep -qF "Deadlock reached" "${file}"; then
     deadlock="yes"
   fi
   printf -v "${out_var_states}" '%s' "${states}"
