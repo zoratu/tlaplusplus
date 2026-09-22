@@ -944,6 +944,19 @@ impl<'a> Parser<'a> {
                             self.advance();
                             break;
                         }
+                        // Unterminated `[` at end of input: bail instead of
+                        // spinning. `advance()` clamps at the Eof token, so the
+                        // catch-all `_ => self.advance()` below would never make
+                        // progress once `pos` reaches Eof — an infinite loop on
+                        // `LET f[` (a LET binding name followed by an unclosed
+                        // func-arg bracket and no `==`/`IN`). The sibling
+                        // operator-param `(...)` loop above already guards its
+                        // opaque skip with `!self.at_eof()`; mirror that here.
+                        // Breaking leaves `peek` at Eof so the `== ` check below
+                        // fails and `parse_let` returns Err, which classifies as
+                        // a v2 Fallback (the string splitter then owns the body).
+                        // Found by fuzz_action_splitter.
+                        Tok::Eof => break,
                         _ => {
                             self.advance();
                         }
