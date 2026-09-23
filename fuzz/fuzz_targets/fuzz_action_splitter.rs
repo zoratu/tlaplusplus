@@ -9,24 +9,37 @@
 //! adversarial raw-byte suffix, giving both deep structural coverage of the
 //! splitter and the pathological-input coverage of a byte fuzzer.
 //!
-//! Primary oracle: no panic / no abort (the #187 failure mode).
+//! ## What the splitter is (per the TLC reference) and what this target checks
 //!
-//! Secondary oracle (fixpoint convergence): the splitter separates top-level
-//! `\/` disjuncts. It is NOT strictly idempotent — an existential whose body is
-//! a bare disjunction, `\E i \in S: A \/ B`, is left intact when it appears as
-//! one disjunct of a larger expression but is distributed into `\E i: A`,
-//! `\E i: B` when that piece is re-split on its own. That distribution is a
-//! sound rewrite (`\E i: (A \/ B) <=> (\E i: A) \/ (\E i: B)`; the body has no
-//! shared conjunct to drop, so it is not the #187 conjunct-dropping shape), so
-//! demanding one-step stability is too strong (a fuzz run falsified it). The
-//! invariant that DOES hold, and is worth gating, is that repeated splitting
-//! CONVERGES to a fixpoint: it never oscillates, never grows without bound, and
-//! never collapses to nothing. This still catches "didn't split", "not stable
-//! on its own output past a bounded rewrite", and "dropped every piece"
-//! regressions. It is only asserted for the fully-structured input (no raw
-//! suffix), where the grammar guarantees balanced delimiters; raw-suffixed
-//! inputs are panic-checked only, since a truncated/garbled tail can
-//! legitimately defeat top-level-delimiter scanning.
+//! TLC decomposes `Next` in `Tool.getActions`, before checking begins, into "as
+//! many simple subactions as possible" — materializing even a top-level
+//! `\E x \in S` into one subaction PER element of `S` ("Model Checking TLA+
+//! Specifications", Yu/Manolios/Lamport 1999). That decomposition is maximal
+//! and one-shot; a maximal decomposition is idempotent by construction.
+//!
+//! `split_action_body_disjuncts` is our string-level FIRST stage of that
+//! decomposition, and it is deliberately NOT maximal: it separates top-level
+//! `\/` but keeps `\E`-scoped and guard-shared `\/` grouped, leaving the
+//! `\E`/guard distribution to eval time (`eval_exists_action_multi`). That is
+//! the T1.5/#187 soundness design — distributing `\E i: (g /\ (A \/ B))` at the
+//! string level drops the shared `g` from all but one branch. So this stage is
+//! a PARTIAL, non-idempotent decomposition whose COMPOSITION with eval-time
+//! expansion reproduces TLC's successor set. Idempotence is therefore neither a
+//! contract nor a useful oracle here: a "fixpoint convergence" check would stay
+//! green even if the splitter regressed into distributing
+//! `\E i: (g /\ (A \/ B))` and dropping `g` — the exact #187 conjunct-drop —
+//! because that still converges. Successor-set faithfulness to TLC is not
+//! checkable without a TLC oracle; it lives in the diff-gate
+//! (`corpus/diff_test/list.tsv`), not here.
+//!
+//! The reference-grounded contracts this target CAN check, and does:
+//!   1. Totality: the splitter terminates and returns at least one subaction
+//!      for a non-empty body (TLC always has at least the whole as one
+//!      subaction). A hang or empty result is a bug.
+//!   2. No panic / no abort — the #187 failure mode.
+//! Both are asserted on the fully-structured input; the raw-suffixed and
+//! raw-suffix-alone inputs are panic-checked only, since a truncated/garbled
+//! tail can legitimately defeat top-level-delimiter scanning.
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
@@ -127,40 +140,17 @@ fuzz_target!(|input: FuzzInput| {
     let mut structured = String::new();
     input.expr.render(MAX_DEPTH, &mut structured);
 
-    // 1. Structured input: panic check + fixpoint-convergence check.
-    // Re-split every piece until the set stops changing. A sound one-shot
-    // rewrite (e.g. distributing `\E i: A \/ B`) is allowed; oscillation,
-    // unbounded growth, and total collapse are not.
-    let mut frontier = split_action_body_disjuncts(&structured);
+    // 1. Structured input: totality (terminates + at least one subaction) and
+    // no panic. A non-empty action body always decomposes to >= 1 subaction —
+    // TLC keeps at least the whole body as one. We do NOT re-split the output:
+    // this stage is a deliberately partial (non-maximal, non-idempotent)
+    // decomposition finished at eval time, so re-feeding its pieces exercises a
+    // path no caller takes, and successor-set faithfulness is the diff-gate's
+    // job against TLC, not something checkable here (see module docs).
+    let pieces = split_action_body_disjuncts(&structured);
     assert!(
-        !frontier.is_empty(),
-        "splitter returned no pieces for {structured:?}"
-    );
-    // MAX_DEPTH bounds disjunction nesting, so a handful of passes suffices;
-    // the cap only fires on a genuine non-converging (oscillating/growing) bug.
-    const FIXPOINT_CAP: u32 = 24;
-    let mut converged = false;
-    for _ in 0..FIXPOINT_CAP {
-        let mut next = Vec::new();
-        for piece in &frontier {
-            next.extend(split_action_body_disjuncts(piece));
-        }
-        assert!(
-            !next.is_empty(),
-            "splitter collapsed a non-empty piece set to nothing; \
-             frontier {frontier:?} from {structured:?}"
-        );
-        if next == frontier {
-            converged = true;
-            break;
-        }
-        frontier = next;
-    }
-    assert!(
-        converged,
-        "splitter did not reach a fixpoint within {FIXPOINT_CAP} passes \
-         (oscillation or unbounded growth) for {structured:?}; \
-         last frontier {frontier:?}"
+        !pieces.is_empty(),
+        "splitter returned no subactions for non-empty body {structured:?}"
     );
 
     // 2. Structured input with an adversarial tail: panic check only.

@@ -831,6 +831,29 @@ fn leading_conjunct_is_sole(body: &str) -> bool {
     true
 }
 
+/// Split an action body into its top-level `\/` disjuncts (subactions).
+///
+/// This is the string-level FIRST stage of the same decomposition TLC performs
+/// in `Tool.getActions` — rewriting `Next` into "as many simple subactions as
+/// possible" before checking begins. TLC's decomposition is *maximal* (it even
+/// materializes a top-level `\E x \in S` into one subaction per element of `S`),
+/// and a maximal decomposition is idempotent.
+///
+/// This function is deliberately **NOT** maximal, and therefore **not
+/// idempotent**. It separates top-level `\/` but keeps `\E`-scoped and
+/// guard-shared `\/` grouped as a single subaction, leaving that distribution
+/// to eval time (`eval_exists_action_multi`, which iterates the binder and
+/// explores both disjuncts — TLC's per-element materialization, deferred). This
+/// two-stage split is the T1.5/#187 soundness design: distributing
+/// `\E i: (g /\ (A \/ B))` at the string level would drop the shared `g` from
+/// all but one branch. The *composition* of this stage with eval-time expansion
+/// reproduces TLC's successor set; that faithfulness is verified against the TLC
+/// oracle by the differential gate, not by any idempotence property here.
+///
+/// Contract: total (always terminates), returns `>= 1` subaction for a
+/// non-empty body and an empty vec for an empty/blank body. Callers split a
+/// Next body (or clause) exactly once and treat each element as one action
+/// branch — they never re-feed the returned pieces.
 pub fn split_action_body_disjuncts(expr: &str) -> Vec<String> {
     use std::cell::RefCell;
     use std::collections::HashMap;
