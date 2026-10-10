@@ -391,6 +391,7 @@ EXTENDS Integers
 VARIABLE x
 Init == x = 5  \* x is an Int, not a record
 Next == \/ /\ x > 0
+            /\ x < 10  \* bound the state space (was unbounded -> BFS never terminates)
             /\ x' = x + 1
         \/ /\ x.ghost > 0  \* accessing .ghost on Int - should error
             /\ x' = x + 2
