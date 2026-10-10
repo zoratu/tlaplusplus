@@ -34,6 +34,7 @@ pub(crate) fn handle(
     simulate_traces: usize,
     simulate_seed: u64,
     swarm: bool,
+    sim_weight: crate::cli::args::SimWeightArg,
     por: bool,
     coverage: bool,
     dump: Option<std::path::PathBuf>,
@@ -130,11 +131,12 @@ pub(crate) fn handle(
             num_traces: simulate_traces,
             seed: simulate_seed,
             swarm,
+            weighting: sim_weight.into(),
         };
         let max_violations = runtime.max_violations;
         println!(
-            "Running simulation: {} traces, depth {}, seed {}",
-            sim_config.num_traces, sim_config.depth, sim_config.seed
+            "Running simulation: {} traces, depth {}, seed {}, weighting {:?}",
+            sim_config.num_traces, sim_config.depth, sim_config.seed, sim_config.weighting
         );
         let mut sim_outcome = run_simulation(&model, &sim_config, max_violations);
         // T9 Phase A: minimize simulation violation traces too.

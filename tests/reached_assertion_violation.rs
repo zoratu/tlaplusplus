@@ -18,7 +18,8 @@ use std::fs;
 use tempfile::TempDir;
 use tlaplusplus::models::tla_native::TlaModel;
 use tlaplusplus::{
-    EngineConfig, Model, PropertyType, RunOutcome, SimulationConfig, run_model, run_simulation,
+    EngineConfig, Model, PropertyType, RunOutcome, SimWeighting, SimulationConfig, run_model,
+    run_simulation,
 };
 
 /// Build a `TlaModel` from inline sources (with `allow_deadlock = true`, the
@@ -147,6 +148,7 @@ Next == /\ x < 3
         num_traces: 5,
         seed: 1,
         swarm: false,
+        ..SimulationConfig::default()
     };
     let outcome = run_simulation(&model, &config, 1);
 
@@ -183,6 +185,7 @@ Next == \/ (x < 3 /\ x' = x + 1 /\ Assert(x' < 3, "x' reached 3"))
         num_traces: 300,
         seed: 12345,
         swarm: true,
+        ..SimulationConfig::default()
     };
     let outcome = run_simulation(&model, &config, 1);
 
@@ -388,6 +391,7 @@ EXTENDS Integers
 VARIABLE x
 Init == x = 5  \* x is an Int, not a record
 Next == \/ /\ x > 0
+            /\ x < 10  \* bound the state space (was unbounded -> BFS never terminates)
             /\ x' = x + 1
         \/ /\ x.ghost > 0  \* accessing .ghost on Int - should error
             /\ x' = x + 2
@@ -401,5 +405,42 @@ Next == \/ /\ x > 0
         outcome.violation.is_none(),
         "record access on non-record errors should not cause violations, got: {:?}",
         outcome.violation
+    );
+}
+
+// --- Simulation successor weighting (ersc.io "when random isn't random enough") ---
+
+/// The opt-in `LeastVisited` weighting steers the random walk via a weighted
+/// choice but must stay a complete, correct simulation: it still finds a reached
+/// Assert(FALSE), exactly as the default uniform walk does.
+#[test]
+#[serial]
+fn least_visited_weighting_still_finds_reached_assert() {
+    let module_src = r#"---- MODULE AssertSimWeighted ----
+EXTENDS Integers, TLC
+VARIABLE x
+Init == x = 0
+Next == x < 3 /\ x' = x + 1 /\ Assert(x' < 3, "x' reached 3")
+====
+"#;
+    let (model, _dir) = build_model("AssertSimWeighted", module_src, "INIT Init\nNEXT Next\n");
+    let config = SimulationConfig {
+        depth: 10,
+        num_traces: 5,
+        seed: 1,
+        swarm: false,
+        weighting: SimWeighting::LeastVisited,
+    };
+    let outcome = run_simulation(&model, &config, 1);
+
+    let v = outcome
+        .violations
+        .first()
+        .expect("least-visited simulation must still report the reached Assert(FALSE)");
+    assert_eq!(v.property_type, PropertyType::Safety, "{}", v.message);
+    assert!(
+        v.message.contains("assertion failed"),
+        "unexpected message: {}",
+        v.message
     );
 }

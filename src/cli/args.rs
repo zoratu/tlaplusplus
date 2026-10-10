@@ -2,7 +2,26 @@
 //!
 //! Extracted from `src/main.rs` as part of the cli/ refactor.
 
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
+
+/// Successor-selection weighting for simulation mode (`--sim-weight`).
+/// Mirrors [`crate::SimWeighting`]; kept separate so clap owns the CLI surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum SimWeightArg {
+    /// Uniform random walk — every enabled successor is equiprobable (TLC parity).
+    Uniform,
+    /// Weighted walk biased toward successors seen least often so far.
+    LeastVisited,
+}
+
+impl From<SimWeightArg> for crate::SimWeighting {
+    fn from(arg: SimWeightArg) -> Self {
+        match arg {
+            SimWeightArg::Uniform => crate::SimWeighting::Uniform,
+            SimWeightArg::LeastVisited => crate::SimWeighting::LeastVisited,
+        }
+    }
+}
 
 pub(crate) fn parse_byte_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
@@ -413,6 +432,12 @@ pub(crate) enum Command {
         /// Only effective with --simulate.
         #[arg(long, default_value_t = false)]
         swarm: bool,
+        /// Successor-selection weighting for simulation mode. `uniform` is the
+        /// classic TLC `-simulate` walk; `least-visited` uses a weighted random
+        /// choice to steer the walk toward under-explored states. Only effective
+        /// with --simulate.
+        #[arg(long, value_enum, default_value_t = SimWeightArg::Uniform)]
+        sim_weight: SimWeightArg,
         /// Enable partial-order reduction (POR) via stubborn sets.
         ///
         /// For specs with independent actions (typical of distributed
