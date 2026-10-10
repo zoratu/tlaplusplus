@@ -61,7 +61,7 @@ pub use runtime::{EngineConfig, PropertyType, RunOutcome, RunStats, Violation, r
 pub use streaming_scc::{
     Color, FingerprintAdjacencyGraph, LivenessGraph, NestedDfsResult, nested_dfs,
 };
-pub use simulation::{SimulationConfig, SimulationOutcome, run_simulation};
+pub use simulation::{SimWeighting, SimulationConfig, SimulationOutcome, run_simulation};
 pub use trace_minimize::{
     MinimizeResult, OperatorBody, extract_invariant_variables,
     extract_invariant_variables_transitive, minimize_trace,

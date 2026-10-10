@@ -202,6 +202,29 @@ for entry in "${FAILPOINTS[@]}"; do
   EXIT_FAIL_COUNT["$name"]=0
 done
 
+# ---- helper: unbiased uniform integer in [0, n) ---------------------------
+# `$RANDOM % n` over-weights the low values whenever n does not divide 32768
+# (bash's $RANDOM yields 0..32767) — the modulo-bias "classic blunder" from
+# ersc.io "when random isn't random enough". We reject the biased tail so every
+# value in [0, n) is equiprobable. Falls back to 0 for n <= 1.
+rand_below() {
+  local n="$1"
+  if [[ "${n}" -le 1 ]]; then
+    echo 0
+    return
+  fi
+  local max=32768                        # $RANDOM range size (0..32767)
+  local limit=$(( max - (max % n) ))     # reject [limit, max): the short tail
+  local r
+  while :; do
+    r=${RANDOM}
+    if (( r < limit )); then
+      echo $(( r % n ))
+      return
+    fi
+  done
+}
+
 # ---- helper: pick K distinct failpoints from FAILPOINTS -------------------
 # Echoes K entries (one per line, "name|category" form). K is clamped to
 # the catalog size.
@@ -314,7 +337,8 @@ run_one() {
 # A small fraction are permanent so we exercise graceful-error termination.
 pick_action() {
   local category="$1"
-  local r=$((RANDOM % 100))
+  local r
+  r=$(rand_below 100)
   case "${category}" in
     worker)
       # worker_panic must always be transient otherwise the run can't finish
@@ -324,7 +348,7 @@ pick_action() {
       ;;
     delay)
       # return(N) where N is delay in ms; pick small to stay within timeout.
-      local n=$(( (RANDOM % 50) + 5 ))
+      local n=$(( $(rand_below 50) + 5 ))
       echo "return(${n})"
       ;;
     quiesce)
@@ -334,7 +358,7 @@ pick_action() {
     checkpoint|queue|fp_store)
       if (( r < 70 )); then
         # transient: fire 1-3 times then disable
-        local k=$(( (RANDOM % 3) + 1 ))
+        local k=$(( $(rand_below 3) + 1 ))
         echo "${k}*return->off"
       else
         # permanent: every call fails — graceful error expected
@@ -403,10 +427,11 @@ while (( $(date +%s) < DEADLINE )); do
 
   # T16b: decide how many concurrent failpoints fire this iteration.
   if [[ "${SWARM_MODE}" == "auto" ]]; then
-    # Random N in [1, SWARM_MAX] (default 1-4). Uniform — small N is the
-    # baseline behaviour and most likely to also exercise the well-tested
-    # single-failpoint paths; larger N hunts for fault-cascade bugs.
-    swarm_n=$(( (RANDOM % SWARM_MAX) + 1 ))
+    # Random N in [1, SWARM_MAX] (default 1-4). Unbiased via rand_below even
+    # when SWARM_MAX is not a power of two; small N is the baseline behaviour and
+    # most likely to also exercise the well-tested single-failpoint paths, while
+    # larger N hunts for fault-cascade bugs.
+    swarm_n=$(( $(rand_below "${SWARM_MAX}") + 1 ))
   else
     swarm_n="${SWARM_MODE}"
   fi
