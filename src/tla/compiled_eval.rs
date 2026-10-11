@@ -3537,6 +3537,23 @@ fn try_eval_guard_disjunction_as_action<'a>(
         return Ok(None);
     }
 
+    // A single, non-disjunction clause that is a *parameterized* operator-call
+    // action (e.g. `Shift(x)` where `Shift(q) == q' = ...`) must NOT be routed
+    // here: it needs the argument-aliasing textual substitution in
+    // `execute_branch`'s operator-call path (PR #180), which naive routing
+    // through `eval_action_body_multi` would bypass (leaking a phantom `q`
+    // variable). Leave it to that specialized path. Disjunctions, nullary
+    // operator calls, and inline actions are all routed below.
+    let is_single_plain = disjuncts.len() == 1 && !body.trim_start().starts_with("\\/");
+    if is_single_plain {
+        let single = strip_outer_parens_str(disjuncts[0].trim());
+        if let Some((_name, args)) = crate::tla::eval::parse_action_call_expr(single) {
+            if !args.is_empty() {
+                return Ok(None);
+            }
+        }
+    }
+
     // Route to the action evaluator iff a real action is present — whether the
     // clause is a disjunction (`A \/ B`, `\/ A`, `(A \/ FALSE)`) OR a single
     // parenthesized/plain action (`(OpA)`): a guard-classified clause that is
@@ -3560,7 +3577,10 @@ fn try_eval_guard_disjunction_as_action<'a>(
     // boolean clause evaluation. For a genuine multi-branch body the stripped
     // `body` is equivalent to `text` (the interpreted entry strips parens too).
     let routed_body: String = if disjuncts.len() == 1 {
-        disjuncts[0].clone()
+        // Strip any residual parens so a single disjunct like `(OpA)` (e.g. from
+        // `\/ (OpA)`) reaches the evaluator as `OpA`; a parenthesized lone
+        // operator call otherwise fails to resolve and yields no successor.
+        strip_outer_parens_str(disjuncts[0].trim()).to_string()
     } else {
         body.to_string()
     };
