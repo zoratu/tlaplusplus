@@ -21,20 +21,15 @@
 //! the degenerate junction shapes (FALSE literals, single-branch `\/`, redundant
 //! parens, idempotent `X \/ X`) that individual regression tests under-cover.
 //!
-//! ## Scope (known residuals)
+//! ## Scope
 //!
-//! Leaves are operator-call actions (the reported shape: `Arm`/`Body` are named
-//! operators), and generated disjunctions have 2+ branches. This generator found
-//! — and the accompanying fix closed — the operator-call family. It deliberately
-//! does NOT generate two adjacent residual shapes that remain open follow-ups,
-//! so it stays a green regression guard rather than flapping on unfixed edges:
-//!   1. a guard AND'd with an *inline* primed action (`g /\ ((pc' = v)))`) — the
-//!      inline body is mis-evaluated as a boolean in some parenthesizations;
-//!   2. a guard plus a lone *parenthesized* operator call (`g /\ (OpA)`), with no
-//!      disjunction at all.
-//! Both are the same underlying class (a guard-classified clause that is really
-//! an action) and are tracked for a follow-up that reclassifies such clauses
-//! without the regressions a broad change risks in this heuristic-dense path.
+//! Leaves are both operator-call actions (`Arm`/`Body`-style named operators —
+//! the reported #201 shape) AND inline primed actions (`pc' = v /\ UNCHANGED ph`
+//! written in place), and generated disjunctions have 1+ branches. A single-
+//! element disjunction renders as redundant parens around one action, so the
+//! degenerate shapes `(X)`, `((X))`, `(X \/ FALSE)`, `\/ X` are all exercised
+//! against both leaf kinds. The accompanying fixes close this whole family
+//! (operator-call *and* inline), so the generator runs clean.
 
 use proptest::prelude::*;
 use tlaplusplus::tla::{TlaValue, evaluate_next_states, parse_tla_module_text, tla_state};
@@ -51,6 +46,9 @@ enum Leaf {
     OpA,
     OpB,
     OpC,
+    /// An inline primed assignment of `pc`, holding `ph` (`pc' = v /\ UNCHANGED ph`),
+    /// written in place rather than behind an operator name.
+    InlinePc(usize),
 }
 
 impl Leaf {
@@ -59,6 +57,9 @@ impl Leaf {
             Leaf::OpA => "OpA".to_string(),
             Leaf::OpB => "OpB".to_string(),
             Leaf::OpC => "OpC".to_string(),
+            Leaf::InlinePc(i) => {
+                format!("(pc' = \"{}\" /\\ UNCHANGED ph)", PC_VALS[*i % PC_VALS.len()])
+            }
         }
     }
 }
@@ -126,25 +127,23 @@ fn apply_wrap(rendered: &str, w: Wrap) -> String {
 }
 
 fn arb_leaf() -> impl Strategy<Value = Leaf> {
-    // Scope: operator-call actions (the reported #201 shape — Arm/Body are named
-    // operators). An `InlinePc` leaf is deliberately excluded: it exercises a
-    // DISTINCT, still-open edge (a guard AND'd with a single/double-parenthesized
-    // *inline* primed action, e.g. `(g /\ ((pc' = v)))`, is mis-evaluated as a
-    // boolean). That residual is tracked as a follow-up; keeping it out of the
-    // generator lets this test stay a green regression guard for the operator-call
-    // family the #201 fix covers, rather than flapping on an unfixed shape.
-    prop_oneof![Just(Leaf::OpA), Just(Leaf::OpB), Just(Leaf::OpC)]
+    // Both leaf kinds: operator-call actions (the reported #201 shape) and inline
+    // primed actions (the residual family the follow-up fix closes).
+    prop_oneof![
+        Just(Leaf::OpA),
+        Just(Leaf::OpB),
+        Just(Leaf::OpC),
+        (0usize..PC_VALS.len()).prop_map(Leaf::InlinePc),
+    ]
 }
 
 fn arb_act() -> impl Strategy<Value = Act> {
     let leaf = arb_leaf().prop_map(Act::Leaf);
-    // Disjunctions have 2+ branches: a single-element `Disj` renders as redundant
-    // parens around one action (`(OpA)`), another distinct residual edge (a guard
-    // plus a lone parenthesized operator-call action) left as a follow-up. The
-    // degenerate single-branch shapes the #201 fix DOES handle are still covered
-    // here via the `\/ X` and `(X \/ FALSE)` metamorphic wraps applied to leaves.
+    // Disjunctions have 1+ branches: a single-element `Disj` renders as redundant
+    // parens around one action (`(OpA)` / `((IA))`), exercising the lone-
+    // parenthesized-action and double-paren shapes alongside the multi-branch ones.
     leaf.prop_recursive(2, 6, 3, |inner| {
-        prop::collection::vec(inner, 2..=3).prop_map(Act::Disj)
+        prop::collection::vec(inner, 1..=3).prop_map(Act::Disj)
     })
 }
 
