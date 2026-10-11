@@ -302,21 +302,35 @@ pub fn classify_clause(clause: &str) -> ClauseKind {
     if let Some((lhs, rhs)) = trimmed.split_once('=') {
         let lhs = lhs.trim();
         let rhs = rhs.trim();
-        if let Some(var) = lhs.strip_suffix('\'') {
-            let var = var.trim();
-            if !is_simple_name(var) || rhs.is_empty() {
-                return ClauseKind::Other;
+        // In TLA+, `=` binds tighter than `/\` and `\/`, so a clause like
+        // `pc' = "b" /\ UNCHANGED ph` means `(pc' = "b") /\ (UNCHANGED ph)` — a
+        // conjunction, NOT an assignment of the value `"b" /\ UNCHANGED ph`.
+        // `split_once('=')` grabs only the first `=`, so without this guard the
+        // whole junction is swallowed into the assignment's RHS, which then fails
+        // to evaluate (UNCHANGED/`\/` are not value operators) and the branch is
+        // silently dropped (issue #201 inline-action family: `g /\ ((IA))` and
+        // `g /\ (IA \/ FALSE)`). When the RHS carries a top-level junction, this
+        // is not a bare assignment: fall through to `Other`, which compiles to a
+        // Guard clause that the action-disjunction routing expands correctly.
+        // (A genuine value-junction assignment must parenthesize it — `x' = (a /\
+        // b)` — where the junction is not top-level and this guard does not trip.)
+        if !rhs_has_top_level_junction(rhs) {
+            if let Some(var) = lhs.strip_suffix('\'') {
+                let var = var.trim();
+                if !is_simple_name(var) || rhs.is_empty() {
+                    return ClauseKind::Other;
+                }
+                return ClauseKind::PrimedAssignment {
+                    var: var.to_string(),
+                    expr: rhs.to_string(),
+                };
             }
-            return ClauseKind::PrimedAssignment {
-                var: var.to_string(),
-                expr: rhs.to_string(),
-            };
-        }
-        if is_simple_name(lhs) && !rhs.is_empty() {
-            return ClauseKind::UnprimedEquality {
-                var: lhs.to_string(),
-                expr: rhs.to_string(),
-            };
+            if is_simple_name(lhs) && !rhs.is_empty() {
+                return ClauseKind::UnprimedEquality {
+                    var: lhs.to_string(),
+                    expr: rhs.to_string(),
+                };
+            }
         }
     }
 
@@ -352,6 +366,50 @@ fn split_membership(s: &str) -> Option<(String, String)> {
         }
     }
     None
+}
+
+/// True if `s` contains a top-level `/\` or `\/` — outside any parentheses,
+/// brackets or braces, and outside double-quoted string literals. Used to tell a
+/// bare assignment (`x' = expr`) from a junction whose first conjunct merely
+/// looks like one (`x' = v /\ ...`), which TLA+ precedence parses as `(x'=v) /\
+/// ...`. Kept string-aware so a string value like `x' = "a /\ b"` is not
+/// mistaken for a junction.
+fn rhs_has_top_level_junction(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_string {
+            if c == b'\\' {
+                i += 2; // skip escaped char inside the string
+                continue;
+            }
+            if c == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' => in_string = true,
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b'\\' if depth == 0 && i + 1 < bytes.len() => {
+                // `\/` (or) or, for `/\`, handled by the '/' arm below.
+                if bytes[i + 1] == b'/' {
+                    return true;
+                }
+            }
+            b'/' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b'\\' => {
+                return true;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Find pattern at top level (not inside brackets/parens)
@@ -587,6 +645,58 @@ mod tests {
                 set_expr: "1..3".to_string()
             }
         );
+    }
+
+    #[test]
+    fn assignment_with_top_level_junction_is_not_a_bare_assignment() {
+        // `pc' = "b" /\ UNCHANGED ph` is `(pc' = "b") /\ (UNCHANGED ph)` by TLA+
+        // precedence, not an assignment of `"b" /\ UNCHANGED ph` — it must NOT be
+        // classified as a PrimedAssignment (issue #201 inline-action family).
+        assert_eq!(
+            classify_clause(r#"pc' = "b" /\ UNCHANGED ph"#),
+            ClauseKind::Other
+        );
+        // Inner disjunction (the `(IA \/ FALSE)` shape, parens already stripped).
+        assert_eq!(
+            classify_clause(r#"pc' = "b" /\ UNCHANGED ph \/ FALSE"#),
+            ClauseKind::Other
+        );
+        assert_eq!(classify_clause("y = a /\\ b"), ClauseKind::Other);
+
+        // But a bare assignment, or one whose junction is parenthesized into a
+        // value, is still a normal assignment.
+        assert_eq!(
+            classify_clause(r#"pc' = "b""#),
+            ClauseKind::PrimedAssignment {
+                var: "pc".to_string(),
+                expr: "\"b\"".to_string()
+            }
+        );
+        assert_eq!(
+            classify_clause("x' = (a /\\ b)"),
+            ClauseKind::PrimedAssignment {
+                var: "x".to_string(),
+                expr: "(a /\\ b)".to_string()
+            }
+        );
+        // A string value that contains the junction glyphs is not a junction.
+        assert_eq!(
+            classify_clause(r#"x' = "a /\ b""#),
+            ClauseKind::PrimedAssignment {
+                var: "x".to_string(),
+                expr: "\"a /\\ b\"".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn rhs_top_level_junction_detector() {
+        assert!(rhs_has_top_level_junction(r#""b" /\ UNCHANGED ph"#));
+        assert!(rhs_has_top_level_junction("a \\/ b"));
+        assert!(!rhs_has_top_level_junction("x + 1"));
+        assert!(!rhs_has_top_level_junction("(a /\\ b)")); // parenthesized → not top level
+        assert!(!rhs_has_top_level_junction(r#""a /\ b""#)); // inside a string
+        assert!(!rhs_has_top_level_junction("[a |-> 1, b |-> 2]"));
     }
 
     #[test]
