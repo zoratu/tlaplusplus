@@ -424,11 +424,13 @@ where
                 &fair_scc,
             ) {
                 eprintln!(
-                    "  Graph-level liveness violation ([](P => <>[]Q)) found in {:.2?}",
+                    "  Graph-level liveness violation (<>[]Q / [](P => <>[]Q)) found in {:.2?}",
                     gl_start.elapsed()
                 );
                 return Some(Violation {
-                    message: "Temporal property violated: []((P) => <>[](Q))".to_string(),
+                    message: "Temporal property violated: eventually-always liveness \
+                              (<>[]Q, or [](P => <>[]Q))"
+                        .to_string(),
                     state: bad_state.clone(),
                     property_type: PropertyType::Liveness,
                     trace: vec![bad_state],
