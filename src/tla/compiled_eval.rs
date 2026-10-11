@@ -3474,8 +3474,25 @@ fn try_eval_guard_disjunction_as_action<'a>(
     text: &str,
     branch: &CompiledActionBranch<'a>,
 ) -> Result<Option<Vec<CompiledActionBranch<'a>>>> {
-    let disjuncts = crate::tla::action_ir::split_action_body_disjuncts(text);
-    if disjuncts.len() <= 1 {
+    // Strip a redundant outer paren so `(A \/ B)` is seen as a ROOT disjunction
+    // rather than a parenthesized leaf. Mirrors the interpreted sibling
+    // (`eval_disjunctive_action_body_multi`, eval/action.rs), which strips before
+    // splitting. Without this, `(Body \/ FALSE)` classifies as a non-root `Or`,
+    // `split_action_body_disjuncts` returns ONE disjunct, the length bail below
+    // fires, and the clause falls through to boolean evaluation — which drops the
+    // `Body` branch's prime and the successor (issue #201, headline shape).
+    let body = strip_outer_parens_str(text);
+    let disjuncts = crate::tla::action_ir::split_action_body_disjuncts(body);
+    // A bulleted disjunction can legitimately reduce to a SINGLE branch — the
+    // one-item list `\/ Body`, where the splitter strips the lone bullet to
+    // `Body`. That is still a disjunctive *action* context (evaluating `\/ Body`
+    // as a boolean guard drops the successor — issue #201, bulleted shape), so
+    // accept it when the body carries disjunction syntax. A bare non-disjunction
+    // leaf (no `\/`, single disjunct) is left to the caller's single-action-call
+    // and boolean-guard paths. The `any_action` check below still gates routing,
+    // so a lone *boolean* bullet (`\/ x = 1`) returns None and falls through.
+    let has_disjunction_syntax = disjuncts.len() > 1 || body.trim_start().starts_with("\\/");
+    if disjuncts.is_empty() || !has_disjunction_syntax {
         return Ok(None);
     }
 
@@ -3504,9 +3521,20 @@ fn try_eval_guard_disjunction_as_action<'a>(
         return Ok(None);
     }
 
+    // Route through the interpreted action-body evaluator, which stages each
+    // disjunct's primes correctly. For a single-branch bulleted disjunction hand
+    // it the bullet-stripped disjunct (`Body`) rather than the raw `\/ Body`, so
+    // the interpreted side's own single-disjunct guard doesn't bounce it back to
+    // boolean clause evaluation. For a genuine multi-branch body the stripped
+    // `body` is equivalent to `text` (the interpreted entry strips parens too).
+    let routed_body: String = if disjuncts.len() == 1 {
+        disjuncts[0].clone()
+    } else {
+        body.to_string()
+    };
     let outer_ctx = branch.ctx.clone();
     let interpreted_branches =
-        crate::tla::eval::eval_action_body_multi(text, &branch.ctx, &branch.staged)?;
+        crate::tla::eval::eval_action_body_multi(&routed_body, &branch.ctx, &branch.staged)?;
     let mut out = Vec::with_capacity(interpreted_branches.len());
     for (staged, unchanged_vars) in interpreted_branches {
         let mut merged_unchanged = branch.unchanged_vars.clone();
