@@ -1,5 +1,26 @@
 # Changelog
 
+## v1.2.33 (2026-10-11)
+
+Follow-up soundness fix to v1.2.32, closing the last two shapes in the #201 family (PR #206).
+
+### Inline primed action after a guard dropped successors in two parenthesizations
+
+v1.2.32 fixed the operator-call cases of #201. A guard followed by an *inline* primed action — one written out in place rather than behind an operator name — still silently dropped its successor in two forms:
+
+```tla
+Arm \/ (ph = "ok" /\ ((pc' = "b" /\ UNCHANGED ph)))          \* double-parenthesized   -> successor dropped
+Arm \/ (ph = "ok" /\ (pc' = "b" /\ UNCHANGED ph \/ FALSE))    \* inline in a disjunction -> successor dropped
+```
+
+Root cause: `classify_clause` split a clause on its *first* `=` and returned a `PrimedAssignment` whose expression was everything after it, without checking that `=` was the clause's top-level operator. For `pc' = "b" /\ UNCHANGED ph` the whole conjunction was swallowed into the assignment's right-hand side (`pc' := "b" /\ UNCHANGED ph`); evaluating that as a value then errors (`UNCHANGED` and `\/` are not value operators), and in a multi-disjunct `Next` the error was swallowed as a disabled branch, so the successor vanished with no diagnostic. The single-parenthesized and bulleted inline forms happened to work only because an earlier pass pre-splits a parenthesized conjunction into its conjuncts; a doubly-parenthesized conjunction or a parenthesized disjunction arrived whole and hit the misclassification.
+
+The fix makes `classify_clause` reject an assignment whose right-hand side contains a top-level `/\` or `\/`, falling through to a guard clause that the action-disjunction routing from #204 expands correctly. This is precedence-correct — in TLA+, `=` binds tighter than the junctions, so `x' = a /\ b` means `(x' = a) /\ b`, and a genuine value-junction assignment must be parenthesized (`x' = (a /\ b)`), where the junction is no longer top-level. A string-aware helper ensures a string value such as `x' = "a /\ b"` is not mistaken for a junction.
+
+### Testing
+
+Adds a 9-shape regression matrix (`tests/guard_action_shapes_issue_201.rs`) covering operator-call and inline actions in bare, single-paren, double-paren, `\/ FALSE`, and bulleted forms, and broadens the metamorphic generator (`tests/splitter_metamorphic_issue_201.rs`) back to inline-action leaves and single-element disjunctions — clean at `PROPTEST_CASES=8000`. Validation: lib tests 1132/0, `scripts/diff_tlc.sh` 23/23, and the full GitHub Actions matrix (`cargo test --release` on x86_64 + aarch64, `--features symbolic-init`, `--features failpoints`, and `tlaplusplus vs TLC` on both arches) green on the merged PR.
+
 ## v1.2.32 (2026-10-11)
 
 Soundness fix for a missed-violation / under-exploration bug (#201, PR #204).
