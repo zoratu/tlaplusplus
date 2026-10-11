@@ -1,5 +1,46 @@
 # Changelog
 
+## v1.2.31 (2026-10-11)
+
+The first tagged release since v1.2.30 (2026-07-10). Alongside new simulation/chaos random-selection work, it collects the substantial soundness, performance, verification, and CI backlog that has landed on `main` since — PRs #166–#202. Model-checking semantics move strictly toward TLC parity (a large cluster of under-exploration and false-violation fixes); there are no intended behavior regressions.
+
+### Simulation & chaos — unbiased and weighted random selection (#202)
+
+Inspired by ersc.io's "When random isn't random enough".
+
+- `random_u64() % n` over-weights the first `2^64 mod n` indices. `Rng::range` in simulation mode now rejection-samples (via a new `range_u64`), making the random walk exactly uniform; the RNG stream is unchanged except on the vanishing biased tail, so seeded simulations reproduce as before.
+- `scripts/chaos_soak.sh` gets a `rand_below` helper replacing its `$RANDOM % N` action and swarm-size picks. The swarm-N selection was previously unbiased only because the default `--swarm-max 4` is a power of two, and silently skewed toward small N (under-sampling the larger fault cascades swarm mode exists to find) for any other value.
+- A new exact integer-weighted `Rng::weighted(&[u32])` primitive backs a `--sim-weight` flag: `uniform` (default, TLC `-simulate` parity) or `least-visited`, which weights each successor by how rarely the simulation has visited it (`1 + max_visits - visits`), steering the walk toward under-explored states without starving any branch. `RandomElement`/`RandomSubset` stay deterministic, as exhaustive model checking requires.
+- Fixed a pre-existing test hang: `record_access_non_record_is_swallowed_in_multi_disjunct` used an unbounded spec, so exhaustive BFS never terminated (hanging `cargo test` on large-memory machines). Bounded the growing disjunct with `x < 10`; the test's intent (a swallowed record-access error on a non-record, no violation) is preserved.
+
+### TLA+ correctness — under-exploration and false-violation fixes
+
+A large batch of semantics fixes, each closing a specific divergence from TLC:
+
+- **Structural set membership** — `\subseteq` over infinite-domain sets (#172), parameterized set operators and sequences (#173), `Nat`-override plus structural set-op membership (#171), and `SetRange` membership returning false for non-integer values (#177), with a guard invariant that membership never errors on a type mismatch (#178).
+- **Action evaluation** — recover successors dropped by `LET`-with-primes in action bodies (#175) and in compiled `LET` clauses hiding a helper prime (#192); stage primed arguments in the compiled and `execute_branch` paths (#185) and trust the compiled empty result there (#186); an action operator priming its parameter now targets the argument variable (#180); action constraints go through the full evaluator (#184).
+- **Disjunction / product expansion** — expand parenthesized disjunctions of actions (#182), enumerate memberships in a disjunctive `Init` conjunct (#190), and yield flat n-tuples from chained Cartesian products (#183).
+- **EnvironmentController** — unmask a panic from nested-disjunction splitting plus `UNCHANGED`-tuple staging (#187), then explore the spec fully (#188).
+- **Fingerprinting** — keep `CONSTANTS` out of the fingerprinted state (model context, not state) (#193), normalize an empty function to the empty sequence (#181), and hold symmetric-value constant self-bindings fixed during canonicalization (#176).
+- **Reached `Assert(FALSE)`** — surfaced as a safety violation in actions (#194), in simulation/swarm mode (#195), and as a hard failure in an `ASSUME` (#196); non-`Assert` eval errors in `Next` actions are now surfaced for diagnostics (4bc39f4).
+- **TLC built-ins / CLI** — implement `TLC!Assert`/`Print`/`PrintT` (#174) and apply state/action constraints in the `--dump` state-graph BFS (#179).
+
+### Performance
+
+- Cache the compiled IR in the action-call guard path (#189).
+- Memoize the interpreted-path action text splitters (#191).
+
+### Verification (Verus, T13.4)
+
+- VerifiedShard wrapper for `FingerprintShard` (Phase A.1) and equivalence tests proving it matches the production shard (Phase A.2).
+
+### CI & housekeeping
+
+- Gate `--features symbolic-init` and `--features failpoints` in CI, after a bit-rotted symbolic-init test surface slipped past the default build (#168, #169); add a manual-dispatch `heavy-gates` workflow for spot self-hosted runners (#170).
+- Dedup `first_logical_line_skipping_comments` into `text_util` (#166); refresh the README to v1.2.30 (#167).
+
+Validation: the project's GitHub Actions gates (`cargo test --release` on x86_64 + aarch64, `--features symbolic-init`, `--features failpoints`, and `tlaplusplus vs TLC` on both arches) run on `main`. The #202 simulation/chaos changes were additionally spot-validated: lib tests 1130/0 (including 5 new RNG unit tests), `scripts/diff_tlc.sh` 23/23, and the formerly-hanging test binary 11/11 with no skip.
+
 ## v1.2.30 (2026-07-10)
 
 Dual-evaluator unification. `tlaplusplus` had **two** expression evaluators — interpreted (`eval_expr` → `classify_op`) and compiled (`compile_expr` → `CompiledExpr` → `eval_compiled`) — and the model's hot path (Init / guards) used the interpreted one while `check_invariants` used the compiled one. Same predicate text, two mechanisms that could disagree — the root cause behind MCBakery and the v1.2.29 `.trim()`-body missed-violation class. This routes the model onto the single compiled evaluator, matching TLC's single-AST/single-evaluator design.
