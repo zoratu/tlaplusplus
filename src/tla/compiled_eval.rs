@@ -3529,25 +3529,22 @@ fn try_eval_guard_disjunction_as_action<'a>(
     // Strip a redundant outer paren so `(A \/ B)` is seen as a ROOT disjunction
     // rather than a parenthesized leaf. Mirrors the interpreted sibling
     // (`eval_disjunctive_action_body_multi`, eval/action.rs), which strips before
-    // splitting. Without this, `(Body \/ FALSE)` classifies as a non-root `Or`,
-    // `split_action_body_disjuncts` returns ONE disjunct, the length bail below
-    // fires, and the clause falls through to boolean evaluation — which drops the
-    // `Body` branch's prime and the successor (issue #201, headline shape).
+    // splitting. Without this, `(Body \/ FALSE)` classifies as a non-root `Or`
+    // and `split_action_body_disjuncts` returns ONE disjunct (issue #201).
     let body = strip_outer_parens_str(text);
     let disjuncts = crate::tla::action_ir::split_action_body_disjuncts(body);
-    // A bulleted disjunction can legitimately reduce to a SINGLE branch — the
-    // one-item list `\/ Body`, where the splitter strips the lone bullet to
-    // `Body`. That is still a disjunctive *action* context (evaluating `\/ Body`
-    // as a boolean guard drops the successor — issue #201, bulleted shape), so
-    // accept it when the body carries disjunction syntax. A bare non-disjunction
-    // leaf (no `\/`, single disjunct) is left to the caller's single-action-call
-    // and boolean-guard paths. The `any_action` check below still gates routing,
-    // so a lone *boolean* bullet (`\/ x = 1`) returns None and falls through.
-    let has_disjunction_syntax = disjuncts.len() > 1 || body.trim_start().starts_with("\\/");
-    if disjuncts.is_empty() || !has_disjunction_syntax {
+    if disjuncts.is_empty() {
         return Ok(None);
     }
 
+    // Route to the action evaluator iff a real action is present — whether the
+    // clause is a disjunction (`A \/ B`, `\/ A`, `(A \/ FALSE)`) OR a single
+    // parenthesized/plain action (`(OpA)`): a guard-classified clause that is
+    // actually an operator-call or inline action must not be boolean-evaluated,
+    // which silently drops its prime and the successor (issue #201 and family).
+    // `guard_disjunct_contains_action` is the gate, so a pure *boolean* clause
+    // (`x = 1`, `\/ x = 1`, `(x = 1 \/ y = 2)`) is NOT an action and falls
+    // through here to ordinary boolean guard evaluation.
     let any_action = disjuncts
         .iter()
         .any(|d| guard_disjunct_contains_action(d, branch, 0));
