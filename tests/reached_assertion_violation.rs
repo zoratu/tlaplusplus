@@ -385,7 +385,9 @@ Next == \/ /\ f[1] > 5
 #[test]
 #[serial]
 fn record_access_non_record_is_swallowed_in_multi_disjunct() {
-    // Test that x.field on non-record errors are handled correctly
+    // Test that x.field on non-record errors are handled correctly.
+    // The first disjunct is bounded (x < 10) so the state space is finite:
+    // an unbounded x' = x + 1 would explore forever and hang the run.
     let module_src = r#"---- MODULE RecordAccessNonRecord ----
 EXTENDS Integers
 VARIABLE x
@@ -405,6 +407,21 @@ Next == \/ /\ x > 0
         outcome.violation.is_none(),
         "record access on non-record errors should not cause violations, got: {:?}",
         outcome.violation
+    );
+
+    // The record-access-on-Int error should be counted as swallowed
+    assert!(
+        outcome.stats.swallowed_eval_errors >= 1,
+        "expected at least 1 swallowed eval error, got {}",
+        outcome.stats.swallowed_eval_errors
+    );
+
+    // States: x = 5, 6, 7, 8, 9, 10 (the .ghost branch produces no successors;
+    // x = 10 is terminal since x < 10 disables the first disjunct there).
+    assert_eq!(
+        outcome.stats.states_distinct, 6,
+        "expected 6 distinct states (x=5..10), got {}",
+        outcome.stats.states_distinct
     );
 }
 

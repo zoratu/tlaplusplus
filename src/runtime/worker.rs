@@ -586,9 +586,62 @@ pub(super) fn run_worker<M: Model>(
             continue;
         }
 
-        #[allow(unused_variables)]
         let successors_before_filter = successors.len();
         local_states_generated += successors.len() as u64;
+
+        // Terminal-state deadlock detection (TLC's default deadlock check).
+        // A reachable state with no successors under Next has no enabled
+        // action — a deadlock. We use the RAW successor count (before the
+        // state/action-constraint filter below) so that "no action enabled"
+        // is what triggers the report, matching TLC's next-state-relation
+        // semantics rather than a constraint-induced dead end. Gated on the
+        // model opting in via `deadlock_check_enabled()` (TLA+ models, unless
+        // --allow-deadlock / CHECK_DEADLOCK FALSE; synthetic models never
+        // deadlock-check). Reported through the same violation channel + trace
+        // reconstruction as an invariant violation, honouring
+        // --stop-on-violation / --max-violations. A reached Assert(FALSE)
+        // above already `continue`d, so it takes priority over a deadlock.
+        if successors_before_filter == 0 && worker_model.deadlock_check_enabled() {
+            let trace = if let Some(ref pm) = worker_parent_map {
+                let sm = worker_state_map
+                    .as_ref()
+                    .expect("state_map missing but parent_map present");
+                let mut chain = vec![state.clone()];
+                let mut fp = worker_model.fingerprint(&state);
+                while let Some(parent_fp_entry) = pm.get(&fp) {
+                    let parent_fp = *parent_fp_entry;
+                    if let Some(parent_state) = sm.get(&parent_fp) {
+                        chain.push(parent_state.clone());
+                        fp = parent_fp;
+                    } else {
+                        break;
+                    }
+                }
+                chain.reverse();
+                chain
+            } else {
+                reconstruct_trace_limited(worker_model.as_ref(), &state, 100)
+                    .unwrap_or_else(|| vec![state.clone()])
+            };
+            let _ = worker_violation_tx.try_send(Violation {
+                message: "Deadlock reached: state has no successor states".to_string(),
+                state: state.clone(),
+                property_type: PropertyType::Deadlock,
+                trace,
+            });
+            let prev_count = worker_violation_count.fetch_add(1, Ordering::AcqRel);
+            let should_stop =
+                worker_stop_on_violation && (prev_count + 1) >= worker_max_violations;
+            if should_stop {
+                worker_stop.store(true, Ordering::Release);
+                worker_queue.finish();
+            }
+            worker_queue.worker_idle(worker_state.id());
+            if should_stop {
+                break;
+            }
+            continue;
+        }
 
         // Filter successors by state constraints (prune states that don't satisfy constraints)
         successors.retain(|next_state| {
