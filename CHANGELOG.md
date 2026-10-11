@@ -1,5 +1,31 @@
 # Changelog
 
+## v1.2.32 (2026-10-11)
+
+Soundness fix for a missed-violation / under-exploration bug (#201, PR #204).
+
+### Guard followed by a parenthesized or single-branch action disjunction dropped successors
+
+A `Next` branch of the shape `guard /\ (Action \/ FALSE)` — or the bulleted `guard /\ (\/ Action)` — where `Action` is an operator-call (so its prime is hidden behind the operator name) silently produced no successor. The state space was under-explored and invariant violations were missed. Reported with a precise shape-by-shape table by @kylezh.
+
+```tla
+Arm  == ph = "pend" /\ ph' = "ok" /\ UNCHANGED pc
+Body == pc = "a" /\ pc' = "b" /\ UNCHANGED ph
+Next == Arm \/ (ph = "ok" /\ (Body \/ FALSE))   \* was: 2 states, no violation; now: 3 states, violation (matches TLC)
+```
+
+Root cause: on the compiled evaluation path, the guarded clause `(Body \/ FALSE)` was handed to the disjunct splitter with its outer parentheses still attached. A `Paren(Or)` classifies as a single non-root disjunct, a `len <= 1` check bailed, and the clause fell through to *boolean* guard evaluation — which evaluates the operator-call `Body` in value context and drops its prime. The interpreted path already stripped the parentheses before splitting; the compiled path did not.
+
+The fix strips the redundant outer parentheses before splitting (mirroring the interpreted path), handles the single-bulleted (`\/ Body`) and nested-disjunction cases, treats a literal `FALSE` disjunct as a never-enabled branch, and recognizes inline primed/`UNCHANGED` actions in addition to operator calls — while leaving parameterized operator-call actions on their existing argument-aliasing path (no regression to #180).
+
+### Testing — metamorphic generator
+
+Because the failure is a *silent* missed successor (a crash/hang fuzzer can't see it), this adds a metamorphic generator (`tests/splitter_metamorphic_issue_201.rs`): wrapping any action node in a semantics-preserving degenerate junction — `(X)`, `(X \/ FALSE)`, `(FALSE \/ X)`, `(X \/ X)`, `\/ X` — must not change the successor set, checked over a bounded state space with the same evaluator on the un-wrapped form as the oracle (no TLC, no second evaluator). It found two further bugs in the same family during development, both fixed here, and runs clean at `PROPTEST_CASES=8000`. Pinned minimal repros live in `tests/guard_disjunction_issue_201.rs`.
+
+Two closely-related shapes remain open follow-ups (documented in the generator, which is scoped to exclude them): a guard plus an *inline* primed action in certain parenthesizations, and a guard plus a *lone parenthesized* operator call with no disjunction (`g /\ (OpA)`).
+
+Validation: lib tests 1130/0, `scripts/diff_tlc.sh` 23/23, plus the full GitHub Actions matrix (`cargo test --release` x86_64 + aarch64, `--features symbolic-init`, `--features failpoints`, and `tlaplusplus vs TLC` on both arches) green on the merged PR.
+
 ## v1.2.31 (2026-10-11)
 
 The first tagged release since v1.2.30 (2026-07-10). Alongside new simulation/chaos random-selection work, it collects the substantial soundness, performance, verification, and CI backlog that has landed on `main` since — PRs #166–#202. Model-checking semantics move strictly toward TLC parity (a large cluster of under-exploration and false-violation fixes); there are no intended behavior regressions.
