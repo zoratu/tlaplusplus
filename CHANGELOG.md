@@ -1,5 +1,35 @@
 # Changelog
 
+## v1.2.34 (2026-10-11)
+
+Lands a batch of correctness and test-hardening work that had been developed and validated earlier but not yet merged (PRs #197, #198, #199, #200). Each fix was re-confirmed as a live issue on the v1.2.33 codebase, rebased, and revalidated (full test matrix + `scripts/diff_tlc.sh`) before merge.
+
+### Terminal-state deadlock detection (#197)
+
+tlaplusplus previously had **no** terminal-deadlock detection: a reachable state with no successor under `Next` was silently accepted as an exploration leaf, so the checker always behaved as if TLC's `-deadlock` were passed and could not report a deadlock even when asked. It now reports such a state as a deadlock, matching TLC's default.
+
+- New `Model::deadlock_check_enabled()` trait method (default `false`, so synthetic/stress models that legitimately reach terminal states are unaffected); `TlaModel` enables it unless `--allow-deadlock` or `CHECK_DEADLOCK FALSE` is set.
+- The trigger is "no action enabled" — measured on the raw successor count, before state/action-constraint filtering, matching TLC's next-state relation.
+- New `PropertyType::Deadlock`, reported through the existing violation/trace channel and honoring `--stop-on-violation` / `--max-violations`.
+
+### Bare `<>[]P` liveness properties were left unchecked (#198)
+
+A top-level `PROPERTY` of the shape `<>[]P` (eventually-always) was silently never checked: the liveness-shape matcher recognized only the compound `[](P => <>[]Q)`, so a bare `<>[]P` fell through and no checker ran — the spec explored fully and reported no violation even where TLC finds one. This is a soundness false-negative (a missed violation is indistinguishable from a genuine hold), observed on a 12.39M-state production spec.
+
+The matcher now also accepts bare `<>[]P`, desugaring it to `[](TRUE => <>[]P)` and routing it through the existing backward-reachability liveness checker, with terminal quiescent `¬P` states correctly treated as fair recurrence.
+
+### Action-splitter parser hang (#200)
+
+A new structured fuzz target (`fuzz/fuzz_targets/fuzz_action_splitter.rs`) found a genuine non-termination: input of the form `LET <name> [` (a LET binding followed by an unterminated function-argument bracket) spun forever in the v2 expression parser's `parse_let`, whose function-argument loop lacked the end-of-input guard its sibling operator-parameter loop already had. Fixed with a one-arm `Tok::Eof => break`; the malformed LET now returns an error and falls back cleanly.
+
+Also adds the first differential-gate spec exercising `SYMMETRY` (`corpus/internals/SymmetryReduction.{tla,cfg}`) and a metamorphic test asserting symmetry reduction preserves the verdict and strictly reduces the state count — closing a coverage hole, since symmetry lives on the fingerprint path the raw-model gate can't reach.
+
+### Unnamed-INSTANCE re-export hardening (#199)
+
+Adds regression coverage pinning the flatten-before-merge ordering invariant for transitively re-exported operators through unnamed `INSTANCE M` chains (`Rest <- Shared <- Top`, and a three-level nesting), so a future parse/merge refactor cannot silently drop them. Also makes the "module not found" warning actionable — it now names the consequence (re-exported operators become unresolved and later fail as "unknown operator") and the likely causes (module name spelling/case, search path). No behavior change beyond the warning text.
+
+Validation: lib tests 1133/0, `scripts/diff_tlc.sh` 24/24, and the full GitHub Actions matrix (`cargo test --release` on x86_64 + aarch64, `--features symbolic-init`, `--features failpoints`, and `tlaplusplus vs TLC` on both arches) green on each merged PR.
+
 ## v1.2.33 (2026-10-11)
 
 Follow-up soundness fix to v1.2.32, closing the last two shapes in the #201 family (PR #206).
