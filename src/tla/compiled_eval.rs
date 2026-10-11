@@ -3503,11 +3503,23 @@ fn guard_disjunct_contains_action(disjunct: &str, branch: &CompiledActionBranch<
             .iter()
             .any(|d| guard_disjunct_contains_action(d, branch, depth + 1));
     }
-    // Leaf: a single action call that resolves to an action.
+    // Leaf: an operator call that resolves to an action, ...
     if let Some((name, _args)) = crate::tla::eval::parse_action_call_expr(inner) {
-        return def_call_is_transitively_action(&name, &branch.ctx, 0);
+        if def_call_is_transitively_action(&name, &branch.ctx, 0) {
+            return true;
+        }
     }
-    false
+    // ... or an INLINE action — a primed assignment / `UNCHANGED` written out in
+    // place (e.g. `pc' = "b" /\ UNCHANGED ph`) rather than behind an operator
+    // name. Detecting only operator calls here would drop the successors of a
+    // guarded inline disjunct such as `(g /\ (pc' = v \/ FALSE))`.
+    let synthetic = crate::tla::TlaDefinition {
+        name: "<disjunct>".to_string(),
+        params: Vec::new(),
+        body: inner.to_string(),
+        is_recursive: false,
+    };
+    crate::tla::action_ir::looks_like_action(&synthetic)
 }
 
 fn try_eval_guard_disjunction_as_action<'a>(
