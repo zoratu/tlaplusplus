@@ -3470,43 +3470,123 @@ fn extract_body_call_idents(body: &str) -> Vec<String> {
 /// `\E ... :` binder and parentheses) to a user-defined *action*. Returns
 /// `Ok(None)` when the text is not such a disjunction (caller falls through to
 /// the single-action-call check and, ultimately, boolean guard evaluation).
+/// Does this one disjunct of a guard-level disjunction (eventually) contain a
+/// user-defined *action*? Recurses through redundant parens, a leading
+/// `\E <binders> :`, and NESTED disjunctions — so a disjunct that is itself a
+/// (possibly single-bulleted, possibly parenthesized) disjunction of actions,
+/// e.g. `(\/ (OpA \/ OpB))`, is recognised. A flat `parse_action_call_expr`
+/// alone misses those, which left `(... /\ (\/ (A \/ B)))` dropping successors
+/// even after the issue-#201 paren-strip fix (found by the metamorphic
+/// generator in tests/splitter_metamorphic_issue_201.rs).
+fn guard_disjunct_contains_action(disjunct: &str, branch: &CompiledActionBranch<'_>, depth: usize) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    let mut inner = strip_outer_parens_str(disjunct.trim());
+    // Peel a leading `\E <binders> : <body>` so `\E j \in S : Act(i, j)` is
+    // recognised by its inner action.
+    while let Some(rest) = inner.strip_prefix("\\E") {
+        if let Some(colon) = crate::tla::compiled_expr::find_top_level_colon(rest) {
+            inner = strip_outer_parens_str(rest[colon + 1..].trim());
+        } else {
+            break;
+        }
+    }
+    // If this disjunct is itself a disjunction (multiple branches, or a single
+    // bulleted branch), recurse into its parts.
+    let sub = crate::tla::action_ir::split_action_body_disjuncts(inner);
+    if sub.len() > 1 || inner.trim_start().starts_with("\\/") {
+        // `split_action_body_disjuncts` strips a lone leading bullet, so for a
+        // single-bullet disjunct `\/ X` it returns `[X]` — recursing on `X`
+        // makes progress (no infinite loop) and the depth guard backstops it.
+        return sub
+            .iter()
+            .any(|d| guard_disjunct_contains_action(d, branch, depth + 1));
+    }
+    // Leaf: an operator call that resolves to an action, ...
+    if let Some((name, _args)) = crate::tla::eval::parse_action_call_expr(inner) {
+        if def_call_is_transitively_action(&name, &branch.ctx, 0) {
+            return true;
+        }
+    }
+    // ... or an INLINE action — a primed assignment / `UNCHANGED` written out in
+    // place (e.g. `pc' = "b" /\ UNCHANGED ph`) rather than behind an operator
+    // name. Detecting only operator calls here would drop the successors of a
+    // guarded inline disjunct such as `(g /\ (pc' = v \/ FALSE))`.
+    let synthetic = crate::tla::TlaDefinition {
+        name: "<disjunct>".to_string(),
+        params: Vec::new(),
+        body: inner.to_string(),
+        is_recursive: false,
+    };
+    crate::tla::action_ir::looks_like_action(&synthetic)
+}
+
 fn try_eval_guard_disjunction_as_action<'a>(
     text: &str,
     branch: &CompiledActionBranch<'a>,
 ) -> Result<Option<Vec<CompiledActionBranch<'a>>>> {
-    let disjuncts = crate::tla::action_ir::split_action_body_disjuncts(text);
-    if disjuncts.len() <= 1 {
+    // Strip a redundant outer paren so `(A \/ B)` is seen as a ROOT disjunction
+    // rather than a parenthesized leaf. Mirrors the interpreted sibling
+    // (`eval_disjunctive_action_body_multi`, eval/action.rs), which strips before
+    // splitting. Without this, `(Body \/ FALSE)` classifies as a non-root `Or`
+    // and `split_action_body_disjuncts` returns ONE disjunct (issue #201).
+    let body = strip_outer_parens_str(text);
+    let disjuncts = crate::tla::action_ir::split_action_body_disjuncts(body);
+    if disjuncts.is_empty() {
         return Ok(None);
     }
 
-    let mut any_action = false;
-    for disjunct in &disjuncts {
-        // Peel a leading `\E <binders> : <body>` so `\E j \in S : Act(i, j)`
-        // is recognised by its inner action call.
-        let mut inner = strip_outer_parens_str(disjunct.trim());
-        while let Some(rest) = inner.strip_prefix("\\E") {
-            if let Some(colon) = crate::tla::compiled_expr::find_top_level_colon(rest) {
-                inner = strip_outer_parens_str(rest[colon + 1..].trim());
-            } else {
-                break;
+    // A single, non-disjunction clause that is a *parameterized* operator-call
+    // action (e.g. `Shift(x)` where `Shift(q) == q' = ...`) must NOT be routed
+    // here: it needs the argument-aliasing textual substitution in
+    // `execute_branch`'s operator-call path (PR #180), which naive routing
+    // through `eval_action_body_multi` would bypass (leaking a phantom `q`
+    // variable). Leave it to that specialized path. Disjunctions, nullary
+    // operator calls, and inline actions are all routed below.
+    let is_single_plain = disjuncts.len() == 1 && !body.trim_start().starts_with("\\/");
+    if is_single_plain {
+        let single = strip_outer_parens_str(disjuncts[0].trim());
+        if let Some((_name, args)) = crate::tla::eval::parse_action_call_expr(single) {
+            if !args.is_empty() {
+                return Ok(None);
             }
         }
-        let Some((name, _args)) = crate::tla::eval::parse_action_call_expr(inner) else {
-            continue;
-        };
-        if def_call_is_transitively_action(&name, &branch.ctx, 0) {
-            any_action = true;
-            break;
-        }
     }
+
+    // Route to the action evaluator iff a real action is present — whether the
+    // clause is a disjunction (`A \/ B`, `\/ A`, `(A \/ FALSE)`) OR a single
+    // parenthesized/plain action (`(OpA)`): a guard-classified clause that is
+    // actually an operator-call or inline action must not be boolean-evaluated,
+    // which silently drops its prime and the successor (issue #201 and family).
+    // `guard_disjunct_contains_action` is the gate, so a pure *boolean* clause
+    // (`x = 1`, `\/ x = 1`, `(x = 1 \/ y = 2)`) is NOT an action and falls
+    // through here to ordinary boolean guard evaluation.
+    let any_action = disjuncts
+        .iter()
+        .any(|d| guard_disjunct_contains_action(d, branch, 0));
 
     if !any_action {
         return Ok(None);
     }
 
+    // Route through the interpreted action-body evaluator, which stages each
+    // disjunct's primes correctly. For a single-branch bulleted disjunction hand
+    // it the bullet-stripped disjunct (`Body`) rather than the raw `\/ Body`, so
+    // the interpreted side's own single-disjunct guard doesn't bounce it back to
+    // boolean clause evaluation. For a genuine multi-branch body the stripped
+    // `body` is equivalent to `text` (the interpreted entry strips parens too).
+    let routed_body: String = if disjuncts.len() == 1 {
+        // Strip any residual parens so a single disjunct like `(OpA)` (e.g. from
+        // `\/ (OpA)`) reaches the evaluator as `OpA`; a parenthesized lone
+        // operator call otherwise fails to resolve and yields no successor.
+        strip_outer_parens_str(disjuncts[0].trim()).to_string()
+    } else {
+        body.to_string()
+    };
     let outer_ctx = branch.ctx.clone();
     let interpreted_branches =
-        crate::tla::eval::eval_action_body_multi(text, &branch.ctx, &branch.staged)?;
+        crate::tla::eval::eval_action_body_multi(&routed_body, &branch.ctx, &branch.staged)?;
     let mut out = Vec::with_capacity(interpreted_branches.len());
     for (staged, unchanged_vars) in interpreted_branches {
         let mut merged_unchanged = branch.unchanged_vars.clone();

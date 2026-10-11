@@ -518,6 +518,19 @@ fn execute_branch(
         return Err(anyhow!("empty branch expression"));
     }
 
+    // The boolean literal `FALSE` is a never-enabled action: it contributes no
+    // successors (TLC semantics). It arises as a disjunct of a degenerate
+    // junction, e.g. the `FALSE` in `A \/ FALSE` / `(FALSE \/ A)` (issue #201
+    // family). Without this it parses as a nullary action call named `FALSE`,
+    // falls through to the operator-call path, and errors with
+    // "unknown action 'FALSE'" — which, in a multi-disjunct Next, is swallowed
+    // as a disabled branch and can drop the *sibling* action's successors too.
+    // (A non-literal false guard like `(1 = 2)` already routes to the inline
+    // guard path and yields no successors; only the literal mis-parses.)
+    if trimmed == "FALSE" {
+        return Ok(Vec::new());
+    }
+
     // Handle nested disjunctions: \/ A \/ B \/ C
     // This happens when a quantifier body contains disjunctions, e.g.:
     //   \E op \in pendingOps : \/ JournalOperation(op) \/ CommitOperation(op)
