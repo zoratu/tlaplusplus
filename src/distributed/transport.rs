@@ -8,7 +8,14 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
 use super::ClusterConfig;
-use super::protocol::{Message, decode_message, encode_message};
+use super::protocol::{
+    CLUSTER_PROTO_VERSION, Handshake, Message, constant_time_eq, decode_message, encode_message,
+};
+
+/// Maximum accepted size of the handshake frame. The handshake is tiny (a
+/// version, a node id, and a token), so anything larger is a malformed or
+/// hostile peer.
+const HANDSHAKE_MAX_LEN: usize = 64 * 1024;
 
 /// Shorthand for the `Send`-able boxed future returned by [`Transport`] methods.
 ///
@@ -80,12 +87,26 @@ impl ClusterTransport {
 
         // Spawn acceptor task.
         let t = Arc::clone(&transport);
+        // Clone the expected token once; each accepted connection gets its own
+        // clone so the authentication check does not touch the shared config.
+        let expected_token = t.config.auth_token.clone();
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
-                    Ok((stream, _addr)) => {
+                    Ok((mut stream, _addr)) => {
                         let tx = t.inbound_tx.clone();
-                        tokio::spawn(Self::handle_inbound(stream, tx));
+                        let expected = expected_token.clone();
+                        tokio::spawn(async move {
+                            // Authenticate the peer before processing any
+                            // message: an unauthenticated connection never
+                            // reaches `decode_message`.
+                            match Self::verify_inbound_handshake(&mut stream, &expected).await {
+                                Ok(_peer_id) => Self::handle_inbound(stream, tx).await,
+                                Err(e) => {
+                                    eprintln!("[cluster] rejected inbound connection: {e}")
+                                }
+                            }
+                        });
                     }
                     Err(e) => {
                         eprintln!("[cluster] accept error: {e}");
@@ -111,10 +132,15 @@ impl ClusterTransport {
                 idx as u32
             };
 
-            let stream = TcpStream::connect(peer_addr)
+            let mut stream = TcpStream::connect(peer_addr)
                 .await
                 .with_context(|| format!("failed to connect to peer {peer_id} at {peer_addr}"))?;
             stream.set_nodelay(true).ok();
+            // Present our handshake (version + token) as the first frame; the
+            // peer's acceptor verifies it before reading any message.
+            Self::write_handshake(&mut stream, &self.config)
+                .await
+                .with_context(|| format!("handshake to peer {peer_id} at {peer_addr} failed"))?;
             self.connections
                 .insert(peer_id, Arc::new(tokio::sync::Mutex::new(stream)));
         }
@@ -167,6 +193,79 @@ impl ClusterTransport {
     /// The node ID of this transport.
     pub fn node_id(&self) -> u32 {
         self.config.node_id
+    }
+
+    /// Write this node's handshake (version + token) as the first framed
+    /// message on an outbound connection.
+    async fn write_handshake(stream: &mut TcpStream, config: &ClusterConfig) -> Result<()> {
+        let h = Handshake {
+            proto_version: CLUSTER_PROTO_VERSION,
+            node_id: config.node_id,
+            token: config.auth_token.clone().unwrap_or_default(),
+        };
+        let payload = bincode::serialize(&h).context("failed to serialize handshake")?;
+        let len = payload.len() as u32;
+        stream
+            .write_all(&len.to_be_bytes())
+            .await
+            .context("failed to write handshake length")?;
+        stream
+            .write_all(&payload)
+            .await
+            .context("failed to write handshake payload")?;
+        stream.flush().await?;
+        Ok(())
+    }
+
+    /// Read the inbound handshake and verify protocol version + token.
+    ///
+    /// Returns the peer's declared node id on success. On any failure
+    /// (truncated frame, oversized frame, version mismatch, bad token) the
+    /// caller drops the connection without reading any [`Message`].
+    async fn verify_inbound_handshake(
+        stream: &mut TcpStream,
+        expected_token: &Option<String>,
+    ) -> Result<u32> {
+        let mut len_buf = [0u8; 4];
+        stream
+            .read_exact(&mut len_buf)
+            .await
+            .context("failed to read handshake length")?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len == 0 || len > HANDSHAKE_MAX_LEN {
+            anyhow::bail!("handshake frame length {len} out of range");
+        }
+        let mut payload = vec![0u8; len];
+        stream
+            .read_exact(&mut payload)
+            .await
+            .context("failed to read handshake payload")?;
+        let h: Handshake =
+            bincode::deserialize(&payload).context("failed to decode handshake")?;
+        if h.proto_version != CLUSTER_PROTO_VERSION {
+            anyhow::bail!(
+                "protocol version mismatch: peer sent {}, local is {}",
+                h.proto_version,
+                CLUSTER_PROTO_VERSION
+            );
+        }
+        // Open mode: when the server has no token configured (None or empty),
+        // authentication is disabled and any peer is accepted — the legacy
+        // behavior documented on `ClusterConfig::auth_token`. Only enforce the
+        // token when the server actually has one, so a token-bearing client
+        // talking to a token-less server is not spuriously rejected.
+        match expected_token.as_deref() {
+            Some(expected) if !expected.is_empty() => {
+                if !constant_time_eq(h.token.as_bytes(), expected.as_bytes()) {
+                    anyhow::bail!(
+                        "authentication failed for inbound peer (node {})",
+                        h.node_id
+                    );
+                }
+            }
+            _ => {}
+        }
+        Ok(h.node_id)
     }
 
     /// Handle a single inbound TCP connection: read framed messages and
@@ -386,6 +485,64 @@ impl Transport for MockTransport {
 #[cfg(test)]
 mod mock_tests {
     use super::*;
+
+    /// Drive `write_handshake` (client side) against `verify_inbound_handshake`
+    /// (server side) over a real loopback socket, returning the server's result.
+    async fn handshake_roundtrip(
+        client_token: Option<String>,
+        server_expected: Option<String>,
+    ) -> Result<u32> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            ClusterTransport::verify_inbound_handshake(&mut stream, &server_expected).await
+        });
+
+        let client_cfg = ClusterConfig {
+            node_id: 7,
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            peers: vec![],
+            auth_token: client_token,
+        };
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        ClusterTransport::write_handshake(&mut stream, &client_cfg)
+            .await
+            .unwrap();
+
+        server.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn handshake_accepts_matching_token() {
+        let r = handshake_roundtrip(Some("s3cr3t".into()), Some("s3cr3t".into())).await;
+        assert_eq!(r.unwrap(), 7, "matching token must authenticate");
+    }
+
+    #[tokio::test]
+    async fn handshake_rejects_wrong_token() {
+        let r = handshake_roundtrip(Some("wrong".into()), Some("s3cr3t".into())).await;
+        assert!(r.is_err(), "mismatched token must be rejected");
+    }
+
+    #[tokio::test]
+    async fn handshake_rejects_missing_token_when_required() {
+        let r = handshake_roundtrip(None, Some("s3cr3t".into())).await;
+        assert!(
+            r.is_err(),
+            "peer with no token must be rejected when server requires one"
+        );
+    }
+
+    #[tokio::test]
+    async fn handshake_open_mode_accepts_any() {
+        // Server with no token configured accepts any peer (legacy behavior).
+        let r = handshake_roundtrip(Some("whatever".into()), None).await;
+        assert_eq!(r.unwrap(), 7);
+        let r2 = handshake_roundtrip(None, None).await;
+        assert_eq!(r2.unwrap(), 7);
+    }
 
     #[tokio::test]
     async fn mock_transport_routes_messages_between_nodes() {

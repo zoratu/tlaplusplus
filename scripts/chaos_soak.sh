@@ -39,7 +39,12 @@
 #                         [--per-iter-timeout SECS]
 #                         [--checkpoint-interval SECS]
 #                         [--queue-max-inmem SECS]
-#                         [--swarm-mode N|auto]
+#                         [--swarm-mode N|auto] [--seed N]
+#
+# Pass --seed N to reproduce a prior run's failpoint/action selection
+# sequence (the seed is printed on every run and saved to <workdir>/seed.txt).
+# Every divergence/hang also logs the exact FAILPOINTS string and a
+# copy-pasteable single-iteration replay command.
 #
 # Defaults target CheckpointDrain (~26K distinct), 1 hour soak,
 # checkpoint-interval=2s + small queue-max-inmem to drive the spill path.
@@ -74,6 +79,11 @@ SUMMARY_OUT=""
 # size); "auto" picks a random N in [1, SWARM_MAX] each iter.
 SWARM_MODE=1
 SWARM_MAX=4
+# Master RNG seed. Empty = pick a fresh random seed and print it. Passing an
+# explicit --seed reproduces the same failpoint/action selection *sequence*
+# (per iteration index), which — together with the per-iteration FAILPOINTS
+# string logged for every divergence/hang — makes a failing run replayable.
+SEED=""
 
 # ---- arg parsing -----------------------------------------------------------
 while [[ $# -gt 0 ]]; do
@@ -91,13 +101,33 @@ while [[ $# -gt 0 ]]; do
     --summary-out) SUMMARY_OUT="$2"; shift 2 ;;
     --swarm-mode) SWARM_MODE="$2"; shift 2 ;;
     --swarm-max) SWARM_MAX="$2"; shift 2 ;;
+    --seed) SEED="$2"; shift 2 ;;
     -h|--help)
-      sed -n '1,40p' "$0"
+      sed -n '1,48p' "$0"
       exit 0
       ;;
     *) echo "Unknown arg: $1" >&2; exit 2 ;;
   esac
 done
+
+# ---- seed the RNG ----------------------------------------------------------
+# Every random choice downstream (swarm size via rand_below, the Fisher-Yates
+# shuffle in pick_k_failpoints via awk srand, and the action choice in
+# pick_action) draws from bash $RANDOM. Seeding $RANDOM once here makes the
+# whole selection sequence a deterministic function of SEED, so a run can be
+# reproduced with --seed <SEED>. Must happen before the first $RANDOM read.
+if [[ -z "${SEED}" ]]; then
+  if [[ -r /dev/urandom ]]; then
+    SEED=$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')
+  else
+    SEED=$(( $$ ^ $(date +%s) ))
+  fi
+fi
+if ! [[ "${SEED}" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: --seed must be a non-negative integer, got: ${SEED}" >&2
+  exit 2
+fi
+RANDOM="${SEED}"
 
 # ---- swarm-mode validation -------------------------------------------------
 if [[ "${SWARM_MODE}" != "auto" ]] && ! [[ "${SWARM_MODE}" =~ ^[0-9]+$ ]]; then
@@ -152,6 +182,9 @@ fi
 mkdir -p "${WORKDIR_BASE}"
 LOG_DIR="${WORKDIR_BASE}/logs"
 mkdir -p "${LOG_DIR}"
+# Persist the seed so a run (especially a CI run) is reproducible after the
+# fact even if its stdout scrolled away.
+echo "${SEED}" > "${WORKDIR_BASE}/seed.txt"
 ITER_TSV="${WORKDIR_BASE}/iterations.tsv"
 # T16b: `failpoint` and `action` columns now contain comma-joined lists when
 # --swarm-mode > 1 fires multiple failpoints concurrently. `swarm_n` records
@@ -382,6 +415,7 @@ echo "  workdir:     ${WORKDIR_BASE}"
 echo "  duration:    ${DURATION_SECS}s"
 echo "  per-iter:    ${PER_ITER_TIMEOUT}s"
 echo "  workers:     ${WORKERS}"
+echo "  seed:        ${SEED}  (reproduce with --seed ${SEED})"
 echo "  ckpt-int:    ${CHECKPOINT_INTERVAL}s"
 if [[ -n "${QUEUE_FLAG}" ]]; then
   echo "  queue-cap:   ${QUEUE_MAX_INMEM} items"
@@ -530,7 +564,7 @@ while (( $(date +%s) < DEADLINE )); do
     # exit 0 means the run completed — must match control
     if [[ "${DISTINCT}" != "${CTRL_DISTINCT}" ]] || [[ "${VERDICT}" != "${CTRL_VERDICT}" ]]; then
       divergent="yes"
-      notes="exit=0 but distinct=${DISTINCT}/verdict=${VERDICT} != control(${CTRL_DISTINCT}/${CTRL_VERDICT}) [n=${swarm_n} fps=${fp_names_csv}]"
+      notes="exit=0 but distinct=${DISTINCT}/verdict=${VERDICT} != control(${CTRL_DISTINCT}/${CTRL_VERDICT}) [n=${swarm_n} fps=${fp_names_csv}] seed=${SEED} FAILPOINTS=${fp_env}"
       for n in "${fp_names[@]}"; do
         DIVERGE_COUNT["${n}"]=$(( DIVERGE_COUNT["${n}"] + 1 ))
       done
@@ -542,13 +576,25 @@ while (( $(date +%s) < DEADLINE )); do
       HANG_COUNT["${n}"]=$(( HANG_COUNT["${n}"] + 1 ))
     done
     TOTAL_HANGS=$(( TOTAL_HANGS + 1 ))
-    notes="timed out (possible hang) after ${WALL}ms [n=${swarm_n} fps=${fp_names_csv}]"
+    notes="timed out (possible hang) after ${WALL}ms [n=${swarm_n} fps=${fp_names_csv}] seed=${SEED} FAILPOINTS=${fp_env}"
   else
     # graceful non-zero exit — expected for permanent failpoints
     for n in "${fp_names[@]}"; do
       EXIT_FAIL_COUNT["${n}"]=$(( EXIT_FAIL_COUNT["${n}"] + 1 ))
     done
     notes="graceful exit ${EC}"
+  fi
+
+  if [[ "${divergent}" == "yes" ]] || [[ "${EC}" -eq 124 ]] || [[ "${EC}" -eq 137 ]]; then
+    # Emit a copy-pasteable command that reproduces *this* iteration directly
+    # (bit-for-bit identical to what run_one executed, minus the timeout
+    # wrapper). This is the per-iteration replay artifact the Bug Bash
+    # playbook's determinism strategy calls for.
+    echo "  REPLAY (seed=${SEED}, iter=${ITER}):"
+    echo "    FAILPOINTS='${fp_env}' '${BINARY_PATH}' run-tla \\"
+    echo "      --module '${MODULE_PATH}' --config '${CONFIG_PATH}' \\"
+    echo "      --workers ${WORKERS} --work-dir '${iter_wd}' \\"
+    echo "      --checkpoint-interval-secs ${CHECKPOINT_INTERVAL} ${QUEUE_FLAG} --skip-system-checks"
   fi
 
   if [[ "${divergent}" == "yes" ]]; then
@@ -582,6 +628,7 @@ SOAK_WALL=$(( SOAK_END - SOAK_START ))
   echo "ended:         $(date -d @${SOAK_END} -u +%FT%TZ)"
   echo "wall:          ${SOAK_WALL}s (target: ${DURATION_SECS}s)"
   echo "iterations:    ${ITER}"
+  echo "seed:          ${SEED}  (reproduce with --seed ${SEED})"
   echo "spec:          ${SPEC_NAME}"
   echo "control:       distinct=${CTRL_DISTINCT} verdict=${CTRL_VERDICT}"
   echo "binary:        ${BINARY_PATH}"
