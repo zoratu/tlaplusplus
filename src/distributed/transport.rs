@@ -249,9 +249,21 @@ impl ClusterTransport {
                 CLUSTER_PROTO_VERSION
             );
         }
-        let expected = expected_token.clone().unwrap_or_default();
-        if !constant_time_eq(h.token.as_bytes(), expected.as_bytes()) {
-            anyhow::bail!("authentication failed for inbound peer (node {})", h.node_id);
+        // Open mode: when the server has no token configured (None or empty),
+        // authentication is disabled and any peer is accepted — the legacy
+        // behavior documented on `ClusterConfig::auth_token`. Only enforce the
+        // token when the server actually has one, so a token-bearing client
+        // talking to a token-less server is not spuriously rejected.
+        match expected_token.as_deref() {
+            Some(expected) if !expected.is_empty() => {
+                if !constant_time_eq(h.token.as_bytes(), expected.as_bytes()) {
+                    anyhow::bail!(
+                        "authentication failed for inbound peer (node {})",
+                        h.node_id
+                    );
+                }
+            }
+            _ => {}
         }
         Ok(h.node_id)
     }
