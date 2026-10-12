@@ -95,3 +95,13 @@ path = "fuzz_targets/fuzz_tla_swarm.rs"
 test = false
 doc = false
 bench = false
+
+# Structure-aware parser+evaluator target: generates typed TLA+ expressions
+# and drives eval_expr (parse + evaluate) under a per-eval budget, reaching
+# deep evaluator paths the byte-level fuzz_tla_module rarely hits.
+[[bin]]
+name = "fuzz_tla_expr_eval"
+path = "fuzz_targets/fuzz_tla_expr_eval.rs"
+test = false
+doc = false
+bench = false

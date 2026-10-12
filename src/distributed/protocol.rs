@@ -194,6 +194,42 @@ pub enum RedDfsOutcome {
 /// `max_red_dfs_hops`.
 pub const MAX_RED_DFS_HOPS: usize = 1024;
 
+/// Wire-protocol version, bumped whenever the handshake or message framing
+/// changes incompatibly. A peer presenting a different version is rejected at
+/// handshake time rather than left to mis-decode later messages.
+pub const CLUSTER_PROTO_VERSION: u32 = 1;
+
+/// First framed message on every cluster connection, sent by the connecting
+/// node and verified by the accepting node before any [`Message`] is processed.
+///
+/// Carries the protocol version (so mismatched builds are rejected cleanly) and
+/// the pre-shared authentication token. When the accepting node has a token
+/// configured, the presented token must match it exactly (constant-time
+/// comparison); when it has none, any token is accepted (legacy open mode).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Handshake {
+    pub proto_version: u32,
+    pub node_id: u32,
+    /// Pre-shared token, or empty string when none is configured.
+    pub token: String,
+}
+
+/// Constant-time byte-slice equality.
+///
+/// Returns as soon as the lengths differ (so the token *length* is not
+/// protected), but compares equal-length inputs without an early-out branch so
+/// a correct-length guess cannot be refined byte-by-byte via timing.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// Wire format: `[4-byte big-endian length][bincode payload]`.
 ///
 /// The 4-byte length prefix allows framing on a TCP stream so the receiver
@@ -538,6 +574,29 @@ mod tests {
             Message::RequestStateBlob { fps, .. } => assert_eq!(fps, vec![0xA, 0xB, 0xC]),
             _ => panic!("expected RequestStateBlob"),
         }
+    }
+
+    #[test]
+    fn constant_time_eq_matches_and_rejects() {
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(b"s3cr3t", b"s3cr3t"));
+        assert!(!constant_time_eq(b"s3cr3t", b"s3cr3T"));
+        assert!(!constant_time_eq(b"short", b"longer"));
+        assert!(!constant_time_eq(b"", b"x"));
+    }
+
+    #[test]
+    fn roundtrip_handshake() {
+        let h = Handshake {
+            proto_version: CLUSTER_PROTO_VERSION,
+            node_id: 3,
+            token: "hunter2".to_string(),
+        };
+        let bytes = bincode::serialize(&h).unwrap();
+        let got: Handshake = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(got.proto_version, CLUSTER_PROTO_VERSION);
+        assert_eq!(got.node_id, 3);
+        assert_eq!(got.token, "hunter2");
     }
 
     #[test]

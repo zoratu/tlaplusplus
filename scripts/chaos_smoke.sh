@@ -50,6 +50,9 @@ SUMMARY_OUT=""
 # Minimum failpoints we expect to fire over the smoke. The acceptance
 # criterion is >= 6 of the 12 in the catalog.
 MIN_FAILPOINTS_EXERCISED=6
+# Forwarded to chaos_soak.sh; empty = soak picks + prints a fresh seed. Pass
+# --seed N to reproduce a prior smoke run's failpoint selection sequence.
+SEED=""
 
 # ---- arg parsing -----------------------------------------------------------
 while [[ $# -gt 0 ]]; do
@@ -61,6 +64,7 @@ while [[ $# -gt 0 ]]; do
     --binary) BINARY_PATH="$2"; shift 2 ;;
     --summary-out) SUMMARY_OUT="$2"; shift 2 ;;
     --min-failpoints) MIN_FAILPOINTS_EXERCISED="$2"; shift 2 ;;
+    --seed) SEED="$2"; shift 2 ;;
     -h|--help)
       sed -n '1,40p' "$0"
       exit 0
@@ -102,6 +106,10 @@ echo "============================================================"
 # automatically — there is exactly one chaos test path, just two
 # durations.
 SOAK_EXIT=0
+SEED_ARGS=()
+if [[ -n "${SEED}" ]]; then
+  SEED_ARGS=(--seed "${SEED}")
+fi
 "${SCRIPT_DIR}/chaos_soak.sh" \
   --duration "${DURATION_SECS}" \
   --per-iter-timeout "${PER_ITER_TIMEOUT}" \
@@ -111,6 +119,7 @@ SOAK_EXIT=0
   --summary-out "${SUMMARY_OUT}" \
   --swarm-mode auto \
   --swarm-max 4 \
+  "${SEED_ARGS[@]}" \
   || SOAK_EXIT=$?
 
 echo

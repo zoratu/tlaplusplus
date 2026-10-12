@@ -116,6 +116,17 @@ pub(crate) fn handle(
         );
     }
 
+    // Opt-in per-state evaluation budget (0 = unlimited). Bounds each successor
+    // computation and invariant check so an untrusted/explosive spec cannot run
+    // the evaluator unbounded.
+    if runtime.eval_budget > 0 {
+        model = model.with_eval_budget(runtime.eval_budget);
+        eprintln!(
+            "Evaluation budget: {} elements per successor computation / invariant check",
+            runtime.eval_budget
+        );
+    }
+
     // Feature 7: Evaluate ASSUME statements before exploration
     evaluate_assumes(&model)?;
 
@@ -236,11 +247,8 @@ pub(crate) fn handle(
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
 
-        let cluster_config = ClusterConfig {
-            node_id: cluster.node_id,
-            listen_addr,
-            peers: peers.clone(),
-        };
+        let cluster_config =
+            ClusterConfig::with_env_auth(cluster.node_id, listen_addr, peers.clone());
         let num_nodes = cluster_config.num_nodes();
 
         // Build tokio runtime for cluster transport
@@ -339,11 +347,8 @@ pub(crate) fn handle(
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
 
-        let cluster_config = ClusterConfig {
-            node_id: cluster.node_id,
-            listen_addr,
-            peers: peers.clone(),
-        };
+        let cluster_config =
+            ClusterConfig::with_env_auth(cluster.node_id, listen_addr, peers.clone());
         let num_nodes = cluster_config.num_nodes();
 
         let tokio_rt = tokio::runtime::Runtime::new()

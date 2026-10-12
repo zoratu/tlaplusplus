@@ -15,12 +15,35 @@ use crate::tla::{
     evaluate_next_states_per_disjunct, evaluate_next_states_swarm,
     evaluate_next_states_with_instances, insert_compiled_action,
     looks_like_action, normalize_operator_ref_name, parse_tla_config, parse_tla_module_file,
-    split_action_body_disjuncts, split_top_level,
+    restore_eval_budget, set_active_eval_budget, split_action_body_disjuncts, split_top_level,
 };
 use anyhow::{Context, Result, anyhow};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::Arc;
+
+/// RAII guard that installs a fresh thread-local evaluation budget for the
+/// duration of one evaluation call and restores the previous budget on drop.
+///
+/// Created and dropped entirely within a single method call on a single worker
+/// thread — the `Rc` never escapes the thread, so it is sound despite `Rc` not
+/// being `Send`. When `installed` is false the guard is a true no-op (it does
+/// not touch the thread-local at all), so a model with no configured budget
+/// cannot clobber an ambient budget set by some other caller.
+struct EvalBudgetGuard {
+    installed: bool,
+    prev: Option<Rc<Cell<usize>>>,
+}
+
+impl Drop for EvalBudgetGuard {
+    fn drop(&mut self) {
+        if self.installed {
+            restore_eval_budget(self.prev.take());
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct TlaModel {
@@ -78,6 +101,13 @@ pub struct TlaModel {
     /// POR in this implementation preserves only safety properties; it is
     /// disabled automatically when fairness or liveness checking is active.
     pub por_analysis: Option<Arc<PorAnalysis>>,
+    /// Optional per-call evaluation budget. When `Some(n)`, each successor
+    /// computation (`next_states`) and each invariant check (`check_invariants`)
+    /// installs a fresh budget of `n` evaluation elements before evaluating, so
+    /// a single adversarial or accidentally-explosive state cannot run the
+    /// evaluator unbounded. `None` (the default) means unlimited, preserving
+    /// the historical behavior. Set via [`TlaModel::with_eval_budget`].
+    pub eval_budget: Option<usize>,
 }
 
 impl TlaModel {
@@ -311,6 +341,7 @@ impl TlaModel {
             trivial_next,
             por_analysis: None,
             streaming_init: false,
+            eval_budget: None,
         })
     }
 
@@ -327,6 +358,37 @@ impl TlaModel {
     pub fn with_streaming_init(mut self, on: bool) -> Self {
         self.streaming_init = on;
         self
+    }
+
+    /// Set a per-call evaluation budget (in evaluation elements) applied to each
+    /// successor computation and each invariant check. `0` means unlimited and
+    /// is normalized to `None`, matching the CLI convention. Opt-in; defaults to
+    /// unlimited. Use when model-checking an untrusted spec so a single state
+    /// cannot drive the evaluator unbounded (set comprehension over a huge
+    /// range, deep quantifier nest, etc.) — the offending branch yields an
+    /// evaluation error instead of exhausting memory/CPU.
+    pub fn with_eval_budget(mut self, budget: usize) -> Self {
+        self.eval_budget = if budget == 0 { None } else { Some(budget) };
+        self
+    }
+
+    /// Install the configured per-call eval budget for the duration of the
+    /// returned guard, or return a no-op guard when no budget is configured.
+    /// Called at the top of `next_states`/`check_invariants` so the budget is
+    /// active before any `EvalContext` is constructed (contexts capture the
+    /// active budget at construction time).
+    #[inline]
+    fn install_eval_budget(&self) -> EvalBudgetGuard {
+        match self.eval_budget {
+            Some(n) => EvalBudgetGuard {
+                installed: true,
+                prev: set_active_eval_budget(n),
+            },
+            None => EvalBudgetGuard {
+                installed: false,
+                prev: None,
+            },
+        }
     }
 
     /// Enable partial-order reduction.
@@ -499,6 +561,11 @@ impl Model for TlaModel {
     }
 
     fn next_states(&self, state: &Self::State, out: &mut Vec<Self::State>) {
+        // Opt-in per-call evaluation budget (unlimited unless configured). Must
+        // be installed before any EvalContext is built below, since contexts
+        // capture the active budget at construction. A no-op when unset.
+        let _budget = self.install_eval_budget();
+
         // Mark committed next-state generation: a reached `Assert(FALSE)` in the
         // action is a safety violation and is recorded on the reached-assertion
         // side channel (drained by the worker), rather than being masked as a
@@ -582,6 +649,10 @@ impl Model for TlaModel {
         if self.compiled_invariants.is_empty() {
             return Ok(());
         }
+
+        // Opt-in per-call evaluation budget (unlimited unless configured).
+        // Installed before the EvalContext below so the context inherits it.
+        let _budget = self.install_eval_budget();
 
         let ctx = EvalContext::with_definitions_and_instances(
             state,
@@ -753,6 +824,10 @@ impl Model for TlaModel {
         if !self.has_fairness_constraints() && !self.needs_graph_liveness_check() {
             return None;
         }
+
+        // Opt-in per-call evaluation budget (unlimited unless configured);
+        // installed before any EvalContext is built in the evaluation below.
+        let _budget = self.install_eval_budget();
 
         // Committed next-state generation (see next_states): a reached
         // Assert(FALSE) here is recorded on the reached-assertion side channel.
@@ -1003,6 +1078,10 @@ impl Model for TlaModel {
         enabled_mask: &[usize],
         out: &mut Vec<Self::State>,
     ) {
+        // Opt-in per-call evaluation budget (unlimited unless configured);
+        // installed before any EvalContext is built in the evaluation below.
+        let _budget = self.install_eval_budget();
+
         // Committed next-state generation (see next_states): a reached
         // Assert(FALSE) here is recorded on the reached-assertion side channel so
         // the caller (e.g. the simulation loop) can report it as a violation.
@@ -6208,6 +6287,56 @@ Spec == Init /\ [][Next]_taken
                 model.check_invariants(s).is_ok(),
                 "Invariant violated: {s:?}"
             );
+        }
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// `with_eval_budget` normalizes 0 to unlimited (None) and a positive value
+    /// to Some, and a generous budget does not perturb ordinary exploration.
+    #[test]
+    fn eval_budget_opt_in_and_zero_is_unlimited() {
+        let tmp = std::env::temp_dir().join("tlapp-eval-budget");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir");
+
+        let module = tmp.join("BudgetSpec.tla");
+        fs::write(
+            &module,
+            r#"
+---- MODULE BudgetSpec ----
+EXTENDS Naturals
+VARIABLES x
+Init == x = 0
+Next == x' = x + 1 \/ UNCHANGED x
+Inv == x >= 0
+====
+"#,
+        )
+        .expect("module write");
+        let cfg = tmp.join("BudgetSpec.cfg");
+        fs::write(&cfg, "INIT Init\nNEXT Next\nINVARIANT Inv\n").expect("cfg write");
+
+        let model =
+            TlaModel::from_files(&module, Some(&cfg), None, None).expect("model should build");
+        assert_eq!(model.eval_budget, None, "default is unlimited");
+
+        // 0 => unlimited (None).
+        let m0 = TlaModel::from_files(&module, Some(&cfg), None, None)
+            .unwrap()
+            .with_eval_budget(0);
+        assert_eq!(m0.eval_budget, None, "0 normalizes to unlimited");
+
+        // A generous budget is Some and does not break ordinary exploration.
+        let m = model.with_eval_budget(1_000_000);
+        assert_eq!(m.eval_budget, Some(1_000_000));
+        let init = m.initial_states();
+        assert_eq!(init.len(), 1);
+        let mut next = Vec::new();
+        m.next_states(&init[0], &mut next);
+        assert!(!next.is_empty(), "generous budget must not block successors");
+        for s in &next {
+            assert!(m.check_invariants(s).is_ok());
         }
 
         let _ = fs::remove_dir_all(&tmp);

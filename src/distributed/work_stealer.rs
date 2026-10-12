@@ -596,6 +596,7 @@ mod tests {
                 node_id: 0,
                 listen_addr: "127.0.0.1:0".parse().unwrap(),
                 peers: vec![],
+                auth_token: None,
             };
             ClusterTransport::new(cfg).await.unwrap()
         })
