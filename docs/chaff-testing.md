@@ -58,6 +58,38 @@ CHAFF_INCLUDE_TODO=1 scripts/chaff_matrix.sh
 
 Per project convention, build and run on a spot instance, not locally.
 
+## Chaff status vocabulary
+
+Each `[[chaff]]` in `chaffs.toml` has a `status`:
+
+- **`wired`** — toggle is in the source *and* the matrix has demonstrated the
+  gate catches it. These are what the matrix asserts on; a `wired` chaff that
+  goes UNCAUGHT fails CI as a real suite hole.
+- **`open`** — toggle is in the source but the gate does *not* (yet) catch it: a
+  tracked finding, with a `note` explaining why. The matrix skips these so CI
+  stays green while the gap is documented.
+- **`todo`** — located but the toggle is not yet inserted.
+
+## First run found three open findings (the tool working)
+
+The very first CI run (2026-11-07) reported: control OK, **5 caught**, **3 open**.
+The three were not false alarms — each is a case where a first-draft chaff did
+not reproduce the bug via the gated spec's *actual* evaluation path, which is
+precisely what the matrix exists to reveal:
+
+- `assert_short_circuit_disabled` — `AssertDisabled`'s guarded disjunct contains
+  a primed assignment, so it routes through the *interpreted* action-body
+  evaluator, not `CompiledExpr::And`. The chaff must move to that layer.
+- `let_helper_prime_as_guard` — the spec's `LET` is nested under `\E`, so it
+  never reaches the top-level `starts_with("LET")` arm the chaff toggles.
+- `constants_in_fingerprint` — a genuine *oracle* limitation: carrying constants
+  in every state does not change the distinct-state count or the invariant
+  verdict, so a count-based differential gate structurally cannot see it.
+
+Each carries a `note` in `chaffs.toml` with the re-site or oracle fix. This is
+the Examplar discipline made concrete: a chaff is only useful if it reproduces a
+failure the gate's oracle can actually observe.
+
 ## Adding a chaff
 
 1. Find the source site of a fix for a bug class worth guarding (start from a

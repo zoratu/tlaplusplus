@@ -156,8 +156,12 @@ declare -a HOLES=()
 while IFS=$'\t' read -r id spec gate status; do
   [[ -n "${id}" ]] || continue
   if [[ -n "${CHAFF_ONLY}" && "${id}" != "${CHAFF_ONLY}" ]]; then continue; fi
+  # Only "wired" chaffs are asserted on. "open" (a tracked finding) and "todo"
+  # (not yet wired) are skipped so CI stays green while the gap is documented in
+  # chaffs.toml. CHAFF_INCLUDE_TODO=1 forces them to run (they are expected to
+  # report UNCAUGHT — useful while investigating a re-site).
   if [[ "${status}" != "wired" && "${CHAFF_INCLUDE_TODO}" != "1" ]]; then
-    printf '  [skip] %-34s (status=%s)\n' "${id}" "${status}"
+    printf '  [skip] %-34s (status=%s — see chaffs.toml note)\n' "${id}" "${status}"
     skipped=$((skipped+1))
     continue
   fi
@@ -183,7 +187,7 @@ echo "== summary =="
 echo "  wired chaffs run : ${total}"
 echo "  caught           : ${caught}"
 echo "  UNCAUGHT (holes) : ${uncaught}"
-echo "  skipped (todo)   : ${skipped}"
+echo "  skipped (open/todo): ${skipped}"
 if [[ ${uncaught} -gt 0 ]]; then
   echo
   echo "SUITE HOLES — these chaffs slipped through their gate:" >&2
