@@ -1,0 +1,115 @@
+# chaffs.toml — the chaff ledger (Examplar "conceptual mutation" catalog).
+#
+# Each [[chaff]] is ONE intentional, feature-gated semantic regression, sourced
+# from a bug we have actually shipped (see corpus/diff_test/list.tsv and the
+# project log). `scripts/chaff_matrix.sh` activates each chaff in turn
+# (TLAPP_CHAFF=<id>, against a `--features chaff` build) and asserts that the
+# named gate CATCHES it. A chaff the gate does not catch is a proven hole in the
+# suite. See src/chaff.rs and docs/chaff-testing.md.
+#
+# This is the inverse of diff_tlc: diff_tlc proves "we agree with TLC today";
+# the chaff matrix proves "a gate would fail if bug class X came back."
+#
+# Fields per [[chaff]]:
+#   id      - value passed to TLAPP_CHAFF and to crate::chaff::active("<id>")
+#   bug     - the wrong behavior reintroduced (the historical defect)
+#   origin  - where the real bug was found / the fixing work
+#   spec    - the spec_id in corpus/diff_test/list.tsv that should catch it
+#   gate    - gate that catches it: "diff_tlc" (default) | "snapshot" |
+#             "proptest" | "reached_assertion"
+#   site    - source location of the toggle (file::function)
+#   status  - "wired"  : the `if chaff::active("<id>")` toggle is in the source
+#             "todo"   : located, toggle not yet inserted
+#
+# Wiring a chaff: at `site`, wrap the fix so the OLD (buggy) behavior runs when
+# `crate::chaff::active("<id>")`, the fix otherwise. Then flip status to "wired".
+
+[[chaff]]
+id = "assert_short_circuit_disabled"
+bug = "Assert(FALSE) behind an unsatisfiable guard fires anyway — conjunction does not short-circuit — producing a false invariant/assertion violation."
+origin = "list.tsv: assert_disabled; item-3 reached-assertion side channel (#194/#196)"
+spec = "assert_disabled"
+gate = "diff_tlc"
+site = "src/tla/compiled_eval.rs::eval_compiled_inner (And arm)"
+status = "wired"
+
+[[chaff]]
+id = "init_disjunct_as_guard"
+bug = "An Init conjunct that is a guarded disjunction over a state var (\\/ C /\\ y \\in S \\/ ~C /\\ y=v) is evaluated as a boolean guard instead of being enumerated, so membership collapses to a single under-explored initial state."
+origin = "list.tsv: init_disjunct_conjunct; Prisoner*LightUnknown under-exploration (#190)"
+spec = "init_disjunct_conjunct"
+gate = "diff_tlc"
+site = "src/models/tla_native.rs::evaluate_init_states (distribution block)"
+status = "wired"
+
+[[chaff]]
+id = "exists_disjunction_hoisted"
+bug = "\\E i : /\\ guard /\\ (\\/ A \\/ B) is split so the inner disjunction is hoisted to top-level disjuncts, dropping the guard and shared primed conjuncts and firing A/B from every state."
+origin = "list.tsv: exists_guarded_nested_disjunction; EnvironmentController ProcTick (#187/#188)"
+spec = "exists_guarded_nested_disjunction"
+gate = "diff_tlc"
+site = "src/tla/action_ir.rs::split_action_body_disjuncts_uncached (exists body)"
+status = "wired"
+
+[[chaff]]
+id = "instance_primed_arg_unstaged"
+bug = "An instance action call Det!Receive(i, chan'[i]) reads the primed argument against the bare (unstaged) context instead of the caller's staged context, binding an unbound ModelValue (freezes exploration). Also: the callee's leading guard-disjunction is split even when followed by shared sibling conjuncts."
+origin = "list.tsv: clock_detector_instance; EnvironmentController localClock freeze (#188)"
+spec = "clock_detector_instance"
+gate = "diff_tlc"
+site = "src/tla/eval/action.rs::expand_action_call_multi + src/tla/action_ir.rs leading-guard guard"
+status = "wired"
+
+[[chaff]]
+id = "let_helper_prime_as_guard"
+bug = "A LET action clause whose body assigns a prime via a helper call (LET x==.. IN Send(x), Send(m)==msg'=m) is compiled as a boolean guard rather than a prime assignment → 0 successors (under-exploration)."
+origin = "list.tsv: let_hidden_prime; PaxosAccept under-exploration (#175)"
+spec = "let_hidden_prime"
+gate = "diff_tlc"
+site = "src/tla/compiled_expr.rs::compile_action_clause_text (LET arm)"
+status = "wired"
+
+[[chaff]]
+id = "unchanged_tuple_prime_unstaged"
+bug = "UNCHANGED of a defined variable-tuple (frozen == <<failed>>) does not stage the component prime failed', so a trailing constraint reading failed' panics / mis-evaluates."
+origin = "list.tsv: unchanged_defined_tuple; Chandra-Toueg EnvironmentController UNCHANGED envVars"
+spec = "unchanged_defined_tuple"
+gate = "diff_tlc"
+site = "src/tla/eval/action.rs::expand_unchanged_var"
+status = "wired"
+
+[[chaff]]
+id = "nat_override_enumerates_infinite"
+bug = "x \\in (Nat \\ {0}) under CONSTANT Nat <- Override enumerates infinite Nat instead of testing membership structurally → eval error / false violation / nontermination."
+origin = "list.tsv: nat_override_membership; MCLamportMutex/TLCSailfish false-violations (#171)"
+spec = "nat_override_membership"
+gate = "diff_tlc"
+site = "src/tla/compiled_eval.rs::compiled_membership_contains (SetMinus arm)"
+status = "wired"
+
+[[chaff]]
+id = "constants_in_fingerprint"
+bug = "Scalar constants and model values are carried in the fingerprinted state instead of the fixed model context, inflating the distinct-state count."
+origin = "list.tsv: const_state_omit; constants-in-state refactor (#193)"
+spec = "const_state_omit"
+gate = "diff_tlc"
+site = "src/models/tla_native.rs::TlaModel::from_files (variable-only filter)"
+status = "wired"
+
+[[chaff]]
+id = "eventually_always_unchecked"
+bug = "A bare <>[]P (eventually-always) PROPERTY is left UNCHECKED — the liveness shape matcher only recognizes [](P=><>[]Q) — so a real Progress violation is reported as violation=false."
+origin = "list.tsv/temporal; 12.39M-state production false-negative (#198)"
+spec = "TODO — needs a bare-<>[]P liveness spec in list.tsv (see note)"
+gate = "diff_tlc"
+site = "src/models/tla_native.rs::graph_liveness_shape (EventuallyAlways arm)"
+status = "todo"
+
+# NOTE on eventually_always_unchecked: the toggle IS wired in the source, but no
+# diff_tlc spec in corpus/diff_test/list.tsv currently exercises a bare `<>[]P`
+# liveness PROPERTY with a reachable Progress violation. Until such a spec is
+# added, the matrix cannot assert this chaff is caught, so it is left status=todo
+# (the matrix will report it skipped). Adding that spec — and confirming the
+# matrix flips it to CAUGHT — is itself the proof that the liveness gate has the
+# coverage we think it does. This is exactly the kind of hole the chaff matrix is
+# designed to surface.

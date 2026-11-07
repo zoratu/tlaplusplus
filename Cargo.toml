@@ -13,6 +13,14 @@ verify = true
 default = []
 # Enable fail points for chaos/fault injection testing
 failpoints = ["fail/failpoints"]
+# Chaff — intentional, feature-gated semantic regressions used to MEASURE the
+# sensitivity of our own test suite (Examplar-style conceptual mutation).
+# Activates the `if chaff::active(..)` branches in the evaluator/runtime; a chaff
+# is selected at runtime via the `TLAPP_CHAFF` env var. OFF by default and NEVER
+# part of `default` — without this feature every chaff branch compiles away to a
+# no-op (`chaff::active` is `#[inline(always)] false`). Must never ship in a
+# release artifact. Driven by `scripts/chaff_matrix.sh`; see `src/chaff.rs`.
+chaff = []
 # Enable Z3-backed symbolic Init enumeration (T5).
 # Requires libz3-dev / clang to build the z3-sys bindgen step.
 symbolic-init = ["dep:z3"]

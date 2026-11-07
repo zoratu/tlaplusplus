@@ -159,7 +159,11 @@ impl TlaModel {
         // inject_constants_into_module_tree). Because the active schema below is
         // derived from these (now variable-only) states, constant references
         // compile to name-based `Var` rather than per-state `StateVar { slot }`.
-        {
+        // CHAFF `constants_in_fingerprint`: skip stripping non-VARIABLE keys, so
+        // scalar constants + model values are carried into every fingerprint and
+        // inflate the distinct-state count. Reintroduces the `const_state_omit`
+        // regression.
+        if !crate::chaff::active("constants_in_fingerprint") {
             let var_set: std::collections::HashSet<&str> =
                 module.variables.iter().map(|s| s.as_str()).collect();
             initial_states_vec = initial_states_vec
@@ -1522,6 +1526,12 @@ fn graph_liveness_shape(formula: &TemporalFormula) -> Option<(&str, &str)> {
         // reachable state that reaches a bad `¬Q` cycle witnesses the
         // violation.
         TemporalFormula::EventuallyAlways(q_inner) => {
+            if crate::chaff::active("eventually_always_unchecked") {
+                // CHAFF: refuse to recognize a bare `<>[]Q` property, so it is left
+                // UNCHECKED and a real Progress violation is reported as
+                // violation=false. Reintroduces the `eventually_always` regression.
+                return None;
+            }
             let TemporalFormula::StatePredicate(q) = q_inner.as_ref() else {
                 return None;
             };
@@ -3034,7 +3044,12 @@ fn evaluate_init_states(
     // disjunct with a false constant guard (`~Light_Unknown` when `Light_Unknown
     // = TRUE`) yields zero states via the guard check, so the union is exact.
     // Recursion terminates (each level removes one disjunctive conjunct).
-    if merged_clauses.len() > 1 {
+    // CHAFF `init_disjunct_as_guard`: skip distributing a disjunctive Init conjunct
+    // over the others, so `/\ A /\ (\/ B1 \/ B2) /\ C` falls to the guard loop below
+    // and is eval'd as a boolean (membership reads FALSE → branch dropped), yielding
+    // 1 under-explored initial state instead of enumerating 2. Reintroduces the
+    // `init_disjunct_conjunct` regression.
+    if !crate::chaff::active("init_disjunct_as_guard") && merged_clauses.len() > 1 {
         let disj_pos = merged_clauses.iter().position(|c| {
             let t = c.trim();
             t.starts_with("\\/") && split_top_level(t, "\\/").len() > 1

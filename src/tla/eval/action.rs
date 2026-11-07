@@ -187,6 +187,13 @@ pub(crate) fn expand_unchanged_var(
     if depth > 16 || ctx.state.get(var).is_some() {
         return vec![var.to_string()];
     }
+    if crate::chaff::active("unchanged_tuple_prime_unstaged") {
+        // CHAFF: do NOT expand a defined variable-tuple (frozen == <<failed>>) into
+        // its component vars, so the component prime `failed'` is never staged and a
+        // trailing constraint reading it mis-evaluates. Reintroduces the
+        // `unchanged_defined_tuple` regression.
+        return vec![var.to_string()];
+    }
     if let Some(def) = ctx.definition(var)
         && def.params.is_empty()
     {
@@ -782,7 +789,16 @@ fn expand_action_call_multi(
         // no successor — the RECEIVE branch never fires, `LocallyTick` never runs,
         // and localClock stays frozen at 0. A staged context only ADDS `var'`
         // keys, so unprimed arguments evaluate identically.
-        let arg_ctx = ctx_with_staged_primes(ctx, &branch.staged);
+        // CHAFF `instance_primed_arg_unstaged` (part 1): evaluate call arguments
+        // against the bare (unstaged) `ctx`, so a primed argument like
+        // `Detector!Receive(i, inDelivery')` reads an unbound ModelValue and the
+        // branch produces no successor (localClock freezes). Reintroduces the
+        // `clock_detector_instance` regression.
+        let arg_ctx = if crate::chaff::active("instance_primed_arg_unstaged") {
+            ctx.clone()
+        } else {
+            ctx_with_staged_primes(ctx, &branch.staged)
+        };
         {
             let locals_mut = std::rc::Rc::make_mut(&mut instance_ctx.locals);
             if let Err(err) = bind_instance_substitutions(instance, ctx, locals_mut) {

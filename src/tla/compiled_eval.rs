@@ -405,6 +405,18 @@ fn eval_compiled_inner(
 
         // Logical operators with short-circuit evaluation
         CompiledExpr::And(exprs) => {
+            if crate::chaff::active("assert_short_circuit_disabled") {
+                // CHAFF: evaluate every conjunct eagerly (no short-circuit), so an
+                // Assert(FALSE) behind an unsatisfiable guard fires anyway → false
+                // violation. Reintroduces the `assert_disabled` regression.
+                let mut result = true;
+                for e in exprs {
+                    if !eval_compiled_inner(e, ctx, depth)?.as_bool()? {
+                        result = false;
+                    }
+                }
+                return Ok(TlaValue::Bool(result));
+            }
             for e in exprs {
                 if !eval_compiled_inner(e, ctx, depth)?.as_bool()? {
                     return Ok(TlaValue::Bool(false));
@@ -1418,8 +1430,19 @@ fn compiled_membership_contains(
         // Set operations: membership checked structurally so a non-enumerable
         // operand (e.g. Nat in `Nat \\ {0}`) is used only in a membership test,
         // never enumerated. Matches TLC, which never enumerates the codomain.
-        CompiledExpr::SetMinus(a, b) => Ok(compiled_membership_contains(value, a, ctx, depth)?
-            && !compiled_membership_contains(value, b, ctx, depth)?),
+        CompiledExpr::SetMinus(a, b) => {
+            if crate::chaff::active("nat_override_enumerates_infinite") {
+                // CHAFF: materialize the whole `S \ T` into a concrete set instead
+                // of testing membership structurally, forcing enumeration of
+                // infinite Nat in `x \in (Nat \ {0})` under `Nat <- Override`.
+                // Reintroduces the `nat_override_membership` regression.
+                let set_val = eval_compiled_inner(set_expr, ctx, depth)?;
+                set_val.contains(value)
+            } else {
+                Ok(compiled_membership_contains(value, a, ctx, depth)?
+                    && !compiled_membership_contains(value, b, ctx, depth)?)
+            }
+        }
         CompiledExpr::Union(a, b) => Ok(compiled_membership_contains(value, a, ctx, depth)?
             || compiled_membership_contains(value, b, ctx, depth)?),
         CompiledExpr::Intersect(a, b) => Ok(compiled_membership_contains(value, a, ctx, depth)?
