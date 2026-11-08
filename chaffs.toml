@@ -37,9 +37,14 @@
 #   first-draft chaff did not reproduce the bug via the gated spec's ACTUAL
 #   evaluation path.
 # - Resolved (2026-11-08): all 3 re-sited/re-gated and confirmed CAUGHT —
-#   assert -> interpreted clause-loop short-circuit; let -> new top-level spec
-#   LetHiddenPrimeTop; const -> new schema-level gate (tests/chaff_const_schema).
-#   Now 8 wired + 1 todo. See per-chaff `note` fields for the diagnosis.
+#   assert -> COMPILED clause-loop short-circuit (eval_compiled_clause_sequence);
+#   let -> new top-level spec LetHiddenPrimeTop + 2nd toggle in
+#   body_has_let_with_primes; const -> new schema-level gate
+#   (tests/chaff_const_schema). Now 8 wired + 1 open. See per-chaff `note` fields.
+# - Review hardening (2026-11-08, Codex): matrix no longer exits 0 on a zero/typo
+#   sweep; config errors exit 2; diff_tlc spec match is literal + exactly-one;
+#   gate logs retained under .chaff-matrix-out; eventually_always relabeled
+#   todo->open (its toggle is wired). Reported coverage is "8 of 9, 1 open".
 # ---------------------------------------------------------------------------
 
 [[chaff]]
@@ -78,6 +83,12 @@ spec = "clock_detector_instance"
 gate = "diff_tlc"
 site = "src/tla/eval/action.rs::expand_action_call_multi + src/tla/action_ir.rs leading-guard guard"
 status = "wired"
+# LIMITATION (Codex review): this chaff toggles TWO independent #188 fix sites
+# under one id (the primed-arg staged-context read AND the leading guard-disjunction
+# split). A combined mutant being CAUGHT does not prove each site would be caught
+# independently. Splitting into two ids would give stronger evidence, but both
+# sites are needed for the single clock_detector_instance spec to diverge; isolating
+# them would require two specs that each exercise only one. Tracked as a follow-up.
 
 [[chaff]]
 id = "let_helper_prime_as_guard"
@@ -124,13 +135,15 @@ origin = "list.tsv/temporal; 12.39M-state production false-negative (#198)"
 spec = "TODO — needs a bare-<>[]P liveness spec in list.tsv (see note)"
 gate = "diff_tlc"
 site = "src/models/tla_native.rs::graph_liveness_shape (EventuallyAlways arm)"
-status = "todo"
+status = "open"
 
-# NOTE on eventually_always_unchecked: the toggle IS wired in the source, but no
-# diff_tlc spec in corpus/diff_test/list.tsv currently exercises a bare `<>[]P`
-# liveness PROPERTY with a reachable Progress violation. Until such a spec is
-# added, the matrix cannot assert this chaff is caught, so it is left status=todo
-# (the matrix will report it skipped). Adding that spec — and confirming the
-# matrix flips it to CAUGHT — is itself the proof that the liveness gate has the
-# coverage we think it does. This is exactly the kind of hole the chaff matrix is
-# designed to surface.
+# NOTE on eventually_always_unchecked: the toggle IS wired in the source
+# (graph_liveness_shape's EventuallyAlways arm), so by the status vocabulary this
+# is `open`, NOT `todo` — the gap is a missing catcher, not a missing toggle. No
+# diff_tlc spec in corpus/diff_test/list.tsv yet exercises a bare `<>[]P` liveness
+# PROPERTY with a reachable Progress violation, so the matrix cannot assert this
+# chaff is caught and skips it. Adding that spec — and confirming the matrix flips
+# it to CAUGHT — is itself the proof that the liveness gate has the coverage we
+# think it does, and is exactly the kind of hole the chaff matrix is designed to
+# surface. Reported coverage is therefore "8 of 9 wired chaffs caught, 1 open",
+# never "8/8".

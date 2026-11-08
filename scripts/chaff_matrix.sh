@@ -37,7 +37,7 @@
 set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "${ROOT_DIR}"
+cd "${ROOT_DIR}" || { echo "error: cannot cd to repo root ${ROOT_DIR}" >&2; exit 2; }
 
 CHAFF_LEDGER="${CHAFF_LEDGER:-${ROOT_DIR}/chaffs.toml}"
 DIFF_LIST="${DIFF_LIST:-${ROOT_DIR}/corpus/diff_test/list.tsv}"
@@ -94,19 +94,34 @@ parse_ledger() {
 # (caught a divergence). The matrix interprets a chaff as "caught" when its gate
 # returns non-zero.
 
+# Where per-gate logs are retained so CI artifacts show WHY a gate failed (so we
+# can tell an expected semantic divergence from an infra/timeout failure).
+CHAFF_OUTPUT_DIR="${CHAFF_OUTPUT_DIR:-${ROOT_DIR}/.chaff-matrix-out}"
+mkdir -p "${CHAFF_OUTPUT_DIR}"
+
 run_gate_diff_tlc() {
   local spec="$1"
-  local row tmp_list
-  row="$(grep -P "^${spec}\t" "${DIFF_LIST}" || true)"
-  if [[ -z "${row}" ]]; then
+  local tmp_list nrows rc log
+  log="${CHAFF_OUTPUT_DIR}/${TLAPP_CHAFF:-control}.diff_tlc.${spec}.log"
+  tmp_list="$(mktemp)"
+  # Literal match on the first TSV field (not a regex), and require EXACTLY one
+  # row — a regex match could pull in unintended rows or break on metacharacters
+  # in a future spec id, and a duplicate id would silently run several specs.
+  awk -F'\t' -v s="${spec}" '$1 == s { print }' "${DIFF_LIST}" > "${tmp_list}"
+  nrows="$(wc -l < "${tmp_list}" | tr -d ' ')"
+  if [[ "${nrows}" -eq 0 ]]; then
     echo "    gate=diff_tlc: spec '${spec}' not found in ${DIFF_LIST}" >&2
+    rm -f "${tmp_list}"
     return 125  # configuration error, distinct from pass/fail
   fi
-  tmp_list="$(mktemp)"
-  printf '%s\n' "${row}" > "${tmp_list}"
+  if [[ "${nrows}" -ne 1 ]]; then
+    echo "    gate=diff_tlc: spec '${spec}' matched ${nrows} rows in ${DIFF_LIST} (expected 1)" >&2
+    rm -f "${tmp_list}"
+    return 125
+  fi
   DIFF_LIST="${tmp_list}" TLAPLUSPLUS_BIN="${BIN}" \
-    bash "${ROOT_DIR}/scripts/diff_tlc.sh" >/dev/null 2>&1
-  local rc=$?
+    bash "${ROOT_DIR}/scripts/diff_tlc.sh" >"${log}" 2>&1
+  rc=$?
   rm -f "${tmp_list}"
   return ${rc}
 }
@@ -116,7 +131,8 @@ run_gate_cargo_test() {
   # set by the caller. Debug profile (no --release): it reuses the debug lib the
   # matrix build produced, so only the test crate itself compiles.
   local test_name="$1"
-  cargo test --features chaff --test "${test_name}" >/dev/null 2>&1
+  local log="${CHAFF_OUTPUT_DIR}/${TLAPP_CHAFF:-control}.cargo.${test_name}.log"
+  cargo test --features chaff --test "${test_name}" >"${log}" 2>&1
   return $?
 }
 
@@ -132,6 +148,30 @@ dispatch_gate() {
   esac
 }
 
+# ---- parse the ledger ONCE and validate ------------------------------------
+# Parsing once (not per-loop via process substitution) lets us detect a parser
+# failure and an empty/garbled ledger up front, instead of silently iterating
+# over nothing and exiting 0 ("false green").
+LEDGER_ROWS="$(parse_ledger)"
+if [[ $? -ne 0 || -z "${LEDGER_ROWS}" ]]; then
+  echo "error: failed to parse any chaff entries from ${CHAFF_LEDGER}" >&2
+  exit 2
+fi
+
+# A typo'd CHAFF_ONLY must be a hard error, never a silent no-op that exits 0.
+if [[ -n "${CHAFF_ONLY}" ]]; then
+  only_matches="$(awk -F'\t' -v only="${CHAFF_ONLY}" '$1 == only { n++ } END { print n+0 }' <<<"${LEDGER_ROWS}")"
+  if [[ "${only_matches}" -ne 1 ]]; then
+    echo "error: CHAFF_ONLY='${CHAFF_ONLY}' matched ${only_matches} ledger entries (expected exactly 1)" >&2
+    exit 2
+  fi
+fi
+
+# How many wired chaffs the sweep is expected to assert on, under the active
+# filter. The sweep must run exactly this many, and (for a full run) at least one.
+wired_expected="$(awk -F'\t' -v only="${CHAFF_ONLY}" \
+  '$4 == "wired" && (only == "" || $1 == only) { n++ } END { print n+0 }' <<<"${LEDGER_ROWS}")"
+
 # ---- control: no chaff must pass -------------------------------------------
 echo "== control (no chaff active) =="
 control_fail=0
@@ -143,15 +183,23 @@ while IFS=$'\t' read -r id spec gate status; do
   key="${gate}::${spec}"
   [[ -n "${control_seen[$key]:-}" ]] && continue
   control_seen[$key]=1
-  if TLAPP_CHAFF="" dispatch_gate "${gate}" "${spec}"; then
+  TLAPP_CHAFF="" dispatch_gate "${gate}" "${spec}"
+  crc=$?
+  if [[ ${crc} -eq 0 ]]; then
     printf '  control OK: %s\n' "${key}"
+  elif [[ ${crc} -eq 125 ]]; then
+    echo "  CONTROL CONFIG ERROR: gate '${gate}' on spec '${spec}' is misconfigured" >&2
+    control_fail=2
   else
     echo "  CONTROL FAIL: gate '${gate}' on spec '${spec}' failed with NO chaff active" >&2
-    control_fail=1
+    [[ "${control_fail}" == "0" ]] && control_fail=1
   fi
-done < <(parse_ledger)
-if [[ "${control_fail}" == "1" ]]; then
-  echo "control failed — gate is failing without any chaff; aborting." >&2
+done <<<"${LEDGER_ROWS}"
+if [[ "${control_fail}" == "2" ]]; then
+  echo "control aborted — a gate is misconfigured (see .chaff-matrix-out logs)." >&2
+  exit 2
+elif [[ "${control_fail}" == "1" ]]; then
+  echo "control failed — a gate is failing without any chaff; aborting." >&2
   exit 1
 fi
 echo "  control: all gates pass clean"
@@ -159,8 +207,9 @@ echo
 
 # ---- chaff sweep ------------------------------------------------------------
 echo "== chaff sweep =="
-total=0; caught=0; uncaught=0; skipped=0
+total=0; caught=0; uncaught=0; skipped=0; config_err=0
 declare -a HOLES=()
+declare -a CONFIG_ERRORS=()
 while IFS=$'\t' read -r id spec gate status; do
   [[ -n "${id}" ]] || continue
   if [[ -n "${CHAFF_ONLY}" && "${id}" != "${CHAFF_ONLY}" ]]; then continue; fi
@@ -177,32 +226,61 @@ while IFS=$'\t' read -r id spec gate status; do
   TLAPP_CHAFF="${id}" dispatch_gate "${gate}" "${spec}"
   rc=$?
   if [[ ${rc} -eq 125 ]]; then
-    printf '  [ERR ] %-34s gate=%-10s (configuration error)\n' "${id}" "${gate}"
-    HOLES+=("${id} (config error)")
-    uncaught=$((uncaught+1))
+    # Misconfiguration (spec missing / ambiguous / unknown gate). This is NOT a
+    # verdict about the chaff — it is a setup error, reported separately (exit 2).
+    printf '  [ERR ] %-34s gate=%-10s (configuration error — see logs)\n' "${id}" "${gate}"
+    CONFIG_ERRORS+=("${id} via ${gate} on ${spec}")
+    config_err=$((config_err+1))
   elif [[ ${rc} -ne 0 ]]; then
-    printf '  [OK  ] %-34s gate=%-10s CAUGHT (gate failed as expected)\n' "${id}" "${gate}"
+    printf '  [OK  ] %-34s gate=%-10s CAUGHT (gate failed as expected, rc=%d)\n' "${id}" "${gate}" "${rc}"
     caught=$((caught+1))
   else
     printf '  [HOLE] %-34s gate=%-10s UNCAUGHT — gate passed with chaff active!\n' "${id}" "${gate}"
     HOLES+=("${id} via ${gate} on ${spec}")
     uncaught=$((uncaught+1))
   fi
-done < <(parse_ledger)
+done <<<"${LEDGER_ROWS}"
 
 echo
 echo "== summary =="
-echo "  wired chaffs run : ${total}"
-echo "  caught           : ${caught}"
-echo "  UNCAUGHT (holes) : ${uncaught}"
+echo "  wired chaffs run   : ${total} (expected ${wired_expected})"
+echo "  caught             : ${caught}"
+echo "  UNCAUGHT (holes)   : ${uncaught}"
+echo "  config errors      : ${config_err}"
 echo "  skipped (open/todo): ${skipped}"
+echo "  logs               : ${CHAFF_OUTPUT_DIR}"
+
+# Config errors are a setup problem, not a verdict — surface them with exit 2
+# (matches the documented 'usage/configuration error' code) before any pass.
+if [[ ${config_err} -gt 0 ]]; then
+  echo
+  echo "CONFIGURATION ERRORS — these chaffs could not be evaluated:" >&2
+  for c in "${CONFIG_ERRORS[@]}"; do echo "  - ${c}" >&2; done
+  exit 2
+fi
+
 if [[ ${uncaught} -gt 0 ]]; then
   echo
   echo "SUITE HOLES — these chaffs slipped through their gate:" >&2
   for h in "${HOLES[@]}"; do echo "  - ${h}" >&2; done
   exit 1
 fi
-if [[ ${total} -eq 0 ]]; then
-  echo "  (no wired chaffs ran — nothing asserted)"
+
+# Guard against "false green": in a normal run the sweep must have run exactly
+# the wired chaffs the filter selected, and a full run must assert on at least
+# one. (CHAFF_INCLUDE_TODO=1 is an investigation mode that intentionally also
+# runs non-wired entries, so the strict count guard does not apply there.)
+if [[ "${CHAFF_INCLUDE_TODO}" != "1" ]]; then
+  if [[ ${total} -ne ${wired_expected} ]]; then
+    echo "ERROR: ran ${total} wired chaffs but expected ${wired_expected} — refusing to report success." >&2
+    exit 1
+  fi
+  if [[ -z "${CHAFF_ONLY}" && ${total} -eq 0 ]]; then
+    echo "ERROR: no wired chaffs ran in a full sweep — refusing to report success (nothing was asserted)." >&2
+    exit 1
+  fi
+  if [[ ${total} -eq 0 ]]; then
+    echo "  (CHAFF_ONLY=${CHAFF_ONLY} selected a non-wired entry — nothing asserted, by request)"
+  fi
 fi
 exit 0

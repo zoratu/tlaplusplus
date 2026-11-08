@@ -25,9 +25,17 @@ chaffs it catches**.
    wrong behavior when activated.
 
 2. Chaffs are gated behind `--features chaff` and selected at runtime via the
-   `TLAPP_CHAFF` env var. **Without the feature, every chaff compiles away to a
-   no-op** (`chaff::active` is `#[inline(always)] false`): zero cost, zero
-   behavioral change, never shipped.
+   `TLAPP_CHAFF` env var. **Without the feature there is no way to activate a
+   chaff**: `chaff::active` is unconditionally `false`, so no environment can turn
+   one on and the production behavior is unchanged. The call sites are left
+   *unconditional* (not `#[cfg]`-removed) on purpose, so the default `tests` build
+   compiles and type-checks every chaff branch and the feature cannot bit-rot.
+   `chaff::active` is `#[inline(always)]`, so in a release (optimized) build each
+   `if chaff::active(..)` folds to the constant `false` and the guarded branch is
+   dropped — the zero-cost claim holds for optimized builds, which is what ships;
+   an unoptimized debug build keeps a trivially-predictable dead branch. The
+   `chaff` feature must never be part of `default` and must never ship in a
+   release artifact.
 
 3. `scripts/chaff_matrix.sh` activates each chaff in turn and runs the gate that
    is *supposed* to catch it, asserting the gate **fails**. A chaff the gate does
@@ -70,13 +78,15 @@ Each `[[chaff]]` in `chaffs.toml` has a `status`:
   stays green while the gap is documented.
 - **`todo`** — located but the toggle is not yet inserted.
 
-## Three findings the tool surfaced — all resolved (8/8 caught)
+## Three findings the tool surfaced — all resolved (8 of 9 caught, 1 open)
 
 The first CI run (2026-11-07) reported: control OK, **5 caught**, **3 open**.
 The three were not false alarms — each was a case where a first-draft chaff did
 not reproduce the bug via the gated spec's *actual* evaluation path, which is
 precisely what the matrix exists to reveal. All three are now `wired` and
-confirmed CAUGHT (final run 2026-11-08: control clean, **8 caught, 0 holes**):
+confirmed CAUGHT (final run 2026-11-08: control clean, **8 of 9 wired chaffs
+caught, 0 holes**; the 9th, `eventually_always_unchecked`, is an `open` finding —
+its toggle is wired but no spec exercises it yet):
 
 - `assert_short_circuit_disabled` — `run-tla` uses the **compiled** evaluator by
   default (the dual-evaluator unification), so the first draft on `CompiledExpr::And`

@@ -19,10 +19,15 @@
 //! # Production safety
 //!
 //! Without `--features chaff` (the default), [`active`] is a `#[inline(always)]`
-//! function that unconditionally returns `false`, so every `if chaff::active(..)`
-//! branch is dead code the optimizer deletes. There is **zero** cost and zero
-//! behavioral change on any shipping build. The `chaff` feature must never be
-//! part of `default` and must never be enabled in a release artifact.
+//! function that unconditionally returns `false`, so there is no way to activate
+//! a chaff and **production behavior is unchanged**. In a release (optimized)
+//! build — what actually ships — each `if chaff::active(..)` folds to the constant
+//! `false` and the guarded branch is dropped, so there is no runtime cost; an
+//! unoptimized debug build keeps a trivially-predictable dead branch. The call
+//! sites are deliberately left unconditional (rather than `#[cfg]`-removed) so the
+//! default build still type-checks every chaff branch and the feature cannot
+//! bit-rot. The `chaff` feature must never be part of `default` and must never be
+//! enabled in a release artifact.
 //!
 //! # Usage at a bug site
 //!
