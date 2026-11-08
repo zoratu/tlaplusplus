@@ -48,9 +48,9 @@ bug = "Assert(FALSE) behind an unsatisfiable guard fires anyway — conjunction 
 origin = "list.tsv: assert_disabled; item-3 reached-assertion side channel (#194/#196)"
 spec = "assert_disabled"
 gate = "diff_tlc"
-site = "src/tla/eval/action.rs::eval_action_body_text_multi (clause-loop short-circuit)"
+site = "src/tla/compiled_eval.rs::eval_compiled_clause_sequence (clause-loop short-circuit)"
 status = "wired"
-note = "Re-sited after the first matrix run reported UNCAUGHT. AssertDisabled's guarded disjunct contains `x'=x`, so the body routes through the INTERPRETED action-body evaluator, not CompiledExpr::And where the first-draft chaff lived. The real protection is the `break` in eval_action_body_text_multi's clause loop: once a false guard empties the branch set, the later `Assert(FALSE)` clause is never reached. The chaff now suppresses that short-circuit (keeps pre-clause branches when a clause yields none) so the Assert fires. Confirmed CAUGHT by diff_tlc on assert_disabled."
+note = "Re-sited TWICE. First draft lived in CompiledExpr::And (unreached — AssertDisabled's disjunct is an action body, not a boolean And). Second draft moved to the INTERPRETED eval_action_body_text_multi, still UNCAUGHT because run-tla uses the COMPILED evaluator by default (dual-evaluator unification). Final site is the compiled clause loop eval_compiled_clause_sequence: once a false guard (x>100) empties the branch set the loop breaks, so the later Assert(FALSE) clause is never reached. The chaff snapshots the pre-clause branches and skips the break, so the Assert fires and records a false violation. Lesson: site the chaff on the evaluator run-tla actually uses."
 
 [[chaff]]
 id = "init_disjunct_as_guard"
@@ -85,9 +85,9 @@ bug = "A LET action clause whose body assigns a prime via a helper call (LET x==
 origin = "list.tsv: let_hidden_prime; PaxosAccept under-exploration (#175)"
 spec = "let_hidden_prime_top"
 gate = "diff_tlc"
-site = "src/tla/compiled_expr.rs::compile_action_clause_text (LET arm)"
+site = "src/tla/compiled_expr.rs::compile_action_clause_text (LET arm) + src/tla/action_exec.rs::body_has_let_with_primes (empty-result fallback)"
 status = "wired"
-note = "Re-pointed after the first matrix run reported UNCAUGHT. The existing LetHiddenPrime spec wraps the LET under `\\E i : ...`, so it routes through the interpreted/quantifier path and never reaches the top-level `trimmed.starts_with(\"LET\")` arm the chaff toggles. Added a companion spec LetHiddenPrimeTop (`Act == LET x==7 IN Send(x)`, top-level) that reaches the compiled LET arm directly. Under the chaff the helper-hidden prime is compiled as a boolean Guard (no literal `'`) -> 0 successors, diverging from TLC's distinct count. Confirmed CAUGHT by diff_tlc on let_hidden_prime_top."
+note = "TWO sites — the #175 fix is two defensive layers and both must be defeated. (1) compile_action_clause_text's LET arm: a helper-hidden prime (no literal ') compiles to a boolean Guard. (2) body_has_let_with_primes: when the compiled action returns an EMPTY result, run-tla cross-checks with the interpreted evaluator for LET-bodied actions, which re-stages the prime and masks (1) alone. The chaff suppresses both: the LET compiles to a Guard -> 0 successors AND the fallback no longer rescues it -> divergence from TLC's distinct count. Spec: added LetHiddenPrimeTop (`Act == LET x==7 IN Send(x)`, top-level) since the original LetHiddenPrime wraps the LET under \\E and routes through the interpreted/quantifier path that never reaches the compiled LET arm."
 
 [[chaff]]
 id = "unchanged_tuple_prime_unstaged"
