@@ -70,32 +70,38 @@ Each `[[chaff]]` in `chaffs.toml` has a `status`:
   stays green while the gap is documented.
 - **`todo`** — located but the toggle is not yet inserted.
 
-## The first run found three findings (the tool working), now resolved
+## Three findings the tool surfaced — all resolved (8/8 caught)
 
-The very first CI run (2026-11-07) reported: control OK, **5 caught**, **3 open**.
-The three were not false alarms — each is a case where a first-draft chaff did
+The first CI run (2026-11-07) reported: control OK, **5 caught**, **3 open**.
+The three were not false alarms — each was a case where a first-draft chaff did
 not reproduce the bug via the gated spec's *actual* evaluation path, which is
-precisely what the matrix exists to reveal. All three were resolved (2026-11-08)
-and are now `wired` and confirmed CAUGHT:
+precisely what the matrix exists to reveal. All three are now `wired` and
+confirmed CAUGHT (final run 2026-11-08: control clean, **8 caught, 0 holes**):
 
-- `assert_short_circuit_disabled` — `AssertDisabled`'s guarded disjunct contains
-  a primed assignment, so it routes through the *interpreted* action-body
-  evaluator, not `CompiledExpr::And`. **Fix:** re-sited the chaff to the
-  interpreted clause-loop short-circuit in `eval_action_body_text_multi`.
-- `let_helper_prime_as_guard` — the existing `LetHiddenPrime` spec nests the
-  `LET` under `\E`, so it routes through the interpreted path and never reaches
-  the top-level `starts_with("LET")` arm the chaff toggles. **Fix:** added a
-  companion top-level spec `LetHiddenPrimeTop` that reaches the compiled LET arm.
+- `assert_short_circuit_disabled` — `run-tla` uses the **compiled** evaluator by
+  default (the dual-evaluator unification), so the first draft on `CompiledExpr::And`
+  and a second draft on the *interpreted* clause loop were both unreached.
+  **Fix:** sited the chaff on the compiled clause loop
+  `eval_compiled_clause_sequence`, where the false-guard short-circuit actually
+  runs for this spec.
+- `let_helper_prime_as_guard` — two lessons in one. The existing `LetHiddenPrime`
+  spec nests the `LET` under `\E` (interpreted/quantifier path), so it never
+  reaches the compiled LET arm; **and** the #175 fix is *two* defensive layers —
+  the compiled LET gate *and* an interpreted cross-check that re-runs on an empty
+  compiled result for LET-bodied actions. **Fix:** added a top-level spec
+  `LetHiddenPrimeTop` that reaches the compiled LET arm, and a second toggle in
+  `body_has_let_with_primes` so the chaff defeats both layers.
 - `constants_in_fingerprint` — a genuine *oracle* limitation: carrying constants
   in every state changes neither the distinct-state count nor the invariant
   verdict, so a count-based differential gate structurally cannot see it.
   **Fix:** added a schema-level gate (`tests/chaff_const_schema.rs`) asserting no
   state carries a constant key.
 
-Each carries a `note` in `chaffs.toml` with the diagnosis and fix. This is the
+Each carries a `note` in `chaffs.toml` with the full diagnosis. This is the
 Examplar discipline made concrete: a chaff is only useful if it reproduces a
-failure the gate's oracle can actually observe; when it can't, strengthen the
-oracle (the constants case) or re-site the chaff (the other two).
+failure the gate's oracle can actually observe *on the path the checker takes* —
+when it can't, strengthen the oracle (the constants case) or re-site the chaff
+onto the real evaluator (the other two).
 
 ## Adding a chaff
 
