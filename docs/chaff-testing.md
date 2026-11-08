@@ -70,25 +70,32 @@ Each `[[chaff]]` in `chaffs.toml` has a `status`:
   stays green while the gap is documented.
 - **`todo`** — located but the toggle is not yet inserted.
 
-## First run found three open findings (the tool working)
+## The first run found three findings (the tool working), now resolved
 
 The very first CI run (2026-11-07) reported: control OK, **5 caught**, **3 open**.
 The three were not false alarms — each is a case where a first-draft chaff did
 not reproduce the bug via the gated spec's *actual* evaluation path, which is
-precisely what the matrix exists to reveal:
+precisely what the matrix exists to reveal. All three were resolved (2026-11-08)
+and are now `wired` and confirmed CAUGHT:
 
 - `assert_short_circuit_disabled` — `AssertDisabled`'s guarded disjunct contains
   a primed assignment, so it routes through the *interpreted* action-body
-  evaluator, not `CompiledExpr::And`. The chaff must move to that layer.
-- `let_helper_prime_as_guard` — the spec's `LET` is nested under `\E`, so it
-  never reaches the top-level `starts_with("LET")` arm the chaff toggles.
+  evaluator, not `CompiledExpr::And`. **Fix:** re-sited the chaff to the
+  interpreted clause-loop short-circuit in `eval_action_body_text_multi`.
+- `let_helper_prime_as_guard` — the existing `LetHiddenPrime` spec nests the
+  `LET` under `\E`, so it routes through the interpreted path and never reaches
+  the top-level `starts_with("LET")` arm the chaff toggles. **Fix:** added a
+  companion top-level spec `LetHiddenPrimeTop` that reaches the compiled LET arm.
 - `constants_in_fingerprint` — a genuine *oracle* limitation: carrying constants
-  in every state does not change the distinct-state count or the invariant
+  in every state changes neither the distinct-state count nor the invariant
   verdict, so a count-based differential gate structurally cannot see it.
+  **Fix:** added a schema-level gate (`tests/chaff_const_schema.rs`) asserting no
+  state carries a constant key.
 
-Each carries a `note` in `chaffs.toml` with the re-site or oracle fix. This is
-the Examplar discipline made concrete: a chaff is only useful if it reproduces a
-failure the gate's oracle can actually observe.
+Each carries a `note` in `chaffs.toml` with the diagnosis and fix. This is the
+Examplar discipline made concrete: a chaff is only useful if it reproduces a
+failure the gate's oracle can actually observe; when it can't, strengthen the
+oracle (the constants case) or re-site the chaff (the other two).
 
 ## Adding a chaff
 

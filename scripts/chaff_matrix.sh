@@ -112,9 +112,11 @@ run_gate_diff_tlc() {
 }
 
 run_gate_cargo_test() {
-  # Runs an integration test crate under --features chaff with TLAPP_CHAFF set.
+  # Runs an integration test crate under --features chaff with TLAPP_CHAFF already
+  # set by the caller. Debug profile (no --release): it reuses the debug lib the
+  # matrix build produced, so only the test crate itself compiles.
   local test_name="$1"
-  cargo test --release --features chaff --test "${test_name}" >/dev/null 2>&1
+  cargo test --features chaff --test "${test_name}" >/dev/null 2>&1
   return $?
 }
 
@@ -125,6 +127,7 @@ dispatch_gate() {
     snapshot)          run_gate_cargo_test state_graph_snapshots ;;
     proptest)          run_gate_cargo_test compiled_vs_interpreted ;;
     reached_assertion) run_gate_cargo_test reached_assertion_violation ;;
+    const_schema)      run_gate_cargo_test chaff_const_schema ;;
     *)                 echo "    unknown gate '${gate}'" >&2; return 125 ;;
   esac
 }
@@ -132,11 +135,16 @@ dispatch_gate() {
 # ---- control: no chaff must pass -------------------------------------------
 echo "== control (no chaff active) =="
 control_fail=0
+declare -A control_seen=()
 while IFS=$'\t' read -r id spec gate status; do
   [[ "${status}" == "wired" ]] || continue
-  [[ "${gate}" == "diff_tlc" ]] || continue  # control only meaningful for diff_tlc specs
+  # One control run per (gate, spec) pair — with no chaff active every gate must
+  # PASS, confirming it is not simply always-failing.
+  key="${gate}::${spec}"
+  [[ -n "${control_seen[$key]:-}" ]] && continue
+  control_seen[$key]=1
   if TLAPP_CHAFF="" dispatch_gate "${gate}" "${spec}"; then
-    :
+    printf '  control OK: %s\n' "${key}"
   else
     echo "  CONTROL FAIL: gate '${gate}' on spec '${spec}' failed with NO chaff active" >&2
     control_fail=1
@@ -146,7 +154,7 @@ if [[ "${control_fail}" == "1" ]]; then
   echo "control failed — gate is failing without any chaff; aborting." >&2
   exit 1
 fi
-echo "  control OK"
+echo "  control: all gates pass clean"
 echo
 
 # ---- chaff sweep ------------------------------------------------------------

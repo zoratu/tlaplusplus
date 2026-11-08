@@ -405,18 +405,6 @@ fn eval_compiled_inner(
 
         // Logical operators with short-circuit evaluation
         CompiledExpr::And(exprs) => {
-            if crate::chaff::active("assert_short_circuit_disabled") {
-                // CHAFF: evaluate every conjunct eagerly (no short-circuit), so an
-                // Assert(FALSE) behind an unsatisfiable guard fires anyway → false
-                // violation. Reintroduces the `assert_disabled` regression.
-                let mut result = true;
-                for e in exprs {
-                    if !eval_compiled_inner(e, ctx, depth)?.as_bool()? {
-                        result = false;
-                    }
-                }
-                return Ok(TlaValue::Bool(result));
-            }
             for e in exprs {
                 if !eval_compiled_inner(e, ctx, depth)?.as_bool()? {
                     return Ok(TlaValue::Bool(false));

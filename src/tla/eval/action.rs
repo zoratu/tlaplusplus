@@ -318,14 +318,32 @@ fn eval_action_body_text_multi(
 
     let mut branches = vec![branch];
     for clause in split_action_body_clauses(body) {
+        // CHAFF `assert_short_circuit_disabled`: snapshot the pre-clause branches so
+        // a clause that disables the branch (a false guard) does NOT short-circuit —
+        // a later guarded-out `Assert(FALSE)` is then still evaluated and fires a
+        // false violation. `active(..)` is a compile-time `false` without
+        // `--features chaff`, so this snapshot (and the clone) vanish in production
+        // and the loop is byte-identical to the short-circuiting original.
+        let chaff_snapshot = if crate::chaff::active("assert_short_circuit_disabled") {
+            Some(branches.clone())
+        } else {
+            None
+        };
         let mut next_branches = Vec::new();
         for branch in branches {
             next_branches.extend(eval_action_clause_text_multi(&clause, ctx, branch)?);
         }
-        branches = next_branches;
-        if branches.is_empty() {
-            break;
+        if next_branches.is_empty() {
+            if let Some(snapshot) = chaff_snapshot {
+                // CHAFF path: keep the pre-clause branches instead of breaking.
+                branches = snapshot;
+                continue;
+            }
+            // Correct behavior: once a guard empties the branch set, subsequent
+            // clauses (including any Assert) are never reached.
+            return Ok(next_branches);
         }
+        branches = next_branches;
     }
     Ok(branches)
 }

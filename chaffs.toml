@@ -31,10 +31,15 @@
 # CAUGHT, set status="wired"; if UNCAUGHT, leave it "open" and record why.
 #
 # ---------------------------------------------------------------------------
-# First matrix run (CI, 2026-11-07): control OK, 5 CAUGHT, 3 open findings.
-# The 3 open findings are the tool working as intended — each is a case where the
-# first-draft chaff does not reproduce the bug via the gated spec's ACTUAL
-# evaluation path. See per-chaff `note` fields below.
+# History:
+# - First matrix run (CI, 2026-11-07): control OK, 5 CAUGHT, 3 open findings.
+#   The 3 open findings were the tool working as intended — each a case where a
+#   first-draft chaff did not reproduce the bug via the gated spec's ACTUAL
+#   evaluation path.
+# - Resolved (2026-11-08): all 3 re-sited/re-gated and confirmed CAUGHT —
+#   assert -> interpreted clause-loop short-circuit; let -> new top-level spec
+#   LetHiddenPrimeTop; const -> new schema-level gate (tests/chaff_const_schema).
+#   Now 8 wired + 1 todo. See per-chaff `note` fields for the diagnosis.
 # ---------------------------------------------------------------------------
 
 [[chaff]]
@@ -43,9 +48,9 @@ bug = "Assert(FALSE) behind an unsatisfiable guard fires anyway — conjunction 
 origin = "list.tsv: assert_disabled; item-3 reached-assertion side channel (#194/#196)"
 spec = "assert_disabled"
 gate = "diff_tlc"
-site = "src/tla/compiled_eval.rs::eval_compiled_inner (And arm)"
-status = "open"
-note = "UNCAUGHT on first run. AssertDisabled's guarded disjunct contains `x'=x`, so the whole body is routed to the INTERPRETED action-body evaluator (guard_text_is_action_body -> eval_action_body_multi, compiled_eval.rs:2818), and the guard short-circuit that actually protects the Assert lives there and in eval_compiled_clause_to_branch's Guard arm (compiled_eval.rs:2838: false guard -> Ok(Vec::new())), NOT in CompiledExpr::And. Re-site the chaff to the interpreted action-body clause short-circuit. The And-arm chaff is still a valid reproduction of a short-circuit regression, just not the one this spec gates."
+site = "src/tla/eval/action.rs::eval_action_body_text_multi (clause-loop short-circuit)"
+status = "wired"
+note = "Re-sited after the first matrix run reported UNCAUGHT. AssertDisabled's guarded disjunct contains `x'=x`, so the body routes through the INTERPRETED action-body evaluator, not CompiledExpr::And where the first-draft chaff lived. The real protection is the `break` in eval_action_body_text_multi's clause loop: once a false guard empties the branch set, the later `Assert(FALSE)` clause is never reached. The chaff now suppresses that short-circuit (keeps pre-clause branches when a clause yields none) so the Assert fires. Confirmed CAUGHT by diff_tlc on assert_disabled."
 
 [[chaff]]
 id = "init_disjunct_as_guard"
@@ -78,11 +83,11 @@ status = "wired"
 id = "let_helper_prime_as_guard"
 bug = "A LET action clause whose body assigns a prime via a helper call (LET x==.. IN Send(x), Send(m)==msg'=m) is compiled as a boolean guard rather than a prime assignment → 0 successors (under-exploration)."
 origin = "list.tsv: let_hidden_prime; PaxosAccept under-exploration (#175)"
-spec = "let_hidden_prime"
+spec = "let_hidden_prime_top"
 gate = "diff_tlc"
 site = "src/tla/compiled_expr.rs::compile_action_clause_text (LET arm)"
-status = "open"
-note = "UNCAUGHT on first run. LetHiddenPrime's clause is `\\E i \\in {1,2,3} : LET x == i+10 IN Send(x)` — it starts with `\\E`, not `LET`, so it never reaches the `trimmed.starts_with(\"LET\")` arm that the chaff toggles. The LET is compiled via the exists/quantifier route; find where the compiled-exists body routes its LET sub-clause and re-site the chaff there (or confirm compile_let_with_primes is reached directly, bypassing the starts_with gate the #175 fix guarded)."
+status = "wired"
+note = "Re-pointed after the first matrix run reported UNCAUGHT. The existing LetHiddenPrime spec wraps the LET under `\\E i : ...`, so it routes through the interpreted/quantifier path and never reaches the top-level `trimmed.starts_with(\"LET\")` arm the chaff toggles. Added a companion spec LetHiddenPrimeTop (`Act == LET x==7 IN Send(x)`, top-level) that reaches the compiled LET arm directly. Under the chaff the helper-hidden prime is compiled as a boolean Guard (no literal `'`) -> 0 successors, diverging from TLC's distinct count. Confirmed CAUGHT by diff_tlc on let_hidden_prime_top."
 
 [[chaff]]
 id = "unchanged_tuple_prime_unstaged"
@@ -107,10 +112,10 @@ id = "constants_in_fingerprint"
 bug = "Scalar constants and model values are carried in the fingerprinted state instead of the fixed model context, inflating the distinct-state count."
 origin = "list.tsv: const_state_omit; constants-in-state refactor (#193)"
 spec = "const_state_omit"
-gate = "diff_tlc"
+gate = "const_schema"
 site = "src/models/tla_native.rs::TlaModel::from_files (variable-only filter)"
-status = "open"
-note = "UNCAUGHT on first run — and this one is a genuine oracle limitation, not just a mis-site. Carrying constants (MaxN=3, NULL) in the state map adds the SAME key->value to every state, so the DISTINCT-state count is unchanged (4) and the invariant verdict is unchanged. diff_tlc compares distinct count + verdict, so it structurally cannot observe this mutation. The real #193 failure mode was model-value / slot-index resolution, not count inflation. To guard #193 either (a) write a chaff that reproduces the actual failure (e.g. constant aliasing a variable slot index, or model-value resolution) or (b) add an assertion on the fingerprint SCHEMA (state keys) rather than the count. Good Examplar lesson: a chaff must reproduce the real failure the oracle can see."
+status = "wired"
+note = "Re-gated after the first matrix run reported UNCAUGHT — a genuine ORACLE limitation, not a mis-site. Carrying constants (MaxN, NULL) in the state map adds the SAME key->value to every state, so the distinct-state count and invariant verdict are unchanged; a count-based diff_tlc oracle structurally cannot observe it. Fixed by adding a SCHEMA-level gate (tests/chaff_const_schema.rs) that asserts no initial state contains a constant key. Under the chaff the filter is skipped, MaxN/NULL leak into the state, and the test fails -> CAUGHT. Examplar lesson: a chaff must reproduce a failure the gate's oracle can actually see; when it can't, strengthen the oracle."
 
 [[chaff]]
 id = "eventually_always_unchecked"
