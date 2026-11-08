@@ -930,9 +930,15 @@ fn split_action_body_disjuncts_uncached(expr: &str) -> Vec<String> {
     // falls through to the conjunction guard below, which keeps it whole and
     // lets the clause evaluator expand the inner `\/` with the shared conjuncts
     // in scope.
+    // CHAFF `instance_primed_arg_unstaged` (part 2): bypass the
+    // `leading_conjunct_is_sole` check so a `/\ (\/ A \/ B) /\ shared` body strips
+    // its `/\` and splits the leading guard-disjunction, absorbing the shared
+    // trailing conjuncts into only the last branch. Part of the
+    // `clock_detector_instance` regression.
     if let Some(rest) = trimmed.strip_prefix("/\\").map(str::trim_start)
         && rest.starts_with("\\/")
-        && leading_conjunct_is_sole(trimmed)
+        && (crate::chaff::active("instance_primed_arg_unstaged")
+            || leading_conjunct_is_sole(trimmed))
     {
         return split_action_body_disjuncts(rest);
     }
@@ -992,7 +998,13 @@ fn split_action_body_disjuncts_uncached(expr: &str) -> Vec<String> {
         // `\E <binders> : <conjunction>` as one disjunct; downstream IR
         // compilation / `eval_exists_action_multi` expands the inner `\/` with
         // the guards and binder in scope.
-        if split_action_body_clauses(body).len() > 1 {
+        // CHAFF `exists_disjunction_hoisted`: skip the keep-whole guard so a
+        // `\E i : /\ guard /\ (\/ A \/ B)` body hoists the inner disjunction to
+        // top-level `\E i : A` / `\E i : B`, dropping the guard and shared primed
+        // conjuncts. Reintroduces the `exists_guarded_nested_disjunction` regression.
+        if !crate::chaff::active("exists_disjunction_hoisted")
+            && split_action_body_clauses(body).len() > 1
+        {
             return vec![trimmed.to_string()];
         }
         let body_disjuncts = split_top_level(body, "\\/");

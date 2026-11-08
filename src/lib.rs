@@ -17,6 +17,11 @@
 pub mod autotune;
 #[cfg_attr(feature = "verus", verifier::external)]
 pub mod canon;
+/// Feature-gated intentional semantic regressions for test-suite sensitivity
+/// measurement. No-op without `--features chaff`; never shipped. See the module
+/// docs and `scripts/chaff_matrix.sh`.
+#[cfg_attr(feature = "verus", verifier::external)]
+pub mod chaff;
 #[cfg_attr(feature = "verus", verifier::external)]
 #[macro_use]
 pub mod chaos;

@@ -25,3 +25,4 @@ notes/
 .ci/last-analysis.txt
 
 /.diff-tlc-out
+/.chaff-matrix-out

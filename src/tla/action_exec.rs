@@ -297,6 +297,19 @@ fn body_primes_identifier(body: &str, ident: &str) -> bool {
 }
 
 fn body_has_let_with_primes(body: &str) -> bool {
+    if crate::chaff::active("let_helper_prime_as_guard") {
+        // CHAFF (second site): suppress the interpreted cross-check that rescues a
+        // hidden prime in a LET body when the compiled path returns an empty result.
+        // The #175 fix is two layers — the compiled gate in
+        // `compile_action_clause_text` (first site) AND this empty-result fallback.
+        // Toggling only the compiled gate does not reproduce the bug because this
+        // fallback re-runs the interpreted evaluator and stages the prime anyway.
+        // With both suppressed, a helper-hidden-prime LET compiles to a boolean
+        // Guard -> 0 successors and stays empty -> divergence from TLC. Reintroduces
+        // the full `let_hidden_prime` / PaxosAccept regression. Covers both the
+        // operator-call and inline fallback sites in one place.
+        return false;
+    }
     let bytes = body.as_bytes();
     let mut i = 0;
     while i + 3 <= bytes.len() {

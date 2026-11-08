@@ -4157,7 +4157,15 @@ fn compile_action_clause_text(expr: &str) -> CompiledActionClause {
             // still returns None (→ interpreted `LetWithPrimes`) for shapes it
             // can't compile (e.g. a `CASE`-of-actions body). A pure value LET is
             // handled identically: its body compiles to boolean `Guard` clauses.
-            if trimmed.starts_with("LET") {
+            // CHAFF `let_helper_prime_as_guard`: require a literal `'` in the LET
+            // text before routing through the prime-aware path, so a prime hidden
+            // behind a helper call (`LET m == .. IN Send(m)`, `Send(x) == msg' = x`)
+            // is compiled as a boolean Guard → 0 successors. Reintroduces the
+            // `let_hidden_prime` regression.
+            if trimmed.starts_with("LET")
+                && (!crate::chaff::active("let_helper_prime_as_guard")
+                    || trimmed.contains('\''))
+            {
                 match compile_let_with_primes(trimmed) {
                     Some(compiled) => compiled,
                     None => CompiledActionClause::LetWithPrimes {
