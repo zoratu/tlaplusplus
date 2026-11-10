@@ -124,6 +124,7 @@ bug = "A callee action body `/\\ (\\/ A \\/ B) /\\ shared` has its leading guard
 origin = "list.tsv: clock_detector_instance; EnvironmentController localClock freeze (#188, site 2)"
 spec = "leading_guard_shared_conjuncts"
 gate = "diff_tlc"
+catch = "divergence"
 site = "src/tla/action_ir.rs::split_action_body_disjuncts_uncached (leading_conjunct_is_sole bypass)"
 status = "wired"
 # The second of the two #188 sites, split out from instance_primed_arg_unstaged.
