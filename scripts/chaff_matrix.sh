@@ -69,18 +69,21 @@ echo "              chaffs will (correctly) report as uncaught no-ops."
 echo
 
 # ---- minimal TOML array-of-tables parser (awk) ------------------------------
-# Emits one TSV line per [[chaff]]: id<TAB>spec<TAB>gate<TAB>status
+# Emits one TSV line per [[chaff]]: id<TAB>spec<TAB>gate<TAB>status<TAB>catch
+# `catch` is the OPTIONAL expected catch-mode (divergence|infra|test). Empty when
+# the entry omits it, in which case the observed mode is reported but not asserted.
 parse_ledger() {
   awk '
-    /^\[\[chaff\]\]/ { if (id != "") print id "\t" spec "\t" gate "\t" status;
-                       id=""; spec=""; gate="diff_tlc"; status="todo"; next }
+    /^\[\[chaff\]\]/ { if (id != "") print id "\t" spec "\t" gate "\t" status "\t" catch;
+                       id=""; spec=""; gate="diff_tlc"; status="todo"; catch=""; next }
     /^[[:space:]]*#/ { next }
-    /^[[:space:]]*id[[:space:]]*=/      { status_line($0, "id");     id=val }
-    /^[[:space:]]*spec[[:space:]]*=/    { status_line($0, "spec");   spec=val }
-    /^[[:space:]]*gate[[:space:]]*=/    { status_line($0, "gate");   gate=val }
-    /^[[:space:]]*status[[:space:]]*=/  { status_line($0, "status"); status=val }
-    END { if (id != "") print id "\t" spec "\t" gate "\t" status }
-    function status_line(line, key,   s) {
+    /^[[:space:]]*id[[:space:]]*=/      { status_line($0); id=val }
+    /^[[:space:]]*spec[[:space:]]*=/    { status_line($0); spec=val }
+    /^[[:space:]]*gate[[:space:]]*=/    { status_line($0); gate=val }
+    /^[[:space:]]*status[[:space:]]*=/  { status_line($0); status=val }
+    /^[[:space:]]*catch[[:space:]]*=/   { status_line($0); catch=val }
+    END { if (id != "") print id "\t" spec "\t" gate "\t" status "\t" catch }
+    function status_line(line,   s) {
       s = line
       sub(/^[^=]*=[[:space:]]*/, "", s)   # strip up to and including "="
       gsub(/^"/, "", s); gsub(/".*$/, "", s)  # strip surrounding quotes
@@ -99,6 +102,31 @@ parse_ledger() {
 CHAFF_OUTPUT_DIR="${CHAFF_OUTPUT_DIR:-${ROOT_DIR}/.chaff-matrix-out}"
 mkdir -p "${CHAFF_OUTPUT_DIR}"
 
+# GATE_MODE: HOW the gate failed when a chaff is caught, so an infra failure
+# (timeout / crash / no output) is never silently miscounted as a semantic catch.
+# Set by the gate runners; one of: divergence | infra | test | none | unknown.
+#   - divergence : diff_tlc saw a clean state-count/verdict/deadlock MISMATCH
+#                  (our binary ran to a verdict that differs from TLC)
+#   - infra      : diff_tlc saw "produced no state count" (our run timed out,
+#                  panicked, or errored out without a verdict) OR a missing file
+#   - test       : a cargo integration-test gate failed (always semantic)
+#   - none       : the gate passed (no catch)
+#   - unknown    : non-zero but no recognized marker (treat as a real failure)
+GATE_MODE="none"
+
+# Classify a diff_tlc run's stdout log into a GATE_MODE. The marker strings are
+# emitted by scripts/diff_tlc.sh (see its spec_failures reasons).
+classify_diff_tlc_log() {
+  local log="$1"
+  if grep -qiE "produced no state count|MISSING (MODULE|CONFIG)" "${log}" 2>/dev/null; then
+    echo "infra"
+  elif grep -qiE "state count mismatch|violation mismatch|COUNT-DROP false-safe|deadlock detection mismatch|expected violation but TLC|did not expect violation but TLC" "${log}" 2>/dev/null; then
+    echo "divergence"
+  else
+    echo "unknown"
+  fi
+}
+
 run_gate_diff_tlc() {
   local spec="$1"
   local tmp_list nrows rc log
@@ -112,17 +140,24 @@ run_gate_diff_tlc() {
   if [[ "${nrows}" -eq 0 ]]; then
     echo "    gate=diff_tlc: spec '${spec}' not found in ${DIFF_LIST}" >&2
     rm -f "${tmp_list}"
+    GATE_MODE="none"
     return 125  # configuration error, distinct from pass/fail
   fi
   if [[ "${nrows}" -ne 1 ]]; then
     echo "    gate=diff_tlc: spec '${spec}' matched ${nrows} rows in ${DIFF_LIST} (expected 1)" >&2
     rm -f "${tmp_list}"
+    GATE_MODE="none"
     return 125
   fi
   DIFF_LIST="${tmp_list}" TLAPLUSPLUS_BIN="${BIN}" \
     bash "${ROOT_DIR}/scripts/diff_tlc.sh" >"${log}" 2>&1
   rc=$?
   rm -f "${tmp_list}"
+  if [[ ${rc} -eq 0 ]]; then
+    GATE_MODE="none"
+  else
+    GATE_MODE="$(classify_diff_tlc_log "${log}")"
+  fi
   return ${rc}
 }
 
@@ -133,18 +168,23 @@ run_gate_cargo_test() {
   local test_name="$1"
   local log="${CHAFF_OUTPUT_DIR}/${TLAPP_CHAFF:-control}.cargo.${test_name}.log"
   cargo test --features chaff --test "${test_name}" >"${log}" 2>&1
-  return $?
+  local rc=$?
+  # A cargo-test gate failure is always a semantic assertion failure, not infra.
+  if [[ ${rc} -eq 0 ]]; then GATE_MODE="none"; else GATE_MODE="test"; fi
+  return ${rc}
 }
 
 dispatch_gate() {
   local gate="$1" spec="$2"
+  GATE_MODE="none"
   case "${gate}" in
     diff_tlc)          run_gate_diff_tlc "${spec}" ;;
     snapshot)          run_gate_cargo_test state_graph_snapshots ;;
     proptest)          run_gate_cargo_test compiled_vs_interpreted ;;
     reached_assertion) run_gate_cargo_test reached_assertion_violation ;;
     const_schema)      run_gate_cargo_test chaff_const_schema ;;
-    *)                 echo "    unknown gate '${gate}'" >&2; return 125 ;;
+    liveness_check)    run_gate_cargo_test chaff_liveness_check ;;
+    *)                 echo "    unknown gate '${gate}'" >&2; GATE_MODE="none"; return 125 ;;
   esac
 }
 
@@ -176,7 +216,7 @@ wired_expected="$(awk -F'\t' -v only="${CHAFF_ONLY}" \
 echo "== control (no chaff active) =="
 control_fail=0
 declare -A control_seen=()
-while IFS=$'\t' read -r id spec gate status; do
+while IFS=$'\t' read -r id spec gate status catch; do
   [[ "${status}" == "wired" ]] || continue
   # One control run per (gate, spec) pair — with no chaff active every gate must
   # PASS, confirming it is not simply always-failing.
@@ -207,10 +247,11 @@ echo
 
 # ---- chaff sweep ------------------------------------------------------------
 echo "== chaff sweep =="
-total=0; caught=0; uncaught=0; skipped=0; config_err=0
+total=0; caught=0; uncaught=0; skipped=0; config_err=0; mode_mismatch=0
 declare -a HOLES=()
 declare -a CONFIG_ERRORS=()
-while IFS=$'\t' read -r id spec gate status; do
+declare -a MODE_MISMATCHES=()
+while IFS=$'\t' read -r id spec gate status catch; do
   [[ -n "${id}" ]] || continue
   if [[ -n "${CHAFF_ONLY}" && "${id}" != "${CHAFF_ONLY}" ]]; then continue; fi
   # Only "wired" chaffs are asserted on. "open" (a tracked finding) and "todo"
@@ -225,6 +266,7 @@ while IFS=$'\t' read -r id spec gate status; do
   total=$((total+1))
   TLAPP_CHAFF="${id}" dispatch_gate "${gate}" "${spec}"
   rc=$?
+  mode="${GATE_MODE}"
   if [[ ${rc} -eq 125 ]]; then
     # Misconfiguration (spec missing / ambiguous / unknown gate). This is NOT a
     # verdict about the chaff — it is a setup error, reported separately (exit 2).
@@ -232,8 +274,23 @@ while IFS=$'\t' read -r id spec gate status; do
     CONFIG_ERRORS+=("${id} via ${gate} on ${spec}")
     config_err=$((config_err+1))
   elif [[ ${rc} -ne 0 ]]; then
-    printf '  [OK  ] %-34s gate=%-10s CAUGHT (gate failed as expected, rc=%d)\n' "${id}" "${gate}" "${rc}"
-    caught=$((caught+1))
+    # CAUGHT. Report HOW it was caught (the catch mode) so an infra failure
+    # (timeout/crash/no-output) is never silently credited as a semantic catch.
+    # When the ledger PINS an expected `catch`, enforce it; otherwise report only.
+    if [[ "${mode}" == "unknown" ]]; then
+      # Non-zero but no recognized marker — do not credit this as a clean catch.
+      printf '  [HOLE] %-34s gate=%-10s FAILED but mode=unknown (not a recognized catch — see logs)\n' "${id}" "${gate}"
+      HOLES+=("${id} via ${gate} on ${spec} (mode=unknown)")
+      uncaught=$((uncaught+1))
+    elif [[ -n "${catch}" && "${catch}" != "${mode}" ]]; then
+      printf '  [MODE] %-34s gate=%-10s CAUGHT but mode=%s, expected catch=%s\n' "${id}" "${gate}" "${mode}" "${catch}"
+      MODE_MISMATCHES+=("${id}: observed '${mode}' but ledger pins catch='${catch}'")
+      mode_mismatch=$((mode_mismatch+1))
+    else
+      local_pin="${catch:+ (pinned)}"
+      printf '  [OK  ] %-34s gate=%-10s CAUGHT via %s%s (rc=%d)\n' "${id}" "${gate}" "${mode}" "${local_pin}" "${rc}"
+      caught=$((caught+1))
+    fi
   else
     printf '  [HOLE] %-34s gate=%-10s UNCAUGHT — gate passed with chaff active!\n' "${id}" "${gate}"
     HOLES+=("${id} via ${gate} on ${spec}")
@@ -246,6 +303,7 @@ echo "== summary =="
 echo "  wired chaffs run   : ${total} (expected ${wired_expected})"
 echo "  caught             : ${caught}"
 echo "  UNCAUGHT (holes)   : ${uncaught}"
+echo "  mode mismatches    : ${mode_mismatch}"
 echo "  config errors      : ${config_err}"
 echo "  skipped (open/todo): ${skipped}"
 echo "  logs               : ${CHAFF_OUTPUT_DIR}"
@@ -263,6 +321,16 @@ if [[ ${uncaught} -gt 0 ]]; then
   echo
   echo "SUITE HOLES — these chaffs slipped through their gate:" >&2
   for h in "${HOLES[@]}"; do echo "  - ${h}" >&2; done
+  exit 1
+fi
+
+# A pinned catch-mode that does not match the observed mode is a real failure:
+# either the chaff's failure character changed (e.g. a divergence became a
+# timeout) or the pin is stale. Either way, don't report success.
+if [[ ${mode_mismatch} -gt 0 ]]; then
+  echo
+  echo "CATCH-MODE MISMATCHES — observed mode differs from the pinned 'catch':" >&2
+  for m in "${MODE_MISMATCHES[@]}"; do echo "  - ${m}" >&2; done
   exit 1
 fi
 

@@ -930,14 +930,16 @@ fn split_action_body_disjuncts_uncached(expr: &str) -> Vec<String> {
     // falls through to the conjunction guard below, which keeps it whole and
     // lets the clause evaluator expand the inner `\/` with the shared conjuncts
     // in scope.
-    // CHAFF `instance_primed_arg_unstaged` (part 2): bypass the
-    // `leading_conjunct_is_sole` check so a `/\ (\/ A \/ B) /\ shared` body strips
-    // its `/\` and splits the leading guard-disjunction, absorbing the shared
-    // trailing conjuncts into only the last branch. Part of the
-    // `clock_detector_instance` regression.
+    // CHAFF `instance_leading_guard_split`: bypass the `leading_conjunct_is_sole`
+    // check so a `/\ (\/ A \/ B) /\ shared` body strips its `/\` and splits the
+    // leading guard-disjunction, absorbing the shared trailing conjuncts into only
+    // the last branch. This is the SECOND of the two #188 fix sites, split out from
+    // `instance_primed_arg_unstaged` (the primed-arg staging site) so each is
+    // asserted by its own isolating spec. Reintroduces that half of the
+    // clock_detector_instance regression.
     if let Some(rest) = trimmed.strip_prefix("/\\").map(str::trim_start)
         && rest.starts_with("\\/")
-        && (crate::chaff::active("instance_primed_arg_unstaged")
+        && (crate::chaff::active("instance_leading_guard_split")
             || leading_conjunct_is_sole(trimmed))
     {
         return split_action_body_disjuncts(rest);
