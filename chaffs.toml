@@ -20,8 +20,12 @@
 #   catch   - OPTIONAL expected catch-MODE, asserted by the matrix when present:
 #               "divergence" - diff_tlc saw a clean state-count/verdict/deadlock
 #                              MISMATCH (our binary ran to a differing verdict)
-#               "infra"      - diff_tlc saw "produced no state count" (our run
-#                              timed out / panicked / errored without a verdict)
+#               "infra"      - diff_tlc saw "produced no state count": our run
+#                              reached no parseable verdict — a timeout, a panic,
+#                              OR a deterministic eval error (e.g. init_disjunct's
+#                              unbound read aborts Init). "infra" means "no clean
+#                              verdict", not necessarily an environmental flake;
+#                              it is still deterministic and safe to pin.
 #               "test"       - a cargo integration-test gate failed (semantic)
 #             Pinning `catch` makes the matrix fail if the chaff is caught the
 #             WRONG way (e.g. a divergence degrades into a timeout, or an infra
@@ -72,6 +76,7 @@ bug = "Assert(FALSE) behind an unsatisfiable guard fires anyway — conjunction 
 origin = "list.tsv: assert_disabled; item-3 reached-assertion side channel (#194/#196)"
 spec = "assert_disabled"
 gate = "diff_tlc"
+catch = "divergence"
 site = "src/tla/compiled_eval.rs::eval_compiled_clause_sequence (clause-loop short-circuit)"
 status = "wired"
 note = "Re-sited TWICE. First draft lived in CompiledExpr::And (unreached — AssertDisabled's disjunct is an action body, not a boolean And). Second draft moved to the INTERPRETED eval_action_body_text_multi, still UNCAUGHT because run-tla uses the COMPILED evaluator by default (dual-evaluator unification). Final site is the compiled clause loop eval_compiled_clause_sequence: once a false guard (x>100) empties the branch set the loop breaks, so the later Assert(FALSE) clause is never reached. The chaff snapshots the pre-clause branches and skips the break, so the Assert fires and records a false violation. Lesson: site the chaff on the evaluator run-tla actually uses."
@@ -82,6 +87,7 @@ bug = "An Init conjunct that is a guarded disjunction over a state var (\\/ C /\
 origin = "list.tsv: init_disjunct_conjunct; Prisoner*LightUnknown under-exploration (#190)"
 spec = "init_disjunct_conjunct"
 gate = "diff_tlc"
+catch = "infra"
 site = "src/models/tla_native.rs::evaluate_init_states (distribution block)"
 status = "wired"
 
@@ -91,6 +97,7 @@ bug = "\\E i : /\\ guard /\\ (\\/ A \\/ B) is split so the inner disjunction is 
 origin = "list.tsv: exists_guarded_nested_disjunction; EnvironmentController ProcTick (#187/#188)"
 spec = "exists_guarded_nested_disjunction"
 gate = "diff_tlc"
+catch = "divergence"
 site = "src/tla/action_ir.rs::split_action_body_disjuncts_uncached (exists body)"
 status = "wired"
 
@@ -100,6 +107,7 @@ bug = "An instance action call Det!Receive(i, chan'[i]) reads the primed argumen
 origin = "list.tsv: clock_detector_instance; EnvironmentController localClock freeze (#188)"
 spec = "instance_primed_arg"
 gate = "diff_tlc"
+catch = "divergence"
 site = "src/tla/eval/action.rs::expand_action_call_multi (arg_ctx staging)"
 status = "wired"
 # SPLIT (follow-up to Codex review): #188 was two independent fix sites under one
@@ -119,9 +127,14 @@ gate = "diff_tlc"
 site = "src/tla/action_ir.rs::split_action_body_disjuncts_uncached (leading_conjunct_is_sole bypass)"
 status = "wired"
 # The second of the two #188 sites, split out from instance_primed_arg_unstaged.
-# Caught by LeadingGuardSharedConjuncts, a plain (no-INSTANCE) spec whose Step body
-# is ClockDetector!Receive's exact shape, so it exercises ONLY the leading-guard
-# split, not the primed-arg staging site.
+# Caught by LeadingGuardSharedConjuncts. The first-draft isolating spec was a plain
+# (no-INSTANCE) action, but the matrix reported it UNCAUGHT: the leading-guard split
+# lives in split_action_body_disjuncts_uncached, which the compiled run-tla reaches
+# via INSTANCE expansion of the callee body, NOT for a direct action. The spec now
+# calls ClockDetector!Receive (whose body has the leading-guard shape) with an
+# UNPRIMED arg {clock[i]}, so site 1 (primed-arg staging) stays a no-op and only
+# this site changes behavior. (Good chaff-matrix catch: the first isolation attempt
+# did not exercise the targeted code path, and the matrix said so.)
 
 [[chaff]]
 id = "let_helper_prime_as_guard"
@@ -129,6 +142,7 @@ bug = "A LET action clause whose body assigns a prime via a helper call (LET x==
 origin = "list.tsv: let_hidden_prime; PaxosAccept under-exploration (#175)"
 spec = "let_hidden_prime_top"
 gate = "diff_tlc"
+catch = "divergence"
 site = "src/tla/compiled_expr.rs::compile_action_clause_text (LET arm) + src/tla/action_exec.rs::body_has_let_with_primes (empty-result fallback)"
 status = "wired"
 note = "TWO sites — the #175 fix is two defensive layers and both must be defeated. (1) compile_action_clause_text's LET arm: a helper-hidden prime (no literal ') compiles to a boolean Guard. (2) body_has_let_with_primes: when the compiled action returns an EMPTY result, run-tla cross-checks with the interpreted evaluator for LET-bodied actions, which re-stages the prime and masks (1) alone. The chaff suppresses both: the LET compiles to a Guard -> 0 successors AND the fallback no longer rescues it -> divergence from TLC's distinct count. Spec: added LetHiddenPrimeTop (`Act == LET x==7 IN Send(x)`, top-level) since the original LetHiddenPrime wraps the LET under \\E and routes through the interpreted/quantifier path that never reaches the compiled LET arm."
@@ -139,6 +153,7 @@ bug = "UNCHANGED of a defined variable-tuple (frozen == <<failed>>) does not sta
 origin = "list.tsv: unchanged_defined_tuple; Chandra-Toueg EnvironmentController UNCHANGED envVars"
 spec = "unchanged_defined_tuple"
 gate = "diff_tlc"
+catch = "divergence"
 site = "src/tla/eval/action.rs::expand_unchanged_var"
 status = "wired"
 
@@ -148,6 +163,7 @@ bug = "x \\in (Nat \\ {0}) under CONSTANT Nat <- Override enumerates infinite Na
 origin = "list.tsv: nat_override_membership; MCLamportMutex/TLCSailfish false-violations (#171)"
 spec = "nat_override_membership"
 gate = "diff_tlc"
+catch = "divergence"
 site = "src/tla/compiled_eval.rs::compiled_membership_contains (SetMinus arm)"
 status = "wired"
 

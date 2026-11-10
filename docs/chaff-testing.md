@@ -88,10 +88,12 @@ catch into a **mode** and reports it:
 - **`divergence`** — `diff_tlc` saw a clean state-count / verdict / deadlock
   *mismatch*: our binary ran to a verdict that differs from TLC. This is the
   intended way a diff_tlc chaff is caught.
-- **`infra`** — `diff_tlc` saw `produced no state count`: our run timed out,
-  panicked, or errored out without reaching a verdict. Legitimate for a chaff
-  that makes the checker hang (e.g. `nat_override` enumerating infinite `Nat`),
-  but it must be *expected*, not a surprise.
+- **`infra`** — `diff_tlc` saw `produced no state count`: our run reached no
+  parseable verdict. That covers a timeout or panic *and* a deterministic eval
+  error that aborts before a count (e.g. `init_disjunct_as_guard`'s unbound read
+  kills Init). "infra" means "no clean verdict", not necessarily an environmental
+  flake — it is deterministic and safe to pin; it just must be *expected*, not a
+  surprise degradation of a divergence.
 - **`test`** — a cargo integration-test gate (`const_schema`, `liveness_check`)
   failed; always a semantic assertion failure.
 - **`unknown`** — the gate failed but emitted no recognized marker. Treated as a

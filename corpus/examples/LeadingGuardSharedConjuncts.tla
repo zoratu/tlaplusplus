@@ -1,27 +1,26 @@
 ---- MODULE LeadingGuardSharedConjuncts ----
 EXTENDS Integers
-\* Isolates the SECOND #188 site only: an action body of the shape
-\*   /\ (\/ A \/ B)        <- leading guard-disjunction
-\*   /\ <shared primed conjuncts>
-\* The leading `\/`-group is NOT the sole leading conjunct (LocalTick and seen'
-\* follow it), so `leading_conjunct_is_sole` must return false and the body must
-\* stay one disjunct. Splitting it (the bug) absorbs the shared LocalTick/seen'
-\* conjuncts into only the LAST branch, dropping them from the first — so the
-\* first branch stages no primes and the state graph diverges. No INSTANCE here,
-\* so the first #188 site (primed-arg staging) is not involved.
-\* Chaff: instance_leading_guard_split. Mirrors ClockDetector!Receive's body.
+\* Isolates the SECOND #188 site only: the leading guard-disjunction split.
+\*
+\* The split lives in `split_action_body_disjuncts_uncached`, which the compiled
+\* run-tla reaches via INSTANCE expansion of the callee body — a direct
+\* (non-instance) action does not route through it, so this spec reuses
+\* ClockDetector (whose `Receive` body is `/\ (\/ A \/ B) /\ LocalTick /\ seen'`,
+\* a leading `\/`-group that is NOT the sole leading conjunct) via an instance
+\* call. Crucially the argument is UNPRIMED (`{clock[i]}`, not `chan'[i]` as in
+\* ClockDetectorMC), so the FIRST #188 site — the primed-arg staged-context read —
+\* is a no-op here (`ctx.clone()` and the staged ctx agree for an unprimed arg).
+\* Only `instance_leading_guard_split` can change this spec's behavior: with it,
+\* the leading `\/` splits and the shared LocalTick/seen' conjuncts are dropped
+\* from every branch but the last, so when guard A is taken clock does not advance
+\* and the state graph collapses — diverging from TLC.
+CONSTANT N
+Proc == 1..N
 VARIABLES clock, seen
-Proc == 1..2
-LocalTick(i) == clock' = [ clock EXCEPT ![i] = IF clock[i] >= 5 THEN 0 ELSE clock[i] + 1 ]
-Step(i) ==
-  /\ \/ /\ clock[i] % 2 = 0
-        /\ clock[i] % 3 = 0
-     \/ /\ clock[i] % 2 # 0
-        /\ clock[i] % 3 # 0
-  /\ LocalTick(i)
-  /\ seen' = [ seen EXCEPT ![i] = clock[i] ]
+Det == INSTANCE ClockDetector
 Init ==
   /\ clock = [i \in Proc |-> 0]
-  /\ seen  = [i \in Proc |-> 0]
+  /\ seen  = [i \in Proc |-> {}]
+Step(i) == Det!Receive(i, {clock[i]})
 Next == \E i \in Proc : Step(i)
 ====
