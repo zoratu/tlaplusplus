@@ -41,12 +41,18 @@ fn constants_are_not_carried_in_state_schema() {
     // Constants declared in the .cfg must never appear as state keys. Under the
     // chaff this assertion fails (the gate catches it); under normal operation it
     // holds. We check every initial state, not just the first.
+    // The `[CHAFF_CATCH_OK]` sentinel marks the INTENDED assertion. The chaff
+    // matrix greps the cargo log for it so that only a failure HERE (a constant
+    // leaking into the fingerprinted state) is credited as a catch — an unrelated
+    // panic, a compile error, or a `from_files` crash does not carry the sentinel
+    // and is reported as an unknown-mode HOLE instead of a false "caught".
     for (idx, state) in initial.iter().enumerate() {
         for constant in ["MaxN", "NULL"] {
             assert!(
                 !state.contains_key(constant),
-                "constant `{constant}` leaked into the fingerprinted state (initial state #{idx}): \
-                 constants belong to the fixed model context, not the per-state schema (see #193)"
+                "[CHAFF_CATCH_OK] constant `{constant}` leaked into the fingerprinted state \
+                 (initial state #{idx}): constants belong to the fixed model context, not the \
+                 per-state schema (see #193)"
             );
         }
         // Positive check: the real state variable `x` must be present.

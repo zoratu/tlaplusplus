@@ -118,9 +118,19 @@ GATE_MODE="none"
 # emitted by scripts/diff_tlc.sh (see its spec_failures reasons).
 classify_diff_tlc_log() {
   local log="$1"
-  if grep -qiE "produced no state count|MISSING (MODULE|CONFIG)" "${log}" 2>/dev/null; then
+  # ONLY our-side, our-vs-TLC failures count as a catch mode. Anything else
+  # (a TLC-baseline failure, a missing file, a ledger-vs-TLC expectation
+  # mismatch) is NOT our checker diverging, so it falls through to "unknown" and
+  # is treated as a HOLE — never silently credited as a catch.
+  if grep -qiE "tlaplusplus produced no state count" "${log}" 2>/dev/null; then
+    # Our run reached no parseable verdict (timeout / panic / eval error).
     echo "infra"
-  elif grep -qiE "state count mismatch|violation mismatch|COUNT-DROP false-safe|deadlock detection mismatch|expected violation but TLC|did not expect violation but TLC" "${log}" 2>/dev/null; then
+  elif grep -qiE "state count mismatch|violation mismatch|COUNT-DROP false-safe|deadlock detection mismatch" "${log}" 2>/dev/null; then
+    # Our binary ran to a verdict that cleanly differs from TLC's. (These four
+    # diff_tlc markers all name both sides, e.g. "TLC=.. tlaplusplus=..".) The
+    # TLC-vs-ledger markers ("expected violation but TLC", "produced no state
+    # count" on TLC's side) and "MISSING MODULE/CONFIG" are deliberately NOT here:
+    # they are not our checker diverging, so they must not satisfy a catch.
     echo "divergence"
   else
     echo "unknown"
@@ -169,8 +179,18 @@ run_gate_cargo_test() {
   local log="${CHAFF_OUTPUT_DIR}/${TLAPP_CHAFF:-control}.cargo.${test_name}.log"
   cargo test --features chaff --test "${test_name}" >"${log}" 2>&1
   local rc=$?
-  # A cargo-test gate failure is always a semantic assertion failure, not infra.
-  if [[ ${rc} -eq 0 ]]; then GATE_MODE="none"; else GATE_MODE="test"; fi
+  if [[ ${rc} -eq 0 ]]; then
+    GATE_MODE="none"
+  elif grep -q "CHAFF_CATCH_OK" "${log}" 2>/dev/null; then
+    # Failed AT the intended assertion (it carries the [CHAFF_CATCH_OK] sentinel),
+    # so this is a genuine semantic catch.
+    GATE_MODE="test"
+  else
+    # Non-zero but the intended assertion was never reached — a compile/link error,
+    # a signal, a harness failure, or an unrelated panic (e.g. run_model/from_files
+    # crashing before the assertion). Do NOT credit this as a catch.
+    GATE_MODE="unknown"
+  fi
   return ${rc}
 }
 

@@ -84,10 +84,16 @@ Progress == <>[]P
         outcome.stats.states_distinct, 2,
         "x toggles in {{0, 1}} — exploration itself must be unaffected"
     );
+    // The `[CHAFF_CATCH_OK]` sentinel marks the INTENDED assertion. The chaff
+    // matrix greps the cargo log for it so that only a failure HERE (the missing
+    // liveness violation) is credited as a catch — an unrelated panic, a compile
+    // error, or a `run_model` crash does not carry the sentinel and is reported as
+    // an unknown-mode HOLE instead of a false "caught".
     let v = outcome.violation.as_ref().expect(
-        "expected a liveness violation: bare <>[](x = 1) fails on the 0<->1 cycle. \
-         If this fails under TLAPP_CHAFF=eventually_always_unchecked, the chaff is CAUGHT; \
-         if it fails WITHOUT the chaff, the bare-<>[]P liveness gate has regressed.",
+        "[CHAFF_CATCH_OK] expected a liveness violation: bare <>[](x = 1) fails on the \
+         0<->1 cycle. If this fails under TLAPP_CHAFF=eventually_always_unchecked, the \
+         chaff is CAUGHT; if it fails WITHOUT the chaff, the bare-<>[]P liveness gate has \
+         regressed.",
     );
     assert_eq!(
         v.property_type,

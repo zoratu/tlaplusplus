@@ -197,4 +197,4 @@ status = "wired"
 # that asserts `run_model` reports a `PropertyType::Liveness` violation for a bare
 # `<>[]P` on the 0<->1 fair cycle (PR #198's proven shape). With the chaff active,
 # graph_liveness_shape's EventuallyAlways arm returns None, no violation is
-# reported, and the test FAILS -> CAUGHT. All 9 wired chaffs are now caught.
+# reported, and the test FAILS -> CAUGHT. All 10 wired chaffs are now caught.

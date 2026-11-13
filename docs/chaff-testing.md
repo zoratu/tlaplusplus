@@ -153,7 +153,8 @@ caught, 0 open**:
   independently. It is now split into `instance_primed_arg_unstaged` (the
   primed-arg staged-context read, isolated by `PrimedArgMC` whose callee has no
   leading disjunction) and `instance_leading_guard_split` (the leading
-  guard-disjunction split, isolated by the no-INSTANCE `LeadingGuardSharedConjuncts`).
+  guard-disjunction split, isolated by `LeadingGuardSharedConjuncts` — an instance
+  call with an *unprimed* argument, so site 1 stays a no-op while this site fires).
 - **Infra-vs-semantic catch contract.** See *Catch modes* above — a timeout or
   crash is no longer silently credited as a semantic catch.
 
