@@ -15,8 +15,23 @@
 #   bug     - the wrong behavior reintroduced (the historical defect)
 #   origin  - where the real bug was found / the fixing work
 #   spec    - the spec_id in corpus/diff_test/list.tsv that should catch it
-#   gate    - gate that catches it: "diff_tlc" (default) | "snapshot" |
-#             "proptest" | "reached_assertion"
+#   gate    - gate that catches it: "diff_tlc" (default) | "const_schema" |
+#             "liveness_check" | "snapshot" | "proptest" | "reached_assertion"
+#   catch   - OPTIONAL expected catch-MODE, asserted by the matrix when present:
+#               "divergence" - diff_tlc saw a clean state-count/verdict/deadlock
+#                              MISMATCH (our binary ran to a differing verdict)
+#               "infra"      - diff_tlc saw "produced no state count": our run
+#                              reached no parseable verdict — a timeout, a panic,
+#                              OR a deterministic eval error (e.g. init_disjunct's
+#                              unbound read aborts Init). "infra" means "no clean
+#                              verdict", not necessarily an environmental flake;
+#                              it is still deterministic and safe to pin.
+#               "test"       - a cargo integration-test gate failed (semantic)
+#             Pinning `catch` makes the matrix fail if the chaff is caught the
+#             WRONG way (e.g. a divergence degrades into a timeout, or an infra
+#             failure masquerades as a catch). Omit it to report the observed mode
+#             without asserting. A caught chaff whose mode is "unknown" (non-zero
+#             with no recognized marker) is always treated as a HOLE, not a catch.
 #   site    - source location of the toggle (file::function)
 #   status  - "wired"  : toggle in source AND demonstrated CAUGHT by its gate
 #                        (the matrix asserts on these; a wired chaff that goes
@@ -45,6 +60,14 @@
 #   sweep; config errors exit 2; diff_tlc spec match is literal + exactly-one;
 #   gate logs retained under .chaff-matrix-out; eventually_always relabeled
 #   todo->open (its toggle is wired). Reported coverage is "8 of 9, 1 open".
+# - Follow-ups closed (2026-11-10): (1) eventually_always_unchecked open->wired via
+#   a direct Rust liveness gate (tests/chaff_liveness_check.rs) — now 10/10 wired,
+#   0 open. (2) the two-site instance chaff SPLIT into instance_primed_arg_unstaged
+#   (site 1, spec PrimedArgMC) + instance_leading_guard_split (site 2, spec
+#   LeadingGuardSharedConjuncts), each with an isolating spec. (3) added the
+#   infra-vs-semantic catch-MODE contract: the matrix classifies each catch
+#   (divergence|infra|test), reports it, and asserts it against an optional pinned
+#   `catch`; a caught-but-"unknown" mode is treated as a HOLE.
 # ---------------------------------------------------------------------------
 
 [[chaff]]
@@ -53,6 +76,7 @@ bug = "Assert(FALSE) behind an unsatisfiable guard fires anyway — conjunction 
 origin = "list.tsv: assert_disabled; item-3 reached-assertion side channel (#194/#196)"
 spec = "assert_disabled"
 gate = "diff_tlc"
+catch = "divergence"
 site = "src/tla/compiled_eval.rs::eval_compiled_clause_sequence (clause-loop short-circuit)"
 status = "wired"
 note = "Re-sited TWICE. First draft lived in CompiledExpr::And (unreached — AssertDisabled's disjunct is an action body, not a boolean And). Second draft moved to the INTERPRETED eval_action_body_text_multi, still UNCAUGHT because run-tla uses the COMPILED evaluator by default (dual-evaluator unification). Final site is the compiled clause loop eval_compiled_clause_sequence: once a false guard (x>100) empties the branch set the loop breaks, so the later Assert(FALSE) clause is never reached. The chaff snapshots the pre-clause branches and skips the break, so the Assert fires and records a false violation. Lesson: site the chaff on the evaluator run-tla actually uses."
@@ -63,6 +87,7 @@ bug = "An Init conjunct that is a guarded disjunction over a state var (\\/ C /\
 origin = "list.tsv: init_disjunct_conjunct; Prisoner*LightUnknown under-exploration (#190)"
 spec = "init_disjunct_conjunct"
 gate = "diff_tlc"
+catch = "infra"
 site = "src/models/tla_native.rs::evaluate_init_states (distribution block)"
 status = "wired"
 
@@ -72,23 +97,45 @@ bug = "\\E i : /\\ guard /\\ (\\/ A \\/ B) is split so the inner disjunction is 
 origin = "list.tsv: exists_guarded_nested_disjunction; EnvironmentController ProcTick (#187/#188)"
 spec = "exists_guarded_nested_disjunction"
 gate = "diff_tlc"
+catch = "divergence"
 site = "src/tla/action_ir.rs::split_action_body_disjuncts_uncached (exists body)"
 status = "wired"
 
 [[chaff]]
 id = "instance_primed_arg_unstaged"
-bug = "An instance action call Det!Receive(i, chan'[i]) reads the primed argument against the bare (unstaged) context instead of the caller's staged context, binding an unbound ModelValue (freezes exploration). Also: the callee's leading guard-disjunction is split even when followed by shared sibling conjuncts."
+bug = "An instance action call Det!Receive(i, chan'[i]) reads the primed argument against the bare (unstaged) context instead of the caller's staged context, binding an unbound ModelValue (freezes/under-explores)."
 origin = "list.tsv: clock_detector_instance; EnvironmentController localClock freeze (#188)"
-spec = "clock_detector_instance"
+spec = "instance_primed_arg"
 gate = "diff_tlc"
-site = "src/tla/eval/action.rs::expand_action_call_multi + src/tla/action_ir.rs leading-guard guard"
+catch = "divergence"
+site = "src/tla/eval/action.rs::expand_action_call_multi (arg_ctx staging)"
 status = "wired"
-# LIMITATION (Codex review): this chaff toggles TWO independent #188 fix sites
-# under one id (the primed-arg staged-context read AND the leading guard-disjunction
-# split). A combined mutant being CAUGHT does not prove each site would be caught
-# independently. Splitting into two ids would give stronger evidence, but both
-# sites are needed for the single clock_detector_instance spec to diverge; isolating
-# them would require two specs that each exercise only one. Tracked as a follow-up.
+# SPLIT (follow-up to Codex review): #188 was two independent fix sites under one
+# chaff id, so a combined mutant being CAUGHT did not prove each site independently.
+# Now split into two chaffs, each with an ISOLATING spec that exercises only its
+# site: this one (the primed-arg staged-context read) is caught by PrimedArgMC,
+# whose callee PrimedArgInner has NO leading disjunction. The leading-guard split
+# is the separate `instance_leading_guard_split` chaff below. The original
+# clock_detector_instance spec stays in list.tsv as a plain combined regression gate.
+
+[[chaff]]
+id = "instance_leading_guard_split"
+bug = "A callee action body `/\\ (\\/ A \\/ B) /\\ shared` has its leading guard-disjunction split even though shared sibling conjuncts (LocalTick, seen') follow it, so those shared primed conjuncts are dropped from every branch but the last."
+origin = "list.tsv: clock_detector_instance; EnvironmentController localClock freeze (#188, site 2)"
+spec = "leading_guard_shared_conjuncts"
+gate = "diff_tlc"
+catch = "divergence"
+site = "src/tla/action_ir.rs::split_action_body_disjuncts_uncached (leading_conjunct_is_sole bypass)"
+status = "wired"
+# The second of the two #188 sites, split out from instance_primed_arg_unstaged.
+# Caught by LeadingGuardSharedConjuncts. The first-draft isolating spec was a plain
+# (no-INSTANCE) action, but the matrix reported it UNCAUGHT: the leading-guard split
+# lives in split_action_body_disjuncts_uncached, which the compiled run-tla reaches
+# via INSTANCE expansion of the callee body, NOT for a direct action. The spec now
+# calls ClockDetector!Receive (whose body has the leading-guard shape) with an
+# UNPRIMED arg {clock[i]}, so site 1 (primed-arg staging) stays a no-op and only
+# this site changes behavior. (Good chaff-matrix catch: the first isolation attempt
+# did not exercise the targeted code path, and the matrix said so.)
 
 [[chaff]]
 id = "let_helper_prime_as_guard"
@@ -96,6 +143,7 @@ bug = "A LET action clause whose body assigns a prime via a helper call (LET x==
 origin = "list.tsv: let_hidden_prime; PaxosAccept under-exploration (#175)"
 spec = "let_hidden_prime_top"
 gate = "diff_tlc"
+catch = "divergence"
 site = "src/tla/compiled_expr.rs::compile_action_clause_text (LET arm) + src/tla/action_exec.rs::body_has_let_with_primes (empty-result fallback)"
 status = "wired"
 note = "TWO sites — the #175 fix is two defensive layers and both must be defeated. (1) compile_action_clause_text's LET arm: a helper-hidden prime (no literal ') compiles to a boolean Guard. (2) body_has_let_with_primes: when the compiled action returns an EMPTY result, run-tla cross-checks with the interpreted evaluator for LET-bodied actions, which re-stages the prime and masks (1) alone. The chaff suppresses both: the LET compiles to a Guard -> 0 successors AND the fallback no longer rescues it -> divergence from TLC's distinct count. Spec: added LetHiddenPrimeTop (`Act == LET x==7 IN Send(x)`, top-level) since the original LetHiddenPrime wraps the LET under \\E and routes through the interpreted/quantifier path that never reaches the compiled LET arm."
@@ -106,6 +154,7 @@ bug = "UNCHANGED of a defined variable-tuple (frozen == <<failed>>) does not sta
 origin = "list.tsv: unchanged_defined_tuple; Chandra-Toueg EnvironmentController UNCHANGED envVars"
 spec = "unchanged_defined_tuple"
 gate = "diff_tlc"
+catch = "divergence"
 site = "src/tla/eval/action.rs::expand_unchanged_var"
 status = "wired"
 
@@ -115,6 +164,7 @@ bug = "x \\in (Nat \\ {0}) under CONSTANT Nat <- Override enumerates infinite Na
 origin = "list.tsv: nat_override_membership; MCLamportMutex/TLCSailfish false-violations (#171)"
 spec = "nat_override_membership"
 gate = "diff_tlc"
+catch = "divergence"
 site = "src/tla/compiled_eval.rs::compiled_membership_contains (SetMinus arm)"
 status = "wired"
 
@@ -124,6 +174,7 @@ bug = "Scalar constants and model values are carried in the fingerprinted state 
 origin = "list.tsv: const_state_omit; constants-in-state refactor (#193)"
 spec = "const_state_omit"
 gate = "const_schema"
+catch = "test"
 site = "src/models/tla_native.rs::TlaModel::from_files (variable-only filter)"
 status = "wired"
 note = "Re-gated after the first matrix run reported UNCAUGHT — a genuine ORACLE limitation, not a mis-site. Carrying constants (MaxN, NULL) in the state map adds the SAME key->value to every state, so the distinct-state count and invariant verdict are unchanged; a count-based diff_tlc oracle structurally cannot observe it. Fixed by adding a SCHEMA-level gate (tests/chaff_const_schema.rs) that asserts no initial state contains a constant key. Under the chaff the filter is skipped, MaxN/NULL leak into the state, and the test fails -> CAUGHT. Examplar lesson: a chaff must reproduce a failure the gate's oracle can actually see; when it can't, strengthen the oracle."
@@ -132,18 +183,18 @@ note = "Re-gated after the first matrix run reported UNCAUGHT — a genuine ORAC
 id = "eventually_always_unchecked"
 bug = "A bare <>[]P (eventually-always) PROPERTY is left UNCHECKED — the liveness shape matcher only recognizes [](P=><>[]Q) — so a real Progress violation is reported as violation=false."
 origin = "list.tsv/temporal; 12.39M-state production false-negative (#198)"
-spec = "TODO — needs a bare-<>[]P liveness spec in list.tsv (see note)"
-gate = "diff_tlc"
+spec = "(cargo) tests/chaff_liveness_check.rs"
+gate = "liveness_check"
+catch = "test"
 site = "src/models/tla_native.rs::graph_liveness_shape (EventuallyAlways arm)"
-status = "open"
+status = "wired"
 
-# NOTE on eventually_always_unchecked: the toggle IS wired in the source
-# (graph_liveness_shape's EventuallyAlways arm), so by the status vocabulary this
-# is `open`, NOT `todo` — the gap is a missing catcher, not a missing toggle. No
-# diff_tlc spec in corpus/diff_test/list.tsv yet exercises a bare `<>[]P` liveness
-# PROPERTY with a reachable Progress violation, so the matrix cannot assert this
-# chaff is caught and skips it. Adding that spec — and confirming the matrix flips
-# it to CAUGHT — is itself the proof that the liveness gate has the coverage we
-# think it does, and is exactly the kind of hole the chaff matrix is designed to
-# surface. Reported coverage is therefore "8 of 9 wired chaffs caught, 1 open",
-# never "8/8".
+# RESOLVED (follow-up): previously `open` — the toggle was wired but no gate
+# exercised a reachable bare `<>[]P` Progress violation. A diff_tlc gate is the
+# wrong oracle here: the CLI has a finite-trace liveness fallback that can print
+# `violation=false` for temporal properties, so a count/verdict differential is
+# unreliable. Instead the gate is a direct Rust test (tests/chaff_liveness_check.rs)
+# that asserts `run_model` reports a `PropertyType::Liveness` violation for a bare
+# `<>[]P` on the 0<->1 fair cycle (PR #198's proven shape). With the chaff active,
+# graph_liveness_shape's EventuallyAlways arm returns None, no violation is
+# reported, and the test FAILS -> CAUGHT. All 10 wired chaffs are now caught.

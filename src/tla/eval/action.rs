@@ -789,11 +789,13 @@ fn expand_action_call_multi(
         // no successor — the RECEIVE branch never fires, `LocallyTick` never runs,
         // and localClock stays frozen at 0. A staged context only ADDS `var'`
         // keys, so unprimed arguments evaluate identically.
-        // CHAFF `instance_primed_arg_unstaged` (part 1): evaluate call arguments
-        // against the bare (unstaged) `ctx`, so a primed argument like
+        // CHAFF `instance_primed_arg_unstaged`: evaluate call arguments against the
+        // bare (unstaged) `ctx`, so a primed argument like
         // `Detector!Receive(i, inDelivery')` reads an unbound ModelValue and the
-        // branch produces no successor (localClock freezes). Reintroduces the
-        // `clock_detector_instance` regression.
+        // branch produces no/wrong successor (localClock freezes). This is the
+        // first of the two #188 fix sites; the second (leading guard-disjunction
+        // split) is the separate `instance_leading_guard_split` chaff. Isolated by
+        // the PrimedArgMC spec, whose callee has no leading disjunction.
         let arg_ctx = if crate::chaff::active("instance_primed_arg_unstaged") {
             ctx.clone()
         } else {

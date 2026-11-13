@@ -78,15 +78,39 @@ Each `[[chaff]]` in `chaffs.toml` has a `status`:
   stays green while the gap is documented.
 - **`todo`** — located but the toggle is not yet inserted.
 
-## Three findings the tool surfaced — all resolved (8 of 9 caught, 1 open)
+## Catch modes (how a chaff is caught)
+
+When a gate catches a chaff it is not enough that the gate merely failed — an
+infrastructure failure (a timeout, a panic, a crash with no output) must never be
+silently credited as a semantic catch. The matrix therefore classifies every
+catch into a **mode** and reports it:
+
+- **`divergence`** — `diff_tlc` saw a clean state-count / verdict / deadlock
+  *mismatch*: our binary ran to a verdict that differs from TLC. This is the
+  intended way a diff_tlc chaff is caught.
+- **`infra`** — `diff_tlc` saw `produced no state count`: our run reached no
+  parseable verdict. That covers a timeout or panic *and* a deterministic eval
+  error that aborts before a count (e.g. `init_disjunct_as_guard`'s unbound read
+  kills Init). "infra" means "no clean verdict", not necessarily an environmental
+  flake — it is deterministic and safe to pin; it just must be *expected*, not a
+  surprise degradation of a divergence.
+- **`test`** — a cargo integration-test gate (`const_schema`, `liveness_check`)
+  failed; always a semantic assertion failure.
+- **`unknown`** — the gate failed but emitted no recognized marker. Treated as a
+  **hole**, never a catch.
+
+A chaff may pin its expected mode with an optional `catch` field. When pinned,
+the matrix fails if the observed mode differs — so a divergence silently
+degrading into a timeout, or an infra failure masquerading as a catch, is caught.
+Omit `catch` to report the observed mode without asserting it.
+
+## Three findings the tool surfaced — all resolved (10/10 caught)
 
 The first CI run (2026-11-07) reported: control OK, **5 caught**, **3 open**.
 The three were not false alarms — each was a case where a first-draft chaff did
 not reproduce the bug via the gated spec's *actual* evaluation path, which is
 precisely what the matrix exists to reveal. All three are now `wired` and
-confirmed CAUGHT (final run 2026-11-08: control clean, **8 of 9 wired chaffs
-caught, 0 holes**; the 9th, `eventually_always_unchecked`, is an `open` finding —
-its toggle is wired but no spec exercises it yet):
+confirmed CAUGHT (control clean, **all wired chaffs caught, 0 holes**):
 
 - `assert_short_circuit_disabled` — `run-tla` uses the **compiled** evaluator by
   default (the dual-evaluator unification), so the first draft on `CompiledExpr::And`
@@ -113,6 +137,27 @@ failure the gate's oracle can actually observe *on the path the checker takes* �
 when it can't, strengthen the oracle (the constants case) or re-site the chaff
 onto the real evaluator (the other two).
 
+## Follow-ups closed (2026-11-10)
+
+Three review follow-ups are now resolved; the matrix runs **10 wired chaffs, all
+caught, 0 open**:
+
+- **Liveness chaff wired.** `eventually_always_unchecked` was `open` because no
+  gate exercised a reachable bare-`<>[]P` Progress violation. A diff_tlc gate is
+  the wrong oracle (the CLI has a finite-trace liveness fallback that can print
+  `violation=false`), so the gate is a direct Rust test
+  (`tests/chaff_liveness_check.rs`) asserting `run_model` reports a
+  `PropertyType::Liveness` violation for a bare `<>[]P` on the 0↔1 fair cycle.
+- **Two-site instance chaff split.** The single `instance_primed_arg_unstaged`
+  toggled two independent #188 sites, so a combined catch did not prove either
+  independently. It is now split into `instance_primed_arg_unstaged` (the
+  primed-arg staged-context read, isolated by `PrimedArgMC` whose callee has no
+  leading disjunction) and `instance_leading_guard_split` (the leading
+  guard-disjunction split, isolated by `LeadingGuardSharedConjuncts` — an instance
+  call with an *unprimed* argument, so site 1 stays a no-op while this site fires).
+- **Infra-vs-semantic catch contract.** See *Catch modes* above — a timeout or
+  crash is no longer silently credited as a semantic catch.
+
 ## Adding a chaff
 
 1. Find the source site of a fix for a bug class worth guarding (start from a
@@ -129,7 +174,9 @@ onto the real evaluator (the other two).
 
 3. Add a `[[chaff]]` entry to `chaffs.toml` (id, bug, origin, spec, gate, site),
    set `status = "wired"`, and confirm `CHAFF_ONLY=my_bug_id scripts/chaff_matrix.sh`
-   reports it **CAUGHT**.
+   reports it **CAUGHT**. Note the catch *mode* it reports; once stable, pin it
+   with `catch = "divergence" | "infra" | "test"` so a later change of failure
+   character (e.g. a divergence becoming a timeout) is flagged.
 4. If the matrix reports the chaff **UNCAUGHT**, the suite has a hole: add or
    strengthen a spec in `corpus/diff_test/list.tsv` (or the relevant gate) until
    the chaff is caught, then commit both.
