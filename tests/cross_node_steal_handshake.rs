@@ -53,11 +53,13 @@ async fn make_pair(
         node_id: 0,
         listen_addr: a0,
         peers: vec![a1],
+        auth_token: None,
     };
     let cfg1 = ClusterConfig {
         node_id: 1,
         listen_addr: a1,
         peers: vec![a0],
+        auth_token: None,
     };
 
     let t0 = ClusterTransport::new(cfg0).await.unwrap();

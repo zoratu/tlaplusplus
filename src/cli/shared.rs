@@ -343,11 +343,8 @@ pub(crate) fn maybe_setup_cluster(
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    let cluster_config = ClusterConfig {
-        node_id: cluster.node_id,
-        listen_addr,
-        peers: peers.clone(),
-    };
+    let cluster_config =
+        ClusterConfig::with_env_auth(cluster.node_id, listen_addr, peers.clone());
     let num_nodes = cluster_config.num_nodes();
 
     // Build tokio runtime for cluster transport

@@ -194,6 +194,16 @@ pub(crate) struct RuntimeArgs {
     /// fairness constraints.
     #[arg(long, default_value_t = 0)]
     pub(crate) dfs_workers: usize,
+    /// Per-state evaluation budget (in evaluation elements). `0` (default) means
+    /// unlimited, preserving historical behavior. When set, each successor
+    /// computation and each invariant check is capped at this many evaluation
+    /// elements, so a single adversarial or accidentally-explosive state
+    /// (e.g. a set comprehension over a huge range, a deep quantifier nest)
+    /// yields an evaluation error instead of exhausting memory/CPU. Recommended
+    /// when model-checking an untrusted spec; a few million is generous for
+    /// ordinary specs.
+    #[arg(long, default_value_t = 0)]
+    pub(crate) eval_budget: usize,
 }
 
 #[derive(Args, Clone, Debug)]

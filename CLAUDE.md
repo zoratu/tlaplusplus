@@ -16,6 +16,22 @@ Key performance features:
 - No GC pauses (native Rust memory management)
 - Cgroup-aware worker sizing and memory budgeting
 
+## Correctness practices (Bug Bash 2026 playbook)
+
+Distilled from the Bug Bash 2026 talks. This repo already embodies most of it (it *is* a model checker with differential-vs-TLC gates, PBT, fuzzing, chaos/failpoints, and Verus proofs); the digest is kept here as the standing reference and to flag the areas still being hardened.
+
+- Code is cheap, correctness is not. The bottleneck is verification, not typing. The human owns intent (types, schemas, interfaces, invariants, tests); the agent fills in implementation.
+- Prefer EXECUTABLE specs/models over prose specs. A spec that can't run and isn't connected to the code will rot — don't write one. (We dogfood this: `corpus/internals/*.tla` model-check our own concurrency protocols — seqlock resize, work-stealing termination, checkpoint drain.)
+- For any pure function or stateful model with an invariant, add PROPERTY-BASED tests (proptest here), not just example-based tests.
+- For stateful + concurrent + fault-tolerant code, make it DETERMINISTIC (seed all randomness, virtual clock, I/O behind an interface) so failures are replayable; inject faults in tests. Our chaos soak/smoke records its per-iteration `FAILPOINTS` string and seed so a divergence can be replayed; the work-stealing scheduler itself is not yet seed-deterministic (use `--workers 1` + fixed `fingerprint_hasher` seed to shrink).
+- Name the system's INVARIANTS explicitly. For every safety invariant, add a reachability WITNESS (a test proving the interesting state is reachable) so the property isn't vacuous. (See `tests/reached_assertion_violation.rs`.)
+- When a reference model or a second implementation exists, use DIFFERENTIAL testing against it. TLC is our reference oracle (`scripts/diff_tlc.sh`); the compiled-vs-interpreted proptest is a second differential axis.
+- Security: keep DATA and CONTROL channels separate; treat all external input (incl. untrusted `.tla` specs and cluster-peer bytes) as untrusted; least privilege; minimize attack surface. Cluster TCP authenticates peers via a pre-shared token (`TLAPLUSPLUS_CLUSTER_TOKEN`); bind to loopback/trusted networks otherwise. An opt-in `--eval-budget` caps per-state evaluation cost for untrusted specs.
+- Reliability ≠ correctness. Watch for metastable failure (retry storms, feedback loops); bound inputs/load; be wary of out-of-sample designs.
+- Review the diff. Don't merge code you don't understand, human- or agent-written.
+
+Full reference: `zoratu/bugbash-2026-playbook` (`bugbash-playbook.md`) — 9 strategies, per-repo diagnostic, tools-by-stack.
+
 ## Common Commands
 
 ### Build and Test

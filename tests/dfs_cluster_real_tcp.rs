@@ -161,11 +161,13 @@ fn run_two_node_cluster_real_tcp(
         node_id: 0,
         listen_addr: addr0,
         peers: vec![addr1],
+        auth_token: None,
     };
     let cfg1 = ClusterConfig {
         node_id: 1,
         listen_addr: addr1,
         peers: vec![addr0],
+        auth_token: None,
     };
 
     let rt0 = tokio::runtime::Builder::new_multi_thread()
