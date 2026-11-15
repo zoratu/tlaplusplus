@@ -221,14 +221,18 @@ impl TlaModel {
                 if std::env::var("TLAPP_VERBOSE").is_ok() {
                     eprintln!("  Spec body: {}", spec_def.body);
                 }
-                match TemporalFormula::parse(&spec_def.body) {
-                    Ok(spec_formula) => {
-                        extract_fairness_from_formula(&spec_formula, &mut fairness_constraints);
-                    }
-                    Err(e) => {
-                        eprintln!("  Failed to parse Spec as temporal formula: {}", e);
-                    }
-                }
+                // Walk Spec conjuncts directly: unfold named-operator fairness
+                // (transitively) and extract inline WF/SF. (Bug A fix — see
+                // extract_spec_fairness. Quantified WF is deferred to Bugs B/C.)
+                let spec_body = spec_def.body.clone();
+                let mut visited_fairness_ops = std::collections::HashSet::new();
+                extract_spec_fairness(
+                    &spec_body,
+                    &module,
+                    &mut fairness_constraints,
+                    &mut visited_fairness_ops,
+                    0,
+                );
             } else {
                 eprintln!("  SPECIFICATION '{}' not found in definitions", spec_name);
             }
@@ -1891,11 +1895,16 @@ fn extract_init_next_from_spec_inner(
         return (None, None);
     }
 
+    // Strip parens wrapping the whole body so a fully-parenthesized Spec
+    // (`Spec == (Init /\ [][Next]_v /\ Fairness)`) splits into its conjuncts
+    // rather than becoming one opaque part (which would hide Init/Next and fail
+    // model loading). Symmetric with extract_spec_fairness.
+    let spec_body = strip_matched_outer_parens(spec_body.trim());
     let parts = split_top_level(spec_body, "/\\");
 
     // If there's a single part that's a definition reference, chase it
     if parts.len() == 1 {
-        let part = parts[0].trim();
+        let part = strip_matched_outer_parens(parts[0].trim());
         if let Some(name) = parse_simple_identifier(part) {
             if let Some(def) = module.definitions.get(&name) {
                 let result = extract_init_next_from_spec_inner(&def.body, module, depth + 1);
@@ -1910,8 +1919,25 @@ fn extract_init_next_from_spec_inner(
     let mut next: Option<SpecComponent> = None;
 
     for part in &parts {
-        let part = part.trim();
+        let part = strip_matched_outer_parens(part.trim());
         if part.is_empty() {
+            continue;
+        }
+
+        // A part that is itself a conjunction (exposed by stripping its wrapping
+        // parens, e.g. `(Init /\ [][Next]_v) /\ Fairness`) must be re-split so its
+        // Init/Next are seen — symmetric with extract_spec_fairness, which already
+        // re-splits such a conjunct (otherwise the two extractors disagree on
+        // structure and Init/Next could misclassify the compound).
+        if split_top_level(part, "/\\").len() > 1 {
+            let (sub_init, sub_next) =
+                extract_init_next_from_spec_inner(part, module, depth + 1);
+            if init.is_none() {
+                init = sub_init;
+            }
+            if next.is_none() {
+                next = sub_next;
+            }
             continue;
         }
 
@@ -4136,6 +4162,271 @@ fn extract_fairness_from_formula(
         }
         TemporalFormula::StatePredicate(_) => {
             // No fairness constraints in state predicates
+        }
+    }
+}
+
+/// Extract fairness constraints from a SPECIFICATION body (Bug A fix).
+///
+/// Previously fairness was extracted by parsing the whole Spec body as one
+/// `TemporalFormula`, which recognizes only top-level *inline, unquantified*
+/// `WF_v(A)` / `SF_v(A)` conjuncts. A conjunct that is a **named operator**
+/// (`Spec == Init /\ [][Next]_v /\ Fairness` with `Fairness == WF_x(Next)`, the
+/// common idiom) became a `StatePredicate("Fairness")` and was silently dropped.
+/// With no fairness extracted, infinite stuttering in `Init` was treated as a
+/// fair behaviour, producing false `<>[]Q` violations.
+///
+/// This walks the Spec conjuncts directly and:
+/// - unfolds a named-operator conjunct into its definition, **transitively**
+///   (alias chains `Fairness == MoreFairness == WF_x(Next)`), with a `visited`
+///   set to break cycles;
+/// - extracts inline `WF_`/`SF_` (including a parenthesized group
+///   `(WF_x(A) /\ WF_x(B))`);
+/// - refuses to extract a fairness token that sits under a top-level
+///   disjunction / implication / leads-to (it is not an *unconditional* fairness
+///   assumption — extracting it could hide a real violation);
+/// - warns loudly whenever a conjunct carries a `WF_`/`SF_` token (literally, or
+///   transitively through a parameterized operator's definition closure —
+///   `Fair(1)` with `Fair(i) == WF_x(A(i))`, or `Fair(i) == MoreFair(i)`) yet
+///   yields no constraint, so deferred parameterized fairness is not silently
+///   dropped. One residual silent case remains: an instance-qualified reference
+///   `Alias!Fairness` whose operator lives in the INSTANCED module is not resolved
+///   here (needs instance resolution, added with Bug C's fairness work); if it is
+///   genuinely fairness it is left unextracted — consistent with all other
+///   deferred fairness, just without a precise warning.
+///
+/// NOTE: quantified fairness `\A n \in S : WF_v(A(n))` is deliberately NOT handled
+/// here. Correctly checking it requires *per-instance* fairness (the SCC checker
+/// currently keys fairness on the action head identifier, so `WF(A(a))` and
+/// `WF(A(b))` would collapse to one `A` constraint — see Codex review of PR #212).
+/// That belongs with the enablement-aware fairness-filter rewrite (Bugs B/C);
+/// until then a quantified-WF conjunct is left unextracted with a loud warning.
+fn extract_spec_fairness(
+    spec_body: &str,
+    module: &TlaModule,
+    constraints: &mut Vec<FairnessConstraint>,
+    visited: &mut std::collections::HashSet<String>,
+    depth: usize,
+) {
+    if depth > 16 {
+        eprintln!(
+            "WARNING: Spec fairness extraction hit the depth limit; some fairness may be \
+             unextracted (deeply nested or cyclic operator definitions)."
+        );
+        return;
+    }
+    // Strip parens wrapping the whole body BEFORE splitting, so a fully
+    // parenthesized spec `Spec == (Init /\ [][Next]_v /\ Fairness)` is split into
+    // its conjuncts rather than treated as one opaque part.
+    let body = strip_matched_outer_parens(spec_body.trim());
+    for raw in split_top_level(body, "/\\") {
+        let part = strip_matched_outer_parens(raw.trim());
+        if part.is_empty() {
+            continue;
+        }
+        // A conjunct that is ITSELF a parenthesized conjunction (exposed by the
+        // strip above) is re-split so its inner fairness is seen.
+        if split_top_level(part, "/\\").len() > 1 {
+            extract_spec_fairness(part, module, constraints, visited, depth + 1);
+            continue;
+        }
+        // `[][Next]_v` behaviour conjunct — no fairness here.
+        if part.starts_with("[][") || part.starts_with("[] [") {
+            continue;
+        }
+        // Bare operator reference FIRST — before the WF_/SF_ substring test — so a
+        // named fairness operator whose NAME contains the token (e.g.
+        // `WF_Fairness == WF_x(Next)`) is unfolded, not mis-parsed as an inline
+        // expression. Handles alias chains (`Fairness == MoreFairness == WF_x(..)`)
+        // transitively; `visited` breaks cycles; unfolding a non-fairness def
+        // (Init, TypeOK, ...) is harmless (only WF_/SF_ leaves add constraints).
+        if let Some(name) = parse_simple_identifier(part) {
+            if visited.insert(name.clone()) {
+                if let Some(def) = module.definitions.get(&name) {
+                    if def.params.is_empty() {
+                        let def_body = def.body.clone();
+                        extract_spec_fairness(&def_body, module, constraints, visited, depth + 1);
+                    }
+                }
+            }
+            continue;
+        }
+        // Parameterized or alias-qualified operator reference whose definition
+        // carries fairness — e.g. `Fair(1)` with `Fair(i) == WF_x(A(i))`, or
+        // `Inst!Fairness`. Extracting it would hit the same per-instance collapse
+        // as quantified fairness (the SCC checker keys on the action HEAD, so
+        // `WF_x(A(1))` becomes an `A` constraint), so it is deferred to Bugs B/C —
+        // but it must WARN, not drop silently (the conjunct carries no literal
+        // WF_/SF_ token at this call site, so the inline path below would miss it).
+        if let Some(op_name) = conjunct_leading_operator_name(part) {
+            // Transitive closure: `Fair(1)` with `Fair(i) == WF_x(A(i))`, and also
+            // `Fair(i) == MoreFair(i)` where only `MoreFair` carries the token.
+            let mut seen = std::collections::HashSet::new();
+            if operator_closure_mentions_fairness(&op_name, module, &mut seen, 0) {
+                eprintln!(
+                    "WARNING: Spec conjunct `{}` references a parameterized fairness operator \
+                     (`{}`, transitively mentions WF_/SF_), which is not yet supported (needs \
+                     per-instance fairness — Bugs B/C). It is left unextracted and may cause a \
+                     false liveness violation.",
+                    part, op_name
+                );
+                continue;
+            }
+            // Residual (documented) limitation: an instance-qualified reference
+            // `Alias!Fairness` whose operator lives in the INSTANCED module is not
+            // resolved here (needs instance resolution, which Bug C's fairness work
+            // adds). Such a conjunct — if it is genuinely fairness — is still left
+            // unextracted, consistent with all other deferred parameterized/
+            // quantified fairness, just without a precise warning.
+        }
+        // Quantified conjunct (`\A .. : ..`): quantified fairness is deferred to
+        // Bugs B/C (needs per-instance fairness). If it literally carries a
+        // WF_/SF_ token, warn loudly rather than silently drop. (A quantified
+        // conjunct whose fairness is hidden behind a parameterized operator cannot
+        // be detected without resolving that operator inside the quantifier; that
+        // remains a known limitation of the deferred quantified support.)
+        let trimmed = part.trim_start();
+        if trimmed.starts_with("\\A") || trimmed.starts_with("\\E") {
+            if part.contains("WF_") || part.contains("SF_") {
+                eprintln!(
+                    "WARNING: Spec conjunct `{}` is quantified fairness (`\\A .. : WF_/SF_`), \
+                     which is not yet supported (needs per-instance fairness — Bugs B/C). It is \
+                     left unextracted and may cause a false liveness violation.",
+                    part
+                );
+            }
+            continue;
+        }
+        if part.contains("WF_") || part.contains("SF_") {
+            // A fairness token under a top-level `\/`, `=>`, or `~>` is NOT an
+            // unconditional fairness assumption; extracting it would add a spurious
+            // constraint that could hide a real violation. `split_top_level` is
+            // paren-aware, so an operator nested inside the WF action — e.g.
+            // `WF_x(P => Q)` — stays within one part and is not matched.
+            if split_top_level(part, "\\/").len() > 1
+                || split_top_level(part, "=>").len() > 1
+                || split_top_level(part, "~>").len() > 1
+            {
+                eprintln!(
+                    "WARNING: Spec conjunct `{}` has a WF_/SF_ token under a top-level \\/, =>, or \
+                     ~>; it is NOT treated as unconditional fairness and is left unextracted.",
+                    part
+                );
+                continue;
+            }
+            match TemporalFormula::parse(part) {
+                Ok(f) => {
+                    let before = constraints.len();
+                    extract_fairness_from_formula(&f, constraints);
+                    if constraints.len() == before {
+                        eprintln!(
+                            "WARNING: Spec conjunct `{}` contains WF_/SF_ but no fairness \
+                             constraint was extracted — DROPPED; may cause a false liveness \
+                             violation.",
+                            part
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "WARNING: failed to parse Spec fairness conjunct `{}`: {} — DROPPED.",
+                        part, e
+                    );
+                }
+            }
+        }
+        // else: a plain state-predicate conjunct (Init, TypeOK, an invariant
+        // assumption) — not fairness, ignored here.
+    }
+}
+
+/// Extract the leading operator name of a conjunct that is an operator
+/// *application* `Name(args)` or an alias-qualified reference `Alias!Name(args)` /
+/// `Alias!Name`. Returns the bare operator name (`Name`), or `None` if the conjunct
+/// is not such a reference. Used to warn on parameterized/qualified fairness that
+/// is deferred rather than silently dropped.
+fn conjunct_leading_operator_name(part: &str) -> Option<String> {
+    let s = part.trim();
+    // Take the head token up to the first `(` (operator application) if present.
+    let head = match s.find('(') {
+        Some(idx) => s[..idx].trim(),
+        None => s,
+    };
+    // Resolve the rightmost component of an `Alias!Name` qualified reference.
+    let name = head.rsplit('!').next().unwrap_or(head).trim();
+    parse_simple_identifier(name)
+}
+
+/// Does the definition closure of operator `name` (following every operator it
+/// references, any arity) mention a `WF_`/`SF_` fairness token? Used to WARN —
+/// never to extract — on a parameterized fairness operator whose fairness is
+/// reached transitively (`Fair(i) == MoreFair(i)`, `MoreFair(i) == WF_x(A(i))`),
+/// so such a (deferred) conjunct is not silently dropped. Bounded by `visited`
+/// (cycles) and `depth`.
+fn operator_closure_mentions_fairness(
+    name: &str,
+    module: &TlaModule,
+    visited: &mut std::collections::HashSet<String>,
+    depth: usize,
+) -> bool {
+    if depth > 16 || !visited.insert(name.to_string()) {
+        return false;
+    }
+    let Some(def) = module.definitions.get(name) else {
+        return false; // unresolved (e.g. an instanced-module member) — can't tell
+    };
+    if def.body.contains("WF_") || def.body.contains("SF_") {
+        return true;
+    }
+    // Recurse into referenced operators. Identifier-token scan: split on any
+    // non-identifier char and follow tokens that name a definition.
+    for tok in def.body.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+        if tok.is_empty() || tok == name {
+            continue;
+        }
+        if module.definitions.contains_key(tok)
+            && operator_closure_mentions_fairness(tok, module, visited, depth + 1)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Strip matched outer parentheses from `s`, repeatedly. Only strips a layer when
+/// the parens genuinely wrap the whole expression (depth never returns to 0 before
+/// the end), so `(a) /\ (b)` is left untouched.
+///
+/// NOTE: like `split_top_level` (which this module relies on throughout), this
+/// counts `()` without being aware of TLA+ string literals, so a parenthesis
+/// inside a `"..."` string is counted. This is a shared, pre-existing limitation
+/// of the text-level Spec handling, not specific to this helper.
+fn strip_matched_outer_parens(s: &str) -> &str {
+    let mut cur = s.trim();
+    loop {
+        let inner = match cur.strip_prefix('(').and_then(|x| x.strip_suffix(')')) {
+            Some(i) => i.trim(),
+            None => return cur,
+        };
+        let mut depth = 0i32;
+        let mut matched = true;
+        for c in inner.chars() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth < 0 {
+                        matched = false;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if matched && depth == 0 {
+            cur = inner;
+        } else {
+            return cur;
         }
     }
 }
