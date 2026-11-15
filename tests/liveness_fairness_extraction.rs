@@ -1,12 +1,19 @@
-//! Bug A regression: fairness written in a NAMED operator or a QUANTIFIED
-//! `\A n \in N : WF_v(A(n))` must be extracted from the SPECIFICATION, not
-//! silently dropped. Dropping it made infinite stuttering in `Init` look fair,
-//! yielding a false `<>[]Q` violation (found cross-checking Fermion's DQS specs
-//! against Java TLC).
+//! Bug A regression: fairness written in a NAMED operator (including an alias
+//! chain), or as strong fairness `SF_`, must be extracted from the SPECIFICATION,
+//! not silently dropped. Dropping it made infinite stuttering in `Init` look
+//! fair, yielding a false `<>[]Q` violation (found cross-checking Fermion's DQS
+//! specs against Java TLC).
 //!
-//! These run `run_model` directly (no Java/TLC needed) and assert the verdict.
-//! The companion diff_tlc corpus entries (fairness_named_wf, fairness_quantified_wf,
-//! fairness_inline_wf) cross-check the same specs against TLC in CI.
+//! Each spec is constructed so the property is FALSE without fairness (stutter in
+//! Init) and TRUE with it — so a passing "no violation" result genuinely depends
+//! on the fairness being extracted, not on the checker being lenient.
+//!
+//! Runs `run_model` directly (no Java/TLC needed). The companion diff_tlc corpus
+//! entries (fairness_named_wf, fairness_inline_wf) cross-check against TLC in CI.
+//!
+//! NOTE: quantified fairness `\A n \in N : WF_x(Set(n))` is intentionally NOT
+//! covered here — it needs per-instance fairness and is deferred to the Bug B/C
+//! fairness-filter rewrite (see extract_spec_fairness docs and PR #212 review).
 
 use std::fs;
 
@@ -38,6 +45,8 @@ fn run_spec(module_name: &str, module_src: &str, cfg_src: &str) -> RunOutcome<<T
     run_model(model, engine_cfg).expect("engine runs cleanly")
 }
 
+const CFG: &str = "SPECIFICATION Spec\nCHECK_DEADLOCK FALSE\nPROPERTIES\n  EvTwo\n";
+
 const NAMED_WF: &str = r#"---- MODULE ReproNamedWF ----
 EXTENDS Naturals
 VARIABLE x
@@ -49,14 +58,29 @@ EvTwo == <>[](x = 2)
 ====
 "#;
 
-const QUANT_WF: &str = r#"---- MODULE ReproQuantWF ----
-CONSTANT N
+// Alias chain: Spec references `Fair1`, which is `Fair2`, which is the WF.
+// Exercises transitive named-operator unfolding (Codex review #5).
+const ALIAS_CHAIN_WF: &str = r#"---- MODULE ReproAliasWF ----
+EXTENDS Naturals
 VARIABLE x
-Init == x = [n \in N |-> 0]
-Set(n) == x[n] = 0 /\ x' = [x EXCEPT ![n] = 1]
-Next == \E n \in N : Set(n)
-Spec == Init /\ [][Next]_x /\ \A n \in N : WF_x(Set(n))
-AllSet == <>[](\A n \in N : x[n] = 1)
+Init == x = 0
+Next == x < 2 /\ x' = x + 1
+Fair2 == WF_x(Next)
+Fair1 == Fair2
+Spec == Init /\ [][Next]_x /\ Fair1
+EvTwo == <>[](x = 2)
+====
+"#;
+
+// Strong fairness inside a named operator — exercises the SF_ extraction path.
+const NAMED_SF: &str = r#"---- MODULE ReproNamedSF ----
+EXTENDS Naturals
+VARIABLE x
+Init == x = 0
+Next == x < 2 /\ x' = x + 1
+Fairness == SF_x(Next)
+Spec == Init /\ [][Next]_x /\ Fairness
+EvTwo == <>[](x = 2)
 ====
 "#;
 
@@ -73,10 +97,7 @@ EvTwo == <>[](x = 2)
 #[test]
 #[serial]
 fn named_operator_wf_is_extracted() {
-    // `Fairness == WF_x(Next)`: under WF every fair behavior reaches x=2, so
-    // `<>[](x=2)` HOLDS. Before the fix the named WF was dropped and tlapp
-    // reported a false violation from stutter-at-Init.
-    let outcome = run_spec("ReproNamedWF", NAMED_WF, "SPECIFICATION Spec\nCHECK_DEADLOCK FALSE\nPROPERTIES\n  EvTwo\n");
+    let outcome = run_spec("ReproNamedWF", NAMED_WF, CFG);
     assert!(
         outcome.violation.is_none(),
         "named-operator WF must be extracted so <>[](x=2) holds; got a false violation: {:?}",
@@ -86,13 +107,22 @@ fn named_operator_wf_is_extracted() {
 
 #[test]
 #[serial]
-fn quantified_wf_is_expanded() {
-    // `\A n \in N : WF_x(Set(n))` over N={a,b}: under fairness every node is set,
-    // so `<>[](\A n : x[n]=1)` HOLDS. Before the fix the quantified WF was dropped.
-    let outcome = run_spec("ReproQuantWF", QUANT_WF, "CONSTANT N = {a, b}\nSPECIFICATION Spec\nCHECK_DEADLOCK FALSE\nPROPERTIES\n  AllSet\n");
+fn alias_chain_named_wf_is_extracted() {
+    let outcome = run_spec("ReproAliasWF", ALIAS_CHAIN_WF, CFG);
     assert!(
         outcome.violation.is_none(),
-        "quantified WF must be expanded over N so <>[](all set) holds; got a false violation: {:?}",
+        "transitive (alias-chain) named WF must be unfolded so <>[](x=2) holds; got: {:?}",
+        outcome.violation
+    );
+}
+
+#[test]
+#[serial]
+fn named_operator_sf_is_extracted() {
+    let outcome = run_spec("ReproNamedSF", NAMED_SF, CFG);
+    assert!(
+        outcome.violation.is_none(),
+        "named-operator SF must be extracted so <>[](x=2) holds; got a false violation: {:?}",
         outcome.violation
     );
 }
@@ -101,7 +131,7 @@ fn quantified_wf_is_expanded() {
 #[serial]
 fn inline_wf_still_works() {
     // Control: the pre-existing inline-WF path must keep working after the rewrite.
-    let outcome = run_spec("ReproFairWF", INLINE_WF, "SPECIFICATION Spec\nCHECK_DEADLOCK FALSE\nPROPERTIES\n  EvTwo\n");
+    let outcome = run_spec("ReproFairWF", INLINE_WF, CFG);
     assert!(
         outcome.violation.is_none(),
         "inline WF_x(Next) must still be extracted; got a false violation: {:?}",
