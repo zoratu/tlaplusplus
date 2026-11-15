@@ -20,7 +20,7 @@ use std::fs;
 use serial_test::serial;
 use tempfile::TempDir;
 use tlaplusplus::models::tla_native::TlaModel;
-use tlaplusplus::{EngineConfig, Model, RunOutcome, run_model};
+use tlaplusplus::{EngineConfig, Model, PropertyType, RunOutcome, run_model};
 
 fn run_spec(module_name: &str, module_src: &str, cfg_src: &str) -> RunOutcome<<TlaModel as Model>::State> {
     let dir = TempDir::new().expect("tempdir");
@@ -182,8 +182,37 @@ fn no_fairness_violates() {
     // confirms the positive tests' "no violation" is caused by extraction, not by
     // the checker failing to detect the violation at all.
     let outcome = run_spec("ReproNoFair", NO_FAIRNESS, CFG);
+    let v = outcome.violation.as_ref().expect(
+        "with no fairness, <>[](x=2) must be VIOLATED (stutter at Init); got no violation",
+    );
+    assert_eq!(
+        v.property_type,
+        PropertyType::Liveness,
+        "the no-fairness violation must be a liveness-property violation, not something else"
+    );
+}
+
+const NESTED_GROUP_WF: &str = r#"---- MODULE ReproNestedGroupWF ----
+EXTENDS Naturals
+VARIABLE x
+Init == x = 0
+Next == x < 2 /\ x' = x + 1
+Fairness == WF_x(Next)
+Spec == (Init /\ [][Next]_x) /\ Fairness
+EvTwo == <>[](x = 2)
+====
+"#;
+
+#[test]
+#[serial]
+fn nested_group_spec_loads_and_extracts() {
+    // `Spec == (Init /\ [][Next]_x) /\ Fairness`: the parenthesized group must be
+    // re-split by BOTH extractors (Init/Next and fairness), or the model fails to
+    // load or drops the fairness. With both consistent, <>[](x=2) HOLDS.
+    let outcome = run_spec("ReproNestedGroupWF", NESTED_GROUP_WF, CFG);
     assert!(
-        outcome.violation.is_some(),
-        "with no fairness, <>[](x=2) must be VIOLATED (stutter at Init); got no violation"
+        outcome.violation.is_none(),
+        "nested parenthesized group must be re-split by both extractors; got: {:?}",
+        outcome.violation
     );
 }

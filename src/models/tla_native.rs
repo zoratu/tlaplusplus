@@ -1924,6 +1924,23 @@ fn extract_init_next_from_spec_inner(
             continue;
         }
 
+        // A part that is itself a conjunction (exposed by stripping its wrapping
+        // parens, e.g. `(Init /\ [][Next]_v) /\ Fairness`) must be re-split so its
+        // Init/Next are seen — symmetric with extract_spec_fairness, which already
+        // re-splits such a conjunct (otherwise the two extractors disagree on
+        // structure and Init/Next could misclassify the compound).
+        if split_top_level(part, "/\\").len() > 1 {
+            let (sub_init, sub_next) =
+                extract_init_next_from_spec_inner(part, module, depth + 1);
+            if init.is_none() {
+                init = sub_init;
+            }
+            if next.is_none() {
+                next = sub_next;
+            }
+            continue;
+        }
+
         // Check for [][...]_vars pattern (Next)
         if next.is_none() {
             if let Some(rest) = part.strip_prefix("[][") {
@@ -4231,6 +4248,27 @@ fn extract_spec_fairness(
             }
             continue;
         }
+        // Parameterized or alias-qualified operator reference whose definition
+        // carries fairness — e.g. `Fair(1)` with `Fair(i) == WF_x(A(i))`, or
+        // `Inst!Fairness`. Extracting it would hit the same per-instance collapse
+        // as quantified fairness (the SCC checker keys on the action HEAD, so
+        // `WF_x(A(1))` becomes an `A` constraint), so it is deferred to Bugs B/C —
+        // but it must WARN, not drop silently (the conjunct carries no literal
+        // WF_/SF_ token at this call site, so the inline path below would miss it).
+        if let Some(op_name) = conjunct_leading_operator_name(part) {
+            if let Some(def) = module.definitions.get(&op_name) {
+                if def.body.contains("WF_") || def.body.contains("SF_") {
+                    eprintln!(
+                        "WARNING: Spec conjunct `{}` references a parameterized/qualified fairness \
+                         operator (`{}`), which is not yet supported (needs per-instance fairness \
+                         — Bugs B/C). It is left unextracted and may cause a false liveness \
+                         violation.",
+                        part, op_name
+                    );
+                    continue;
+                }
+            }
+        }
         // Quantified conjunct (`\A .. : ..`): quantified fairness is deferred to
         // Bugs B/C (needs per-instance fairness). If it literally carries a
         // WF_/SF_ token, warn loudly rather than silently drop. (A quantified
@@ -4292,9 +4330,31 @@ fn extract_spec_fairness(
     }
 }
 
+/// Extract the leading operator name of a conjunct that is an operator
+/// *application* `Name(args)` or an alias-qualified reference `Alias!Name(args)` /
+/// `Alias!Name`. Returns the bare operator name (`Name`), or `None` if the conjunct
+/// is not such a reference. Used to warn on parameterized/qualified fairness that
+/// is deferred rather than silently dropped.
+fn conjunct_leading_operator_name(part: &str) -> Option<String> {
+    let s = part.trim();
+    // Take the head token up to the first `(` (operator application) if present.
+    let head = match s.find('(') {
+        Some(idx) => s[..idx].trim(),
+        None => s,
+    };
+    // Resolve the rightmost component of an `Alias!Name` qualified reference.
+    let name = head.rsplit('!').next().unwrap_or(head).trim();
+    parse_simple_identifier(name)
+}
+
 /// Strip matched outer parentheses from `s`, repeatedly. Only strips a layer when
 /// the parens genuinely wrap the whole expression (depth never returns to 0 before
 /// the end), so `(a) /\ (b)` is left untouched.
+///
+/// NOTE: like `split_top_level` (which this module relies on throughout), this
+/// counts `()` without being aware of TLA+ string literals, so a parenthesis
+/// inside a `"..."` string is counted. This is a shared, pre-existing limitation
+/// of the text-level Spec handling, not specific to this helper.
 fn strip_matched_outer_parens(s: &str) -> &str {
     let mut cur = s.trim();
     loop {
