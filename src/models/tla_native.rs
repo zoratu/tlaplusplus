@@ -1895,11 +1895,16 @@ fn extract_init_next_from_spec_inner(
         return (None, None);
     }
 
+    // Strip parens wrapping the whole body so a fully-parenthesized Spec
+    // (`Spec == (Init /\ [][Next]_v /\ Fairness)`) splits into its conjuncts
+    // rather than becoming one opaque part (which would hide Init/Next and fail
+    // model loading). Symmetric with extract_spec_fairness.
+    let spec_body = strip_matched_outer_parens(spec_body.trim());
     let parts = split_top_level(spec_body, "/\\");
 
     // If there's a single part that's a definition reference, chase it
     if parts.len() == 1 {
-        let part = parts[0].trim();
+        let part = strip_matched_outer_parens(parts[0].trim());
         if let Some(name) = parse_simple_identifier(part) {
             if let Some(def) = module.definitions.get(&name) {
                 let result = extract_init_next_from_spec_inner(&def.body, module, depth + 1);
@@ -1914,7 +1919,7 @@ fn extract_init_next_from_spec_inner(
     let mut next: Option<SpecComponent> = None;
 
     for part in &parts {
-        let part = part.trim();
+        let part = strip_matched_outer_parens(part.trim());
         if part.is_empty() {
             continue;
         }
