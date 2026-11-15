@@ -203,6 +203,37 @@ EvTwo == <>[](x = 2)
 ====
 "#;
 
+// Parameterized fairness operator applied at a concrete arg. Correctly checking
+// this needs PER-INSTANCE fairness (the SCC checker keys on the action head), so
+// it is DEFERRED to Bug C. This test PINS the current deferred behavior — the
+// fairness is not extracted, so `<>[](x=2)` currently VIOLATES — and documents
+// that it must flip to `is_none()` once Bug C lands. (TLC holds this spec.)
+const PARAM_FAIRNESS: &str = r#"---- MODULE ReproParamFair ----
+EXTENDS Naturals
+VARIABLE x
+Init == x = 0
+Next == x < 2 /\ x' = x + 1
+Fair(i) == WF_x(Next)
+Spec == Init /\ [][Next]_x /\ Fair(1)
+EvTwo == <>[](x = 2)
+====
+"#;
+
+#[test]
+#[serial]
+fn parameterized_fairness_is_deferred_not_crashed() {
+    // KNOWN LIMITATION (deferred to Bug C): parameterized fairness is not yet
+    // extracted. The spec must still LOAD and run (no panic), and currently the
+    // property violates because fairness is absent. When Bug C adds per-instance
+    // fairness this assertion should become `is_none()`.
+    let outcome = run_spec("ReproParamFair", PARAM_FAIRNESS, CFG);
+    assert!(
+        outcome.violation.is_some(),
+        "parameterized fairness is deferred to Bug C, so <>[](x=2) currently VIOLATES; \
+         if this now holds, Bug C has landed — flip this assertion to is_none()"
+    );
+}
+
 #[test]
 #[serial]
 fn nested_group_spec_loads_and_extracts() {

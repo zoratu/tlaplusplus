@@ -4185,12 +4185,15 @@ fn extract_fairness_from_formula(
 /// - refuses to extract a fairness token that sits under a top-level
 ///   disjunction / implication / leads-to (it is not an *unconditional* fairness
 ///   assumption — extracting it could hide a real violation);
-/// - warns loudly whenever a conjunct that literally carries a `WF_`/`SF_` token
-///   yields no constraint. (One residual silent case: quantified fairness hidden
-///   behind a parameterized operator inside the quantifier, e.g.
-///   `AllFair == \A i \in S : OneFair(i)`, carries no literal token after
-///   unfolding `AllFair`, so it is neither extracted nor warned — a known
-///   limitation of the deferred quantified support below.)
+/// - warns loudly whenever a conjunct carries a `WF_`/`SF_` token (literally, or
+///   transitively through a parameterized operator's definition closure —
+///   `Fair(1)` with `Fair(i) == WF_x(A(i))`, or `Fair(i) == MoreFair(i)`) yet
+///   yields no constraint, so deferred parameterized fairness is not silently
+///   dropped. One residual silent case remains: an instance-qualified reference
+///   `Alias!Fairness` whose operator lives in the INSTANCED module is not resolved
+///   here (needs instance resolution, added with Bug C's fairness work); if it is
+///   genuinely fairness it is left unextracted — consistent with all other
+///   deferred fairness, just without a precise warning.
 ///
 /// NOTE: quantified fairness `\A n \in S : WF_v(A(n))` is deliberately NOT handled
 /// here. Correctly checking it requires *per-instance* fairness (the SCC checker
@@ -4256,18 +4259,25 @@ fn extract_spec_fairness(
         // but it must WARN, not drop silently (the conjunct carries no literal
         // WF_/SF_ token at this call site, so the inline path below would miss it).
         if let Some(op_name) = conjunct_leading_operator_name(part) {
-            if let Some(def) = module.definitions.get(&op_name) {
-                if def.body.contains("WF_") || def.body.contains("SF_") {
-                    eprintln!(
-                        "WARNING: Spec conjunct `{}` references a parameterized/qualified fairness \
-                         operator (`{}`), which is not yet supported (needs per-instance fairness \
-                         — Bugs B/C). It is left unextracted and may cause a false liveness \
-                         violation.",
-                        part, op_name
-                    );
-                    continue;
-                }
+            // Transitive closure: `Fair(1)` with `Fair(i) == WF_x(A(i))`, and also
+            // `Fair(i) == MoreFair(i)` where only `MoreFair` carries the token.
+            let mut seen = std::collections::HashSet::new();
+            if operator_closure_mentions_fairness(&op_name, module, &mut seen, 0) {
+                eprintln!(
+                    "WARNING: Spec conjunct `{}` references a parameterized fairness operator \
+                     (`{}`, transitively mentions WF_/SF_), which is not yet supported (needs \
+                     per-instance fairness — Bugs B/C). It is left unextracted and may cause a \
+                     false liveness violation.",
+                    part, op_name
+                );
+                continue;
             }
+            // Residual (documented) limitation: an instance-qualified reference
+            // `Alias!Fairness` whose operator lives in the INSTANCED module is not
+            // resolved here (needs instance resolution, which Bug C's fairness work
+            // adds). Such a conjunct — if it is genuinely fairness — is still left
+            // unextracted, consistent with all other deferred parameterized/
+            // quantified fairness, just without a precise warning.
         }
         // Quantified conjunct (`\A .. : ..`): quantified fairness is deferred to
         // Bugs B/C (needs per-instance fairness). If it literally carries a
@@ -4345,6 +4355,42 @@ fn conjunct_leading_operator_name(part: &str) -> Option<String> {
     // Resolve the rightmost component of an `Alias!Name` qualified reference.
     let name = head.rsplit('!').next().unwrap_or(head).trim();
     parse_simple_identifier(name)
+}
+
+/// Does the definition closure of operator `name` (following every operator it
+/// references, any arity) mention a `WF_`/`SF_` fairness token? Used to WARN —
+/// never to extract — on a parameterized fairness operator whose fairness is
+/// reached transitively (`Fair(i) == MoreFair(i)`, `MoreFair(i) == WF_x(A(i))`),
+/// so such a (deferred) conjunct is not silently dropped. Bounded by `visited`
+/// (cycles) and `depth`.
+fn operator_closure_mentions_fairness(
+    name: &str,
+    module: &TlaModule,
+    visited: &mut std::collections::HashSet<String>,
+    depth: usize,
+) -> bool {
+    if depth > 16 || !visited.insert(name.to_string()) {
+        return false;
+    }
+    let Some(def) = module.definitions.get(name) else {
+        return false; // unresolved (e.g. an instanced-module member) — can't tell
+    };
+    if def.body.contains("WF_") || def.body.contains("SF_") {
+        return true;
+    }
+    // Recurse into referenced operators. Identifier-token scan: split on any
+    // non-identifier char and follow tokens that name a definition.
+    for tok in def.body.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+        if tok.is_empty() || tok == name {
+            continue;
+        }
+        if module.definitions.contains_key(tok)
+            && operator_closure_mentions_fairness(tok, module, visited, depth + 1)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Strip matched outer parentheses from `s`, repeatedly. Only strips a layer when
