@@ -466,98 +466,51 @@ where
                     non_trivial_sccs.len()
                 );
 
+                // Bug C fix: fairness is a FILTER on behaviours, never a
+                // reported violation. WF/SF are ASSUMPTIONS that exclude unfair
+                // cycles from the behaviours a liveness property is checked
+                // against; an unfair SCC (e.g. a weakly-fair action enabled
+                // throughout a cycle but never taken) is DISCARDED, not reported.
+                // (Previously this loop reported such SCCs as "Fairness violation",
+                // which was a false positive — TLC never reports one.) The actual
+                // liveness verdict comes solely from `graph_liveness_violation`
+                // above, which consumes the per-SCC `fair_scc` filter (computed
+                // with the same enablement-aware `check_fairness_on_scc_fp_sharded`)
+                // and reports a property counterexample only on a FAIR bad cycle.
+                //
+                // This block is now diagnostics only: it counts how many SCCs each
+                // constraint excludes, and never sets `violation`.
                 let phase5_start = std::time::Instant::now();
                 let next_name = model.next_action_name();
                 let mut total_constraint_checks = 0usize;
+                let mut unfair_scc_count = 0usize;
 
-                'outer: for (scc_idx, scc) in non_trivial_sccs.iter().enumerate() {
-                    // Build the SCC fingerprint set once (reused for
-                    // every constraint).
+                for scc in non_trivial_sccs.iter() {
                     let scc_fps: HashSet<u64> = scc.iter().copied().collect();
-
                     for constraint in &constraints {
                         total_constraint_checks += 1;
-                        let result = check_fairness_on_scc_fp_sharded(
+                        if check_fairness_on_scc_fp_sharded(
                             &scc_fps,
                             constraint,
                             &shards,
                             &adjacency_fp,
                             next_name,
-                        );
-                        if let Err(e) = result {
-                            let scc_states: Vec<M::State> = scc
-                                .iter()
-                                .map(|fp| {
-                                    state_by_fp
-                                        .get(fp)
-                                        .expect("SCC fp must be in state map")
-                                        .clone()
-                                })
-                                .collect();
-
-                            // PROPERTY GATE (TLC parity): a fairness-unfair SCC
-                            // is not, by itself, a liveness counterexample. Ask
-                            // the model whether a declared temporal PROPERTY
-                            // actually fails on this SCC. `Some(false)` means
-                            // every evaluable property holds here → suppress
-                            // the spurious violation (e.g. EWD840's
-                            // environment-only cycle, where `terminated` never
-                            // holds so `terminated ~> terminationDetected` is
-                            // vacuously satisfied). `Some(true)` (a property
-                            // genuinely fails) and `None` (model can't judge —
-                            // preserve prior fairness-only behaviour) both fall
-                            // through to reporting.
-                            if model.scc_violates_liveness_property(&scc_states) == Some(false) {
-                                if std::env::var("TLAPP_TRACE_INVARIANT").is_ok() {
-                                    eprintln!(
-                                        "  Fairness-unfair SCC {} ({} states) satisfies all \
-                                         checked temporal properties — not a liveness \
-                                         counterexample (suppressed)",
-                                        scc_idx,
-                                        scc_states.len()
-                                    );
-                                }
-                                continue;
-                            }
-
-                            eprintln!(
-                                "  Fairness violation in SCC {} ({} states): {}",
-                                scc_idx,
-                                scc_states.len(),
-                                e
-                            );
-
-                            let representative = scc_states
-                                .first()
-                                .cloned()
-                                .expect("non-trivial SCC has at least one state");
-
-                            let mut trace = scc_states.clone();
-                            if let Some(first) = trace.first().cloned() {
-                                trace.push(first);
-                            }
-
-                            violation = Some(Violation {
-                                message: format!("Fairness violation: {}", e),
-                                state: representative,
-                                property_type: PropertyType::Liveness,
-                                trace,
-                            });
-
-                            break 'outer;
+                        )
+                        .is_err()
+                        {
+                            unfair_scc_count += 1;
+                            break; // one failed constraint makes the SCC unfair
                         }
                     }
                 }
 
                 eprintln!(
-                    "  Fairness check: {} constraint-on-SCC checks in {:.2?}",
+                    "  Fairness filter: {} constraint-on-SCC checks, {} unfair SCC(s) excluded \
+                     ({:.2?})",
                     total_constraint_checks,
+                    unfair_scc_count,
                     phase5_start.elapsed()
                 );
-
-                if violation.is_none() {
-                    eprintln!("  All fairness constraints satisfied");
-                }
 
                 // T10.2 — streaming-SCC oracle (opt-in via
                 // `--liveness-streaming`). Run nested-DFS over
