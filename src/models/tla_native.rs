@@ -4186,41 +4186,70 @@ fn extract_spec_fairness(
         );
         return;
     }
-    for raw in split_top_level(spec_body, "/\\") {
-        // Strip matched outer parens so `(Fairness)` / `(WF_x(A) /\ WF_x(B))` work.
+    // Strip parens wrapping the whole body BEFORE splitting, so a fully
+    // parenthesized spec `Spec == (Init /\ [][Next]_v /\ Fairness)` is split into
+    // its conjuncts rather than treated as one opaque part.
+    let body = strip_matched_outer_parens(spec_body.trim());
+    for raw in split_top_level(body, "/\\") {
         let part = strip_matched_outer_parens(raw.trim());
         if part.is_empty() {
+            continue;
+        }
+        // A conjunct that is ITSELF a parenthesized conjunction (exposed by the
+        // strip above) is re-split so its inner fairness is seen.
+        if split_top_level(part, "/\\").len() > 1 {
+            extract_spec_fairness(part, module, constraints, visited, depth + 1);
             continue;
         }
         // `[][Next]_v` behaviour conjunct — no fairness here.
         if part.starts_with("[][") || part.starts_with("[] [") {
             continue;
         }
-        if part.contains("WF_") || part.contains("SF_") {
-            // A fairness token under a top-level `\/`, `=>`, or `~>` is NOT an
-            // unconditional fairness assumption; extracting it would add a
-            // spurious constraint that could hide a real violation. Skip + warn.
-            if split_top_level(part, "\\/").len() > 1
-                || split_top_level(part, "=>").len() > 1
-                || part.contains("~>")
-            {
+        // Bare operator reference FIRST — before the WF_/SF_ substring test — so a
+        // named fairness operator whose NAME contains the token (e.g.
+        // `WF_Fairness == WF_x(Next)`) is unfolded, not mis-parsed as an inline
+        // expression. Handles alias chains (`Fairness == MoreFairness == WF_x(..)`)
+        // transitively; `visited` breaks cycles; unfolding a non-fairness def
+        // (Init, TypeOK, ...) is harmless (only WF_/SF_ leaves add constraints).
+        if let Some(name) = parse_simple_identifier(part) {
+            if visited.insert(name.clone()) {
+                if let Some(def) = module.definitions.get(&name) {
+                    if def.params.is_empty() {
+                        let def_body = def.body.clone();
+                        extract_spec_fairness(&def_body, module, constraints, visited, depth + 1);
+                    }
+                }
+            }
+            continue;
+        }
+        // Quantified conjunct (`\A .. : ..`): quantified fairness is deferred to
+        // Bugs B/C (needs per-instance fairness). If it literally carries a
+        // WF_/SF_ token, warn loudly rather than silently drop. (A quantified
+        // conjunct whose fairness is hidden behind a parameterized operator cannot
+        // be detected without resolving that operator inside the quantifier; that
+        // remains a known limitation of the deferred quantified support.)
+        let trimmed = part.trim_start();
+        if trimmed.starts_with("\\A") || trimmed.starts_with("\\E") {
+            if part.contains("WF_") || part.contains("SF_") {
                 eprintln!(
-                    "WARNING: Spec conjunct `{}` has a WF_/SF_ token under a non-conjunctive \
-                     operator (\\/, =>, ~>); it is NOT treated as unconditional fairness and is \
-                     left unextracted.",
+                    "WARNING: Spec conjunct `{}` is quantified fairness (`\\A .. : WF_/SF_`), \
+                     which is not yet supported (needs per-instance fairness — Bugs B/C). It is \
+                     left unextracted and may cause a false liveness violation.",
                     part
                 );
-                continue;
             }
-            // Quantified fairness is out of scope here (see the doc comment); warn
-            // rather than mis-extract it as a single collapsed constraint.
-            if part.trim_start().starts_with("\\A") || part.contains(": WF_") || part.contains(": SF_")
-            {
+            continue;
+        }
+        if part.contains("WF_") || part.contains("SF_") {
+            // A fairness token under a top-level `\/` or `=>` is NOT an
+            // unconditional fairness assumption; extracting it would add a spurious
+            // constraint that could hide a real violation. (split_top_level is
+            // paren-aware, so a `\/`/`=>` nested inside the WF action — e.g.
+            // `WF_x(P => Q)` — stays within one part and is not matched.)
+            if split_top_level(part, "\\/").len() > 1 || split_top_level(part, "=>").len() > 1 {
                 eprintln!(
-                    "WARNING: Spec conjunct `{}` looks like quantified fairness \
-                     (`\\A .. : WF_/SF_`), which is not yet supported (needs per-instance \
-                     fairness — Bugs B/C). It is left unextracted and may cause a false \
-                     liveness violation.",
+                    "WARNING: Spec conjunct `{}` has a WF_/SF_ token under a top-level \\/ or =>; \
+                     it is NOT treated as unconditional fairness and is left unextracted.",
                     part
                 );
                 continue;
@@ -4245,23 +4274,9 @@ fn extract_spec_fairness(
                     );
                 }
             }
-            continue;
         }
-        // Bare operator reference (possibly an alias chain, e.g.
-        // `Fairness == MoreFairness`, `MoreFairness == WF_x(Next)`): unfold its
-        // definition transitively. The `visited` set breaks cycles; unfolding a
-        // non-fairness definition (Init, TypeOK, ...) is harmless because only
-        // WF_/SF_ leaves contribute constraints.
-        if let Some(name) = parse_simple_identifier(part) {
-            if visited.insert(name.clone()) {
-                if let Some(def) = module.definitions.get(&name) {
-                    if def.params.is_empty() {
-                        let body = def.body.clone();
-                        extract_spec_fairness(&body, module, constraints, visited, depth + 1);
-                    }
-                }
-            }
-        }
+        // else: a plain state-predicate conjunct (Init, TypeOK, an invariant
+        // assumption) — not fairness, ignored here.
     }
 }
 
