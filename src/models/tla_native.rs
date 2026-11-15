@@ -4163,8 +4163,12 @@ fn extract_fairness_from_formula(
 /// - refuses to extract a fairness token that sits under a top-level
 ///   disjunction / implication / leads-to (it is not an *unconditional* fairness
 ///   assumption — extracting it could hide a real violation);
-/// - warns loudly whenever a fairness-looking conjunct yields no constraint, so a
-///   drop is never silent again.
+/// - warns loudly whenever a conjunct that literally carries a `WF_`/`SF_` token
+///   yields no constraint. (One residual silent case: quantified fairness hidden
+///   behind a parameterized operator inside the quantifier, e.g.
+///   `AllFair == \A i \in S : OneFair(i)`, carries no literal token after
+///   unfolding `AllFair`, so it is neither extracted nor warned — a known
+///   limitation of the deferred quantified support below.)
 ///
 /// NOTE: quantified fairness `\A n \in S : WF_v(A(n))` is deliberately NOT handled
 /// here. Correctly checking it requires *per-instance* fairness (the SCC checker
@@ -4241,15 +4245,18 @@ fn extract_spec_fairness(
             continue;
         }
         if part.contains("WF_") || part.contains("SF_") {
-            // A fairness token under a top-level `\/` or `=>` is NOT an
+            // A fairness token under a top-level `\/`, `=>`, or `~>` is NOT an
             // unconditional fairness assumption; extracting it would add a spurious
-            // constraint that could hide a real violation. (split_top_level is
-            // paren-aware, so a `\/`/`=>` nested inside the WF action — e.g.
-            // `WF_x(P => Q)` — stays within one part and is not matched.)
-            if split_top_level(part, "\\/").len() > 1 || split_top_level(part, "=>").len() > 1 {
+            // constraint that could hide a real violation. `split_top_level` is
+            // paren-aware, so an operator nested inside the WF action — e.g.
+            // `WF_x(P => Q)` — stays within one part and is not matched.
+            if split_top_level(part, "\\/").len() > 1
+                || split_top_level(part, "=>").len() > 1
+                || split_top_level(part, "~>").len() > 1
+            {
                 eprintln!(
-                    "WARNING: Spec conjunct `{}` has a WF_/SF_ token under a top-level \\/ or =>; \
-                     it is NOT treated as unconditional fairness and is left unextracted.",
+                    "WARNING: Spec conjunct `{}` has a WF_/SF_ token under a top-level \\/, =>, or \
+                     ~>; it is NOT treated as unconditional fairness and is left unextracted.",
                     part
                 );
                 continue;
