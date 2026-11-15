@@ -221,14 +221,11 @@ impl TlaModel {
                 if std::env::var("TLAPP_VERBOSE").is_ok() {
                     eprintln!("  Spec body: {}", spec_def.body);
                 }
-                match TemporalFormula::parse(&spec_def.body) {
-                    Ok(spec_formula) => {
-                        extract_fairness_from_formula(&spec_formula, &mut fairness_constraints);
-                    }
-                    Err(e) => {
-                        eprintln!("  Failed to parse Spec as temporal formula: {}", e);
-                    }
-                }
+                // Walk Spec conjuncts directly: unfold named-operator fairness,
+                // expand quantified WF/SF over finite sets, extract inline WF/SF.
+                // (Bug A fix — see extract_spec_fairness.)
+                let spec_body = spec_def.body.clone();
+                extract_spec_fairness(&spec_body, &module, &config, &mut fairness_constraints, 0);
             } else {
                 eprintln!("  SPECIFICATION '{}' not found in definitions", spec_name);
             }
@@ -4138,6 +4135,242 @@ fn extract_fairness_from_formula(
             // No fairness constraints in state predicates
         }
     }
+}
+
+/// Extract fairness constraints from a SPECIFICATION body (Bug A fix).
+///
+/// Previously fairness was extracted by parsing the whole Spec body as one
+/// `TemporalFormula`, which recognizes only top-level *inline, unquantified*
+/// `WF_v(A)` / `SF_v(A)` conjuncts. A conjunct that is a named operator
+/// (`Spec == Init /\ [][Next]_v /\ Fairness` with `Fairness == WF_x(Next)`, the
+/// common idiom) became a `StatePredicate("Fairness")` and was silently dropped;
+/// a state-level `\A n \in N : WF_x(Set(n))` likewise fell through to a dropped
+/// `StatePredicate`. With no fairness extracted, infinite stuttering in `Init`
+/// was treated as a fair behaviour, producing false `<>[]Q` violations.
+///
+/// This walks the Spec conjuncts directly: it unfolds a named-operator conjunct
+/// into its definition, expands a quantified `\A v \in S : <WF/SF body>` over the
+/// finite constant/inline set `S`, extracts inline `WF_`/`SF_`, and warns loudly
+/// when a conjunct that looks like fairness could not be extracted (so a drop is
+/// never silent again). Non-fairness conjuncts (Init, `[][Next]_v`, invariants,
+/// other temporal assumptions) are left to the paths that already handle them.
+fn extract_spec_fairness(
+    spec_body: &str,
+    module: &TlaModule,
+    config: &TlaConfig,
+    constraints: &mut Vec<FairnessConstraint>,
+    depth: usize,
+) {
+    if depth > 8 {
+        return;
+    }
+    for raw in split_top_level(spec_body, "/\\") {
+        let part = raw.trim();
+        if part.is_empty() {
+            continue;
+        }
+        // `[][Next]_v` behaviour conjunct — no fairness here.
+        if part.starts_with("[][") || part.starts_with("[] [") {
+            continue;
+        }
+        let has_fairness_token = part.contains("WF_") || part.contains("SF_");
+        if has_fairness_token {
+            // Quantified fairness: `\A v \in S : <body containing WF_/SF_>`.
+            if let Some((bvar, set_expr, body)) = parse_bounded_forall(part) {
+                match resolve_finite_set_elements(&set_expr, config) {
+                    Some(values) => {
+                        for v in values {
+                            let substituted = substitute_identifier(&body, &bvar, &v);
+                            extract_spec_fairness(
+                                &substituted,
+                                module,
+                                config,
+                                constraints,
+                                depth + 1,
+                            );
+                        }
+                    }
+                    None => {
+                        eprintln!(
+                            "WARNING: cannot expand quantified fairness `{}`: set `{}` is not a \
+                             finite model-value/constant set in the cfg — this fairness assumption \
+                             is DROPPED and may cause a false liveness violation.",
+                            part,
+                            set_expr.trim()
+                        );
+                    }
+                }
+                continue;
+            }
+            // Inline (non-quantified) fairness, possibly with other temporal
+            // structure around it: parse just this conjunct and extract.
+            match TemporalFormula::parse(part) {
+                Ok(f) => {
+                    let before = constraints.len();
+                    extract_fairness_from_formula(&f, constraints);
+                    if constraints.len() == before {
+                        eprintln!(
+                            "WARNING: Spec conjunct `{}` contains WF_/SF_ but no fairness \
+                             constraint was extracted — it is DROPPED and may cause a false \
+                             liveness violation.",
+                            part
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "WARNING: failed to parse Spec fairness conjunct `{}`: {} — DROPPED.",
+                        part, e
+                    );
+                }
+            }
+            continue;
+        }
+        // Bare operator reference: chase its definition only if it (transitively)
+        // carries fairness, so the common `Spec == Init /\ [][Next]_v /\ Fairness`
+        // idiom is unfolded. A named operator with no fairness tokens is Init /
+        // TypeOK / a non-fairness assumption and is ignored here.
+        if let Some(name) = parse_simple_identifier(part) {
+            if let Some(def) = module.definitions.get(&name) {
+                if def.params.is_empty() && (def.body.contains("WF_") || def.body.contains("SF_")) {
+                    extract_spec_fairness(&def.body, module, config, constraints, depth + 1);
+                }
+            }
+        }
+    }
+}
+
+/// Parse `\A v \in S : body` (one bound variable), tolerating one layer of outer
+/// parens. Returns `(var, set_expr, body)`. Multi-variable binders bail (`None`).
+fn parse_bounded_forall(text: &str) -> Option<(String, String, String)> {
+    let mut s = text.trim();
+    while let Some(inner) = s.strip_prefix('(').and_then(|x| x.strip_suffix(')')) {
+        if parens_balanced(inner) {
+            s = inner.trim();
+        } else {
+            break;
+        }
+    }
+    let rest = s.strip_prefix("\\A")?.trim_start();
+    let colon = top_level_colon(rest)?;
+    let binder = rest[..colon].trim();
+    let body = rest[colon + 1..].trim().to_string();
+    let in_idx = binder.find("\\in")?;
+    let var = binder[..in_idx].trim();
+    if var.contains(',') {
+        return None; // multi-variable binder unsupported
+    }
+    let var = parse_simple_identifier(var)?;
+    let set_expr = binder[in_idx + 3..].trim().to_string();
+    Some((var, set_expr, body))
+}
+
+/// Resolve a set expression to its element tokens: an inline `{a, b, c}` literal,
+/// or a CONSTANT bound in the cfg to a model-value/scalar set. `None` if the set
+/// is not statically finite (e.g. `Nat`, or an operator-defined set).
+fn resolve_finite_set_elements(set_expr: &str, config: &TlaConfig) -> Option<Vec<String>> {
+    let s = set_expr.trim();
+    if let Some(inner) = s.strip_prefix('{').and_then(|x| x.strip_suffix('}')) {
+        let mut out = Vec::new();
+        for elem in split_top_level(inner, ",") {
+            let e = elem.trim();
+            if !e.is_empty() {
+                out.push(e.to_string());
+            }
+        }
+        return Some(out);
+    }
+    if let Some(name) = parse_simple_identifier(s) {
+        if let Some(ConfigValue::Set(items)) = config.constants.get(&name) {
+            let mut out = Vec::with_capacity(items.len());
+            for it in items {
+                out.push(config_value_to_token(it)?);
+            }
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// Render a cfg constant value as the source token it would appear as in an
+/// action expression (model value / scalar). Compound values are unsupported.
+fn config_value_to_token(v: &ConfigValue) -> Option<String> {
+    match v {
+        ConfigValue::ModelValue(s) | ConfigValue::String(s) => Some(s.clone()),
+        ConfigValue::Int(i) => Some(i.to_string()),
+        ConfigValue::Bool(b) => Some(if *b { "TRUE" } else { "FALSE" }.to_string()),
+        ConfigValue::Set(_) | ConfigValue::Tuple(_) | ConfigValue::OperatorRef(_) => None,
+    }
+}
+
+/// Replace whole-identifier occurrences of `var` with `value` (token-boundary
+/// aware, so `n` does not match inside `Next` or `node`).
+fn substitute_identifier(body: &str, var: &str, value: &str) -> String {
+    if var.is_empty() {
+        return body.to_string();
+    }
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(pos) = rest.find(var) {
+        let before = &rest[..pos];
+        let after = &rest[pos + var.len()..];
+        let prev_ok = before
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+        let next_ok = after
+            .chars()
+            .next()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+        out.push_str(before);
+        if prev_ok && next_ok {
+            out.push_str(value);
+        } else {
+            out.push_str(var);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Index of the first top-level `:` (bracket depth 0) that is not part of `::` or
+/// `:=`. Used to split a quantifier binder from its body.
+fn top_level_colon(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b':' if depth == 0 => {
+                let next = bytes.get(i + 1).copied();
+                let prev = if i > 0 { bytes.get(i - 1).copied() } else { None };
+                if next != Some(b'=') && next != Some(b':') && prev != Some(b':') {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn parens_balanced(s: &str) -> bool {
+    let mut d = 0i32;
+    for c in s.chars() {
+        match c {
+            '(' => d += 1,
+            ')' => {
+                d -= 1;
+                if d < 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    d == 0
 }
 
 /// TLC-style directory search: find definitions referenced by config (invariants,
