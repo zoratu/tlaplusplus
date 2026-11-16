@@ -979,9 +979,15 @@ mod tests {
     }
 
     #[test]
-    fn detects_violation_in_self_loop_scc_missing_fair_action() {
-        // Self-loop labeled "Other" with WF on "Step" must yield a
-        // liveness violation (Step never occurs in the SCC).
+    fn unfair_scc_alone_is_not_reported() {
+        // Bug C fix: a self-loop labeled "Other" with WF("Step") is a
+        // fairness-UNFAIR cycle (Step enabled-or-not, never taken). Fairness is an
+        // ASSUMPTION that EXCLUDES such a cycle — it is NEVER itself a reported
+        // liveness violation (TLC never reports "action does not occur in SCC").
+        // With no declared temporal PROPERTY that fails on a fair cycle (LivModel
+        // uses the default no-op graph-liveness check), the verdict must be NONE.
+        // (Previously this was reported as a "Fairness violation" — the false
+        // positive this fix removes.)
         let model = Arc::new(LivModel {
             constraints: vec![FairnessConstraint::Weak {
                 vars: vec!["x".into()],
@@ -992,12 +998,10 @@ mod tests {
         let s0 = LivState { v: 0 };
         let edges = build_transitions(&[(s0.clone(), s0, "Other")]);
         let v = run_post_processing(false, &model, Some(&edges), &config_for_test());
-        let violation = v.expect("expected fairness violation");
-        assert_eq!(violation.property_type, PropertyType::Liveness);
         assert!(
-            violation.message.contains("Fairness"),
-            "message should mention fairness, got {:?}",
-            violation.message
+            v.is_none(),
+            "an unfair SCC alone must be discarded, not reported as a violation; got {:?}",
+            v.map(|viol| viol.message)
         );
     }
 
@@ -1131,10 +1135,12 @@ mod tests {
     }
 
     #[test]
-    fn violation_trace_loops_back_to_first_state() {
-        // The violation trace pushes a copy of the first SCC state at the
-        // end so the lasso loop is visible. For a single-state self-loop
-        // the trace must therefore have length 2.
+    fn fairness_filter_excludes_unfair_self_loop() {
+        // Companion to `unfair_scc_alone_is_not_reported`: the fairness FILTER
+        // excludes the unfair self-loop, and with no property failing on a fair
+        // cycle the post-processing yields no violation. (This replaces the old
+        // test that asserted a fairness-violation trace looping back to its first
+        // state — that reporting path is removed by the Bug C fix.)
         let model = Arc::new(LivModel {
             constraints: vec![FairnessConstraint::Weak {
                 vars: vec!["x".into()],
@@ -1145,9 +1151,10 @@ mod tests {
         let s0 = LivState { v: 7 };
         let edges = build_transitions(&[(s0.clone(), s0.clone(), "Other")]);
         let v = run_post_processing(false, &model, Some(&edges), &config_for_test());
-        let violation = v.expect("expected violation");
-        assert_eq!(violation.trace.len(), 2, "self-loop trace = state, state");
-        assert_eq!(violation.trace[0], s0);
-        assert_eq!(violation.trace[1], s0);
+        assert!(
+            v.is_none(),
+            "unfair self-loop is filtered out, not reported; got {:?}",
+            v.map(|viol| viol.message)
+        );
     }
 }

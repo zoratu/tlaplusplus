@@ -31,6 +31,19 @@ pub struct TlaModel {
     pub invariant_exprs: Vec<(String, String)>,
     pub temporal_properties: Vec<(String, TemporalFormula)>,
     pub fairness_constraints: Vec<FairnessConstraint>,
+    /// True if the `SPECIFICATION` declares fairness (`WF_`/`SF_`) that we could
+    /// NOT fully extract into `fairness_constraints` — currently quantified
+    /// (`\A n \in S : WF_v(A(n))`) or parameterized/instance-qualified fairness,
+    /// which are deferred (they need per-instance fairness). When set, the
+    /// graph-level liveness checks (`graph_liveness_violation`,
+    /// `graph_liveness_eventually_violation`) must NOT run their no-fairness
+    /// "stutter-forever" reasoning — the spec IS fair, we just can't model all of
+    /// it — so those properties are left UNCHECKED (conservative: miss rather than
+    /// false-violate). This is the soundness guard for the Bug A deferral
+    /// interacting with the Bug B eventually-checks (CheckpointDrain: all
+    /// properties are `<>Q`, all fairness is `\A t : WF_vars(..)` → without this
+    /// guard the empty constraint set is read as "no fairness" → false positive).
+    pub fairness_extraction_incomplete: bool,
     /// True if the behaviour `SPECIFICATION` conjoins a *non-fairness* temporal
     /// assumption (`[]<>R`, `<>R`, `~>`, `<>[]`, …) beyond `Init /\ [][Next]_vars`
     /// and `WF_`/`SF_` fairness. Such an assumption can exclude the
@@ -208,6 +221,7 @@ impl TlaModel {
         }
 
         let mut fairness_constraints = extract_fairness_constraints(&temporal_properties);
+        let mut fairness_extraction_incomplete = false;
 
         // Also extract fairness from SPECIFICATION if present
         if let Some(spec_name) = config.specification.as_ref() {
@@ -231,8 +245,17 @@ impl TlaModel {
                     &module,
                     &mut fairness_constraints,
                     &mut visited_fairness_ops,
+                    &mut fairness_extraction_incomplete,
                     0,
                 );
+                if fairness_extraction_incomplete {
+                    eprintln!(
+                        "WARNING: some SPECIFICATION fairness could not be fully extracted \
+                         (quantified/parameterized); graph-level liveness checks for <>Q / \
+                         [](P=><>Q) / ~> / <>[]Q will be SKIPPED for this spec to avoid a false \
+                         violation (conservative — see fairness_extraction_incomplete)."
+                    );
+                }
             } else {
                 eprintln!("  SPECIFICATION '{}' not found in definitions", spec_name);
             }
@@ -306,6 +329,7 @@ impl TlaModel {
             invariant_exprs,
             temporal_properties,
             fairness_constraints,
+            fairness_extraction_incomplete,
             spec_has_non_fairness_liveness,
             state_constraints,
             action_constraints,
@@ -867,6 +891,14 @@ impl Model for TlaModel {
         // cycle containing a `¬Q` state). Because every state in the graph is
         // reachable from Init, a P-state that reaches such a cycle witnesses a
         // behaviour that satisfies P but for which `<>[]Q` fails.
+
+        // SOUNDNESS GUARD (same as graph_liveness_eventually_violation): with
+        // fairness we couldn't fully extract, the no-fairness stutter reasoning and
+        // the `fair_scc` filter are both unreliable, so leave these properties
+        // unchecked rather than risk a false violation.
+        if self.fairness_extraction_incomplete {
+            return None;
+        }
         let has_fairness = !self.fairness_constraints.is_empty();
 
         for (_name, formula) in &self.temporal_properties {
@@ -1017,6 +1049,17 @@ impl Model for TlaModel {
         // cycle and on the connecting path. `Q` must be *confidently* false
         // (`Some(false)`); an unevaluable state never establishes `¬Q`, so an
         // uncheckable predicate can only miss a violation, never invent one.
+
+        // SOUNDNESS GUARD: if the Spec declares fairness we could NOT fully extract
+        // (quantified/parameterized — deferred), the constraint set is incomplete.
+        // Running the no-fairness "stutter-forever" reasoning would read the empty/
+        // partial constraints as "unfair" and false-violate (CheckpointDrain: all
+        // `<>Q` properties, all `\A t : WF_vars(..)` fairness). We cannot soundly
+        // check an eventuality without the full fairness picture, so leave these
+        // properties UNCHECKED (conservative — matches pre-Bug-B behaviour).
+        if self.fairness_extraction_incomplete {
+            return None;
+        }
         let has_fairness = !self.fairness_constraints.is_empty();
 
         // `¬Q` test (confident false only).
@@ -4391,6 +4434,7 @@ fn extract_spec_fairness(
     module: &TlaModule,
     constraints: &mut Vec<FairnessConstraint>,
     visited: &mut std::collections::HashSet<String>,
+    incomplete: &mut bool,
     depth: usize,
 ) {
     if depth > 16 {
@@ -4398,6 +4442,7 @@ fn extract_spec_fairness(
             "WARNING: Spec fairness extraction hit the depth limit; some fairness may be \
              unextracted (deeply nested or cyclic operator definitions)."
         );
+        *incomplete = true;
         return;
     }
     // Strip parens wrapping the whole body BEFORE splitting, so a fully
@@ -4412,7 +4457,7 @@ fn extract_spec_fairness(
         // A conjunct that is ITSELF a parenthesized conjunction (exposed by the
         // strip above) is re-split so its inner fairness is seen.
         if split_top_level(part, "/\\").len() > 1 {
-            extract_spec_fairness(part, module, constraints, visited, depth + 1);
+            extract_spec_fairness(part, module, constraints, visited, incomplete, depth + 1);
             continue;
         }
         // `[][Next]_v` behaviour conjunct — no fairness here.
@@ -4430,7 +4475,14 @@ fn extract_spec_fairness(
                 if let Some(def) = module.definitions.get(&name) {
                     if def.params.is_empty() {
                         let def_body = def.body.clone();
-                        extract_spec_fairness(&def_body, module, constraints, visited, depth + 1);
+                        extract_spec_fairness(
+                            &def_body,
+                            module,
+                            constraints,
+                            visited,
+                            incomplete,
+                            depth + 1,
+                        );
                     }
                 }
             }
@@ -4455,6 +4507,7 @@ fn extract_spec_fairness(
                      false liveness violation.",
                     part, op_name
                 );
+                *incomplete = true;
                 continue;
             }
             // Residual (documented) limitation: an instance-qualified reference
@@ -4479,6 +4532,7 @@ fn extract_spec_fairness(
                      left unextracted and may cause a false liveness violation.",
                     part
                 );
+                *incomplete = true;
             }
             continue;
         }
@@ -4497,6 +4551,7 @@ fn extract_spec_fairness(
                      ~>; it is NOT treated as unconditional fairness and is left unextracted.",
                     part
                 );
+                *incomplete = true;
                 continue;
             }
             match TemporalFormula::parse(part) {
@@ -4510,6 +4565,7 @@ fn extract_spec_fairness(
                              violation.",
                             part
                         );
+                        *incomplete = true;
                     }
                 }
                 Err(e) => {
@@ -4517,6 +4573,7 @@ fn extract_spec_fairness(
                         "WARNING: failed to parse Spec fairness conjunct `{}`: {} — DROPPED.",
                         part, e
                     );
+                    *incomplete = true;
                 }
             }
         }
