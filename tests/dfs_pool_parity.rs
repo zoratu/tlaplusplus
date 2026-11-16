@@ -218,9 +218,11 @@ Spec == Init /\ [][Next]_vars /\ WF_vars(Idle)
         );
         if let Some(v) = outcome.violation.as_ref() {
             assert_eq!(v.property_type, PropertyType::Liveness);
+            // Post Bug B/C: a graph-level liveness violation (fairness is a filter,
+            // not a reported "Idle does not occur" violation).
             assert!(
-                v.message.contains("Idle"),
-                "DFS pool n={} violation must mention Idle, got: {}",
+                v.message.contains("liveness"),
+                "DFS pool n={} violation must be a graph-level liveness violation, got: {}",
                 n,
                 v.message
             );

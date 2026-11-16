@@ -288,11 +288,14 @@ ReachesGoal == <>(x = 999)
     let dfs_v = dfs
         .violation
         .as_ref()
-        .expect("DFS must report fairness violation on Idle");
+        .expect("DFS must report liveness violation: <>(x=999) fails on the cycle");
     assert_eq!(dfs_v.property_type, PropertyType::Liveness);
+    // `ReachesGoal == <>(x=999)` is violated on the fair 3-state cycle. Post
+    // Bug B/C this is a graph-level liveness violation (fairness is a filter now,
+    // not a reported "Idle does not occur" violation).
     assert!(
-        dfs_v.message.contains("Idle"),
-        "DFS violation must mention Idle, got: {}",
+        dfs_v.message.contains("liveness"),
+        "DFS violation must be a graph-level liveness violation, got: {}",
         dfs_v.message
     );
 }
