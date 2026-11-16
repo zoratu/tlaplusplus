@@ -802,9 +802,11 @@ pub(super) fn run_inband_fairness_check<M: Model>(
         );
     }
 
+    let mut shape_desc = "<>[]Q / [](P => <>[]Q)";
     let bad_state = model
         .graph_liveness_violation(&adjacency_fp, state_by_fp, &owned_sccs, &fair_scc)
         .or_else(|| {
+            shape_desc = "<>Q / [](P => <>Q) / ~>";
             model.graph_liveness_eventually_violation(
                 &adjacency_fp,
                 state_by_fp,
@@ -824,12 +826,12 @@ pub(super) fn run_inband_fairness_check<M: Model>(
             }
         }
         let v = Violation {
-            message: "Temporal property violated: graph-level liveness".to_string(),
+            message: format!("Temporal property violated: graph-level liveness ({shape_desc})"),
             state,
             property_type: PropertyType::Liveness,
             trace,
         };
-        eprintln!("[dfs-worker] graph-level liveness violation");
+        eprintln!("[dfs-worker] graph-level liveness violation ({shape_desc})");
         let _ = violation_tx.try_send(v);
         let prev = violation_count.fetch_add(1, Ordering::AcqRel);
         if stop_on_violation && (prev + 1) >= max_violations {
