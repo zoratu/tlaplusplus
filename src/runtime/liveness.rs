@@ -436,6 +436,28 @@ where
                     trace: vec![bad_state],
                 });
             }
+            // Bug B: the "eventually" shapes <>Q / [](P => <>Q) / P ~> Q, checked
+            // against the FAIR SCCs (a fair cycle where Q is false everywhere,
+            // reached by a Q-false path).
+            if let Some(bad_state) = model.graph_liveness_eventually_violation(
+                &adjacency_fp,
+                &state_by_fp,
+                &owned_sccs,
+                &fair_scc,
+            ) {
+                eprintln!(
+                    "  Graph-level liveness violation (<>Q / [](P => <>Q) / ~>) found in {:.2?}",
+                    gl_start.elapsed()
+                );
+                return Some(Violation {
+                    message: "Temporal property violated: eventually liveness \
+                              (<>Q, [](P => <>Q), or P ~> Q)"
+                        .to_string(),
+                    state: bad_state.clone(),
+                    property_type: PropertyType::Liveness,
+                    trace: vec![bad_state],
+                });
+            }
             eprintln!(
                 "  Graph-level liveness check: no violation ({:.2?})",
                 gl_start.elapsed()

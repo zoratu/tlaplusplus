@@ -850,9 +850,9 @@ impl Model for TlaModel {
     }
 
     fn needs_graph_liveness_check(&self) -> bool {
-        self.temporal_properties
-            .iter()
-            .any(|(_, f)| graph_liveness_shape(f).is_some())
+        self.temporal_properties.iter().any(|(_, f)| {
+            graph_liveness_shape(f).is_some() || graph_liveness_eventually_shape(f).is_some()
+        })
     }
 
     fn graph_liveness_violation(
@@ -991,6 +991,141 @@ impl Model for TlaModel {
                     && self.eval_state_pred_on_state(p_text, st) == Some(true)
                 {
                     return Some(st.clone());
+                }
+            }
+        }
+        None
+    }
+
+    fn graph_liveness_eventually_violation(
+        &self,
+        adjacency_fp: &HashMap<u64, Vec<u64>>,
+        state_by_fp: &HashMap<u64, Self::State>,
+        non_trivial_sccs: &[Vec<u64>],
+        fair_scc: &[bool],
+    ) -> Option<Self::State> {
+        // Bug B: the "eventually" shapes `<>Q`, `[](P => <>Q)`, and `P ~> Q`.
+        // A behaviour VIOLATES these iff `Q` is false forever along some suffix:
+        //   - `<>Q`          : `Q` false on the WHOLE behaviour from Init.
+        //   - `[](P=><>Q)`/~>: there is a P-state after which `Q` is false forever.
+        // So a counterexample is a FAIR cycle (or quiescent terminal) where `Q` is
+        // false at EVERY state, reached by a path along which `Q` is false
+        // throughout — from Init (bare `<>Q`) or from a `¬Q` P-state (`~>`).
+        //
+        // This is STRICTER than the `<>[]Q` check (which fires on a cycle merely
+        // *containing* a `¬Q` state): here `Q` must be false everywhere in the
+        // cycle and on the connecting path. `Q` must be *confidently* false
+        // (`Some(false)`); an unevaluable state never establishes `¬Q`, so an
+        // uncheckable predicate can only miss a violation, never invent one.
+        let has_fairness = !self.fairness_constraints.is_empty();
+
+        // `¬Q` test (confident false only).
+        let is_not_q = |fp: u64, q_text: &str| -> bool {
+            state_by_fp
+                .get(&fp)
+                .map(|st| self.eval_state_pred_on_state(q_text, st) == Some(false))
+                .unwrap_or(false)
+        };
+
+        for (_name, formula) in &self.temporal_properties {
+            let Some((p_text, q_text)) = graph_liveness_eventually_shape(formula) else {
+                continue;
+            };
+            let is_bare_eventually = p_text == "TRUE";
+
+            // 1. Bad cycles: `Q` false at EVERY state of a fair non-trivial SCC,
+            //    plus quiescent `¬Q` terminals (a terminal has `Next` disabled, so
+            //    every WF_/SF_ constraint is vacuously satisfied → its stutter
+            //    suffix is fair). Without fairness, any `¬Q` state stutters forever
+            //    (guarded by `spec_has_non_fairness_liveness`, which excludes the
+            //    stutter suffix when the Spec conjoins another temporal assumption).
+            let mut bad_cycle_fps: HashSet<u64> = HashSet::new();
+            if has_fairness {
+                for (idx, scc) in non_trivial_sccs.iter().enumerate() {
+                    if !fair_scc.get(idx).copied().unwrap_or(true) {
+                        continue; // unfair cycle — excluded
+                    }
+                    let all_not_q = scc.iter().all(|fp| is_not_q(*fp, q_text));
+                    if all_not_q {
+                        for fp in scc {
+                            bad_cycle_fps.insert(*fp);
+                        }
+                    }
+                }
+                for (&fp, _st) in state_by_fp.iter() {
+                    let is_terminal = adjacency_fp
+                        .get(&fp)
+                        .map(|succs| succs.is_empty())
+                        .unwrap_or(true);
+                    if is_terminal && is_not_q(fp, q_text) {
+                        bad_cycle_fps.insert(fp);
+                    }
+                }
+            } else {
+                if self.spec_has_non_fairness_liveness {
+                    continue;
+                }
+                for (&fp, _st) in state_by_fp.iter() {
+                    if is_not_q(fp, q_text) {
+                        bad_cycle_fps.insert(fp);
+                    }
+                }
+            }
+
+            if bad_cycle_fps.is_empty() {
+                continue;
+            }
+
+            // 2. Backward reachability RESTRICTED to `¬Q` states: a state can begin
+            //    a `Q`-false-forever suffix iff it is `¬Q` and either is a bad-cycle
+            //    state or has a successor that can (so the connecting path is all
+            //    `¬Q`). Build reverse adjacency and BFS, only entering `¬Q` preds.
+            let mut reverse: HashMap<u64, Vec<u64>> = HashMap::with_capacity(adjacency_fp.len());
+            for (&from, succs) in adjacency_fp.iter() {
+                for &to in succs {
+                    reverse.entry(to).or_default().push(from);
+                }
+            }
+            let mut bad_reaching: HashSet<u64> = HashSet::new();
+            let mut stack: Vec<u64> = Vec::new();
+            for &fp in &bad_cycle_fps {
+                // A bad-cycle fp is itself `¬Q` (SCC-everywhere or terminal `¬Q`).
+                if bad_reaching.insert(fp) {
+                    stack.push(fp);
+                }
+            }
+            while let Some(fp) = stack.pop() {
+                if let Some(preds) = reverse.get(&fp) {
+                    for &pred in preds {
+                        // Only extend the suffix through `¬Q` predecessors.
+                        if is_not_q(pred, q_text) && bad_reaching.insert(pred) {
+                            stack.push(pred);
+                        }
+                    }
+                }
+            }
+
+            // 3. Report a violation.
+            if is_bare_eventually {
+                // `<>Q`: a `¬Q` path from an INIT state to a bad cycle. The whole
+                // behaviour is `¬Q`, so Init itself must be `¬Q` and bad-reaching.
+                for init in self.initial_states() {
+                    let fp = self.fingerprint(&init);
+                    if bad_reaching.contains(&fp) {
+                        return state_by_fp.get(&fp).cloned().or(Some(init));
+                    }
+                }
+            } else {
+                // `[](P=><>Q)` / `~>`: a `¬Q` P-state that reaches a bad cycle via a
+                // `¬Q` path (the P-state begins the `Q`-false-forever suffix; the
+                // stem from Init may contain `Q`). Reachability from Init is implied
+                // (every state in the graph is reachable from Init).
+                for (&fp, st) in state_by_fp.iter() {
+                    if bad_reaching.contains(&fp)
+                        && self.eval_state_pred_on_state(p_text, st) == Some(true)
+                    {
+                        return Some(st.clone());
+                    }
                 }
             }
         }
@@ -1544,6 +1679,56 @@ fn graph_liveness_shape(formula: &TemporalFormula) -> Option<(&str, &str)> {
             } else {
                 None
             }
+        }
+        _ => None,
+    }
+}
+
+/// Recognize the "eventually" liveness shapes that `graph_liveness_shape`
+/// deliberately does NOT handle — `<>Q`, `[](P => <>Q)`, and `P ~> Q` — returning
+/// `(p_text, q_text)` with `p == "TRUE"` for the bare `<>Q`. (Bug B.)
+///
+/// These differ from the `<>[]Q` shapes in their violation condition: `<>[]Q`
+/// fails on a fair cycle that merely *contains* a `¬Q` state, whereas `<>Q` /
+/// `[](P => <>Q)` / `~>` fail only on a fair cycle where `Q` is false *everywhere*,
+/// reached by a path along which `Q` is false *throughout* (see
+/// `graph_liveness_eventually_violation`). They are kept separate so the two
+/// conditions don't get conflated.
+fn graph_liveness_eventually_shape(formula: &TemporalFormula) -> Option<(&str, &str)> {
+    match formula {
+        // Bare `<>Q`.
+        TemporalFormula::Eventually(q_inner) => {
+            let TemporalFormula::StatePredicate(q) = q_inner.as_ref() else {
+                return None;
+            };
+            is_pure_state_predicate_text(q).then(|| ("TRUE", q.trim()))
+        }
+        // `P ~> Q` ≡ `[](P => <>Q)`.
+        TemporalFormula::LeadsTo(p, q) => {
+            let (TemporalFormula::StatePredicate(p), TemporalFormula::StatePredicate(q)) =
+                (p.as_ref(), q.as_ref())
+            else {
+                return None;
+            };
+            (is_pure_state_predicate_text(p) && is_pure_state_predicate_text(q))
+                .then(|| (p.trim(), q.trim()))
+        }
+        // `[](P => <>Q)` (always-implies-eventually, NOT eventually-always).
+        TemporalFormula::Always(inner) => {
+            let TemporalFormula::Implies(ante, cons) = inner.as_ref() else {
+                return None;
+            };
+            let TemporalFormula::StatePredicate(p) = ante.as_ref() else {
+                return None;
+            };
+            let TemporalFormula::Eventually(q_inner) = cons.as_ref() else {
+                return None;
+            };
+            let TemporalFormula::StatePredicate(q) = q_inner.as_ref() else {
+                return None;
+            };
+            (is_pure_state_predicate_text(p) && is_pure_state_predicate_text(q))
+                .then(|| (p.trim(), q.trim()))
         }
         _ => None,
     }

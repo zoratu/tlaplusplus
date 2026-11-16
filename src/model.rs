@@ -317,6 +317,27 @@ pub trait Model: Send + Sync + 'static {
         None
     }
 
+    /// Graph-level liveness check for the "eventually" shapes `<>Q`,
+    /// `[](P => <>Q)`, and `P ~> Q` (Bug B). Companion to
+    /// `graph_liveness_violation` (which handles the `<>[]Q` shapes). A behaviour
+    /// violates these iff `Q` is false forever along some suffix: for `<>Q` the
+    /// whole behaviour from Init, for `[](P=><>Q)`/`~>` the suffix after a P-state.
+    /// So a counterexample is a FAIR cycle (or quiescent terminal) where `Q` is
+    /// false at EVERY state, reached by a `Q`-false path — stricter than the
+    /// `<>[]Q` "contains a `¬Q` state" condition. Same arguments and return
+    /// contract as `graph_liveness_violation`.
+    ///
+    /// Default: `None`.
+    fn graph_liveness_eventually_violation(
+        &self,
+        _adjacency_fp: &std::collections::HashMap<u64, Vec<u64>>,
+        _state_by_fp: &std::collections::HashMap<u64, Self::State>,
+        _non_trivial_sccs: &[Vec<u64>],
+        _fair_scc: &[bool],
+    ) -> Option<Self::State> {
+        None
+    }
+
     fn check_invariants(&self, state: &Self::State) -> Result<(), String>;
 
     /// Check state constraints - returns Ok(()) if state should be explored, Err if pruned
