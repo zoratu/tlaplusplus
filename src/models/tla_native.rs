@@ -899,6 +899,13 @@ impl Model for TlaModel {
         if self.fairness_extraction_incomplete {
             return None;
         }
+        // SOUNDNESS GUARD (Codex review #3): a non-fairness temporal assumption in
+        // the Spec can exclude a behaviour this check would flag; we don't model it
+        // in acceptance, so bail REGARDLESS of whether WF/SF constraints exist
+        // (previously only the no-fairness branch below consulted this flag).
+        if self.spec_has_non_fairness_liveness {
+            return None;
+        }
         let has_fairness = !self.fairness_constraints.is_empty();
 
         for (_name, formula) in &self.temporal_properties {
@@ -970,16 +977,9 @@ impl Model for TlaModel {
                     }
                 }
             } else {
-                // No fairness: every reachable ¬Q state can be stuttered on
-                // forever → each is a bad cycle. BUT this stutter-reachability
-                // is only sound when the spec is exactly `Init /\ [][Next]_vars`.
-                // If the SPECIFICATION conjoins a non-fairness temporal
-                // assumption (`[]<>R`, `<>R`, `~>`, …) it excludes the
-                // stutter-forever suffix, so firing here could false-violate —
-                // leave the property unchecked instead ((d) guardrail).
-                if self.spec_has_non_fairness_liveness {
-                    continue;
-                }
+                // No fairness (and, by the top-level guard, no non-fairness
+                // temporal assumption either): every reachable ¬Q state can be
+                // stuttered on forever under `[Next]_vars` → each is a bad cycle.
                 for (&fp, st) in state_by_fp.iter() {
                     if self.eval_state_pred_on_state(q_text, st) == Some(false) {
                         bad_cycle_fps.insert(fp);
@@ -1060,6 +1060,17 @@ impl Model for TlaModel {
         if self.fairness_extraction_incomplete {
             return None;
         }
+
+        // SOUNDNESS GUARD (Codex review #3): if the Spec conjoins a NON-fairness
+        // temporal assumption (`[]<>R`, `<>R`, `~>`, `<>[]`, …) beyond
+        // Init/Next/WF/SF, that assumption can EXCLUDE a behaviour this graph check
+        // would otherwise flag — e.g. a `¬Q` cycle that is fair under `WF_v(A)` but
+        // ruled out by `[]<>R`. We do not model such assumptions in acceptance, so
+        // reporting a violation would be unsound REGARDLESS of whether WF/SF
+        // constraints are also present. Leave these properties unchecked.
+        if self.spec_has_non_fairness_liveness {
+            return None;
+        }
         let has_fairness = !self.fairness_constraints.is_empty();
 
         // `¬Q` test (confident false only).
@@ -1071,10 +1082,11 @@ impl Model for TlaModel {
         };
 
         for (_name, formula) in &self.temporal_properties {
-            let Some((p_text, q_text)) = graph_liveness_eventually_shape(formula) else {
+            let Some((p_text, q_text, is_bare_eventually)) =
+                graph_liveness_eventually_shape(formula)
+            else {
                 continue;
             };
-            let is_bare_eventually = p_text == "TRUE";
 
             // 1. Bad cycles: `Q` false at EVERY state of a fair non-trivial SCC,
             //    plus quiescent `¬Q` terminals (a terminal has `Next` disabled, so
@@ -1105,9 +1117,9 @@ impl Model for TlaModel {
                     }
                 }
             } else {
-                if self.spec_has_non_fairness_liveness {
-                    continue;
-                }
+                // No fairness constraints (and, by the guard above, no non-fairness
+                // temporal assumption either): every `¬Q` state can be stuttered on
+                // forever under `[Next]_v`, so each is a bad cycle.
                 for (&fp, _st) in state_by_fp.iter() {
                     if is_not_q(fp, q_text) {
                         bad_cycle_fps.insert(fp);
@@ -1729,24 +1741,31 @@ fn graph_liveness_shape(formula: &TemporalFormula) -> Option<(&str, &str)> {
 
 /// Recognize the "eventually" liveness shapes that `graph_liveness_shape`
 /// deliberately does NOT handle — `<>Q`, `[](P => <>Q)`, and `P ~> Q` — returning
-/// `(p_text, q_text)` with `p == "TRUE"` for the bare `<>Q`. (Bug B.)
+/// `(p_text, q_text, is_bare)`. (Bug B.)
+///
+/// `is_bare` is true ONLY for the syntactic bare `<>Q` (`TemporalFormula::Eventually`),
+/// which means "Q holds at least once over the whole behaviour". The triggered
+/// forms `[](P => <>Q)` and `P ~> Q` (which includes `TRUE ~> Q` ≡ `[]<>Q`) are
+/// NOT bare: they require Q to recur after every P-state. The distinction is by
+/// which AST arm matched, never by the text of `p` — a literal `TRUE ~> Q` has
+/// `p_text == "TRUE"` but is NOT a bare eventually (Codex review of PR #213).
 ///
 /// These differ from the `<>[]Q` shapes in their violation condition: `<>[]Q`
-/// fails on a fair cycle that merely *contains* a `¬Q` state, whereas `<>Q` /
-/// `[](P => <>Q)` / `~>` fail only on a fair cycle where `Q` is false *everywhere*,
-/// reached by a path along which `Q` is false *throughout* (see
-/// `graph_liveness_eventually_violation`). They are kept separate so the two
-/// conditions don't get conflated.
-fn graph_liveness_eventually_shape(formula: &TemporalFormula) -> Option<(&str, &str)> {
+/// fails on a fair cycle that merely *contains* a `¬Q` state, whereas these fail
+/// only on a fair cycle where `Q` is false *everywhere*, reached by a path along
+/// which `Q` is false *throughout* (see `graph_liveness_eventually_violation`).
+fn graph_liveness_eventually_shape(formula: &TemporalFormula) -> Option<(&str, &str, bool)> {
     match formula {
-        // Bare `<>Q`.
+        // Bare `<>Q` — the only shape where `is_bare` is true.
         TemporalFormula::Eventually(q_inner) => {
             let TemporalFormula::StatePredicate(q) = q_inner.as_ref() else {
                 return None;
             };
-            is_pure_state_predicate_text(q).then(|| ("TRUE", q.trim()))
+            is_pure_state_predicate_text(q).then(|| ("TRUE", q.trim(), true))
         }
-        // `P ~> Q` ≡ `[](P => <>Q)`.
+        // `P ~> Q` ≡ `[](P => <>Q)`. P may be literally "TRUE" (`TRUE ~> Q` ≡
+        // `[]<>Q`); it is still a TRIGGERED form (is_bare = false), handled by the
+        // every-P-state branch of the checker.
         TemporalFormula::LeadsTo(p, q) => {
             let (TemporalFormula::StatePredicate(p), TemporalFormula::StatePredicate(q)) =
                 (p.as_ref(), q.as_ref())
@@ -1754,7 +1773,7 @@ fn graph_liveness_eventually_shape(formula: &TemporalFormula) -> Option<(&str, &
                 return None;
             };
             (is_pure_state_predicate_text(p) && is_pure_state_predicate_text(q))
-                .then(|| (p.trim(), q.trim()))
+                .then(|| (p.trim(), q.trim(), false))
         }
         // `[](P => <>Q)` (always-implies-eventually, NOT eventually-always).
         TemporalFormula::Always(inner) => {
@@ -1771,7 +1790,7 @@ fn graph_liveness_eventually_shape(formula: &TemporalFormula) -> Option<(&str, &
                 return None;
             };
             (is_pure_state_predicate_text(p) && is_pure_state_predicate_text(q))
-                .then(|| (p.trim(), q.trim()))
+                .then(|| (p.trim(), q.trim(), false))
         }
         _ => None,
     }
