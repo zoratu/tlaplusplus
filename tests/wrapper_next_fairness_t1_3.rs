@@ -156,11 +156,16 @@ Reaches100 == <>(x = 100)
         "expected exactly 2 distinct states (Toggle cycle)"
     );
 
-    // We expect a Liveness violation for `NeverFires`.
+    // `Reaches100 == <>(x=100)` is VIOLATED: x toggles in {0,1}, NeverFires
+    // (x=99 -> x=100) is never enabled, so x=100 is never reached. After the Bug
+    // B/C rewrite this is reported by the graph-level liveness check (an
+    // eventually-shape property on the fair {0,1} cycle), not by the old
+    // "Fairness violation: NeverFires does not occur" path — fairness is now a
+    // filter, never a reported violation.
     let violation = outcome
         .violation
         .as_ref()
-        .expect("expected fairness violation for WF_vars(NeverFires)");
+        .expect("expected liveness violation: <>(x=100) fails on the Toggle cycle");
     assert_eq!(
         violation.property_type,
         PropertyType::Liveness,
@@ -168,8 +173,8 @@ Reaches100 == <>(x = 100)
         violation.property_type
     );
     assert!(
-        violation.message.contains("NeverFires"),
-        "expected violation message to mention 'NeverFires', got: {}",
+        violation.message.contains("liveness"),
+        "expected a graph-level liveness violation message, got: {}",
         violation.message
     );
 }

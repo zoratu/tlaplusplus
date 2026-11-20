@@ -188,11 +188,13 @@ Reaches100 == <>(x = 100)
     let v = outcome
         .violation
         .as_ref()
-        .expect("expected fairness violation for WF_vars(NeverFires)");
+        .expect("expected liveness violation: <>(x=100) fails on the Toggle cycle");
     assert_eq!(v.property_type, PropertyType::Liveness);
+    // After the Bug B/C rewrite the <>(x=100) violation is reported by the
+    // graph-level liveness check, not the old fairness-action-missing path.
     assert!(
-        v.message.contains("NeverFires"),
-        "violation message should mention the missing action; got: {}",
+        v.message.contains("liveness"),
+        "violation message should indicate a graph-level liveness violation; got: {}",
         v.message
     );
 }

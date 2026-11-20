@@ -155,14 +155,19 @@ fn pool_verdict_matches_single_worker_on_failing_spec() {
         .expect("4-worker pool must report fairness violation");
     assert_eq!(one_v.property_type, PropertyType::Liveness);
     assert_eq!(four_v.property_type, PropertyType::Liveness);
+    // `Reaches100 == <>(x=100)` is violated on the fair {0,1} Toggle cycle (x never
+    // reaches 100). After the Bug B/C rewrite this is reported by the graph-level
+    // liveness check (an eventually-shape property on a fair cycle), not by the old
+    // "Fairness violation: action NeverFires does not occur" path (fairness is now
+    // a filter, never a reported violation). Assert the liveness-property message.
     assert!(
-        one_v.message.contains("NeverFires"),
-        "1-worker violation must mention NeverFires, got: {}",
+        one_v.message.contains("liveness"),
+        "1-worker violation must be a graph-level liveness violation, got: {}",
         one_v.message
     );
     assert!(
-        four_v.message.contains("NeverFires"),
-        "4-worker violation must mention NeverFires, got: {}",
+        four_v.message.contains("liveness"),
+        "4-worker violation must be a graph-level liveness violation, got: {}",
         four_v.message
     );
 }
@@ -213,9 +218,11 @@ Spec == Init /\ [][Next]_vars /\ WF_vars(Idle)
         );
         if let Some(v) = outcome.violation.as_ref() {
             assert_eq!(v.property_type, PropertyType::Liveness);
+            // Post Bug B/C: a graph-level liveness violation (fairness is a filter,
+            // not a reported "Idle does not occur" violation).
             assert!(
-                v.message.contains("Idle"),
-                "DFS pool n={} violation must mention Idle, got: {}",
+                v.message.contains("liveness"),
+                "DFS pool n={} violation must be a graph-level liveness violation, got: {}",
                 n,
                 v.message
             );

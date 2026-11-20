@@ -774,87 +774,68 @@ pub(super) fn run_inband_fairness_check<M: Model>(
         constraints.len()
     );
 
-    // Phase 5: per-SCC × per-constraint check.
-    'outer: for (scc_idx, scc) in non_trivial.iter().enumerate() {
-        let scc_fps: HashSet<u64> = scc.iter().copied().collect();
-        for constraint in constraints {
-            let result = check_fairness_on_scc_fp_sharded(
-                &scc_fps,
-                constraint,
-                &shards,
+    // Phase 5: fairness FILTER + graph-level liveness check. Mirrors the BFS path
+    // in `runtime/liveness.rs` so the two stay at parity (Bugs B/C).
+    //
+    // Fairness is a FILTER, never a reported violation (Bug C): an SCC where a
+    // weakly/strongly-fair action is enabled-but-never-taken is excluded, not
+    // reported. The actual liveness verdict comes from the model's graph-level
+    // checks over the FAIR SCCs: `graph_liveness_violation` (<>[]Q, [](P=><>[]Q))
+    // and `graph_liveness_eventually_violation` (<>Q, [](P=><>Q), ~> — Bug B).
+    let owned_sccs: Vec<Vec<u64>> = non_trivial.iter().map(|scc| (*scc).clone()).collect();
+    let fair_scc: Vec<bool> = owned_sccs
+        .iter()
+        .map(|scc| {
+            let scc_fps: HashSet<u64> = scc.iter().copied().collect();
+            constraints.iter().all(|c| {
+                check_fairness_on_scc_fp_sharded(&scc_fps, c, &shards, &adjacency_fp, next_name)
+                    .is_ok()
+            })
+        })
+        .collect();
+    let unfair = fair_scc.iter().filter(|f| !**f).count();
+    if unfair > 0 {
+        eprintln!(
+            "[dfs-worker] fairness filter: {} of {} non-trivial SCC(s) excluded as unfair",
+            unfair,
+            owned_sccs.len()
+        );
+    }
+
+    let mut shape_desc = "<>[]Q / [](P => <>[]Q)";
+    let bad_state = model
+        .graph_liveness_violation(&adjacency_fp, state_by_fp, &owned_sccs, &fair_scc)
+        .or_else(|| {
+            shape_desc = "<>Q / [](P => <>Q) / ~>";
+            model.graph_liveness_eventually_violation(
                 &adjacency_fp,
-                next_name,
-            );
-            if let Err(e) = result {
-                // PROPERTY GATE (TLC parity): a fairness-unfair SCC is only a
-                // liveness counterexample if a declared temporal property
-                // actually fails on it. Mirrors the BFS path in
-                // `runtime/liveness.rs`. `Some(false)` → every checked
-                // property holds on this SCC → suppress.
-                let scc_states: Vec<M::State> =
-                    scc.iter().filter_map(|fp| state_by_fp.get(fp).cloned()).collect();
-                if !scc_states.is_empty()
-                    && model.scc_violates_liveness_property(&scc_states) == Some(false)
-                {
-                    continue;
-                }
+                state_by_fp,
+                &owned_sccs,
+                &fair_scc,
+            )
+        });
 
-                let representative_fp = scc[0];
-                let representative_state = state_by_fp
-                    .get(&representative_fp)
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        // State map miss — fall back to any state we
-                        // have. If that also misses, we'd have to
-                        // re-explore; for now we panic-print and let
-                        // the caller surface the message-only
-                        // violation.
-                        eprintln!(
-                            "[dfs-worker] state-map miss for fp={:#x} when reporting fairness \
-                             violation; trace will be empty",
-                            representative_fp
-                        );
-                        // Pick any state we do have.
-                        state_by_fp
-                            .values()
-                            .next()
-                            .cloned()
-                            .expect("state_by_fp empty but SCC non-trivial — unreachable")
-                    });
-
-                let mut trace: Vec<M::State> = scc
-                    .iter()
-                    .filter_map(|fp| state_by_fp.get(fp).cloned())
-                    .collect();
-                if trace.is_empty() {
-                    trace.push(representative_state.clone());
-                } else {
-                    // Close the lasso.
-                    let first = trace[0].clone();
-                    trace.push(first);
-                }
-
-                let v = Violation {
-                    message: format!("Fairness violation: {}", e),
-                    state: representative_state,
-                    property_type: PropertyType::Liveness,
-                    trace,
-                };
-
-                eprintln!(
-                    "[dfs-worker] fairness violation in SCC {} ({} states): {}",
-                    scc_idx,
-                    scc.len(),
-                    e
-                );
-
-                let _ = violation_tx.try_send(v);
-                let prev = violation_count.fetch_add(1, Ordering::AcqRel);
-                if stop_on_violation && (prev + 1) >= max_violations {
-                    stop.store(true, Ordering::Release);
-                }
-                break 'outer;
+    if let Some(state) = bad_state {
+        let mut trace = vec![state.clone()];
+        // Close the lasso on the containing SCC if we can locate it.
+        let fp = model.fingerprint(&state);
+        if let Some(scc) = owned_sccs.iter().find(|scc| scc.contains(&fp)) {
+            trace = scc.iter().filter_map(|f| state_by_fp.get(f).cloned()).collect();
+            if let Some(first) = trace.first().cloned() {
+                trace.push(first);
             }
+        }
+        let v = Violation {
+            message: format!("Temporal property violated: graph-level liveness ({shape_desc})"),
+            state,
+            property_type: PropertyType::Liveness,
+            trace,
+        };
+        eprintln!("[dfs-worker] graph-level liveness violation ({shape_desc})");
+        let _ = violation_tx.try_send(v);
+        let prev = violation_count.fetch_add(1, Ordering::AcqRel);
+        if stop_on_violation && (prev + 1) >= max_violations {
+            stop.store(true, Ordering::Release);
         }
     }
 }

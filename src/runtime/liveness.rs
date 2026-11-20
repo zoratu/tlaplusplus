@@ -436,6 +436,28 @@ where
                     trace: vec![bad_state],
                 });
             }
+            // Bug B: the "eventually" shapes <>Q / [](P => <>Q) / P ~> Q, checked
+            // against the FAIR SCCs (a fair cycle where Q is false everywhere,
+            // reached by a Q-false path).
+            if let Some(bad_state) = model.graph_liveness_eventually_violation(
+                &adjacency_fp,
+                &state_by_fp,
+                &owned_sccs,
+                &fair_scc,
+            ) {
+                eprintln!(
+                    "  Graph-level liveness violation (<>Q / [](P => <>Q) / ~>) found in {:.2?}",
+                    gl_start.elapsed()
+                );
+                return Some(Violation {
+                    message: "Temporal property violated: eventually liveness \
+                              (<>Q, [](P => <>Q), or P ~> Q)"
+                        .to_string(),
+                    state: bad_state.clone(),
+                    property_type: PropertyType::Liveness,
+                    trace: vec![bad_state],
+                });
+            }
             eprintln!(
                 "  Graph-level liveness check: no violation ({:.2?})",
                 gl_start.elapsed()
@@ -466,98 +488,51 @@ where
                     non_trivial_sccs.len()
                 );
 
+                // Bug C fix: fairness is a FILTER on behaviours, never a
+                // reported violation. WF/SF are ASSUMPTIONS that exclude unfair
+                // cycles from the behaviours a liveness property is checked
+                // against; an unfair SCC (e.g. a weakly-fair action enabled
+                // throughout a cycle but never taken) is DISCARDED, not reported.
+                // (Previously this loop reported such SCCs as "Fairness violation",
+                // which was a false positive — TLC never reports one.) The actual
+                // liveness verdict comes solely from `graph_liveness_violation`
+                // above, which consumes the per-SCC `fair_scc` filter (computed
+                // with the same enablement-aware `check_fairness_on_scc_fp_sharded`)
+                // and reports a property counterexample only on a FAIR bad cycle.
+                //
+                // This block is now diagnostics only: it counts how many SCCs each
+                // constraint excludes, and never sets `violation`.
                 let phase5_start = std::time::Instant::now();
                 let next_name = model.next_action_name();
                 let mut total_constraint_checks = 0usize;
+                let mut unfair_scc_count = 0usize;
 
-                'outer: for (scc_idx, scc) in non_trivial_sccs.iter().enumerate() {
-                    // Build the SCC fingerprint set once (reused for
-                    // every constraint).
+                for scc in non_trivial_sccs.iter() {
                     let scc_fps: HashSet<u64> = scc.iter().copied().collect();
-
                     for constraint in &constraints {
                         total_constraint_checks += 1;
-                        let result = check_fairness_on_scc_fp_sharded(
+                        if check_fairness_on_scc_fp_sharded(
                             &scc_fps,
                             constraint,
                             &shards,
                             &adjacency_fp,
                             next_name,
-                        );
-                        if let Err(e) = result {
-                            let scc_states: Vec<M::State> = scc
-                                .iter()
-                                .map(|fp| {
-                                    state_by_fp
-                                        .get(fp)
-                                        .expect("SCC fp must be in state map")
-                                        .clone()
-                                })
-                                .collect();
-
-                            // PROPERTY GATE (TLC parity): a fairness-unfair SCC
-                            // is not, by itself, a liveness counterexample. Ask
-                            // the model whether a declared temporal PROPERTY
-                            // actually fails on this SCC. `Some(false)` means
-                            // every evaluable property holds here → suppress
-                            // the spurious violation (e.g. EWD840's
-                            // environment-only cycle, where `terminated` never
-                            // holds so `terminated ~> terminationDetected` is
-                            // vacuously satisfied). `Some(true)` (a property
-                            // genuinely fails) and `None` (model can't judge —
-                            // preserve prior fairness-only behaviour) both fall
-                            // through to reporting.
-                            if model.scc_violates_liveness_property(&scc_states) == Some(false) {
-                                if std::env::var("TLAPP_TRACE_INVARIANT").is_ok() {
-                                    eprintln!(
-                                        "  Fairness-unfair SCC {} ({} states) satisfies all \
-                                         checked temporal properties — not a liveness \
-                                         counterexample (suppressed)",
-                                        scc_idx,
-                                        scc_states.len()
-                                    );
-                                }
-                                continue;
-                            }
-
-                            eprintln!(
-                                "  Fairness violation in SCC {} ({} states): {}",
-                                scc_idx,
-                                scc_states.len(),
-                                e
-                            );
-
-                            let representative = scc_states
-                                .first()
-                                .cloned()
-                                .expect("non-trivial SCC has at least one state");
-
-                            let mut trace = scc_states.clone();
-                            if let Some(first) = trace.first().cloned() {
-                                trace.push(first);
-                            }
-
-                            violation = Some(Violation {
-                                message: format!("Fairness violation: {}", e),
-                                state: representative,
-                                property_type: PropertyType::Liveness,
-                                trace,
-                            });
-
-                            break 'outer;
+                        )
+                        .is_err()
+                        {
+                            unfair_scc_count += 1;
+                            break; // one failed constraint makes the SCC unfair
                         }
                     }
                 }
 
                 eprintln!(
-                    "  Fairness check: {} constraint-on-SCC checks in {:.2?}",
+                    "  Fairness filter: {} constraint-on-SCC checks, {} unfair SCC(s) excluded \
+                     ({:.2?})",
                     total_constraint_checks,
+                    unfair_scc_count,
                     phase5_start.elapsed()
                 );
-
-                if violation.is_none() {
-                    eprintln!("  All fairness constraints satisfied");
-                }
 
                 // T10.2 — streaming-SCC oracle (opt-in via
                 // `--liveness-streaming`). Run nested-DFS over
@@ -1004,9 +979,15 @@ mod tests {
     }
 
     #[test]
-    fn detects_violation_in_self_loop_scc_missing_fair_action() {
-        // Self-loop labeled "Other" with WF on "Step" must yield a
-        // liveness violation (Step never occurs in the SCC).
+    fn unfair_scc_alone_is_not_reported() {
+        // Bug C fix: a self-loop labeled "Other" with WF("Step") is a
+        // fairness-UNFAIR cycle (Step enabled-or-not, never taken). Fairness is an
+        // ASSUMPTION that EXCLUDES such a cycle — it is NEVER itself a reported
+        // liveness violation (TLC never reports "action does not occur in SCC").
+        // With no declared temporal PROPERTY that fails on a fair cycle (LivModel
+        // uses the default no-op graph-liveness check), the verdict must be NONE.
+        // (Previously this was reported as a "Fairness violation" — the false
+        // positive this fix removes.)
         let model = Arc::new(LivModel {
             constraints: vec![FairnessConstraint::Weak {
                 vars: vec!["x".into()],
@@ -1017,12 +998,10 @@ mod tests {
         let s0 = LivState { v: 0 };
         let edges = build_transitions(&[(s0.clone(), s0, "Other")]);
         let v = run_post_processing(false, &model, Some(&edges), &config_for_test());
-        let violation = v.expect("expected fairness violation");
-        assert_eq!(violation.property_type, PropertyType::Liveness);
         assert!(
-            violation.message.contains("Fairness"),
-            "message should mention fairness, got {:?}",
-            violation.message
+            v.is_none(),
+            "an unfair SCC alone must be discarded, not reported as a violation; got {:?}",
+            v.map(|viol| viol.message)
         );
     }
 
@@ -1156,10 +1135,12 @@ mod tests {
     }
 
     #[test]
-    fn violation_trace_loops_back_to_first_state() {
-        // The violation trace pushes a copy of the first SCC state at the
-        // end so the lasso loop is visible. For a single-state self-loop
-        // the trace must therefore have length 2.
+    fn fairness_filter_excludes_unfair_self_loop() {
+        // Companion to `unfair_scc_alone_is_not_reported`: the fairness FILTER
+        // excludes the unfair self-loop, and with no property failing on a fair
+        // cycle the post-processing yields no violation. (This replaces the old
+        // test that asserted a fairness-violation trace looping back to its first
+        // state — that reporting path is removed by the Bug C fix.)
         let model = Arc::new(LivModel {
             constraints: vec![FairnessConstraint::Weak {
                 vars: vec!["x".into()],
@@ -1170,9 +1151,10 @@ mod tests {
         let s0 = LivState { v: 7 };
         let edges = build_transitions(&[(s0.clone(), s0.clone(), "Other")]);
         let v = run_post_processing(false, &model, Some(&edges), &config_for_test());
-        let violation = v.expect("expected violation");
-        assert_eq!(violation.trace.len(), 2, "self-loop trace = state, state");
-        assert_eq!(violation.trace[0], s0);
-        assert_eq!(violation.trace[1], s0);
+        assert!(
+            v.is_none(),
+            "unfair self-loop is filtered out, not reported; got {:?}",
+            v.map(|viol| viol.message)
+        );
     }
 }

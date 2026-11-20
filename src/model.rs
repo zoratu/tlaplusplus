@@ -317,6 +317,47 @@ pub trait Model: Send + Sync + 'static {
         None
     }
 
+    /// Graph-level liveness check for the "eventually" shapes `<>Q`,
+    /// `[](P => <>Q)`, and `P ~> Q` (Bug B). Companion to
+    /// `graph_liveness_violation` (which handles the `<>[]Q` shapes). A behaviour
+    /// violates these iff `Q` is false forever along some suffix: for `<>Q` the
+    /// whole behaviour from Init, for `[](P=><>Q)`/`~>` the suffix after a P-state.
+    /// So a counterexample is a FAIR cycle (or quiescent terminal) where `Q` is
+    /// false at EVERY state, reached by a `Q`-false path — stricter than the
+    /// `<>[]Q` "contains a `¬Q` state" condition. Same arguments and return
+    /// contract as `graph_liveness_violation`.
+    ///
+    /// KNOWN LIMITATIONS (Codex review of PR #213; shared with
+    /// `graph_liveness_violation`, which uses the same maximal-SCC + head-label
+    /// approximation). These are SOUND in the sense that the shipped checks only
+    /// *miss* violations in these cases, except as noted:
+    /// - Maximal-SCC vs recurrent subcycle (findings #1/#4): acceptance is tested
+    ///   on whole Tarjan SCCs, not on the recurrent subcycle a single fair
+    ///   behaviour may stay in. A `¬Q` sub-loop inside an SCC that also contains a
+    ///   `Q` state is missed (`all_not_q` is false). A full fix needs a tableau /
+    ///   recurrent-SCC search in the `¬Q`-induced subgraph.
+    /// - Action label vs `<<A>>_v` subscript (findings #2/#6): fairness
+    ///   occurrence/enablement is matched by the action's head LABEL, ignoring the
+    ///   fairness subscript's non-stuttering requirement. For `WF_v(A)` where `v`
+    ///   is a strict subset of the variables `A` changes, an in-SCC `A`-edge that
+    ///   leaves `v` unchanged is wrongly counted as "A taken". This is the one case
+    ///   that could *false-positive*; it requires a partial-subscript `WF_v(A)`,
+    ///   which the current corpus does not contain. Tracked for the subscript-aware
+    ///   fairness follow-up.
+    /// Specs hitting these fall back to "unchecked" (miss) in the common case; the
+    /// differential-vs-TLC gate covers the corpus we do support.
+    ///
+    /// Default: `None`.
+    fn graph_liveness_eventually_violation(
+        &self,
+        _adjacency_fp: &std::collections::HashMap<u64, Vec<u64>>,
+        _state_by_fp: &std::collections::HashMap<u64, Self::State>,
+        _non_trivial_sccs: &[Vec<u64>],
+        _fair_scc: &[bool],
+    ) -> Option<Self::State> {
+        None
+    }
+
     fn check_invariants(&self, state: &Self::State) -> Result<(), String>;
 
     /// Check state constraints - returns Ok(()) if state should be explored, Err if pruned

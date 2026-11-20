@@ -241,6 +241,23 @@ fn fairness_action_occurs_in_scc(
     false
 }
 
+/// True if the fair action is ENABLED at state `fp` — i.e. `fp` has at least one
+/// outgoing edge in the global graph whose label is one of the action's head
+/// labels. This is the graph-level stand-in for `ENABLED <<A>>_v`: the action
+/// has a successor from `fp` (the guard holds there), regardless of whether that
+/// successor is inside the SCC. Used by the WF/SF fairness semantics, which turn
+/// on *enablement*, not merely occurrence.
+fn fairness_action_enabled_at(fp: u64, action: &str, shards: &ActionShardIndex) -> bool {
+    for label in fairness_action_head_labels(action) {
+        if let Some(edges) = shards.get(label.as_str()) {
+            if edges.iter().any(|(from, _to)| *from == fp) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// T10.4 — fairness check on SCC using a per-action shard index.
 ///
 /// Iterates only the transitions for the constraint's action, instead of
@@ -256,39 +273,60 @@ pub fn check_fairness_on_scc_fp_sharded(
     let action_name = constraint.action_name();
     let constraint_is_wrapper_next = next_action_name.map(|n| n == action_name).unwrap_or(false);
 
-    let action_occurs = if constraint_is_wrapper_next {
-        // Wrapper Next: any in-SCC edge counts, regardless of label.
-        scc_has_any_internal_edge(scc_fps, adjacency)
-    } else {
-        // The fairness-action string is the raw source text of the fair
-        // action, e.g. `Do(p) \/ Rsp(p)` for `WF_vars(Do(p) \/ Rsp(p))` or
-        // `Rsp(p)` for `WF_vars(Rsp(p))`. The shard index, however, is keyed
-        // by the HEAD IDENTIFIER the transition labeller extracts from each
-        // Next-disjunct (`Do(p)` -> "Do", `\E i \in S : Inc(i)` -> "Inc").
-        //
-        // A direct `shards.get(action_name)` therefore MISSES for any
-        // disjunctive or parameterized fair action. Map the action string to
-        // the same head labels the labeller uses (split on top-level `\/`,
-        // then run each disjunct through `extract_action_name`) and treat the
-        // action as occurring if ANY of those heads has an in-SCC edge.
-        fairness_action_occurs_in_scc(scc_fps, action_name, shards)
-    };
-
-    // NOTE: this returns Err whenever the fair action does not *occur* inside
-    // the SCC. That is only the FAIRNESS verdict for the cycle — a
-    // fairness-unfair cycle is not, by itself, a liveness counterexample. The
-    // runtime post-processing (`runtime/liveness.rs`) gates this Err through
-    // `Model::scc_violates_liveness_property`, which checks whether a declared
-    // temporal PROPERTY actually fails on the SCC before reporting a
-    // violation — matching TLC, which never reports "action does not occur in
-    // SCC" and only flags a property that a fair behaviour violates.
-    if !action_occurs && !scc_fps.is_empty() {
+    if constraint_is_wrapper_next {
+        // Wrapper Next: any in-SCC edge counts as "taken", regardless of label.
+        // A non-trivial SCC always has an internal edge, so wrapper-Next fairness
+        // is satisfied on every such cycle.
+        if scc_has_any_internal_edge(scc_fps, adjacency) || scc_fps.is_empty() {
+            return Ok(());
+        }
         return Err(anyhow!(
-            "Fairness constraint may be violated: action '{}' does not occur in SCC",
-            action_name
+            "Fairness (wrapper Next) unsatisfied: no internal edge in SCC"
         ));
     }
 
+    // The fairness-action string is the raw source text of the fair action, e.g.
+    // `Do(p) \/ Rsp(p)` for `WF_vars(Do(p) \/ Rsp(p))`. The shard index is keyed
+    // by the HEAD IDENTIFIER the labeller extracts from each Next-disjunct
+    // (`Do(p)` -> "Do"), so we map the action to those head labels for both
+    // occurrence and enablement.
+    let action_occurs = fairness_action_occurs_in_scc(scc_fps, action_name, shards);
+    if action_occurs || scc_fps.is_empty() {
+        return Ok(());
+    }
+
+    // The action never occurs in the SCC. Whether the cycle is UNFAIR (must be
+    // excluded) depends on ENABLEMENT — this is the TLC semantics the old code
+    // omitted (it treated "never occurs" alone as unfair, which both over-excluded
+    // genuinely-fair cycles where the action is disabled, and mis-handled SF):
+    //
+    //   WF_v(A) is violated by the cycle  iff  A is enabled at EVERY state of the
+    //     cycle and never taken  (`<>[]ENABLED => []<>taken`; on a cycle
+    //     "eventually always enabled" = "enabled at all states").
+    //   SF_v(A) is violated by the cycle  iff  A is enabled at SOME state of the
+    //     cycle and never taken  (`[]<>ENABLED => []<>taken`).
+    //
+    // "Unfair cycle" means this fairness assumption excludes the behaviour; it is
+    // NOT a liveness counterexample by itself (the caller discards unfair SCCs).
+    // If the action is NOT enabled as required, the constraint is SATISFIED
+    // (vacuously) and the cycle stays fair.
+    let is_unfair = match constraint {
+        FairnessConstraint::Weak { .. } => scc_fps
+            .iter()
+            .all(|fp| fairness_action_enabled_at(*fp, action_name, shards)),
+        FairnessConstraint::Strong { .. } => scc_fps
+            .iter()
+            .any(|fp| fairness_action_enabled_at(*fp, action_name, shards)),
+    };
+
+    if is_unfair {
+        return Err(anyhow!(
+            "Fairness constraint unsatisfied: action '{}' is enabled but never occurs in SCC",
+            action_name
+        ));
+    }
+    // Action never occurs but is not enabled as the constraint requires →
+    // the constraint is vacuously satisfied; the cycle remains fair.
     Ok(())
 }
 
@@ -845,29 +883,52 @@ mod tests {
     }
 
     #[test]
-    fn test_check_fairness_on_scc_fp_sharded_named_action() {
-        // SCC = {1, 2, 3}, action "Step" occurs only outside SCC → the
-        // *fairness* check flags it (the runtime then gates this on an actual
-        // property failure — see Model::scc_violates_liveness_property).
+    fn test_check_fairness_on_scc_fp_sharded_named_action_enablement() {
+        // SCC = {1, 2, 3}, WF(Step). The verdict turns on ENABLEMENT, not mere
+        // occurrence (the enablement-aware fix for the Bug C false positive).
         let scc_fps: HashSet<u64> = [1u64, 2, 3].into_iter().collect();
         let constraint = FairnessConstraint::Weak {
             vars: vec!["v".to_string()],
             action: "Step".to_string(),
         };
-        let triples = vec![
-            (10, 11, "Step".to_string()), // outside SCC
+
+        // Case 1: Step occurs ONLY outside the SCC and is NOT enabled at any SCC
+        // state → WF is vacuously satisfied → the cycle is FAIR → Ok.
+        let triples_not_enabled = vec![
+            (10, 11, "Step".to_string()), // outside SCC; 1/2/3 have no Step edge
             (1, 2, "Other".to_string()),
             (2, 3, "Other".to_string()),
             (3, 1, "Other".to_string()),
         ];
-        let shards = build_action_shard_index(&triples);
+        let shards = build_action_shard_index(&triples_not_enabled);
         let mut adj: HashMap<u64, Vec<u64>> = HashMap::new();
         adj.insert(1, vec![2]);
         adj.insert(2, vec![3]);
         adj.insert(3, vec![1]);
         adj.insert(10, vec![11]);
         let r = check_fairness_on_scc_fp_sharded(&scc_fps, &constraint, &shards, &adj, None);
-        assert!(r.is_err());
+        assert!(
+            r.is_ok(),
+            "Step not enabled at any SCC state → WF vacuously satisfied → fair"
+        );
+
+        // Case 2: Step IS enabled at every SCC state (each has a Step out-edge
+        // leaving the cycle) but is never taken inside the cycle (all internal
+        // edges are Other) → WF is violated → the cycle is UNFAIR → Err.
+        let triples_enabled = vec![
+            (1, 2, "Other".to_string()),
+            (2, 3, "Other".to_string()),
+            (3, 1, "Other".to_string()),
+            (1, 99, "Step".to_string()), // Step enabled at 1 (but not taken in-SCC)
+            (2, 99, "Step".to_string()),
+            (3, 99, "Step".to_string()),
+        ];
+        let shards2 = build_action_shard_index(&triples_enabled);
+        let r2 = check_fairness_on_scc_fp_sharded(&scc_fps, &constraint, &shards2, &adj, None);
+        assert!(
+            r2.is_err(),
+            "Step enabled at every SCC state but never taken → WF violated → unfair"
+        );
     }
 
     #[test]
@@ -991,26 +1052,45 @@ mod tests {
     }
 
     #[test]
-    fn test_check_fairness_on_scc_fp_sharded_disjunctive_action_absent() {
-        // Neither "Do" nor "Rsp" edges are inside the SCC → the fair action
-        // genuinely does not occur, so the fairness check must still flag it.
+    fn test_check_fairness_on_scc_fp_sharded_disjunctive_action_enablement() {
+        // WF(Do(p) \/ Rsp(p)) on SCC = {1, 2}. Head labels: "Do", "Rsp".
         let scc_fps: HashSet<u64> = [1u64, 2].into_iter().collect();
         let constraint = FairnessConstraint::Weak {
             vars: vec!["vars".to_string()],
             action: "Do(p) \\/ Rsp(p)".to_string(),
         };
-        let triples = vec![
+
+        // Not enabled in SCC (Do/Rsp occur only outside) → vacuously fair → Ok.
+        let triples_not_enabled = vec![
             (1, 2, "Other".to_string()),
             (2, 1, "Other".to_string()),
             (5, 6, "Do".to_string()), // outside SCC
         ];
-        let shards = build_action_shard_index(&triples);
+        let shards = build_action_shard_index(&triples_not_enabled);
         let mut adj: HashMap<u64, Vec<u64>> = HashMap::new();
         adj.insert(1, vec![2]);
         adj.insert(2, vec![1]);
         adj.insert(5, vec![6]);
         let r = check_fairness_on_scc_fp_sharded(&scc_fps, &constraint, &shards, &adj, None);
-        assert!(r.is_err(), "no in-SCC Do/Rsp edge → action does not occur");
+        assert!(
+            r.is_ok(),
+            "Do/Rsp not enabled at any SCC state → WF vacuously satisfied → fair"
+        );
+
+        // Enabled at every SCC state (a Rsp out-edge leaves the cycle) but never
+        // taken inside → unfair → Err.
+        let triples_enabled = vec![
+            (1, 2, "Other".to_string()),
+            (2, 1, "Other".to_string()),
+            (1, 7, "Rsp".to_string()), // Rsp enabled at 1
+            (2, 7, "Rsp".to_string()), // Rsp enabled at 2
+        ];
+        let shards2 = build_action_shard_index(&triples_enabled);
+        let r2 = check_fairness_on_scc_fp_sharded(&scc_fps, &constraint, &shards2, &adj, None);
+        assert!(
+            r2.is_err(),
+            "Do/Rsp enabled at every SCC state but never taken → WF violated → unfair"
+        );
     }
 
     #[test]
