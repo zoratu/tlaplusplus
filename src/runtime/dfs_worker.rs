@@ -811,20 +811,18 @@ pub(super) fn run_inband_fairness_check<M: Model>(
         });
 
     if let Some(state) = bad_state {
-        let mut trace = vec![state.clone()];
-        // Close the lasso on the containing SCC if we can locate it.
-        let fp = model.fingerprint(&state);
-        if let Some(scc) = non_trivial.iter().find(|scc| scc.contains(&fp)) {
-            trace = scc.iter().filter_map(|f| state_by_fp.get(f).cloned()).collect();
-            if let Some(first) = trace.first().cloned() {
-                trace.push(first);
-            }
-        }
+        // Report only the witness state (matching the BFS path). We deliberately
+        // do NOT reconstruct a lasso from the maximal `non_trivial` SCC: the
+        // tableau may have found a fair PROPER sub-SCC inside an unfair maximal
+        // SCC, so the maximal-SCC states can include SF-pruned/unfair states that
+        // are not part of a valid fair counterexample (Codex review #3). The
+        // verdict is sound; a precise lasso would need the search to return its
+        // accepting set, which it does not expose here.
         let v = Violation {
             message: format!("Temporal property violated: graph-level liveness ({shape_desc})"),
-            state,
+            state: state.clone(),
             property_type: PropertyType::Liveness,
-            trace,
+            trace: vec![state],
         };
         eprintln!("[dfs-worker] graph-level liveness violation ({shape_desc})");
         let _ = violation_tx.try_send(v);

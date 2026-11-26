@@ -896,23 +896,44 @@ impl Model for TlaModel {
         if self.spec_has_non_fairness_liveness {
             return None;
         }
+        // Avoid the (eager, full-graph) fair-subcycle search when no property has
+        // the `<>[]Q` shape this method handles.
+        if !self
+            .temporal_properties
+            .iter()
+            .any(|(_, f)| graph_liveness_shape(f).is_some())
+        {
+            return None;
+        }
 
-        // `<<A>>_v` subscript test: does the subscript tuple `vars` differ between
-        // the states at fingerprints `f` and `t`?
         // Resolve each fairness subscript to concrete state variables once (a
         // `WF_vars(..)` with `vars == <<x,y>>` parses to `["vars"]`, which must be
-        // expanded to `["x","y"]` before projecting a state onto it).
-        let subscript_cache: HashMap<Vec<String>, Vec<String>> = self
-            .fairness_constraints
-            .iter()
-            .map(|c| {
-                let raw: &[String] = match c {
-                    FairnessConstraint::Weak { vars, .. }
-                    | FairnessConstraint::Strong { vars, .. } => vars,
-                };
-                (raw.to_vec(), resolve_subscript_vars(&self.module, raw))
-            })
-            .collect();
+        // expanded to `["x","y"]` before projecting a state onto it). If ANY
+        // subscript cannot be resolved exactly, we cannot soundly evaluate the
+        // `<<A>>_v` tests, so leave these properties unchecked (conservative).
+        let mut subscript_cache: HashMap<Vec<String>, Vec<String>> = HashMap::new();
+        for c in &self.fairness_constraints {
+            let raw: &[String] = match c {
+                FairnessConstraint::Weak { vars, .. }
+                | FairnessConstraint::Strong { vars, .. } => vars,
+            };
+            match resolve_subscript_vars(&self.module, raw) {
+                Some(resolved) => {
+                    subscript_cache.insert(raw.to_vec(), resolved);
+                }
+                None => {
+                    eprintln!(
+                        "WARNING: fairness subscript {:?} could not be resolved to state \
+                         variables; graph-level liveness is left UNCHECKED for this spec \
+                         (conservative — avoids an unsound <<A>>_v verdict).",
+                        raw
+                    );
+                    return None;
+                }
+            }
+        }
+        // `<<A>>_v` subscript test: does the (resolved) subscript tuple differ
+        // between the states at fingerprints `f` and `t`?
         let v_changed = |f: u64, t: u64, vars: &[String]| -> bool {
             let resolved: &[String] =
                 subscript_cache.get(vars).map(|v| v.as_slice()).unwrap_or(vars);
@@ -1014,18 +1035,30 @@ impl Model for TlaModel {
 
         // Resolve each fairness subscript to concrete state variables once (a
         // `WF_vars(..)` with `vars == <<x,y>>` parses to `["vars"]`, which must be
-        // expanded to `["x","y"]` before projecting a state onto it).
-        let subscript_cache: HashMap<Vec<String>, Vec<String>> = self
-            .fairness_constraints
-            .iter()
-            .map(|c| {
-                let raw: &[String] = match c {
-                    FairnessConstraint::Weak { vars, .. }
-                    | FairnessConstraint::Strong { vars, .. } => vars,
-                };
-                (raw.to_vec(), resolve_subscript_vars(&self.module, raw))
-            })
-            .collect();
+        // expanded to `["x","y"]` before projecting a state onto it). If ANY
+        // subscript cannot be resolved exactly, we cannot soundly evaluate the
+        // `<<A>>_v` tests, so leave these properties unchecked (conservative).
+        let mut subscript_cache: HashMap<Vec<String>, Vec<String>> = HashMap::new();
+        for c in &self.fairness_constraints {
+            let raw: &[String] = match c {
+                FairnessConstraint::Weak { vars, .. }
+                | FairnessConstraint::Strong { vars, .. } => vars,
+            };
+            match resolve_subscript_vars(&self.module, raw) {
+                Some(resolved) => {
+                    subscript_cache.insert(raw.to_vec(), resolved);
+                }
+                None => {
+                    eprintln!(
+                        "WARNING: fairness subscript {:?} could not be resolved to state \
+                         variables; graph-level liveness is left UNCHECKED for this spec \
+                         (conservative — avoids an unsound <<A>>_v verdict).",
+                        raw
+                    );
+                    return None;
+                }
+            }
+        }
         let v_changed = |f: u64, t: u64, vars: &[String]| -> bool {
             let resolved: &[String] =
                 subscript_cache.get(vars).map(|v| v.as_slice()).unwrap_or(vars);
@@ -1631,38 +1664,46 @@ fn formula_has_non_fairness_liveness(formula: &TemporalFormula) -> bool {
 /// names it denotes, for the subscript-aware `<<A>>_v` tests. The parsed subscript
 /// `raw` may be: the state variables themselves (`WF_x(..)` → `["x"]`,
 /// `WF_<<x,y>>(..)` → `["x","y"]`); or a DEFINED tuple name (`WF_vars(..)` with
-/// `vars == <<x, y>>` → parsed as `["vars"]`, which must be expanded to
-/// `["x","y"]`). Anything that resolves to no state variable (e.g. an opaque
-/// `vars` we can't expand) falls back to ALL state variables — the near-universal
-/// meaning of a `vars` tuple and a sound conservative default.
-fn resolve_subscript_vars(module: &TlaModule, raw: &[String]) -> Vec<String> {
+/// `vars == <<x, y>>` → parsed as `["vars"]`, expanded to `["x","y"]`).
+///
+/// Returns `None` when the subscript cannot be resolved EXACTLY to a set of state
+/// variables — an opaque subscript (`v == F(x)`), a non-tuple definition, or a
+/// tuple with any non-state-variable component. Projecting onto an approximate
+/// variable set would be UNSOUND for a liveness verdict: a looser projection can
+/// count an edge as a taken `<<A>>_v` step when it is not (so a cycle wrongly
+/// looks fair → false positive), or miss a taken step (false negative). The
+/// callers treat `None` like `fairness_extraction_incomplete`: leave the property
+/// unchecked rather than risk a wrong verdict. (Codex review of PR #213.)
+fn resolve_subscript_vars(module: &TlaModule, raw: &[String]) -> Option<Vec<String>> {
     let state_vars: std::collections::HashSet<&str> =
         module.variables.iter().map(|s| s.as_str()).collect();
     let mut out: Vec<String> = Vec::new();
     for name in raw {
         if state_vars.contains(name.as_str()) {
             out.push(name.clone());
-        } else if let Some(def) = module.definitions.get(name) {
-            // A defined subscript, e.g. `vars == <<x, y>>`: expand its tuple body
-            // and keep the components that are real state variables.
-            let body = def.body.trim();
-            if let Some(inner) = body.strip_prefix("<<").and_then(|s| s.strip_suffix(">>")) {
-                for part in inner.split(',') {
-                    let p = part.trim();
-                    if state_vars.contains(p) {
-                        out.push(p.to_string());
-                    }
+            continue;
+        }
+        // Must be a definition that expands EXACTLY to state variables.
+        let def = module.definitions.get(name)?;
+        if !def.params.is_empty() {
+            return None;
+        }
+        let body = def.body.trim();
+        if let Some(inner) = body.strip_prefix("<<").and_then(|s| s.strip_suffix(">>")) {
+            for part in inner.split(',') {
+                let p = part.trim();
+                if !state_vars.contains(p) {
+                    return None; // a tuple component we can't account for
                 }
-            } else if state_vars.contains(body) {
-                out.push(body.to_string());
+                out.push(p.to_string());
             }
+        } else if state_vars.contains(body) {
+            out.push(body.to_string());
+        } else {
+            return None; // opaque / non-tuple subscript
         }
     }
-    if out.is_empty() {
-        module.variables.clone()
-    } else {
-        out
-    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 fn graph_liveness_shape(formula: &TemporalFormula) -> Option<(&str, &str)> {
