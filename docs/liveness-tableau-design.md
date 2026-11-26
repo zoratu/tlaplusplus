@@ -1,8 +1,13 @@
 # Tableau liveness checking — design
 
-Status: design (pre-implementation). Addresses Codex review findings #1/#2/#4/#6
-on PR #213. Supersedes the maximal-SCC + head-label approximation in
-`graph_liveness_violation` / `graph_liveness_eventually_violation`.
+Status: **IMPLEMENTED** (PR #213). Addresses Codex review findings #1/#2/#4/#6.
+Supersedes the maximal-SCC + head-label approximation in
+`graph_liveness_violation` / `graph_liveness_eventually_violation`. The corrected
+algorithm below was design-reviewed by Codex before implementation, implemented in
+`src/fairness.rs::find_fair_accepting_subsets` + the two `TlaModel` graph-liveness
+methods, implementation-reviewed by Codex, and validated against Java TLC on
+discriminator specs (recurrent-subcycle, SF-subcycle, partial-subscript) that the
+old approximation got wrong.
 
 ## The problem with the current (approximate) checks
 

@@ -847,6 +847,13 @@ impl Model for TlaModel {
         Some(&self.next_name)
     }
 
+    // SUPERSEDED by the tableau liveness checks (`graph_liveness_violation` /
+    // `graph_liveness_eventually_violation` → `find_fair_accepting_subsets`). This
+    // method (and its helper `scc_violates_single_property`) was the old
+    // per-maximal-SCC property gate used to suppress spurious fairness-only
+    // violations; nothing on the live path calls it now. Kept (no dead-code
+    // warning — trait method with a body) to avoid a trait-API change inside this
+    // soundness PR; safe to remove in a dedicated follow-up.
     fn scc_violates_liveness_property(&self, scc_states: &[Self::State]) -> Option<bool> {
         if self.temporal_properties.is_empty() || scc_states.is_empty() {
             return None;
