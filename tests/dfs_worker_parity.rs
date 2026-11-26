@@ -197,14 +197,17 @@ fn dfs_path_matches_bfs_on_failing_named_subaction_spec() {
     );
     assert_eq!(dfs_v.property_type, PropertyType::Liveness);
 
+    // `Reaches100 == <>(x=100)` is violated on the fair {0,1} Toggle cycle. After
+    // the Bug B/C rewrite both paths report this via the graph-level liveness
+    // check (fairness is a filter now, not a reported "NeverFires" violation).
     assert!(
-        bfs_v.message.contains("NeverFires"),
-        "BFS violation must mention NeverFires, got: {}",
+        bfs_v.message.contains("liveness"),
+        "BFS violation must be a graph-level liveness violation, got: {}",
         bfs_v.message
     );
     assert!(
-        dfs_v.message.contains("NeverFires"),
-        "DFS violation must mention NeverFires, got: {}",
+        dfs_v.message.contains("liveness"),
+        "DFS violation must be a graph-level liveness violation, got: {}",
         dfs_v.message
     );
 }
@@ -285,11 +288,14 @@ ReachesGoal == <>(x = 999)
     let dfs_v = dfs
         .violation
         .as_ref()
-        .expect("DFS must report fairness violation on Idle");
+        .expect("DFS must report liveness violation: <>(x=999) fails on the cycle");
     assert_eq!(dfs_v.property_type, PropertyType::Liveness);
+    // `ReachesGoal == <>(x=999)` is violated on the fair 3-state cycle. Post
+    // Bug B/C this is a graph-level liveness violation (fairness is a filter now,
+    // not a reported "Idle does not occur" violation).
     assert!(
-        dfs_v.message.contains("Idle"),
-        "DFS violation must mention Idle, got: {}",
+        dfs_v.message.contains("liveness"),
+        "DFS violation must be a graph-level liveness violation, got: {}",
         dfs_v.message
     );
 }

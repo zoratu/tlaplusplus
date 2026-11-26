@@ -221,14 +221,17 @@ fn t10_2_stage3_parity_on_failing_spec() {
         PropertyType::Liveness,
         "streaming-exploration violation must be Liveness"
     );
+    // `Reaches100 == <>(x=100)` is violated on the fair {0,1} Toggle cycle. After
+    // the Bug B/C rewrite this is a graph-level liveness violation (fairness is a
+    // filter now, not a reported "NeverFires does not occur" violation).
     assert!(
         exploration
             .violation
             .as_ref()
             .unwrap()
             .message
-            .contains("NeverFires"),
-        "expected NeverFires in violation message, got: {}",
+            .contains("liveness"),
+        "expected a graph-level liveness violation message, got: {}",
         exploration.violation.as_ref().unwrap().message,
     );
 }

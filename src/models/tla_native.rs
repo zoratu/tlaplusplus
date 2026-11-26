@@ -1,4 +1,4 @@
-use crate::fairness::{FairnessConstraint, LabeledTransition};
+use crate::fairness::{ActionShardIndex, FairnessConstraint, LabeledTransition};
 use crate::tla::hashed_arc::HashedArc;
 use crate::tla::compiled_expr::{resolve_state_vars, resolve_state_vars_in_action_ir};
 use crate::model::Model;
@@ -31,6 +31,19 @@ pub struct TlaModel {
     pub invariant_exprs: Vec<(String, String)>,
     pub temporal_properties: Vec<(String, TemporalFormula)>,
     pub fairness_constraints: Vec<FairnessConstraint>,
+    /// True if the `SPECIFICATION` declares fairness (`WF_`/`SF_`) that we could
+    /// NOT fully extract into `fairness_constraints` — currently quantified
+    /// (`\A n \in S : WF_v(A(n))`) or parameterized/instance-qualified fairness,
+    /// which are deferred (they need per-instance fairness). When set, the
+    /// graph-level liveness checks (`graph_liveness_violation`,
+    /// `graph_liveness_eventually_violation`) must NOT run their no-fairness
+    /// "stutter-forever" reasoning — the spec IS fair, we just can't model all of
+    /// it — so those properties are left UNCHECKED (conservative: miss rather than
+    /// false-violate). This is the soundness guard for the Bug A deferral
+    /// interacting with the Bug B eventually-checks (CheckpointDrain: all
+    /// properties are `<>Q`, all fairness is `\A t : WF_vars(..)` → without this
+    /// guard the empty constraint set is read as "no fairness" → false positive).
+    pub fairness_extraction_incomplete: bool,
     /// True if the behaviour `SPECIFICATION` conjoins a *non-fairness* temporal
     /// assumption (`[]<>R`, `<>R`, `~>`, `<>[]`, …) beyond `Init /\ [][Next]_vars`
     /// and `WF_`/`SF_` fairness. Such an assumption can exclude the
@@ -208,6 +221,7 @@ impl TlaModel {
         }
 
         let mut fairness_constraints = extract_fairness_constraints(&temporal_properties);
+        let mut fairness_extraction_incomplete = false;
 
         // Also extract fairness from SPECIFICATION if present
         if let Some(spec_name) = config.specification.as_ref() {
@@ -221,13 +235,26 @@ impl TlaModel {
                 if std::env::var("TLAPP_VERBOSE").is_ok() {
                     eprintln!("  Spec body: {}", spec_def.body);
                 }
-                match TemporalFormula::parse(&spec_def.body) {
-                    Ok(spec_formula) => {
-                        extract_fairness_from_formula(&spec_formula, &mut fairness_constraints);
-                    }
-                    Err(e) => {
-                        eprintln!("  Failed to parse Spec as temporal formula: {}", e);
-                    }
+                // Walk Spec conjuncts directly: unfold named-operator fairness
+                // (transitively) and extract inline WF/SF. (Bug A fix — see
+                // extract_spec_fairness. Quantified WF is deferred to Bugs B/C.)
+                let spec_body = spec_def.body.clone();
+                let mut visited_fairness_ops = std::collections::HashSet::new();
+                extract_spec_fairness(
+                    &spec_body,
+                    &module,
+                    &mut fairness_constraints,
+                    &mut visited_fairness_ops,
+                    &mut fairness_extraction_incomplete,
+                    0,
+                );
+                if fairness_extraction_incomplete {
+                    eprintln!(
+                        "WARNING: some SPECIFICATION fairness could not be fully extracted \
+                         (quantified/parameterized); graph-level liveness checks for <>Q / \
+                         [](P=><>Q) / ~> / <>[]Q will be SKIPPED for this spec to avoid a false \
+                         violation (conservative — see fairness_extraction_incomplete)."
+                    );
                 }
             } else {
                 eprintln!("  SPECIFICATION '{}' not found in definitions", spec_name);
@@ -302,6 +329,7 @@ impl TlaModel {
             invariant_exprs,
             temporal_properties,
             fairness_constraints,
+            fairness_extraction_incomplete,
             spec_has_non_fairness_liveness,
             state_constraints,
             action_constraints,
@@ -819,6 +847,13 @@ impl Model for TlaModel {
         Some(&self.next_name)
     }
 
+    // SUPERSEDED by the tableau liveness checks (`graph_liveness_violation` /
+    // `graph_liveness_eventually_violation` → `find_fair_accepting_subsets`). This
+    // method (and its helper `scc_violates_single_property`) was the old
+    // per-maximal-SCC property gate used to suppress spurious fairness-only
+    // violations; nothing on the live path calls it now. Kept (no dead-code
+    // warning — trait method with a body) to avoid a trait-API change inside this
+    // soundness PR; safe to remove in a dedicated follow-up.
     fn scc_violates_liveness_property(&self, scc_states: &[Self::State]) -> Option<bool> {
         if self.temporal_properties.is_empty() || scc_states.is_empty() {
             return None;
@@ -846,130 +881,119 @@ impl Model for TlaModel {
     }
 
     fn needs_graph_liveness_check(&self) -> bool {
-        self.temporal_properties
-            .iter()
-            .any(|(_, f)| graph_liveness_shape(f).is_some())
+        self.temporal_properties.iter().any(|(_, f)| {
+            graph_liveness_shape(f).is_some() || graph_liveness_eventually_shape(f).is_some()
+        })
     }
 
     fn graph_liveness_violation(
         &self,
         adjacency_fp: &HashMap<u64, Vec<u64>>,
         state_by_fp: &HashMap<u64, Self::State>,
-        non_trivial_sccs: &[Vec<u64>],
-        fair_scc: &[bool],
+        labeled_edges: &ActionShardIndex,
     ) -> Option<Self::State> {
-        // For each `[](P => <>[]Q)` property, look for a genuine violation:
-        // a P-state that can REACH a bad cycle (a reachable FAIR non-trivial
-        // cycle containing a `¬Q` state). Because every state in the graph is
-        // reachable from Init, a P-state that reaches such a cycle witnesses a
-        // behaviour that satisfies P but for which `<>[]Q` fails.
-        let has_fairness = !self.fairness_constraints.is_empty();
+        // `<>[]Q` / `[](P => <>[]Q)`: a behaviour fails iff it is `[]<>¬Q`
+        // (visits `¬Q` infinitely often) — a FAIR recurrent set that CONTAINS a
+        // `¬Q` state, reachable from a P-state. Uses the exact fair-subcycle
+        // search (`find_fair_accepting_subsets`), not the old maximal-SCC filter
+        // (which was incomplete under strong fairness — see the tableau design).
+        if self.fairness_extraction_incomplete {
+            return None;
+        }
+        if self.spec_has_non_fairness_liveness {
+            return None;
+        }
+        // Avoid the (eager, full-graph) fair-subcycle search when no property has
+        // the `<>[]Q` shape this method handles.
+        if !self
+            .temporal_properties
+            .iter()
+            .any(|(_, f)| graph_liveness_shape(f).is_some())
+        {
+            return None;
+        }
+
+        // Resolve each fairness subscript to concrete state variables once (a
+        // `WF_vars(..)` with `vars == <<x,y>>` parses to `["vars"]`, which must be
+        // expanded to `["x","y"]` before projecting a state onto it). If ANY
+        // subscript cannot be resolved exactly, we cannot soundly evaluate the
+        // `<<A>>_v` tests, so leave these properties unchecked (conservative).
+        let mut subscript_cache: HashMap<Vec<String>, Vec<String>> = HashMap::new();
+        for c in &self.fairness_constraints {
+            let raw: &[String] = match c {
+                FairnessConstraint::Weak { vars, .. }
+                | FairnessConstraint::Strong { vars, .. } => vars,
+            };
+            match resolve_subscript_vars(&self.module, raw) {
+                Some(resolved) => {
+                    subscript_cache.insert(raw.to_vec(), resolved);
+                }
+                None => {
+                    eprintln!(
+                        "WARNING: fairness subscript {:?} could not be resolved to state \
+                         variables; graph-level liveness is left UNCHECKED for this spec \
+                         (conservative — avoids an unsound <<A>>_v verdict).",
+                        raw
+                    );
+                    return None;
+                }
+            }
+        }
+        // `<<A>>_v` subscript test: does the (resolved) subscript tuple differ
+        // between the states at fingerprints `f` and `t`?
+        let v_changed = |f: u64, t: u64, vars: &[String]| -> bool {
+            let resolved: &[String] =
+                subscript_cache.get(vars).map(|v| v.as_slice()).unwrap_or(vars);
+            match (state_by_fp.get(&f), state_by_fp.get(&t)) {
+                (Some(sf), Some(st)) => resolved.iter().any(|v| sf.get(v) != st.get(v)),
+                _ => true,
+            }
+        };
+        let is_not_q = |fp: u64, q_text: &str| -> bool {
+            state_by_fp
+                .get(&fp)
+                .map(|st| self.eval_state_pred_on_state(q_text, st) == Some(false))
+                .unwrap_or(false)
+        };
+
+        // The recurrent set may alternate `Q`/`¬Q`, so the fair-subcycle search
+        // runs over the WHOLE reachable graph; the fair recurrent sets are
+        // property-independent, so compute them once.
+        let all_nodes: HashSet<u64> = state_by_fp.keys().copied().collect();
+        let accepting = crate::fairness::find_fair_accepting_subsets(
+            &all_nodes,
+            adjacency_fp,
+            labeled_edges,
+            &self.fairness_constraints,
+            self.next_action_name(),
+            &v_changed,
+        );
 
         for (_name, formula) in &self.temporal_properties {
             let Some((p_text, q_text)) = graph_liveness_shape(formula) else {
                 continue;
             };
-
-            // 1. Identify "bad cycle" fingerprints — states from which a
-            //    behaviour can loop forever while `Q` is always false (so
-            //    `<>[]Q` fails).
-            //
-            //    * NO fairness: stuttering (`[Next]_vars` allows `vars'=vars`)
-            //      is always a legal infinite behaviour, so ANY reachable
-            //      `¬Q` state is a bad cycle — you can stutter on it forever.
-            //      Stutter self-loops are NOT materialised as graph edges, so
-            //      we must NOT restrict to SCC membership here (RealTime: the
-            //      bad `now=4` loop is a stutter self-loop, not a recorded
-            //      graph cycle). This is the RealTime case.
-            //
-            //    * WITH fairness: a stutter-forever behaviour is unfair and
-            //      TLC excludes it, so a bad cycle must be a genuine FAIR
-            //      non-trivial graph cycle (SCC) containing a `¬Q` state.
-            //      Restricting to fair SCCs is the guardrail that prevents
-            //      false violations on fair liveness specs.
-            //
-            //    In both cases we require `Q` to be *confidently* false
-            //    (Some(false)); unevaluable states never establish ¬Q, so an
-            //    uncheckable predicate can only miss a violation, never invent
-            //    one.
+            // Bad cycles: the fair recurrent sets that contain a confidently-`¬Q`
+            // state (so the behaviour visits `¬Q` infinitely often).
             let mut bad_cycle_fps: HashSet<u64> = HashSet::new();
-            if has_fairness {
-                for (idx, scc) in non_trivial_sccs.iter().enumerate() {
-                    if !fair_scc.get(idx).copied().unwrap_or(true) {
-                        continue; // unfair cycle — TLC excludes it
-                    }
-                    let has_not_q = scc.iter().any(|fp| {
-                        state_by_fp
-                            .get(fp)
-                            .map(|st| self.eval_state_pred_on_state(q_text, st) == Some(false))
-                            .unwrap_or(false)
-                    });
-                    if has_not_q {
-                        for fp in scc {
-                            bad_cycle_fps.insert(*fp);
-                        }
-                    }
-                }
-                // Quiescent terminal states also stutter forever. A terminal
-                // state (no outgoing graph edge) has `Next` disabled, so every
-                // `WF_`/`SF_` constraint is vacuously satisfied there — the
-                // stutter-suffix behaviour is FAIR. TLC treats a deadlock's
-                // stutter the same way (when deadlock-checking is off, the
-                // usual mode for a spec with intended quiescent states). So a
-                // terminal `¬Q` state fails `<>[]Q` and is a bad cycle. Without
-                // this, a bare `<>[]Q` (or `[](P => <>[]Q)`) violation that
-                // only manifests at a quiescent terminal state was missed under
-                // fairness (the non-trivial-SCC scan never sees a terminal, and
-                // the no-fairness stutter branch below is skipped when fairness
-                // is present).
-                for (&fp, st) in state_by_fp.iter() {
-                    let is_terminal = adjacency_fp
-                        .get(&fp)
-                        .map(|succs| succs.is_empty())
-                        .unwrap_or(true);
-                    if is_terminal
-                        && self.eval_state_pred_on_state(q_text, st) == Some(false)
-                    {
-                        bad_cycle_fps.insert(fp);
-                    }
-                }
-            } else {
-                // No fairness: every reachable ¬Q state can be stuttered on
-                // forever → each is a bad cycle. BUT this stutter-reachability
-                // is only sound when the spec is exactly `Init /\ [][Next]_vars`.
-                // If the SPECIFICATION conjoins a non-fairness temporal
-                // assumption (`[]<>R`, `<>R`, `~>`, …) it excludes the
-                // stutter-forever suffix, so firing here could false-violate —
-                // leave the property unchecked instead ((d) guardrail).
-                if self.spec_has_non_fairness_liveness {
-                    continue;
-                }
-                for (&fp, st) in state_by_fp.iter() {
-                    if self.eval_state_pred_on_state(q_text, st) == Some(false) {
-                        bad_cycle_fps.insert(fp);
-                    }
+            for set in &accepting {
+                if set.iter().any(|fp| is_not_q(*fp, q_text)) {
+                    bad_cycle_fps.extend(set.iter().copied());
                 }
             }
-
             if bad_cycle_fps.is_empty() {
                 continue;
             }
-
-            // 2. Backward-reachability: set of fingerprints that can REACH any
-            //    bad-cycle fingerprint. Build the reverse adjacency once and
-            //    BFS from the bad-cycle set.
-            let mut reverse: HashMap<u64, Vec<u64>> =
-                HashMap::with_capacity(adjacency_fp.len());
+            // Backward reachability over the FULL graph (the stem to the bad cycle
+            // is unrestricted for `<>[]Q`).
+            let mut reverse: HashMap<u64, Vec<u64>> = HashMap::with_capacity(adjacency_fp.len());
             for (&from, succs) in adjacency_fp.iter() {
                 for &to in succs {
                     reverse.entry(to).or_default().push(from);
                 }
             }
-            let mut can_reach_bad: HashSet<u64> = HashSet::new();
+            let mut can_reach_bad: HashSet<u64> = bad_cycle_fps.iter().copied().collect();
             let mut stack: Vec<u64> = bad_cycle_fps.iter().copied().collect();
-            for &fp in &stack {
-                can_reach_bad.insert(fp);
-            }
             while let Some(fp) = stack.pop() {
                 if let Some(preds) = reverse.get(&fp) {
                     for &pred in preds {
@@ -979,14 +1003,158 @@ impl Model for TlaModel {
                     }
                 }
             }
-
-            // 3. A violation exists iff some reachable P-state can reach a bad
-            //    cycle. Return the P-state as the counterexample witness.
+            // Violation iff some reachable P-state can reach a bad cycle. (Bare
+            // `<>[]Q` has `p_text == "TRUE"`, satisfied by every reachable state,
+            // so Init's reachability suffices.)
             for (&fp, st) in state_by_fp.iter() {
                 if can_reach_bad.contains(&fp)
                     && self.eval_state_pred_on_state(p_text, st) == Some(true)
                 {
                     return Some(st.clone());
+                }
+            }
+        }
+        None
+    }
+
+    fn graph_liveness_eventually_violation(
+        &self,
+        adjacency_fp: &HashMap<u64, Vec<u64>>,
+        state_by_fp: &HashMap<u64, Self::State>,
+        labeled_edges: &ActionShardIndex,
+    ) -> Option<Self::State> {
+        // The "eventually" shapes `<>Q`, `[](P => <>Q)`, and `P ~> Q`. A behaviour
+        // VIOLATES these iff `Q` is false forever along some suffix:
+        //   - `<>Q`          : `Q` false on the WHOLE behaviour from Init.
+        //   - `[](P=><>Q)`/~>: there is a P-state after which `Q` is false forever.
+        // So a counterexample is a FAIR recurrent set within the `¬Q` subgraph,
+        // reached by a `¬Q`-only path — from Init (bare `<>Q`) or from a `P /\ ¬Q`
+        // state. The fair recurrent sets are found by the exact fair-subcycle
+        // search (`find_fair_accepting_subsets`). `Q` must be *confidently* false
+        // (`Some(false)`); an unevaluable state never establishes `¬Q`, so an
+        // uncheckable predicate can only miss a violation, never invent one.
+        if self.fairness_extraction_incomplete {
+            return None;
+        }
+        if self.spec_has_non_fairness_liveness {
+            return None;
+        }
+
+        // Resolve each fairness subscript to concrete state variables once (a
+        // `WF_vars(..)` with `vars == <<x,y>>` parses to `["vars"]`, which must be
+        // expanded to `["x","y"]` before projecting a state onto it). If ANY
+        // subscript cannot be resolved exactly, we cannot soundly evaluate the
+        // `<<A>>_v` tests, so leave these properties unchecked (conservative).
+        let mut subscript_cache: HashMap<Vec<String>, Vec<String>> = HashMap::new();
+        for c in &self.fairness_constraints {
+            let raw: &[String] = match c {
+                FairnessConstraint::Weak { vars, .. }
+                | FairnessConstraint::Strong { vars, .. } => vars,
+            };
+            match resolve_subscript_vars(&self.module, raw) {
+                Some(resolved) => {
+                    subscript_cache.insert(raw.to_vec(), resolved);
+                }
+                None => {
+                    eprintln!(
+                        "WARNING: fairness subscript {:?} could not be resolved to state \
+                         variables; graph-level liveness is left UNCHECKED for this spec \
+                         (conservative — avoids an unsound <<A>>_v verdict).",
+                        raw
+                    );
+                    return None;
+                }
+            }
+        }
+        let v_changed = |f: u64, t: u64, vars: &[String]| -> bool {
+            let resolved: &[String] =
+                subscript_cache.get(vars).map(|v| v.as_slice()).unwrap_or(vars);
+            match (state_by_fp.get(&f), state_by_fp.get(&t)) {
+                (Some(sf), Some(st)) => resolved.iter().any(|v| sf.get(v) != st.get(v)),
+                _ => true,
+            }
+        };
+        let is_not_q = |fp: u64, q_text: &str| -> bool {
+            state_by_fp
+                .get(&fp)
+                .map(|st| self.eval_state_pred_on_state(q_text, st) == Some(false))
+                .unwrap_or(false)
+        };
+
+        for (_name, formula) in &self.temporal_properties {
+            let Some((p_text, q_text, is_bare_eventually)) =
+                graph_liveness_eventually_shape(formula)
+            else {
+                continue;
+            };
+
+            // Restrict to the `¬Q` subgraph: the recurrent behaviour and its
+            // connecting suffix must stay in `¬Q`.
+            let restriction: HashSet<u64> = state_by_fp
+                .keys()
+                .copied()
+                .filter(|fp| is_not_q(*fp, q_text))
+                .collect();
+            if restriction.is_empty() {
+                continue;
+            }
+
+            // Fair recurrent sets within `¬Q` (every state in each is `¬Q`).
+            let accepting = crate::fairness::find_fair_accepting_subsets(
+                &restriction,
+                adjacency_fp,
+                labeled_edges,
+                &self.fairness_constraints,
+                self.next_action_name(),
+                &v_changed,
+            );
+            if accepting.is_empty() {
+                continue;
+            }
+            let mut bad_cycle_fps: HashSet<u64> = HashSet::new();
+            for set in &accepting {
+                bad_cycle_fps.extend(set.iter().copied());
+            }
+
+            // Backward reachability RESTRICTED to `¬Q` states: a state can begin a
+            // `Q`-false-forever suffix iff it is `¬Q` and reaches a bad recurrent
+            // set via `¬Q` predecessors.
+            let mut reverse: HashMap<u64, Vec<u64>> = HashMap::with_capacity(adjacency_fp.len());
+            for (&from, succs) in adjacency_fp.iter() {
+                for &to in succs {
+                    reverse.entry(to).or_default().push(from);
+                }
+            }
+            let mut bad_reaching: HashSet<u64> = bad_cycle_fps.iter().copied().collect();
+            let mut stack: Vec<u64> = bad_cycle_fps.iter().copied().collect();
+            while let Some(fp) = stack.pop() {
+                if let Some(preds) = reverse.get(&fp) {
+                    for &pred in preds {
+                        if is_not_q(pred, q_text) && bad_reaching.insert(pred) {
+                            stack.push(pred);
+                        }
+                    }
+                }
+            }
+
+            if is_bare_eventually {
+                // `<>Q`: a `¬Q` path from an INIT state to a bad recurrent set. The
+                // whole behaviour is `¬Q`, so Init itself must be `¬Q` and reaching.
+                for init in self.initial_states() {
+                    let fp = self.fingerprint(&init);
+                    if bad_reaching.contains(&fp) {
+                        return state_by_fp.get(&fp).cloned().or(Some(init));
+                    }
+                }
+            } else {
+                // `[](P=><>Q)` / `~>`: a `P /\ ¬Q` state that reaches a bad recurrent
+                // set via a `¬Q` path (the stem from Init may contain `Q`).
+                for (&fp, st) in state_by_fp.iter() {
+                    if bad_reaching.contains(&fp)
+                        && self.eval_state_pred_on_state(p_text, st) == Some(true)
+                    {
+                        return Some(st.clone());
+                    }
                 }
             }
         }
@@ -1499,6 +1667,52 @@ fn formula_has_non_fairness_liveness(formula: &TemporalFormula) -> bool {
 ///
 /// In both cases the operand(s) must be pure, prime-free, non-temporal state
 /// predicates so they can be evaluated per state.
+/// Resolve a fairness subscript (`WF_<<raw>>(A)`) to the concrete state-variable
+/// names it denotes, for the subscript-aware `<<A>>_v` tests. The parsed subscript
+/// `raw` may be: the state variables themselves (`WF_x(..)` → `["x"]`,
+/// `WF_<<x,y>>(..)` → `["x","y"]`); or a DEFINED tuple name (`WF_vars(..)` with
+/// `vars == <<x, y>>` → parsed as `["vars"]`, expanded to `["x","y"]`).
+///
+/// Returns `None` when the subscript cannot be resolved EXACTLY to a set of state
+/// variables — an opaque subscript (`v == F(x)`), a non-tuple definition, or a
+/// tuple with any non-state-variable component. Projecting onto an approximate
+/// variable set would be UNSOUND for a liveness verdict: a looser projection can
+/// count an edge as a taken `<<A>>_v` step when it is not (so a cycle wrongly
+/// looks fair → false positive), or miss a taken step (false negative). The
+/// callers treat `None` like `fairness_extraction_incomplete`: leave the property
+/// unchecked rather than risk a wrong verdict. (Codex review of PR #213.)
+fn resolve_subscript_vars(module: &TlaModule, raw: &[String]) -> Option<Vec<String>> {
+    let state_vars: std::collections::HashSet<&str> =
+        module.variables.iter().map(|s| s.as_str()).collect();
+    let mut out: Vec<String> = Vec::new();
+    for name in raw {
+        if state_vars.contains(name.as_str()) {
+            out.push(name.clone());
+            continue;
+        }
+        // Must be a definition that expands EXACTLY to state variables.
+        let def = module.definitions.get(name)?;
+        if !def.params.is_empty() {
+            return None;
+        }
+        let body = def.body.trim();
+        if let Some(inner) = body.strip_prefix("<<").and_then(|s| s.strip_suffix(">>")) {
+            for part in inner.split(',') {
+                let p = part.trim();
+                if !state_vars.contains(p) {
+                    return None; // a tuple component we can't account for
+                }
+                out.push(p.to_string());
+            }
+        } else if state_vars.contains(body) {
+            out.push(body.to_string());
+        } else {
+            return None; // opaque / non-tuple subscript
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
 fn graph_liveness_shape(formula: &TemporalFormula) -> Option<(&str, &str)> {
     match formula {
         // `[](P => <>[]Q)`
@@ -1540,6 +1754,63 @@ fn graph_liveness_shape(formula: &TemporalFormula) -> Option<(&str, &str)> {
             } else {
                 None
             }
+        }
+        _ => None,
+    }
+}
+
+/// Recognize the "eventually" liveness shapes that `graph_liveness_shape`
+/// deliberately does NOT handle — `<>Q`, `[](P => <>Q)`, and `P ~> Q` — returning
+/// `(p_text, q_text, is_bare)`. (Bug B.)
+///
+/// `is_bare` is true ONLY for the syntactic bare `<>Q` (`TemporalFormula::Eventually`),
+/// which means "Q holds at least once over the whole behaviour". The triggered
+/// forms `[](P => <>Q)` and `P ~> Q` (which includes `TRUE ~> Q` ≡ `[]<>Q`) are
+/// NOT bare: they require Q to recur after every P-state. The distinction is by
+/// which AST arm matched, never by the text of `p` — a literal `TRUE ~> Q` has
+/// `p_text == "TRUE"` but is NOT a bare eventually (Codex review of PR #213).
+///
+/// These differ from the `<>[]Q` shapes in their violation condition: `<>[]Q`
+/// fails on a fair cycle that merely *contains* a `¬Q` state, whereas these fail
+/// only on a fair cycle where `Q` is false *everywhere*, reached by a path along
+/// which `Q` is false *throughout* (see `graph_liveness_eventually_violation`).
+fn graph_liveness_eventually_shape(formula: &TemporalFormula) -> Option<(&str, &str, bool)> {
+    match formula {
+        // Bare `<>Q` — the only shape where `is_bare` is true.
+        TemporalFormula::Eventually(q_inner) => {
+            let TemporalFormula::StatePredicate(q) = q_inner.as_ref() else {
+                return None;
+            };
+            is_pure_state_predicate_text(q).then(|| ("TRUE", q.trim(), true))
+        }
+        // `P ~> Q` ≡ `[](P => <>Q)`. P may be literally "TRUE" (`TRUE ~> Q` ≡
+        // `[]<>Q`); it is still a TRIGGERED form (is_bare = false), handled by the
+        // every-P-state branch of the checker.
+        TemporalFormula::LeadsTo(p, q) => {
+            let (TemporalFormula::StatePredicate(p), TemporalFormula::StatePredicate(q)) =
+                (p.as_ref(), q.as_ref())
+            else {
+                return None;
+            };
+            (is_pure_state_predicate_text(p) && is_pure_state_predicate_text(q))
+                .then(|| (p.trim(), q.trim(), false))
+        }
+        // `[](P => <>Q)` (always-implies-eventually, NOT eventually-always).
+        TemporalFormula::Always(inner) => {
+            let TemporalFormula::Implies(ante, cons) = inner.as_ref() else {
+                return None;
+            };
+            let TemporalFormula::StatePredicate(p) = ante.as_ref() else {
+                return None;
+            };
+            let TemporalFormula::Eventually(q_inner) = cons.as_ref() else {
+                return None;
+            };
+            let TemporalFormula::StatePredicate(q) = q_inner.as_ref() else {
+                return None;
+            };
+            (is_pure_state_predicate_text(p) && is_pure_state_predicate_text(q))
+                .then(|| (p.trim(), q.trim(), false))
         }
         _ => None,
     }
@@ -1891,11 +2162,16 @@ fn extract_init_next_from_spec_inner(
         return (None, None);
     }
 
+    // Strip parens wrapping the whole body so a fully-parenthesized Spec
+    // (`Spec == (Init /\ [][Next]_v /\ Fairness)`) splits into its conjuncts
+    // rather than becoming one opaque part (which would hide Init/Next and fail
+    // model loading). Symmetric with extract_spec_fairness.
+    let spec_body = strip_matched_outer_parens(spec_body.trim());
     let parts = split_top_level(spec_body, "/\\");
 
     // If there's a single part that's a definition reference, chase it
     if parts.len() == 1 {
-        let part = parts[0].trim();
+        let part = strip_matched_outer_parens(parts[0].trim());
         if let Some(name) = parse_simple_identifier(part) {
             if let Some(def) = module.definitions.get(&name) {
                 let result = extract_init_next_from_spec_inner(&def.body, module, depth + 1);
@@ -1910,8 +2186,25 @@ fn extract_init_next_from_spec_inner(
     let mut next: Option<SpecComponent> = None;
 
     for part in &parts {
-        let part = part.trim();
+        let part = strip_matched_outer_parens(part.trim());
         if part.is_empty() {
+            continue;
+        }
+
+        // A part that is itself a conjunction (exposed by stripping its wrapping
+        // parens, e.g. `(Init /\ [][Next]_v) /\ Fairness`) must be re-split so its
+        // Init/Next are seen — symmetric with extract_spec_fairness, which already
+        // re-splits such a conjunct (otherwise the two extractors disagree on
+        // structure and Init/Next could misclassify the compound).
+        if split_top_level(part, "/\\").len() > 1 {
+            let (sub_init, sub_next) =
+                extract_init_next_from_spec_inner(part, module, depth + 1);
+            if init.is_none() {
+                init = sub_init;
+            }
+            if next.is_none() {
+                next = sub_next;
+            }
             continue;
         }
 
@@ -4136,6 +4429,285 @@ fn extract_fairness_from_formula(
         }
         TemporalFormula::StatePredicate(_) => {
             // No fairness constraints in state predicates
+        }
+    }
+}
+
+/// Extract fairness constraints from a SPECIFICATION body (Bug A fix).
+///
+/// Previously fairness was extracted by parsing the whole Spec body as one
+/// `TemporalFormula`, which recognizes only top-level *inline, unquantified*
+/// `WF_v(A)` / `SF_v(A)` conjuncts. A conjunct that is a **named operator**
+/// (`Spec == Init /\ [][Next]_v /\ Fairness` with `Fairness == WF_x(Next)`, the
+/// common idiom) became a `StatePredicate("Fairness")` and was silently dropped.
+/// With no fairness extracted, infinite stuttering in `Init` was treated as a
+/// fair behaviour, producing false `<>[]Q` violations.
+///
+/// This walks the Spec conjuncts directly and:
+/// - unfolds a named-operator conjunct into its definition, **transitively**
+///   (alias chains `Fairness == MoreFairness == WF_x(Next)`), with a `visited`
+///   set to break cycles;
+/// - extracts inline `WF_`/`SF_` (including a parenthesized group
+///   `(WF_x(A) /\ WF_x(B))`);
+/// - refuses to extract a fairness token that sits under a top-level
+///   disjunction / implication / leads-to (it is not an *unconditional* fairness
+///   assumption — extracting it could hide a real violation);
+/// - warns loudly whenever a conjunct carries a `WF_`/`SF_` token (literally, or
+///   transitively through a parameterized operator's definition closure —
+///   `Fair(1)` with `Fair(i) == WF_x(A(i))`, or `Fair(i) == MoreFair(i)`) yet
+///   yields no constraint, so deferred parameterized fairness is not silently
+///   dropped. One residual silent case remains: an instance-qualified reference
+///   `Alias!Fairness` whose operator lives in the INSTANCED module is not resolved
+///   here (needs instance resolution, added with Bug C's fairness work); if it is
+///   genuinely fairness it is left unextracted — consistent with all other
+///   deferred fairness, just without a precise warning.
+///
+/// NOTE: quantified fairness `\A n \in S : WF_v(A(n))` is deliberately NOT handled
+/// here. Correctly checking it requires *per-instance* fairness (the SCC checker
+/// currently keys fairness on the action head identifier, so `WF(A(a))` and
+/// `WF(A(b))` would collapse to one `A` constraint — see Codex review of PR #212).
+/// That belongs with the enablement-aware fairness-filter rewrite (Bugs B/C);
+/// until then a quantified-WF conjunct is left unextracted with a loud warning.
+fn extract_spec_fairness(
+    spec_body: &str,
+    module: &TlaModule,
+    constraints: &mut Vec<FairnessConstraint>,
+    visited: &mut std::collections::HashSet<String>,
+    incomplete: &mut bool,
+    depth: usize,
+) {
+    if depth > 16 {
+        eprintln!(
+            "WARNING: Spec fairness extraction hit the depth limit; some fairness may be \
+             unextracted (deeply nested or cyclic operator definitions)."
+        );
+        *incomplete = true;
+        return;
+    }
+    // Strip parens wrapping the whole body BEFORE splitting, so a fully
+    // parenthesized spec `Spec == (Init /\ [][Next]_v /\ Fairness)` is split into
+    // its conjuncts rather than treated as one opaque part.
+    let body = strip_matched_outer_parens(spec_body.trim());
+    for raw in split_top_level(body, "/\\") {
+        let part = strip_matched_outer_parens(raw.trim());
+        if part.is_empty() {
+            continue;
+        }
+        // A conjunct that is ITSELF a parenthesized conjunction (exposed by the
+        // strip above) is re-split so its inner fairness is seen.
+        if split_top_level(part, "/\\").len() > 1 {
+            extract_spec_fairness(part, module, constraints, visited, incomplete, depth + 1);
+            continue;
+        }
+        // `[][Next]_v` behaviour conjunct — no fairness here.
+        if part.starts_with("[][") || part.starts_with("[] [") {
+            continue;
+        }
+        // Bare operator reference FIRST — before the WF_/SF_ substring test — so a
+        // named fairness operator whose NAME contains the token (e.g.
+        // `WF_Fairness == WF_x(Next)`) is unfolded, not mis-parsed as an inline
+        // expression. Handles alias chains (`Fairness == MoreFairness == WF_x(..)`)
+        // transitively; `visited` breaks cycles; unfolding a non-fairness def
+        // (Init, TypeOK, ...) is harmless (only WF_/SF_ leaves add constraints).
+        if let Some(name) = parse_simple_identifier(part) {
+            if visited.insert(name.clone()) {
+                if let Some(def) = module.definitions.get(&name) {
+                    if def.params.is_empty() {
+                        let def_body = def.body.clone();
+                        extract_spec_fairness(
+                            &def_body,
+                            module,
+                            constraints,
+                            visited,
+                            incomplete,
+                            depth + 1,
+                        );
+                    }
+                }
+            }
+            continue;
+        }
+        // Parameterized or alias-qualified operator reference whose definition
+        // carries fairness — e.g. `Fair(1)` with `Fair(i) == WF_x(A(i))`, or
+        // `Inst!Fairness`. Extracting it would hit the same per-instance collapse
+        // as quantified fairness (the SCC checker keys on the action HEAD, so
+        // `WF_x(A(1))` becomes an `A` constraint), so it is deferred to Bugs B/C —
+        // but it must WARN, not drop silently (the conjunct carries no literal
+        // WF_/SF_ token at this call site, so the inline path below would miss it).
+        if let Some(op_name) = conjunct_leading_operator_name(part) {
+            // Transitive closure: `Fair(1)` with `Fair(i) == WF_x(A(i))`, and also
+            // `Fair(i) == MoreFair(i)` where only `MoreFair` carries the token.
+            let mut seen = std::collections::HashSet::new();
+            if operator_closure_mentions_fairness(&op_name, module, &mut seen, 0) {
+                eprintln!(
+                    "WARNING: Spec conjunct `{}` references a parameterized fairness operator \
+                     (`{}`, transitively mentions WF_/SF_), which is not yet supported (needs \
+                     per-instance fairness — Bugs B/C). It is left unextracted and may cause a \
+                     false liveness violation.",
+                    part, op_name
+                );
+                *incomplete = true;
+                continue;
+            }
+            // Residual (documented) limitation: an instance-qualified reference
+            // `Alias!Fairness` whose operator lives in the INSTANCED module is not
+            // resolved here (needs instance resolution, which Bug C's fairness work
+            // adds). Such a conjunct — if it is genuinely fairness — is still left
+            // unextracted, consistent with all other deferred parameterized/
+            // quantified fairness, just without a precise warning.
+        }
+        // Quantified conjunct (`\A .. : ..`): quantified fairness is deferred to
+        // Bugs B/C (needs per-instance fairness). If it literally carries a
+        // WF_/SF_ token, warn loudly rather than silently drop. (A quantified
+        // conjunct whose fairness is hidden behind a parameterized operator cannot
+        // be detected without resolving that operator inside the quantifier; that
+        // remains a known limitation of the deferred quantified support.)
+        let trimmed = part.trim_start();
+        if trimmed.starts_with("\\A") || trimmed.starts_with("\\E") {
+            if part.contains("WF_") || part.contains("SF_") {
+                eprintln!(
+                    "WARNING: Spec conjunct `{}` is quantified fairness (`\\A .. : WF_/SF_`), \
+                     which is not yet supported (needs per-instance fairness — Bugs B/C). It is \
+                     left unextracted and may cause a false liveness violation.",
+                    part
+                );
+                *incomplete = true;
+            }
+            continue;
+        }
+        if part.contains("WF_") || part.contains("SF_") {
+            // A fairness token under a top-level `\/`, `=>`, or `~>` is NOT an
+            // unconditional fairness assumption; extracting it would add a spurious
+            // constraint that could hide a real violation. `split_top_level` is
+            // paren-aware, so an operator nested inside the WF action — e.g.
+            // `WF_x(P => Q)` — stays within one part and is not matched.
+            if split_top_level(part, "\\/").len() > 1
+                || split_top_level(part, "=>").len() > 1
+                || split_top_level(part, "~>").len() > 1
+            {
+                eprintln!(
+                    "WARNING: Spec conjunct `{}` has a WF_/SF_ token under a top-level \\/, =>, or \
+                     ~>; it is NOT treated as unconditional fairness and is left unextracted.",
+                    part
+                );
+                *incomplete = true;
+                continue;
+            }
+            match TemporalFormula::parse(part) {
+                Ok(f) => {
+                    let before = constraints.len();
+                    extract_fairness_from_formula(&f, constraints);
+                    if constraints.len() == before {
+                        eprintln!(
+                            "WARNING: Spec conjunct `{}` contains WF_/SF_ but no fairness \
+                             constraint was extracted — DROPPED; may cause a false liveness \
+                             violation.",
+                            part
+                        );
+                        *incomplete = true;
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "WARNING: failed to parse Spec fairness conjunct `{}`: {} — DROPPED.",
+                        part, e
+                    );
+                    *incomplete = true;
+                }
+            }
+        }
+        // else: a plain state-predicate conjunct (Init, TypeOK, an invariant
+        // assumption) — not fairness, ignored here.
+    }
+}
+
+/// Extract the leading operator name of a conjunct that is an operator
+/// *application* `Name(args)` or an alias-qualified reference `Alias!Name(args)` /
+/// `Alias!Name`. Returns the bare operator name (`Name`), or `None` if the conjunct
+/// is not such a reference. Used to warn on parameterized/qualified fairness that
+/// is deferred rather than silently dropped.
+fn conjunct_leading_operator_name(part: &str) -> Option<String> {
+    let s = part.trim();
+    // Take the head token up to the first `(` (operator application) if present.
+    let head = match s.find('(') {
+        Some(idx) => s[..idx].trim(),
+        None => s,
+    };
+    // Resolve the rightmost component of an `Alias!Name` qualified reference.
+    let name = head.rsplit('!').next().unwrap_or(head).trim();
+    parse_simple_identifier(name)
+}
+
+/// Does the definition closure of operator `name` (following every operator it
+/// references, any arity) mention a `WF_`/`SF_` fairness token? Used to WARN —
+/// never to extract — on a parameterized fairness operator whose fairness is
+/// reached transitively (`Fair(i) == MoreFair(i)`, `MoreFair(i) == WF_x(A(i))`),
+/// so such a (deferred) conjunct is not silently dropped. Bounded by `visited`
+/// (cycles) and `depth`.
+fn operator_closure_mentions_fairness(
+    name: &str,
+    module: &TlaModule,
+    visited: &mut std::collections::HashSet<String>,
+    depth: usize,
+) -> bool {
+    if depth > 16 || !visited.insert(name.to_string()) {
+        return false;
+    }
+    let Some(def) = module.definitions.get(name) else {
+        return false; // unresolved (e.g. an instanced-module member) — can't tell
+    };
+    if def.body.contains("WF_") || def.body.contains("SF_") {
+        return true;
+    }
+    // Recurse into referenced operators. Identifier-token scan: split on any
+    // non-identifier char and follow tokens that name a definition.
+    for tok in def.body.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+        if tok.is_empty() || tok == name {
+            continue;
+        }
+        if module.definitions.contains_key(tok)
+            && operator_closure_mentions_fairness(tok, module, visited, depth + 1)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Strip matched outer parentheses from `s`, repeatedly. Only strips a layer when
+/// the parens genuinely wrap the whole expression (depth never returns to 0 before
+/// the end), so `(a) /\ (b)` is left untouched.
+///
+/// NOTE: like `split_top_level` (which this module relies on throughout), this
+/// counts `()` without being aware of TLA+ string literals, so a parenthesis
+/// inside a `"..."` string is counted. This is a shared, pre-existing limitation
+/// of the text-level Spec handling, not specific to this helper.
+fn strip_matched_outer_parens(s: &str) -> &str {
+    let mut cur = s.trim();
+    loop {
+        let inner = match cur.strip_prefix('(').and_then(|x| x.strip_suffix(')')) {
+            Some(i) => i.trim(),
+            None => return cur,
+        };
+        let mut depth = 0i32;
+        let mut matched = true;
+        for c in inner.chars() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth < 0 {
+                        matched = false;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if matched && depth == 0 {
+            cur = inner;
+        } else {
+            return cur;
         }
     }
 }
