@@ -774,52 +774,47 @@ pub(super) fn run_inband_fairness_check<M: Model>(
         constraints.len()
     );
 
-    // Phase 5: fairness FILTER + graph-level liveness check. Mirrors the BFS path
-    // in `runtime/liveness.rs` so the two stay at parity (Bugs B/C).
+    // Phase 5: graph-level liveness check. Mirrors the BFS path in
+    // `runtime/liveness.rs` so the two stay at parity (Bugs B/C + tableau).
     //
-    // Fairness is a FILTER, never a reported violation (Bug C): an SCC where a
-    // weakly/strongly-fair action is enabled-but-never-taken is excluded, not
-    // reported. The actual liveness verdict comes from the model's graph-level
-    // checks over the FAIR SCCs: `graph_liveness_violation` (<>[]Q, [](P=><>[]Q))
-    // and `graph_liveness_eventually_violation` (<>Q, [](P=><>Q), ~> — Bug B).
-    let owned_sccs: Vec<Vec<u64>> = non_trivial.iter().map(|scc| (*scc).clone()).collect();
-    let fair_scc: Vec<bool> = owned_sccs
+    // Fairness is a FILTER, never a reported violation (Bug C). The actual
+    // liveness verdict comes from the model's graph-level checks, which run the
+    // exact fair-subcycle search internally over the labelled edges:
+    // `graph_liveness_violation` (<>[]Q, [](P=><>[]Q)) and
+    // `graph_liveness_eventually_violation` (<>Q, [](P=><>Q), ~>). A quick
+    // maximal-SCC fairness count is still logged for diagnostics.
+    let unfair = non_trivial
         .iter()
-        .map(|scc| {
+        .filter(|scc| {
             let scc_fps: HashSet<u64> = scc.iter().copied().collect();
-            constraints.iter().all(|c| {
+            !constraints.iter().all(|c| {
                 check_fairness_on_scc_fp_sharded(&scc_fps, c, &shards, &adjacency_fp, next_name)
                     .is_ok()
             })
         })
-        .collect();
-    let unfair = fair_scc.iter().filter(|f| !**f).count();
+        .count();
     if unfair > 0 {
         eprintln!(
-            "[dfs-worker] fairness filter: {} of {} non-trivial SCC(s) excluded as unfair",
+            "[dfs-worker] fairness filter: {} of {} non-trivial SCC(s) flagged unfair \
+             (diagnostic)",
             unfair,
-            owned_sccs.len()
+            non_trivial.len()
         );
     }
 
     let mut shape_desc = "<>[]Q / [](P => <>[]Q)";
     let bad_state = model
-        .graph_liveness_violation(&adjacency_fp, state_by_fp, &owned_sccs, &fair_scc)
+        .graph_liveness_violation(&adjacency_fp, state_by_fp, &shards)
         .or_else(|| {
             shape_desc = "<>Q / [](P => <>Q) / ~>";
-            model.graph_liveness_eventually_violation(
-                &adjacency_fp,
-                state_by_fp,
-                &owned_sccs,
-                &fair_scc,
-            )
+            model.graph_liveness_eventually_violation(&adjacency_fp, state_by_fp, &shards)
         });
 
     if let Some(state) = bad_state {
         let mut trace = vec![state.clone()];
         // Close the lasso on the containing SCC if we can locate it.
         let fp = model.fingerprint(&state);
-        if let Some(scc) = owned_sccs.iter().find(|scc| scc.contains(&fp)) {
+        if let Some(scc) = non_trivial.iter().find(|scc| scc.contains(&fp)) {
             trace = scc.iter().filter_map(|f| state_by_fp.get(f).cloned()).collect();
             if let Some(first) = trace.first().cloned() {
                 trace.push(first);

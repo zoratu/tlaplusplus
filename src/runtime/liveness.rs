@@ -387,41 +387,15 @@ where
         // violation. The model decides internally whether cycles are needed.
         if model.needs_graph_liveness_check() {
             let gl_start = std::time::Instant::now();
-            let owned_sccs: Vec<Vec<u64>> =
-                non_trivial_sccs.iter().map(|s| (*s).clone()).collect();
-
-            let constraints = model.fairness_constraints();
-            let fair_scc: Vec<bool> = if constraints.is_empty() {
-                // No fairness → every cycle is a fair (stutter-allowed) loop.
-                vec![true; owned_sccs.len()]
-            } else {
-                let gl_shards = build_action_shard_index(&tx_triples);
-                let next_name = model.next_action_name();
-                owned_sccs
-                    .iter()
-                    .map(|scc| {
-                        let scc_fps: HashSet<u64> = scc.iter().copied().collect();
-                        // Fair iff NO constraint is violated (all actions
-                        // that must occur do occur) in this cycle.
-                        constraints.iter().all(|c| {
-                            check_fairness_on_scc_fp_sharded(
-                                &scc_fps,
-                                c,
-                                &gl_shards,
-                                &adjacency_fp,
-                                next_name,
-                            )
-                            .is_ok()
-                        })
-                    })
-                    .collect()
-            };
+            // The exact fair-subcycle search in the model needs the per-action
+            // labelled edges (the shard index) to evaluate the `<<A>>_v` fairness
+            // primitives; it computes its own (restricted) SCCs internally.
+            let gl_labeled_edges = build_action_shard_index(&tx_triples);
 
             if let Some(bad_state) = model.graph_liveness_violation(
                 &adjacency_fp,
                 &state_by_fp,
-                &owned_sccs,
-                &fair_scc,
+                &gl_labeled_edges,
             ) {
                 eprintln!(
                     "  Graph-level liveness violation (<>[]Q / [](P => <>[]Q)) found in {:.2?}",
@@ -442,8 +416,7 @@ where
             if let Some(bad_state) = model.graph_liveness_eventually_violation(
                 &adjacency_fp,
                 &state_by_fp,
-                &owned_sccs,
-                &fair_scc,
+                &gl_labeled_edges,
             ) {
                 eprintln!(
                     "  Graph-level liveness violation (<>Q / [](P => <>Q) / ~>) found in {:.2?}",
@@ -495,13 +468,13 @@ where
                 // throughout a cycle but never taken) is DISCARDED, not reported.
                 // (Previously this loop reported such SCCs as "Fairness violation",
                 // which was a false positive — TLC never reports one.) The actual
-                // liveness verdict comes solely from `graph_liveness_violation`
-                // above, which consumes the per-SCC `fair_scc` filter (computed
-                // with the same enablement-aware `check_fairness_on_scc_fp_sharded`)
-                // and reports a property counterexample only on a FAIR bad cycle.
+                // liveness verdict comes solely from `graph_liveness_violation` /
+                // `graph_liveness_eventually_violation` above, which run the exact
+                // fair-subcycle search (`find_fair_accepting_subsets`) internally
+                // and report a property counterexample only on a FAIR bad cycle.
                 //
-                // This block is now diagnostics only: it counts how many SCCs each
-                // constraint excludes, and never sets `violation`.
+                // This block is now diagnostics only: it counts how many maximal
+                // SCCs each constraint flags unfair, and never sets `violation`.
                 let phase5_start = std::time::Instant::now();
                 let next_name = model.next_action_name();
                 let mut total_constraint_checks = 0usize;

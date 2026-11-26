@@ -258,6 +258,156 @@ fn fairness_action_enabled_at(fp: u64, action: &str, shards: &ActionShardIndex) 
     false
 }
 
+/// Enumerate the maximal *fair accepting* strongly-connected subsets within
+/// `restriction`, via the recursive strong-fairness-pruning emptiness check (see
+/// `docs/liveness-tableau-design.md`). This is the exact TLC-style liveness
+/// acceptance, replacing the earlier one-pass maximal-SCC approximation (which was
+/// incomplete for strong fairness: a fair recurrent set can be a proper sub-SCC).
+///
+/// Each returned set is strongly connected, lies within `restriction`, and admits
+/// an infinite fair behaviour — it satisfies every `WF`/`SF` constraint, so a
+/// closed walk looping through all of it is a genuine fair lasso. On such a
+/// recurrent set `C`:
+///   - `WF_v(A)` is violated ⇔ `<<A>>_v` enabled at EVERY state of `C` and no
+///     `<<A>>_v` edge internal to `C` (then `C` is discarded — unrepairable, no
+///     subset can satisfy this WF).
+///   - `SF_v(A)` is violated ⇔ `<<A>>_v` enabled at SOME state of `C` and no
+///     `<<A>>_v` edge internal to `C` (then a fair subset must avoid the
+///     SF-enabled states, so they are removed and the remainder re-decomposed).
+///
+/// `<<A>>_v` primitives (subscript-aware, `A /\ v' # v`):
+///   - *taken* on edge `(f, t)`: `(f, t)` is an `A`-labelled edge AND
+///     `v_changed(f, t, vars)` — the subscript tuple `vars` differs between the
+///     states. (For `v` = all variables, any edge between distinct states already
+///     changes `v`.)
+///   - *enabled* at `s`: some `A`-labelled out-edge from `s` is a taken `<<A>>_v`
+///     step (enablement is global, independent of the candidate subset).
+/// Wrapper-`Next` fairness (`action == next_action_name`) is not label-indexed;
+/// "taken internal" = any internal edge that changes `v`, "enabled" = any
+/// out-edge that changes `v`.
+///
+/// `restriction` is the node set the recurrent behaviour must stay in (`¬Q`
+/// states for the eventually shapes; all reachable states for `<>[]Q`). The
+/// caller applies the per-shape reachability / `¬Q`-membership condition to the
+/// returned sets.
+#[allow(clippy::too_many_arguments)]
+pub fn find_fair_accepting_subsets(
+    restriction: &HashSet<u64>,
+    adjacency: &HashMap<u64, Vec<u64>>,
+    labeled_edges: &ActionShardIndex,
+    constraints: &[FairnessConstraint],
+    next_action_name: Option<&str>,
+    v_changed: &dyn Fn(u64, u64, &[String]) -> bool,
+) -> Vec<Vec<u64>> {
+    // Does `s` have a taken `<<A>>_v` out-edge (ENABLED <<A>>_v)?
+    let enabled_at = |s: u64, action: &str, vars: &[String]| -> bool {
+        if next_action_name == Some(action) {
+            return adjacency
+                .get(&s)
+                .map(|succ| succ.iter().any(|t| v_changed(s, *t, vars)))
+                .unwrap_or(false);
+        }
+        for label in fairness_action_head_labels(action) {
+            if let Some(edges) = labeled_edges.get(label.as_str()) {
+                if edges
+                    .iter()
+                    .any(|(f, t)| *f == s && v_changed(*f, *t, vars))
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    };
+
+    // Is there a taken `<<A>>_v` edge with both endpoints in `c`?
+    let taken_in = |c: &HashSet<u64>, action: &str, vars: &[String]| -> bool {
+        if next_action_name == Some(action) {
+            return c.iter().any(|f| {
+                adjacency.get(f).map(|succ| {
+                    succ.iter().any(|t| c.contains(t) && v_changed(*f, *t, vars))
+                }).unwrap_or(false)
+            });
+        }
+        for label in fairness_action_head_labels(action) {
+            if let Some(edges) = labeled_edges.get(label.as_str()) {
+                if edges
+                    .iter()
+                    .any(|(f, t)| c.contains(f) && c.contains(t) && v_changed(*f, *t, vars))
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    };
+
+    // Tarjan SCCs of the subgraph induced by `nodes` (successors kept inside `nodes`).
+    let scc_of = |nodes: &HashSet<u64>| -> Vec<Vec<u64>> {
+        let node_vec: Vec<u64> = nodes.iter().copied().collect();
+        let mut tarjan = TarjanSCC::new();
+        tarjan.find_sccs(&node_vec, |n: &u64| {
+            adjacency
+                .get(n)
+                .map(|succ| succ.iter().copied().filter(|t| nodes.contains(t)).collect())
+                .unwrap_or_default()
+        })
+    };
+
+    let mut results: Vec<Vec<u64>> = Vec::new();
+    let mut worklist: Vec<HashSet<u64>> = scc_of(restriction)
+        .into_iter()
+        .map(|c| c.into_iter().collect())
+        .collect();
+
+    while let Some(c) = worklist.pop() {
+        // Weak fairness: if a WF action is enabled throughout `c` and never taken
+        // internally, no subset can repair it — discard `c`.
+        let mut wf_fail = false;
+        for con in constraints {
+            if let FairnessConstraint::Weak { vars, action } = con {
+                if !taken_in(&c, action, vars)
+                    && c.iter().all(|s| enabled_at(*s, action, vars))
+                {
+                    wf_fail = true;
+                    break;
+                }
+            }
+        }
+        if wf_fail {
+            continue;
+        }
+        // Strong fairness: if an SF action is enabled somewhere in `c` and never
+        // taken internally, every fair subset must avoid the SF-enabled states.
+        // Remove them and re-decompose the remainder.
+        let mut sf_pruned = false;
+        for con in constraints {
+            if let FairnessConstraint::Strong { vars, action } = con {
+                if !taken_in(&c, action, vars)
+                    && c.iter().any(|s| enabled_at(*s, action, vars))
+                {
+                    let remainder: HashSet<u64> = c
+                        .iter()
+                        .copied()
+                        .filter(|s| !enabled_at(*s, action, vars))
+                        .collect();
+                    for sub in scc_of(&remainder) {
+                        worklist.push(sub.into_iter().collect());
+                    }
+                    sf_pruned = true;
+                    break;
+                }
+            }
+        }
+        if sf_pruned {
+            continue;
+        }
+        // No constraint fails: `c` admits a fair recurrent behaviour.
+        results.push(c.into_iter().collect());
+    }
+    results
+}
+
 /// T10.4 — fairness check on SCC using a per-action shard index.
 ///
 /// Iterates only the transitions for the constraint's action, instead of

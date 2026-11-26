@@ -1,4 +1,4 @@
-use crate::fairness::{FairnessConstraint, LabeledTransition};
+use crate::fairness::{ActionShardIndex, FairnessConstraint, LabeledTransition};
 use crate::tla::hashed_arc::HashedArc;
 use crate::tla::compiled_expr::{resolve_state_vars, resolve_state_vars_in_action_ir};
 use crate::model::Model;
@@ -883,129 +883,89 @@ impl Model for TlaModel {
         &self,
         adjacency_fp: &HashMap<u64, Vec<u64>>,
         state_by_fp: &HashMap<u64, Self::State>,
-        non_trivial_sccs: &[Vec<u64>],
-        fair_scc: &[bool],
+        labeled_edges: &ActionShardIndex,
     ) -> Option<Self::State> {
-        // For each `[](P => <>[]Q)` property, look for a genuine violation:
-        // a P-state that can REACH a bad cycle (a reachable FAIR non-trivial
-        // cycle containing a `¬Q` state). Because every state in the graph is
-        // reachable from Init, a P-state that reaches such a cycle witnesses a
-        // behaviour that satisfies P but for which `<>[]Q` fails.
-
-        // SOUNDNESS GUARD (same as graph_liveness_eventually_violation): with
-        // fairness we couldn't fully extract, the no-fairness stutter reasoning and
-        // the `fair_scc` filter are both unreliable, so leave these properties
-        // unchecked rather than risk a false violation.
+        // `<>[]Q` / `[](P => <>[]Q)`: a behaviour fails iff it is `[]<>¬Q`
+        // (visits `¬Q` infinitely often) — a FAIR recurrent set that CONTAINS a
+        // `¬Q` state, reachable from a P-state. Uses the exact fair-subcycle
+        // search (`find_fair_accepting_subsets`), not the old maximal-SCC filter
+        // (which was incomplete under strong fairness — see the tableau design).
         if self.fairness_extraction_incomplete {
             return None;
         }
-        // SOUNDNESS GUARD (Codex review #3): a non-fairness temporal assumption in
-        // the Spec can exclude a behaviour this check would flag; we don't model it
-        // in acceptance, so bail REGARDLESS of whether WF/SF constraints exist
-        // (previously only the no-fairness branch below consulted this flag).
         if self.spec_has_non_fairness_liveness {
             return None;
         }
-        let has_fairness = !self.fairness_constraints.is_empty();
+
+        // `<<A>>_v` subscript test: does the subscript tuple `vars` differ between
+        // the states at fingerprints `f` and `t`?
+        // Resolve each fairness subscript to concrete state variables once (a
+        // `WF_vars(..)` with `vars == <<x,y>>` parses to `["vars"]`, which must be
+        // expanded to `["x","y"]` before projecting a state onto it).
+        let subscript_cache: HashMap<Vec<String>, Vec<String>> = self
+            .fairness_constraints
+            .iter()
+            .map(|c| {
+                let raw: &[String] = match c {
+                    FairnessConstraint::Weak { vars, .. }
+                    | FairnessConstraint::Strong { vars, .. } => vars,
+                };
+                (raw.to_vec(), resolve_subscript_vars(&self.module, raw))
+            })
+            .collect();
+        let v_changed = |f: u64, t: u64, vars: &[String]| -> bool {
+            let resolved: &[String] =
+                subscript_cache.get(vars).map(|v| v.as_slice()).unwrap_or(vars);
+            match (state_by_fp.get(&f), state_by_fp.get(&t)) {
+                (Some(sf), Some(st)) => resolved.iter().any(|v| sf.get(v) != st.get(v)),
+                _ => true,
+            }
+        };
+        let is_not_q = |fp: u64, q_text: &str| -> bool {
+            state_by_fp
+                .get(&fp)
+                .map(|st| self.eval_state_pred_on_state(q_text, st) == Some(false))
+                .unwrap_or(false)
+        };
+
+        // The recurrent set may alternate `Q`/`¬Q`, so the fair-subcycle search
+        // runs over the WHOLE reachable graph; the fair recurrent sets are
+        // property-independent, so compute them once.
+        let all_nodes: HashSet<u64> = state_by_fp.keys().copied().collect();
+        let accepting = crate::fairness::find_fair_accepting_subsets(
+            &all_nodes,
+            adjacency_fp,
+            labeled_edges,
+            &self.fairness_constraints,
+            self.next_action_name(),
+            &v_changed,
+        );
 
         for (_name, formula) in &self.temporal_properties {
             let Some((p_text, q_text)) = graph_liveness_shape(formula) else {
                 continue;
             };
-
-            // 1. Identify "bad cycle" fingerprints — states from which a
-            //    behaviour can loop forever while `Q` is always false (so
-            //    `<>[]Q` fails).
-            //
-            //    * NO fairness: stuttering (`[Next]_vars` allows `vars'=vars`)
-            //      is always a legal infinite behaviour, so ANY reachable
-            //      `¬Q` state is a bad cycle — you can stutter on it forever.
-            //      Stutter self-loops are NOT materialised as graph edges, so
-            //      we must NOT restrict to SCC membership here (RealTime: the
-            //      bad `now=4` loop is a stutter self-loop, not a recorded
-            //      graph cycle). This is the RealTime case.
-            //
-            //    * WITH fairness: a stutter-forever behaviour is unfair and
-            //      TLC excludes it, so a bad cycle must be a genuine FAIR
-            //      non-trivial graph cycle (SCC) containing a `¬Q` state.
-            //      Restricting to fair SCCs is the guardrail that prevents
-            //      false violations on fair liveness specs.
-            //
-            //    In both cases we require `Q` to be *confidently* false
-            //    (Some(false)); unevaluable states never establish ¬Q, so an
-            //    uncheckable predicate can only miss a violation, never invent
-            //    one.
+            // Bad cycles: the fair recurrent sets that contain a confidently-`¬Q`
+            // state (so the behaviour visits `¬Q` infinitely often).
             let mut bad_cycle_fps: HashSet<u64> = HashSet::new();
-            if has_fairness {
-                for (idx, scc) in non_trivial_sccs.iter().enumerate() {
-                    if !fair_scc.get(idx).copied().unwrap_or(true) {
-                        continue; // unfair cycle — TLC excludes it
-                    }
-                    let has_not_q = scc.iter().any(|fp| {
-                        state_by_fp
-                            .get(fp)
-                            .map(|st| self.eval_state_pred_on_state(q_text, st) == Some(false))
-                            .unwrap_or(false)
-                    });
-                    if has_not_q {
-                        for fp in scc {
-                            bad_cycle_fps.insert(*fp);
-                        }
-                    }
-                }
-                // Quiescent terminal states also stutter forever. A terminal
-                // state (no outgoing graph edge) has `Next` disabled, so every
-                // `WF_`/`SF_` constraint is vacuously satisfied there — the
-                // stutter-suffix behaviour is FAIR. TLC treats a deadlock's
-                // stutter the same way (when deadlock-checking is off, the
-                // usual mode for a spec with intended quiescent states). So a
-                // terminal `¬Q` state fails `<>[]Q` and is a bad cycle. Without
-                // this, a bare `<>[]Q` (or `[](P => <>[]Q)`) violation that
-                // only manifests at a quiescent terminal state was missed under
-                // fairness (the non-trivial-SCC scan never sees a terminal, and
-                // the no-fairness stutter branch below is skipped when fairness
-                // is present).
-                for (&fp, st) in state_by_fp.iter() {
-                    let is_terminal = adjacency_fp
-                        .get(&fp)
-                        .map(|succs| succs.is_empty())
-                        .unwrap_or(true);
-                    if is_terminal
-                        && self.eval_state_pred_on_state(q_text, st) == Some(false)
-                    {
-                        bad_cycle_fps.insert(fp);
-                    }
-                }
-            } else {
-                // No fairness (and, by the top-level guard, no non-fairness
-                // temporal assumption either): every reachable ¬Q state can be
-                // stuttered on forever under `[Next]_vars` → each is a bad cycle.
-                for (&fp, st) in state_by_fp.iter() {
-                    if self.eval_state_pred_on_state(q_text, st) == Some(false) {
-                        bad_cycle_fps.insert(fp);
-                    }
+            for set in &accepting {
+                if set.iter().any(|fp| is_not_q(*fp, q_text)) {
+                    bad_cycle_fps.extend(set.iter().copied());
                 }
             }
-
             if bad_cycle_fps.is_empty() {
                 continue;
             }
-
-            // 2. Backward-reachability: set of fingerprints that can REACH any
-            //    bad-cycle fingerprint. Build the reverse adjacency once and
-            //    BFS from the bad-cycle set.
-            let mut reverse: HashMap<u64, Vec<u64>> =
-                HashMap::with_capacity(adjacency_fp.len());
+            // Backward reachability over the FULL graph (the stem to the bad cycle
+            // is unrestricted for `<>[]Q`).
+            let mut reverse: HashMap<u64, Vec<u64>> = HashMap::with_capacity(adjacency_fp.len());
             for (&from, succs) in adjacency_fp.iter() {
                 for &to in succs {
                     reverse.entry(to).or_default().push(from);
                 }
             }
-            let mut can_reach_bad: HashSet<u64> = HashSet::new();
+            let mut can_reach_bad: HashSet<u64> = bad_cycle_fps.iter().copied().collect();
             let mut stack: Vec<u64> = bad_cycle_fps.iter().copied().collect();
-            for &fp in &stack {
-                can_reach_bad.insert(fp);
-            }
             while let Some(fp) = stack.pop() {
                 if let Some(preds) = reverse.get(&fp) {
                     for &pred in preds {
@@ -1015,9 +975,9 @@ impl Model for TlaModel {
                     }
                 }
             }
-
-            // 3. A violation exists iff some reachable P-state can reach a bad
-            //    cycle. Return the P-state as the counterexample witness.
+            // Violation iff some reachable P-state can reach a bad cycle. (Bare
+            // `<>[]Q` has `p_text == "TRUE"`, satisfied by every reachable state,
+            // so Init's reachability suffices.)
             for (&fp, st) in state_by_fp.iter() {
                 if can_reach_bad.contains(&fp)
                     && self.eval_state_pred_on_state(p_text, st) == Some(true)
@@ -1033,47 +993,47 @@ impl Model for TlaModel {
         &self,
         adjacency_fp: &HashMap<u64, Vec<u64>>,
         state_by_fp: &HashMap<u64, Self::State>,
-        non_trivial_sccs: &[Vec<u64>],
-        fair_scc: &[bool],
+        labeled_edges: &ActionShardIndex,
     ) -> Option<Self::State> {
-        // Bug B: the "eventually" shapes `<>Q`, `[](P => <>Q)`, and `P ~> Q`.
-        // A behaviour VIOLATES these iff `Q` is false forever along some suffix:
+        // The "eventually" shapes `<>Q`, `[](P => <>Q)`, and `P ~> Q`. A behaviour
+        // VIOLATES these iff `Q` is false forever along some suffix:
         //   - `<>Q`          : `Q` false on the WHOLE behaviour from Init.
         //   - `[](P=><>Q)`/~>: there is a P-state after which `Q` is false forever.
-        // So a counterexample is a FAIR cycle (or quiescent terminal) where `Q` is
-        // false at EVERY state, reached by a path along which `Q` is false
-        // throughout — from Init (bare `<>Q`) or from a `¬Q` P-state (`~>`).
-        //
-        // This is STRICTER than the `<>[]Q` check (which fires on a cycle merely
-        // *containing* a `¬Q` state): here `Q` must be false everywhere in the
-        // cycle and on the connecting path. `Q` must be *confidently* false
+        // So a counterexample is a FAIR recurrent set within the `¬Q` subgraph,
+        // reached by a `¬Q`-only path — from Init (bare `<>Q`) or from a `P /\ ¬Q`
+        // state. The fair recurrent sets are found by the exact fair-subcycle
+        // search (`find_fair_accepting_subsets`). `Q` must be *confidently* false
         // (`Some(false)`); an unevaluable state never establishes `¬Q`, so an
         // uncheckable predicate can only miss a violation, never invent one.
-
-        // SOUNDNESS GUARD: if the Spec declares fairness we could NOT fully extract
-        // (quantified/parameterized — deferred), the constraint set is incomplete.
-        // Running the no-fairness "stutter-forever" reasoning would read the empty/
-        // partial constraints as "unfair" and false-violate (CheckpointDrain: all
-        // `<>Q` properties, all `\A t : WF_vars(..)` fairness). We cannot soundly
-        // check an eventuality without the full fairness picture, so leave these
-        // properties UNCHECKED (conservative — matches pre-Bug-B behaviour).
         if self.fairness_extraction_incomplete {
             return None;
         }
-
-        // SOUNDNESS GUARD (Codex review #3): if the Spec conjoins a NON-fairness
-        // temporal assumption (`[]<>R`, `<>R`, `~>`, `<>[]`, …) beyond
-        // Init/Next/WF/SF, that assumption can EXCLUDE a behaviour this graph check
-        // would otherwise flag — e.g. a `¬Q` cycle that is fair under `WF_v(A)` but
-        // ruled out by `[]<>R`. We do not model such assumptions in acceptance, so
-        // reporting a violation would be unsound REGARDLESS of whether WF/SF
-        // constraints are also present. Leave these properties unchecked.
         if self.spec_has_non_fairness_liveness {
             return None;
         }
-        let has_fairness = !self.fairness_constraints.is_empty();
 
-        // `¬Q` test (confident false only).
+        // Resolve each fairness subscript to concrete state variables once (a
+        // `WF_vars(..)` with `vars == <<x,y>>` parses to `["vars"]`, which must be
+        // expanded to `["x","y"]` before projecting a state onto it).
+        let subscript_cache: HashMap<Vec<String>, Vec<String>> = self
+            .fairness_constraints
+            .iter()
+            .map(|c| {
+                let raw: &[String] = match c {
+                    FairnessConstraint::Weak { vars, .. }
+                    | FairnessConstraint::Strong { vars, .. } => vars,
+                };
+                (raw.to_vec(), resolve_subscript_vars(&self.module, raw))
+            })
+            .collect();
+        let v_changed = |f: u64, t: u64, vars: &[String]| -> bool {
+            let resolved: &[String] =
+                subscript_cache.get(vars).map(|v| v.as_slice()).unwrap_or(vars);
+            match (state_by_fp.get(&f), state_by_fp.get(&t)) {
+                (Some(sf), Some(st)) => resolved.iter().any(|v| sf.get(v) != st.get(v)),
+                _ => true,
+            }
+        };
         let is_not_q = |fp: u64, q_text: &str| -> bool {
             state_by_fp
                 .get(&fp)
@@ -1088,71 +1048,48 @@ impl Model for TlaModel {
                 continue;
             };
 
-            // 1. Bad cycles: `Q` false at EVERY state of a fair non-trivial SCC,
-            //    plus quiescent `¬Q` terminals (a terminal has `Next` disabled, so
-            //    every WF_/SF_ constraint is vacuously satisfied → its stutter
-            //    suffix is fair). Without fairness, any `¬Q` state stutters forever
-            //    (guarded by `spec_has_non_fairness_liveness`, which excludes the
-            //    stutter suffix when the Spec conjoins another temporal assumption).
-            let mut bad_cycle_fps: HashSet<u64> = HashSet::new();
-            if has_fairness {
-                for (idx, scc) in non_trivial_sccs.iter().enumerate() {
-                    if !fair_scc.get(idx).copied().unwrap_or(true) {
-                        continue; // unfair cycle — excluded
-                    }
-                    let all_not_q = scc.iter().all(|fp| is_not_q(*fp, q_text));
-                    if all_not_q {
-                        for fp in scc {
-                            bad_cycle_fps.insert(*fp);
-                        }
-                    }
-                }
-                for (&fp, _st) in state_by_fp.iter() {
-                    let is_terminal = adjacency_fp
-                        .get(&fp)
-                        .map(|succs| succs.is_empty())
-                        .unwrap_or(true);
-                    if is_terminal && is_not_q(fp, q_text) {
-                        bad_cycle_fps.insert(fp);
-                    }
-                }
-            } else {
-                // No fairness constraints (and, by the guard above, no non-fairness
-                // temporal assumption either): every `¬Q` state can be stuttered on
-                // forever under `[Next]_v`, so each is a bad cycle.
-                for (&fp, _st) in state_by_fp.iter() {
-                    if is_not_q(fp, q_text) {
-                        bad_cycle_fps.insert(fp);
-                    }
-                }
-            }
-
-            if bad_cycle_fps.is_empty() {
+            // Restrict to the `¬Q` subgraph: the recurrent behaviour and its
+            // connecting suffix must stay in `¬Q`.
+            let restriction: HashSet<u64> = state_by_fp
+                .keys()
+                .copied()
+                .filter(|fp| is_not_q(*fp, q_text))
+                .collect();
+            if restriction.is_empty() {
                 continue;
             }
 
-            // 2. Backward reachability RESTRICTED to `¬Q` states: a state can begin
-            //    a `Q`-false-forever suffix iff it is `¬Q` and either is a bad-cycle
-            //    state or has a successor that can (so the connecting path is all
-            //    `¬Q`). Build reverse adjacency and BFS, only entering `¬Q` preds.
+            // Fair recurrent sets within `¬Q` (every state in each is `¬Q`).
+            let accepting = crate::fairness::find_fair_accepting_subsets(
+                &restriction,
+                adjacency_fp,
+                labeled_edges,
+                &self.fairness_constraints,
+                self.next_action_name(),
+                &v_changed,
+            );
+            if accepting.is_empty() {
+                continue;
+            }
+            let mut bad_cycle_fps: HashSet<u64> = HashSet::new();
+            for set in &accepting {
+                bad_cycle_fps.extend(set.iter().copied());
+            }
+
+            // Backward reachability RESTRICTED to `¬Q` states: a state can begin a
+            // `Q`-false-forever suffix iff it is `¬Q` and reaches a bad recurrent
+            // set via `¬Q` predecessors.
             let mut reverse: HashMap<u64, Vec<u64>> = HashMap::with_capacity(adjacency_fp.len());
             for (&from, succs) in adjacency_fp.iter() {
                 for &to in succs {
                     reverse.entry(to).or_default().push(from);
                 }
             }
-            let mut bad_reaching: HashSet<u64> = HashSet::new();
-            let mut stack: Vec<u64> = Vec::new();
-            for &fp in &bad_cycle_fps {
-                // A bad-cycle fp is itself `¬Q` (SCC-everywhere or terminal `¬Q`).
-                if bad_reaching.insert(fp) {
-                    stack.push(fp);
-                }
-            }
+            let mut bad_reaching: HashSet<u64> = bad_cycle_fps.iter().copied().collect();
+            let mut stack: Vec<u64> = bad_cycle_fps.iter().copied().collect();
             while let Some(fp) = stack.pop() {
                 if let Some(preds) = reverse.get(&fp) {
                     for &pred in preds {
-                        // Only extend the suffix through `¬Q` predecessors.
                         if is_not_q(pred, q_text) && bad_reaching.insert(pred) {
                             stack.push(pred);
                         }
@@ -1160,10 +1097,9 @@ impl Model for TlaModel {
                 }
             }
 
-            // 3. Report a violation.
             if is_bare_eventually {
-                // `<>Q`: a `¬Q` path from an INIT state to a bad cycle. The whole
-                // behaviour is `¬Q`, so Init itself must be `¬Q` and bad-reaching.
+                // `<>Q`: a `¬Q` path from an INIT state to a bad recurrent set. The
+                // whole behaviour is `¬Q`, so Init itself must be `¬Q` and reaching.
                 for init in self.initial_states() {
                     let fp = self.fingerprint(&init);
                     if bad_reaching.contains(&fp) {
@@ -1171,10 +1107,8 @@ impl Model for TlaModel {
                     }
                 }
             } else {
-                // `[](P=><>Q)` / `~>`: a `¬Q` P-state that reaches a bad cycle via a
-                // `¬Q` path (the P-state begins the `Q`-false-forever suffix; the
-                // stem from Init may contain `Q`). Reachability from Init is implied
-                // (every state in the graph is reachable from Init).
+                // `[](P=><>Q)` / `~>`: a `P /\ ¬Q` state that reaches a bad recurrent
+                // set via a `¬Q` path (the stem from Init may contain `Q`).
                 for (&fp, st) in state_by_fp.iter() {
                     if bad_reaching.contains(&fp)
                         && self.eval_state_pred_on_state(p_text, st) == Some(true)
@@ -1693,6 +1627,44 @@ fn formula_has_non_fairness_liveness(formula: &TemporalFormula) -> bool {
 ///
 /// In both cases the operand(s) must be pure, prime-free, non-temporal state
 /// predicates so they can be evaluated per state.
+/// Resolve a fairness subscript (`WF_<<raw>>(A)`) to the concrete state-variable
+/// names it denotes, for the subscript-aware `<<A>>_v` tests. The parsed subscript
+/// `raw` may be: the state variables themselves (`WF_x(..)` → `["x"]`,
+/// `WF_<<x,y>>(..)` → `["x","y"]`); or a DEFINED tuple name (`WF_vars(..)` with
+/// `vars == <<x, y>>` → parsed as `["vars"]`, which must be expanded to
+/// `["x","y"]`). Anything that resolves to no state variable (e.g. an opaque
+/// `vars` we can't expand) falls back to ALL state variables — the near-universal
+/// meaning of a `vars` tuple and a sound conservative default.
+fn resolve_subscript_vars(module: &TlaModule, raw: &[String]) -> Vec<String> {
+    let state_vars: std::collections::HashSet<&str> =
+        module.variables.iter().map(|s| s.as_str()).collect();
+    let mut out: Vec<String> = Vec::new();
+    for name in raw {
+        if state_vars.contains(name.as_str()) {
+            out.push(name.clone());
+        } else if let Some(def) = module.definitions.get(name) {
+            // A defined subscript, e.g. `vars == <<x, y>>`: expand its tuple body
+            // and keep the components that are real state variables.
+            let body = def.body.trim();
+            if let Some(inner) = body.strip_prefix("<<").and_then(|s| s.strip_suffix(">>")) {
+                for part in inner.split(',') {
+                    let p = part.trim();
+                    if state_vars.contains(p) {
+                        out.push(p.to_string());
+                    }
+                }
+            } else if state_vars.contains(body) {
+                out.push(body.to_string());
+            }
+        }
+    }
+    if out.is_empty() {
+        module.variables.clone()
+    } else {
+        out
+    }
+}
+
 fn graph_liveness_shape(formula: &TemporalFormula) -> Option<(&str, &str)> {
     match formula {
         // `[](P => <>[]Q)`

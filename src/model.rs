@@ -1,4 +1,4 @@
-use crate::fairness::FairnessConstraint;
+use crate::fairness::{ActionShardIndex, FairnessConstraint};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fmt::Debug;
@@ -311,8 +311,7 @@ pub trait Model: Send + Sync + 'static {
         &self,
         _adjacency_fp: &std::collections::HashMap<u64, Vec<u64>>,
         _state_by_fp: &std::collections::HashMap<u64, Self::State>,
-        _non_trivial_sccs: &[Vec<u64>],
-        _fair_scc: &[bool],
+        _labeled_edges: &ActionShardIndex,
     ) -> Option<Self::State> {
         None
     }
@@ -352,8 +351,7 @@ pub trait Model: Send + Sync + 'static {
         &self,
         _adjacency_fp: &std::collections::HashMap<u64, Vec<u64>>,
         _state_by_fp: &std::collections::HashMap<u64, Self::State>,
-        _non_trivial_sccs: &[Vec<u64>],
-        _fair_scc: &[bool],
+        _labeled_edges: &ActionShardIndex,
     ) -> Option<Self::State> {
         None
     }
